@@ -1437,6 +1437,12 @@ impl FileMetadata {
             FdType::Pipe
         } else if file_type.contains(stat::SFlag::S_IFSOCK) {
             FdType::Socket
+        } else if status_flags & libc::O_PATH == 0
+            && crate::fd::is_random_device(raw_stat.st_mode, raw_stat.st_rdev)
+        {
+            // Linux's random devices by device number, as an open classifies
+            // them (`Detcore::handle_openat`).
+            FdType::Rng
         } else {
             FdType::Regular
         };
@@ -2859,6 +2865,34 @@ mod file_metadata_tests {
             .expect("discovered descriptor should remain tracked");
         assert_eq!(metadata.file_handles[&fd].known_flock_mode(), None);
         assert!(!metadata.file_handles[&fd].flock_mode_may_be_stale());
+    }
+
+    #[test]
+    fn discovery_classifies_random_devices_by_device_number() {
+        let owner = DetTid::from_raw(9);
+        let random = std::fs::File::open("/dev/random").unwrap();
+        let urandom = std::fs::File::open("/dev/urandom").unwrap();
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let path_only = nix::fcntl::open(
+            "/dev/urandom",
+            OFlag::O_PATH | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .unwrap();
+        let mut metadata = FileMetadata::new(owner);
+        for (fd, expected) in [
+            (random.as_raw_fd(), FdType::Rng),
+            (urandom.as_raw_fd(), FdType::Rng),
+            // Another character device, and an `O_PATH` descriptor of a
+            // random device, which reads nothing, stay `Regular`.
+            (null.as_raw_fd(), FdType::Regular),
+            (path_only.as_raw_fd(), FdType::Regular),
+        ] {
+            metadata
+                .discover_fd_from_current_process(owner, fd)
+                .expect("live descriptor should be discovered");
+            assert_eq!(metadata.file_handles[&fd].ty(), expected, "fd {fd}");
+        }
     }
 
     #[test]

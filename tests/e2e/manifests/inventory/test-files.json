@@ -1802,6 +1802,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/random_device_spellings.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/random_device_spellings.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Reads /dev/urandom through every spelling a guest can use and checks each open reads Hermit's stream from its start, on every backend, as Detcore classifies random devices by device number"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/random_readv_stream.c",
       "runner": "test-harness c-programs/random-readv-stream",
       "why": "The shared manifest runs all random and urandom scalar/vector cursor, access-mode, fault-ordering, dup, fork, and exec assertions under strict ptrace/KVM verification and ptrace record/replay; seeded bytes and successful prefixes have independent exact oracles. The fixture also provides a manual --native syscall/effects control; this manifest does not schedule that mode."

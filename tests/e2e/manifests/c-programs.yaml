@@ -20237,6 +20237,94 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this guest
           liteinst: No custom edge-case arguments have been calibrated for this guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/random-device-spellings
+    description: "tests/c/random_device_spellings.c reads /dev/urandom through every spelling a guest can use under Hermit (double slash, dot, dot-dot, directory-relative, cwd-relative, symbolic link, /proc/self/fd/N and /dev/fd/N) and checks that each new open reads Hermit's stream from its start, as Detcore classifies random devices by device number (https://github.com/rrnewton/hermit/issues/4544). It also checks that a regular file reached through a name like the device's reads its own bytes, that a write-only descriptor's read and pread get EBADF, the descriptor's /proc/self/fd link, F_SETLK and TCGETS, the device metadata, a cursor shared by dup and fork, mmap's ENODEV and an O_PATH read's EBADF. Bind mounts and node copies are covered by the device-number rule but untested under Hermit (Detcore refuses mount, and the user namespace cannot create a character device). Standard output is the oracle and the program exits 0. The SaBRe and KVM rows are KNOWN-DEFECT REGRESSION BASELINES, NOT COMPLETION: SaBRe does not carry a forked child's reads of a shared random-device cursor back to the parent (https://github.com/rrnewton/hermit/issues/4548), and KVM's executor stand-in for the device refuses the /proc/self/fd/N and /dev/fd/N reopens and F_SETLK with ENOSYS, names a private memfd as the descriptor's link and answers TCGETS with ENOTTY until LinuxEmu slice D3b deletes it"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/random_device_spellings.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+          - sabre
+          - kvm
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        expected_stdout:
+          ptrace: "reference=2972bb044d96df2871ba034c95de2770\nspelling literal-random same-stream\nspelling double-slash same-stream\nspelling dot same-stream\nspelling dot-dot same-stream\nspelling directory-relative same-stream\nspelling cwd-relative same-stream\nspelling symlink same-stream\nspelling proc-self-fd same-stream\nspelling dev-fd same-stream\nregular-file-alias reads its own bytes\nwrite-only /dev//urandom read=-1 errno=9 pread=-1 errno=9\nwrite-only /dev/urandom read=-1 errno=9 pread=-1 errno=9\nreadlink=/dev/urandom\nfcntl F_SETLK=0 errno=0\nioctl TCGETS=-1 errno=22\nfstat /dev/urandom character-device 1:9 size=0\nfstat /dev/random character-device 1:8 size=0\ncursor first same-stream\ncursor dup same-stream\ncursor fork-child same-stream\ncursor fork-parent same-stream\nmmap errno=19\no-path read=-1 errno=9\nfailures=0\n"
+          dbt: "reference=2972bb044d96df2871ba034c95de2770\nspelling literal-random same-stream\nspelling double-slash same-stream\nspelling dot same-stream\nspelling dot-dot same-stream\nspelling directory-relative same-stream\nspelling cwd-relative same-stream\nspelling symlink same-stream\nspelling proc-self-fd same-stream\nspelling dev-fd same-stream\nregular-file-alias reads its own bytes\nwrite-only /dev//urandom read=-1 errno=9 pread=-1 errno=9\nwrite-only /dev/urandom read=-1 errno=9 pread=-1 errno=9\nreadlink=/dev/urandom\nfcntl F_SETLK=0 errno=0\nioctl TCGETS=-1 errno=22\nfstat /dev/urandom character-device 1:9 size=0\nfstat /dev/random character-device 1:8 size=0\ncursor first same-stream\ncursor dup same-stream\ncursor fork-child same-stream\ncursor fork-parent same-stream\nmmap errno=19\no-path read=-1 errno=9\nfailures=0\n"
+          sabre: "reference=2972bb044d96df2871ba034c95de2770\nspelling literal-random same-stream\nspelling double-slash same-stream\nspelling dot same-stream\nspelling dot-dot same-stream\nspelling directory-relative same-stream\nspelling cwd-relative same-stream\nspelling symlink same-stream\nspelling proc-self-fd same-stream\nspelling dev-fd same-stream\nregular-file-alias reads its own bytes\nwrite-only /dev//urandom read=-1 errno=9 pread=-1 errno=9\nwrite-only /dev/urandom read=-1 errno=9 pread=-1 errno=9\nreadlink=/dev/urandom\nfcntl F_SETLK=0 errno=0\nioctl TCGETS=-1 errno=22\nfstat /dev/urandom character-device 1:9 size=0\nfstat /dev/random character-device 1:8 size=0\ncursor first same-stream\ncursor dup same-stream\ncursor fork-child same-stream\ncursor fork-parent DIFFERENT bytes=4992db246db6ff4891da236cb5fe4790\nmmap errno=19\no-path read=-1 errno=9\nfailures=1\n"
+          kvm: "reference=2972bb044d96df2871ba034c95de2770\nspelling literal-random same-stream\nspelling double-slash same-stream\nspelling dot same-stream\nspelling dot-dot same-stream\nspelling directory-relative same-stream\nspelling cwd-relative same-stream\nspelling symlink same-stream\nspelling proc-self-fd refused errno=38\nspelling dev-fd refused errno=38\nregular-file-alias reads its own bytes\nwrite-only /dev//urandom read=-1 errno=9 pread=-1 errno=9\nwrite-only /dev/urandom read=-1 errno=9 pread=-1 errno=9\nreadlink=/memfd:reverie-kvm-virtual (deleted)\nfcntl F_SETLK=-1 errno=38\nioctl TCGETS=-1 errno=25\nfstat /dev/urandom character-device 1:9 size=0\nfstat /dev/random character-device 1:8 size=0\ncursor first same-stream\ncursor dup same-stream\ncursor fork-child same-stream\ncursor fork-parent same-stream\nmmap errno=19\no-path read=-1 errno=9\nfailures=0\n"
+          liteinst: "reference=2972bb044d96df2871ba034c95de2770\nspelling literal-random same-stream\nspelling double-slash same-stream\nspelling dot same-stream\nspelling dot-dot same-stream\nspelling directory-relative same-stream\nspelling cwd-relative same-stream\nspelling symlink same-stream\nspelling proc-self-fd same-stream\nspelling dev-fd same-stream\nregular-file-alias reads its own bytes\nwrite-only /dev//urandom read=-1 errno=9 pread=-1 errno=9\nwrite-only /dev/urandom read=-1 errno=9 pread=-1 errno=9\nreadlink=/dev/urandom\nfcntl F_SETLK=0 errno=0\nioctl TCGETS=-1 errno=22\nfstat /dev/urandom character-device 1:9 size=0\nfstat /dev/random character-device 1:8 size=0\ncursor first same-stream\ncursor dup same-stream\ncursor fork-child same-stream\ncursor fork-parent same-stream\nmmap errno=19\no-path read=-1 errno=9\nfailures=0\n"
+          in-guest-trap: "reference=2972bb044d96df2871ba034c95de2770\nspelling literal-random same-stream\nspelling double-slash same-stream\nspelling dot same-stream\nspelling dot-dot same-stream\nspelling directory-relative same-stream\nspelling cwd-relative same-stream\nspelling symlink same-stream\nspelling proc-self-fd same-stream\nspelling dev-fd same-stream\nregular-file-alias reads its own bytes\nwrite-only /dev//urandom read=-1 errno=9 pread=-1 errno=9\nwrite-only /dev/urandom read=-1 errno=9 pread=-1 errno=9\nreadlink=/dev/urandom\nfcntl F_SETLK=0 errno=0\nioctl TCGETS=-1 errno=22\nfstat /dev/urandom character-device 1:9 size=0\nfstat /dev/random character-device 1:8 size=0\ncursor first same-stream\ncursor dup same-stream\ncursor fork-child same-stream\ncursor fork-parent same-stream\nmmap errno=19\no-path read=-1 errno=9\nfailures=0\n"
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as c-programs/random-sources-root-only does (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): natively every spelling reads different host entropy; the contract is deterministic output under Hermit.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract asserts deterministic output under Hermit, not native nondeterminism
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: true
+        args:
+          - --strict
+          - --no-virtualize-metadata
+        guest_args:
+          ptrace:
+            - --strict-checks
+        assert:
+          runs: 3
+          repeat_identical: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: The metadata-off classification path is backend-independent Detcore code; ptrace carries it (its stack-scratch and transient-page placement through each backend's own inject is exercised there only by the verify cells, with metadata virtualized)
+          kvm: The metadata-off classification path is backend-independent Detcore code; ptrace carries it (its stack-scratch and transient-page placement through each backend's own inject is exercised there only by the verify cells, with metadata virtualized)
+          sabre: The metadata-off classification path is backend-independent Detcore code; ptrace carries it (its stack-scratch and transient-page placement through each backend's own inject is exercised there only by the verify cells, with metadata virtualized)
+          liteinst: The metadata-off classification path is backend-independent Detcore code; ptrace carries it (its stack-scratch and transient-page placement through each backend's own inject is exercised there only by the verify cells, with metadata virtualized)
+          in-guest-trap: The metadata-off classification path is backend-independent Detcore code; ptrace carries it (its stack-scratch and transient-page placement through each backend's own inject is exercised there only by the verify cells, with metadata virtualized)
   - id: c-programs/signal-disposition
     description: Strict verification for tests/c/signal_disposition.c
     lane: portable

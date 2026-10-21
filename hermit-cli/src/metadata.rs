@@ -817,7 +817,17 @@ impl RecordVersion {
 // 0x183 -> 0x184 (provisional dh-ldymk reservation in dh-gxmvo; coordinator
 // rederives at landing): project existing runtime-private ownership from whole
 // smaps sections and refuse unsupported mixed-VMA accounting.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x184);
+// 0x184 -> 0x185 (provisional: 0x185 is HIGHEST_SHIPPED + 1 at this base; the
+// lander re-checks HIGHEST_SHIPPED + 1 at land): Detcore classifies a random
+// device by its device number, character 1:8 or 1:9, whatever spelling reached
+// it, and under record and replay takes that number from an `fstat` recorded
+// after every open that is not O_PATH. An older recording read an alternate
+// spelling (/dev//urandom, a symbolic link, /proc/self/fd/N) as recorded kernel
+// reads and has no such `fstat`, while this replayer answers those reads from
+// the seeded stream and expects the `fstat`; replaying it would print other
+// bytes and fall out of step, so it is refused here
+// (https://github.com/rrnewton/hermit/issues/4544).
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x185);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -842,7 +852,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x184);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x184;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x185;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -2218,6 +2228,15 @@ mod tests {
         // Metadata does not persist the memory configuration, so a recording made with the
         // previous hardcoded value cannot be replayed compatibly with the corrected default.
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10a)));
+    }
+
+    /// A 0x184 recording read a random device reached through an alternate
+    /// spelling as recorded kernel reads and recorded no classification
+    /// `fstat`; this replayer serves those reads from the seeded stream and
+    /// expects the `fstat`, so the version gate must refuse it.
+    #[test]
+    fn record_version_rejects_path_classified_random_device_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x184)));
     }
 
     #[test]

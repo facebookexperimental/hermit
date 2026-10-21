@@ -695,6 +695,27 @@ fn random_device_lseek_result(status_flags: i32, whence: Whence) -> Result<i64, 
     }
 }
 
+/// Why a stat Detcore takes for its own bookkeeping failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatFailure {
+    /// The stat call failed: the kernel's answer, or under record and replay
+    /// the recorded one.
+    Call(Errno),
+    /// Its buffer could not be prepared (the stack scratch faulted, or the
+    /// transient page could not be mapped), and then nothing was recorded; or,
+    /// after a successful stat, the guest's borrowed stack bytes could not be
+    /// written back.
+    Scratch(Errno),
+}
+
+impl StatFailure {
+    fn errno(self) -> Errno {
+        match self {
+            Self::Call(errno) | Self::Scratch(errno) => errno,
+        }
+    }
+}
+
 fn require_random_device_read_access(status_flags: i32) -> Result<(), Errno> {
     if status_flags & libc::O_PATH != 0
         || !matches!(
@@ -2985,19 +3006,35 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_stat(Some(statptr)),
             )
         };
-        let copied = match Self::inject_stat_on_stack(guest, fstat).await {
-            Err(Errno::EFAULT) => {
+        let copied = Self::stat_with_fallback(guest, raw_fd, fstat, None)
+            .await
+            .map_err(StatFailure::errno)?;
+        trace!("extra fstat returned inode {}", copied.st_ino);
+        Ok(copied)
+    }
+
+    /// `stat_call` for descriptor `raw_fd` with its buffer in the guest stack
+    /// scratch or, where the scratch cannot hold it (the commit or the call
+    /// faults), in a transient private page; see [`Self::inject_fstat`].
+    /// `recorded` routes the call through that Detcore's recording
+    /// ([`Self::recorded_fstat`]); `None` injects it.
+    async fn stat_with_fallback<G: Guest<Self>>(
+        guest: &mut G,
+        raw_fd: RawFd,
+        stat_call: impl Fn(StatPtr<'_>) -> Syscall + Copy,
+        recorded: Option<&Self>,
+    ) -> Result<libc::stat, StatFailure> {
+        match Self::inject_stat_on_stack(guest, stat_call, recorded).await {
+            Err(StatFailure::Scratch(Errno::EFAULT) | StatFailure::Call(Errno::EFAULT)) => {
                 info!(
                     "Guest stack scratch cannot hold the fstat buffer for fd {}; \
                      using a transient page instead.",
                     raw_fd
                 );
-                Self::inject_stat_in_transient_page(guest, fstat).await?
+                Self::inject_stat_in_transient_page(guest, stat_call, recorded).await
             }
-            result => result?,
-        };
-        trace!("extra fstat returned inode {}", copied.st_ino);
-        Ok(copied)
+            result => result,
+        }
     }
 
     /// `fstatat(dirfd, path, AT_SYMLINK_NOFOLLOW)` for a path the guest named
@@ -3081,7 +3118,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // computed by subtraction.
         let scratch = 128 + std::mem::size_of::<libc::stat>();
         if usize::try_from(guest.regs().await.rsp).map_or(true, |rsp| rsp <= scratch) {
-            return Self::inject_stat_in_transient_page(guest, lstatat).await;
+            return Self::inject_stat_in_transient_page(guest, lstatat, None)
+                .await
+                .map_err(StatFailure::errno);
         }
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
@@ -3095,28 +3134,36 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .is_ok();
         if !staged_on_stack {
             drop(stack);
-            return Self::inject_stat_in_transient_page(guest, lstatat).await;
+            return Self::inject_stat_in_transient_page(guest, lstatat, None)
+                .await
+                .map_err(StatFailure::errno);
         }
         let guard = match stack.commit() {
             Ok(guard) => guard,
             Err(_) => {
                 restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
-                return Self::inject_stat_in_transient_page(guest, lstatat).await;
+                return Self::inject_stat_in_transient_page(guest, lstatat, None)
+                    .await
+                    .map_err(StatFailure::errno);
             }
         };
         restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
-        let looked_up = Self::inject_stat_into(guest, lstatat(statptr), statptr).await;
+        let looked_up = Self::inject_stat_into(guest, lstatat(statptr), statptr, None)
+            .await
+            .map_err(StatFailure::errno);
         restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
         drop(guard);
         looked_up
     }
 
     /// The fast path of [`Self::inject_fstat`]: the buffer lives in the guest
-    /// stack scratch. Returns `EFAULT` when that scratch is not writable.
+    /// stack scratch. Returns `Scratch(EFAULT)` when that scratch is not
+    /// writable.
     async fn inject_stat_on_stack<G: Guest<Self>>(
         guest: &mut G,
         stat_call: impl Fn(StatPtr<'_>) -> Syscall,
-    ) -> Result<libc::stat, Errno> {
+        recorded: Option<&Self>,
+    ) -> Result<libc::stat, StatFailure> {
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
         // Ptrace lends bytes below the guest red zone. Save them before
@@ -3124,29 +3171,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         // adjacent pre-call lookup path does. Tool-owned scratch is likewise
         // held by stack/guard throughout every access.
         let mut saved = [0u8; std::mem::size_of::<libc::stat>()];
-        guest.memory().read_exact(statptr.0.cast(), &mut saved)?;
+        guest
+            .memory()
+            .read_exact(statptr.0.cast(), &mut saved)
+            .map_err(StatFailure::Scratch)?;
         let guard = match stack.commit() {
             Ok(guard) => guard,
             Err(errno) => {
                 restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
-                return Err(errno);
+                return Err(StatFailure::Scratch(errno));
             }
         };
         restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
         // No early `?`: even kernel/readback errors must put back the borrowed
         // bytes before the guard releases a backend's Tool-owned arena.
-        let copied = Self::inject_stat_into(guest, stat_call(statptr), statptr).await;
+        let copied = Self::inject_stat_into(guest, stat_call(statptr), statptr, recorded).await;
         let restored = guest.memory().write_exact(statptr.0.cast(), &saved);
         drop(guard);
         // Preserve the actual injection/readback errno. On success, preserve
         // the old contract that a failed final scratch write is an error.
         match copied {
-            Ok(copied) => restored.map(|()| copied),
-            Err(errno) => {
+            Ok(copied) => restored.map(|()| copied).map_err(StatFailure::Scratch),
+            Err(failure) => {
                 if restored.is_err() {
                     info!("Could not restore the guest bytes under a pre-call lookup buffer.");
                 }
-                Err(errno)
+                Err(failure)
             }
         }
     }
@@ -3159,7 +3209,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn inject_stat_in_transient_page<G: Guest<Self>>(
         guest: &mut G,
         stat_call: impl Fn(StatPtr<'_>) -> Syscall,
-    ) -> Result<libc::stat, Errno> {
+        recorded: Option<&Self>,
+    ) -> Result<libc::stat, StatFailure> {
         let len = std::mem::size_of::<libc::stat>();
         let mapped = guest
             .inject_with_retry(Syscall::Mmap(
@@ -3171,12 +3222,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_fd(-1)
                     .with_offset(0),
             ))
-            .await?;
+            .await
+            .map_err(StatFailure::Scratch)?;
         let page = usize::try_from(mapped)
             .ok()
             .and_then(AddrMut::<libc::stat>::from_raw)
             .unwrap_or_else(|| panic!("transient fstat page mmap returned {mapped}"));
-        let copied = Self::inject_stat_into(guest, stat_call(StatPtr(page)), StatPtr(page)).await;
+        let copied =
+            Self::inject_stat_into(guest, stat_call(StatPtr(page)), StatPtr(page), recorded).await;
         if let Err(errno) = guest
             .inject_with_retry(Syscall::Munmap(
                 syscalls::Munmap::new()
@@ -3197,16 +3250,35 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Inject `stat_call`, which writes a `struct stat` at `statptr`, and read
-    /// back what the kernel wrote.
+    /// back what the kernel wrote. With `recorded`, the call goes through that
+    /// Detcore's recording ([`Detcore::record_or_replay`]): recorded under
+    /// record, served from the recording under replay, injected otherwise.
     async fn inject_stat_into<G: Guest<Self>>(
         guest: &mut G,
         stat_call: Syscall,
         statptr: StatPtr<'_>,
-    ) -> Result<libc::stat, Errno> {
+        recorded: Option<&Self>,
+    ) -> Result<libc::stat, StatFailure> {
         // NOTE: Must retry the injection here. This could get interrupted and
-        // we don't want to rerun the entire syscall handler twice.
-        guest.inject_with_retry(stat_call).await?;
-        statptr.read(&guest.memory())
+        // we don't want to rerun the entire syscall handler twice. Through the
+        // recording, every attempt is a recorded event, so replay consumes the
+        // same attempts, in order, and retries exactly as the record did.
+        match recorded {
+            None => {
+                guest
+                    .inject_with_retry(stat_call)
+                    .await
+                    .map_err(StatFailure::Call)?;
+            }
+            Some(detcore) => loop {
+                match detcore.record_or_replay(guest, stat_call).await {
+                    Ok(_) => break,
+                    Err(Errno::EINTR | Errno::ERESTARTSYS) => continue,
+                    Err(errno) => return Err(StatFailure::Call(errno)),
+                }
+            },
+        }
+        statptr.read(&guest.memory()).map_err(StatFailure::Call)
     }
 
     // helper function to track a new file descriptor.
@@ -4028,8 +4100,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     resolved_open_path(&backend, pid, fd)
                 })
                 .await;
+                // Linux's random devices are classified below by the device
+                // the open reached. An `O_PATH` descriptor, which reads
+                // nothing, keeps the type its literal name gave it before.
                 let fd_type = path.to_str().map_or(FdType::Regular, |fname| {
-                    if fname == "/dev/random" || fname == "/dev/urandom" {
+                    if call.flags().contains(OFlag::O_PATH)
+                        && (fname == "/dev/random" || fname == "/dev/urandom")
+                    {
                         FdType::Rng
                     } else {
                         FdType::Regular
@@ -4069,6 +4146,52 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let host_stat = self
                     .add_fd_with_stat(guest, fd, call.flags(), fd_type)
                     .await?;
+                // Linux names a random device by its device number, whatever
+                // path reached it (a literal or relative name, `.` or `..`, a
+                // symbolic link, `/proc/self/fd/N`, a bind mount, a copy of
+                // the node), so every such open reads Detcore's stream, not
+                // the host's entropy (https://github.com/rrnewton/hermit/issues/4544).
+                // The device number comes from the `fstat` taken above when
+                // metadata is virtualized, so the default run makes no extra
+                // call; otherwise from one `fstat`, which under record and
+                // replay goes through the recording, so replay classifies by
+                // the recorded device, not by its placeholder's. If that
+                // `fstat` fails, the open fails with its error: a descriptor
+                // Detcore could not classify must not read the host.
+                let fd_type = if fd_type == FdType::Regular && !call.flags().contains(OFlag::O_PATH)
+                {
+                    match self
+                        .opened_random_device(guest, fd, host_stat.as_ref())
+                        .await
+                    {
+                        Ok(true) => {
+                            guest
+                                .thread_state()
+                                .with_detfd(fd, |detfd| detfd.set_type(FdType::Rng))?;
+                            FdType::Rng
+                        }
+                        Ok(false) => fd_type,
+                        // Under record and replay, a buffer the guest's
+                        // address space could not provide was never
+                        // recorded; continuing would consume a different
+                        // event than the other run did, so the run stops.
+                        Err(StatFailure::Scratch(errno)) if self.cfg.recordreplay_modes => {
+                            resource_release_all(guest).await;
+                            return Err(Error::Tool(anyhow::anyhow!(
+                                "cannot classify fd {fd} under record and replay: no buffer \
+                                 for its fstat ({errno})"
+                            )));
+                        }
+                        Err(failure) => {
+                            let cleanup = self.close_unclassified(guest, fd).await;
+                            resource_release_all(guest).await;
+                            cleanup?;
+                            return Err(failure.errno().into());
+                        }
+                    }
+                } else {
+                    fd_type
+                };
                 // A placeholder reached through any other spelling (a symbolic
                 // link to a descriptor link, `/dev/stdin`): the kernel opened
                 // the placeholder, which is the rendered file again, also for
@@ -5317,6 +5440,90 @@ impl<T: RecordOrReplay> Detcore<T> {
         Some(PathBuf::from(
             <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes?),
         ))
+    }
+
+    /// Whether the descriptor `fd` an open just returned is one of Linux's
+    /// random devices (`crate::fd::is_random_device`), by the host `fstat`
+    /// the open already took (`stat`, when metadata is virtualized) or by one
+    /// `fstat` through the recording ([`Self::recorded_fstat`]). Under record
+    /// and replay the latter is always used: replay's descriptor is a
+    /// placeholder, so only the recorded result names the device.
+    async fn opened_random_device<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        stat: Option<&libc::stat>,
+    ) -> Result<bool, StatFailure> {
+        let stat = match stat {
+            Some(stat) if !self.cfg.recordreplay_modes => *stat,
+            _ => self.recorded_fstat(guest, fd).await?,
+        };
+        Ok(crate::fd::is_random_device(stat.st_mode, stat.st_rdev))
+    }
+
+    /// `fstat(fd)` through the recording, with [`Self::inject_fstat`]'s buffer
+    /// placement and retry: recorded under record, served from the recording
+    /// under replay, injected otherwise. Every attempt, including an
+    /// interrupted one, is a recorded event. The buffer's placement consumes
+    /// no event: the stack scratch is used or not by the guest's own stack
+    /// pointer and mappings, which replay reproduces, and the transient page
+    /// is an unrecorded private mapping of the same address space. If that
+    /// mapping fails, `StatFailure::Scratch` reports it, so the caller can
+    /// refuse to continue a recording or replay rather than consume a
+    /// different event than the other run did.
+    async fn recorded_fstat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        raw_fd: RawFd,
+    ) -> Result<libc::stat, StatFailure> {
+        info!(
+            "Taking fstat through the recording to classify fd {}.",
+            raw_fd
+        );
+        let fstat = move |statptr: StatPtr<'_>| {
+            Syscall::Fstat(
+                syscalls::Fstat::new()
+                    .with_fd(raw_fd)
+                    .with_stat(Some(statptr)),
+            )
+        };
+        Self::stat_with_fallback(guest, raw_fd, fstat, Some(self)).await
+    }
+
+    /// Close descriptor `fd`, which an open just returned but Detcore could
+    /// not classify, through the recording, and then forget it. A close that
+    /// provably never ran (ERESTARTSYS: a signal stopped the injection before
+    /// its `syscall` instruction) is retried; one that ran is not, as Linux
+    /// releases the descriptor even when `close` reports EINTR or EIO. A close
+    /// still refused after the retries, or refused otherwise, ends the run:
+    /// the descriptor would stay open in the guest with no model.
+    async fn close_unclassified<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(), Error> {
+        const ATTEMPTS: usize = 16;
+        let mut last = Errno::ERESTARTSYS;
+        for _ in 0..ATTEMPTS {
+            match self
+                .record_or_replay(guest, syscalls::Close::new().with_fd(fd))
+                .await
+            {
+                Ok(_) | Err(Errno::EINTR | Errno::EIO) => {
+                    guest.thread_state().remove_fd(fd);
+                    return Ok(());
+                }
+                Err(Errno::ERESTARTSYS) => last = Errno::ERESTARTSYS,
+                Err(errno) => {
+                    last = errno;
+                    break;
+                }
+            }
+        }
+        Err(Error::Tool(anyhow::anyhow!(
+            "cannot close fd {fd}, which an open returned but Detcore could not \
+             classify: close answered {last}"
+        )))
     }
 
     /// What descriptor `fd` of the calling process names, as its
@@ -6641,9 +6848,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(copied as i64);
         }
 
-        let (fd_type, resource) = guest
-            .thread_state_mut()
-            .with_detfd(call.fd(), |detfd| (detfd.ty(), detfd.resource()))?;
+        let (fd_type, resource, status_flags) =
+            guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
+                (detfd.ty(), detfd.resource(), detfd.status_flags())
+            })?;
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::R);
@@ -6653,6 +6861,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let res = match fd_type {
             FdType::Rng => (|| -> Result<i64, Error> {
                 trace!("Pread64 call RNG fd {}, simulating...", call.fd());
+                // A random device open for writing only reads nothing
+                // (EBADF), before its buffer is looked at, as `vfs_read`
+                // checks FMODE_READ first; read and readv already check.
+                require_random_device_read_access(status_flags)?;
                 let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
                 let n =
                     self.fill_random_device_bytes(guest, remote_buf, call.len(), offset as u64)?;
@@ -15638,6 +15850,9 @@ mod inject_fstat_scratch {
         close_errors: std::collections::VecDeque<Errno>,
         /// Every injected close's descriptor, a scripted failure included.
         close_attempts: Vec<RawFd>,
+        /// Scripted errors of injected fstats, in order, before any real
+        /// fstat.
+        fstat_errors: std::collections::VecDeque<Errno>,
         /// The effective set an injected capget reports (the permitted set is
         /// every capability).
         capget_effective: u64,
@@ -15687,6 +15902,7 @@ mod inject_fstat_scratch {
                 opened_fds: Vec::new(),
                 close_errors: Default::default(),
                 close_attempts: Vec::new(),
+                fstat_errors: Default::default(),
                 capget_effective: (1 << 41) - 1,
                 scratch_page: None,
                 commit_partial: false,
@@ -15890,6 +16106,9 @@ mod inject_fstat_scratch {
                     self.fstat_buffers.push(buffer);
                     self.fstat_guard_live
                         .push(self.guard_live.load(Ordering::SeqCst));
+                    if let Some(errno) = self.fstat_errors.pop_front() {
+                        return Err(errno);
+                    }
                     i64::from(unsafe { libc::fstat(call.fd(), buffer as *mut libc::stat) })
                 }
                 Syscall::Munmap(call) => {
@@ -16440,15 +16659,19 @@ mod inject_fstat_scratch {
             }
             let original = *guest.arena;
             let (fd, inode) = if success { open_file() } else { (-1, 0) };
-            let copied = Detcore::inject_stat_on_stack(&mut guest, |statptr| {
-                Syscall::Fstat(syscalls::Fstat::new().with_fd(fd).with_stat(Some(statptr)))
-            })
+            let copied = Detcore::inject_stat_on_stack(
+                &mut guest,
+                |statptr| {
+                    Syscall::Fstat(syscalls::Fstat::new().with_fd(fd).with_stat(Some(statptr)))
+                },
+                None,
+            )
             .await;
             if success {
                 assert_eq!(unsafe { libc::close(fd) }, 0);
                 assert_eq!(copied.unwrap().st_ino, inode);
             } else {
-                assert_eq!(copied.err(), Some(Errno::EBADF));
+                assert_eq!(copied.err(), Some(StatFailure::Call(Errno::EBADF)));
             }
             assert_eq!(
                 *guest.arena, original,
@@ -16575,6 +16798,133 @@ mod inject_fstat_scratch {
             Err(Errno::EBADF),
             "a descriptor that failed registration must not be modeled"
         );
+    }
+
+    /// A random-device descriptor for the classification tests, and a guest
+    /// without virtualized metadata, so the classification takes its own
+    /// fstat (as under record and replay).
+    fn random_device_fd() -> RawFd {
+        std::fs::File::open("/dev/urandom").unwrap().into_raw_fd()
+    }
+
+    #[tokio::test]
+    async fn classification_retries_an_interrupted_fstat() {
+        let fd = random_device_fd();
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.virtualize_metadata = false;
+        guest.fstat_errors = [Errno::ERESTARTSYS, Errno::EINTR].into();
+        let classified = tool.opened_random_device(&mut guest, fd, None).await;
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        assert_eq!(classified, Ok(true));
+        assert_eq!(
+            guest.injected,
+            [Sysno::fstat, Sysno::fstat, Sysno::fstat],
+            "each interrupted attempt is repeated, and only those"
+        );
+    }
+
+    #[tokio::test]
+    async fn classification_fstat_errors_and_regular_files() {
+        let fd = random_device_fd();
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        guest.fstat_errors = [Errno::EIO].into();
+        assert_eq!(
+            tool.opened_random_device(&mut guest, fd, None).await,
+            Err(StatFailure::Call(Errno::EIO)),
+            "a genuine fstat error is not retried and is the call's failure"
+        );
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        let (regular, _) = open_file();
+        assert_eq!(
+            tool.opened_random_device(&mut guest, regular, None).await,
+            Ok(false)
+        );
+        assert_eq!(unsafe { libc::close(regular) }, 0);
+    }
+
+    #[tokio::test]
+    async fn classification_falls_back_to_a_transient_page() {
+        let fd = random_device_fd();
+        let (tool, mut guest) = ScriptedGuest::new(false, false);
+        let classified = tool.opened_random_device(&mut guest, fd, None).await;
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        assert_eq!(classified, Ok(true));
+        assert_eq!(guest.injected, [Sysno::mmap, Sysno::fstat, Sysno::munmap]);
+        assert_eq!(guest.mapped.len(), 1);
+        assert_eq!(guest.unmapped, guest.mapped, "the page is unmapped whole");
+    }
+
+    #[tokio::test]
+    async fn classification_without_any_buffer_is_a_scratch_failure() {
+        let fd = random_device_fd();
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+        let classified = tool.opened_random_device(&mut guest, fd, None).await;
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        assert_eq!(
+            classified,
+            Err(StatFailure::Scratch(Errno::ENOMEM)),
+            "a failed buffer allocation is not an fstat result"
+        );
+        assert_eq!(guest.injected, [Sysno::mmap], "no fstat was attempted");
+    }
+
+    #[tokio::test]
+    async fn unclassified_close_retries_only_a_close_that_never_ran() {
+        let (fd, _) = open_file();
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        guest
+            .thread
+            .add_fd(fd, OFlag::O_RDONLY, FdType::Regular, None)
+            .unwrap();
+        guest.close_errors = [Errno::ERESTARTSYS, Errno::ERESTARTSYS].into();
+        let closed = tool.close_unclassified(&mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+        assert!(closed.is_ok(), "{closed:?}");
+        assert_eq!(guest.close_attempts, [fd, fd, fd]);
+        assert_eq!(guest.closed, [fd]);
+        assert_eq!(guest.thread.with_detfd(fd, |_| ()), Err(Errno::EBADF));
+    }
+
+    #[tokio::test]
+    async fn unclassified_close_that_ran_is_not_repeated() {
+        for errno in [Errno::EINTR, Errno::EIO] {
+            let (fd, _) = open_file();
+            let (tool, mut guest) = ScriptedGuest::new(true, false);
+            guest
+                .thread
+                .add_fd(fd, OFlag::O_RDONLY, FdType::Regular, None)
+                .unwrap();
+            guest.close_errors = [errno].into();
+            let closed = tool.close_unclassified(&mut guest, fd).await;
+            close_unless_detcore_did(&guest, fd);
+            assert!(closed.is_ok(), "{errno}: {closed:?}");
+            assert_eq!(guest.close_attempts, [fd], "{errno}: Linux closes once");
+            assert_eq!(guest.thread.with_detfd(fd, |_| ()), Err(Errno::EBADF));
+        }
+    }
+
+    #[tokio::test]
+    async fn unclassified_close_refused_ends_the_run() {
+        for errors in [vec![Errno::EBADF], vec![Errno::ERESTARTSYS; 16]] {
+            let (fd, _) = open_file();
+            let (tool, mut guest) = ScriptedGuest::new(true, false);
+            guest
+                .thread
+                .add_fd(fd, OFlag::O_RDONLY, FdType::Regular, None)
+                .unwrap();
+            guest.close_errors = errors.clone().into();
+            let closed = tool.close_unclassified(&mut guest, fd).await;
+            close_unless_detcore_did(&guest, fd);
+            assert!(
+                matches!(closed, Err(Error::Tool(_))),
+                "{errors:?}: {closed:?}"
+            );
+            assert_eq!(
+                guest.thread.with_detfd(fd, |_| ()),
+                Ok(()),
+                "{errors:?}: a descriptor still open stays modeled"
+            );
+        }
     }
 
     /// The canonical statfs view: fixed caps on the free counts, clamped to

@@ -76,6 +76,18 @@ pub enum FdType {
     Rng,
 }
 
+/// Whether a file of mode `mode` and device number `rdev` is one of Linux's
+/// random devices: character device 1:8 (`/dev/random`) or 1:9
+/// (`/dev/urandom`). Linux names the device by this number, whatever path
+/// reached it (a relative or symbolic-link spelling, `/proc/self/fd/N`, a bind
+/// mount or a copy of the node), so Detcore classifies the object, not the
+/// spelling (https://github.com/rrnewton/hermit/issues/4544).
+pub(crate) fn is_random_device(mode: libc::mode_t, rdev: libc::dev_t) -> bool {
+    mode & libc::S_IFMT == libc::S_IFCHR
+        && libc::major(rdev) == 1
+        && matches!(libc::minor(rdev), 8 | 9)
+}
+
 /// How an active network trace mode classifies a socket's family and type
 /// (see `crate::syscalls::network_trace`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -914,8 +926,13 @@ impl DetFd {
     }
     /// change fd type
     pub fn with_type(self, ty: FdType) -> Self {
-        self.with_description(|d| d.ty = ty);
+        self.set_type(ty);
         self
+    }
+    /// Change the type of this descriptor's open file description, which every
+    /// alias shares.
+    pub(crate) fn set_type(&self, ty: FdType) {
+        self.with_description(|d| d.ty = ty);
     }
     /// Set per-slot descriptor flags on a newly duplicated fd.
     pub fn with_fd_flags(mut self, flags: OFlag) -> Self {
@@ -2012,6 +2029,22 @@ pub(crate) fn install_test_shared_open_file_channel() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_devices_are_character_devices_one_eight_and_one_nine() {
+        let chr = libc::S_IFCHR | 0o666;
+        assert!(is_random_device(chr, libc::makedev(1, 8)));
+        assert!(is_random_device(chr, libc::makedev(1, 9)));
+        // /dev/null, /dev/zero and /dev/full share major 1.
+        for minor in [3, 5, 7] {
+            assert!(!is_random_device(chr, libc::makedev(1, minor)));
+        }
+        // The same numbers on another kind of file name no device.
+        for kind in [libc::S_IFBLK, libc::S_IFREG, libc::S_IFIFO] {
+            assert!(!is_random_device(kind | 0o666, libc::makedev(1, 9)));
+        }
+        assert!(!is_random_device(chr, libc::makedev(9, 1)));
+    }
 
     #[test]
     fn native_exec_directory_lease_probe_preserves_idle_stream_and_aliases() {
