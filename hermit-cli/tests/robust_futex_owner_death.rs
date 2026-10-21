@@ -1589,11 +1589,12 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // 0x180 sigreturn continuations under record and replay for
     // https://github.com/rrnewton/hermit/issues/4505, and
     // 0x181 the /proc/locks capture drops only repeated rows, and
-    // 0x182 private DBT runtime images stay out of application mapping space),
+    // 0x182 private DBT runtime images stay out of application mapping space,
+    // and 0x183 authenticates bootstrap LOAD ownership in the guest maps view),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x182,
+        metadata["version"], 0x183,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

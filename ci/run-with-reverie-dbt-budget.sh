@@ -2409,7 +2409,15 @@ fi
 # rust-toolchain.toml, so inventory 997, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the 87c88c0d entry.
 
-expected_pin=94f126befc69990655a48c41b070f1d252609dd6
+# CARRY TO e3634c5119f365406362ee57ddcc684bd45a813e (2026-10-21): exact reviewed
+# bootstrap ownership replay. The complete vendor SDK tree, native tree and
+# build.rs equal reviewed 951796a95bbf831654b372d0f9d912fdbccf7da2.
+# That native-source equality retains its bounded SDK budget sample: source key
+# d6c5266c0a97b77e538b60ba3ce857d334d0a0451418bcf2c45b75322322f9cb,
+# 204.04 job-seconds. Root Cargo.lock and Rust package versions have changed;
+# no Rust/package identity or old-head validation is carried. Fresh source-key
+# binding and runtime qualification are required. Preserve limits and histories.
+expected_pin=e3634c5119f365406362ee57ddcc684bd45a813e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

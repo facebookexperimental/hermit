@@ -809,7 +809,12 @@ impl RecordVersion {
 // of consuming application address space. Guest mappings can therefore use
 // different addresses from an older runtime even though the record schema
 // is unchanged; refuse old recordings rather than replay different values.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x182);
+// 0x182 -> 0x183 (provisional dh-eowbq reservation in dh-gxmvo; coordinator
+// rederives HIGHEST_SHIPPED + 1 at landing): authenticated DynamoRIO bootstrap
+// PT_LOAD pages are runtime-private in the guest's maps view. The ownership
+// snapshot/task-state layout grows, which can also shift later mappings.
+// Replaying older recordings could produce different bytes or addresses.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x183);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -834,7 +839,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x182);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x182;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x183;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

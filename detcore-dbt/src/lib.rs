@@ -93,8 +93,10 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 /// Version 12 appends optional internal branch facts at offset72.
 /// Version 13 adds the syscall invoker's fourth injection-purpose argument;
 /// the callback table remains 80 bytes, but version 12 is incompatible.
+/// Version 14 grows the private-memory snapshot pointee from 96 to 176 bytes
+/// for authenticated bootstrap LOAD pages; the callback table remains 80 bytes.
 /// Installing the callback does not enable instrumentation or shared time.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 13;
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 14;
 const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 80;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3622,7 +3624,7 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 13);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 14);
         assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 80);
         assert_eq!(
             std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, branch_fact),
@@ -3643,7 +3645,7 @@ mod tests {
         );
         assert_eq!(
             std::mem::size_of::<reverie_dbt::NativePrivateMemorySnapshot>(),
-            96
+            176
         );
         // The native client's dbt_signal_event_t (ABI version 7).
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
