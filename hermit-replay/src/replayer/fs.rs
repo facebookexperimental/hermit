@@ -884,32 +884,25 @@ impl Replayer {
     async fn replay_sigpipe<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         let uid = guest.inject(Getuid::new()).await? as libc::uid_t;
 
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        assert!(std::mem::size_of::<UserSignalInfoHead>() <= std::mem::size_of_val(&info));
-        let head =
-            unsafe { &mut *(&mut info as *mut libc::siginfo_t).cast::<UserSignalInfoHead>() };
-        *head = UserSignalInfoHead {
-            signo: libc::SIGPIPE,
-            errno: 0,
-            code: libc::SI_USER,
-            padding: 0,
-            pid: guest.pid().as_raw(),
-            uid,
-        };
-
+        // Since libc 0.2.190 `siginfo_t` holds raw pointers and is not `Send`,
+        // so neither a value of it nor an address typed by it may live across
+        // an `.await` here: the slot is named by its bytes, and the value is
+        // built only in the statement that writes it.
         let mut stack = guest.stack().await;
-        let info_addr = stack.reserve::<libc::siginfo_t>();
+        let info_addr = stack
+            .reserve::<libc::siginfo_t>()
+            .cast::<[u8; std::mem::size_of::<libc::siginfo_t>()]>();
         let _guard = stack.commit()?;
-        guest.memory().write_value(info_addr, &info)?;
-        let delivered = guest
-            .inject(
-                RtTgsigqueueinfo::new()
-                    .with_tgid(guest.pid().as_raw())
-                    .with_tid(guest.tid().as_raw())
-                    .with_sig(libc::SIGPIPE)
-                    .with_siginfo(Some(info_addr)),
-            )
-            .await;
+        guest.memory().write_value(
+            info_addr.cast::<libc::siginfo_t>(),
+            &user_sigpipe_info(guest.pid().as_raw(), uid),
+        )?;
+        let queue = RtTgsigqueueinfo::new()
+            .with_tgid(guest.pid().as_raw())
+            .with_tid(guest.tid().as_raw())
+            .with_sig(libc::SIGPIPE)
+            .with_siginfo(Some(info_addr.cast()));
+        let delivered = guest.inject(queue).await;
         assert_eq!(
             delivered,
             Ok(0),
@@ -917,6 +910,23 @@ impl Replayer {
         );
         Ok(())
     }
+}
+
+/// The `siginfo_t` of a `SIGPIPE` that process `pid`, owned by `uid`, sends
+/// itself with `kill`, as replay queues it.
+fn user_sigpipe_info(pid: libc::pid_t, uid: libc::uid_t) -> libc::siginfo_t {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    assert!(std::mem::size_of::<UserSignalInfoHead>() <= std::mem::size_of_val(&info));
+    let head = unsafe { &mut *(&mut info as *mut libc::siginfo_t).cast::<UserSignalInfoHead>() };
+    *head = UserSignalInfoHead {
+        signo: libc::SIGPIPE,
+        errno: 0,
+        code: libc::SI_USER,
+        padding: 0,
+        pid,
+        uid,
+    };
+    info
 }
 
 impl ReplayOutputs {

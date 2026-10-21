@@ -42,6 +42,7 @@ use crate::scheduler::discarded_at_send::DiscardedSignalControl;
 use crate::scheduler::discarded_at_send::QueueId;
 use crate::scheduler::pid_namespaces::GuestPidAnswer;
 use crate::scheduler::signal_lists::KernelSiginfo;
+use crate::syscalls::guest_siginfo::GuestSiginfo;
 use crate::syscalls::helpers::REAL_TIME_SIGNALS;
 use crate::syscalls::helpers::act_on_pending_real_time;
 use crate::syscalls::helpers::observe_under_mask;
@@ -1923,7 +1924,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Without a siginfo buffer the guest sees only the signal number,
         // which every copy shares; the ledger still learns that the wait took
         // one (`DequeuedCopy::Unknown`), which may be the shared queue's.
-        let Some(info) = call.info() else {
+        let Some(info) = call.info().map(AddrMut::cast::<GuestSiginfo>) else {
             crate::tool_global::child_exit_sigchld(
                 guest,
                 crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::Dequeue {
@@ -1934,7 +1935,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await;
             return true;
         };
-        let Some(bytes) = read_siginfo(guest, info) else {
+        let Some(bytes) = read_siginfo(guest, info.cast()) else {
             return true;
         };
         Self::synchronous_sigchld_copy_stands(guest, info, &bytes).await
@@ -1945,7 +1946,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`synchronous_sigchld_stands`).
     async fn synchronous_sigchld_copy_stands<G: Guest<Self>>(
         guest: &mut G,
-        info: AddrMut<'_, libc::siginfo_t>,
+        info: AddrMut<'_, GuestSiginfo>,
         bytes: &[u8; 128],
     ) -> bool {
         use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
@@ -3242,12 +3243,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         sysno: Sysno,
         signal: i32,
-        info: Option<AddrMut<'_, libc::siginfo_t>>,
+        info: Option<AddrMut<'_, GuestSiginfo>>,
     ) -> Option<Result<i64, Error>> {
         if signal != libc::SIGCHLD {
             return None;
         }
-        let bytes = read_siginfo(guest, info?)?;
+        let bytes = read_siginfo(guest, info?.cast())?;
         let (code, _) = crate::scheduler::child_exit_sigchld::siginfo_code_and_pid(&bytes);
         let value = i32::from_ne_bytes(bytes[24..28].try_into().expect("four bytes"));
         if code != libc::SI_QUEUE || value != crate::scheduler::child_exit_sigchld::OWN_SIGCHLD_MARK
@@ -3278,7 +3279,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::RtTgsigqueueinfo,
     ) -> Result<i64, Error> {
         if let Some(refused) = self
-            .refuse_forged_own_sigchld(guest, Sysno::rt_tgsigqueueinfo, call.sig(), call.siginfo())
+            .refuse_forged_own_sigchld(
+                guest,
+                Sysno::rt_tgsigqueueinfo,
+                call.sig(),
+                call.siginfo().map(AddrMut::cast),
+            )
             .await
         {
             return refused;
@@ -3411,7 +3417,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::RtSigqueueinfo,
     ) -> Result<i64, Error> {
         if let Some(refused) = self
-            .refuse_forged_own_sigchld(guest, Sysno::rt_sigqueueinfo, call.sig(), call.siginfo())
+            .refuse_forged_own_sigchld(
+                guest,
+                Sysno::rt_sigqueueinfo,
+                call.sig(),
+                call.siginfo().map(AddrMut::cast),
+            )
             .await
         {
             return refused;

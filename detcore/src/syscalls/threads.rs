@@ -52,6 +52,7 @@ use crate::scheduler::FutexSignalWatch;
 use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::SchedValue;
 use crate::scheduler::pid_namespaces::GuestPidAnswer;
+use crate::syscalls::guest_siginfo::GuestSiginfo;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::RestartCall;
 use crate::syscalls::helpers::keep_restart_block;
@@ -4209,7 +4210,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Reject the blocking form until Detcore can retain that identity.
             return Err(Errno::EOPNOTSUPP.into());
         }
-        let info = call.info().expect("waitid infop checked above");
+        let info = call
+            .info()
+            .expect("waitid infop checked above")
+            .cast::<GuestSiginfo>();
 
         // Unlike wait4, waitid returns zero both when it reports a child event and
         // when WNOHANG finds nothing. Polling must inspect si_pid to distinguish
@@ -4217,10 +4221,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Known limitation: without backend-neutral scratch memory, an invalid
         // non-null infop faults on the first physical poll rather than after a
         // child becomes waitable.
-        // siginfo_t has no portable initializer. An all-zero value is the
-        // waitid WNOHANG sentinel defined by POSIX and Linux.
-        let empty_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-
         // The lifecycle scheduler currently models terminal child events for
         // exact and any-child selectors. Group membership and stop/continue
         // state remain on the legacy kernel-polling path.
@@ -4263,7 +4263,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let selected = if let Some(spec) = terminal_spec {
                     let (ready, has_child) = ready_child_wait(guest, spec).await;
                     if ready.is_none() && has_child {
-                        guest.memory().write_value(info, &empty_info)?;
+                        guest.memory().write_value(info, &GuestSiginfo::zeroed())?;
                         return Ok(0);
                     }
                     if ready.is_none() && complete_lineage {
@@ -4284,7 +4284,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     None => call,
                 };
                 loop {
-                    guest.memory().write_value(info, &empty_info)?;
+                    guest.memory().write_value(info, &GuestSiginfo::zeroed())?;
                     let value = match guest.inject_with_retry(effective_call).await {
                         Ok(value) => value,
                         Err(Errno::ECHILD) if selected.is_some() => {
@@ -4297,19 +4297,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                         Err(errno) => return Err(errno.into()),
                     };
-                    let info_value: libc::siginfo_t = guest.memory().read_value(info)?;
-                    let child_pid = unsafe { info_value.si_pid() };
+                    let info_value: GuestSiginfo = guest.memory().read_value(info)?;
+                    let child_pid = info_value.pid();
                     if child_pid == 0 && selected.is_some() {
                         yield_once().await;
                         continue;
                     }
                     let consumed = child_pid != 0
                         && call.options() & libc::WNOWAIT == 0
-                        && waitid_code_is_termination(info_value.si_code);
+                        && waitid_code_is_termination(info_value.code());
                     let child = self
                         .task_of_guest_pid(guest, reverie::syscalls::Sysno::waitid, child_pid)
                         .await?;
-                    let result = finish_waitid_result(guest, call, value, info_value, child)?;
+                    let result = finish_waitid_result(guest, call, value, info_value.0, child)?;
                     if consumed {
                         let _ = consume_child_wait(guest, child).await;
                     }
@@ -4378,7 +4378,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
                 if let Some(child) = ready {
                     let _ = await_exact_child_physical_exit(guest, child).await;
-                    if let Err(error) = guest.memory().write_value(info, &empty_info) {
+                    if let Err(error) = guest.memory().write_value(info, &GuestSiginfo::zeroed()) {
                         break Err(error.into());
                     }
                     let pid = match self
@@ -4391,8 +4391,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let exact_call = call.with_which(libc::P_PID as i32).with_pid(pid);
                     match guest.inject_with_retry(exact_call).await {
                         Ok(value) => {
-                            let info_value: libc::siginfo_t = match guest.memory().read_value(info)
-                            {
+                            let info_value = match guest.memory().read_value(info) {
                                 Ok(value) => value,
                                 Err(error) => break Err(error.into()),
                             };
@@ -4400,14 +4399,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 .task_of_guest_pid(
                                     guest,
                                     reverie::syscalls::Sysno::waitid,
-                                    unsafe { info_value.si_pid() },
+                                    info_value.pid(),
                                 )
                                 .await
                             {
                                 Ok(task) => task,
                                 Err(error) => break Err(error),
                             };
-                            break finish_waitid_result(guest, call, value, info_value, reported);
+                            break finish_waitid_result(guest, call, value, info_value.0, reported);
                         }
                         Err(Errno::ECHILD) => {
                             let _ = consume_child_wait(guest, child).await;
@@ -4437,19 +4436,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                     break Err(Errno::ECHILD.into());
                 }
 
-                if let Err(error) = guest.memory().write_value(info, &empty_info) {
+                if let Err(error) = guest.memory().write_value(info, &GuestSiginfo::zeroed()) {
                     break Err(error.into());
                 }
                 let result = guest.inject(poll_call).await;
                 match result {
                     Ok(value) => {
-                        let info_value: libc::siginfo_t = match guest.memory().read_value(info) {
+                        let info_value = match guest.memory().read_value(info) {
                             Ok(value) => value,
                             Err(error) => break Err(error.into()),
                         };
                         // waitid writes the SIGCHLD variant of siginfo_t. A zeroed
                         // structure is used only for the no-event WNOHANG result.
-                        let child_pid = unsafe { info_value.si_pid() };
+                        let child_pid = info_value.pid();
                         match exact_wait_poll_decision(
                             child_pid != 0,
                             pending_signal.is_some(),
@@ -4468,7 +4467,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                                     Err(error) => break Err(error),
                                 };
                                 break finish_waitid_result(
-                                    guest, call, value, info_value, reported,
+                                    guest,
+                                    call,
+                                    value,
+                                    info_value.0,
+                                    reported,
                                 );
                             }
                             ExactWaitPollDecision::Interrupted => {
@@ -4505,9 +4508,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             restore_signals_after_disposition(guest, old_mask_addr).await?;
             if result.is_ok() && call.options() & libc::WNOWAIT == 0 {
-                let info_value: libc::siginfo_t = guest.memory().read_value(info)?;
-                let child_pid = unsafe { info_value.si_pid() };
-                if child_pid != 0 && waitid_code_is_termination(info_value.si_code) {
+                let info_value: GuestSiginfo = guest.memory().read_value(info)?;
+                let child_pid = info_value.pid();
+                if child_pid != 0 && waitid_code_is_termination(info_value.code()) {
                     let child = self
                         .task_of_guest_pid(guest, reverie::syscalls::Sysno::waitid, child_pid)
                         .await?;

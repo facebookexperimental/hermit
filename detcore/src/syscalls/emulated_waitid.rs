@@ -225,27 +225,27 @@ where
         // their nested Tool callbacks. Borrow scratch only after the wait has
         // completed, never while its resource request can observe a signal.
         let mut stack = guest.stack().await;
-        let info = stack.reserve::<libc::siginfo_t>();
+        let info = stack.reserve::<GuestSiginfo>();
         let _guard = stack
             .commit()
             .map_err(|error| failure(format!("private stack: {error}")))?;
         let probe = call
             .with_which(libc::P_PID as i32)
             .with_pid(child.as_raw())
-            .with_info(Some(info))
+            .with_info(Some(info.cast()))
             .with_rusage(None)
             .with_options(libc::WEXITED | libc::WNOWAIT | libc::WNOHANG);
         match guest.inject(probe).await {
             Ok(0) => {
-                let event: libc::siginfo_t = guest
+                let event: GuestSiginfo = guest
                     .memory()
                     .read_value(info)
                     .map_err(|error| failure(format!("private event read: {error}")))?;
                 // The private page is writable. No user pointer has been
                 // touched, and no resource request occurs after this proof.
-                if unsafe { event.si_pid() } != child.as_raw()
-                    || event.si_signo != libc::SIGCHLD
-                    || !waitid_code_is_termination(event.si_code)
+                if event.pid() != child.as_raw()
+                    || event.0.si_signo != libc::SIGCHLD
+                    || !waitid_code_is_termination(event.code())
                 {
                     return Err(failure(
                         "private proof did not report the selected terminal child",

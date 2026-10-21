@@ -76,6 +76,7 @@ use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::scheduler::terminal_signals;
 use crate::stat::*;
+use crate::syscalls::guest_siginfo::GuestSiginfo;
 use crate::syscalls::threads::kernel_sigset_bit;
 use crate::tool_global::*;
 use crate::tool_local::CapturedDetFdInstallError;
@@ -11404,7 +11405,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // Linux checks the flags before it looks at the descriptor.
         let mut scope = pidfd_signal_scope(flags)?;
-        let info = AddrMut::<libc::siginfo_t>::from_raw(call.into_parts().1.arg2);
+        let info = AddrMut::<GuestSiginfo>::from_raw(call.into_parts().1.arg2);
         if let Some(refused) = self
             .refuse_forged_own_sigchld(guest, Sysno::pidfd_send_signal, signal, info)
             .await
@@ -11745,18 +11746,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             Syscall::Other(_, args) => args.arg2,
             _ => 0,
         };
-        let Some(info) = AddrMut::<libc::siginfo_t>::from_raw(info) else {
+        let Some(info) = AddrMut::<GuestSiginfo>::from_raw(info) else {
             return Err(Errno::ESRCH.into());
         };
         let signo = guest.memory().read_value(info.cast::<libc::c_int>()).ok();
-        let checked = guest
-            .inject(
-                syscalls::RtSigqueueinfo::new()
-                    .with_tgid(super::signal::NO_SUCH_PID)
-                    .with_sig(signo.unwrap_or(signal))
-                    .with_siginfo(Some(info)),
-            )
-            .await;
+        let probe = syscalls::RtSigqueueinfo::new()
+            .with_tgid(super::signal::NO_SUCH_PID)
+            .with_sig(signo.unwrap_or(signal))
+            .with_siginfo(Some(info.cast()));
+        let checked = guest.inject(probe).await;
         let answer = match checked {
             Err(errno @ (Errno::EPERM | Errno::ESRCH)) => errno,
             Err(errno) => return Err(errno.into()),

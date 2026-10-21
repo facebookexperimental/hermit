@@ -10,6 +10,7 @@
 
 mod accept_in_turn;
 mod files;
+pub(crate) mod guest_siginfo;
 pub mod helpers;
 
 /// Re-exported so `procfs` can report the SAME ceiling that `F_SETPIPE_SZ`
