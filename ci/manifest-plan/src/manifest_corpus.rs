@@ -96,6 +96,20 @@ struct CorpusReplay {
     /// Replay cells measured red, as in the corpus's own `unselected`.
     #[serde(default)]
     unselected: Vec<CorpusVariantUnselected>,
+    /// Rows whose replay cell gets its own budget instead of the section's,
+    /// each group with the measurement behind it.
+    #[serde(default)]
+    slow: Vec<CorpusReplaySlow>,
+}
+
+/// Replay cells of the named rows with their own budget and its reason.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusReplaySlow {
+    timeout_seconds: u64,
+    cpu_timeout_seconds: u64,
+    slow_reason: String,
+    rows: Vec<String>,
 }
 
 /// Rows sharing one reason.
@@ -604,6 +618,32 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
         .flat_map(|replay| &replay.unselected)
         .flat_map(|class| class.rows.iter().map(move |label| (label.as_str(), class)))
         .collect::<BTreeMap<_, _>>();
+    let mut replay_slow = BTreeMap::new();
+    for group in corpus.replay.iter().flat_map(|replay| &replay.slow) {
+        nonempty(bucket, "replay slow_reason", &group.slow_reason)?;
+        if group.rows.is_empty() {
+            return Err(format!("{bucket}: corpus replay slow group names no rows"));
+        }
+        if group.cpu_timeout_seconds >= group.timeout_seconds {
+            return Err(format!(
+                "{bucket}: corpus replay slow group's cpu_timeout_seconds {} must stay below \
+                 its timeout_seconds {}",
+                group.cpu_timeout_seconds, group.timeout_seconds
+            ));
+        }
+        for label in &group.rows {
+            if !labels.contains(label.as_str()) || replay_excepted.contains(label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus replay slow names `{label}`, which has no replay cell"
+                ));
+            }
+            if replay_slow.insert(label.as_str(), group).is_some() {
+                return Err(format!(
+                    "{bucket}: corpus replay slow names `{label}` twice"
+                ));
+            }
+        }
+    }
     let mut tests = Vec::with_capacity(corpus.rows.len());
     for row in &corpus.rows {
         let diagnostic = corpus
@@ -874,6 +914,19 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             let backend = corpus.backend.as_str();
             let per_cell = |value: Value| mapping([(backend, value)]);
             let class = replay_unselected.get(row.label.as_str());
+            let (timeout_seconds, cpu_timeout_seconds, slow_reason) =
+                match replay_slow.get(row.label.as_str()) {
+                    Some(group) => (
+                        group.timeout_seconds,
+                        group.cpu_timeout_seconds,
+                        &group.slow_reason,
+                    ),
+                    None => (
+                        replay.timeout_seconds,
+                        replay.cpu_timeout_seconds,
+                        &replay.slow_reason,
+                    ),
+                };
             let mut recipe = vec![
                 (
                     "ci",
@@ -889,15 +942,12 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                             .map(|other| (*other, string(&off_reason))),
                     ),
                 ),
-                (
-                    "timeout_seconds",
-                    per_cell(Value::from(replay.timeout_seconds)),
-                ),
+                ("timeout_seconds", per_cell(Value::from(timeout_seconds))),
                 (
                     "cpu_timeout_seconds",
-                    per_cell(Value::from(replay.cpu_timeout_seconds)),
+                    per_cell(Value::from(cpu_timeout_seconds)),
                 ),
-                ("slow_reason", per_cell(string(&replay.slow_reason))),
+                ("slow_reason", per_cell(string(slow_reason))),
             ];
             if let Some(class) = class {
                 recipe.push((
@@ -1327,7 +1377,16 @@ mod tests {
                 "{id}"
             );
             assert_eq!(replay["env"], seq("{}"), "{id}");
-            assert_eq!(replay["timeout_seconds"], seq("{ptrace: 60}"), "{id}");
+            // The heavy compile and JVM rows' replay cells get a three-times
+            // wall backstop (the section's `slow` group); every other row
+            // keeps the section's 60 seconds.
+            let wall = if ["compat/java", "compat/javac", "compat/rustc"].contains(&id) {
+                "{ptrace: 177}"
+            } else {
+                "{ptrace: 60}"
+            };
+            assert_eq!(replay["timeout_seconds"], seq(wall), "{id}");
+            assert_eq!(replay["cpu_timeout_seconds"], seq("{ptrace: 59}"), "{id}");
             for absent in ["hermit_args", "comparator", "no_retry_reason", "diagnostic"] {
                 assert!(replay.get(absent).is_none(), "{id}: {absent}");
             }
@@ -2090,6 +2149,59 @@ mod tests {
                 "{setting}"
             );
         }
+        // A `slow` group gives its rows' replay cells their own budget, and
+        // only rows with a replay cell may be in one, once.
+        let slow_group = "    slow:\n      - timeout_seconds: 90\n        cpu_timeout_seconds: 45\n        \
+             slow_reason: fixture heavy replay\n        rows: [big]\n";
+        let anchor = "    unselected:\n      - result: replay-failure";
+        assert_eq!(replay.matches(anchor).count(), 1);
+        let with_slow = replay.replace(anchor, &format!("{slow_group}{anchor}"));
+        let seq = |text: &str| serde_yaml::from_str::<Value>(text).unwrap();
+        let expanded = expand_corpus(document(&with_slow)).unwrap();
+        let tests = tests_of(&expanded);
+        let replay_of = |id: &str| {
+            tests
+                .iter()
+                .find(|test| test["id"] == id)
+                .unwrap_or_else(|| panic!("{id}"))["modes"]["replay"]
+                .clone()
+        };
+        assert_eq!(
+            replay_of("fixture/big")["timeout_seconds"],
+            seq("{ptrace: 90}")
+        );
+        assert_eq!(
+            replay_of("fixture/big")["cpu_timeout_seconds"],
+            seq("{ptrace: 45}")
+        );
+        assert_eq!(
+            replay_of("fixture/big")["slow_reason"],
+            seq("{ptrace: fixture heavy replay}")
+        );
+        assert_eq!(
+            replay_of("fixture/gxx")["timeout_seconds"],
+            seq("{ptrace: 30}")
+        );
+        let refused_slow = |from: &str, to: &str| {
+            let group = slow_group.replace(from, to);
+            assert_ne!(group, slow_group, "{from}");
+            expand_corpus(document(
+                &replay.replace(anchor, &format!("{group}{anchor}")),
+            ))
+            .unwrap_err()
+        };
+        assert!(refused_slow("rows: [big]", "rows: [echo]").contains("which has no replay cell"));
+        assert!(refused_slow("rows: [big]", "rows: [absent]").contains("which has no replay cell"));
+        assert!(refused_slow("rows: [big]", "rows: [big, big]").contains("twice"));
+        assert!(refused_slow("rows: [big]", "rows: []").contains("names no rows"));
+        assert!(
+            refused_slow("cpu_timeout_seconds: 45", "cpu_timeout_seconds: 90")
+                .contains("must stay below")
+        );
+        assert!(
+            refused_slow("slow_reason: fixture heavy replay", "slow_reason: \"\"")
+                .contains("replay slow_reason must be nonempty")
+        );
     }
 
     #[test]

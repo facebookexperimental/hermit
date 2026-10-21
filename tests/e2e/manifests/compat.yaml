@@ -1679,6 +1679,25 @@ corpus:
           to create /tmp/cscope.9 (the guest's deterministic pid) and zip-unzip
           finding /tmp/hermit-compat-zip removed under it
         rows: [cscope, zip-unzip]
+    # The three heavy compile and JVM rows replay at 20 to 31 CPU seconds,
+    # about half the section's 59, and their wall needs more than double that
+    # on a loaded host.
+    slow:
+      - timeout_seconds: 177
+        cpu_timeout_seconds: 59
+        slow_reason: >-
+          In the 13 full validations of 2026-10-20/21 that ran these replay
+          cells, java took 27.0 CPU seconds median and 31.1 at most, rustc
+          22.9 and 24.9, javac 20.6 and 23.0; passing walls reached 40
+          (java), 53 (rustc) and 32 (javac) seconds. java's cell hit the
+          section's 60-second wall bound twice (abbde438, 73805952), during
+          disk-backup I/O at a host load near 260; in the loaded validation
+          of 73e512ea, replay cells of 2 to 7 CPU seconds took 46 to 61
+          seconds of wall and two of them timed out. The CPU budget stays 59,
+          about twice the largest measured use; the wall bound is three times
+          it, the host-load backstop ci/nextest-timeout-config.rs gives the
+          liteinst_stacks tests
+        rows: [java, javac, rustc]
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}

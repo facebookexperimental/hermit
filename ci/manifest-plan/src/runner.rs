@@ -15072,9 +15072,16 @@ fi
             compat_replay.len(),
             COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT
         );
+        // java, javac and rustc replay under a 177 s wall backstop, three
+        // times the shared 59 s CPU budget (compat.yaml's replay `slow`).
         for ((test, _, backend), bounds) in &compat_replay {
             assert_eq!(*backend, "ptrace", "{test}");
-            assert_eq!(*bounds, (59, 60), "{test}");
+            let wall = if ["compat/java", "compat/javac", "compat/rustc"].contains(test) {
+                177
+            } else {
+                60
+            };
+            assert_eq!(*bounds, (59, wall), "{test}");
         }
         assert_eq!(
             compat.len(),

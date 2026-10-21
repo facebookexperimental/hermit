@@ -43038,7 +43038,7 @@
         "cpuid-faulting"
       ],
       "test": "compat/java",
-      "timeout_seconds": 60
+      "timeout_seconds": 177
     },
     {
       "backend": "ptrace",
@@ -43057,7 +43057,7 @@
         "cpuid-faulting"
       ],
       "test": "compat/javac",
-      "timeout_seconds": 60
+      "timeout_seconds": 177
     },
     {
       "backend": "ptrace",
@@ -44254,7 +44254,7 @@
         "cpuid-faulting"
       ],
       "test": "compat/rustc",
-      "timeout_seconds": 60
+      "timeout_seconds": 177
     },
     {
       "backend": "ptrace",
