@@ -924,7 +924,9 @@ mod tests {
             // A wait mask differing only in forced signals (+1): 656.
             // The dedicated pselect6 wrapper-validation fixture adds one
             // integration identity beyond the landed signals tests: 657.
-            assert_eq!(population, 657);
+            // procfs_determinism's runtime_private_smaps_keep_the_opened_targets_guest_mapping
+            // (DBT Smaps projection, +1): 658.
+            assert_eq!(population, 658);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
