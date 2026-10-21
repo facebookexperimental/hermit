@@ -2017,6 +2017,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-execveat-unsupported",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-execveat-unsupported",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -34337,6 +34344,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-execveat-unsupported",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-execveat-unsupported",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -52714,6 +52728,13 @@
           "test": "c-programs/dbt-exec-failure",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-execveat-unsupported",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",

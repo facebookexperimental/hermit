@@ -964,7 +964,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
@@ -977,10 +977,6 @@ test:
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []

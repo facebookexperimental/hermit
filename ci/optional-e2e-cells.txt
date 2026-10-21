@@ -1,7 +1,6 @@
 # Enabled E2E cells that are not required (ci: false): <test> <mode> <backend>.
 # Generated from tests/e2e/manifests by ci/sync-cell-config.sh; do not edit.
 applications/example-timed-progress-bar verify kvm
-c-programs/dbt-execveat-unsupported verify dbt
 c-programs/dbt-execveat-unsupported verify sabre
 c-programs/dbt-unsupported-syscall verify ptrace
 c-programs/get-robust-list-thread verify sabre

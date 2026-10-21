@@ -45469,6 +45469,23 @@
       ],
       "test": "applications/kvm-python-examples",
       "timeout_seconds": 74
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/dbt-execveat-unsupported",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1
