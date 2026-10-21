@@ -2551,8 +2551,22 @@ fi
 # Upstream KVM/LiteInst changes and a Tool documentation edit are retained.
 # Keep calibrated budgets/limits unchanged; no new runtime, package or fresh
 # calibration result is claimed by this source-only carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e069a76deaf8bd0768bc94a11b64ca2207a5aab1 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e069a76deaf8bd0768bc94a11b64ca2207a5aab1 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 9f25b76efde9ec2170ff2a5cb5080c490e60b110 (2026-10-21): replay E5 on
+# the coherent NUMA prerequisite22133ff8. The complete SDK/native trees,
+# build.rs, DBT/root manifests, root lock and toolchain are byte-identical.
+# Only the four reviewed returning-provider Rust files change. Preserve the
+# prerequisite SDK sample and existing resource limits; this source identity
+# carries no Rust/package result. Fresh normal qualification remains required.
+# CARRY TO 12a8e54cc4258e3f6ebc47bf963e5c844bfd2ac8 (2026-10-21): identical returning-provider replay on main39f2.
+# All four E5 afterimages equal 9f25b76; SDK/native capture inputs equal the
+# prerequisite. Preserve the existing limits and calibration history; no new
+# calibration or old package identity is claimed for this Rust-source revision.
+# CARRY TO 99a1ea5e022fa0eb8ffc3c7cf9c31d5122895c53 (2026-10-22): identical E5 replay on main71aa.
+# The four-file returning-provider delta is unchanged from 12a8e54; SDK/native
+# capture inputs equal the new prerequisite. Keep all existing limits and
+# calibration history; no new calibration or package identity is claimed.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 99a1ea5e022fa0eb8ffc3c7cf9c31d5122895c53 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 99a1ea5e022fa0eb8ffc3c7cf9c31d5122895c53 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
