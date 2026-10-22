@@ -30300,6 +30300,56 @@ fn log_diff_compares_the_log_files_of_two_separate_runs() {
     }
 }
 
+/// `--log-ring` keeps the newest records of the INFO log in its file, and
+/// `hermit log-diff` reads that file. With `--log-file` as well, both get the
+/// same records, so the ring's records, printed by `log-diff FILE`, are the end
+/// of the full log's; two runs' ring files compare equal.
+#[test]
+fn log_ring_keeps_the_end_of_the_info_log_and_log_diff_reads_it() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut rings = Vec::new();
+    for name in ["a", "b"] {
+        let log = directory.path().join(format!("{name}.log"));
+        let ring = directory.path().join(format!("{name}.ring"));
+        let log_arg = format!("--log-file={}", log.display());
+        let ring_arg = format!("--log-ring-file={}", ring.display());
+        let args = [
+            "--log=info",
+            log_arg.as_str(),
+            "--log-ring=16K",
+            ring_arg.as_str(),
+            "run",
+            "--base-env=minimal",
+            "--max-timeslice=disabled",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            "/bin/true",
+        ];
+        let output =
+            hermit_test::hermit_output("hermit run", hermit_command(&args).stdin(Stdio::null()));
+        assert_success(&output, &args);
+        assert_eq!(fs::metadata(&ring).unwrap().len(), 16 * 1024 + 64);
+        let full = log_diff(&[log.to_str().unwrap()]);
+        let tail = log_diff(&[ring.to_str().unwrap()]);
+        assert_eq!(tail.status.code(), Some(0), "{}", stderr(&tail));
+        let (full, tail) = (stdout(&full), stdout(&tail));
+        assert!(
+            full.len() > tail.len() && tail.len() > 1000,
+            "{} vs {}",
+            full.len(),
+            tail.len()
+        );
+        assert!(
+            full.ends_with(&tail),
+            "the ring is not the end of the log:\n{tail}"
+        );
+        rings.push(ring);
+    }
+    let compared = log_diff(&[rings[0].to_str().unwrap(), rings[1].to_str().unwrap()]);
+    assert_eq!(compared.status.code(), Some(0), "{}", stderr(&compared));
+}
+
 /// Two logs without guest or Detcore evidence are refused as having no
 /// comparable messages in every mode, never reported as a match (review of
 /// <https://github.com/rrnewton/hermit/pull/3427>). At the default log level

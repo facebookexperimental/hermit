@@ -113,6 +113,29 @@ pub struct GlobalOpts {
     #[clap(long, value_name = "SIZE", value_parser = parse_max_log_bytes)]
     pub max_log_bytes: Option<u64>,
 
+    /// Keep the newest SIZE bytes of hermit's log, at the --log level or INFO
+    /// if that is quieter, in --log-ring-file, as a flight recorder.
+    ///
+    /// The file is a fixed-size ring mapped into hermit, so it holds the newest
+    /// records however hermit ends, a crash or SIGKILL included, at a cost of one
+    /// memory copy per record and no disk writes of its own beyond the page
+    /// cache's. Other logging (--log-file, or stderr) is unchanged. Read the file
+    /// with `hermit log-diff FILE`, or compare two with `hermit log-diff A B`.
+    /// SIZE is a byte count with an optional K/M/G/T suffix in powers of 1024,
+    /// at least 4K. The file is SIZE plus 64 bytes.
+    #[clap(long, value_name = "SIZE", value_parser = parse_max_log_bytes, requires = "log_ring_file")]
+    pub log_ring: Option<u64>,
+
+    /// The --log-ring file. Like --log-file it is opened on the HOST, before the
+    /// guest's container exists, and replaced if it exists.
+    #[clap(long, value_name = "FILE", requires = "log_ring")]
+    pub log_ring_file: Option<PathBuf>,
+
+    /// The --log-ring file, opened in the host's filename namespace (see
+    /// `log_file_handle`).
+    #[clap(skip)]
+    pub log_ring_handle: Option<Arc<File>>,
+
     /// Process-shared byte total for `--max-log-bytes`, created by
     /// [`GlobalOpts::prepare_log_budget`] before any container fork so the cap
     /// is one total for the invocation. See [`LogBudget`].
@@ -198,6 +221,19 @@ impl GlobalOpts {
                     format!("cannot open --log-file {} for writing", path.display())
                 })?;
             self.log_file_handle = Some(Arc::new(file));
+        }
+        if let Some(path) = &self.log_ring_file {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(path)
+                .with_context(|| {
+                    format!("cannot open --log-ring-file {} for writing", path.display())
+                })?;
+            self.log_ring_handle = Some(Arc::new(file));
         }
         Ok(())
     }
@@ -346,6 +382,27 @@ impl GlobalOpts {
     }
 
     fn install_tracing_for_backend(&self, backend: Backend) -> Option<TracingGuard> {
+        if let (Some(ring_file), Some(capacity)) = (&self.log_ring_handle, self.log_ring) {
+            let ring = super::log_ring::LogRing::create(ring_file, capacity)
+                .unwrap_or_else(|e| panic!("cannot map the --log-ring file: {e}"));
+            let file = self.log_file_handle.as_ref().map(|handle| {
+                let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
+                CappedWriter::file(
+                    handle
+                        .try_clone()
+                        .expect("cannot duplicate the host log file descriptor"),
+                    limit,
+                    self.log_budget(),
+                )
+            });
+            return Some(super::tracing::init_ring_tracing(
+                self.log,
+                super::log_ring::RingWriter::new(ring),
+                file,
+                self.log_budget(),
+                backend,
+            ));
+        }
         if let Some(handle) = &self.log_file_handle {
             // Each subscriber needs an owned File; `try_clone` dups the descriptor,
             // so every run writes through the same host-side open file.
@@ -392,6 +449,9 @@ mod tests {
             log_budget: None,
             log_file_handle: None,
             log_file_limit: None,
+            log_ring: None,
+            log_ring_file: None,
+            log_ring_handle: None,
             unsafe_ignore_host_seccomp: false,
             backend: None,
         }

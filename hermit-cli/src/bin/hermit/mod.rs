@@ -46,6 +46,7 @@ mod initial_image_admission;
 mod instruction_map;
 mod inventory;
 mod list;
+mod log_ring;
 mod logdiff;
 mod manifest;
 #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]

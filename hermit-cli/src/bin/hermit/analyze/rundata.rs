@@ -235,6 +235,9 @@ impl RunData {
             max_log_bytes: self.analyze_opts.max_log_bytes,
             log_budget: self.analyze_opts.log_budget.clone(),
             log_file_handle: None,
+            log_ring: None,
+            log_ring_file: None,
+            log_ring_handle: None,
             unsafe_ignore_host_seccomp: false,
         }
     }

@@ -1035,6 +1035,54 @@ pub fn init_sync_file_tracing<W: Write + Send + 'static>(
     TracingGuard::synchronous()
 }
 
+/// Installs tracing for `--log-ring`. Every record at the ring's level, the
+/// `--log` level or INFO if that is quieter, goes to `ring`; `file` (the
+/// `--log-file`) or, without one, stderr gets the records at `level` exactly as
+/// it would without the ring. Both are synchronous.
+pub fn init_ring_tracing<W: Write + Send + 'static>(
+    level: Option<LevelFilter>,
+    ring: super::log_ring::RingWriter,
+    file: Option<W>,
+    budget: Option<LogBudget>,
+    backend: Backend,
+) -> TracingGuard {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    align_tracing_pid_baseline(backend);
+    let public = level.unwrap_or(DEFAULT_TRACE_LEVEL);
+    let ring_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::sync::Mutex::new(ring))
+        .with_ansi(false)
+        .with_filter(env_filter(public.max(LevelFilter::INFO)));
+    let (file_layer, stderr_layer) = match file {
+        Some(file) => (
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_ansi(false)
+                    .with_filter(env_filter(public)),
+            ),
+            None,
+        ),
+        None => (
+            None,
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || CappedWriter::stderr(budget.clone()))
+                    .with_ansi(stderr().is_terminal())
+                    .with_filter(env_filter(public)),
+            ),
+        ),
+    };
+    tracing_subscriber::registry()
+        .with(ring_layer)
+        .with(file_layer)
+        .with(stderr_layer)
+        .try_init()
+        .expect("global tracing subscriber to install");
+    TracingGuard::synchronous()
+}
+
 /// Make the next guest task use the same identity as the asynchronous logger.
 ///
 /// The non-blocking file subscriber that `--log-file` used until

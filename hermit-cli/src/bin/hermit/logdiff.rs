@@ -34,13 +34,22 @@ use super::run::VerifyAllow;
 use super::verify::lock_failed_verification_logs_for_read;
 use super::verify_run;
 
+/// The bytes of a log file, decoding a `--log-ring` file into its records.
+fn read_log(path: &Path) -> std::io::Result<Vec<u8>> {
+    let bytes = std::fs::read(path)?;
+    match super::log_ring::decode(&bytes) {
+        Some(decoded) => decoded,
+        None => Ok(bytes),
+    }
+}
+
 fn write_canonical_info(
     file: &Path,
     writer: &mut impl Write,
     record_envelope: RecordEnvelope,
 ) -> std::io::Result<usize> {
     if record_envelope.policy() == RecordEnvelopePolicy::AllRecordsV1 {
-        let bytes = std::fs::read(file)?;
+        let bytes = read_log(file)?;
         return logdiff::write_bitwise_info_v1_bytes(&bytes, &file.display().to_string(), writer);
     }
     logdiff::write_canonical_info_with_filter(file, writer, record_envelope.predicate())
@@ -52,8 +61,8 @@ fn try_log_diff_with_records(
     options: &logdiff::LogDiffOpts,
     record_envelope: RecordEnvelope,
 ) -> std::io::Result<(logdiff::LogDiffSummary, usize, usize, LogDiffInputs)> {
-    let left_bytes = std::fs::read(left)?;
-    let right_bytes = std::fs::read(right)?;
+    let left_bytes = read_log(left)?;
+    let right_bytes = read_log(right)?;
     let left = strict_log_text(&left_bytes, &left.display().to_string())?;
     let right = strict_log_text(&right_bytes, &right.display().to_string())?;
     let summary = logdiff::log_diff_summary_from_strs_with_filter(

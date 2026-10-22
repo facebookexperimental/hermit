@@ -3746,6 +3746,9 @@ mod tests {
             log_budget: None,
             log_file_handle: None,
             log_file_limit: None,
+            log_ring: None,
+            log_ring_file: None,
+            log_ring_handle: None,
             unsafe_ignore_host_seccomp: false,
             backend: None,
         }
