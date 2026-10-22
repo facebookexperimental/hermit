@@ -1225,6 +1225,16 @@ Record the CPU model and virtualization environment when reporting a failure.
 `--no-virtualize-cpuid` may help diagnosis, but makes the guest depend on host
 CPU features.
 
+Some KVM guests with an AMD vCPU model on Linux 6.16 or older, such as
+on-demand cloud VMs, report `ptrace-cpuid-faulting-unavailable ... errno=19`
+or `CPUID faulting is unavailable`. Their hypervisor supports CPUID faulting,
+but the kernel does not detect it. On such a guest, run
+`tools/cpuid-fault-kmod/enable-cpuid-faulting.sh` from the Hermit source tree
+once per boot, before reproducible builds. It loads a small kernel module that
+turns on Linux's own per-task CPUID faulting. Where faulting already works, it
+changes nothing. See [tools/cpuid-fault-kmod/README.md](../tools/cpuid-fault-kmod/README.md).
+On such a guest, Hermit adds a `note:` with this pointer to the error.
+
 ## How Hermit Works
 
 Hermit has three main layers:

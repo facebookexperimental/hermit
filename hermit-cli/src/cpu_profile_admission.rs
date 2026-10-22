@@ -186,6 +186,48 @@ pub fn check_host_no_rdrand_request(
 const CPUID_FAULTING_REMEDY: &str = "use a CPU and Linux kernel with CPUID faulting support (capable AMD CPUs need \
      Linux 6.17 or its CPUID-faulting backport)";
 
+/// The source-tree script that loads a module turning on CPUID faulting in a
+/// KVM guest whose hypervisor offers it but whose pre-6.17 kernel probes it
+/// only on Intel vCPU models.
+pub const CPUID_FAULTING_VM_SCRIPT: &str = "tools/cpuid-fault-kmod/enable-cpuid-faulting.sh";
+
+/// A pointer to [`CPUID_FAULTING_VM_SCRIPT`] when `host` reports a hypervisor
+/// (CPUID leaf 1 ECX bit 31) and `release` is older than Linux 6.17, the only
+/// hosts the module can help; `None` otherwise.
+pub fn cpuid_faulting_vm_pointer(host: &dyn HostCpuid, release: &str) -> Option<String> {
+    let hypervisor = host.cpuid(1, 0)[2] & (1 << 31) != 0;
+    let before_6_17 = kernel_version(release).is_some_and(|version| version < (6, 17));
+    (hypervisor && before_6_17).then(|| {
+        format!(
+            "this host is a virtual machine on Linux {release}; if its hypervisor offers CPUID \
+             faulting, {CPUID_FAULTING_VM_SCRIPT} in the Hermit source tree can enable it"
+        )
+    })
+}
+
+fn native_cpuid_faulting_vm_pointer() -> Option<String> {
+    let uname = nix::sys::utsname::uname().ok()?;
+    cpuid_faulting_vm_pointer(&NativeCpuid, &uname.release().to_string_lossy())
+}
+
+/// The note to print after an error whose chain reports missing CPUID
+/// faulting, on a host where the script may help, unless a message already
+/// carries the pointer.
+pub fn missing_cpuid_faulting_note(messages: &[String]) -> Option<String> {
+    let missing = messages.iter().any(|message| {
+        message.contains("ptrace-cpuid-faulting-unavailable")
+            || message.contains("CPUID faulting is unavailable")
+    });
+    let pointed = messages
+        .iter()
+        .any(|message| message.contains(CPUID_FAULTING_VM_SCRIPT));
+    if missing && !pointed {
+        native_cpuid_faulting_vm_pointer()
+    } else {
+        None
+    }
+}
+
 fn check_host_no_rdrand_cpuid(host: &dyn HostCpuid) -> Result<(), AdmissionRefusal> {
     let intel_hybrid = host.cpuid(0, 0)[0] >= 7 && host.cpuid(7, 0)[3] & (1 << 15) != 0;
     // AMD advertises heterogeneous cores independently of Intel's hybrid bit:
@@ -260,8 +302,11 @@ pub fn qualify_host_no_rdrand() -> Result<(), AdmissionRefusal> {
     } else {
         "the CPUID-faulting probe did not exit normally"
     };
+    let vm_pointer = native_cpuid_faulting_vm_pointer()
+        .map(|pointer| format!("; {pointer}"))
+        .unwrap_or_default();
     Err(format!(
-        "CPUID faulting is unavailable: {failure}; {CPUID_FAULTING_REMEDY}"
+        "CPUID faulting is unavailable: {failure}; {CPUID_FAULTING_REMEDY}{vm_pointer}"
     ))
 }
 
@@ -1136,6 +1181,36 @@ mod tests {
         let advertised: u32 = words.iter().map(|&(_, _, _, bits)| bits.count_ones()).sum();
         // Every advertised bit but OSXSAVE, which has its own check.
         assert_eq!(checked, advertised - 1);
+    }
+
+    /// The kernel-module pointer is given only on a VM before Linux 6.17, and
+    /// only after an error that reports missing faulting and lacks it already.
+    #[test]
+    fn cpuid_faulting_vm_pointer_needs_a_hypervisor_and_a_kernel_before_6_17() {
+        let mut vm = qualifying_host();
+        vm.0.get_mut(&(1, 0)).unwrap()[2] |= 1 << 31;
+        let pointer = cpuid_faulting_vm_pointer(&vm, "6.16.1-0_fbk5_0_g0e127f210adc").unwrap();
+        assert!(pointer.contains(CPUID_FAULTING_VM_SCRIPT), "{pointer}");
+        assert!(pointer.contains("Linux 6.16.1-0_fbk5"), "{pointer}");
+        assert!(cpuid_faulting_vm_pointer(&vm, "5.19.0").is_some());
+        assert_eq!(cpuid_faulting_vm_pointer(&vm, "6.17.0"), None);
+        assert_eq!(cpuid_faulting_vm_pointer(&vm, "7.1.3-0_fbk0"), None);
+        assert_eq!(cpuid_faulting_vm_pointer(&vm, "garbage"), None);
+        let bare_metal = qualifying_host();
+        assert_eq!(cpuid_faulting_vm_pointer(&bare_metal, "6.16.1"), None);
+
+        // Host-independent cases of the note: no matching message, or a
+        // message that already names the script.
+        assert_eq!(
+            missing_cpuid_faulting_note(&["permission denied".to_string()]),
+            None
+        );
+        assert_eq!(
+            missing_cpuid_faulting_note(&[format!(
+                "CPUID faulting is unavailable: ARCH_SET_CPUID(0) failed; {pointer}"
+            )]),
+            None
+        );
     }
 
     #[test]

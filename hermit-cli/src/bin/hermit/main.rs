@@ -1031,6 +1031,11 @@ fn display_error(error: Error) {
     for cause in chain {
         let _ = writeln!(out, "     {} {}", ">".dimmed().bold(), cause);
     }
+
+    let messages = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+    if let Some(note) = hermit::cpu_profile_admission::missing_cpuid_faulting_note(&messages) {
+        let _ = writeln!(out, "note: {note}");
+    }
 }
 
 // Compile the actual native consumer in this existing test target; the preload

@@ -1722,7 +1722,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And metadata::tests::record_version_rejects_path_classified_random_device_streams
     // (the LinuxEmu D3a record version): 1074, listed.
     // And +1 from e931b265: 1074.
-    ("test.hermit_unit", 1074),
+    // And cpu_profile_admission::tests::cpuid_faulting_vm_pointer_needs_a_hypervisor_and_a_kernel_before_6_17
+    // (the tools/cpuid-fault-kmod pointer): 1075.
+    ("test.hermit_unit", 1075),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5034,7 +5036,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three --skid-margin tests: 1073, listed.
     // And the same D3a record-version unit: 1074, listed.
     // And +1 from e931b265: 1074.
-    ("test.hermit_unit_on_host", 1074),
+    // And the same CPUID-faulting VM pointer test: 1075.
+    ("test.hermit_unit_on_host", 1075),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
