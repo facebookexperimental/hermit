@@ -527,6 +527,16 @@ env_args+=(-e CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true)
 # on a loaded host that interpreter start took 16.8 s, every second of it on a
 # node's critical path, and validate_pinned_image's forced-stop test failed at
 # 20.2 s against its 20 s bound when five validations ran at once (f9d81a69).
+#
+# Snapshot the file with one read(2) first. `read` on a seekable file reads
+# 4096 bytes, then lseeks back to the end of the line it consumed, so a loop
+# reading /proc/self/status line by line makes the kernel regenerate the file
+# once per line. Fields before Cpus_allowed_list (VmRSS, RssAnon, ...) change
+# length between regenerations, so a later line could be read at a shifted
+# offset and arrive torn, which failed this check intermittently
+# (lint-check-pinned-root-cache, three validates on 2026-10-21/22).
+# $(<file) reads to EOF in one 4096-byte call for this ~1.4 KB file.
+proc_status=$(< /proc/self/status)
 caller_affinity=
 while IFS=$'\t' read -r status_key status_value; do
     if [[ $status_key == Cpus_allowed_list: ]]; then
@@ -545,7 +555,7 @@ while IFS=$'\t' read -r status_key status_value; do
         done
         break
     fi
-done < /proc/self/status
+done <<< "$proc_status"
 [[ $caller_affinity =~ ^[0-9]+(,[0-9]+)*$ ]] || {
     echo "run-in-pinned-root: cannot read a nonempty caller CPU affinity" >&2
     exit 2
