@@ -1162,6 +1162,29 @@ pub struct Config {
     #[serde(skip)]
     #[clap(skip)]
     pub fatal_core_capture: Option<FatalCoreCapture>,
+
+    /// Whether the in-guest runtime delivers the guest's signals through
+    /// Detcore's schedule (A5 step 3c.1, gate D35 of the design,
+    /// <https://github.com/rrnewton/hermit/issues/4485>): while its code runs
+    /// it blocks every signal it does not reserve, and at each return to
+    /// guest code it predicts the kernel's deliveries, reports them in two
+    /// phases, and makes a predicted death a scheduled one. Detcore answers
+    /// Reverie's `Tool::in_guest_signal_delivery` from it.
+    ///
+    /// The host sets it, not a flag, when it prepares an in-guest run on the
+    /// default route, and only where every condition of the gate holds:
+    /// site patching off, sequentialized threads, no configuration in which
+    /// the two-phase protocol cannot be kept (`detcore::two_phase_refusal`),
+    /// and a scheduler that runs as the init of the guest's PID namespace,
+    /// which only `hermit run`'s container launch knows. Preparing any run
+    /// clears it first, so a caller's configuration cannot carry it in; the
+    /// in-guest loader route never sets it. Every Tool image receives it in
+    /// the configuration handshake, which guest code cannot change. False,
+    /// the default, changes nothing. Like `in_guest_reserved_signals`, it
+    /// has no legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub in_guest_signal_delivery: bool,
 }
 
 /// Where and how much [`Config::fatal_core_capture`] may write.
@@ -2227,8 +2250,9 @@ impl Default for Config {
 /// [`Config::inherited_seccomp`], added after this form froze, which reads
 /// back as unknown. So is [`Config::in_guest_reserved_signals`], empty for
 /// DBT (it is set only for in-guest runs), which reads back as empty, and
-/// [`Config::in_guest_refuses_host_timed_producers`], false for DBT, which
-/// reads back as false. Every
+/// [`Config::in_guest_refuses_host_timed_producers`] and
+/// [`Config::in_guest_signal_delivery`], false for DBT, which read back as
+/// false. Every
 /// other field is serialized exactly as `serde_json::to_string(config)`
 /// serializes it.
 ///
@@ -2685,6 +2709,7 @@ mod legacy_backend_json {
     /// in-guest runs), so it is never written and reads as empty.
     /// `in_guest_refuses_host_timed_producers` is false for DBT (it is set
     /// only for in-guest runs), so it is never written and reads as false.
+    /// So is `in_guest_signal_delivery`, for the same reason.
     /// `launch_image` came after the legacy form froze: it is never written
     /// and reads as unset. DBT's runtime takes it from the coordinator's
     /// configuration instead, which declares DynamoRIO's library as the
@@ -2709,7 +2734,7 @@ mod legacy_backend_json {
     /// as unset.
     /// `signal_at` came after the form froze; the scheduler acts on it, not
     /// the runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 23] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 24] = [
         "backend",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
@@ -2733,6 +2758,7 @@ mod legacy_backend_json {
         "signal_delivery_check_fatal",
         "work_span_report",
         "signal_at",
+        "in_guest_signal_delivery",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2826,7 +2852,8 @@ mod legacy_backend_json {
     /// [`Config::in_guest_detlog_forward_policy`],
     /// [`Config::in_guest_site_patching_off`],
     /// [`Config::in_guest_reserved_signals`],
-    /// [`Config::in_guest_refuses_host_timed_producers`], [`Config::launch_image`],
+    /// [`Config::in_guest_refuses_host_timed_producers`],
+    /// [`Config::in_guest_signal_delivery`], [`Config::launch_image`],
     /// [`Config::target_timeslice_syscalls_only`],
     /// [`Config::futex_wake_yields`], [`Config::replaying`],
     /// [`Config::scheduler_turn_cost`] or [`Config::inherited_seccomp`] takes
@@ -2865,6 +2892,7 @@ mod legacy_backend_json {
                     | "guest_may_inherit_a_terminal"
                     | "in_guest_site_patching_off"
                     | "in_guest_refuses_host_timed_producers"
+                    | "in_guest_signal_delivery"
                     | "target_timeslice_syscalls_only"
                     | "futex_wake_yields"
                     | "replaying"
@@ -3172,7 +3200,8 @@ mod legacy_backend_json {
                 | "mountinfo_mount_namespace"
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
-                | "signal_at" => Ok(()),
+                | "signal_at"
+                | "in_guest_signal_delivery" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3309,6 +3338,7 @@ mod tests {
         assert_eq!(config.in_guest_reserved_signals, 0);
         assert!(!config.reserves_in_guest_signal(libc::SIGSYS.into()));
         assert!(!config.in_guest_refuses_host_timed_producers);
+        assert!(!config.in_guest_signal_delivery);
         assert!(config.launch_image.is_none());
     }
 
@@ -3857,6 +3887,7 @@ mod tests {
     /// `record_host_inputs`, `guest_may_inherit_a_terminal`,
     /// `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
     /// `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
+    /// `in_guest_signal_delivery`,
     /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
     /// `replaying`,
     /// `scheduler_turn_cost` or
@@ -3897,7 +3928,8 @@ mod tests {
                 | "mountinfo_mount_namespace"
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
-                | "signal_at" => {}
+                | "signal_at"
+                | "in_guest_signal_delivery" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -3916,10 +3948,11 @@ mod tests {
         // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `signal_delivery_check_fatal`,
-        // `work_span_report` and `signal_at` none: fourteen more keys, and
-        // twenty-two fewer, so eight keys fewer than fields.
+        // `work_span_report`, `signal_at` and `in_guest_signal_delivery`
+        // none: fourteen more keys, and twenty-three fewer, so nine keys
+        // fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 8);
+        assert_eq!(fields.len(), keys.len() + 9);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4729,6 +4762,68 @@ mod tests {
             .expect("the field is serialized");
         let decoded: Config = serde_json::from_value(encoded).unwrap();
         assert!(!decoded.in_guest_refuses_host_timed_producers);
+    }
+
+    /// `in_guest_signal_delivery` is false for DBT, so the legacy form never
+    /// carries it, and it reads back as false from both the object and the
+    /// array form.
+    #[test]
+    fn in_guest_signal_delivery_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            in_guest_signal_delivery: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("in_guest_signal_delivery"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .in_guest_signal_delivery
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .in_guest_signal_delivery
+        );
+    }
+
+    /// The gate reaches every Tool image through Reverie's bincode handshake
+    /// unchanged, on or off, and a JSON configuration without the key reads
+    /// as off (its serde default).
+    #[test]
+    fn in_guest_signal_delivery_round_trips_and_defaults_to_off() {
+        for on in [false, true] {
+            let config = Config {
+                in_guest_signal_delivery: on,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.in_guest_signal_delivery, on);
+            let json: Config =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(json.in_guest_signal_delivery, on);
+        }
+        let mut encoded = serde_json::to_value(Config::default()).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("in_guest_signal_delivery")
+            .expect("the field is serialized");
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.in_guest_signal_delivery);
     }
 
     /// `--signal-at` takes `turn=N:SIGNAL` with SIGNAL a name or a number.

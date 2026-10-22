@@ -2872,6 +2872,7 @@ impl GlobalState {
                 GlobalRequest::ParkedProtocolFailure(_)
                     | GlobalRequest::UnrecoverableShutdown
                     | GlobalRequest::PolicyRefusal(_)
+                    | GlobalRequest::StoppingRefusal(_)
             );
 
         let (exec_reconnect, is_exec_caller_after_local_mm_swap) = {
@@ -3144,6 +3145,13 @@ impl GlobalState {
             GlobalRequest::PolicyRefusal(reason) => {
                 self.policy_refusal.lock().unwrap().get_or_insert(reason);
                 R::PolicyRefusal(())
+            }
+            // Acted on even from a committed SIGKILL victim (it is in the
+            // victim's answered list, as PolicyRefusal is). Whether a victim
+            // gets to file one before it dies is host-timed once 3c.1c and
+            // 3c.1e add producers; to be re-examined there.
+            GlobalRequest::StoppingRefusal(reason) => {
+                crate::scheduler::exit_on_scheduler_refusal(&reason)
             }
             // TODO-HUMAN-REVIEW(PR-643): Review run-wide unsupported-syscall aggregation.
             GlobalRequest::ReportUnsupportedSyscall(name) => {
@@ -6538,6 +6546,18 @@ pub enum GlobalRequest {
     LockLedgerRefused(String),
     /// Contained mapping capture; answered without changing the serial grant.
     MappingCapture(mapping_capture::Request),
+    /// The in-guest delivery protocol cannot go on in this run, for this
+    /// reason: the whole refusal line, conventionally `hermit refused to
+    /// continue the run (NAME): ...` (A5 design D49). The coordinator ends the
+    /// whole run on it (`scheduler::exit_on_scheduler_refusal`): it writes the
+    /// line and exits with `HERMIT_POLICY_REFUSAL_EXIT`, and where the
+    /// scheduler runs as the init of the guest's PID namespace, the kernel
+    /// then kills every guest process. Unlike `PolicyRefusal`, which records a
+    /// reason while only the refusing Tool image exits, no guest process runs
+    /// on after it, and it is never answered. Filed only under
+    /// `Config::in_guest_signal_delivery`, whose gate requires that
+    /// ownership. Appended last.
+    StoppingRefusal(String),
 }
 
 /// Responses from the global object
@@ -10543,6 +10563,7 @@ mod tests {
     mod backend_failure_tests;
     mod exec_identity_tests;
     mod exec_teardown_tests;
+    mod stopping_refusal_tests;
     mod timerless_clock_tests;
     use std::collections::BTreeSet;
     use std::os::fd::AsRawFd;

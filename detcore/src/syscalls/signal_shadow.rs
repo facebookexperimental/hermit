@@ -3228,6 +3228,47 @@ mod tests {
             .map_or(0, |shadow| shadow.thread.activations.len())
     }
 
+    /// IR-13 of the A5 3c.1 plan (design D36): on the in-guest backend, a
+    /// two-phase commit's check returns before `Guest::deliver_signal`, so no
+    /// 3c.1 commit, default-fatal deliveries among them, asks the backend to
+    /// check a delivery: the kernel's signal state there is the runtime's,
+    /// and the check comes with 3c.2's caught handlers. The thread keeps a
+    /// copy in which SIGUSR1 is caught, so a check that went on would ask the
+    /// backend about SIGUSR1 (its script refuses to answer) and count the
+    /// other signals as skipped. Mutation it catches: the early return
+    /// removed.
+    #[tokio::test]
+    async fn an_in_guest_commit_returns_before_the_backend_check() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        let handler = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        kernel.set(0, 0, USR1);
+        record_rt_sigaction(&mut guest, libc::SIGUSR1, Some(handler), None, &Ok(0));
+        guest.config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
+        guest.config.in_guest_signal_delivery = true;
+        let counters = format!("{:?}", guest.thread.delivery_counters);
+        for signal in [
+            libc::SIGTERM,
+            libc::SIGKILL,
+            libc::SIGQUIT,
+            libc::SIGUSR1,
+            40,
+        ] {
+            assert!(
+                check_delivery_to_record(&mut guest, signal).await,
+                "{signal}"
+            );
+        }
+        assert!(guest.delivery.asked.is_empty());
+        assert_eq!(format!("{:?}", guest.thread.delivery_counters), counters);
+    }
+
     #[test]
     fn copied_dispositions_answer_only_where_the_copy_can() {
         let kernel = Kernel::default();

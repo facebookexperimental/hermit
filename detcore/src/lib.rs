@@ -67,6 +67,8 @@ pub mod native_exec;
 pub mod netlink_route;
 pub mod nonwaiting_write;
 mod pipe_wake;
+#[cfg(test)]
+mod predicted_death_tests;
 mod procfs;
 mod procfs_inode;
 mod procmaps;
@@ -80,6 +82,7 @@ mod shared_open_files;
 mod sigalrm_phase1;
 #[cfg(test)]
 mod signal_announcement_tests;
+pub mod signal_restart;
 mod signal_state;
 mod sock_diag;
 mod stat;
@@ -447,7 +450,11 @@ fn completed_syscall_projection(
 /// (`Tool::announce_signal_event`), if it cannot: a part of the commit would
 /// file a scheduler request, or would read what only exists after the
 /// kernel's dequeue (the thread's queues, or the delivery's siginfo).
-fn two_phase_refusal(cfg: &Config) -> Option<&'static str> {
+///
+/// Public because the host's in-guest delivery gate requires `None` on the
+/// final prepared configuration (`Config::in_guest_signal_delivery`, D35 of
+/// the A5 design), and must ask Detcore rather than restate the rows.
+pub fn two_phase_refusal(cfg: &Config) -> Option<&'static str> {
     if scheduler::discarded_at_send::records(cfg) {
         return Some(
             "the record of copies Linux discarded at send reads the thread's queues after the dequeue",
@@ -2521,6 +2528,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         crate::syscalls::signal_shadow::observes_sigreturns(config)
     }
 
+    /// The in-guest delivery gate exactly as the host prepared it
+    /// (`Config::in_guest_signal_delivery`): Hermit sets it only where the
+    /// whole protocol holds, and clears it in every other run.
+    fn in_guest_signal_delivery(config: &Config) -> bool {
+        config.in_guest_signal_delivery
+    }
+
     fn handle_sigreturn(
         &self,
         thread_state: &mut Self::ThreadState,
@@ -3098,6 +3112,66 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         thread_state.signal_announcements.retain(|held| {
             held.token != announcement.token() || held.signal != announcement.signal()
         });
+    }
+
+    /// A death the backend's final read predicted, after its commits (A5
+    /// design 16.30; Reverie's contract, step 3): the thread keeps its turn
+    /// for its group's exit (`Scheduler::hold_turn_for_group_exit`), so no
+    /// other thread takes a turn between the decision and the grant, then
+    /// files the group `Exit`, which that hold grants at the very next turn
+    /// and which starts the physical-exit hold. This is what DBT's fatal
+    /// default action does (`end_thread_group_before_fatal_delivery`), here
+    /// at the in-guest runtime's return, where the kernel then ends the
+    /// group.
+    ///
+    /// Robust-futex owner-death wakes are not claimed: the group's robust
+    /// lists are not walked here, which stays the named gap of
+    /// <https://github.com/rrnewton/hermit/issues/4268> (D24, IR-11).
+    ///
+    /// Refused with `EPROTONOSUPPORT` before anything is filed when the run
+    /// does not take in-guest delivery (`Config::in_guest_signal_delivery`,
+    /// the gate this protocol needs), and when the thread does not hold the
+    /// turn, which leaves the decision unprotected: Detcore has opted in, so
+    /// `EOPNOTSUPP` stays Reverie's "not opted in". A status that is not a
+    /// death by a signal is `EINVAL`.
+    async fn exit_for_predicted_death<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        status: ExitStatus,
+    ) -> Result<(), Errno> {
+        if !matches!(
+            status,
+            ExitStatus::Signaled(..) | ExitStatus::SignaledRaw(..)
+        ) {
+            return Err(Errno::EINVAL);
+        }
+        let dettid = guest.thread_state().dettid;
+        if !self.cfg.in_guest_signal_delivery {
+            warn!(
+                "[dtid {dettid}] refusing a predicted death ({status:?}): this run does not \
+                 take in-guest signal delivery"
+            );
+            return Err(Errno::EPROTONOSUPPORT);
+        }
+        if !tool_global::hold_turn_for_group_exit(guest, dettid).await {
+            warn!(
+                "[dtid {dettid}] refusing a predicted death ({status:?}): the thread does not \
+                 hold the turn its group's exit needs"
+            );
+            return Err(Errno::EPROTONOSUPPORT);
+        }
+        debug!("[dtid {dettid}] predicted death ({status:?}) ends its thread group");
+        let state = guest.thread_state();
+        let request = state.mk_request(
+            ResourceID::Exit {
+                group: true,
+                process: state.detpid.expect("detpid unset"),
+                mm: state.mm_id,
+            },
+            Permission::RW,
+        );
+        tool_global::resource_request(guest, request).await;
+        Ok(())
     }
 
     /// A `SIGCHLD` the backend passes on without reporting it is dropped when

@@ -1150,7 +1150,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And hermit-manifest-plan's
     // parity::tests::run_comparisons_belong_to_a_red_candidate_and_must_be_consistent
     // (parity post-pass, 3c19ef32): 1814, listed.
-    ("test.regular_crates", 1814),
+    // And detcore-model's config::tests::in_guest_signal_delivery_never_enters_the_legacy_form
+    // and config::tests::in_guest_signal_delivery_round_trips_and_defaults_to_off
+    // (A5 step 3c.1a, the delivery gate's field): 1816, listed.
+    ("test.regular_crates", 1816),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1748,7 +1751,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // to ..._follow_the_backend_the_subscription_and_site_patching and adds
     // tests::the_default_route_reserves_sigtrap_only_with_site_patching_on:
     // 1083, listed.
-    ("test.hermit_unit", 1083),
+    // And tests::a_poisoned_signal_delivery_gate_never_survives_preparation,
+    // tests::the_signal_delivery_gate_needs_every_condition,
+    // tests::only_a_pid_namespace_init_owns_the_guests_namespace and
+    // tests::no_launch_outside_a_new_pid_namespace_and_no_3c1a_launch_turns_the_gate_on
+    // (A5 step 3c.1a, D35 and D52): 1087, listed.
+    ("test.hermit_unit", 1087),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2698,7 +2706,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and scheduler::test::every_kernel_run_blocking_resource_is_granted_outside_the_schedule
     // (A5 step 3c slice 0f, the published kernel-run call list): 2300, listed.
     // And fourteen retained coherent NUMA controls: 2314.
-    ("test.detcore_unit", 2314),
+    // And A5 step 3c.1a's twelve: the four predicted_death_tests (the
+    // group-exit hold against a runnable peer, gate off, no turn, not a death),
+    // tool_global::tests::stopping_refusal_tests::a_stopping_refusal_filed_by_a_child_ends_every_process_of_the_run,
+    // the six signal_restart::tests rows, and
+    // syscalls::signal_shadow::tests::an_in_guest_commit_returns_before_the_backend_check
+    // (IR-13): 2326, listed.
+    ("test.detcore_unit", 2326),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4783,7 +4797,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same nine host-timed producer units (slice 0b): 2298, listed.
     // And the same two slice 0f kernel-run call-list units: 2300, listed.
     // And the same fourteen retained coherent NUMA controls: 2314.
-    ("test.detcore_unit_on_host", 2314),
+    // And the same twelve slice 3c.1a units: 2326, listed.
+    ("test.detcore_unit_on_host", 2326),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5121,7 +5136,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two slice 0a reserved-signal tests: 1077, listed.
     // And the same five host-timed producer units (slice 0b): 1082, listed.
     // And the same slice 0c default-route SIGTRAP unit: 1083, listed.
-    ("test.hermit_unit_on_host", 1083),
+    // And the same four slice 3c.1a delivery-gate units: 1087, listed.
+    ("test.hermit_unit_on_host", 1087),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5309,7 +5325,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two in_guest_refuses_host_timed_producers config tests: 1799,
     // listed.
     // And the same parity post-pass run-comparison test: 1800, listed.
-    ("test.regular_crates_on_host", 1800),
+    // And the same two in_guest_signal_delivery config tests: 1802, listed.
+    ("test.regular_crates_on_host", 1802),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

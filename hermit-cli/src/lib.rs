@@ -1222,6 +1222,61 @@ pub const fn in_guest_refuses_host_timed_producers(backend: Backend) -> bool {
     backend.is_in_guest_liteinst()
 }
 
+/// Whether this process, which runs the scheduler of the in-guest run it
+/// launches, owns the guests' PID namespace (A5 step 3c.1, D51 and D52): it
+/// is PID 1 of its PID namespace, and every guest it launches descends from
+/// it, so is a member of that namespace. When a PID namespace's init exits,
+/// the kernel sends SIGKILL to every task with a PID in the namespace and
+/// waits for them (`zap_pid_ns_processes`, kernel/pid_namespace.c v6.12
+/// lines 170-222). That covers a guest in a nested PID namespace too: a task
+/// has a PID in its own namespace and in every ancestor (`alloc_pid`,
+/// kernel/pid.c v6.12 lines 194-253), and `setns` enters only the caller's
+/// namespace or a descendant of it (`pidns_install`, kernel/pid_namespace.c
+/// lines 390-397), so no guest leaves the namespace. So a refusal that exits
+/// the scheduler (`GlobalRequest::StoppingRefusal`) then leaves no guest
+/// process running; the in-guest delivery gate requires that
+/// ([`in_guest_signal_delivery_gate`]).
+///
+/// A fact read from the process, never a setting a caller supplies, so the
+/// run-wide-exit claim cannot be forged: `hermit run`'s container launch,
+/// which runs the scheduler as the init of the namespace it creates, owns it,
+/// and `hermit run --no-namespace` does not (its scheduler is a plain
+/// child). A library caller owns it exactly when it really is that init.
+pub fn scheduler_owns_guest_pid_namespace() -> bool {
+    // SAFETY: getpid has no preconditions.
+    unsafe { libc::getpid() == 1 }
+}
+
+/// Whether the pinned in-guest runtime delivers the guest's signals itself
+/// under the gate (its runtime mask, final-read loop and predicted deaths,
+/// A5 step 3c.1e). Not yet: until the flip (3c.1f), the gate stays off on
+/// every route, whatever [`in_guest_signal_delivery_gate`] answers.
+#[cfg(feature = "liteinst")]
+const IN_GUEST_RUNTIME_DELIVERS_SIGNALS: bool = false;
+
+/// The in-guest delivery gate (`detcore::Config::in_guest_signal_delivery`,
+/// D35 of the A5 step 3c design) for a run of `backend` on Hermit's default
+/// in-guest route, from its final prepared configuration and the launcher's
+/// PID-namespace ownership: an in-guest backend, site patching off,
+/// sequentialized threads, no configuration in which the two-phase delivery
+/// protocol cannot be kept (`detcore::two_phase_refusal`: a timeslice, a
+/// recorded or replayed schedule, an in-effect pipe hand-off, and the rows no
+/// in-guest backend reaches), and a scheduler that owns the guest's PID
+/// namespace (`owns_guest_pid_namespace`, which the launch sites compute
+/// with [`scheduler_owns_guest_pid_namespace`]). The in-guest loader route
+/// never asks (D26, D43): its configuration keeps the gate off.
+pub fn in_guest_signal_delivery_gate(
+    config: &DetConfig,
+    backend: Backend,
+    owns_guest_pid_namespace: bool,
+) -> bool {
+    backend.is_in_guest_liteinst()
+        && config.in_guest_site_patching_off
+        && config.sequentialize_threads
+        && detcore::two_phase_refusal(config).is_none()
+        && owns_guest_pid_namespace
+}
+
 /// `RLIMIT_CPU`'s value as Hermit's log and refusal print it: `unlimited`, or
 /// a number of seconds.
 #[cfg(feature = "liteinst")]
@@ -4748,6 +4803,10 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // So is the refusal of host-timed signal producers
     // (`in_guest_refuses_host_timed_producers`, A5 step 3c slice 0b).
     config.in_guest_refuses_host_timed_producers = false;
+    // And the in-guest delivery gate, which only the default route's launch
+    // sets, from the final configuration and the process's PID-namespace
+    // ownership (`in_guest_signal_delivery_gate`, A5 step 3c.1, D35 and D52).
+    config.in_guest_signal_delivery = false;
     config
 }
 
@@ -5066,6 +5125,15 @@ async fn dispatch_backend(
                 in_guest_refuses_host_timed_producers(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
+            // The delivery gate, from the final configuration and whether
+            // this process owns the guests' PID namespace; off until the
+            // runtime takes it (A5 step 3c.1, D35, D52).
+            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+                && in_guest_signal_delivery_gate(
+                    &config,
+                    backend,
+                    scheduler_owns_guest_pid_namespace(),
+                );
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (exit_status, mut global_state, dispatch_stats, process_reports) =
@@ -5396,6 +5464,15 @@ async fn dispatch_output_backend(
                 in_guest_refuses_host_timed_producers(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
+            // The delivery gate, from the final configuration and whether
+            // this process owns the guests' PID namespace; off until the
+            // runtime takes it (A5 step 3c.1, D35, D52).
+            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+                && in_guest_signal_delivery_gate(
+                    &config,
+                    backend,
+                    scheduler_owns_guest_pid_namespace(),
+                );
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (output, mut global_state, dispatch_stats, process_reports) =
@@ -7494,6 +7571,190 @@ mod tests {
         let loader = prepare_in_guest_loader_route_config(poisoned);
         assert!(!loader.in_guest_refuses_host_timed_producers);
         assert!(loader.in_guest_site_patching_off);
+    }
+
+    /// A configuration that every condition of the in-guest delivery gate
+    /// holds for, on `backend`, as the default route's launch leaves it
+    /// before it sets the gate: prepared, with site patching off.
+    fn gate_ready(backend: Backend) -> DetConfig {
+        let mut config = prepare_backend_config(
+            DetConfig {
+                sequentialize_threads: true,
+                max_timeslice: None,
+                ..DetConfig::default()
+            },
+            backend,
+        );
+        config.in_guest_site_patching_off = true;
+        config
+    }
+
+    /// A configuration that already turns the in-guest delivery gate on (a
+    /// public, serialized field) never keeps it through Hermit's
+    /// preparation: every backend's preparation and the loader route's (the
+    /// exec-stop, native-exec and mapped-first-admission launchers, and the
+    /// native-exec verify route) turn it off, also where every other
+    /// condition holds (A5 step 3c.1, D35, D43, D52). Only the default
+    /// route's launch sets it afterwards. Mutation it catches: the reset in
+    /// `prepare_backend_config` removed.
+    #[test]
+    fn a_poisoned_signal_delivery_gate_never_survives_preparation() {
+        let poisoned = DetConfig {
+            in_guest_signal_delivery: true,
+            sequentialize_threads: true,
+            max_timeslice: None,
+            in_guest_site_patching_off: true,
+            ..DetConfig::default()
+        };
+        for backend in Backend::ALL {
+            let prepared = prepare_backend_config(poisoned.clone(), backend);
+            assert!(!prepared.in_guest_signal_delivery, "{backend:?}");
+        }
+        let loader = prepare_in_guest_loader_route_config(poisoned);
+        assert!(!loader.in_guest_signal_delivery);
+        assert!(loader.in_guest_site_patching_off);
+        assert_eq!(loader.backend, backend_capabilities(Backend::InGuestTrap));
+    }
+
+    /// D35's gate holds only for an in-guest backend with site patching off,
+    /// sequentialized threads, none of the configurations in which Detcore
+    /// cannot keep the two-phase protocol (D33: each one alone turns the gate
+    /// off), and a launcher that owns the guest's PID namespace (D51).
+    #[test]
+    fn the_signal_delivery_gate_needs_every_condition() {
+        let owned = true;
+        for backend in Backend::ALL {
+            let ready = gate_ready(backend);
+            assert_eq!(
+                in_guest_signal_delivery_gate(&ready, backend, owned),
+                backend.is_in_guest_liteinst(),
+                "{backend:?}"
+            );
+        }
+        for backend in [Backend::Liteinst, Backend::InGuestTrap] {
+            let ready = gate_ready(backend);
+            assert!(detcore::two_phase_refusal(&ready).is_none(), "{backend:?}");
+            let off = |change: &dyn Fn(&mut DetConfig)| {
+                let mut config = ready.clone();
+                change(&mut config);
+                !in_guest_signal_delivery_gate(&config, backend, owned)
+            };
+            assert!(
+                off(&|c| c.in_guest_site_patching_off = false),
+                "{backend:?}"
+            );
+            assert!(off(&|c| c.sequentialize_threads = false), "{backend:?}");
+            // D33's flags, each refused by `two_phase_refusal`.
+            assert!(
+                off(&|c| c.target_timeslice = std::num::NonZeroU64::new(1_000)),
+                "{backend:?}"
+            );
+            assert!(
+                off(&|c| c.max_timeslice = std::num::NonZeroU64::new(1_000)),
+                "{backend:?}"
+            );
+            assert!(off(&|c| c.record_preemptions = true), "{backend:?}");
+            assert!(
+                off(&|c| c.replay_schedule_from = Some(PathBuf::from("schedule.json"))),
+                "{backend:?}"
+            );
+            let mut pipe = ready.clone();
+            pipe.pipe_wake_latency = Some(1_000);
+            assert!(pipe.pipe_wake_latency_in_effect().is_some());
+            assert!(
+                !in_guest_signal_delivery_gate(&pipe, backend, owned),
+                "{backend:?}"
+            );
+            // D51: no PID namespace the launcher owns.
+            assert!(
+                !in_guest_signal_delivery_gate(&ready, backend, false),
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// `scheduler_owns_guest_pid_namespace` in a forked process, plain or
+    /// the first process of a new user and PID namespace, as its exit status
+    /// (1 owned, 0 not, 2 when a step failed).
+    fn ownership_in_child(new_pid_namespace: bool) -> i32 {
+        let observe = || i32::from(scheduler_owns_guest_pid_namespace());
+        // SAFETY: plain process calls; each forked process calls only getpid,
+        // unshare, fork, waitpid and _exit before it exits.
+        unsafe {
+            let launcher = libc::fork();
+            assert!(launcher >= 0, "fork failed");
+            if launcher == 0 {
+                if !new_pid_namespace {
+                    libc::_exit(observe());
+                }
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) != 0 {
+                    libc::_exit(2);
+                }
+                let init = libc::fork();
+                if init == 0 {
+                    libc::_exit(observe());
+                }
+                let mut status = 0;
+                if init < 0
+                    || libc::waitpid(init, &mut status, 0) != init
+                    || !libc::WIFEXITED(status)
+                {
+                    libc::_exit(2);
+                }
+                libc::_exit(libc::WEXITSTATUS(status));
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(launcher, &mut status, 0), launcher);
+            assert!(libc::WIFEXITED(status), "wait status {status:#x}");
+            libc::WEXITSTATUS(status)
+        }
+    }
+
+    /// D52: ownership of the guests' PID namespace is derived from the
+    /// process, not supplied. The first process of a new user and PID
+    /// namespace (PID 1 there, as `hermit run`'s container init is) owns it;
+    /// a plain child, as under `--no-namespace`, does not, and neither does
+    /// this test process. Mutation it catches: ownership forced true.
+    #[test]
+    fn only_a_pid_namespace_init_owns_the_guests_namespace() {
+        assert!(!scheduler_owns_guest_pid_namespace());
+        assert_eq!(
+            ownership_in_child(false),
+            0,
+            "a plain child owns no namespace"
+        );
+        assert_eq!(
+            ownership_in_child(true),
+            1,
+            "the init of a new PID namespace owns it (2: no user and PID namespace)"
+        );
+    }
+
+    /// D52: a public-API launch from a process that is not the init of a new
+    /// PID namespace, like this test, never has the gate on, however ready
+    /// the configuration; and until the in-guest runtime takes the gate
+    /// (3c.1f), no launch sets it at all, owned or not.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn no_launch_outside_a_new_pid_namespace_and_no_3c1a_launch_turns_the_gate_on() {
+        for backend in Backend::ALL {
+            let ready = gate_ready(backend);
+            assert!(
+                !in_guest_signal_delivery_gate(
+                    &ready,
+                    backend,
+                    scheduler_owns_guest_pid_namespace()
+                ),
+                "{backend:?}"
+            );
+            for owned in [false, true] {
+                assert!(
+                    !(IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+                        && in_guest_signal_delivery_gate(&ready, backend, owned)),
+                    "{backend:?} {owned}"
+                );
+            }
+        }
     }
 
     /// D25: the guest's check logs the limit it found, unchanged when

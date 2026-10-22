@@ -6009,6 +6009,31 @@ impl Scheduler {
         self.step3_peek()
     }
 
+    /// Registers `dettid` with an empty request slot, as a thread that has
+    /// started and not yet filed its next request.
+    #[cfg(test)]
+    pub(crate) fn register_thread_for_test(&mut self, dettid: DetTid) {
+        self.priorities.insert(dettid, DEFAULT_PRIORITY);
+        self.next_turns.insert(
+            dettid,
+            ThreadNextTurn {
+                dettid,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+    }
+
+    /// Files `request` as `dettid`'s next request and makes it runnable, as
+    /// a thread's request reaching the scheduler does.
+    #[cfg(test)]
+    pub(crate) fn queue_request_for_test(&mut self, dettid: DetTid, request: Resources) {
+        self.next_turns[&dettid].req.put(Ok(request));
+        self.run_queue.push_back(dettid, DEFAULT_PRIORITY);
+    }
+
     // TODO-HUMAN-REVIEW(PR-1023): Review fail-closed SaBRe thread tombstones.
     pub(crate) fn thread_is_logically_killed(&self, dettid: DetTid) -> bool {
         self.backend.needs_killed_thread_rpc_cancellation
