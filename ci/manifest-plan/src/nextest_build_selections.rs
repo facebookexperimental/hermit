@@ -930,7 +930,10 @@ mod tests {
             // under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change,
             // ignored as a known failure by
             // https://github.com/rrnewton/hermit/pull/4559 (-1): 657.
-            assert_eq!(population, 657);
+            // procfs_determinism's mapping_capture_live module, the DBT NUMA
+            // coherent-capture tests from the dbt NUMA + E5 landing (Hermit
+            // b4cd1664 and 74ed9f94; +28): 685.
+            assert_eq!(population, 685);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
