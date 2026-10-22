@@ -99,8 +99,8 @@ const RR_THREAD_STRESS_WRAPPER_NAME: &str = "hermit-rr-thread-stress-cpu";
 // hermit-run::rr_suite rr_thread_stress records rr's thread_stress program
 // under ptrace, mostly system time. Its 36 recorded cgroup attempts under
 // ignored/validate on 2026-10-19/21: 35 completed at 8.0 to 21.10 CPU
-// seconds (8.0 to 9.3 on one validation host's ops-tick validations, 15.3 to
-// 21.10 on the other's coordinator validations, at most 23.2 s wall; hosts in
+// seconds (8.0 to 9.3 in the host's ops-tick validations, 15.3 to 21.10 in
+// its coordinator validations, at most 23.2 s wall; host in
 // docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts"); 73805952's
 // full validation was stopped by the 22-second cap at 22.16 (23.7 s wall,
 // 16.2 s of it system time). ceil(1.5 * 22.16) = 34 covers that censored
@@ -108,11 +108,82 @@ const RR_THREAD_STRESS_WRAPPER_NAME: &str = "hermit-rr-thread-stress-cpu";
 // 0.93 CPU per wall second, 34 CPU seconds take 37 s, inside the unchanged
 // 57-second wall.
 const RR_THREAD_STRESS_CPU_SECONDS: u64 = 34;
+// The allowances below come from the same 2026-10-18 to 2026-10-22 records:
+// the cgroup CPU of every attempt in the 122 to 128 full validations recorded
+// under ignored/validate that ran each test, all on one host
+// (docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts"). Its coordinator
+// validations, which share the host with other work, cost two to four times
+// its ops-tick validations, mostly in system time. Each cap is
+// ceil(1.5 * the largest observation), a CPU-cap stop at 22 seconds counting
+// as an observation of at least what it had used (censored, so half again).
+// Wall bounds stay the profile's 57 seconds.
+//
+// hermit-run::external_signal_interrupt's four
+// ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_* tests run a
+// guest poll to its virtual deadline under ptrace, about one CPU second per
+// wall second. Per test, 123 or 124 of 127 attempts completed at 4.28 to
+// 21.84 CPU seconds (4.5 to 7.5 in ops-tick validations, 8.7 to 21.84 in
+// coordinator validations, at most 28.3 s wall); the 13 others were stopped
+// by the 22-second cap at 22.00 to 22.02 (22.1 to 29.6 s wall).
+// ceil(1.5 * 22.02) = 34.
+const ESI_POLL_DEADLINE_CPU_SECONDS: u64 = 34;
+const ESI_POLL_DEADLINE_TESTS: [(&str, &str); 4] = [
+    (
+        "hermit-esi-poll-deadline-resize-namespace-cpu",
+        "ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_through_a_resize_in_a_namespace",
+    ),
+    (
+        "hermit-esi-poll-deadline-resize-cpu",
+        "ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_through_a_resize_without_a_namespace",
+    ),
+    (
+        "hermit-esi-poll-deadline-sighup-namespace-cpu",
+        "ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_through_sighup_in_a_namespace",
+    ),
+    (
+        "hermit-esi-poll-deadline-sighup-cpu",
+        "ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_through_sighup_without_a_namespace",
+    ),
+];
+const LIT_CHAOS_VERIFY_WRAPPER_NAME: &str = "hermit-lit-chaos-verify-cpu";
+// hermit-run::lit lit_scheduler_strategies_chaos_verify: 123 of 127 attempts
+// completed at 5.34 to 21.92 CPU seconds (at most 51.4 s wall); 4 were stopped
+// by the cap at 22.16 to 23.33 (25.1 to 34.5 s wall). ceil(1.5 * 23.33) = 35.
+const LIT_CHAOS_VERIFY_CPU_SECONDS: u64 = 35;
+const DBT_VIRTUAL_KERNEL_FILES_WRAPPER_NAME: &str = "hermit-dbt-virtual-kernel-files-cpu";
+// hermit-run::cli detcore_fixes_the_virtual_kernel_files_on_dbt: 120 of 122
+// completed at 4.75 to 20.21 CPU seconds (at most 42.2 s wall); 2 were stopped
+// by the cap at 22.30 and 22.70 (41.7 and 36.7 s wall). ceil(1.5 * 22.70) = 35.
+// At those runs' 0.53 to 0.62 CPU per wall second the 57-second wall comes
+// first, so the cap only stops a test that spends CPU faster than that.
+const DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS: u64 = 35;
+const CPU_PROFILE_V3_GUEST_WRAPPER_NAME: &str = "hermit-cpu-profile-v3-guest-cpu";
+// hermit-run::cli cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity: 127
+// of 128 completed at 1.17 to 4.35 CPU seconds (at most 4.7 s wall); d1f777df's
+// was stopped by the cap at 23.99 (25.4 s wall), five times the completed
+// maximum, beside cpu_profile_v3_cpuinfo_matches_cpuid at 23.2 s wall in the
+// same node. ceil(1.5 * 23.99) = 36.
+const CPU_PROFILE_V3_GUEST_CPU_SECONDS: u64 = 36;
+const SIGNAL_DISCARD_WRAPPER_NAME: &str = "hermit-signal-discard-no-take-cpu";
+// hermit-run::cli a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take:
+// 121 of 122 completed at 6.47 to 21.81 CPU seconds, 99% of the 22-second cap
+// (at most 45.4 s wall). ceil(1.5 * 21.81) = 33. The other, d1f777df's, was
+// stopped by the 57-second wall at 10.22 CPU seconds, which this cap does not
+// change.
+const SIGNAL_DISCARD_CPU_SECONDS: u64 = 33;
+const PARITY_POST_PASS_NO_GUEST_WRAPPER_NAME: &str = "hermit-parity-post-pass-no-guest-cpu";
+// hermit-manifest-plan's test-harness
+// tests::the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest
+// (node test.regular_crates): 123 of 124 completed at 5.83 to 21.62 CPU seconds
+// (at most 35.7 s wall); 64f898eb's was stopped by the cap at 22.28 (32.4 s
+// wall). ceil(1.5 * 22.28) = 34.
+const PARITY_POST_PASS_NO_GUEST_CPU_SECONDS: u64 = 34;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 #[derive(Clone, Copy)]
 struct MeasuredCpuAllowance {
     wrapper_name: &'static str,
+    package: &'static str,
     binary: &'static str,
     test: &'static str,
     cpu_seconds: u64,
@@ -123,6 +194,7 @@ impl MeasuredCpuAllowance {
     const fn stack(wrapper_name: &'static str, test: &'static str, cpu_seconds: u64) -> Self {
         Self {
             wrapper_name,
+            package: "hermit-run",
             binary: "hermit-run::liteinst_stacks",
             test,
             cpu_seconds,
@@ -132,7 +204,7 @@ impl MeasuredCpuAllowance {
 
     fn identity(self) -> nextest_cpu::AttemptIdentity {
         nextest_cpu::AttemptIdentity {
-            package: "hermit-run".into(),
+            package: self.package.into(),
             binary: self.binary.into(),
             test: self.test.into(),
             attempt: 1,
@@ -140,9 +212,10 @@ impl MeasuredCpuAllowance {
     }
 }
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 20] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 29] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
+        package: "hermit-run",
         binary: "hermit-run::liteinst_allocator",
         test: "genuine_detcore_leaf_keeps_scope_free_work_private",
         cpu_seconds: DETCORE_ALLOCATOR_CPU_SECONDS,
@@ -150,6 +223,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 20] = [
     },
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_CONSTRUCTOR_WRAPPER_NAME,
+        package: "hermit-run",
         binary: "hermit-run::liteinst_stacks",
         test: "cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack",
         cpu_seconds: DETCORE_CONSTRUCTOR_CPU_SECONDS,
@@ -157,6 +231,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 20] = [
     },
     MeasuredCpuAllowance {
         wrapper_name: STANDALONE_ALLOCATOR_WRAPPER_NAME,
+        package: "hermit-run",
         binary: "hermit-run::liteinst_allocator",
         test: "genuine_standalone_leaf_keeps_scope_free_work_private",
         cpu_seconds: STANDALONE_ALLOCATOR_CPU_SECONDS,
@@ -164,6 +239,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 20] = [
     },
     MeasuredCpuAllowance {
         wrapper_name: RENDERED_PROCFS_WRAPPER_NAME,
+        package: "hermit-run",
         binary: "hermit-run::cli",
         test: "detcore_renders_its_procfs_files_on_every_backend",
         cpu_seconds: RENDERED_PROCFS_CPU_SECONDS,
@@ -171,6 +247,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 20] = [
     },
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_STACK_WRAPPER_NAME,
+        package: "hermit-run",
         binary: "hermit-run::liteinst_stacks",
         test: "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
         cpu_seconds: DETCORE_STACK_CPU_SECONDS,
@@ -243,6 +320,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 20] = [
     ),
     MeasuredCpuAllowance {
         wrapper_name: CPU_PROFILE_V3_LOADER_WRAPPER_NAME,
+        package: "hermit-run",
         binary: "hermit-run::cli",
         test: "cpu_profile_v3_host_loader_sees_exactly_x86_64_v3",
         cpu_seconds: CPU_PROFILE_V3_LOADER_CPU_SECONDS,
@@ -250,9 +328,82 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 20] = [
     },
     MeasuredCpuAllowance {
         wrapper_name: RR_THREAD_STRESS_WRAPPER_NAME,
+        package: "hermit-run",
         binary: "hermit-run::rr_suite",
         test: "rr_thread_stress",
         cpu_seconds: RR_THREAD_STRESS_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: ESI_POLL_DEADLINE_TESTS[0].0,
+        package: "hermit-run",
+        binary: "hermit-run::external_signal_interrupt",
+        test: ESI_POLL_DEADLINE_TESTS[0].1,
+        cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: ESI_POLL_DEADLINE_TESTS[1].0,
+        package: "hermit-run",
+        binary: "hermit-run::external_signal_interrupt",
+        test: ESI_POLL_DEADLINE_TESTS[1].1,
+        cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: ESI_POLL_DEADLINE_TESTS[2].0,
+        package: "hermit-run",
+        binary: "hermit-run::external_signal_interrupt",
+        test: ESI_POLL_DEADLINE_TESTS[2].1,
+        cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: ESI_POLL_DEADLINE_TESTS[3].0,
+        package: "hermit-run",
+        binary: "hermit-run::external_signal_interrupt",
+        test: ESI_POLL_DEADLINE_TESTS[3].1,
+        cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: LIT_CHAOS_VERIFY_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::lit",
+        test: "lit_scheduler_strategies_chaos_verify",
+        cpu_seconds: LIT_CHAOS_VERIFY_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: DBT_VIRTUAL_KERNEL_FILES_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "detcore_fixes_the_virtual_kernel_files_on_dbt",
+        cpu_seconds: DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: CPU_PROFILE_V3_GUEST_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity",
+        cpu_seconds: CPU_PROFILE_V3_GUEST_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: SIGNAL_DISCARD_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take",
+        cpu_seconds: SIGNAL_DISCARD_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: PARITY_POST_PASS_NO_GUEST_WRAPPER_NAME,
+        package: "hermit-manifest-plan",
+        binary: "hermit-manifest-plan::bin/test-harness",
+        test: "tests::the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest",
+        cpu_seconds: PARITY_POST_PASS_NO_GUEST_CPU_SECONDS,
         wall_seconds: None,
     },
 ];
@@ -969,7 +1120,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), signal discard ({SIGNAL_DISCARD_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -2053,6 +2204,124 @@ mod tests {
         );
     }
 
+    /// The 2026-10-22 allowances (contended-host CPU-cap stops): each exact
+    /// identity, the test-harness one under its own package, gets its own
+    /// wrapper and budget, keeps the profile's wall, and nothing without
+    /// prepared admission.
+    #[test]
+    fn contended_host_allowances_have_their_measured_caps_and_keep_their_walls() {
+        let mut expected = ESI_POLL_DEADLINE_TESTS
+            .iter()
+            .map(|(name, test)| {
+                (
+                    "hermit-run",
+                    "hermit-run::external_signal_interrupt",
+                    *test,
+                    *name,
+                    34,
+                )
+            })
+            .collect::<Vec<_>>();
+        expected.extend([
+            (
+                "hermit-run",
+                "hermit-run::lit",
+                "lit_scheduler_strategies_chaos_verify",
+                LIT_CHAOS_VERIFY_WRAPPER_NAME,
+                35,
+            ),
+            (
+                "hermit-run",
+                "hermit-run::cli",
+                "detcore_fixes_the_virtual_kernel_files_on_dbt",
+                DBT_VIRTUAL_KERNEL_FILES_WRAPPER_NAME,
+                35,
+            ),
+            (
+                "hermit-run",
+                "hermit-run::cli",
+                "cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity",
+                CPU_PROFILE_V3_GUEST_WRAPPER_NAME,
+                36,
+            ),
+            (
+                "hermit-run",
+                "hermit-run::cli",
+                "a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take",
+                SIGNAL_DISCARD_WRAPPER_NAME,
+                33,
+            ),
+            (
+                "hermit-manifest-plan",
+                "hermit-manifest-plan::bin/test-harness",
+                "tests::the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest",
+                PARITY_POST_PASS_NO_GUEST_WRAPPER_NAME,
+                34,
+            ),
+        ]);
+        let identities = expected
+            .iter()
+            .map(
+                |(package, binary, test, _, _)| nextest_cpu::AttemptIdentity {
+                    package: (*package).into(),
+                    binary: (*binary).into(),
+                    test: (*test).into(),
+                    attempt: 1,
+                },
+            )
+            .collect::<Vec<_>>();
+        let inventory = measured_inventory(&identities);
+        let selected =
+            prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
+                .unwrap();
+        assert_eq!(selected.len(), expected.len());
+        let names = MEASURED_CPU_ALLOWANCES
+            .iter()
+            .map(|allowance| allowance.wrapper_name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names.len(),
+            MEASURED_CPU_ALLOWANCES.len(),
+            "wrapper names are unique"
+        );
+        for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5)] {
+            let rendered = scaled_config_with_allowances(
+                include_str!("../.config/nextest.toml"),
+                wall_multiplier,
+                Some((Path::new("/fixture/wrapper"), cpu_multiplier)),
+                &selected,
+            )
+            .unwrap();
+            let doc = rendered.parse::<DocumentMut>().unwrap();
+            for ((_, _, _, name, base), identity) in expected.iter().zip(&identities) {
+                let cpu_seconds =
+                    timeouts::scale_timeout_seconds(*base, cpu_multiplier, "CPU multiplier")
+                        .unwrap();
+                assert_eq!(
+                    wrapper_argv(&doc, name)[2],
+                    (cpu_seconds * 1_000_000).to_string(),
+                    "{name}"
+                );
+                let filter = exact_filter(identity);
+                let overrides = doc["profile"]["default"]["overrides"]
+                    .as_array_of_tables()
+                    .unwrap();
+                assert!(
+                    !overrides
+                        .iter()
+                        .any(|r| r.contains_key("slow-timeout")
+                            && r["filter"].as_str() == Some(&filter)),
+                    "{filter} keeps the profile's wall"
+                );
+            }
+        }
+        assert!(
+            prepared_selected_cpu_allowances(false, || Ok(serde_json::to_vec(&inventory).unwrap()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn rr_thread_stress_has_its_measured_cap_and_keeps_its_wall() {
         let identity = nextest_cpu::AttemptIdentity {
@@ -2352,7 +2621,7 @@ mod tests {
             prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
                 .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 20);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 29);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),
