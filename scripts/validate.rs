@@ -8493,10 +8493,40 @@ mod concurrent_validate_path_tests {
     }
 }
 
+/// Every `<lane>/<node>/`[`PARITY_JSONL`](hermit_manifest_plan::parity::PARITY_JSONL)
+/// the run's parity post-passes left below `e2e_result_root`, in path order.
+/// The series writer folds each record into its cell's row; a directory it
+/// cannot list contributes nothing, because the parity ledger append, not
+/// this, accounts for every owed cell.
+fn run_parity_records(e2e_result_root: &Path) -> Vec<PathBuf> {
+    let sorted = |directory: &Path| {
+        let mut entries = std::fs::read_dir(directory)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        entries.sort();
+        entries
+    };
+    sorted(e2e_result_root)
+        .iter()
+        .flat_map(|lane| sorted(lane))
+        .map(|node| node.join(hermit_manifest_plan::parity::PARITY_JSONL))
+        .filter(|records| records.is_file())
+        .collect()
+}
+
 /// Send all completed cells from one validate invocation to the parent series
 /// writer as one batch. The harness appends retries to each bucket's existing
 /// `results.jsonl`, so this reads the same durable attempt records used by the
 /// terminal-verdict projection instead of maintaining another result file.
+/// Each `parity.jsonl` the run's post-passes left goes with them as a
+/// `--parity-file`, so each verify row carries its cell's divergence from
+/// ptrace (dev-hermit ai_docs/2026-10-21-cell-row-first-divergence-design.md).
 fn append_validate_series(
     parent: Option<&Path>,
     tool_root: Option<&Path>,
@@ -8523,7 +8553,8 @@ fn append_validate_series(
             script.display()
         ));
     }
-    let mut child = Command::new("python3")
+    let mut command = Command::new("python3");
+    command
         .arg(&script)
         .arg("append-cells")
         .arg("--parent")
@@ -8535,7 +8566,11 @@ fn append_validate_series(
         .arg("--run-id")
         .arg(&run_id)
         .arg("--tree")
-        .arg(tree)
+        .arg(tree);
+    for records in run_parity_records(result_root) {
+        command.arg("--parity-file").arg(records);
+    }
+    let mut child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -23954,10 +23989,13 @@ fn validate_series_writer_bracket() -> Result<(), String> {
     let tool_root = root.join("tool-root");
     let checkout = root.join("checkout");
     let results = root.join("results/bucket");
+    let post_pass = root.join("results/portable/manifest_fixture");
     std::fs::create_dir_all(&parent)
         .and_then(|_| std::fs::create_dir_all(tool_root.join("ci-hub/series")))
         .and_then(|_| std::fs::create_dir_all(&checkout))
         .and_then(|_| std::fs::create_dir_all(&results))
+        .and_then(|_| std::fs::create_dir_all(&post_pass))
+        .and_then(|_| std::fs::write(post_pass.join("parity.jsonl"), b"{}\n"))
         .map_err(|error| format!("validate series writer: cannot create fixture: {error}"))?;
     std::fs::write(
         tool_root.join("ci-hub/series/series.py"),
@@ -24026,12 +24064,30 @@ print("fixture append accepted")
         ["--producer", "validate"],
         ["--run-id", "validate-series-fixture"],
         ["--tree", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        [
+            "--parity-file",
+            post_pass
+                .join("parity.jsonl")
+                .to_str()
+                .ok_or("fixture parity file is not UTF-8")?,
+        ],
     ] {
         if !arguments.windows(2).any(|window| window == pair) {
             return Err(format!(
                 "validate series writer: omitted argument pair {pair:?}"
             ));
         }
+    }
+    // Only the post-pass directory holds a parity.jsonl.
+    if arguments
+        .iter()
+        .filter(|argument| **argument == "--parity-file")
+        .count()
+        != 1
+    {
+        return Err(format!(
+            "validate series writer: expected exactly one --parity-file: {arguments:?}"
+        ));
     }
     let rows = captured["stdin"]
         .as_str()
@@ -24046,7 +24102,9 @@ print("fixture append accepted")
         ));
     }
     let _ = std::fs::remove_dir_all(&root);
-    println!("  validate series writer: checkout identity and both appended attempts carried");
+    println!(
+        "  validate series writer: checkout identity, the run's parity records and both appended attempts carried"
+    );
     Ok(())
 }
 

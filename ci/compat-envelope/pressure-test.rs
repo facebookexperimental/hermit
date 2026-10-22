@@ -4068,6 +4068,13 @@ fn emit_series_to(
             .arg("--tree")
             .arg(&metadata.hermit_sha)
             .stdin(Stdio::from(input));
+        // The series' post-pass records, which the writer folds into each
+        // cell's first-repetition row (dev-hermit
+        // ai_docs/2026-10-21-cell-row-first-divergence-design.md).
+        let parity_records = results.join(parity::PARITY_JSONL);
+        if parity_records.is_file() {
+            command.arg("--parity-file").arg(&parity_records);
+        }
         let child = parity::GroupChild::spawn(&mut command)
             .map_err(|e| format!("cannot run {}: {e}", script.display()))?;
         let status = child
@@ -28846,6 +28853,7 @@ print("fixture " + args[0] + " accepted")
             );
             let parent_arg = parent.display().to_string();
             let checkout_arg = checkout.display().to_string();
+            let parity_arg = results.join(parity::PARITY_JSONL).display().to_string();
             let calls = recorded_calls(&parent);
             let argv = calls
                 .iter()
@@ -28866,6 +28874,8 @@ print("fixture " + args[0] + " accepted")
                         RUN,
                         "--tree",
                         TREE,
+                        "--parity-file",
+                        &parity_arg,
                     ],
                     vec![
                         "append-parity",
