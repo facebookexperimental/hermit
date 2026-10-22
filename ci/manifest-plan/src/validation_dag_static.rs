@@ -1145,7 +1145,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (first divergence in the cell row): 1808.
     // And +3 from 9c05a306: 1811.
     // And +2 from 4a3194e4: 1813.
-    ("test.regular_crates", 1813),
+    // And +1 from f412ae41: 1814.
+    ("test.regular_crates", 1814),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5255,7 +5256,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same first-divergence cell-row test: 1794.
     // And +3 from 9c05a306: 1797.
     // And +2 from 4a3194e4: 1799.
-    ("test.regular_crates_on_host", 1799),
+    // And +1 from f412ae41: 1800.
+    ("test.regular_crates_on_host", 1800),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

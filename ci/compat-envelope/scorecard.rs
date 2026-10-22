@@ -41093,6 +41093,7 @@ mod parity_summary_tests {
             )),
             run_id: RUN.into(),
             hermit_sha: SHA.into(),
+            runs: None,
         }
     }
 

@@ -709,6 +709,78 @@ pub struct ParityFirstDifference {
     pub candidate_message: Option<String>,
 }
 
+/// One run of a candidate whose own two verify runs diverged, compared with
+/// the ptrace golden as a deterministic candidate's first run is (one
+/// `hermit log-diff` with [`PARITY_RECORD_ENVELOPE`]). It measures how far
+/// each run follows ptrace; the record stays `nondeterministic` with no
+/// credit, so nothing here is scored.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParityRunComparison {
+    /// Which of the candidate's two verify runs: 1 or 2.
+    pub run: u8,
+    /// `matched` or `diverged`.
+    pub verdict: ParityVerdict,
+    /// Raw log-record index of the first difference.
+    pub first_divergent_record: Option<usize>,
+    /// Compared messages on the ptrace reference side.
+    pub left_len: usize,
+    /// Compared messages on this run's side.
+    pub right_len: usize,
+    /// Leading compared messages equal on both sides.
+    pub matched_prefix: Option<usize>,
+    pub first_difference: Option<ParityFirstDifference>,
+}
+
+impl ParityRunComparison {
+    /// The run comparison a validated comparison `record` measured.
+    fn from_record(run: u8, record: &ParityRecord) -> Option<Self> {
+        if !record.verdict.is_measured() {
+            return None;
+        }
+        Some(Self {
+            run,
+            verdict: record.verdict,
+            first_divergent_record: record.first_divergent_record,
+            left_len: record.left_len?,
+            right_len: record.right_len?,
+            matched_prefix: record.matched_prefix,
+            first_difference: record.first_difference.clone(),
+        })
+    }
+
+    fn validate(&self, at: &str) -> Result<(), String> {
+        let at = format!("{at}: run {}", self.run);
+        if !self.verdict.is_measured() {
+            return Err(format!(
+                "{at}: a run comparison is matched or diverged, got {:?}",
+                self.verdict
+            ));
+        }
+        let shorter = self.left_len.min(self.right_len);
+        if let Some(prefix) = self.matched_prefix.filter(|&prefix| prefix > shorter) {
+            return Err(format!(
+                "{at}: matched prefix {prefix} exceeds the shorter compared stream of {} | {}",
+                self.left_len, self.right_len
+            ));
+        }
+        let diverged = self.verdict == ParityVerdict::Diverged;
+        if !diverged && (self.first_divergent_record.is_some() || self.first_difference.is_some()) {
+            return Err(format!("{at}: a match carries no divergence position"));
+        }
+        if !diverged && self.matched_prefix != Some(shorter) {
+            return Err(format!(
+                "{at}: a match must match the whole shorter stream of {shorter}, got {:?}",
+                self.matched_prefix
+            ));
+        }
+        if diverged && self.first_difference.is_none() {
+            return Err(format!("{at}: a divergence names its first difference"));
+        }
+        Ok(())
+    }
+}
+
 /// Deserialize an `Option` field that must be present, as `null` or a value.
 /// Serde reads a missing `Option` field as `None` unless the field names its
 /// own deserializer, so a row that omits the field is refused rather than
@@ -771,6 +843,11 @@ pub struct ParityRecord {
     pub candidate_log: Option<String>,
     pub run_id: String,
     pub hermit_sha: String,
+    /// For a `nondeterministic` candidate only: each run log of its diverged
+    /// attempt that was compared with the ptrace golden, in run order. Absent
+    /// when none was (see [`post_pass`]). Never credited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs: Option<Vec<ParityRunComparison>>,
 }
 
 impl ParityRecord {
@@ -883,6 +960,7 @@ impl ParityRecord {
             candidate_log: Some(candidate_log.to_string()),
             run_id: run_id.to_string(),
             hermit_sha: hermit_sha.to_string(),
+            runs: None,
         };
         record.validate()?;
         Ok(record)
@@ -924,6 +1002,7 @@ impl ParityRecord {
             candidate_log: candidate_log.map(str::to_string),
             run_id: run_id.to_string(),
             hermit_sha: hermit_sha.to_string(),
+            runs: None,
         };
         record.validate()?;
         Ok(record)
@@ -1069,6 +1148,28 @@ impl ParityRecord {
                     "{at}: {:?} names the log it says is missing",
                     self.verdict
                 ));
+            }
+        }
+        if let Some(runs) = &self.runs {
+            if self.verdict != ParityVerdict::Nondeterministic
+                || self.operand != Some(ParityOperand::Candidate)
+            {
+                return Err(format!(
+                    "{at}: only a nondeterministic candidate carries run comparisons"
+                ));
+            }
+            if runs.is_empty() {
+                return Err(format!("{at}: run comparisons are absent, never empty"));
+            }
+            let order = runs.iter().map(|run| run.run).collect::<Vec<_>>();
+            if !matches!(order.as_slice(), [1] | [2] | [1, 2]) {
+                return Err(format!(
+                    "{at}: run comparisons name runs {order:?}; expected 1 and 2 at most once, \
+                     in order"
+                ));
+            }
+            for run in runs {
+                run.validate(&at)?;
             }
         }
         Ok(())
@@ -2488,6 +2589,17 @@ struct Comparison {
     inputs_equalized: bool,
 }
 
+/// One run log of a red candidate's diverged attempt, to compare with the
+/// golden after every [`Comparison`] ([`ParityRunComparison`]).
+struct RunComparison {
+    index: usize,
+    cell: ParityCellId,
+    run: u8,
+    reference: Operand,
+    candidate: Operand,
+    inputs_equalized: bool,
+}
+
 /// Write `parity.jsonl` for `scope` from the verify rows of one harness
 /// process (every attempt, in any order) and their retained logs.
 ///
@@ -2510,8 +2622,18 @@ struct Comparison {
 ///   [`ParityRecord::from_comparison`] records it. A comparison that cannot
 ///   run or report is [`UnavailableClass::LogDiffFailed`].
 ///
-/// No log is read before d), so an operand that diverged is never compared,
+/// No log is read before d), so an operand that diverged is never scored,
 /// whatever logs it retained. Every cell in scope gets exactly one line.
+///
+/// A candidate that is `nondeterministic` because its own two runs diverged
+/// on an attempt of this history is still measured, never scored: once every
+/// comparison above has run, within the same budget, each of that attempt's
+/// two run logs (`run1_log_*`, `run2_log_*`) is compared with the test's
+/// golden by the same log-diff, and the record's `runs` keeps each
+/// [`ParityRunComparison`] that completed. It is absent when the reference
+/// left no golden, the attempt did not retain exactly one nonempty log per
+/// run, the operands cannot be shown to share a `HERMIT_EPOCH`, or no
+/// comparison completed. Its verdict, class and credit are unchanged.
 ///
 /// Before anything that can fail it removes the previous outputs
 /// ([`clear_outputs`]) and marks [`PARITY_STATUS_JSON`] `running`; it ends it
@@ -2624,6 +2746,7 @@ fn measure(
 
     let mut records: Vec<Option<ParityRecord>> = vec![None; scope.len()];
     let mut comparisons = Vec::new();
+    let mut run_comparisons = Vec::new();
     let mut references: BTreeMap<String, Result<CellResult, Unusable>> = BTreeMap::new();
     let mut goldens: BTreeMap<String, Result<Operand, Unusable>> = BTreeMap::new();
     for (index, cell) in scope.iter().enumerate() {
@@ -2716,6 +2839,23 @@ fn measure(
                     Ok(row) => golden_of(&mut goldens, test, row).ok(),
                     _ => None,
                 };
+                if let (Some(golden), UnavailableClass::DeterminismMismatch) =
+                    (&golden, unusable.class)
+                {
+                    run_comparisons.extend(
+                        red_run_operands(candidate_history, config.imported_logs.as_ref(), golden)
+                            .into_iter()
+                            .map(|(run, operand)| RunComparison {
+                                index,
+                                cell: cell.clone(),
+                                run,
+                                inputs_equalized: config.imported_logs.is_none()
+                                    && inputs_equalized(&golden.inputs, &operand.inputs),
+                                reference: golden.clone(),
+                                candidate: operand,
+                            }),
+                    );
+                }
                 records[index] = Some(unusable_record(
                     unusable,
                     golden.as_ref().map(|golden| golden.log.as_path()),
@@ -2868,7 +3008,7 @@ fn measure(
     }
 
     let log_diff_runs = AtomicUsize::new(0);
-    if !comparisons.is_empty() {
+    if !comparisons.is_empty() || !run_comparisons.is_empty() {
         let logdiff_dir = config.output_dir.join(PARITY_LOGDIFF_DIR);
         fs::create_dir_all(&logdiff_dir)
             .map_err(|error| format!("cannot create {}: {error}", logdiff_dir.display()))?;
@@ -2883,34 +3023,31 @@ fn measure(
             Some(outer) if outer.at < budget.at => outer.clone(),
             _ => budget,
         };
-        let next = AtomicUsize::new(0);
-        let measured = Mutex::new(Vec::new());
-        thread::scope(|threads| {
-            for _ in 0..config.jobs.clamp(1, comparisons.len()) {
-                threads.spawn(|| {
-                    loop {
-                        let slot = next.fetch_add(1, Ordering::SeqCst);
-                        let Some(comparison) = comparisons.get(slot) else {
-                            break;
-                        };
-                        let record = compare(config, comparison, &deadline, &log_diff_runs);
-                        measured
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .push((comparison, record));
-                    }
-                });
-            }
-        });
-        for (comparison, record) in measured
-            .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
+        for (comparison, record) in in_parallel(config.jobs, &comparisons, |comparison| {
+            compare(config, comparison, &deadline, &log_diff_runs)
+        }) {
             let record = match record {
                 Ok(record) => record,
                 Err(error) => unrecorded_comparison(config, comparison, &error)?,
             };
             records[comparison.index] = Some(record);
+        }
+        // The red candidates' runs go last, so they never take the budget
+        // from a scored comparison.
+        let mut measured_runs = in_parallel(config.jobs, &run_comparisons, |comparison| {
+            compare_run(config, comparison, &deadline, &log_diff_runs)
+        });
+        measured_runs.sort_by_key(|(comparison, _)| (comparison.index, comparison.run));
+        for (comparison, run) in measured_runs {
+            let (Ok(run), Some(record)) = (run, records[comparison.index].as_mut()) else {
+                continue;
+            };
+            record.runs.get_or_insert_with(Vec::new).push(run);
+        }
+        for record in records.iter().flatten() {
+            if record.runs.is_some() {
+                record.validate()?;
+            }
         }
     }
     let records = records
@@ -2933,6 +3070,100 @@ fn measure(
         records,
         log_diff_runs: log_diff_runs.into_inner(),
     })
+}
+
+/// `measure` applied to every item on at most `jobs` threads, each result
+/// beside its item, in completion order.
+fn in_parallel<'a, T: Sync, R: Send>(
+    jobs: usize,
+    items: &'a [T],
+    measure: impl Fn(&'a T) -> R + Sync,
+) -> Vec<(&'a T, R)> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let next = AtomicUsize::new(0);
+    let measured = Mutex::new(Vec::new());
+    thread::scope(|threads| {
+        for _ in 0..jobs.clamp(1, items.len()) {
+            threads.spawn(|| {
+                loop {
+                    let slot = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(item) = items.get(slot) else {
+                        break;
+                    };
+                    let result = measure(item);
+                    measured
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((item, result));
+                }
+            });
+        }
+    });
+    measured
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The two run logs of a red candidate's last attempt whose verification
+/// recorded a mismatch, hashed, for [`RunComparison`]s against `golden`:
+/// `(1, run 1)` and `(2, run 2)`. None when that attempt did not retain
+/// exactly one nonempty `run1_log_*` and one `run2_log_*`, when either cannot
+/// be read, or when its `HERMIT_EPOCH` is not the golden's. A row another
+/// process ran is read only from the directory its logs were restored into.
+fn red_run_operands(
+    history: Option<&Vec<CellResult>>,
+    imported: Option<&ImportedLogs>,
+    golden: &Operand,
+) -> Vec<(u8, Operand)> {
+    let Some(row) = history
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|row| records_mismatch(row))
+    else {
+        return Vec::new();
+    };
+    let inputs = ParityGuestInputs::from_result(row);
+    if inputs.epoch.is_none() || inputs.epoch != golden.inputs.epoch {
+        return Vec::new();
+    }
+    let Some(recorded) = recorded_log_dir(row) else {
+        return Vec::new();
+    };
+    let directory = match imported.map(|imported| imported.restored(recorded)) {
+        None => PathBuf::from(recorded),
+        Some(Ok(directory)) => directory.to_path_buf(),
+        Some(Err(_)) => return Vec::new(),
+    };
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let names = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    let mut operands = Vec::new();
+    for run in [1u8, 2] {
+        let prefix = format!("run{run}_log_");
+        let logs = names
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect::<Vec<_>>();
+        let [log] = logs.as_slice() else {
+            return Vec::new();
+        };
+        match hashed(log, inputs.clone()) {
+            Ok(operand) if operand.bytes > 0 => operands.push((run, operand)),
+            _ => return Vec::new(),
+        }
+    }
+    operands
 }
 
 /// The record for a comparison whose report no record can carry. That is
@@ -3680,39 +3911,104 @@ fn compare(
     // Both operands are deterministic and retained, so every way the
     // comparison fails to run or report is the parity tool's failure: it
     // concerns the comparison, not either side.
-    let unavailable = |reason: String| {
-        ParityRecord::unmeasured(
-            cell,
-            ParityVerdict::Unavailable,
-            UnavailableClass::LogDiffFailed,
-            None,
-            comparison.inputs_equalized,
-            &reason,
-            Some(&reference_log),
-            Some(&candidate_log),
-            &config.run_id,
-            &config.hermit_sha,
-        )
+    let report = match log_diff(
+        config,
+        cell,
+        &comparison.reference,
+        &comparison.candidate,
+        &cell.backend.to_string(),
+        deadline,
+        runs,
+    ) {
+        Ok(report) => report,
+        Err(reason) => {
+            return ParityRecord::unmeasured(
+                cell,
+                ParityVerdict::Unavailable,
+                UnavailableClass::LogDiffFailed,
+                None,
+                comparison.inputs_equalized,
+                &reason,
+                Some(&reference_log),
+                Some(&candidate_log),
+                &config.run_id,
+                &config.hermit_sha,
+            );
+        }
     };
+    ParityRecord::from_comparison(
+        cell,
+        &report,
+        comparison.inputs_equalized,
+        &reference_log,
+        &candidate_log,
+        &config.run_id,
+        &config.hermit_sha,
+    )
+}
+
+/// One run of a red candidate compared with the golden
+/// ([`ParityRunComparison`]), or why it was not: a log-diff that could not
+/// run or report, or a report that is not a match or divergence.
+fn compare_run(
+    config: &PostPassConfig,
+    comparison: &RunComparison,
+    deadline: &PostPassDeadline,
+    runs: &AtomicUsize,
+) -> Result<ParityRunComparison, String> {
+    let cell = &comparison.cell;
+    let report = log_diff(
+        config,
+        cell,
+        &comparison.reference,
+        &comparison.candidate,
+        &format!("{}.run{}", cell.backend, comparison.run),
+        deadline,
+        runs,
+    )?;
+    let record = ParityRecord::from_comparison(
+        cell,
+        &report,
+        comparison.inputs_equalized,
+        &config.record_path(&comparison.reference.log),
+        &config.record_path(&comparison.candidate.log),
+        &config.run_id,
+        &config.hermit_sha,
+    )?;
+    ParityRunComparison::from_record(comparison.run, &record).ok_or_else(|| {
+        record
+            .reason
+            .unwrap_or_else(|| format!("log-diff verdict was {:?}", record.verdict))
+    })
+}
+
+/// One bounded `hermit log-diff` of `reference` (left) and `candidate`
+/// (right) with [`PARITY_RECORD_ENVELOPE`], its report and stderr written as
+/// `<test>@<stem>.json` and `.stderr` below [`PARITY_LOGDIFF_DIR`]. A
+/// matched or diverged report must describe exactly the two operands. Every
+/// way it fails to run or report is the error.
+fn log_diff(
+    config: &PostPassConfig,
+    cell: &ParityCellId,
+    reference: &Operand,
+    candidate: &Operand,
+    stem: &str,
+    deadline: &PostPassDeadline,
+    runs: &AtomicUsize,
+) -> Result<LogDiffReport, String> {
     let now = Instant::now();
     if now >= deadline.at {
-        return unavailable(format!(
+        return Err(format!(
             "{} ran out before this comparison started",
             deadline.bound
         ));
     }
     let base = config.output_dir.join(PARITY_LOGDIFF_DIR);
-    let (json, stderr_path) = match (
-        plain_relative(&cell.test_id, &format!("@{}.json", cell.backend)),
-        plain_relative(&cell.test_id, &format!("@{}.stderr", cell.backend)),
-    ) {
-        (Ok(json), Ok(stderr)) => (base.join(json), base.join(stderr)),
-        (Err(error), _) | (_, Err(error)) => return unavailable(error),
-    };
+    let json = base.join(plain_relative(&cell.test_id, &format!("@{stem}.json"))?);
+    let stderr_path = base.join(plain_relative(&cell.test_id, &format!("@{stem}.stderr"))?);
     if let Some(parent) = json.parent() {
-        if let Err(error) = fs::create_dir_all(parent) {
-            return unavailable(format!("cannot create {}: {error}", parent.display()));
-        }
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
     let _ = fs::remove_file(&json);
     // The child runs in the artifacts directory, so each path it is handed
@@ -3720,53 +4016,40 @@ fn compare(
     // `--results`, `--artifacts`, `E2E_RESULT_ROOT` or `HERMIT_BIN` would
     // otherwise resolve a second time below the artifacts directory. The two
     // logs are operands, which are absolute already.
-    let spawn_paths = (|| {
-        Ok::<_, String>((
-            program_independent_of_cwd(&config.hermit_bin)?,
-            independent_of_cwd(&json)?,
-            independent_of_cwd(&config.artifacts)?,
-        ))
-    })();
-    let (program, report_path, child_dir) = match spawn_paths {
-        Ok(paths) => paths,
-        Err(error) => return unavailable(error),
-    };
+    let program = program_independent_of_cwd(&config.hermit_bin)?;
+    let report_path = independent_of_cwd(&json)?;
+    let child_dir = independent_of_cwd(&config.artifacts)?;
     let timeout = config.log_diff_timeout.min(deadline.at - now);
     runs.fetch_add(1, Ordering::SeqCst);
-    let (status, stderr) = match run_bounded(
+    let (status, stderr) = run_bounded(
         Command::new(&program)
             .arg("log-diff")
-            .arg(&comparison.reference.log)
-            .arg(&comparison.candidate.log)
+            .arg(&reference.log)
+            .arg(&candidate.log)
             .arg("--json")
             .arg(&report_path)
             .args(["--record-envelope", PARITY_RECORD_ENVELOPE])
             .current_dir(&child_dir),
         timeout,
-    ) {
-        Ok(outcome) => outcome,
-        Err(error) => return unavailable(format!("cannot run hermit log-diff: {error}")),
-    };
+    )
+    .map_err(|error| format!("cannot run hermit log-diff: {error}"))?;
     let _ = fs::write(&stderr_path, &stderr);
     let stderr_tail = bounded(String::from_utf8_lossy(&stderr).trim(), MESSAGE_LIMIT_BYTES);
     let Some(status) = status else {
-        return unavailable(format!(
+        return Err(format!(
             "hermit log-diff exceeded its {:.1} s bound and was killed",
             timeout.as_secs_f64()
         ));
     };
-    let report: LogDiffReport = match fs::read(&json)
+    let report: LogDiffReport = fs::read(&json)
         .map_err(|error| error.to_string())
         .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
-    {
-        Ok(report) => report,
-        Err(error) => {
-            return unavailable(format!(
+        .map_err(|error| {
+            format!(
                 "hermit log-diff exited {status} without a readable report ({error}); stderr: \
                  {stderr_tail}"
-            ));
-        }
-    };
+            )
+        })?;
     let consistent = match status.code() {
         Some(0) => report.verdict == LogDiffVerdict::Matched,
         Some(1) => report.verdict == LogDiffVerdict::Diverged,
@@ -3777,7 +4060,7 @@ fn compare(
         _ => false,
     };
     if !consistent {
-        return unavailable(format!(
+        return Err(format!(
             "hermit log-diff exited {status}, which contradicts its report verdict {:?}; \
              stderr: {stderr_tail}",
             report.verdict
@@ -3792,25 +4075,16 @@ fn compare(
         };
         match &report.inputs {
             Some(inputs)
-                if describes(&inputs.left, &comparison.reference)
-                    && describes(&inputs.right, &comparison.candidate) => {}
+                if describes(&inputs.left, reference) && describes(&inputs.right, candidate) => {}
             _ => {
-                return unavailable(
+                return Err(
                     "the log-diff report's inputs are not the compared golden and candidate log"
                         .to_string(),
                 );
             }
         }
     }
-    ParityRecord::from_comparison(
-        cell,
-        &report,
-        comparison.inputs_equalized,
-        &reference_log,
-        &candidate_log,
-        &config.run_id,
-        &config.hermit_sha,
-    )
+    Ok(report)
 }
 
 /// Run a child with no stdin or stdout, keeping at most
@@ -6231,6 +6505,138 @@ mod tests {
             test_id: "fixture/parity".into(),
             backend: ParityBackend::Kvm,
         }
+    }
+
+    /// `runs` belongs to a nondeterministic candidate only, as run 1 and/or
+    /// run 2 in order, each a consistent match or divergence; an absent field
+    /// reads as none and is not written, so records without it keep their
+    /// encoding.
+    #[test]
+    fn run_comparisons_belong_to_a_red_candidate_and_must_be_consistent() {
+        let red = ParityRecord::unmeasured(
+            &cell(),
+            ParityVerdict::Nondeterministic,
+            UnavailableClass::DeterminismMismatch,
+            Some(ParityOperand::Candidate),
+            false,
+            "the kvm candidate verify cell failed determinism",
+            None,
+            None,
+            "run",
+            SHA,
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&red).unwrap();
+        assert!(!encoded.contains("\"runs\""), "{encoded}");
+        assert_eq!(serde_json::from_str::<ParityRecord>(&encoded).unwrap(), red);
+        let matched = ParityRunComparison {
+            run: 1,
+            verdict: ParityVerdict::Matched,
+            first_divergent_record: None,
+            left_len: 3,
+            right_len: 3,
+            matched_prefix: Some(3),
+            first_difference: None,
+        };
+        let diverged = ParityRunComparison {
+            run: 2,
+            verdict: ParityVerdict::Diverged,
+            first_divergent_record: Some(2),
+            left_len: 3,
+            right_len: 4,
+            matched_prefix: Some(1),
+            first_difference: Some(ParityFirstDifference {
+                field: None,
+                syscall: None,
+                scheduler_turn: None,
+                virtual_nanoseconds: None,
+                reference_message: Some("INFO a".into()),
+                candidate_message: Some("INFO b".into()),
+            }),
+        };
+        let with = |runs: Vec<ParityRunComparison>| ParityRecord {
+            runs: Some(runs),
+            ..red.clone()
+        };
+        let good = with(vec![matched.clone(), diverged.clone()]);
+        good.validate().unwrap();
+        let encoded = serde_json::to_string(&good).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ParityRecord>(&encoded).unwrap(),
+            good
+        );
+        with(vec![diverged.clone()]).validate().unwrap();
+        let refused = |record: ParityRecord, expected: &str| {
+            let error = record.validate().unwrap_err();
+            assert!(error.contains(expected), "{expected:?} not in {error}");
+        };
+        refused(with(Vec::new()), "absent, never empty");
+        refused(
+            with(vec![diverged.clone(), matched.clone()]),
+            "expected 1 and 2 at most once",
+        );
+        refused(
+            with(vec![
+                matched.clone(),
+                ParityRunComparison {
+                    run: 1,
+                    ..diverged.clone()
+                },
+            ]),
+            "expected 1 and 2 at most once",
+        );
+        refused(
+            with(vec![ParityRunComparison {
+                run: 3,
+                ..matched.clone()
+            }]),
+            "expected 1 and 2 at most once",
+        );
+        refused(
+            ParityRecord {
+                operand: Some(ParityOperand::Reference),
+                ..good.clone()
+            },
+            "only a nondeterministic candidate",
+        );
+        refused(
+            with(vec![ParityRunComparison {
+                verdict: ParityVerdict::Unavailable,
+                ..matched.clone()
+            }]),
+            "matched or diverged",
+        );
+        refused(
+            with(vec![ParityRunComparison {
+                matched_prefix: Some(4),
+                ..diverged.clone()
+            }]),
+            "exceeds the shorter compared stream",
+        );
+        refused(
+            with(vec![ParityRunComparison {
+                first_divergent_record: Some(1),
+                ..matched.clone()
+            }]),
+            "a match carries no divergence position",
+        );
+        refused(
+            with(vec![ParityRunComparison {
+                matched_prefix: Some(2),
+                ..matched.clone()
+            }]),
+            "must match the whole shorter stream",
+        );
+        refused(
+            with(vec![ParityRunComparison {
+                first_difference: None,
+                ..diverged.clone()
+            }]),
+            "names its first difference",
+        );
+        let mut unknown = serde_json::to_value(&good).unwrap();
+        unknown["runs"][0]["credit"] = 1.into();
+        assert!(serde_json::from_value::<ParityRecord>(unknown).is_err());
     }
 
     fn record_on(backend: ParityBackend, report: &LogDiffReport, equal: bool) -> ParityRecord {
@@ -10352,9 +10758,12 @@ mod tests {
     /// when both of its runs' logs were kept: as the candidate or as the
     /// reference, and when a later attempt passed or the mismatch was seen in
     /// an earlier repetition, the cell is `nondeterministic` with no credit,
-    /// nothing is compared, and a mismatched reference writes no golden.
+    /// it is never scored, and a mismatched reference writes no golden. A
+    /// candidate whose mismatch is in this history still has each of its two
+    /// runs compared with the golden, in `runs`; one whose mismatch was in
+    /// another repetition, or whose reference has no golden, has none.
     #[test]
-    fn a_mismatched_operand_is_never_compared_even_with_both_logs_retained() {
+    fn a_mismatched_operand_is_never_scored_even_with_both_logs_retained() {
         let fixture = Fixture::new("mismatch-logs");
         let mismatch = |test: &str, backend: &str, attempt: u64| {
             keep_second_run(
@@ -10409,7 +10818,8 @@ mod tests {
         scope.extend(ParityBackend::ALL.map(|backend| parity_cell("fx/reference", backend)));
         let report = post_pass(&config, &scope, &rows).unwrap();
         assert_eq!(report.records.len(), 4 + ParityBackend::ALL.len());
-        assert_eq!((report.log_diff_runs, fixture.log_diff_calls()), (0, 0));
+        // Two runs each of fx/candidate and fx/candidate-passed.
+        assert_eq!((report.log_diff_runs, fixture.log_diff_calls()), (4, 4));
 
         let golden = |test: &str| path_text(&golden_paths(&fixture.artifacts(), test).unwrap().0);
         let on_attempt = |role: &str, test: &str, consequence: &str| {
@@ -10485,7 +10895,7 @@ mod tests {
                 "{cell}"
             );
             assert!(!record.inputs_equalized, "{cell}");
-            // A mismatched log is never named, so never read.
+            // A mismatched log is never named.
             assert_eq!(
                 (
                     record.reference_log.clone(),
@@ -10494,6 +10904,38 @@ mod tests {
                 (reference_log, None),
                 "{cell}"
             );
+            let measured_runs = ["fx/candidate", "fx/candidate-passed"]
+                .contains(&cell.test_id.as_str())
+                .then(|| {
+                    vec![
+                        ParityRunComparison {
+                            run: 1,
+                            verdict: ParityVerdict::Matched,
+                            first_divergent_record: None,
+                            left_len: 3,
+                            right_len: 3,
+                            matched_prefix: Some(3),
+                            first_difference: None,
+                        },
+                        ParityRunComparison {
+                            run: 2,
+                            verdict: ParityVerdict::Diverged,
+                            first_divergent_record: Some(2),
+                            left_len: 3,
+                            right_len: 3,
+                            matched_prefix: Some(1),
+                            first_difference: Some(ParityFirstDifference {
+                                field: Some("token 4: `3` vs `4`".into()),
+                                syscall: Some(2),
+                                scheduler_turn: None,
+                                virtual_nanoseconds: None,
+                                reference_message: Some("INFO detcore: read 3".into()),
+                                candidate_message: Some("INFO detcore: read 4".into()),
+                            }),
+                        },
+                    ]
+                });
+            assert_eq!(record.runs, measured_runs, "{cell}");
         }
         // Outside the mean and the floor.
         assert_eq!(
@@ -10511,7 +10953,7 @@ mod tests {
              unavailable 0, inputs-not-equalized 0",
             "measured 0; no golden 9 (determinism-mismatch 9); not compared 0; unmeasured 0",
             "none measured with equal inputs; none measured with unequal inputs",
-            "0 log-diff comparison(s), 0 guest runs",
+            "4 log-diff comparison(s), 0 guest runs",
         ] {
             assert!(summary.contains(part), "{part:?} not in {summary}");
         }
@@ -11765,6 +12207,7 @@ mod tests {
             candidate_log: Some("cand.log".into()),
             run_id: LEDGER_RUN.into(),
             hermit_sha: SHA.into(),
+            runs: None,
         };
         record.validate().unwrap();
         record

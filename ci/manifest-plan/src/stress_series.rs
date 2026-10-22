@@ -372,6 +372,26 @@ pub struct SeriesVsPtrace {
     pub right_len: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_difference: Option<SeriesFirstDifference>,
+    /// A `nondeterministic` candidate's own runs against the ptrace golden
+    /// (`parity::ParityRunComparison`), never credited; empty when none was
+    /// compared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<SeriesRunVsPtrace>,
+}
+
+/// One run of a red candidate against the ptrace golden.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesRunVsPtrace {
+    /// 1 or 2.
+    pub run: u8,
+    /// `matched` or `diverged`.
+    pub verdict: crate::parity::ParityVerdict,
+    pub matched_prefix: Option<u64>,
+    pub left_len: u64,
+    pub right_len: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_difference: Option<SeriesFirstDifference>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1066,7 +1086,10 @@ impl SeriesRow {
                     ));
                 }
             }
-            if let Some(difference) = &parity.first_difference {
+            let messages = |at: &str, difference: &Option<SeriesFirstDifference>| {
+                let Some(difference) = difference else {
+                    return Ok(());
+                };
                 for (side, value) in [
                     ("reference", &difference.reference),
                     ("candidate", &difference.candidate),
@@ -1075,10 +1098,46 @@ impl SeriesRow {
                         let chars = value.chars().count();
                         if chars == 0 || chars > DIVERGENCE_MESSAGE_MAX_CHARS {
                             return Err(format!(
-                                "divergence.vs_ptrace.first_difference.{side} must be 1 to {DIVERGENCE_MESSAGE_MAX_CHARS} characters, got {chars}"
+                                "{at}.first_difference.{side} must be 1 to {DIVERGENCE_MESSAGE_MAX_CHARS} characters, got {chars}"
                             ));
                         }
                     }
+                }
+                Ok(())
+            };
+            messages("divergence.vs_ptrace", &parity.first_difference)?;
+            if !parity.runs.is_empty() {
+                if parity.verdict != crate::parity::ParityVerdict::Nondeterministic {
+                    return Err(
+                        "divergence.vs_ptrace.runs belongs to a nondeterministic candidate only"
+                            .into(),
+                    );
+                }
+                let order = parity.runs.iter().map(|run| run.run).collect::<Vec<_>>();
+                if !matches!(order.as_slice(), [1] | [2] | [1, 2]) {
+                    return Err(format!(
+                        "divergence.vs_ptrace.runs names runs {order:?}; expected 1 and 2 at most once, in order"
+                    ));
+                }
+                for run in &parity.runs {
+                    let at = format!("divergence.vs_ptrace.runs[run {}]", run.run);
+                    if !run.verdict.is_measured() {
+                        return Err(format!("{at} must be matched or diverged"));
+                    }
+                    if run
+                        .matched_prefix
+                        .is_some_and(|prefix| prefix > run.left_len.min(run.right_len))
+                    {
+                        return Err(format!("{at}.matched_prefix exceeds the shorter log"));
+                    }
+                    if (run.verdict == crate::parity::ParityVerdict::Diverged)
+                        != run.first_difference.is_some()
+                    {
+                        return Err(format!(
+                            "{at}.first_difference is present exactly when it diverged"
+                        ));
+                    }
+                    messages(&at, &run.first_difference)?;
                 }
             }
         }
@@ -2214,8 +2273,52 @@ mod tests {
                     reference: Some("INFO detcore::scheduler: guest in queue".into()),
                     candidate: Some("INFO detcore::random: DETLOG init auxv".into()),
                 }),
+                runs: Vec::new(),
             }),
         });
+        fixture
+    }
+
+    /// [`divergence_row`] for a red candidate: no credit, both runs measured.
+    fn red_divergence_row() -> SeriesRow {
+        let mut fixture = divergence_row();
+        let parity = fixture
+            .series
+            .divergence
+            .as_mut()
+            .unwrap()
+            .vs_ptrace
+            .as_mut()
+            .unwrap();
+        let difference = parity.first_difference.take();
+        *parity = SeriesVsPtrace {
+            verdict: crate::parity::ParityVerdict::Nondeterministic,
+            unavailable_class: Some(crate::parity::UnavailableClass::DeterminismMismatch),
+            credit: None,
+            unequalized_credit: None,
+            matched_prefix: None,
+            left_len: None,
+            right_len: None,
+            first_difference: None,
+            runs: vec![
+                SeriesRunVsPtrace {
+                    run: 1,
+                    verdict: crate::parity::ParityVerdict::Matched,
+                    matched_prefix: Some(115),
+                    left_len: 115,
+                    right_len: 115,
+                    first_difference: None,
+                },
+                SeriesRunVsPtrace {
+                    run: 2,
+                    verdict: crate::parity::ParityVerdict::Diverged,
+                    matched_prefix: Some(4),
+                    left_len: 115,
+                    right_len: 101,
+                    first_difference: difference,
+                },
+            ],
+        };
         fixture
     }
 
@@ -2230,6 +2333,15 @@ mod tests {
             serde_json::from_value::<SeriesRow>(encoded).unwrap(),
             fixture
         );
+        // A red candidate's runs against the golden round-trip too.
+        let red = red_divergence_row();
+        red.validate_for_write().unwrap();
+        let encoded = serde_json::to_value(&red).unwrap();
+        assert_eq!(
+            encoded["series"]["divergence"]["vs_ptrace"]["runs"][1]["matched_prefix"],
+            4
+        );
+        assert_eq!(serde_json::from_value::<SeriesRow>(encoded).unwrap(), red);
         // A row written before the field existed stays readable without it.
         let mut without = divergence_row();
         without.series.divergence = None;
@@ -2325,6 +2437,44 @@ mod tests {
             .candidate = Some("x".repeat(DIVERGENCE_MESSAGE_MAX_CHARS + 1));
         other.series.divergence = Some(changed);
         cases.push(("long message", other, "must be 1 to 240 characters"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().runs = divergence(&mut red_divergence_row())
+            .vs_ptrace
+            .unwrap()
+            .runs;
+        other.series.divergence = Some(changed);
+        cases.push((
+            "runs on a measured cell",
+            other,
+            "nondeterministic candidate only",
+        ));
+        let mut other = red_divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().runs.reverse();
+        other.series.divergence = Some(changed);
+        cases.push(("runs out of order", other, "at most once, in order"));
+        let mut other = red_divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().runs[0].first_difference =
+            changed.vs_ptrace.as_ref().unwrap().runs[1]
+                .first_difference
+                .clone();
+        other.series.divergence = Some(changed);
+        cases.push((
+            "a matched run with a difference",
+            other,
+            "exactly when it diverged",
+        ));
+        let mut other = red_divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().runs[1].matched_prefix = Some(102);
+        other.series.divergence = Some(changed);
+        cases.push((
+            "a run's prefix past its shorter log",
+            other,
+            "exceeds the shorter log",
+        ));
         for (label, fixture, message) in cases {
             let error = fixture
                 .validate_for_write()
