@@ -926,7 +926,11 @@ mod tests {
             // integration identity beyond the landed signals tests: 657.
             // procfs_determinism's runtime_private_smaps_keep_the_opened_targets_guest_mapping
             // (DBT Smaps projection, +1): 658.
-            assert_eq!(population, 658);
+            // Less verify_claim_names_its_limit's
+            // under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change,
+            // ignored as a known failure by
+            // https://github.com/rrnewton/hermit/pull/4559 (-1): 657.
+            assert_eq!(population, 657);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

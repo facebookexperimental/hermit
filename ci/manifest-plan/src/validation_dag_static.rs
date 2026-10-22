@@ -2661,7 +2661,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the retirement-refusal unit
     // (a_replaced_request_retires_only_plain_waiting_ownership): 2269.
     // And +9 from e931b265: 2278.
-    ("test.detcore_unit", 2278),
+    // And the five io_buffers/statx-tail units of https://github.com/rrnewton/hermit/pull/4559
+    // (two stat records, two field decoders, the statx tail): 2283.
+    ("test.detcore_unit", 2283),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3020,7 +3022,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a wait mask differing only in forced signals: 310.
     // And the dedicated pselect6 wrapper-validation fixture: 311.
     // And the opened-target private-Smaps control: 312, listed.
-    ("test.hermit_integration_3", 312),
+    // Less under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change,
+    // ignored as a known failure by https://github.com/rrnewton/hermit/pull/4559: 311.
+    ("test.hermit_integration_3", 311),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3836,7 +3840,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And signal_at_is_sent_after_commit_n_and_before_the_next_commit and
     // signal_at_snapshot_controller_counts_only_a_completed_snapshot (review of
     // https://github.com/rrnewton/hermit/pull/4532): 587, listed.
-    ("test.cli", 587),
+    // Less no_namespace_preserves_affinity_for_run_and_verify, ignored as a
+    // known failure by https://github.com/rrnewton/hermit/pull/4559: 586.
+    ("test.cli", 586),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4319,7 +4325,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Host CPUID profile coverage: https://github.com/rrnewton/hermit/issues/4534.
     // And the same two --signal-at tests: 519, listed.
     // And the same two review --signal-at tests: 521, listed.
-    ("test.cli_on_host", 521),
+    // Less no_namespace_preserves_affinity_for_run_and_verify (https://github.com/rrnewton/hermit/pull/4559): 520.
+    ("test.cli_on_host", 520),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4709,7 +4716,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two replaced-request ownership units: 2268.
     // And the same retirement-refusal unit: 2269.
     // And +9 from e931b265: 2278.
-    ("test.detcore_unit_on_host", 2278),
+    // And the five io_buffers/statx-tail units of https://github.com/rrnewton/hermit/pull/4559: 2283.
+    ("test.detcore_unit_on_host", 2283),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4816,7 +4824,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 for a wait mask differing only in forced signals: 656.
     // And +1 from 14a1715c: 657.
     // And the opened-target private-Smaps control: 658, listed.
-    ("test.hermit_integration_on_host", 658),
+    // Less under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change
+    // (https://github.com/rrnewton/hermit/pull/4559): 657.
+    ("test.hermit_integration_on_host", 657),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
