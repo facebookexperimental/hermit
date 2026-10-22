@@ -2565,8 +2565,15 @@ fi
 # The four-file returning-provider delta is unchanged from 12a8e54; SDK/native
 # capture inputs equal the new prerequisite. Keep all existing limits and
 # calibration history; no new calibration or package identity is claimed.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 99a1ea5e022fa0eb8ffc3c7cf9c31d5122895c53 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 99a1ea5e022fa0eb8ffc3c7cf9c31d5122895c53 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 80f7dc63759627127da5b51bb50dc3b978e3c168 (2026-10-22): from
+# 99a1ea5e022fa0eb8ffc3c7cf9c31d5122895c53. One commit (reverie#1091 fix: do not resume a held stop the
+# tracee left for its exit stop). It changes safeptrace/src and
+# reverie-ptrace/src only; git diff is empty under reverie-dbt/ and
+# third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 99a1ea5e entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 80f7dc63759627127da5b51bb50dc3b978e3c168 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 80f7dc63759627127da5b51bb50dc3b978e3c168 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
