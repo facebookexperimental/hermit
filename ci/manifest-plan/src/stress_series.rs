@@ -271,6 +271,120 @@ pub struct SeriesComparison {
     pub bitwise_parity: bool,
 }
 
+/// Whether `value` is `<16 lowercase hex digits>:<decimal bytes>`.
+fn is_output_digest(value: &str) -> bool {
+    let Some((hash, bytes)) = value.split_once(':') else {
+        return false;
+    };
+    hash.len() == 16
+        && hash
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && !bytes.is_empty()
+        && bytes.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The longest first-difference message a cell row carries; a longer one is
+/// cut to this many characters, the last of them an ellipsis.
+pub const DIVERGENCE_MESSAGE_MAX_CHARS: usize = 240;
+
+/// A verify cell observation's first divergence in all three senses, in the
+/// one cell row (owner request, 2026-10-20; dev-hermit
+/// ai_docs/2026-10-21-cell-row-first-divergence-design.md): its two runs'
+/// log lengths (L1; the raw self-divergence position stays in
+/// [`SeriesCoordinates`]), the guest's outputs and whether they equal the
+/// ptrace row's from the same run (L2), and its parity against the ptrace
+/// reference from the same run's `parity.jsonl` (L3). The series writer fills
+/// what the run recorded; an absent part was not recorded, never "equal".
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesDivergence {
+    /// Both runs' compared log lengths (`compared_log_messages`).
+    #[serde(rename = "self", default, skip_serializing_if = "Option::is_none")]
+    pub self_lengths: Option<SeriesLogLengths>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<SeriesOutputs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vs_ptrace: Option<SeriesVsPtrace>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesLogLengths {
+    pub left_len: u64,
+    pub right_len: u64,
+}
+
+/// One run's guest outputs: exit code, signal, and each stream as
+/// `<first 16 hex digits of its sha256>:<bytes>`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesGuestOutputs {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// How a cell's run 1 outputs compare with run 1 of the same test's ptrace
+/// verify row in the same run.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeriesOutputsVsPtrace {
+    Equal,
+    Differs,
+    /// This row is the ptrace reference itself.
+    Reference,
+    /// The run has no ptrace verify row for the test, or that row recorded
+    /// no outputs.
+    NoReference,
+}
+
+/// L2: the guest's outputs, both runs' agreement and the comparison with
+/// ptrace's.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesOutputs {
+    pub run1: SeriesGuestOutputs,
+    pub runs_equal: bool,
+    /// Present exactly when `runs_equal` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run2: Option<SeriesGuestOutputs>,
+    pub vs_ptrace: SeriesOutputsVsPtrace,
+    /// The fields of `run1` that differ from ptrace's, present exactly when
+    /// `vs_ptrace` is `differs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vs_ptrace_fields: Vec<String>,
+}
+
+/// L3: the same run's parity record for this cell (`parity::ParityRecord`),
+/// without its temporary log paths and with each message cut to
+/// [`DIVERGENCE_MESSAGE_MAX_CHARS`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesVsPtrace {
+    pub verdict: crate::parity::ParityVerdict,
+    pub unavailable_class: Option<crate::parity::UnavailableClass>,
+    pub credit: Option<f64>,
+    pub unequalized_credit: Option<f64>,
+    pub matched_prefix: Option<u64>,
+    pub left_len: Option<u64>,
+    pub right_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_difference: Option<SeriesFirstDifference>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesFirstDifference {
+    pub record: Option<u64>,
+    pub syscall: Option<u64>,
+    pub scheduler_turn: Option<u64>,
+    pub virtual_nanoseconds: Option<u64>,
+    pub reference: Option<String>,
+    pub candidate: Option<String>,
+}
+
 /// The manifest declaration under which a verify cell may pass although its
 /// guest ended with one exact nonzero code or signal.
 ///
@@ -634,6 +748,10 @@ pub struct SeriesPayload {
     /// "strict": a reader must not infer it from the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strictness: Option<crate::runner::CellStrictness>,
+    /// First divergence in all three senses ([`SeriesDivergence`]), on verify
+    /// rows written since 2026-10-21; absent means not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divergence: Option<SeriesDivergence>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -846,6 +964,123 @@ impl SeriesRow {
         }
         if let Some(comparison) = &self.series.comparison {
             self.validate_comparison(comparison)?;
+        }
+        if let Some(divergence) = &self.series.divergence {
+            self.validate_divergence(divergence)?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a divergence object the series writer cannot produce: it is
+    /// written only on a verify row of a `stress-series/v3` envelope, its
+    /// output hashes are 16 hex digits and a byte count, run 2 appears exactly
+    /// when the runs' outputs differ, `reference` only on a ptrace row, and
+    /// an L3 record never on one; its credits are in [0, 1], its matched
+    /// prefix fits both logs, and its messages are nonempty and at most
+    /// [`DIVERGENCE_MESSAGE_MAX_CHARS`] characters.
+    fn validate_divergence(&self, divergence: &SeriesDivergence) -> Result<(), String> {
+        if self.schema != SeriesSchema::V3 {
+            return Err("divergence is supported only by stress-series/v3".into());
+        }
+        let mut parts = self.series.cell.rsplit('/');
+        let backend = parts.next().unwrap_or_default();
+        let mode = parts.next().unwrap_or_default();
+        if mode != "verify" {
+            return Err(format!(
+                "divergence is written only on verify rows, not {mode:?}"
+            ));
+        }
+        if divergence.self_lengths.is_none()
+            && divergence.outputs.is_none()
+            && divergence.vs_ptrace.is_none()
+        {
+            return Err(
+                "divergence must record at least one of self, outputs and vs_ptrace".into(),
+            );
+        }
+        if let Some(outputs) = &divergence.outputs {
+            for (name, run) in std::iter::once(("run1", &outputs.run1))
+                .chain(outputs.run2.as_ref().map(|run| ("run2", run)))
+            {
+                for (stream, value) in [("stdout", &run.stdout), ("stderr", &run.stderr)] {
+                    if !is_output_digest(value) {
+                        return Err(format!(
+                            "divergence.outputs.{name}.{stream} must be `<16 hex digits>:<bytes>`, got {value:?}"
+                        ));
+                    }
+                }
+            }
+            if outputs.runs_equal == outputs.run2.is_some() {
+                return Err(
+                    "divergence.outputs.run2 must be present exactly when runs_equal is false"
+                        .into(),
+                );
+            }
+            if outputs
+                .run2
+                .as_ref()
+                .is_some_and(|run| run == &outputs.run1)
+            {
+                return Err("divergence.outputs.run2 equal to run1 contradicts runs_equal".into());
+            }
+            if (outputs.vs_ptrace == SeriesOutputsVsPtrace::Differs)
+                == outputs.vs_ptrace_fields.is_empty()
+            {
+                return Err("divergence.outputs.vs_ptrace_fields must be nonempty exactly when vs_ptrace is differs".into());
+            }
+            if let Some(field) = outputs.vs_ptrace_fields.iter().find(|field| {
+                !matches!(field.as_str(), "exit_code" | "signal" | "stdout" | "stderr")
+            }) {
+                return Err(format!(
+                    "divergence.outputs.vs_ptrace_fields names unknown field {field:?}"
+                ));
+            }
+            if (outputs.vs_ptrace == SeriesOutputsVsPtrace::Reference) != (backend == "ptrace") {
+                return Err(
+                    "divergence.outputs.vs_ptrace is reference exactly on a ptrace row".into(),
+                );
+            }
+        }
+        if let Some(parity) = &divergence.vs_ptrace {
+            if backend == "ptrace" {
+                return Err(
+                    "divergence.vs_ptrace is a candidate's parity; a ptrace row has none".into(),
+                );
+            }
+            for (name, value) in [
+                ("credit", parity.credit),
+                ("unequalized_credit", parity.unequalized_credit),
+            ] {
+                if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+                    return Err(format!(
+                        "divergence.vs_ptrace.{name} must be in [0, 1] or null"
+                    ));
+                }
+            }
+            if let (Some(prefix), Some(left), Some(right)) =
+                (parity.matched_prefix, parity.left_len, parity.right_len)
+            {
+                if prefix > left.min(right) {
+                    return Err(format!(
+                        "divergence.vs_ptrace.matched_prefix {prefix} exceeds the shorter log ({left}, {right})"
+                    ));
+                }
+            }
+            if let Some(difference) = &parity.first_difference {
+                for (side, value) in [
+                    ("reference", &difference.reference),
+                    ("candidate", &difference.candidate),
+                ] {
+                    if let Some(value) = value {
+                        let chars = value.chars().count();
+                        if chars == 0 || chars > DIVERGENCE_MESSAGE_MAX_CHARS {
+                            return Err(format!(
+                                "divergence.vs_ptrace.first_difference.{side} must be 1 to {DIVERGENCE_MESSAGE_MAX_CHARS} characters, got {chars}"
+                            ));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1731,6 +1966,7 @@ mod tests {
                     ),
                 ])),
                 strictness: None,
+                divergence: None,
             },
         }
     }
@@ -1935,6 +2171,177 @@ mod tests {
         // Unknown audit fields are refused rather than ignored.
         let mut encoded = serde_json::to_value(base()).unwrap();
         encoded["series"]["declared_guest_exit"]["note"] = "x".into();
+        assert!(serde_json::from_value::<SeriesRow>(encoded).is_err());
+    }
+
+    /// A kvm verify row with all three parts of its first divergence, as the
+    /// series writer fills them from the cell's result row and the run's
+    /// parity.jsonl.
+    fn divergence_row() -> SeriesRow {
+        let mut fixture = row(SeriesSchema::V3);
+        fixture.series.cell = "fixture/test/verify/kvm".into();
+        let outputs = SeriesGuestOutputs {
+            exit_code: Some(0),
+            signal: None,
+            stdout: "fb9a253ff29ae72a:16".into(),
+            stderr: "e3b0c44298fc1c14:0".into(),
+        };
+        fixture.series.divergence = Some(SeriesDivergence {
+            self_lengths: Some(SeriesLogLengths {
+                left_len: 103,
+                right_len: 103,
+            }),
+            outputs: Some(SeriesOutputs {
+                run1: outputs,
+                runs_equal: true,
+                run2: None,
+                vs_ptrace: SeriesOutputsVsPtrace::Equal,
+                vs_ptrace_fields: Vec::new(),
+            }),
+            vs_ptrace: Some(SeriesVsPtrace {
+                verdict: crate::parity::ParityVerdict::Diverged,
+                unavailable_class: None,
+                credit: Some(0.0348),
+                unequalized_credit: None,
+                matched_prefix: Some(4),
+                left_len: Some(115),
+                right_len: Some(101),
+                first_difference: Some(SeriesFirstDifference {
+                    record: Some(5),
+                    syscall: None,
+                    scheduler_turn: None,
+                    virtual_nanoseconds: None,
+                    reference: Some("INFO detcore::scheduler: guest in queue".into()),
+                    candidate: Some("INFO detcore::random: DETLOG init auxv".into()),
+                }),
+            }),
+        });
+        fixture
+    }
+
+    #[test]
+    fn a_verify_rows_divergence_is_admitted_and_its_impossible_forms_refused() {
+        let fixture = divergence_row();
+        fixture.validate_for_write().unwrap();
+        fixture.validate_for_read().unwrap();
+        let encoded = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(encoded["series"]["divergence"]["self"]["left_len"], 103);
+        assert_eq!(
+            serde_json::from_value::<SeriesRow>(encoded).unwrap(),
+            fixture
+        );
+        // A row written before the field existed stays readable without it.
+        let mut without = divergence_row();
+        without.series.divergence = None;
+        without.validate_for_write().unwrap();
+        let divergence =
+            |fixture: &mut SeriesRow| fixture.series.divergence.as_mut().unwrap().clone();
+        let mut cases: Vec<(&str, SeriesRow, &str)> = Vec::new();
+        let mut other = divergence_row();
+        other.series.cell = "fixture/test/replay/ptrace".into();
+        cases.push(("replay row", other, "only on verify rows"));
+        let mut other = divergence_row();
+        other.series.divergence = Some(SeriesDivergence {
+            self_lengths: None,
+            outputs: None,
+            vs_ptrace: None,
+        });
+        cases.push(("empty", other, "at least one of"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.outputs.as_mut().unwrap().run1.stdout = "fb9a253ff29ae72ad120:16".into();
+        other.series.divergence = Some(changed);
+        cases.push(("long hash", other, "<16 hex digits>:<bytes>"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.outputs.as_mut().unwrap().runs_equal = false;
+        other.series.divergence = Some(changed);
+        cases.push((
+            "unequal without run2",
+            other,
+            "exactly when runs_equal is false",
+        ));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        let outputs = changed.outputs.as_mut().unwrap();
+        outputs.runs_equal = false;
+        outputs.run2 = Some(outputs.run1.clone());
+        other.series.divergence = Some(changed);
+        cases.push(("equal run2", other, "contradicts runs_equal"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.outputs.as_mut().unwrap().vs_ptrace = SeriesOutputsVsPtrace::Differs;
+        other.series.divergence = Some(changed);
+        cases.push((
+            "differs without fields",
+            other,
+            "vs_ptrace_fields must be nonempty",
+        ));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        let outputs = changed.outputs.as_mut().unwrap();
+        outputs.vs_ptrace = SeriesOutputsVsPtrace::Differs;
+        outputs.vs_ptrace_fields = vec!["status".into()];
+        other.series.divergence = Some(changed);
+        cases.push(("unknown field", other, "unknown field"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.outputs.as_mut().unwrap().vs_ptrace = SeriesOutputsVsPtrace::Reference;
+        other.series.divergence = Some(changed);
+        cases.push((
+            "reference on kvm",
+            other,
+            "reference exactly on a ptrace row",
+        ));
+        let mut other = divergence_row();
+        other.series.cell = "fixture/test/verify/ptrace".into();
+        let mut changed = divergence(&mut other);
+        changed.outputs.as_mut().unwrap().vs_ptrace = SeriesOutputsVsPtrace::Reference;
+        other.series.divergence = Some(changed);
+        cases.push(("parity on ptrace", other, "a ptrace row has none"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().credit = Some(1.5);
+        other.series.divergence = Some(changed);
+        cases.push(("credit above 1", other, "credit must be in [0, 1]"));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed.vs_ptrace.as_mut().unwrap().matched_prefix = Some(102);
+        other.series.divergence = Some(changed);
+        cases.push((
+            "prefix past the shorter log",
+            other,
+            "exceeds the shorter log",
+        ));
+        let mut other = divergence_row();
+        let mut changed = divergence(&mut other);
+        changed
+            .vs_ptrace
+            .as_mut()
+            .unwrap()
+            .first_difference
+            .as_mut()
+            .unwrap()
+            .candidate = Some("x".repeat(DIVERGENCE_MESSAGE_MAX_CHARS + 1));
+        other.series.divergence = Some(changed);
+        cases.push(("long message", other, "must be 1 to 240 characters"));
+        for (label, fixture, message) in cases {
+            let error = fixture
+                .validate_for_write()
+                .expect_err(&format!("{label} was accepted"));
+            assert!(error.contains(message), "{label}: {error}");
+        }
+        // A retained v2 row cannot carry it either.
+        let mut v2 = divergence_row();
+        v2.schema = SeriesSchema::V2;
+        let error = v2.validate_for_read().unwrap_err();
+        assert!(
+            error.contains("supported only by stress-series/v3"),
+            "{error}"
+        );
+        // Unknown fields inside the object are refused rather than ignored.
+        let mut encoded = serde_json::to_value(divergence_row()).unwrap();
+        encoded["series"]["divergence"]["outputs"]["note"] = "x".into();
         assert!(serde_json::from_value::<SeriesRow>(encoded).is_err());
     }
 

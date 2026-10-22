@@ -1140,7 +1140,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And hermit-manifest-plan's a_full_replay_run_type_labels_its_cells_with_the_full_validation_too
     // and the_corpus_full_run_type_is_the_default_run_type (replay into full): 1796, listed.
     // And eleven maintained custom-capture/retention controls: 1807.
-    ("test.regular_crates", 1807),
+    // And hermit-manifest-plan's
+    // a_verify_rows_divergence_is_admitted_and_its_impossible_forms_refused
+    // (first divergence in the cell row): 1808.
+    ("test.regular_crates", 1808),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5220,7 +5223,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two hermit-verify tests of 028b1192: 1780, listed.
     // And the same two replay-into-full manifest-plan tests: 1782, listed.
     // The same eleven capture controls retain the unchanged fourteen exclusions.
-    ("test.regular_crates_on_host", 1793),
+    // And the same first-divergence cell-row test: 1794.
+    ("test.regular_crates_on_host", 1794),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
