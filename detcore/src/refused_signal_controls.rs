@@ -95,6 +95,25 @@ pub(crate) fn handler_refused_warning(signum: i32) -> String {
     )
 }
 
+/// The WARN for a guest handler that Detcore refused with EPERM because the
+/// run's threads are not sequentialized (A5 step 3c slice 0g, design 16.2):
+/// `caller` is the calling thread. Printed for every refused install, through
+/// Detcore's guest WARN path (`crate::guest_log`), like the reserved-signal
+/// refusals: Detcore decides it itself, at the call.
+pub(crate) fn unsequentialized_handler_refused_warning(signum: i32, caller: i32) -> String {
+    let name = signal_name(signum);
+    format!(
+        "HERMIT_UNSEQUENTIALIZED_HANDLER_REFUSED signum={signum} ({name}) caller={caller}: the \
+         guest asked for a handler and received EPERM, so the handler was not installed: threads \
+         are not sequentialized (--no-sequentialize-threads, or --strace-only, which turns \
+         sequentialization off; for a library caller, Config::sequentialize_threads is false), \
+         and an in-guest guest handler needs Detcore's scheduler to run one guest thread at a \
+         time. A named refusal, not Linux's behaviour (A5 step 3c, \
+         https://github.com/rrnewton/hermit/issues/4485). A {name} the guest receives takes the \
+         action it had before."
+    )
+}
+
 /// The WARN for an alternate signal stack change the runtime refused.
 pub(crate) fn alternate_stack_refused_warning() -> String {
     "HERMIT_SIGNAL_ALTSTACK_REFUSED: the guest asked to set or change its alternate signal \
@@ -256,7 +275,25 @@ mod tests {
             pdeathsig.contains("when the parent thread exits"),
             "{pdeathsig}"
         );
-        for text in [&send, &arming, &timer, &pdeathsig] {
+        let unsequentialized = unsequentialized_handler_refused_warning(libc::SIGALRM, 4);
+        assert!(
+            unsequentialized.starts_with(
+                "HERMIT_UNSEQUENTIALIZED_HANDLER_REFUSED signum=14 (SIGALRM) caller=4: the guest \
+                 asked for a handler and received EPERM, so the handler was not installed: \
+                 threads are not sequentialized"
+            ),
+            "{unsequentialized}"
+        );
+        // It names what turns sequentialization off, for the CLI and for a
+        // library caller.
+        for cause in [
+            "--no-sequentialize-threads",
+            "--strace-only",
+            "Config::sequentialize_threads",
+        ] {
+            assert!(unsequentialized.contains(cause), "{unsequentialized}");
+        }
+        for text in [&send, &arming, &timer, &pdeathsig, &unsequentialized] {
             assert!(
                 text.contains("A named refusal, not Linux's behaviour"),
                 "{text}"

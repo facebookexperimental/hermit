@@ -275,6 +275,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on",
     "liteinst_in_guest_programs::in_guest_trap_sigalrm_scalar_identity_matches_ptrace",
     "liteinst_in_guest_programs::in_guest_trap_verifies_a_program_with_no_site_patched",
+    "liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name",
     "liteinst_in_guest_programs::liteinst_in_guest_a_root_that_aborts_ends_with_its_own_status",
     "liteinst_in_guest_programs::liteinst_in_guest_a_held_parent_death_signal_at_an_unscheduled_death_ends_the_run_by_name",
     "liteinst_in_guest_programs::liteinst_in_guest_a_held_parent_death_signal_that_would_fire_ends_the_run_by_name",

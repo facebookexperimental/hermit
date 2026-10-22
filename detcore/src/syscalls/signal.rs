@@ -1404,11 +1404,29 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Signal phase 1's Detcore-side refusals of a new guest SIGALRM handler,
     /// each EPERM before anything changes (design section 6 and closure 5):
-    /// threads not sequentialized (`alarm` would arm a kernel timer), a
-    /// signalfd in the process's descriptor table, and a kernel producer of
-    /// SIGALRM armed anywhere in the run.
+    /// threads not sequentialized (`alarm` would arm a kernel timer; named
+    /// with a WARN, `unsequentialized_handler_refused_warning`), a signalfd in
+    /// the process's descriptor table, and a kernel producer of SIGALRM armed
+    /// anywhere in the run.
     async fn refuse_sigalrm_handler<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        // Without sequentialization a run has no premise P (design 16.2: one
+        // guest thread runs guest code at a time), so it may not catch a
+        // signal: the first caught-handler install is refused, by name, with
+        // EPERM and a WARN (coordinator decision D32). A run that catches no
+        // signal keeps running, a labelled relaxation as on ptrace. Today this
+        // phase 1 SIGALRM handler is the only handler the in-guest runtime
+        // lets through to Detcore (it refuses every other one itself, and
+        // resets any handler installed before it to SIG_DFL). A5 step 3c.2's
+        // handler admission must carry the same rule for every handler
+        // install under --no-sequentialize-threads.
         if !guest.config().sequentialize_threads {
+            tracing::warn!(
+                "{}",
+                crate::refused_signal_controls::unsequentialized_handler_refused_warning(
+                    libc::SIGALRM,
+                    guest.thread_state().dettid.as_raw(),
+                )
+            );
             return Err(Errno::EPERM.into());
         }
         // The model's own signalfds, and any the kernel's table holds that

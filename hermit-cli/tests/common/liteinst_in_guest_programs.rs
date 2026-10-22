@@ -693,6 +693,100 @@ fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
     );
 }
 
+/// A run whose threads are not sequentialized (`--no-sequentialize-threads`,
+/// or `--strace-only`, which turns sequentialization off) may not catch a
+/// signal on the in-guest backends (A5 step 3c slice 0g, coordinator decision
+/// D32): with phase 1's SIGALRM handlers admitted, the guest's handler
+/// install gets EPERM and a WARN naming the reason, on in-guest-trap and on
+/// liteinst with site patching off, and the guest carries on as with
+/// handlers not admitted. Before, the EPERM was silent. A signal-free run
+/// keeps running unsequentialized, a labelled relaxation as on ptrace, and
+/// ptrace installs the handler in every mode. The sequentialized phase 1 path
+/// is `liteinst_in_guest_sigalrm_handler_is_virtual_and_published`'s.
+#[test]
+fn in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_virtual_handler");
+    let warning = "HERMIT_UNSEQUENTIALIZED_HANDLER_REFUSED signum=14 (SIGALRM) caller=";
+    let run = |backend: &str, relaxation: &str, program: &[&std::ffi::OsStr]| {
+        super::hermit_test::hermit_output(
+            "hermit run",
+            Command::new(hermit_binary())
+                .args(["--log=info", "--backend", backend, "run"])
+                .args([
+                    "--max-timeslice=disabled",
+                    "--epoch=2026-01-01T00:00:00Z",
+                    "--base-env=minimal",
+                    relaxation,
+                    "--env=REVERIE_LITEINST_SITE_PATCHING=0",
+                    "--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1",
+                    "--",
+                ])
+                .args(program)
+                .env_remove("REVERIE_LITEINST_SITE_PATCHING")
+                .env_remove("REVERIE_LITEINST_SIGALRM_HANDLERS")
+                .stdin(Stdio::null()),
+        )
+    };
+    let handler = [guest.as_os_str()];
+    // A shell builtin: no exec, and bash is one of the pinned root's declared
+    // guest programs.
+    let signal_free = ["/usr/bin/bash", "-c", "printf 'ran\\n'"].map(std::ffi::OsStr::new);
+    let refused = "install=-1 errno=1\nquery_is_handler=0\nsigpending=0 errno=0\n\
+                   socket=ok errno=0\nfork=ok errno=0\nto_default=0 errno=0\n\
+                   ignore=0\nsocket_after=ok errno=0\n";
+    for relaxation in ["--no-sequentialize-threads", "--strace-only"] {
+        for backend in ["in-guest-trap", "liteinst"] {
+            let output = run(backend, relaxation, &handler);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{backend} {relaxation}: status={:?}\nstderr={stderr}",
+                output.status
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                refused,
+                "{backend} {relaxation}: {stderr}"
+            );
+            assert_eq!(
+                stderr.matches(warning).count(),
+                1,
+                "{backend} {relaxation}: {stderr}"
+            );
+            assert!(
+                stderr.contains("threads are not sequentialized"),
+                "{backend} {relaxation}: {stderr}"
+            );
+
+            let output = run(backend, relaxation, &signal_free);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{backend} {relaxation} signal-free: status={:?}\nstderr={stderr}",
+                output.status
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "ran\n");
+            assert!(
+                !stderr.contains(warning),
+                "{backend} {relaxation}: {stderr}"
+            );
+        }
+        let output = run("ptrace", relaxation, &handler);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "ptrace {relaxation}: status={:?}\nstderr={stderr}",
+            output.status
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).starts_with("install=0 errno=0\n"),
+            "ptrace {relaxation}: {stderr}"
+        );
+        assert!(!stderr.contains(warning), "ptrace {relaxation}: {stderr}");
+    }
+}
+
 /// Compiles one of the SIGALRM guests in `tests/fixtures`.
 fn sigalrm_fixture(name: &str) -> std::path::PathBuf {
     let build_root = process_build_root(&format!("liteinst-{name}"));
