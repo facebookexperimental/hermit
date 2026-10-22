@@ -390,6 +390,12 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
     // Rewritten in place across the whole array.
     reverie::syscalls::Sysno::poll,
     reverie::syscalls::Sysno::ppoll,
+    // A structure the kernel (and Detcore) fills whole (`stat_buffer`).
+    reverie::syscalls::Sysno::stat,
+    reverie::syscalls::Sysno::lstat,
+    reverie::syscalls::Sysno::fstat,
+    reverie::syscalls::Sysno::newfstatat,
+    reverie::syscalls::Sysno::statx,
 ];
 
 fn ret_gates_output(call: &Syscall) -> bool {
@@ -2527,6 +2533,112 @@ mod event_tests {
     fn zeroed_stat() -> libc::stat {
         // SAFETY: an all-zero `libc::stat` is a valid value.
         unsafe { std::mem::zeroed() }
+    }
+
+    /// Every decoded field of a `struct stat` result names its own field: each
+    /// field holds a distinct value, so a decoder that read one field for
+    /// another, or `statx`'s layout for `stat`'s, prints a different line.
+    #[test]
+    fn every_field_of_a_stat_result_is_decoded_from_its_own_place() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Regular, None);
+        let mut stat = zeroed_stat();
+        stat.st_dev = 0x1234;
+        stat.st_ino = 1001;
+        stat.st_mode = libc::S_IFREG | 0o640;
+        stat.st_nlink = 3;
+        stat.st_uid = 11;
+        stat.st_gid = 22;
+        stat.st_rdev = 0x5678;
+        stat.st_size = 4444;
+        stat.st_blksize = 512;
+        stat.st_blocks = 9;
+        stat.st_atime = 101;
+        stat.st_atime_nsec = 1;
+        stat.st_mtime = 202;
+        stat.st_mtime_nsec = 2;
+        stat.st_ctime = 303;
+        stat.st_ctime_nsec = 3;
+        put_stat(&guest.memory, &stat);
+        let call: Syscall = reverie::syscalls::Fstat::new()
+            .with_fd(FD)
+            .with_stat(Some(reverie::syscalls::StatPtr(
+                AddrMut::from_raw(FIRST_DEST).unwrap(),
+            )))
+            .into();
+        digest(&mut guest, &call, 0).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        let expected = " mask=0x7ff dev=0x1234 ino=1001 mode=0o100640 nlink=3 uid=11 gid=22 \
+                        rdev=0x5678 size=4444 blksize=512 blocks=9 atime=101.000000001 \
+                        mtime=202.000000002 ctime=303.000000003 btime=0.000000000";
+        assert!(
+            messages[0].contains(expected),
+            "expected {expected}, got {}",
+            messages[0]
+        );
+    }
+
+    /// The same for a `statx` result, whose layout differs from `stat`'s and
+    /// which also carries a mask, a birth time and split device numbers.
+    #[test]
+    fn every_field_of_a_statx_result_is_decoded_from_its_own_place() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Regular, None);
+        // SAFETY: an all-zero statx is a valid value.
+        let mut statx: reverie::syscalls::linux_abi::Statx = unsafe { std::mem::zeroed() };
+        statx.stx_mask = 0xfff;
+        statx.stx_blksize = 512;
+        statx.stx_nlink = 3;
+        statx.stx_uid = 11;
+        statx.stx_gid = 22;
+        statx.stx_mode = (libc::S_IFREG | 0o640) as u16;
+        statx.stx_ino = 1001;
+        statx.stx_size = 4444;
+        statx.stx_blocks = 9;
+        statx.stx_atime.tv_sec = 101;
+        statx.stx_atime.tv_nsec = 1;
+        statx.stx_btime.tv_sec = 404;
+        statx.stx_btime.tv_nsec = 4;
+        statx.stx_ctime.tv_sec = 303;
+        statx.stx_ctime.tv_nsec = 3;
+        statx.stx_mtime.tv_sec = 202;
+        statx.stx_mtime.tv_nsec = 2;
+        statx.stx_rdev_major = 0x56;
+        statx.stx_rdev_minor = 0x78;
+        statx.stx_dev_major = 0x12;
+        statx.stx_dev_minor = 0x34;
+        // SAFETY: Statx is plain old data; viewing it as bytes is sound.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&statx as *const reverie::syscalls::linux_abi::Statx).cast::<u8>(),
+                std::mem::size_of::<reverie::syscalls::linux_abi::Statx>(),
+            )
+        };
+        guest.memory.0.lock().unwrap()[FIRST_DEST..FIRST_DEST + bytes.len()].copy_from_slice(bytes);
+        let call: Syscall = reverie::syscalls::Statx::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_statx(Some(reverie::syscalls::StatxPtr(
+                AddrMut::from_raw(FIRST_DEST).unwrap(),
+            )))
+            .into();
+        digest(&mut guest, &call, 0).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        let dev = libc::makedev(0x12, 0x34);
+        let rdev = libc::makedev(0x56, 0x78);
+        let expected = format!(
+            " mask=0xfff dev={dev:#x} ino=1001 mode=0o100640 nlink=3 uid=11 gid=22 \
+             rdev={rdev:#x} size=4444 blksize=512 blocks=9 atime=101.000000001 \
+             mtime=202.000000002 ctime=303.000000003 btime=404.000000004"
+        );
+        assert!(
+            messages[0].contains(&expected),
+            "expected {expected}, got {}",
+            messages[0]
+        );
     }
 
     /// The INFO record shows a stat result only as `st_mode` and `st_size`.

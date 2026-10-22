@@ -2305,7 +2305,15 @@ fn display_syscall_finished<'a, M: MemoryAccess>(
     result: &Result<i64, Error>,
 ) -> reverie::syscalls::Display<'a, M, Syscall> {
     match syscall {
-        Syscall::Fstat(_) => syscall.display(memory), //FIXME: T136880615 - fstat structure isn't fully deterministic yet
+        // Address only: the whole `fstat` structure is hashed and every field
+        // decoded in the call's `[iobuf]` record (`io_buffers::stat_fields`),
+        // which is where it is compared, so it is not printed twice. That
+        // record retires T136880615 ("fstat structure isn't fully deterministic
+        // yet"): strict verify of `fstat` on stdio, a pipe, a socketpair, an
+        // eventfd, a memfd and an unlinked file passes on ptrace (review of
+        // https://github.com/rrnewton/hermit/pull/4559), and a procfs root
+        // reports one link on every backend (`determinize_stat`).
+        Syscall::Fstat(_) => syscall.display(memory),
         _ if failure_proves_outputs_unwritten(result)
             && failure_leaves_outputs_unwritten(syscall) =>
         {

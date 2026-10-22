@@ -1561,6 +1561,71 @@ fn statx_asking_classic_mount_id(call: syscalls::Statx) -> syscalls::Statx {
     syscalls::Statx::from(args)
 }
 
+/// The `stx_mask` bits of the fields a recording keeps: every field up to
+/// `stx_mnt_id` (`STATX_BASIC_STATS`, `STATX_BTIME`, `STATX_MNT_ID`) and the
+/// unique mount ID, which is also `stx_mnt_id`.
+const STATX_MODELED_MASK: u32 = 0x1fff | STATX_MNT_ID_UNIQUE;
+
+/// Where a `struct statx` stops holding fields Detcore models: the direct-I/O
+/// alignments (0x98), `stx_subvol` (0xa0), the atomic-write limits and the
+/// spare words up to its end (0x100) follow `stx_mnt_id`.
+const STATX_UNMODELED_TAIL: usize = 0x98;
+
+/// Make the `statx` result at `addr` report only the fields Detcore models:
+/// clear the other `stx_mask` bits and zero the rest of the structure, as a
+/// kernel without those fields would. A recording keeps only the modeled
+/// fields (Reverie's `StatxBuf` skips the rest), so without this a recorded
+/// run saw the host's `stx_subvol` (a btrfs subvolume ID) and its replay saw
+/// zero; and outside recording Detcore already writes back only the modeled
+/// fields (`determinize_stat`). Applied after the call in recording and in
+/// replay alike, so both show the same bytes.
+fn canonicalize_statx_tail<M: MemoryAccess>(memory: &mut M, addr: usize) -> Result<(), Errno> {
+    const SIZE: usize = std::mem::size_of::<reverie::syscalls::linux_abi::Statx>();
+    let start = AddrMut::<u8>::from_raw(addr).ok_or(Errno::EFAULT)?;
+    let mut bytes = [0u8; SIZE];
+    memory.read_exact(start, &mut bytes)?;
+    let mut canonical = bytes;
+    let mask = u32::from_ne_bytes(canonical[..4].try_into().unwrap()) & STATX_MODELED_MASK;
+    canonical[..4].copy_from_slice(&mask.to_ne_bytes());
+    canonical[STATX_UNMODELED_TAIL..].fill(0);
+    if canonical != bytes {
+        memory.write_exact(start, &canonical)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod statx_tail_tests {
+    use reverie::syscalls::LocalMemory;
+
+    use super::*;
+
+    /// What a recording keeps of a `statx` result is what the guest sees: the
+    /// modeled fields and mask bits stay, `stx_subvol` and the rest of the
+    /// tail become zero and their mask bits are cleared.
+    #[test]
+    fn a_statx_result_keeps_only_the_fields_a_recording_keeps() {
+        let mut buf = [0xa5u8; 256];
+        // STATX_BASIC_STATS | STATX_BTIME | STATX_MNT_ID | STATX_DIOALIGN |
+        // STATX_MNT_ID_UNIQUE | STATX_SUBVOL | STATX_WRITE_ATOMIC.
+        let mask: u32 = 0x7ff | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x10000;
+        buf[..4].copy_from_slice(&mask.to_ne_bytes());
+        let modeled = buf[4..STATX_UNMODELED_TAIL].to_vec();
+        let mut memory = LocalMemory::new();
+        canonicalize_statx_tail(&mut memory, buf.as_mut_ptr() as usize).unwrap();
+        assert_eq!(
+            u32::from_ne_bytes(buf[..4].try_into().unwrap()),
+            0x7ff | 0x800 | 0x1000 | 0x4000
+        );
+        assert_eq!(buf[4..STATX_UNMODELED_TAIL], modeled[..]);
+        assert!(buf[STATX_UNMODELED_TAIL..].iter().all(|byte| *byte == 0));
+        // Idempotent: replay applies it to what recording already produced.
+        let once = buf;
+        canonicalize_statx_tail(&mut memory, buf.as_mut_ptr() as usize).unwrap();
+        assert_eq!(buf, once);
+    }
+}
+
 /// Whether `statx` accepts these `flags` and `mask` (`vfs_statx`'s and the
 /// syscall's own checks): no reserved mask bit, known flags only (unless the
 /// call names no path), and not both synchronization types at once.
@@ -8884,6 +8949,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         };
+        let host_inode = stat.inode;
         stat.inode = d_ino.as_raw(); // Reveal only the deterministic inode.
 
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -8894,6 +8960,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         // device id.
         let host_device = stat.dev;
         stat.dev = determinize_device(guest, stat.dev).await;
+        // A procfs root that Detcore could not name (`ProcfsEntry::Unknown`, as
+        // on a backend that does not read the guest's mount table) reaches here
+        // with the host's process count as its link count, which changes
+        // whenever a host process starts or exits. Its device is Detcore's
+        // procfs device by now, so it reports 1 like a named one (above).
+        // Measured on DBT: two runs of one guest saw 6724 and 6770.
+        if stat.dev == procfs_inode::VIRTUAL_PROC_DEVICE
+            && host_inode == procfs_inode::PROC_ROOT_INO
+            && stat.mode & libc::S_IFMT == libc::S_IFDIR
+            && stat.mask.contains(StatxMask::STATX_NLINK)
+        {
+            stat.nlink = 1;
+        }
 
         // A directory's size is whatever its file system makes of its
         // entries: btrfs sums the names' lengths, tmpfs counts entries, ext4
@@ -9122,7 +9201,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
                 return self.write_rendered_statx(guest, call, stat).await;
             }
-            Ok(self.record_or_replay(guest, call).await?)
+            let ret = self.record_or_replay(guest, call).await?;
+            // The same in recording, in replay and without either: a recording
+            // keeps only the fields Detcore models, so what else the kernel
+            // wrote must not reach the guest when it is recorded either.
+            if ret == 0
+                && let Some(statptr) = call.statx()
+            {
+                canonicalize_statx_tail(&mut guest.memory(), statptr.0.as_raw())?;
+            }
+            Ok(ret)
         }
     }
 
