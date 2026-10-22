@@ -828,8 +828,16 @@ fn verify_signal_report_cannot_hold_the_disposition_on_a_full_blocking_stderr() 
 /// hermit's stdout still buffers it when the report is written, and are
 /// killed by SIGUSR1; `--verify-allow=failure` admits that. Only the result
 /// of run 1's check for the marker differs, which keeps the comparison's
-/// report of the difference short (about 4.7 KB), and the runs are rejected
+/// report of the difference short (about 4 KB), and the runs are rejected
 /// (status 1) with both reports kept (about 13 KB).
+///
+/// The check is for a path beneath the marker, so it fails in both runs:
+/// ENOENT in run 1, before the marker exists, and ENOTDIR in run 2, where
+/// the marker is a file. A stat that succeeds gets an `[iobuf]` record that a
+/// failed one does not, and that one extra record would shift every later
+/// record of run 2 against run 1's, so the comparison would report its limit
+/// of 20 differences (about 108 KB): more than the pipe holds, ahead of
+/// everything this test checks.
 ///
 /// stdout and stderr are one blocking pipe of four pages with 5632 bytes
 /// waiting. What hermit must write ends in the third page (anywhere from
@@ -843,7 +851,7 @@ fn verify_signal_report_cannot_hold_agreed_guest_stdout() {
     let _guard = hermit_signal_lock();
     let marker = run_1_marker("run-1-marked-agreed-stdout");
     let script = format!(
-        "[ -e '{0}' ]; : > '{0}'; {1}; printf x; kill -USR1 $$",
+        "[ -e '{0}/x' ]; : > '{0}'; {1}; printf x; kill -USR1 $$",
         marker.display(),
         twenty_long_path_checks(),
     );
