@@ -3200,7 +3200,8 @@ fn run_self_signal_death_probe(backend: &str, extra: &[&str], mode: &str) -> Out
 /// not "every self-sent signal": a blocked and an ignored signal leave the
 /// child running to its own exit code. The SIGTRAP child's death is judged by
 /// its own action (the default), not by the handler LiteInst installs for
-/// SIGTRAP to route its own breakpoints: before Reverie judged it so, that
+/// SIGTRAP to route its own breakpoints (on `liteinst`; `in-guest-trap`, with
+/// site patching off, installs none): before Reverie judged it so, that
 /// child still died without deregistering.
 #[test]
 fn liteinst_in_guest_self_signal_deaths_are_scheduled_and_verify() {
@@ -3306,8 +3307,8 @@ fn liteinst_in_guest_runtime_owned_self_signals_refuse_verification() {
 }
 
 /// The send calls `reserved_signal_send_probe` (`tests/c`) makes, in its
-/// order, and the three signals the in-guest runtime keeps for itself with
-/// their numbers.
+/// order, and the three signals the in-guest runtime may keep for itself with
+/// their numbers ([`reserved_under`] says which it keeps on each backend).
 const RESERVED_SEND_CALLS: [&str; 6] = [
     "kill",
     "tkill",
@@ -3321,6 +3322,45 @@ const RESERVED_SIGNALS: [(&str, i32); 3] = [
     ("SIGSEGV", libc::SIGSEGV),
     ("SIGTRAP", libc::SIGTRAP),
 ];
+/// The signals of [`RESERVED_SIGNALS`] the in-guest runtime keeps for itself
+/// under `backend`, Hermit's default route: SIGSYS and SIGSEGV (a default
+/// run traps instructions) on both in-guest backends, and SIGTRAP only on
+/// `liteinst`, whose site patching installs LiteInst's guard router;
+/// `in-guest-trap` runs with site patching off and no router, so SIGTRAP is
+/// the guest's (A5 step 3c slice 0c). None under ptrace.
+fn reserved_under(backend: &str) -> &'static [i32] {
+    match backend {
+        "liteinst" => &[libc::SIGSYS, libc::SIGSEGV, libc::SIGTRAP],
+        "in-guest-trap" => &[libc::SIGSYS, libc::SIGSEGV],
+        "ptrace" => &[],
+        other => panic!("no reserved set for backend {other}"),
+    }
+}
+
+/// The signals of [`RESERVED_SIGNALS`] that `backend` neither keeps nor can
+/// schedule the death of when another process sends one: on `in-guest-trap`,
+/// SIGTRAP. It is delivered as on Linux and its default action kills the
+/// child, but an in-guest process killed by another process's signal dies
+/// before its runtime can deregister it, which Detcore records as a
+/// determinism loss ("exited without deregistering"), as it does for any
+/// other default-fatal signal such as SIGTERM, until the death commit of
+/// design section 16.12 (A5 step 3c). Under ptrace the tracer observes the
+/// death, and `liteinst` keeps all three.
+fn unscheduled_deaths_under(backend: &str) -> &'static [i32] {
+    match backend {
+        "in-guest-trap" => &[libc::SIGTRAP],
+        _ => &[],
+    }
+}
+
+/// The entries of [`RESERVED_SIGNALS`] whose number `keep` accepts.
+fn signals_where(keep: impl Fn(i32) -> bool) -> Vec<(&'static str, i32)> {
+    RESERVED_SIGNALS
+        .into_iter()
+        .filter(|&(_, number)| keep(number))
+        .collect()
+}
+
 /// The arming calls `reserved_signal_send_probe armings` makes for each
 /// reserved signal, in its order, with the call each one's WARN names.
 const RESERVED_ARMINGS: [(&str, &str); 5] = [
@@ -3331,20 +3371,25 @@ const RESERVED_ARMINGS: [(&str, &str); 5] = [
     ("prctl(PR_SET_PDEATHSIG)", "prctl(PR_SET_PDEATHSIG)"),
 ];
 
-/// What `reserved_signal_send_probe sends` prints. On Linux each send
-/// succeeds and kills the child with its signal. Refused, each returns EPERM
-/// and the child exits 0. Under ptrace (`ptrace_drops_sigtrap`) each send
-/// succeeds and kills the child, except that a SIGTRAP from another process
-/// never reaches the child, which exits 0: a known ptrace-backend deviation
-/// from Linux, https://github.com/rrnewton/hermit/issues/4555, measured at
-/// Hermit 1538d448 before the reserved set existed and unrelated to it
-/// (ptrace's set is empty), pinned here at its current value so that this
-/// test shows the reserved-signal rule leaves ptrace unchanged.
-fn reserved_sends_expected(refused: bool, ptrace_drops_sigtrap: bool) -> String {
+/// What `reserved_signal_send_probe sends` prints for `signals`. On Linux each
+/// send succeeds and kills the child with its signal. A send of a signal in
+/// `reserved` is refused: it returns EPERM and the child exits 0. Under ptrace
+/// (`ptrace_drops_sigtrap`) each send succeeds and kills the child, except that
+/// a SIGTRAP from another process never reaches the child, which exits 0: a
+/// known ptrace-backend deviation from Linux,
+/// https://github.com/rrnewton/hermit/issues/4555, measured at Hermit 1538d448
+/// before the reserved set existed and unrelated to it (ptrace's set is empty),
+/// pinned here at its current value so that this test shows the reserved-signal
+/// rule leaves ptrace unchanged.
+fn reserved_sends_expected(
+    signals: &[(&str, i32)],
+    reserved: &[i32],
+    ptrace_drops_sigtrap: bool,
+) -> String {
     let mut expected = String::new();
     for call in RESERVED_SEND_CALLS {
-        for (name, number) in RESERVED_SIGNALS {
-            expected.push_str(&if refused {
+        for &(name, number) in signals {
+            expected.push_str(&if reserved.contains(&number) {
                 format!("{call} {name}: rc=-1 errno=EPERM child=exit 0\n")
             } else if ptrace_drops_sigtrap && number == libc::SIGTRAP {
                 format!("{call} {name}: rc=0 errno=0 child=exit 0\n")
@@ -3414,20 +3459,22 @@ fn reserved_siginfo_expected() -> String {
     expected
 }
 
-/// What `reserved_signal_send_probe tail` prints. A siginfo 8 bytes below
-/// the top of the address space, and one of a layout Linux does not know
-/// whose expansion lies on an unmapped page, are EFAULT everywhere: their
+/// What `reserved_signal_send_probe tail` prints for `signals`. A siginfo 8
+/// bytes below the top of the address space, and one of a layout Linux does not
+/// know whose expansion lies on an unmapped page, are EFAULT everywhere: their
 /// copy fails before any permission check. One of a layout Linux knows
 /// (SI_QUEUE) with the same placement copies, since Linux never reads that
-/// expansion: natively the send kills the child, and `refused` (the in-guest
-/// backends) it is the reserved-signal EPERM and the child exits 0.
-fn reserved_tail_expected(refused: bool) -> String {
+/// expansion: natively the send kills the child, and for a signal in `reserved`
+/// it is the reserved-signal EPERM and the child exits 0.
+fn reserved_tail_expected(signals: &[(&str, i32)], reserved: &[i32]) -> String {
     let mut expected = String::new();
     for case in ["top", "known", "unknown"] {
         for call in ["rt_sigqueueinfo", "rt_tgsigqueueinfo", "pidfd_send_signal"] {
-            for (name, number) in RESERVED_SIGNALS {
+            for &(name, number) in signals {
                 let answer = match case {
-                    "known" if refused => "rc=-1 errno=EPERM child=exit 0".to_string(),
+                    "known" if reserved.contains(&number) => {
+                        "rc=-1 errno=EPERM child=exit 0".to_string()
+                    }
                     "known" => format!("rc=0 errno=0 child=signal {number}"),
                     _ => "rc=-1 errno=EFAULT child=exit 0".to_string(),
                 };
@@ -3439,27 +3486,27 @@ fn reserved_tail_expected(refused: bool) -> String {
 }
 
 /// What `reserved_signal_send_probe armings` prints. Each arming succeeds on
-/// Linux and ptrace and returns EPERM refused; the two disarms succeed
-/// everywhere and leave no parent-death signal armed. Then the answers Linux
-/// gives before it looks at the signal, which a refusal never comes before:
-/// EBADF for F_SETSIG on a closed and on an O_PATH descriptor, EINVAL for
-/// timer_create on an id with no clock and EOPNOTSUPP on a clock without
-/// timers, that answer coming before the notification's, so it stands with
-/// an invalid notification or a SIGEV_THREAD_ID thread outside the process
-/// too. Under ptrace (`ptrace_ignores_timer_clocks`) the two plain
-/// timer_create calls succeed instead and the two combined ones are the
-/// notification's EINVAL: Detcore's virtual timers do not check the clock on
-/// any backend (https://github.com/rrnewton/hermit/issues/4556), a deviation
-/// measured at Hermit 1538d448 and unrelated to the reserved set, which
-/// ptrace does not have; pinned here at its current value.
-fn reserved_armings_expected(refused: bool, ptrace_ignores_timer_clocks: bool) -> String {
-    let answer = if refused {
-        "rc=-1 errno=EPERM"
-    } else {
-        "rc=0 errno=0"
-    };
+/// Linux and ptrace, and returns EPERM for a signal in `reserved`; the two
+/// disarms succeed everywhere and leave no parent-death signal armed. Then the
+/// answers Linux gives before it looks at the signal, which a refusal never
+/// comes before: EBADF for F_SETSIG on a closed and on an O_PATH descriptor,
+/// EINVAL for timer_create on an id with no clock and EOPNOTSUPP on a clock
+/// without timers, that answer coming before the notification's, so it stands
+/// with an invalid notification or a SIGEV_THREAD_ID thread outside the process
+/// too. Under ptrace (`ptrace_ignores_timer_clocks`) the two plain timer_create
+/// calls succeed instead and the two combined ones are the notification's
+/// EINVAL: Detcore's virtual timers do not check the clock on any backend
+/// (https://github.com/rrnewton/hermit/issues/4556), a deviation measured at
+/// Hermit 1538d448 and unrelated to the reserved set, which ptrace does not
+/// have; pinned here at its current value.
+fn reserved_armings_expected(reserved: &[i32], ptrace_ignores_timer_clocks: bool) -> String {
     let mut expected = String::new();
-    for (name, _) in RESERVED_SIGNALS {
+    for (name, number) in RESERVED_SIGNALS {
+        let answer = if reserved.contains(&number) {
+            "rc=-1 errno=EPERM"
+        } else {
+            "rc=0 errno=0"
+        };
         for (call, _) in RESERVED_ARMINGS {
             expected.push_str(&format!("{call} {name}: {answer}\n"));
         }
@@ -3492,6 +3539,17 @@ fn reserved_armings_expected(refused: bool, ptrace_ignores_timer_clocks: bool) -
 /// One run of `reserved_signal_send_probe` (`tests/c`) under `backend`, at log
 /// level `info`, with `extra` run options.
 fn run_reserved_signal_probe(backend: &str, extra: &[&str], mode: &str) -> Output {
+    run_reserved_signal_probe_for(backend, extra, mode, &[])
+}
+
+/// [`run_reserved_signal_probe`] for the probe's `signals` only (names; all
+/// three when empty).
+fn run_reserved_signal_probe_for(
+    backend: &str,
+    extra: &[&str],
+    mode: &str,
+    signals: &[(&str, i32)],
+) -> Output {
     let guest = c_guest(&RESERVED_SIGNAL_GUEST, "reserved_signal_send_probe");
     super::hermit_test::hermit_output(
         "hermit run",
@@ -3508,6 +3566,7 @@ fn run_reserved_signal_probe(backend: &str, extra: &[&str], mode: &str) -> Outpu
             .arg("--")
             .arg(guest)
             .arg(mode)
+            .args(signals.iter().map(|(name, _)| *name))
             .stdin(Stdio::null()),
     )
 }
@@ -3518,7 +3577,19 @@ fn run_reserved_signal_probe(backend: &str, extra: &[&str], mode: &str) -> Outpu
 /// must print `expected` with no recorded determinism loss, and the verify run
 /// must establish bitwise parity. Returns the plain run's stderr.
 fn assert_reserved_probe_runs(backend: &str, mode: &str, expected: &str) -> String {
-    let output = run_reserved_signal_probe(backend, &[], mode);
+    assert_reserved_probe_runs_for(backend, &[], mode, &[], expected)
+}
+
+/// [`assert_reserved_probe_runs`] with `extra` run options, for the probe's
+/// `signals` only (all three when empty).
+fn assert_reserved_probe_runs_for(
+    backend: &str,
+    extra: &[&str],
+    mode: &str,
+    signals: &[(&str, i32)],
+    expected: &str,
+) -> String {
+    let output = run_reserved_signal_probe_for(backend, extra, mode, signals);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
@@ -3532,7 +3603,8 @@ fn assert_reserved_probe_runs(backend: &str, mode: &str, expected: &str) -> Stri
         "{backend} {mode}: {stderr}"
     );
 
-    let verified = run_reserved_signal_probe(backend, &["--verify", "--verify-strict"], mode);
+    let verify_options = [extra, &["--verify", "--verify-strict"]].concat();
+    let verified = run_reserved_signal_probe_for(backend, &verify_options, mode, signals);
     let verified_stdout = String::from_utf8_lossy(&verified.stdout);
     let verified_stderr = String::from_utf8_lossy(&verified.stderr);
     assert!(
@@ -3556,11 +3628,58 @@ fn assert_reserved_probe_runs(backend: &str, mode: &str, expected: &str) -> Stri
     stderr
 }
 
+/// Runs `mode` of `reserved_signal_send_probe` for `signals` under `backend`,
+/// whose sends of them each kill a child that dies unscheduled
+/// ([`unscheduled_deaths_under`]): plainly, which must print `expected`
+/// (Linux's answer) with no reserved-signal WARN, and under `--verify
+/// --verify-strict`, which must refuse the run for the recorded loss and
+/// never report it verified. Returns the plain run's stderr.
+fn assert_unscheduled_probe_deaths(
+    backend: &str,
+    mode: &str,
+    signals: &[(&str, i32)],
+    expected: &str,
+) -> String {
+    let output = run_reserved_signal_probe_for(backend, &[], mode, signals);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "{backend} {mode} {signals:?}: status={:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status
+    );
+    assert_eq!(stdout, expected, "{backend} {mode} {signals:?}: {stderr}");
+    assert!(
+        !stderr.contains("HERMIT_RESERVED_SIGNAL"),
+        "{backend} {mode} {signals:?}: {stderr}"
+    );
+
+    let verified =
+        run_reserved_signal_probe_for(backend, &["--verify", "--verify-strict"], mode, signals);
+    let verified_stderr = String::from_utf8_lossy(&verified.stderr);
+    assert!(
+        !verified.status.success(),
+        "{backend} {mode} {signals:?} --verify: verification matched: {verified_stderr}"
+    );
+    assert!(
+        verified_stderr.contains("run 1: determinism loss recorded: process ")
+            && verified_stderr
+                .contains(" exited without deregistering; its exit was not scheduled"),
+        "{backend} {mode} {signals:?} --verify: {verified_stderr}"
+    );
+    assert!(
+        !verified_stderr.contains("Determinism verified"),
+        "{backend} {mode} {signals:?} --verify: {verified_stderr}"
+    );
+    stderr
+}
+
 /// A5 step 3c slice 0a (design section 16.30,
 /// <https://github.com/rrnewton/hermit/issues/4485>): the in-guest runtime keeps
 /// SIGSYS, SIGSEGV (while it traps instructions, which a default run does)
-/// and SIGTRAP (while LiteInst's guard router is installed, which today is
-/// every in-guest image) for itself. A send of one to another live process
+/// and SIGTRAP (while LiteInst's guard router is installed, which is site
+/// patching on: `liteinst`, not `in-guest-trap`, slice 0c) for itself
+/// ([`reserved_under`]). A send of one to another live process
 /// would run that process's runtime handler outside the schedule, so on both
 /// in-guest backends Detcore refuses each with EPERM and a WARN naming the
 /// call, the signal and the target, by every send call, and the child lives
@@ -3569,7 +3688,15 @@ fn assert_reserved_probe_runs(backend: &str, mode: &str, expected: &str) -> Stri
 /// `PR_SET_PDEATHSIG`) is refused the same way, with a WARN per arming; a
 /// disarm is not, and Linux's earlier answers (EBADF for the descriptor,
 /// EINVAL or EOPNOTSUPP for the clock) come first. Both runs verify
-/// bitwise. The same guest under ptrace, whose reserved set is empty, prints
+/// bitwise. Under `in-guest-trap` a SIGTRAP from another process is
+/// delivered and kills the child as on Linux, with no WARN, and the run is
+/// then refused verification for that child's unscheduled death
+/// ([`unscheduled_deaths_under`]), so its sends run apart from the refused
+/// ones, which verify; arming SIGTRAP succeeds there and verifies. Each
+/// backend's guest also reads its own SigCgt (`router` mode), which shows
+/// SIGTRAP caught exactly where LiteInst installed its guard router: on
+/// `liteinst`, not on `in-guest-trap`, ptrace or natively. The same guest under ptrace, whose reserved set
+/// is empty, prints
 /// what it printed before the set existed (see `reserved_sends_expected` and
 /// `reserved_armings_expected` for its two named deviations from Linux) and
 /// Hermit warns of nothing.
@@ -3579,20 +3706,67 @@ fn assert_reserved_probe_runs(backend: &str, mode: &str, expected: &str) -> Stri
 #[test]
 fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
     let _guard = hermit_run_guard();
-    for (backend, refused) in [
-        ("liteinst", true),
-        ("in-guest-trap", true),
-        ("ptrace", false),
-    ] {
+    // Linux's own answers on this host: every send kills the child with its
+    // signal, so a signal a backend does not keep must print the same.
+    let guest = c_guest(&RESERVED_SIGNAL_GUEST, "reserved_signal_send_probe");
+    let native = Command::new(guest)
+        .arg("sends")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        reserved_sends_expected(&RESERVED_SIGNALS, &[], false),
+        "native"
+    );
+    let native = Command::new(guest)
+        .arg("router")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "sigtrap caught: no\n",
+        "native"
+    );
+    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+        // The runtime's real router state, read from inside the image: the
+        // kernel's SigCgt has SIGTRAP only where LiteInst installed its guard
+        // router (site patching on). A Reverie that installed it with
+        // patching off again would show here (slice 0c).
+        let caught = if reserved_under(backend).contains(&libc::SIGTRAP) {
+            "yes"
+        } else {
+            "no"
+        };
+        assert_reserved_probe_runs(backend, "router", &format!("sigtrap caught: {caught}\n"));
+
+        let reserved = reserved_under(backend);
+        let unscheduled = unscheduled_deaths_under(backend);
+        let refused = !reserved.is_empty();
         let ptrace = backend == "ptrace";
-        let stderr =
-            assert_reserved_probe_runs(backend, "sends", &reserved_sends_expected(refused, ptrace));
+        let verifiable = signals_where(|number| !unscheduled.contains(&number));
+        // All three, as the probe's default, where none dies unscheduled.
+        let selected: &[(&str, i32)] = if unscheduled.is_empty() {
+            &[]
+        } else {
+            &verifiable
+        };
+        let stderr = assert_reserved_probe_runs_for(
+            backend,
+            &[],
+            "sends",
+            selected,
+            &reserved_sends_expected(&verifiable, reserved, ptrace),
+        );
         if refused {
             assert_eq!(
                 stderr
                     .matches("HERMIT_RESERVED_SIGNAL_SEND_REFUSED ")
                     .count(),
-                RESERVED_SEND_CALLS.len() * RESERVED_SIGNALS.len(),
+                RESERVED_SEND_CALLS.len() * reserved.len(),
                 "{backend}: {stderr}"
             );
             for (name, number) in RESERVED_SIGNALS {
@@ -3603,7 +3777,7 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
                     );
                     assert_eq!(
                         stderr.matches(&warning).count(),
-                        1,
+                        usize::from(reserved.contains(&number)),
                         "{backend}: {warning}\n{stderr}"
                     );
                 }
@@ -3614,20 +3788,29 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
                 "{backend}: {stderr}"
             );
         }
+        if !unscheduled.is_empty() {
+            let delivered = signals_where(|number| unscheduled.contains(&number));
+            assert_unscheduled_probe_deaths(
+                backend,
+                "sends",
+                &delivered,
+                &reserved_sends_expected(&delivered, &[], false),
+            );
+        }
 
         let stderr = assert_reserved_probe_runs(
             backend,
             "armings",
-            &reserved_armings_expected(refused, ptrace),
+            &reserved_armings_expected(reserved, ptrace),
         );
         if refused {
-            // One WARN per refused arming, none for a disarm or for a call
-            // Linux answers first.
+            // One WARN per refused arming, none for a disarm, for a call
+            // Linux answers first, or for a signal the backend does not keep.
             assert_eq!(
                 stderr
                     .matches("HERMIT_RESERVED_SIGNAL_ARMING_REFUSED ")
                     .count(),
-                RESERVED_ARMINGS.len() * RESERVED_SIGNALS.len(),
+                RESERVED_ARMINGS.len() * reserved.len(),
                 "{backend}: {stderr}"
             );
             for (name, number) in RESERVED_SIGNALS {
@@ -3636,10 +3819,14 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
                         "HERMIT_RESERVED_SIGNAL_ARMING_REFUSED signum={number} ({name}) \
                          call={warned} caller="
                     );
-                    let times = RESERVED_ARMINGS
-                        .iter()
-                        .filter(|(_, call)| *call == warned)
-                        .count();
+                    let times = if reserved.contains(&number) {
+                        RESERVED_ARMINGS
+                            .iter()
+                            .filter(|(_, call)| *call == warned)
+                            .count()
+                    } else {
+                        0
+                    };
                     assert_eq!(
                         stderr.matches(&warning).count(),
                         times,
@@ -3654,6 +3841,43 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
             );
         }
     }
+}
+
+/// A known difference, named in A5 step 3c slice 0c and failing closed: on
+/// `--backend=liteinst` Hermit leaves `REVERIE_LITEINST_SITE_PATCHING` to the
+/// guest's environment, so a guest that sets it to 0 runs images with no
+/// guard router (SigCgt shows SIGTRAP not caught), while Hermit still
+/// reserves SIGTRAP for the run. A SIGTRAP another process sends is then
+/// refused with EPERM and a WARN where Linux would deliver it: an
+/// over-refusal, never a missed reservation. Following each image's router
+/// state needs target-image-scoped reservation, deferred to 3c.1's
+/// published per-process state. Both runs verify bitwise.
+#[test]
+fn liteinst_in_guest_patching_off_by_environment_still_reserves_sigtrap() {
+    let _guard = hermit_run_guard();
+    let patching_off = ["--env", "REVERIE_LITEINST_SITE_PATCHING=0"];
+    assert_reserved_probe_runs_for(
+        "liteinst",
+        &patching_off,
+        "router",
+        &[],
+        "sigtrap caught: no\n",
+    );
+    let trap = signals_where(|number| number == libc::SIGTRAP);
+    let stderr = assert_reserved_probe_runs_for(
+        "liteinst",
+        &patching_off,
+        "sends",
+        &trap,
+        &reserved_sends_expected(&trap, &[libc::SIGTRAP], false),
+    );
+    assert_eq!(
+        stderr
+            .matches("HERMIT_RESERVED_SIGNAL_SEND_REFUSED signum=5 (SIGTRAP) ")
+            .count(),
+        RESERVED_SEND_CALLS.len(),
+        "{stderr}"
+    );
 }
 
 /// A reserved signal sent to a process with no live thread is never refused:
@@ -3728,23 +3952,48 @@ fn liteinst_in_guest_reserved_sends_keep_linuxs_siginfo_answers() {
         .output()
         .expect("failed to run the guest natively");
     assert!(native.status.success(), "{native:?}");
-    let native_tail = reserved_tail_expected(false);
+    let native_tail = reserved_tail_expected(&RESERVED_SIGNALS, &[]);
     assert_eq!(
         String::from_utf8_lossy(&native.stdout),
         native_tail,
         "native"
     );
     for backend in ["liteinst", "in-guest-trap"] {
-        let stderr = assert_reserved_probe_runs(backend, "tail", &reserved_tail_expected(true));
+        let reserved = reserved_under(backend);
+        let unscheduled = unscheduled_deaths_under(backend);
+        let verifiable = signals_where(|number| !unscheduled.contains(&number));
+        let selected: &[(&str, i32)] = if unscheduled.is_empty() {
+            &[]
+        } else {
+            &verifiable
+        };
+        let stderr = assert_reserved_probe_runs_for(
+            backend,
+            &[],
+            "tail",
+            selected,
+            &reserved_tail_expected(&verifiable, reserved),
+        );
         // A WARN for each known-layout send it refuses, and none for a copy
-        // that fails first.
+        // that fails first or for a signal the backend does not keep.
         assert_eq!(
             stderr
                 .matches("HERMIT_RESERVED_SIGNAL_SEND_REFUSED ")
                 .count(),
-            3 * RESERVED_SIGNALS.len(),
+            3 * reserved.len(),
             "{backend}: {stderr}"
         );
+        if !unscheduled.is_empty() {
+            // A known-layout send of a signal the backend does not keep is
+            // delivered and kills the child, as natively.
+            let delivered = signals_where(|number| unscheduled.contains(&number));
+            assert_unscheduled_probe_deaths(
+                backend,
+                "tail",
+                &delivered,
+                &reserved_tail_expected(&delivered, &[]),
+            );
+        }
     }
     let output = run_reserved_signal_probe("ptrace", &[], "tail");
     let stdout = String::from_utf8_lossy(&output.stdout);

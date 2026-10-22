@@ -7,18 +7,23 @@
  */
 
 /*
- * Sends and armings of the signals Hermit's in-guest runtime keeps for itself
- * (SIGSYS, SIGSEGV, SIGTRAP), A5 step 3c slice 0a
- * (https://github.com/rrnewton/hermit/issues/4485). Run by
+ * Sends and armings of the signals Hermit's in-guest runtime may keep for
+ * itself (SIGSYS, SIGSEGV, SIGTRAP), A5 step 3c slices 0a and 0c
+ * (https://github.com/rrnewton/hermit/issues/4485): SIGTRAP only with site
+ * patching on (--backend=liteinst), where LiteInst's guard router owns it;
+ * --backend=in-guest-trap installs no router and leaves SIGTRAP to the
+ * guest. Run by
  * hermit-cli/tests/common/liteinst_in_guest_programs.rs; never run it
  * natively in the group modes, which signal the caller's process group or
- * every process it may signal.
+ * every process it may signal. Signal names after the mode (SIGSYS, SIGSEGV,
+ * SIGTRAP) restrict the sends and armings to those signals, in that order.
  *
  *   sends     For each send call and each of the three signals: fork a child
  *             that waits on a pipe and exits 0, send it the signal, close the
  *             pipe, and print the call's result and how the child ended.
  *             Linux kills the child with the signal. Hermit's in-guest
- *             backends refuse each send with EPERM and the child exits 0.
+ *             backends refuse each send of a signal they keep with EPERM and
+ *             the child exits 0; in-guest-trap delivers SIGTRAP as Linux does.
  *             Hermit's ptrace backend kills the child too, except that a
  *             SIGTRAP from another process never reaches it and it exits 0
  *             (https://github.com/rrnewton/hermit/issues/4555).
@@ -52,6 +57,13 @@
  *             Hermit's ptrace backend both timer_create calls succeed: Detcore's
  *             timers do not check the clock
  *             (https://github.com/rrnewton/hermit/issues/4556).
+ *   router    Print whether this process catches SIGTRAP, read from the
+ *             SigCgt mask in /proc/self/status after the in-guest runtime has
+ *             installed itself (main runs after its constructor): caught on
+ *             --backend=liteinst, whose site patching installs LiteInst's
+ *             guard router, and not caught natively, under ptrace, or on
+ *             --backend=in-guest-trap or a patching-off image, which install
+ *             no router (A5 step 3c slice 0c).
  *   group-kill0, group-killpgid, group-killall, group-pidfd
  *             Lead a process group of its own, then send SIGSYS to it by
  *             kill(0), kill(-pgrp), kill(-1) or pidfd_send_signal with
@@ -78,7 +90,10 @@
 #define PIDFD_SIGNAL_PROCESS_GROUP (1U << 2)
 #endif
 
-static const int SIGNALS[] = {SIGSYS, SIGSEGV, SIGTRAP};
+/* The signals each mode sends or arms, in this order; the optional signal
+   arguments after the mode select a subset, in the order given. */
+static int SIGNALS[] = {SIGSYS, SIGSEGV, SIGTRAP};
+static size_t NSIGNALS = sizeof(SIGNALS) / sizeof(SIGNALS[0]);
 
 static const char *const CALLS[] = {
     "kill",
@@ -189,7 +204,7 @@ static void print_status(const char *label, int status) {
 
 static int sends(void) {
   for (size_t c = 0; c < COUNT(CALLS); c++) {
-    for (size_t s = 0; s < COUNT(SIGNALS); s++) {
+    for (size_t s = 0; s < NSIGNALS; s++) {
       int signal = SIGNALS[s];
       int fds[2];
       if (pipe(fds) != 0) {
@@ -254,7 +269,7 @@ static int siginfo_mode(void) {
     perror("mmap");
     return 1;
   }
-  for (size_t s = 0; s < COUNT(SIGNALS); s++) {
+  for (size_t s = 0; s < NSIGNALS; s++) {
     int signal = SIGNALS[s];
     /* -8: below SI_DETHREAD and not SI_ASYNCNL, so a layout Linux does not
        know, whose expansion must be all zero. */
@@ -314,7 +329,7 @@ static int tail_mode(void) {
   static const char *const CASES[] = {"top", "known", "unknown"};
   for (size_t k = 0; k < COUNT(CASES); k++) {
     for (size_t c = 0; c < COUNT(SEND_CALLS); c++) {
-      for (size_t s = 0; s < COUNT(SIGNALS); s++) {
+      for (size_t s = 0; s < NSIGNALS; s++) {
         int signal = SIGNALS[s];
         void *info;
         if (k == 0) {
@@ -389,7 +404,7 @@ static pid_t exiting_child(int *pidfd) {
 
 static void send_every_way(const char *prefix, pid_t child, int pidfd) {
   for (size_t c = 0; c < COUNT(CALLS); c++) {
-    for (size_t s = 0; s < COUNT(SIGNALS); s++) {
+    for (size_t s = 0; s < NSIGNALS; s++) {
       errno = 0;
       long result = send_with(CALLS[c], child, pidfd, SIGNALS[s]);
       print_send(prefix, CALLS[c], SIGNALS[s], result, errno);
@@ -476,7 +491,7 @@ static int armings(void) {
     perror("pipe");
     return 1;
   }
-  for (size_t s = 0; s < COUNT(SIGNALS); s++) {
+  for (size_t s = 0; s < NSIGNALS; s++) {
     int signal = SIGNALS[s];
     errno = 0;
     print_result("fcntl(F_SETSIG)", signal, fcntl(fds[0], F_SETSIG, signal));
@@ -561,13 +576,58 @@ static int group(const char *mode) {
   return 0;
 }
 
+/* Whether SIGTRAP's bit is set in this process's SigCgt mask. */
+static int router(void) {
+  FILE *status = fopen("/proc/self/status", "r");
+  if (status == NULL) {
+    perror("fopen /proc/self/status");
+    return 1;
+  }
+  char line[256];
+  int found = 0;
+  unsigned long long caught = 0;
+  while (fgets(line, sizeof line, status) != NULL) {
+    if (strncmp(line, "SigCgt:", 7) == 0) {
+      caught = strtoull(line + 7, NULL, 16);
+      found = 1;
+      break;
+    }
+  }
+  fclose(status);
+  if (!found) {
+    fprintf(stderr, "no SigCgt line in /proc/self/status\n");
+    return 1;
+  }
+  printf("sigtrap caught: %s\n", (caught >> (SIGTRAP - 1)) & 1 ? "yes" : "no");
+  return 0;
+}
+
 int main(int argc, char **argv) {
-  if (argc != 2) {
+  if (argc < 2) {
     fprintf(stderr,
             "usage: %s sends|siginfo|tail|exited|armings|group-kill0|group-killpgid|group-killall|"
-            "group-pidfd\n",
+            "group-pidfd|router [SIGSYS|SIGSEGV|SIGTRAP ...]\n",
             argv[0]);
     return 2;
+  }
+  if (argc > 2) {
+    static const int ALL[] = {SIGSYS, SIGSEGV, SIGTRAP};
+    if ((size_t)(argc - 2) > COUNT(ALL)) {
+      fprintf(stderr, "at most %zu signals\n", COUNT(ALL));
+      return 2;
+    }
+    NSIGNALS = 0;
+    for (int a = 2; a < argc; a++) {
+      size_t k = 0;
+      while (k < COUNT(ALL) && strcmp(argv[a], signal_name(ALL[k])) != 0) {
+        k++;
+      }
+      if (k == COUNT(ALL)) {
+        fprintf(stderr, "unknown signal %s\n", argv[a]);
+        return 2;
+      }
+      SIGNALS[NSIGNALS++] = ALL[k];
+    }
   }
   setvbuf(stdout, NULL, _IOLBF, 0);
   if (strcmp(argv[1], "sends") == 0) {
@@ -584,6 +644,9 @@ int main(int argc, char **argv) {
   }
   if (strcmp(argv[1], "armings") == 0) {
     return armings();
+  }
+  if (strcmp(argv[1], "router") == 0) {
+    return router();
   }
   if (strncmp(argv[1], "group-", 6) == 0) {
     return group(argv[1]);

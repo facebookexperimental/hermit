@@ -306,6 +306,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_library_launch_refuses_a_configured_producer",
     "liteinst_in_guest_programs::liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe",
     "liteinst_in_guest_programs::liteinst_in_guest_parent_death_signals_are_held_or_refused_at_arming",
+    "liteinst_in_guest_programs::liteinst_in_guest_patching_off_by_environment_still_reserves_sigtrap",
     "liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_python_entropy",
     "liteinst_in_guest_programs::liteinst_in_guest_python_random_example",

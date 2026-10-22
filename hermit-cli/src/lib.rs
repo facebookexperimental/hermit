@@ -1160,20 +1160,28 @@ pub fn forced_site_patching_value(backend: Backend) -> Option<&'static str> {
     }
 }
 
-/// Whether LiteInst's SIGTRAP guard router is installed in every in-guest Tool
-/// image. At the pinned Reverie it is: the runtime's instrumentation
-/// preparation (`prepare_instrumentation`, reverie-liteinst
-/// `src/runtime.rs:1114-1124`) installs it through
-/// `prepare_live_patching_with_signal_runtime` whatever the site-patching
-/// setting, on both the Tool-host path (`PatchHost::prepare_patcher`,
-/// `src/runtime.rs:730-733`, which reverie-inguest's `activate_runtime` calls
-/// for patching on and off, `src/guest/tool_install.rs:277`) and the direct
-/// install (`install_runtime`, `src/runtime.rs:804`). A guest whose SIGTRAP
-/// action is a handler of its own at that point makes the installation fail
-/// (EPERM), so no guest runs without it. A later step stops installing it with
-/// site patching off (A5 3c.0 slice 0c); this answer changes with it.
-pub const fn in_guest_guard_router_installed(backend: Backend) -> bool {
-    backend.is_in_guest_liteinst()
+/// Whether LiteInst's SIGTRAP guard router can be installed in the in-guest
+/// Tool images of a default-route run of `backend` configured by `config`:
+/// on an in-guest backend, unless every image runs with syscall site
+/// patching off (`config.in_guest_site_patching_off`, set for
+/// `--backend=in-guest-trap`).
+///
+/// At the pinned Reverie, the shared Tool host's preparation
+/// (`LiteinstPatchHost::prepare_patcher`, reverie-liteinst `src/runtime.rs`)
+/// installs the router only when the site-patching setting its runtime
+/// captured is on: the router takes the breakpoints LiteInst plants while it
+/// publishes a patched site, and with patching off it publishes none
+/// (A5 step 3c slice 0c). Every in-guest-trap image checks that its runtime
+/// captured patching off and refuses to run otherwise
+/// (`detcore::in_guest_site_patching`), so no image of such a run executes
+/// guest code with the router. On `--backend=liteinst` Hermit leaves the setting to the guest's
+/// environment, so an image can run with patching off and no router; the
+/// answer is then `true` all the same, which reserves SIGTRAP where it is
+/// not needed: a refusal Linux would not make, never a missed one. The
+/// loader route (Reverie's private-image installer) keeps the router
+/// whatever its setting, and never calls this (D26).
+pub const fn in_guest_guard_router_installed(config: &DetConfig, backend: Backend) -> bool {
+    backend.is_in_guest_liteinst() && !config.in_guest_site_patching_off
 }
 
 /// The signals the in-guest runtime keeps for itself in a run of `backend`
@@ -1181,7 +1189,9 @@ pub const fn in_guest_guard_router_installed(backend: Backend) -> bool {
 /// `n - 1` for signal `n`, for Hermit's default in-guest route: SIGSYS, its
 /// syscall trap, always; SIGSEGV while it subscribes instructions, when it
 /// installs its instruction-fault handler for SIGSEGV; and SIGTRAP while
-/// LiteInst's guard router is installed ([`in_guest_guard_router_installed`]).
+/// LiteInst's guard router can be installed, which is site patching on
+/// ([`in_guest_guard_router_installed`]): never on `in-guest-trap`, whose
+/// `config.in_guest_site_patching_off` the caller has set first.
 /// The subscription is Detcore's own decision from the same configuration
 /// (`Tool::subscriptions`), which each in-guest Tool image reads to choose
 /// its instruction subscriptions (reverie-inguest `tool_install.rs:191-195`).
@@ -1197,7 +1207,7 @@ pub fn in_guest_reserved_signals(config: &DetConfig, backend: Backend) -> u64 {
     if subscription.has_rdtsc() || subscription.has_cpuid() {
         reserved |= bit(libc::SIGSEGV);
     }
-    if in_guest_guard_router_installed(backend) {
+    if in_guest_guard_router_installed(config, backend) {
         reserved |= bit(libc::SIGTRAP);
     }
     reserved
@@ -7692,60 +7702,91 @@ mod tests {
     }
 
     /// Hermit's default in-guest route reserves SIGSYS always, SIGSEGV while
-    /// Detcore's subscription traps an instruction, and SIGTRAP while the
-    /// guard router is installed, which today is every in-guest image. Every
-    /// other backend gets an empty set, and so does the in-guest loader route,
-    /// whose configuration is `prepare_backend_config`'s with no reserved set
-    /// (A5 step 3c, design section 16.30).
+    /// Detcore's subscription traps an instruction, and SIGTRAP only while the
+    /// guard router can be installed: with site patching on
+    /// (`in_guest_site_patching_off` false), never with it off, on either
+    /// in-guest backend (A5 step 3c slice 0c). Every other backend gets an
+    /// empty set and no router whatever the setting, and so does the in-guest
+    /// loader route, whose configuration is `prepare_backend_config`'s with no
+    /// reserved set (A5 step 3c, design section 16.30).
     #[test]
-    fn in_guest_reserved_signals_follow_the_backend_and_the_subscription() {
+    fn in_guest_reserved_signals_follow_the_backend_the_subscription_and_site_patching() {
         let bit = |signal: libc::c_int| 1_u64 << (signal - 1);
-        let all = bit(libc::SIGSYS) | bit(libc::SIGSEGV) | bit(libc::SIGTRAP);
         for backend in Backend::ALL {
-            let config = prepare_backend_config(DetConfig::default(), backend);
-            assert_eq!(config.in_guest_reserved_signals, 0, "{backend:?}");
-            let reserved = in_guest_reserved_signals(&config, backend);
-            // This restates `in_guest_guard_router_installed`'s definition
-            // today and so tests nothing about the router. Slice 0c, which
-            // stops installing the router with site patching off, must
-            // replace it with a test of the route and patching setting that
-            // decide the installation.
-            assert_eq!(
-                in_guest_guard_router_installed(backend),
-                backend.is_in_guest_liteinst(),
-                "{backend:?}"
-            );
-            if !backend.is_in_guest_liteinst() {
-                assert_eq!(reserved, 0, "{backend:?}");
-                continue;
-            }
-            // Without --passthru-opt Detcore always subscribes RDTSC.
-            assert!(<Detcore as reverie::Tool>::subscriptions(&config).has_rdtsc());
-            assert_eq!(reserved, all, "{backend:?}");
-
-            // --passthru-opt with time and CPUID virtualization off traps no
-            // instruction, so the runtime installs no SIGSEGV handler.
-            let mut unsubscribed = config.clone();
-            unsubscribed.passthru_opt = true;
-            unsubscribed.virtualize_time = false;
-            unsubscribed.virtualize_cpuid = false;
-            let subscription = <Detcore as reverie::Tool>::subscriptions(&unsubscribed);
-            assert!(!subscription.has_rdtsc() && !subscription.has_cpuid());
-            assert_eq!(
-                in_guest_reserved_signals(&unsubscribed, backend),
-                bit(libc::SIGSYS) | bit(libc::SIGTRAP),
-                "{backend:?}"
-            );
-            for (time, cpuid) in [(true, false), (false, true)] {
-                let mut subscribed = unsubscribed.clone();
-                subscribed.virtualize_time = time;
-                subscribed.virtualize_cpuid = cpuid;
+            for patching_off in [false, true] {
+                let mut config = prepare_backend_config(DetConfig::default(), backend);
+                assert_eq!(config.in_guest_reserved_signals, 0, "{backend:?}");
+                config.in_guest_site_patching_off = patching_off;
+                let router = in_guest_guard_router_installed(&config, backend);
+                let reserved = in_guest_reserved_signals(&config, backend);
+                let label = format!("{backend:?} patching_off={patching_off}");
+                if !backend.is_in_guest_liteinst() {
+                    assert!(!router, "{label}");
+                    assert_eq!(reserved, 0, "{label}");
+                    continue;
+                }
+                assert_eq!(router, !patching_off, "{label}");
+                let trap = if patching_off { 0 } else { bit(libc::SIGTRAP) };
+                // Without --passthru-opt Detcore always subscribes RDTSC.
+                assert!(<Detcore as reverie::Tool>::subscriptions(&config).has_rdtsc());
                 assert_eq!(
-                    in_guest_reserved_signals(&subscribed, backend),
-                    all,
-                    "{backend:?} time={time} cpuid={cpuid}"
+                    reserved,
+                    bit(libc::SIGSYS) | bit(libc::SIGSEGV) | trap,
+                    "{label}"
                 );
+
+                // --passthru-opt with time and CPUID virtualization off traps
+                // no instruction, so the runtime installs no SIGSEGV handler.
+                let mut unsubscribed = config.clone();
+                unsubscribed.passthru_opt = true;
+                unsubscribed.virtualize_time = false;
+                unsubscribed.virtualize_cpuid = false;
+                let subscription = <Detcore as reverie::Tool>::subscriptions(&unsubscribed);
+                assert!(!subscription.has_rdtsc() && !subscription.has_cpuid());
+                assert_eq!(
+                    in_guest_reserved_signals(&unsubscribed, backend),
+                    bit(libc::SIGSYS) | trap,
+                    "{label}"
+                );
+                for (time, cpuid) in [(true, false), (false, true)] {
+                    let mut subscribed = unsubscribed.clone();
+                    subscribed.virtualize_time = time;
+                    subscribed.virtualize_cpuid = cpuid;
+                    assert_eq!(
+                        in_guest_reserved_signals(&subscribed, backend),
+                        bit(libc::SIGSYS) | bit(libc::SIGSEGV) | trap,
+                        "{label} time={time} cpuid={cpuid}"
+                    );
+                }
             }
+        }
+    }
+
+    /// The default in-guest route sets every Tool image's site-patching check
+    /// from the backend and only then the reserved set, so SIGTRAP is
+    /// reserved on `liteinst` (patching on, router installed) and not on
+    /// `in-guest-trap` (patching off, no router): a SIGTRAP another process
+    /// sends to an in-guest-trap guest is delivered as on Linux, while SIGSYS
+    /// and SIGSEGV stay reserved on both (A5 step 3c slice 0c).
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn the_default_route_reserves_sigtrap_only_with_site_patching_on() {
+        let bit = |signal: libc::c_int| 1_u64 << (signal - 1);
+        for backend in Backend::ALL {
+            let mut config = prepare_backend_config(DetConfig::default(), backend);
+            config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
+            let reserved = in_guest_reserved_signals(&config, backend);
+            let expected = match backend {
+                Backend::Liteinst => bit(libc::SIGSYS) | bit(libc::SIGSEGV) | bit(libc::SIGTRAP),
+                Backend::InGuestTrap => bit(libc::SIGSYS) | bit(libc::SIGSEGV),
+                _ => 0,
+            };
+            assert_eq!(reserved, expected, "{backend:?}");
+            assert_eq!(
+                in_guest_guard_router_installed(&config, backend),
+                backend == Backend::Liteinst,
+                "{backend:?}"
+            );
         }
     }
 
