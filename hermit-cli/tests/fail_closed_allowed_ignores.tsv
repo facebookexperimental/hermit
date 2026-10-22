@@ -204,7 +204,6 @@ rr_suite	rr_sigpwr	ptrace-heavy rr program; requires PMU branch counters and wor
 rr_suite	rr_sigqueueinfo	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
 rr_suite	rr_sigreturn_reg	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
 rr_suite	rr_sigtrap	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
-rr_suite	rr_simple_threads_stress	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
 rr_suite	rr_small_holes	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
 rr_suite	rr_splice	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces
 rr_suite	rr_stack_growth_after_syscallbuf	ptrace-heavy rr program; requires PMU branch counters and working mount namespaces

@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Fail closed when a Hermit integration-test binary is absent from CI accounting.
 
 Cargo discovers every top-level ``hermit-cli/tests/*.rs`` file as a test binary.

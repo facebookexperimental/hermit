@@ -24,7 +24,8 @@ cargo metadata --locked --format-version 1 --no-deps >/dev/null
 "$repo_root/scripts/check-buck-reindeer-features.rs"
 
 # A fresh checkout has none of these generated paths. Removing only paths that
-# Git confirms are excluded makes repeated local use take the same path.
+# Git confirms are excluded makes repeated local use take the same path, which
+# then either restores them from the cache or generates them.
 for generated in \
   "$third_party_dir/.cargo" \
   "$third_party_dir/BUCK" \
@@ -36,6 +37,14 @@ do
     exit 1
   fi
 done
+# Opt-in: fetch Cargo.lock's git dependencies from local mirrors (docs/BUCK2_OSS.md).
+# Checked before anything is removed, so a refusal leaves the previous output in place.
+if [[ -n ${HERMIT_GIT_DEP_MIRRORS:-} ]]; then
+  # shellcheck source=bootstrap/git-dep-mirrors.sh
+  source "$script_dir/git-dep-mirrors.sh"
+  git_dep_mirrors_apply Cargo.lock "$HERMIT_GIT_DEP_MIRRORS"
+fi
+
 rm -rf -- \
   "$third_party_dir/.cargo" \
   "$third_party_dir/BUCK" \
@@ -46,16 +55,65 @@ reindeer_args=(
   --manifest-path "$repo_root/Cargo.toml"
 )
 
-"$script_dir/reindeer" "${reindeer_args[@]}" vendor
-
 first_output=$(mktemp)
 trap 'rm -f -- "$first_output"' EXIT
-"$script_dir/reindeer" "${reindeer_args[@]}" buckify --stdout >"$first_output"
-"$script_dir/reindeer" "${reindeer_args[@]}" buckify
-cmp --silent "$first_output" "$third_party_dir/BUCK" || {
-  echo "Reindeer produced different BUCK output across consecutive invocations" >&2
-  exit 1
-}
+
+# What Reindeer generates is restored from a cache entry named by its inputs
+# when an earlier run produced it (bootstrap/rust-deps-cache.sh).
+# shellcheck source=bootstrap/rust-deps-cache.sh
+source "$script_dir/rust-deps-cache.sh"
+cache_root=$(rust_deps_cache_root)
+cache_key=
+restored=1
+if [[ -n $cache_root ]]; then
+  # A checkout the key cannot cover, or a key that cannot be computed, is
+  # generated without the cache: nothing restored, nothing stored.
+  key_status=0
+  cache_key=$(rust_deps_cache_key "$repo_root") || key_status=$?
+  if [[ $key_status -eq 3 ]]; then
+    echo "warning: not using the rust-deps cache: $cache_key" >&2
+  elif [[ $key_status -ne 0 ]]; then
+    echo "warning: not using the rust-deps cache: its key could not be computed (above)" >&2
+  fi
+  [[ $key_status -eq 0 ]] || cache_key=
+fi
+if [[ -n $cache_key ]]; then
+  restored=0
+  rust_deps_cache_restore "$cache_root" "$cache_key" "$third_party_dir" "$first_output" || restored=$?
+  if [[ $restored -eq 2 ]]; then
+    # A damaged entry would otherwise fail every later run with these inputs.
+    echo "warning: restoring $cache_root/$cache_key failed (above); discarding it and generating" >&2
+    rm -rf -- "$third_party_dir/.cargo" "$third_party_dir/vendor"
+    rust_deps_cache_discard "$cache_root" "$cache_key"
+  fi
+fi
+if [[ $restored -eq 0 ]]; then
+  cp -- "$first_output" "$third_party_dir/BUCK"
+  echo "restored the vendored crates and Reindeer's BUCK from $cache_root/$cache_key" >&2
+else
+  "$script_dir/reindeer" "${reindeer_args[@]}" vendor
+  "$script_dir/reindeer" "${reindeer_args[@]}" buckify --stdout >"$first_output"
+  "$script_dir/reindeer" "${reindeer_args[@]}" buckify
+  cmp --silent "$first_output" "$third_party_dir/BUCK" || {
+    echo "Reindeer produced different BUCK output across consecutive invocations" >&2
+    exit 1
+  }
+  # Cargo's download caches (about 870 MB) are not output; only the
+  # vendored-sources configuration is. Removing them gives a generated and a
+  # restored checkout the same tree.
+  find "$third_party_dir/.cargo" -mindepth 1 -maxdepth 1 ! -name config.toml -exec rm -rf -- {} +
+  # Reindeer resolves the lock itself and can rewrite it. Output a refused run
+  # generated is never stored, and neither is output whose inputs moved during
+  # generation, which a later run with the original inputs would restore.
+  git diff --exit-code -- Cargo.lock
+  if [[ -n $cache_key ]]; then
+    if recheck_key=$(rust_deps_cache_key "$repo_root") && [[ $recheck_key == "$cache_key" ]]; then
+      rust_deps_cache_publish "$cache_root" "$cache_key" "$third_party_dir" "$first_output"
+    else
+      echo "warning: the rust-deps cache inputs changed while Reindeer ran, or could not be read again; not storing its output" >&2
+    fi
+  fi
+fi
 
 # Prelude normally assembles a Cargo manifest directory from symlinks. The
 # pinned reverie-dbt build installs native headers and preserves those links,

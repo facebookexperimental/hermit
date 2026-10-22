@@ -1,7 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
- *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
@@ -139,7 +138,7 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if !guest.config().kvm_shared_dequeue_timers {
+    if guest.signal_control_mode() != reverie::BackendSignalControlMode::ToolControlled {
         return Ok(());
     }
     let current_identity = guest.signal_task_identity();
@@ -199,9 +198,9 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if !guest.config().kvm_shared_dequeue_timers {
-        return resource_request(guest, resources).await;
-    }
+    // Reverie decides whether this callback is a controlled parked site. A
+    // backend without signal control, or one whose Tool did not opt into
+    // signal dequeues, answers `None`, so no backend identity is checked here.
     let Some(site) = guest.parked_signal_site() else {
         // The unmodeled callback keeps its existing ordinary completion.
         // Process publication does not invent an interruption for this site.
@@ -215,6 +214,29 @@ where
     .await
 }
 
+/// The serial KVM waitid handler lends its complete child selector while it
+/// has no checked-out scratch or modified application signal mask.
+pub(crate) async fn child_wait_request<G, T>(guest: &mut G, spec: ChildWaitSpec) -> ResumeStatus
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !guest.config().backend.emulates_child_waits
+        || guest.signal_control_mode() != reverie::BackendSignalControlMode::ToolControlled
+    {
+        terminate_protocol(guest, ProtocolFailure::Unsupported).await;
+    }
+    let Some(site) = guest.parked_signal_site() else {
+        terminate_protocol(guest, ProtocolFailure::Unsupported).await;
+    };
+    let state = guest.thread_state();
+    let parent = state.detpid.expect("registered process");
+    let mut resources = Resources::new(state.dettid);
+    resources.insert(ResourceID::WaitChild { parent, spec }, Permission::R);
+    resources.fyi("wait-child-lifecycle");
+    capable_resource_request(guest, resources, ControlCapability::ChildWait { site }).await
+}
+
 /// Only an actual original scalar read with a witnessed zero-effect EAGAIN
 /// may lend its queued polling request to the parked signal protocol.
 pub(crate) async fn polled_read_request<G, T>(
@@ -226,8 +248,9 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if guest.config().kvm_shared_dequeue_timers
-        && resources.poll_attempt > 0
+    // As in `parked_wait_request`, the Reverie query alone decides whether
+    // this read has a controlled site.
+    if resources.poll_attempt > 0
         && let Some(site) = guest.polled_read_signal_site(call)
     {
         return capable_resource_request(guest, resources, ControlCapability::PolledRead { site })
@@ -258,6 +281,15 @@ where
     };
     loop {
         let control = match reply {
+            ResourceReply::Grant(ResumeStatus::Signaled(None))
+                if matches!(capability, ControlCapability::ChildWait { .. }) =>
+            {
+                // The ordinary None constructor is task cancellation; the
+                // RPC's incarnation/tombstone checks must consume it as
+                // ThreadExited. Only a real caught observation may return
+                // None to this child-wait caller as an interrupted syscall.
+                terminate_protocol(guest, ProtocolFailure::UnexpectedControl).await
+            }
             ResourceReply::Grant(status) => return status,
             ResourceReply::ObserveSignal(control) => *control,
         };

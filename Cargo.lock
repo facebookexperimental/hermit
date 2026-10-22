@@ -438,7 +438,7 @@ dependencies = [
 [[package]]
 name = "dagrun"
 version = "0.15.0"
-source = "git+https://github.com/rrnewton/agent-utils.git?rev=1151317720218c8dd830a50d9f6bf10fc7d175e5#1151317720218c8dd830a50d9f6bf10fc7d175e5"
+source = "git+https://github.com/rrnewton/agent-utils.git?rev=e01f45dd0e3548a068112fbc9af93c8295fa748a#e01f45dd0e3548a068112fbc9af93c8295fa748a"
 dependencies = [
  "libc",
  "serde",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "detcore-dbt"
-version = "0.4.0"
+version = "0.5.1"
 dependencies = [
  "hermit-detcore",
  "hermit-resources",
@@ -525,17 +525,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "detcore-liteinst"
-version = "0.4.0"
+name = "detcore-dbt-cdylib"
+version = "0.5.1"
 dependencies = [
+ "detcore-dbt",
+]
+
+[[package]]
+name = "detcore-liteinst"
+version = "0.5.1"
+dependencies = [
+ "bincode 2.0.1",
+ "detcore-model",
  "hermit-detcore",
  "libc",
+ "reverie-core",
+ "reverie-inguest",
  "reverie-liteinst",
+ "reverie-rpc-transport",
+ "serde",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
 name = "detcore-model"
-version = "0.4.1"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "bincode 2.0.1",
@@ -550,13 +565,14 @@ dependencies = [
  "reverie-syscalls",
  "serde",
  "serde_json",
+ "sha2",
  "shell-words",
  "tracing",
 ]
 
 [[package]]
 name = "detcore-sabre"
-version = "0.4.0"
+version = "0.5.1"
 dependencies = [
  "hermit-detcore",
  "libc",
@@ -570,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "detcore-testutils"
-version = "0.4.0"
+version = "0.5.1"
 dependencies = [
  "hermit-detcore",
  "hermit-test-workdir",
@@ -672,8 +688,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 [[package]]
 name = "fbinit"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9fab2ce1c23354acaba3e8f75bd00c52b4cc8ed91da7c02c8324b874320a298"
+source = "git+https://github.com/facebookexperimental/rust-shed.git?branch=main#84a82026bc1d1a89e7f6ec86e0e52d5479f12ccc"
 dependencies = [
  "fbinit_macros",
  "quickcheck",
@@ -682,12 +697,11 @@ dependencies = [
 [[package]]
 name = "fbinit_macros"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e1b8281b24c3488f292c860b4a6608425bac12a69ce5b16e8f3b1582b5c7083"
+source = "git+https://github.com/facebookexperimental/rust-shed.git?branch=main#84a82026bc1d1a89e7f6ec86e0e52d5479f12ccc"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 1.0.109",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -945,11 +959,11 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermetic_infra_hermit_flaky-tests"
-version = "0.4.0"
+version = "0.5.1"
 
 [[package]]
 name = "hermetic_infra_hermit_tests"
-version = "0.4.0"
+version = "0.5.1"
 dependencies = [
  "close-err",
  "hermit-detcore",
@@ -960,89 +974,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "hermit-abi"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
-
-[[package]]
-name = "hermit-detcore"
-version = "0.4.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "bitflags 2.13.1",
- "chrono",
- "clap",
- "detcore-model",
- "detcore-testutils",
- "futures 0.3.33",
- "hex",
- "libc",
- "nix 0.30.1",
- "pretty",
- "pretty_assertions",
- "procfs",
- "rand",
- "rand_distr",
- "rand_pcg",
- "raw-cpuid",
- "regex",
- "reverie-core",
- "reverie-ptrace",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "test-allocator",
- "test-case",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "hermit-install"
-version = "0.4.0"
-dependencies = [
- "reverie-dbt",
- "reverie-sabre",
-]
-
-[[package]]
-name = "hermit-manifest-plan"
-version = "0.4.0"
-dependencies = [
- "dagrun",
- "detcore-model",
- "libc",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "shell-words",
- "toml",
-]
-
-[[package]]
-name = "hermit-resources"
-version = "0.4.1"
-
-[[package]]
-name = "hermit-run"
-version = "0.4.1"
+name = "hermit"
+version = "0.5.1"
 dependencies = [
  "addr2line",
  "anyhow",
  "bincode 2.0.1",
  "clap",
  "colored",
+ "detcore-dbt",
  "detcore-model",
  "diff",
  "dirs",
  "fbinit",
  "goblin",
  "hermit-detcore",
+ "hermit-record",
+ "hermit-record-format",
+ "hermit-replay",
  "hermit-resources",
+ "hermit-run-kvm",
+ "hermit-run-ptrace",
+ "hermit-test-workdir",
  "iced-x86",
  "libc",
  "nix 0.30.1",
@@ -1055,13 +1008,20 @@ dependencies = [
  "rand_pcg",
  "regex",
  "reverie-core",
+ "reverie-dbt",
+ "reverie-inguest",
  "reverie-kvm",
  "reverie-liteinst",
+ "reverie-liteinst-artifact",
+ "reverie-loader",
  "reverie-ptrace",
  "reverie-rpc-transport",
  "reverie-sabre-stats",
+ "ruzstd 0.9.0",
+ "safeptrace",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "shell-words",
  "syn 2.0.119",
@@ -1075,15 +1035,188 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermit-abi"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "hermit-cdylib"
+version = "0.5.1"
+dependencies = [
+ "hermit",
+]
+
+[[package]]
+name = "hermit-detcore"
+version = "0.5.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode 2.0.1",
+ "bitflags 2.13.1",
+ "chrono",
+ "clap",
+ "detcore-model",
+ "futures 0.3.33",
+ "hex",
+ "libc",
+ "nix 0.30.1",
+ "pretty",
+ "pretty_assertions",
+ "procfs",
+ "rand",
+ "rand_distr",
+ "rand_pcg",
+ "raw-cpuid",
+ "regex",
+ "reverie-core",
+ "ruzstd 0.9.0",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "test-case",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "hermit-detcore-tests"
+version = "0.5.1"
+dependencies = [
+ "chrono",
+ "detcore-model",
+ "detcore-testutils",
+ "hermit-detcore",
+ "libc",
+ "nix 0.30.1",
+ "pretty_assertions",
+ "raw-cpuid",
+ "reverie-core",
+ "reverie-ptrace",
+ "serde",
+ "tempfile",
+ "test-allocator",
+ "tokio",
+]
+
+[[package]]
+name = "hermit-install"
+version = "0.5.1"
+dependencies = [
+ "reverie-dbt",
+ "reverie-liteinst-artifact",
+ "reverie-sabre",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "hermit-lit-guests"
+version = "0.5.1"
+dependencies = [
+ "close-err",
+ "libc",
+ "nix 0.30.1",
+ "syscalls",
+ "tempfile",
+]
+
+[[package]]
+name = "hermit-manifest-plan"
+version = "0.5.1"
+dependencies = [
+ "dagrun",
+ "detcore-model",
+ "libc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "shell-words",
+ "toml",
+]
+
+[[package]]
+name = "hermit-record"
+version = "0.5.1"
+dependencies = [
+ "bincode 2.0.1",
+ "hermit-detcore",
+ "hermit-record-format",
+ "libc",
+ "reverie-core",
+ "reverie-ptrace",
+ "serde",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "hermit-record-format"
+version = "0.5.1"
+dependencies = [
+ "bincode 2.0.1",
+ "goblin",
+ "hermit-detcore",
+ "libc",
+ "reverie-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "hermit-replay"
+version = "0.5.1"
+dependencies = [
+ "anyhow",
+ "hermit-detcore",
+ "hermit-record-format",
+ "libc",
+ "nix 0.30.1",
+ "reverie-core",
+ "reverie-ptrace",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "hermit-resources"
+version = "0.5.1"
+
+[[package]]
+name = "hermit-run-kvm"
+version = "0.5.1"
+dependencies = [
+ "hermit-detcore",
+ "reverie-kvm",
+]
+
+[[package]]
+name = "hermit-run-ptrace"
+version = "0.5.1"
+dependencies = [
+ "hermit-detcore",
+ "reverie-core",
+ "reverie-ptrace",
+]
+
+[[package]]
 name = "hermit-test-workdir"
-version = "0.4.1"
+version = "0.5.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "hermit-verify"
-version = "0.4.1"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1216,9 +1349,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libm"
@@ -1262,7 +1395,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 [[package]]
 name = "liteinst2"
 version = "0.1.0"
-source = "git+https://github.com/rrnewton/liteinst2?rev=2032b49d983f74ec8472761d7704c64c00085a55#2032b49d983f74ec8472761d7704c64c00085a55"
+source = "git+https://github.com/rrnewton/liteinst2?rev=d64dc833418a4c265803645653b8f597d0f25060#d64dc833418a4c265803645653b8f597d0f25060"
 dependencies = [
  "iced-x86",
  "libc",
@@ -1381,8 +1514,8 @@ dependencies = [
 
 [[package]]
 name = "nostd-print"
-version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "syscalls",
 ]
@@ -1719,8 +1852,8 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reverie-core"
-version = "0.4.1"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -1734,6 +1867,7 @@ dependencies = [
  "never-say-never",
  "nix 0.30.1",
  "object 0.40.0",
+ "perf-event-open-sys",
  "procfs",
  "raw-cpuid",
  "reverie-process",
@@ -1741,13 +1875,14 @@ dependencies = [
  "serde",
  "syscalls",
  "thiserror",
+ "tracing",
  "typed-arena",
 ]
 
 [[package]]
 name = "reverie-dbt"
-version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "bincode 2.0.1",
  "libc",
@@ -1763,9 +1898,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "reverie-inguest"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
+dependencies = [
+ "bincode 2.0.1",
+ "libc",
+ "nix 0.30.1",
+ "reverie-core",
+ "reverie-loader",
+ "reverie-memory",
+ "reverie-rpc-transport",
+ "reverie-syscalls",
+ "safeptrace",
+ "serde",
+ "sha2",
+ "syscalls",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "reverie-kvm"
-version = "0.4.1"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "cc",
  "futures 0.3.33",
@@ -1775,21 +1932,32 @@ dependencies = [
  "libc",
  "perf-event-open-sys",
  "reverie-core",
+ "reverie-kvm-core",
+ "thiserror",
+]
+
+[[package]]
+name = "reverie-kvm-core"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
+dependencies = [
+ "goblin",
+ "kvm-ioctls",
+ "reverie-core",
  "thiserror",
 ]
 
 [[package]]
 name = "reverie-liteinst"
-version = "0.4.1"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "bincode 2.0.1",
  "iced-x86",
  "libc",
  "liteinst2",
  "reverie-core",
- "reverie-preload",
- "reverie-ptrace",
+ "reverie-inguest",
  "reverie-rpc-transport",
  "serde",
  "tempfile",
@@ -1798,28 +1966,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "reverie-liteinst-artifact"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
+dependencies = [
+ "goblin",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "reverie-loader"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
+
+[[package]]
 name = "reverie-memory"
-version = "0.4.1"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "syscalls",
 ]
 
 [[package]]
-name = "reverie-preload"
-version = "0.4.1"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
-dependencies = [
- "bincode 2.0.1",
- "libc",
- "reverie-core",
- "serde",
-]
-
-[[package]]
 name = "reverie-process"
-version = "0.4.1"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "bincode 2.0.1",
  "bitflags 2.13.1",
@@ -1835,8 +2009,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-ptrace"
-version = "0.4.1"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1867,8 +2041,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-rpc"
-version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "async-trait",
  "bincode 1.3.3",
@@ -1878,8 +2052,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-rpc-macros"
-version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "darling",
  "heck 0.3.3",
@@ -1890,22 +2064,23 @@ dependencies = [
 
 [[package]]
 name = "reverie-rpc-transport"
-version = "0.4.1"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "async-trait",
  "bincode 2.0.1",
  "libc",
  "reverie-core",
  "serde",
+ "sha2",
  "thiserror",
  "tokio",
 ]
 
 [[package]]
 name = "reverie-sabre"
-version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "atomic 0.5.3",
  "cc",
@@ -1916,8 +2091,8 @@ dependencies = [
  "nostd-print",
  "parking_lot",
  "reverie-core",
+ "reverie-inguest",
  "reverie-memory",
- "reverie-preload",
  "reverie-rpc",
  "reverie-rpc-transport",
  "reverie-sabre-macros",
@@ -1929,8 +2104,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-sabre-macros"
-version = "0.4.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "darling",
  "heck 0.3.3",
@@ -1941,8 +2116,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-sabre-stats"
-version = "0.4.1"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "libc",
  "reverie-core",
@@ -1950,12 +2125,13 @@ dependencies = [
 
 [[package]]
 name = "reverie-syscalls"
-version = "0.4.1"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "bitflags 2.13.1",
  "derive_more",
  "libc",
+ "linux-raw-sys",
  "nix 0.30.1",
  "paste",
  "reverie-memory",
@@ -2014,8 +2190,8 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "safeptrace"
-version = "0.4.1"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c7a1ed25bca339daa0e69241353fc9882da63d7a#c7a1ed25bca339daa0e69241353fc9882da63d7a"
+version = "0.5.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=9b1ba3cfbea21152a11b190112757c2274d9bca3#9b1ba3cfbea21152a11b190112757c2274d9bca3"
 dependencies = [
  "bitflags 2.13.1",
  "futures 0.3.33",
@@ -2336,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "test-allocator"
-version = "0.4.0"
+version = "0.5.1"
 dependencies = [
  "libc",
 ]

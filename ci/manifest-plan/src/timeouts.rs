@@ -1,10 +1,5 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
 
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
@@ -82,6 +77,38 @@ pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
+/// One ptrace verify cell re-selected after the guest mount model excluded
+/// ephemeral host FUSE seed mounts (`fuse.squashfuse_ll` mounts whose last
+/// path component is a host seed name, `<hex>-seed-<seed>-ns-<digits>`, with
+/// `<seed>` a per-process `nspid<digits>_cgpid<digits>` or a named host tool):
+/// `system-utils/procfs-sanitized-paths` passed 60 of 60 `test-harness run`
+/// repetitions with the harness retry, and 60 of 60 at the first attempt, at
+/// the evidence head under its manifest comparison profile
+/// (`compare_io_buffers: true, rcb_time: false`), 2026-10-04 09:38:46Z to
+/// 09:41:42Z. A mountinfo monitor running alongside saw one row change, an
+/// excluded per-process seed mount added at 09:41:31Z during repetition 56,
+/// which matched. The 60-repetition window contained no guest-visible host
+/// mount churn. Guest-visible host mount churn outside the excluded class,
+/// such as `/run/user/<uid>` tmpfs mounts
+/// (<https://github.com/rrnewton/hermit/issues/1820>), can still fail a first
+/// attempt: 180 repetitions at the previous grammar
+/// (d547b64d3b9f9976232aa1bb71ea7773b7f73d1a) passed 180 of 180 with the
+/// retry and 177 of 180 at the first attempt, with two mountinfo-read
+/// divergences, one of them coinciding with a `/run/user/0` unmount, and one
+/// unrelated host-directory `newfstatat` size change. The real fix is one
+/// shared mount snapshot (<https://github.com/rrnewton/hermit/issues/3627>).
+/// Evidence SHA is the tree the measurement binary was built from. The
+/// result rows record `source_tree_dirty: true` only because the slot's
+/// `reverie` submodule checkout (51186070) differed from the pinned gitlink;
+/// Cargo builds Reverie from the pinned git rev in `Cargo.lock`, which at the
+/// measurement was d646498e4c5ec2fbdd48d9eb0cfc26dfb4468918, not from that
+/// checkout. Later heads pin a newer Reverie (034ebf29 when this landed); its
+/// three intervening commits change KVM timestamp classes and launch-time
+/// descriptor allocation, not mount or procfs handling.
+pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA: &str =
+    "ab7f0dd15120aeecea647940feca712741ec214d";
+pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-04T09:41:42Z";
+pub const PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// Cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301> selected
 /// when it replaced `tests/backend-parity/run_matrix.py --backend dbt` with
 /// manifest cells: 26 DBT verify cells, one ptrace verify cell for each of the
@@ -125,7 +152,16 @@ pub const DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS: [&str; 1] =
 /// CPU budgets are 59 s and 19 s; the slowest program used 2.9 s.
 pub const STRICT_COMPAT_FOLD_2026_10_01_EVIDENCE_SHA: &str =
     "76980bac89901c3ecefbefc816ed47bcf099eda6";
-pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 189;
+/// Since 2026-10-13 the full run also selects the ptrace verify cells of 25
+/// rows that were sabre-compat-only, with the same 59/60 s bounds, so that
+/// parity compares them (<https://github.com/rrnewton/hermit/issues/4269>):
+/// 189 + 25.
+pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 214;
+/// Since 2026-10-20 the full run also has the compat corpus's ptrace replay
+/// cells (`replay.full` in `tests/e2e/manifests/compat.yaml`), with the rr run
+/// type's 59/60 s bounds: 212 selected after two clean nightly pressure sweeps,
+/// and 3 enabled with `ci: false` (lsof, cscope and zip-unzip).
+pub const COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT: usize = 215;
 /// Ptrace replay cells selected when
 /// <https://github.com/rrnewton/hermit/pull/3580> taught the recorder and
 /// replayer `select` and `pselect6`. Before it, replay of both programs
@@ -170,6 +206,9 @@ pub const SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS: [&str; 8] = [
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
+/// This group and the 2026-09-17 group below are history: the owner reset of
+/// 2026-10-04 switched every LiteInst cell off
+/// (<https://github.com/rrnewton/hermit/issues/3745>).
 pub const LITEINST_2026_09_16_EVIDENCE_SHA: &str = "ed99e05133b00058fafed7f3dfaf48ab8fd334e6";
 pub const LITEINST_2026_09_16_EVIDENCE_COMPLETED_UTC: &str = "2026-09-16T22:31:37Z";
 pub const LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT: usize =
@@ -1973,6 +2012,15 @@ mod tests {
             "2026-09-25T03:15:24Z"
         );
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
+        assert_eq!(
+            PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA,
+            "ab7f0dd15120aeecea647940feca712741ec214d"
+        );
+        assert_eq!(
+            PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-10-04T09:41:42Z"
+        );
+        assert_eq!(PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT,
             SELECT_REPLAY_2026_10_03_TESTS.len()

@@ -60,11 +60,16 @@ runnable DAG.
 The local privileged selection contains 19 nodes (20 until the one-build change
 of 2026-09-30 retired the unconsumed host copy of
 `privileged-only-build.privileged_tests`, which compiled Hermit on the host)
-with a 4620-second critical
+with a 4740-second critical
 path (4500 until setup.manifest_plan's wall cap went from 180 to 300 seconds in
-https://github.com/rrnewton/hermit/issues/3381). The separately labelled hosted privileged smoke preserves its historical
-12-node population and has a 2100-second critical path, so the manual workflow
-uses an audited 2160-second launcher bound. The stale hosted file omitted CPU
+https://github.com/rrnewton/hermit/issues/3381, then 4620 until the Rust-script
+producer's wall cap went from 900 to 1200 seconds, then 4920 until
+setup.manifest_plan stopped waiting for the Rust-script producer on 2026-10-16;
+the longest path is now the pinned-root one through
+build.rust_scripts_in_pinned_root and setup.manifest_plan_in_pinned_root). The separately labelled hosted privileged smoke preserves its historical
+12-node population and has a 2400-second critical path (2100 before the
+Rust-script producer's wall cap went from 900 to 1200 seconds), so the manual
+workflow uses an audited 2460-second launcher bound. The stale hosted file omitted CPU
 budgets and therefore inherited dagrun's 10-second fallback; every hosted node
 now carries the corresponding current-plan CPU budget explicitly. This is a
 correctness repair, not a claim that the obsolete fallback was equivalent.
@@ -124,8 +129,17 @@ helper during command lookup.
 The quick build now depends on Nextest setup because preparation needs it.
 This adds the existing 600-second setup timeout to its worst-case dependency
 path (8580 to 9180 seconds); individual node timeouts and CPU caps are unchanged.
-The quick path is 9300 seconds since setup.manifest_plan's wall cap went from
-180 to 300 seconds (https://github.com/rrnewton/hermit/issues/3381).
+The quick path was 9300 seconds after setup.manifest_plan's wall cap went from
+180 to 300 seconds (https://github.com/rrnewton/hermit/issues/3381), and is
+9600 seconds since the Rust-script producer's wall cap went from 900 to 1200
+seconds, 1.5 times its largest observed wall of 644.5 seconds rounded up to
+the next 300-second bucket. It is 7200 seconds since quick.build's wall cap
+went from 3600 to 1200 seconds, so a 4200-second ci-hub run keeps a
+preparation reserve under the quick label
+(https://github.com/rrnewton/hermit/issues/3906), and 6900 seconds since
+setup.manifest_plan's 300 seconds run beside the Rust-script producer
+(2026-10-16): it builds the manifest tools in target/debug and runs no
+rust-script, so only gate.manifest waits for both.
 These sums are scheduling bounds, not measured preparation or execution times.
 The pressure runner's batch preparation similarly retains the Nextest setup
 prerequisite: ten nodes including LiteInst, or nine without it. This adds 600
@@ -215,10 +229,16 @@ Each node's tag is `group.job` (e.g. `build.workspace`, `lint.clippy`).
 Since 2026-09-30 a full or portable validation compiles Hermit once, in the
 pinned root, in the `validate` Cargo profile (`Cargo.toml`: release
 optimisation with debug assertions and overflow checks kept on).
-`build.workspace_in_pinned_root` builds every workspace target, the DBT, SaBRe,
-e9patch and LiteInst resources (staged into `target/install_pkg` by
-`hermit-install`'s build script) and every prepared nextest selection in that
-profile; `build.e2e_artifact_in_pinned_root` publishes the one binary at
+`build.workspace_compile_in_pinned_root` builds every workspace target and the
+DBT, SaBRe, e9patch and LiteInst resources (staged into `target/install_pkg` by
+`hermit-install`'s build script) in that profile, and
+`build.workspace_in_pinned_root` then runs `./ci/nextest-binaries.rs prepare
+full`, which lists and records every prepared nextest selection from that
+build. Only the second node needs the prebuilt rust-script tools, so only it
+waits for `build.rust_scripts_in_pinned_root`; the Cargo build runs beside the
+rust-script build. Consumers depend on `build.workspace_in_pinned_root`, never
+on the compile node, so none starts before preparation has finished.
+`build.e2e_artifact_in_pinned_root` publishes the one binary at
 `target/ci/hermit` and as the E2E bundle. Consumers name `target/ci/hermit`
 or the bundle, never a per-profile path. The host keeps only tooling builds
 (`build.rust_scripts`, `setup.manifest_plan`, `build.manifest_guests`) for

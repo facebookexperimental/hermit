@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Compatibility entrypoint for the environmental-failure classifier bracket.
 # The classifier and its two-sided fixtures now live together in the Rust
 # validation driver, so this script cannot drift by copying or scraping them.

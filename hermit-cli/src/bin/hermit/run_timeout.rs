@@ -1,10 +1,4 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+/* Copyright (c) Meta Platforms, Inc. and affiliates. */
 
 //! Process alarms belong only to the isolated CLI init, never an in-process
 //! Record/Replay or run library operation that can return a retained owner.
@@ -47,10 +41,9 @@ pub(super) const RUN_TIMEOUT_UNWIND_GRACE: Duration = Duration::from_secs(10);
 /// reader must not read a passing fallback test as evidence that some specific
 /// teardown hang is handled.
 ///
-/// Deliberately keyed off an environment variable named like the existing
-/// `HERMIT_INTERNAL_LITEINST_ACTIVATION_PROBE` rather than a `cfg(test)` gate:
-/// the fallback lives in the shipped binary and must be exercised there, not in
-/// a differently-compiled one.
+/// Deliberately keyed off an internal environment variable rather than a
+/// `cfg(test)` gate: the fallback lives in the shipped binary and must be
+/// exercised there, not in a differently-compiled one.
 pub(super) fn stall_the_unwind_if_asked() {
     const STALL_ENV: &str = "HERMIT_INTERNAL_RUN_TIMEOUT_STALL_UNWIND";
     if std::env::var_os(STALL_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {

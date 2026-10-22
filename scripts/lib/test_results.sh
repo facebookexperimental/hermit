@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
 
 # Shell bridge for dagrun::TestResults. The Rust reader validates the complete
 # shared record before this library projects its fields for human-facing output.

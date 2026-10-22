@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Nextest flake census: run a nextest selection N times with retries off and
 # give every test a verdict.
 #
@@ -37,7 +37,7 @@
 #   -o OUTDIR  output directory (default: ignored/stress-test/<UTC time>)
 #   NEXTEST_SELECTION  the selection exactly as a validate DAG test.* node passes
 #              it to ci/run-nextest-counted.sh, e.g. for test.detcore_misc:
-#              -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore
+#              -p hermit-detcore-tests --test tests_misc -j 1 -- --skip has_rdrand_without_detcore
 #
 # Writes OUTDIR/stress-test-results.json, OUTDIR/STRESS_TEST_RESULTS.md and
 # OUTDIR/junit.xml. Exit status: 0 when every test is CLEAN, 1 otherwise, 2 on

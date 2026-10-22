@@ -161,8 +161,10 @@ Both invocations should print the same bytes when the command, inputs, and
 Hermit configuration are unchanged.
 
 Hermit uses strict deterministic execution by default. The explicit
-`--strict` option remains for command-line compatibility but does not make the
-default stricter.
+`--strict` option also requires every input of the run on the command line: a
+run without `--epoch` (or `HERMIT_EPOCH`, or a replayed recording that supplies
+the epoch), or with `--seed-from=SystemRandom`, is refused before the guest
+starts instead of drawing that input from the host.
 
 ## Choosing A Mode
 
@@ -211,48 +213,116 @@ hermit --backend=ptrace run -- /bin/echo hello
 
 Hermit detects whether the requested backend is integrated and available on
 the current host. It does not silently fall back to a different backend.
-LiteInst requires `libreverie_liteinst.so` beside the Hermit executable. That
-DSO initializes only the in-guest patch/helper runtime. The ptrace host owns the
-sole `Detcore` Tool and GlobalTool from the initial exec; it observes the first
-syscall at each site and installs a LiteInst trampoline for later invocations.
-There is no second in-guest Detcore instance or coordinator RPC Tool.
+LiteInst runs Detcore inside the guest. Hermit preloads
+`libdetcore_liteinst.so`: the one `HERMIT_LITEINST_TOOL_RUNTIME` names, else
+the installation's `rsrcs/libdetcore_liteinst.so` (which `hermit-install`
+stages), else the one built beside the Hermit executable. Its constructor installs Detcore's `Tool` in
+the guest process before the program's `main`, and Detcore's global state stays
+in Hermit, reached over a socket. No ptrace tracer sits on the system-call path.
 
-Build and stage the constructor-enabled runtime with its locked standalone
-manifest before building Hermit with the optional `liteinst` feature, which
-`third-party-backends` includes; a build without it refuses `--backend=liteinst`:
+Build the runtime beside a Hermit built with the optional `liteinst` feature,
+which `third-party-backends` includes; a build without it refuses
+`--backend=liteinst`:
 
 ```bash
-./scripts/stage-liteinst-runtime.sh dev \
-  "$PWD/target/debug/libreverie_liteinst.so" \
-  "$PWD/target/liteinst-runtime-build"
 cargo build --locked -p hermit --features liteinst --bin hermit
+cargo build --locked -p detcore-liteinst
+./target/debug/hermit --backend=liteinst run --max-timeslice=disabled -- /bin/echo hello
 ```
 
-Hermit verifies the DSO architecture, required exports, and preload constructor
-before activation; an arbitrary shared object or constructor-free runtime is
-rejected rather than silently falling back.
+Hermit verifies the library's architecture and that it registers
+`detcore_liteinst_initialize` as a preload constructor before it starts the
+guest; an arbitrary shared object or a constructor-free library is rejected
+rather than letting the guest run unmonitored. The dynamic loader, the C
+library's initialization and the constructors of the program's own shared
+libraries run before that constructor and are not monitored.
 
-LiteInst uses the normal Hermit run and verification paths. A successful
-`--strict --verify` run compares status/stdout/stderr exactly and applies the
-`Stripped` comparison to selected Detcore scheduler messages; it is useful
-diagnostic evidence, but it is not strict determinism. Strict verification requires
-`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
-compared-message counts. Verification snapshots guest stdin once and supplies
-the identical bytes to both runs. LiteInst supports dynamically linked Linux
-x86-64 guests, including threads and child processes created with `clone`,
-`clone3`, and `fork`. Installation of new hooks stops at the first task-creating
-syscall, while existing hooks and tasks keep running. An activated process
-leader may `exec` a new dynamically linked program; the new image must retain
-the inherited runtime environment and activate the LiteInst runtime again.
-`vfork` and `exec` from a thread other than the process leader remain unsupported
-and are refused. PMU/RCB timer delivery, CPUID, RDTSC, and RDTSCP use the ptrace
-host path and therefore have the same host capability requirements as the
-normal ptrace backend.
+Detcore's constructor uses a guarded 8 MiB bootstrap stack in the fixed Tool
+region `[0x600000000000, 0x600100000000)`. That allocation remains reserved
+after initialization and is disjoint from the runtime's signal and callback
+stacks, including their guard pages. A conflicting mapping refuses startup.
+This provides stack placement and boundary guards; guest writes to writable
+Tool interiors, constructor environment changes, and shared libc/TLS state
+remain outside the isolation guarantee. The standalone Reverie preload's
+constructor still uses its caller's stack.
+
+The in-guest runtime cannot deliver Detcore's preemption timer yet, so Hermit
+refuses a LiteInst run unless `--max-timeslice=disabled` is given. It also
+refuses `--verify`, because the in-guest Tool does not forward its records to
+Hermit yet, and `--timeout`, `--skid-margin` and `--gdbserver`. It refuses guest programs it cannot monitor: statically linked,
+set-user-ID or non-x86-64 programs, programs with a `DT_PREINIT_ARRAY`, and
+anything other than a regular file. A guest may `fork`, and `vfork` runs as a
+copying fork; creating a thread and `exec` are not supported yet.
+
+A guest process leaves the host some time after Hermit grants its exit, so
+Hermit selects no other guest's turn until the process has physically gone.
+An exit that needs another guest's turn to finish therefore cannot complete.
+A guest that serves a kernel network-filesystem client mounted outside the
+guest set (NFS, CIFS, 9p) is an unsupported topology. Hermit fails the run,
+naming the process, when an exit sleeps in the kernel's exit path for over
+1 s, or when any exit is not complete 60 s after its grant, and kills the
+guests; such a run never verifies. A soft mount whose retries give up in
+under a second can still complete unnoticed.
+For the same reason Hermit refuses, by name, a guest that holds a FUSE or
+CUSE device (`/dev/fuse`, `/dev/cuse`) or a seccomp user-notification
+listener, whether it opens one, starts with one, or receives one through
+`SCM_RIGHTS` or `pidfd_getfd`: such a guest could be the server another
+guest's exit waits for. Reading plain files on a FUSE filesystem is not
+affected, and `userfaultfd` is supported.
+
+In-guest LiteInst needs Linux 6.5 or later (`SO_PEERPIDFD`) and refuses to
+start on an older kernel. `--verify` refuses to compare a run that recorded a
+determinism loss (an in-guest process died at a moment the host chose,
+without finishing its exit, or a DETLOG record was lost) or whose log failed
+a write, even if later writes succeeded. The runtime schedules a process's
+own `kill`, `tkill` or `tgkill` (including `abort` and `raise`) when it names
+the calling process or thread and sends an unblocked standard signal with a
+terminating default action. This includes the guest's default SIGTRAP action,
+but excludes SIGSYS and SIGSEGV when the runtime owns its handler. It also
+excludes real-time signals, process-group sends and signal deaths after a
+guest seccomp filter is admitted; filter installation may itself be refused
+by the runtime's existing admission policy. These excluded deaths retain
+the deregistration-loss check and cannot gain verification credit.
+
+For a supported self-signal, the runtime finishes its exit in its own turn
+before the kernel kills it. Verification can then compare the run if the
+program's result otherwise qualifies; scheduling an abort does not turn a
+failing program into a passing one. Because that exit is reported before
+the death, the status Detcore
+receives names the signal exactly, but whether a core was dumped is only
+predicted (from the signal, the process's dumpable mode, `RLIMIT_CORE` and
+`core_pattern`) and differs when the kernel fails to write the core; Detcore
+does not use it, and the guest's parent sees the kernel's own status. A
+death outside the supported delivery paths records the loss, including a
+hardware fault, a signal another process sends, and a SIGPIPE from a write.
+
+Both in-guest backends also schedule a default-fatal SIGALRM from a one-shot
+virtual `alarm` or `ITIMER_REAL` when the single-thread guest is parked in an
+emulated `pause` or `nanosleep` and does not block SIGALRM. No guest-handler
+opt-in is needed. The runtime reports the signal and exit callbacks before
+the kernel terminates the process; a fatal sleep does not copy a remaining
+time to the guest. Ignored or blocked SIGALRM does not interrupt these sleeps,
+and a blocked alarm remains pending after canceling its timer. This bridge
+does not cover recurring timers, other timer kinds, external signals, a
+guest running outside these sleeps, physical or polling I/O, or a sleep
+already at its deadline. Those deaths retain the loss check. The existing
+no-guest-filter launch and callback contract still applies.
+
+On a run qualified for guest SIGALRM handlers, `in-guest-trap` with the
+per-run opt-in `REVERIE_LITEINST_SIGALRM_HANDLERS=1` permits `getuid`,
+`geteuid`, `getgid` and `getegid` while the handler is installed, including
+inside the handler. They return Hermit's existing virtual-root identity
+(`0`). Handler admission still requires site patching to be off; requesting
+the opt-in on patched LiteInst does not admit a handler. Buffered credential
+queries, `getppid` and the other unplaced calls remain refused with
+`EOPNOTSUPP` while a handler is installed, as does closing inherited stderr.
+Handler admission remains disabled unless explicitly requested.
 
 The default namespace, mount, and network setup is shared with Hermit's other
-backends; `--no-namespace` remains available for trusted guests. The preload
-runtime reserves `SIGSYS` in kernel-visible signal masks. This experimental
-patch-helper path is not a security boundary for intentionally hostile code.
+backends; `--no-namespace` remains available for trusted guests. The in-guest
+runtime reserves `SIGSYS` for itself. This experimental path is not a security
+boundary for intentionally hostile code.
+
 The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
 well as their runtime resources. Build and stage both with:
 
@@ -260,6 +330,13 @@ well as their runtime resources. Build and stage both with:
 cargo build --release --workspace --features hermit/third-party-backends
 ./target/install_pkg/hermit --backend=dbt run -- /bin/echo hello
 ```
+
+For DBT, the default `--network=local` gives each physical execution a fresh
+network namespace with active loopback, including both executions of
+`--verify`. Each guest and its verification channel share that namespace.
+Newly created guest sockets are isolated from unrelated outer listeners; a
+namespace setup failure stops before the guest runs. Explicit `--network=host`
+shares the caller's network and remains incompatible with `--strict`.
 
 The same executable accepts `--backend=sabre` and `--backend=e9patch`.
 A default `cargo install` does not enable these selections. KVM requires
@@ -351,7 +428,16 @@ Hermit runs the guest twice and compares observable output, including stdout,
 stderr, and its internal deterministic execution log. Verification fails if
 the compared observations differ or if the guest exit status is not allowed.
 
-The default log comparison is `Stripped`: it can erase numbers, addresses,
+The verifier emits the first run's guest stdout and stderr once when verification
+succeeds, or when both runs agree on both output streams. This also applies to
+DBT: a log-only or branch-count divergence no longer suppresses agreed guest
+output. The divergence remains a failure. If either stream differs, the labelled
+comparison shows the difference instead of choosing one run's output. Errors
+writing the agreed output are still errors, even if the comparison report was
+already written.
+
+The default log comparison is `Stripped` (DBT retains its `Canonical` comparison):
+it can erase numbers, addresses,
 temporary paths, and time values from selected messages. It is a fast
 diagnostic, not strict determinism. Use
 `--verify-strict --verify-json REPORT.json` when a canonical strict result is
@@ -378,16 +464,28 @@ destination is `$XDG_STATE_HOME/hermit/verify-logs`, normally
 durable directory. `--print-verify-logs` instead copies the first run's captured
 log to stderr; it does not retain either file.
 
+Without `--keep-logs`, the two logs are temporary files in the system temporary
+directory, or in `$HERMIT_VERIFY_TMPDIR` when that is set and not empty. The same
+applies to the record and replay logs of `hermit record start --verify`. A verify
+that is killed before it finishes leaves both logs there. A caller that kills
+verify runs at a deadline can set `HERMIT_VERIFY_TMPDIR` to a directory it
+removes afterwards. A directory that cannot hold the logs is reported as an
+error naming `HERMIT_VERIFY_TMPDIR`. Hermit does not pass that variable on to the
+guest unless it is named with `--env`, so unlike changing `TMPDIR` it does not
+change what the guest sees.
+
 `hermit log-diff LOG` prints the canonical INFO stream from one retained log.
 The default `--record-envelope=all-records-v1` preserves every parsed record.
 For a DBT evidence log, select
 `--record-envelope=dbt-evidence-transport-v1` explicitly to exclude only the
 transport's self-description records. This is an offline inspection option;
-live `--backend=dbt run --verify` goes through its dedicated DBT adapter,
-which compares its two runs with `all-records-v1` and publishes its own verdict
-when `--verify-json` is requested. Selecting this envelope there would exclude
-records that adapter compares today, so it is offered here for offline
-inspection rather than applied to a live run.
+live `--backend=dbt run --verify` uses the common verifier with the existing DBT
+execution and evidence adapter. It compares both runs with `all-records-v1` and
+includes DBT's branch counts and process statistics before publishing the common
+verdict. Selecting the narrower envelope there would exclude records compared
+today, so it remains an offline inspection option. A decode, materialization, or
+statistics failure after a physical DBT run records that run as failed, never as
+a match; failure in run 1 prevents run 2 from starting.
 `hermit log-diff LEFT RIGHT --json REPORT.json` compares
 the same canonical INFO stream and atomically records a one-line result. Its
 `comparison.record_envelope` field names that versioned policy, alongside the
@@ -423,6 +521,30 @@ hermit run --verify --verify-allow=both -- PROGRAM
 `--verify-allow` changes which guest statuses are accepted for comparison. It
 does not turn a nonzero guest status into a successful guest exit status for
 calling scripts.
+
+The two runs can also be started separately, for example in parallel, and
+compared afterwards:
+
+```bash
+export HERMIT_EPOCH=2026-01-01T00:00:00Z
+hermit run --strict --verify-strict --verify-run run1 -- PROGRAM &
+hermit run --strict --verify-strict --verify-run run2 -- PROGRAM &
+wait
+hermit log-diff --verify-json report.json run1 run2
+```
+
+Each `--verify-run` writes one execution's evidence to a new directory: its
+verification log, the guest's output, and a `verify-run.json` record of how it
+ended. `log-diff --verify-json` compares two such directories exactly as
+`--verify` compares its two runs, writes the same report, shows the guest's
+output as `--verify` shows it, and exits with the same status; it accepts
+`--verify-allow`, and `--verify-log-dir DIR` keeps the compared logs in DIR as
+`--verify --keep-logs --verify-log-dir DIR` keeps them. Both runs must use
+the same comparison flags and the same epoch, which `--verify` would have
+given both; the comparison refuses directories that differ in either. Where
+`--verify` would not have started its second run (the first failed, or its
+status is not one `--verify-allow` admits), the second directory need not
+exist.
 
 ### Record And Replay
 
@@ -461,7 +583,9 @@ Replay a recording to completion without a debugger:
 hermit replay --autopilot RECORDING_ID
 ```
 
-Omit the ID to replay the last successful recording:
+Omit the ID to replay `last`, the newest `hermit record` (or `hermit run
+--record-networking`) recording; see "Run Manifests" for every way to name a
+recording:
 
 ```bash
 hermit replay --autopilot
@@ -481,6 +605,18 @@ hermit record clean
 `hermit record start --verify -- PROGRAM` records and immediately replays the
 command. On a successful replay it deletes the temporary recording, so do not
 use this form when the recording must be retained.
+
+The recording and its replay can also be run as separate commands and
+compared afterwards, as `hermit run --verify-run` splits `--verify`:
+
+```bash
+hermit record start --verify-strict --verify-run rec -- PROGRAM
+hermit record start --verify-strict --verify-run rep --verify-replay-of rec -- PROGRAM
+hermit log-diff --verify-json report.json rec rep
+```
+
+`rec/recording` holds the recording. Give both commands the same options; the
+comparison writes the report `record start --verify --verify-json` writes.
 
 Replay depends on the captured data and compatible Hermit behavior. Keep the
 recording directory intact and prefer the same Hermit revision for recording
@@ -507,7 +643,7 @@ reproducible target condition.
 
 | Option | Effect |
 | --- | --- |
-| `--strict` | Compatibility spelling for the current deterministic defaults. |
+| `--strict` | Uses the current deterministic defaults and refuses a run that would draw an input from the host: pass `--epoch` (or set `HERMIT_EPOCH`), and do not use `--seed-from=SystemRandom`. |
 | `--allow-unsupported-syscalls` | Run-only compatibility escape hatch that permits Unsupported syscalls to reach Linux and prints a warning. A successful exit does not establish complete deterministic execution. |
 | `--passthru-opt` | Use the reduced syscall subscription set for performance. Requires `--allow-unsupported-syscalls`; unlisted PassThrough syscalls bypass Detcore, weakening deterministic accounting. Unsupported syscalls remain subscribed so the explicit policy is observable. |
 | `--no-sequentialize-threads` | Lets Linux schedule guest threads concurrently. This weakens schedule reproducibility. |
@@ -553,9 +689,101 @@ the default equal-priority policy.
 | `--clock-multiplier=F` | Changes the rate of virtual time. |
 | `--no-virtualize-time` | Uses host time; also requires `--no-virtualize-metadata`. |
 | `--no-virtualize-cpuid` | Exposes host CPUID behavior. |
+| `--cpu-profile x86-64-v3` | Gives the guest an x86-64-v3 CPU instead of the default x86-64-v2; see below. |
+| `--cpu-profile host-no-rdrand` | Intercepts CPUID and returns host features with hardware randomness and unvirtualized timing features hidden; ptrace only, with CPUID faulting required. |
 
 Disabling a virtualization feature introduces a host-dependent input. Do it to
 diagnose compatibility problems, not when asserting full reproducibility.
+
+#### The x86-64-v3 CPU profile
+
+By default every guest sees the same x86-64-v2 CPU, so software built for
+x86-64-v3 (CentOS Stream 10's glibc, for example) refuses to start.
+`--cpu-profile x86-64-v3`, on `hermit run` and `hermit record start`, adds the
+v3 features: AVX2, BMI1/2, FMA, F16C, LZCNT, MOVBE and XSAVE. RDRAND, RDSEED,
+TSX and AVX-512 stay hidden (<https://github.com/rrnewton/hermit/issues/4243>).
+
+With XSAVE, a guest can read processor state the host kernel saves and
+restores at moments Hermit does not control. So v3 is offered only where that
+is checked. `hermit host-capabilities --cpu-profile x86-64-v3` runs the check on
+its own and prints QUALIFIED, or REFUSED with the reason. A v3 run is refused
+by name (exit 122), and never falls back to v2:
+- on any backend but ptrace;
+- with `--no-virtualize-cpuid` or `--gdbserver`;
+- on Linux before 5.16;
+- on hybrid CPUs, on AMD CPUs without XSAVEERPTR, and on hosts with AMX;
+- where the host lacks a v3 feature natively;
+- where the PMU interrupt counter the check needs is unavailable (some VMs,
+  or `perf_event_paranoid` above 1);
+- wherever the check fails.
+
+The guest's CPUID leaf 0xD describes the host's real XSAVE layout, because a
+guest's XSAVE runs on the host. A recording therefore binds those host facts,
+and `hermit replay` refuses a host where any of them differs.
+
+What the check does not cover, which `--verify` also prints after a match under
+v3:
+
+> With --cpu-profile x86-64-v3, Hermit checks at startup that this host does not
+> change the XSTATE_BV bits a guest reads (with XSAVE, XSAVEC or XSAVEOPT, or in
+> a signal frame) when the host saves and restores the guest's registers. The
+> check samples a fixed set of cases and forces only CPUID exits, so a CPU or
+> hypervisor that behaves differently only on other instruction paths, or on VM
+> exits the guest cannot see, is not excluded. Firmware (SMM) entries cannot be
+> checked at all. Default runs use x86-64-v2, which this does not affect.
+
+#### Host CPU features without hardware randomness
+
+`hermit run --cpu-profile=host-no-rdrand` keeps CPUID intercepted, but answers
+with the host CPU's features. This lets software requiring x86-64-v3 (such as
+CentOS 10 glibc) use those instructions on a capable host even when the virtual
+v3 profile's XSAVE qualification refuses it. For example:
+
+```bash
+hermit run --cpu-profile=host-no-rdrand --epoch=2023-01-01T00:00:00Z -- ./program
+```
+
+RDRAND (leaf 1 ECX bit 30) and RDSEED (leaf 7.0 EBX bit 18) are hidden, so
+feature-detecting libraries such as libstdc++'s `std::random_device` use the
+randomness Hermit virtualizes. TSX (HLE, RTM, TSXLDTRK), RDPID, WAITPKG,
+MONITOR/MWAIT, MONITORX/MWAITX, RDPRU, AMD lightweight profiling, architectural
+performance monitoring, VIA XSTORE randomness, and hypervisor-specific clock
+interfaces are also hidden. CPU identity fields
+(APIC, core and node IDs) are zeroed so tracer migration does not change them.
+Before container placement, admission chooses the lowest CPU in the caller's
+allowed affinity set and qualifies it. Every launch pins the actual tracer and
+guest to that source CPU, including when the timeslice is disabled and when a
+library reuses a tracer worker. All native leaves and subleaves therefore come
+from one repeatable source: cache sharing and topology can differ between cores
+even on a homogeneous CPU model. Failure to pin that source refuses the launch.
+Other host features remain visible, including every XSAVE leaf 0xD subleaf;
+Linux's XCOMP queries and permission requests operate on the guest's real
+kernel state. RDTSC and RDTSCP still trap and return virtual time, with RDTSCP's
+CPU ID zero. Leaf 0x15 reports the virtual TSC's one-billion cycles per logical
+second; leaf 0x16 retains the host's static frequency metadata.
+
+Results are **host CPU model specific**: cross-host builds need the same CPU
+model, topology and compatible kernel/XSTATE settings, and repeat runs need the
+same allowed CPU set so they select the same source. Intel hybrid and AMD
+heterogeneous CPUs are refused because different core types can report different
+features. This mode skips v3's XSTATE_BV
+qualification; host save/restore activity can still affect XSAVE output and
+signal-frame register metadata. CPUID masking guides programs that check
+features before using them; it does not trap unconditional RDRAND/RDSEED or
+the other hidden instructions. Keep input files and the environment fixed,
+and verify the actual build across repeated runs.
+
+`hermit host-capabilities --cpu-profile=host-no-rdrand` checks CPUID faulting.
+A host or kernel without faulting is refused clearly, and every exec must
+retain interception; the mode never falls back to native CPUID. It requires
+the ptrace backend and virtual time, and conflicts with
+`--no-virtualize-cpuid`, `--no-virtualize-time`, and execution modes that bypass
+Detcore. Record/replay currently refuses this profile because recordings do
+not bind its complete host CPU state. This includes `--record-networking`,
+`--replay-networking`, and network manifests loaded with `run --from`; `replay`
+refuses any manifest carrying this profile before dispatch. Use a virtual
+profile for recordings. Plain history `run --from` is argument reuse, subject
+to the same host requirements as a new run.
 
 ### File System, Environment, And Network
 
@@ -575,6 +803,31 @@ Hermit starts.
 `--tmp=DIR` uses a chosen host directory as guest `/tmp`. `--tmp=/tmp` exposes
 the real host `/tmp`, which is convenient for diagnosis but weakens isolation
 and reproducibility.
+
+DBT reserves `/tmp/.hermit-dbt-stats-N` for its current run's statistics, choosing
+the lowest number that does not overlap a declared bind target. The backing
+capture remains private to that run. With `--tmp=DIR`, this can create an empty
+directory or temporarily cover an existing directory at that name; existing
+contents are preserved. An incompatible file at the target is a mount error.
+`--no-namespace` keeps the host capture path and adds no statistics bind.
+
+The guest's mount table (`/proc/<pid>/mountinfo`, `/proc/<pid>/mounts` and
+`/proc/mounts`) is a fixed description taken when the guest launches, not the
+host's live table. It is the same on every backend, and in every run as long as
+the mounts it lists (and, under `--no-namespace`, the mounts holding the working
+directory and `/tmp`) do not change on the host between runs. In Hermit's
+container it lists the mounts Hermit installed (its `/proc`, `/tmp`, identity
+files and your `--mount` and `--bind` targets), the ancestors of those mounts,
+and the base mountpoints `/`, `/proc`, `/dev`, `/dev/pts`, `/dev/shm`,
+`/dev/mqueue`, `/sys`, `/sys/fs/cgroup` and `/run` where they are mounted. With
+`--no-namespace`, where Hermit installs no mount, it lists the mounts holding
+the guest's working directory and the host `/tmp`, their ancestors, and those
+base mountpoints. Every other host mount is hidden, although its files stay
+reachable: a file on a hidden mount reports its nearest listed ancestor in
+`/proc/self/fdinfo` (`mnt_id`) and `statx` (`STATX_MNT_ID`), and `df` on it
+prints `-` as the source and that ancestor's mountpoint. This keeps unrelated
+host mount activity out of the guest's view, at the cost of a less complete
+table than Linux shows.
 
 Network modes are:
 
@@ -617,9 +870,220 @@ networking and disables Hermit's virtualized inputs, sequential scheduling,
 deterministic I/O, and RCB time. It is a compatibility diagnostic, not a run
 mode for reproducibility.
 
-`--namespace-only` runs the command in Hermit's namespaces without ptrace,
-seccomp interception, or determinization. It helps separate namespace setup
-failures from interception failures.
+`--namespace-only` runs the command in Hermit's namespaces without ptrace or
+determinization. It helps separate namespace setup failures from interception
+failures. One call is still watched, through a seccomp filter on `kill`: the
+guest shares Hermit's process group, so Hermit refuses with EPERM a
+`kill(0, sig)` from a guest process still in that group. Linux would deliver
+it to Hermit, to the processes that started it, and to the guest's own group
+members; none of them receives it, so a script ending with `trap "kill 0" EXIT`
+leaves its background children running until the guest exits. A guest process
+that first leads a group of its own (`setsid`, `setpgid(0, 0)`) keeps its
+`kill(0)`. The filter is visible inside the guest: `/proc/self/status` reports
+`Seccomp: 2`, a seccomp listener of the guest's own fails with EBUSY, and a
+Hermit run inside the guest refuses the inherited filter (exit 122) unless
+given `--unsafe-ignore-host-seccomp`; a nested `--namespace-only` run still
+refuses (exit 122), because its own filter cannot add a second listener.
+
+## Run Configuration Files
+
+`hermit run --save-config=run.yaml ...` writes the run's options to a file, and
+`hermit run --config=run.yaml` runs with them again:
+
+```bash
+hermit --log=info run --seed-from=SystemRandom --save-config=run.yaml -- PROGRAM ARGS
+hermit run --config=run.yaml
+```
+
+A run config is YAML (JSON is accepted, being YAML) that names options by their
+long names, without the leading `--`:
+
+```yaml
+schema: hermit-run-config/v1
+hermit-version: 0.4.1 (2026-10-08, source revision not embedded)
+global:            # options before the subcommand: hermit [GLOBAL] run
+  backend: ptrace
+  log: info
+run:               # options of `hermit run`
+  base-env: minimal
+  epoch: 2026-10-08T17:54:04.637477466+00:00
+  seed: 12919933106523941100
+  verify: true     # a flag: true gives it; false is the same as leaving it out
+  env:             # a repeatable option: one list entry per occurrence
+  - FOO=1
+  - BAR=2
+program: /bin/sh
+args: [-c, echo $FOO$BAR]
+```
+
+- A file means exactly what typing its options would: Hermit turns each entry
+  into the option it names and checks the result like any command line, so
+  every `hermit run` option can appear and the same combinations are refused.
+- An option given on the command line replaces the file's value for that
+  option (for a repeatable option, its whole list). A guest program on the
+  command line replaces the file's `program` and `args`. The file's values
+  replace the options' environment variables (`HERMIT_EPOCH`, `HERMIT_LOG`, ...).
+  A flag the file gives cannot be taken back on the command line, because
+  flags have no negative spelling; edit the file instead.
+- `--save-config` writes the options given on the command line, in a `--config`
+  file, or through their environment variables, and the implicit inputs Hermit
+  resolved: the epoch taken from the host clock (or from a replayed recording)
+  and the seed `--seed-from` chose. It is written on the host before the guest
+  starts. Defaults are not written, so a file reproduces its run under the
+  Hermit version recorded in it. The host environment that `--base-env=host`
+  passes through is not recorded; use `--base-env=minimal` and `-e` to make the
+  guest environment part of the file.
+- `schema` is required and must be `hermit-run-config/v1`. Unknown keys are
+  refused, with the spelling that would work where there is one. The top-level
+  key `seccomp` is reserved for a future syscall policy section and is refused
+  until then. `--config` and `--save-config` cannot appear in a file.
+- `hermit oci run`, `hermit analyze` and `hermit bisect` do not load run
+  configs.
+
+## Run Manifests
+
+A run whose options give every input is reproduced by its command line. A run
+that draws an input from the host is not: an epoch taken from the host clock
+(no `--epoch`), or a seed from `--seed-from=SystemRandom`. Such a run writes a
+run manifest, a small recording of those inputs, and names it in a warning
+(https://github.com/rrnewton/hermit/issues/4271):
+
+```text
+$ hermit run --seed-from=SystemRandom -- PROGRAM ARGS
+... WARN hermit::controller: this run drew settings from the host; its inputs are saved as a recording in ~/.cache/hermit/; rerun it with: hermit replay 04cba9fc... (hermit show last-run)
+$ hermit replay last-run             # rerun the newest run from its manifest
+$ hermit run --from last-run --sched-seed=7   # the same inputs, another schedule
+$ hermit list
+ID        KIND          CREATED               EXIT        COMMAND
+04cba9fc  inputs-only   2026-10-13T19:55:00Z  0           PROGRAM ARGS
+```
+
+- The manifest is `DATA/<id>/manifest.json`, where `DATA` is the data
+  directory `hermit record` uses (`HERMIT_DATA_DIR`, else
+  `$XDG_CACHE_HOME/hermit`, usually `~/.cache/hermit`) and `<id>` a new
+  recording ID. It is JSON with `schema: hermit-recording-manifest/v1`: the
+  guest command, the run's options with the host-drawn inputs written out
+  (`inputs.global` and `inputs.run`, named as in a run config), which inputs
+  came from the host (`inputs.host_drawn`), and, once the guest ends, its exit
+  status (`exit`).
+- What a manifest does not hold, as a run config does not: the host
+  environment that `--base-env=host` (the default) passes through, the files
+  the guest reads, and the working directory, which is recorded in
+  `command.cwd` but not applied (relative paths resolve against the rerun's
+  directory, and `--from` notes a difference). Output destinations
+  (`--log-file`, `--verify-json`, `--verify-run`, ...) are left out, so a
+  rerun does not overwrite the original run's files. On a host without a
+  usable performance counter, the preemption timer turned off is recorded
+  as `max-timeslice: disabled`. Option values are written as given, `--env`
+  values included; the file is mode 0600.
+- Every kind of recording has one name, which `hermit replay`,
+  `hermit run --from` and `hermit show` take. It is one of:
+  - `last` (`DATA/last`): the newest recording you asked for, by
+    `hermit record` or `hermit run --record-networking`. A bare
+    `hermit replay` replays it, as `rr replay` replays the newest
+    `rr record`.
+  - `last-run` (`DATA/last-run`): the newest of any kind, including the
+    manifest a plain run leaves. A run without `--epoch` draws its epoch from
+    the host and so leaves a manifest. It moves only `last-run`, so it never
+    takes a bare `hermit replay` away from your recording.
+  - a recording ID, or a unique prefix of at least 6 hex digits, as git
+    takes a commit;
+  - the path of a `manifest.json` or of its directory. An existing path is
+    read as a path before an ID; write `./last` for a file called `last`.
+- `hermit replay [RECORDING]` replays any kind, by default `last`. A syscall
+  recording replays as before, under gdb or to the end with `--autopilot`.
+  Any other kind replays by rerunning its program from its manifest, to the
+  end, exactly as `hermit run --from RECORDING`, with the global options
+  given before `replay` passed on. Such a rerun is not served to gdb:
+  `hermit run --from RECORDING --gdbserver` does that, and `--serve-only`,
+  `--gdbex` and `--dap-listen` with such a recording are refused naming it.
+- `hermit run --from RECORDING` reruns it. Options and a guest command on
+  that command line replace the manifest's, as with `--config`, so
+  `hermit run --from last-run --sched-seed=7` explores another schedule from
+  the same inputs. A rerun's inputs are all explicit, so it writes no manifest of
+  its own.
+- `hermit list` lists the recordings of every kind, newest first (`--json`
+  for the full IDs, kinds, times, exit statuses, commands and paths), and
+  `hermit show [RECORDING]` prints one's manifest.
+- A run with no host-drawn input writes nothing. `--manifest=POLICY` chooses
+  otherwise: `nonreproducible-only` (the default), `always` (a reproducible run
+  also writes a `history` manifest, a local record of what ran), or `never`.
+  Without the option, the `manifest` key of the user config file
+  `~/.config/hermit/config.yaml` (`$XDG_CONFIG_HOME/hermit/config.yaml`)
+  decides, then the `HERMIT_MANIFEST` environment variable:
+
+  ```yaml
+  manifest: always
+  ```
+
+- `hermit record list` lists syscall recordings only. `hermit record rm` and
+  `hermit record clean` delete manifest directories as they delete
+  recordings. A data directory keeps the newest 1000 manifest-only
+  recordings.
+- A network recording, `hermit run --record-networking=TRACE`, always writes
+  a manifest beside its trace, `TRACE.manifest.json` (kind `network`): the
+  run's options with any host-drawn epoch or seed written out, and the
+  trace's format version, size and SHA-256. The trace itself does not hold
+  the seeds or the command, so `hermit run --from TRACE.manifest.json`
+  replays the recording offline without retyping them; a trace that does not
+  match the manifest's size and digest is refused. The data directory keeps
+  a copy of that manifest naming the trace by its absolute path, so the
+  recording also has an ID and becomes `last`: `hermit replay` alone replays
+  it offline. A pruned copy takes that ID with it; `hermit run --from
+  TRACE.manifest.json` still replays the recording. Those copies are pruned with the manifest-only recordings; the
+  trace and the manifest beside it never are.
+- A syscall recording, `hermit record`, writes `manifest.json` (kind
+  `full-syscall`) beside its `metadata.json`: the guest command, how it
+  ended, and the recording's `RECORD_VERSION`. The replayer still reads
+  `metadata.json`, which stays as a compatibility copy for one
+  `RECORD_VERSION`; `--from` refuses such a manifest and names the
+  `hermit replay` command instead.
+
+## Signals To Hermit's Own Process
+
+In a run with interception (the default ptrace backend), Hermit's container
+process is PID 1 of the guest's PID namespace, the guest's parent. To the
+guest it is the namespace's init, and Hermit keeps it out of the guest's
+reach (https://github.com/rrnewton/hermit/issues/4066,
+https://github.com/rrnewton/hermit/issues/4083):
+
+- A signal the guest sends to PID 1 or one of its threads (`kill`, `tkill`,
+  `tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`), SIGKILL included, is
+  dropped and the call returns 0, as Linux does for a signal sent from inside
+  a PID namespace to its init when the init has no handler. Signal 0 still
+  answers whether the task exists.
+- `pidfd_open(1)` fails with EPERM, so no pidfd reaches Hermit. Linux would
+  open it.
+- Making one of Hermit's tasks the owner of a descriptor's signals fails
+  with EPERM: `fcntl` `F_SETOWN` or `F_SETOWN_EX`, and `ioctl` `FIOSETOWN` or
+  `SIOCSPGRP`. Linux would accept the owner and later signal it when the
+  descriptor is ready.
+
+A guest in a nested PID namespace (created with `clone(CLONE_NEWPID)`) is
+unaffected: its ids name its own tasks. The EPERM answers are a deliberate
+policy, the same answer the guest already gets for `ptrace` and
+`process_vm_readv` on that process.
+
+## Inherited Seccomp Filters
+
+A seccomp filter installed by whatever launched Hermit, such as a container
+runtime's default profile, is inherited by Hermit and every guest, and cannot be
+removed. It can make system calls fail in ways the guest observes, and Hermit
+records nothing about it, so the same command could behave differently inside
+and outside the container. Hermit therefore refuses to start a guest (exit 122)
+when `/proc/self/status` reports `Seccomp: 1` or `Seccomp: 2`. The refusal
+names the mode and the filter count.
+
+- Run Hermit where no filter is inherited. A filter cannot be removed from
+  inside a running container; for Docker, create the container with
+  `--security-opt seccomp=unconfined`.
+- Or pass `--unsafe-ignore-host-seccomp` (before or after the subcommand; in a
+  run config, `global: {unsafe-ignore-host-seccomp: true}`) to run anyway. The
+  run may not reproduce wherever the filter differs. Hermit prints a warning
+  and records the filter's mode and count in the INFO log.
+
+Declaring an acknowledged host filter in the run config is tracked in
+<https://github.com/rrnewton/hermit/issues/3942> and not implemented.
 
 ## Troubleshooting
 
@@ -777,6 +1241,8 @@ Linux interface.
 Before treating a result as reproducible:
 
 - Use the same Hermit revision, executable, arguments, and configuration.
+- Save the run's options with `--save-config` and rerun with `--config`; the
+  file records the epoch and any seed Hermit chose.
 - Keep file contents and mount layout fixed.
 - Prefer `--base-env=minimal` and explicit `-e` variables.
 - Keep networking isolated; do not depend on external services.

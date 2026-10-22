@@ -1,10 +1,6 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+// Licensed under the BSD-style license in the LICENSE file.
 
 //! Real Detcore RPC cancellation, including cancellation inside an RDTSC posthook.
 //! The official runner owns aggregate CPU containment. Agent qualification uses
@@ -118,6 +114,31 @@ impl<R: Read + AsRawFd> CapturedStream<R> {
     }
 }
 
+/// How a KVM guest's root ends, as Hermit reports it: an exit code, or death by
+/// a signal, which KVM reports as a signal, as ptrace does
+/// (https://github.com/rrnewton/hermit/issues/4181).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum RootOutcome {
+    Exit(i32),
+    Signal(i32),
+}
+
+impl RootOutcome {
+    pub(super) fn exit_code(self) -> Option<i32> {
+        match self {
+            RootOutcome::Exit(code) => Some(code),
+            RootOutcome::Signal(_) => None,
+        }
+    }
+
+    pub(super) fn signal(self) -> Option<i32> {
+        match self {
+            RootOutcome::Signal(signal) => Some(signal),
+            RootOutcome::Exit(_) => None,
+        }
+    }
+}
+
 pub(super) fn bounded_read(path: &Path, limit: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
     fs::File::open(path)
@@ -211,7 +232,8 @@ fn bounded_command_polling(
         .stderr(Stdio::piped())
         .process_group(0);
     // Limit the captured streams, not all file descriptors: RLIMIT_FSIZE also
-    // rejects the KVM backend's required 1 GiB anonymous memory backing file.
+    // rejects the KVM backend's required anonymous memory backing file (the
+    // KVM_GUEST_MEMORY_BYTES window).
     let start = Instant::now();
     let mut child = ProcessGroup {
         child: command.spawn().expect("start bounded command"),

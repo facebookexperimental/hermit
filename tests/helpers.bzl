@@ -306,17 +306,7 @@ def hermit_bin_test(
     )
 
 def hermit_rust_test(
-    path,
-    raw,
-    run,
-    no_sequentialize_threads,
-    no_deterministic_io,
-    chaos,
-    record_and_replay,
-    chaosreplay,
-    tracereplay = False,
-    tracereplay_chaos = False,
-    allocator = None,
+    path, raw, run, no_sequentialize_threads, no_deterministic_io, chaos, record_and_replay, chaosreplay, tracereplay = False, tracereplay_chaos = False, allocator = None
 ):
     basename = paths.replace_extension(paths.basename(path), "")
     bin_name = "rustbin_" + basename
@@ -341,7 +331,7 @@ def hermit_rust_test(
             "-Aunused-crate-dependencies",
         ],
         unittests = False,
-        **allocator_args,
+        **allocator_args
     )
     build_test(
         "rs_" + basename,

@@ -1,0 +1,27 @@
+#!/bin/bash
+# Write a Buck e2e bundle's BUNDLE_RECORD.json: what every cell would otherwise compute
+# again from the same bundle, computed once by the :bundle rule (defs.bzl). How a cell
+# uses it, and what it still checks itself: ci/manifest-plan/src/bundle_record.rs.
+#
+# usage: ci/buck-e2e/bundle-record HERMIT BIN SRC SOURCE_SHA OUT
+#   HERMIT      the bundle's hermit/hermit
+#   BIN         the bundle's bin/ (hermit-manifest-plan)
+#   SRC         the bundle's src/ snapshot
+#   SOURCE_SHA  the file holding the commit src/ was archived from
+#   OUT         where to write the record
+# A planner that rejects src/ is recorded as `rejected`, not a failure here: each cell
+# then runs the planner itself and fails with the planner's own message, as it would
+# without a record.
+set -euo pipefail
+[[ $# -eq 5 ]] || { echo "usage: ci/buck-e2e/bundle-record HERMIT BIN SRC SOURCE_SHA OUT" >&2; exit 2; }
+hermit=$(realpath "$1") bin=$(realpath "$2") src=$(realpath "$3")
+sha=$(tr -d '\n' <"$4")
+[[ $sha =~ ^[0-9a-f]{40}$ ]] || { echo "ci/buck-e2e/bundle-record: $4 holds '$sha', not a full commit" >&2; exit 2; }
+planner=$bin/hermit-manifest-plan
+hermit_sha=$(sha256sum <"$hermit")
+planner_sha=$(sha256sum <"$planner")
+# The cell's invocation (test-harness.rs run_manifest_plan), output discarded as there.
+verdict=accepted
+env -C "$src" "$planner" --format json --root "$src" --source-snapshot >/dev/null || verdict=rejected
+printf '{"schema":"hermit-e2e-bundle-record/v1","source_sha":"%s","hermit_sha256":"%s","planner_sha256":"%s","manifest_plan":"%s"}\n' \
+    "$sha" "${hermit_sha%% *}" "${planner_sha%% *}" "$verdict" >"$5"

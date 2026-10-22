@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Run local validate as TWO PHASES separated by a network boundary:
 #
 #   FETCH phase   -- on the host, WITH network, and it does nothing but
@@ -199,9 +193,10 @@ if [[ -z "$shards" ]]; then
     strict_compat_node_count=$(jq -er '.strict_compat_nodes | if length > 0 then length else error("no strict compatibility steps") end' "$MAP")
     final_node_count=$(jq -er '.final_nodes | if length > 0 then length else error("no final steps") end' "$MAP")
     # Same hosted-portable filter as ci-portable.yml and check-shard-coverage.sh:
-    # GitHub-hosted runners have no PMU, so this selection omits KVM cells.
+    # GitHub-hosted runners have no PMU and no CPUID faulting, so this
+    # selection omits KVM, liteinst and in-guest-trap cells.
     e2e_cell_count=$(jq -er '
-        [.cells[] | select(.lane == "portable" and .backend != "kvm")] as $portable
+        [.cells[] | select(.lane == "portable" and .backend != "kvm" and .backend != "liteinst" and .backend != "in-guest-trap")] as $portable
         | if (.schema == 1 and ($portable | length) > 0)
           then $portable | length
           else error("invalid or empty portable E2E plan")
@@ -428,7 +423,7 @@ if [[ $do_offline -eq 1 ]]; then
 
             # Fail before a DAG node can report a misleading product failure.
             # Build dependencies and guest tools are different populations. The
-            # first assertion names the 18 executables and four native libraries
+            # first assertion names the 18 executables and five native libraries
             # used to compile and stage Hermit and its backend resources; the loop
             # below remains the audit of commands selected cells run as guests.
             /src/ci/hermetic/assert-build-dependencies.sh

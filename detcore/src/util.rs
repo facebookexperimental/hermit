@@ -15,6 +15,97 @@ use std::time::Duration;
 
 use crate::types::NANOS_PER_RCB;
 
+/// Issues syscall `number` with `args` through the syscall instruction itself
+/// on x86-64, returning the kernel's result (a negative errno on failure).
+/// Under in-guest LiteInst Detcore runs inside the guest, where libc's
+/// wrappers (`open`, `fstat`, `syscall`, ...) are dynamic symbols the program
+/// or a preloaded library may define, and allocate in.
+///
+/// # Safety
+///
+/// As for the syscall itself: pointer arguments must be valid for it.
+pub unsafe fn raw_syscall(number: libc::c_long, args: [u64; 6]) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let result: i64;
+        // SAFETY: the caller vouches for the arguments.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") number => result,
+                in("rdi") args[0],
+                in("rsi") args[1],
+                in("rdx") args[2],
+                in("r10") args[3],
+                in("r8") args[4],
+                in("r9") args[5],
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        result
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // SAFETY: the caller vouches for the arguments.
+        let result =
+            unsafe { libc::syscall(number, args[0], args[1], args[2], args[3], args[4], args[5]) };
+        if result < 0 {
+            -i64::from(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            )
+        } else {
+            result
+        }
+    }
+}
+
+/// [`raw_syscall`]'s result as an `io::Result`.
+pub fn raw_result(result: i64) -> std::io::Result<u64> {
+    if (-4095..0).contains(&result) {
+        Err(std::io::Error::from_raw_os_error(-result as i32))
+    } else {
+        Ok(result as u64)
+    }
+}
+
+/// [`raw_syscall`]'s result for a syscall whose only success value is 0
+/// (`fstat`, `pipe2`, `socketpair`, ...): any other value is refused, a
+/// negative one as the error it names. [`raw_result`] would take a positive
+/// return as success, which for such a call the kernel never gives.
+pub fn raw_zero_result(result: i64) -> std::io::Result<()> {
+    match raw_result(result)? {
+        0 => Ok(()),
+        other => Err(std::io::Error::other(format!(
+            "a syscall that returns 0 on success returned {other}"
+        ))),
+    }
+}
+
+/// Describes `error` without asking the C library for an errno message.
+///
+/// `std::io::Error`'s `Display` and `Debug` render an operating-system error
+/// through `strerror_r`, which can call `gettext` and allocate through the C
+/// library's malloc: under in-guest LiteInst, where Detcore runs inside the
+/// guest, the guest's own heap. An operating-system error is described by its
+/// kind and number instead; any other error, or an I/O error wrapping one, as
+/// before.
+pub fn describe_io_error(error: &std::io::Error) -> String {
+    if let Some(code) = error.raw_os_error() {
+        return format!("{:?} (errno {code})", error.kind());
+    }
+    match error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<std::io::Error>())
+    {
+        Some(inner) => describe_io_error(inner),
+        None => error.to_string(),
+    }
+}
+
 #[allow(dead_code)]
 /// A simple debugging helper function that makes it easy to printf-debug through
 /// layers of stdout/stderr caputure, such as when running under buck test/tpx.
@@ -330,14 +421,55 @@ impl std::io::Write for RetryingStderr {
             return Ok(0);
         }
         loop {
-            // SAFETY: `write(2)` on fd 2 reads `buf.len()` bytes from `buf`,
-            // which is valid for that length, and writes no memory.
-            let n = unsafe { libc::write(libc::STDERR_FILENO, buf.as_ptr().cast(), buf.len()) };
-            if n >= 0 {
-                return Ok(n as usize);
-            }
-            let err = std::io::Error::last_os_error();
+            // ⚠️ UNDER --max-log-bytes A BLOCKING DESCRIPTOR MUST NOT WAIT INSIDE
+            // write(2). The bounded wait below starts only at `EAGAIN`, which a
+            // blocking pipe never returns: its write simply waits for a reader,
+            // forever when the reader has stopped, and the run never reaches the
+            // cap. While `--max-log-bytes` is in force (review of
+            // https://github.com/rrnewton/hermit/pull/3686) each attempt is one
+            // that cannot wait for a reader, so a full pipe answers `EAGAIN` and
+            // takes the same bounded path as a guest-set `O_NONBLOCK`. Without the
+            // cap this is the plain `write(2)` it always was.
+            let must_not_wait = crate::nonwaiting_write::diagnostics_must_not_wait();
+            let attempt = if must_not_wait {
+                crate::nonwaiting_write::write_without_waiting_for_a_reader(
+                    libc::STDERR_FILENO,
+                    buf,
+                )
+            } else {
+                // SAFETY: `write(2)` on fd 2 reads `buf.len()` bytes from `buf`,
+                // which is valid for that length, and writes no memory.
+                let n = unsafe { libc::write(libc::STDERR_FILENO, buf.as_ptr().cast(), buf.len()) };
+                if n >= 0 {
+                    Ok(n as usize)
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            };
+            let err = match attempt {
+                Ok(n) => return Ok(n),
+                Err(err) => err,
+            };
             match err.kind() {
+                // ⚠️ UNDER --max-log-bytes AN INTERRUPTED ATTEMPT IS RETRIED ONLY
+                // WITHIN THE SAME DEADLINE, AND GIVEN UP AS `TimedOut`. A seccomp
+                // policy can answer any call in the attempt with `EINTR` every
+                // time: answering `statx` and the file-type probes on fd 2 that
+                // way leaves the writer no type, and it returns `statx`'s
+                // `EINTR`. An unbounded retry then never returned to
+                // `DroppingStderr`, so the log was never charged and the cap
+                // never crossed. `Interrupted` itself must not escape either:
+                // `write_all`, behind `writeln!`, retries it forever. Without the
+                // cap an interrupted write is retried as it always was.
+                std::io::ErrorKind::Interrupted if must_not_wait => {
+                    if STDERR_DIAGNOSTIC_DEADLINE
+                        .checked_sub(stderr_blocked_for())
+                        .is_none()
+                    {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    continue;
+                }
                 std::io::ErrorKind::Interrupted => continue,
                 std::io::ErrorKind::WouldBlock => {
                     // ⚠️ BOUNDED, AND THE CLOCK IS PROCESS-WIDE. Waiting for a slow
@@ -384,6 +516,53 @@ impl std::io::Write for RetryingStderr {
         Ok(())
     }
 }
+
+/// [`RetryingStderr`] for output whose loss must not change how a capped run
+/// ends: hermit's own log when it goes to stderr, and the stack traces that
+/// `--stacktrace-event` and `--preemption-stacktrace` print there.
+///
+/// While `--max-log-bytes` is in force
+/// ([`crate::nonwaiting_write::diagnostics_must_not_wait`]), bytes that
+/// [`RetryingStderr`] gives up on -- its bounded deadline for a reader that is
+/// not draining is spent, or the reader is gone -- are reported as written.
+/// So a log line that stderr could not take still counts against the cap,
+/// as `BoundedWriter` counts the bytes it truncates, and a run whose stderr
+/// reader stopped still reaches the cap and exits 123 instead of running on
+/// uncounted; and a caller that unwraps the write does not panic.
+/// Without the cap this is exactly [`RetryingStderr`], errors included.
+pub struct DroppingStderr;
+
+impl std::io::Write for DroppingStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match RetryingStderr.write(buf) {
+            Err(_) if crate::nonwaiting_write::diagnostics_must_not_wait() => Ok(buf.len()),
+            result => result,
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `eprintln!` for detcore output that a capped run can print before the cap
+/// crosses: under `--max-log-bytes` the line goes through [`DroppingStderr`]
+/// and never waits beyond [`RetryingStderr`]'s deadline; otherwise this is the
+/// `eprintln!` it replaces, with the same arguments, so uncapped output is
+/// unchanged.
+macro_rules! capped_eprintln {
+    ($($arg:tt)*) => {
+        if crate::nonwaiting_write::diagnostics_must_not_wait() {
+            // One buffer, so the line is not split across several writes.
+            let mut line = format!($($arg)*);
+            line.push('\n');
+            let _ = std::io::Write::write_all(&mut crate::util::DroppingStderr, line.as_bytes());
+        } else {
+            eprintln!($($arg)*);
+        }
+    };
+}
+pub(crate) use capped_eprintln;
 
 #[cfg(test)]
 mod shared_stderr_origin_tests {
@@ -490,6 +669,664 @@ mod shared_stderr_origin_tests {
             stderr_deadline_is_shared(),
             "the origin is not shared after init, so the deadline is per-process and \
              is multiplied by the number of writing processes"
+        );
+    }
+}
+
+/// A descriptor opened with a raw syscall, closed with one when dropped.
+pub struct RawFd(u64);
+
+impl RawFd {
+    /// `path` opened with `flags` (`O_CLOEXEC` added) by a raw `openat`, never
+    /// through libc's `open` wrapper (see `raw_syscall`).
+    pub fn open(path: &std::path::Path, flags: libc::c_int) -> std::io::Result<Self> {
+        let path = raw_path(path)?;
+        // SAFETY: a NUL-terminated path.
+        let fd = raw_result(unsafe {
+            raw_syscall(
+                libc::SYS_openat,
+                [
+                    libc::AT_FDCWD as u64,
+                    path.as_ptr() as u64,
+                    (flags | libc::O_CLOEXEC) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })?;
+        Ok(Self(fd))
+    }
+
+    /// `name`, relative to this directory, opened with `flags` (`O_CLOEXEC`
+    /// added) by a raw `openat`.
+    pub fn open_at(&self, name: &std::ffi::OsStr, flags: libc::c_int) -> std::io::Result<Self> {
+        let name = raw_path(std::path::Path::new(name))?;
+        // SAFETY: a NUL-terminated name.
+        let fd = raw_result(unsafe {
+            raw_syscall(
+                libc::SYS_openat,
+                [
+                    self.0,
+                    name.as_ptr() as u64,
+                    (flags | libc::O_CLOEXEC) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })?;
+        Ok(Self(fd))
+    }
+
+    /// The status of `name` in this directory, without following a final
+    /// link, by a raw `newfstatat`.
+    pub fn stat_at(&self, name: &std::ffi::OsStr) -> std::io::Result<libc::stat> {
+        let name = raw_path(std::path::Path::new(name))?;
+        // SAFETY: a NUL-terminated name; an all-zero `stat` is a valid value.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        raw_zero_result(unsafe {
+            raw_syscall(
+                libc::SYS_newfstatat,
+                [
+                    self.0,
+                    name.as_ptr() as u64,
+                    &mut stat as *mut libc::stat as u64,
+                    libc::AT_SYMLINK_NOFOLLOW as u64,
+                    0,
+                    0,
+                ],
+            )
+        })?;
+        Ok(stat)
+    }
+
+    /// The descriptor's number.
+    pub fn raw(&self) -> u64 {
+        self.0
+    }
+
+    /// The open file's status, by a raw `fstat`.
+    pub fn stat(&self) -> std::io::Result<libc::stat> {
+        // SAFETY: an all-zero `stat` is a valid value, and the kernel writes
+        // at most its size.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        raw_zero_result(unsafe {
+            raw_syscall(
+                libc::SYS_fstat,
+                [self.0, &mut stat as *mut libc::stat as u64, 0, 0, 0, 0],
+            )
+        })?;
+        Ok(stat)
+    }
+
+    /// Up to `buffer.len()` bytes at `offset`, by a raw `pread64`.
+    pub fn read_at(&self, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        // SAFETY: the buffer is writable for its length.
+        raw_result(unsafe {
+            raw_syscall(
+                libc::SYS_pread64,
+                [
+                    self.0,
+                    buffer.as_mut_ptr() as u64,
+                    buffer.len() as u64,
+                    offset,
+                    0,
+                    0,
+                ],
+            )
+        })
+        .map(|read| read as usize)
+    }
+}
+
+impl Drop for RawFd {
+    fn drop(&mut self) {
+        // SAFETY: a descriptor this value opened and owns.
+        unsafe { raw_syscall(libc::SYS_close, [self.0, 0, 0, 0, 0, 0]) };
+    }
+}
+
+fn raw_path(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+}
+
+/// The status of the file at `path`, following links, by a raw `newfstatat`.
+pub fn raw_stat(path: &std::path::Path) -> std::io::Result<libc::stat> {
+    let path = raw_path(path)?;
+    // SAFETY: a NUL-terminated path; an all-zero `stat` is a valid value.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    raw_zero_result(unsafe {
+        raw_syscall(
+            libc::SYS_newfstatat,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                &mut stat as *mut libc::stat as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    })?;
+    Ok(stat)
+}
+
+/// The target of the link at `path`, by a raw `readlinkat`.
+pub fn raw_read_link(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = raw_path(path)?;
+    let mut target = vec![0_u8; libc::PATH_MAX as usize];
+    // SAFETY: a NUL-terminated path and a buffer writable for its length.
+    let read = raw_result(unsafe {
+        raw_syscall(
+            libc::SYS_readlinkat,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                target.as_mut_ptr() as u64,
+                target.len() as u64,
+                0,
+                0,
+            ],
+        )
+    })? as usize;
+    target.truncate(read);
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &target,
+    )))
+}
+
+/// The whole contents of the file at `path`, read with raw syscalls. Meant
+/// for small files such as procfs entries.
+pub fn raw_read_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let file = RawFd::open(path, libc::O_RDONLY)?;
+    let mut contents = Vec::new();
+    let mut chunk = vec![0_u8; 4096];
+    loop {
+        // SAFETY: the buffer is writable for its length.
+        let read = raw_result(unsafe {
+            raw_syscall(
+                libc::SYS_read,
+                [
+                    file.raw(),
+                    chunk.as_mut_ptr() as u64,
+                    chunk.len() as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })? as usize;
+        if read == 0 {
+            return Ok(contents);
+        }
+        contents.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// The whole contents of the procfs listing at `path`, read with raw
+/// syscalls and without allocating between reads, so that where the tool
+/// shares the guest's process its own allocator maps nothing while the
+/// kernel walks the address space: the buffer is allocated before the first
+/// read, and a listing that fills it is read again, from the start, into one
+/// twice the size.
+pub fn raw_read_listing(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let mut capacity = 64 * 1024;
+    loop {
+        let file = RawFd::open(path, libc::O_RDONLY)?;
+        let mut contents = vec![0_u8; capacity];
+        let mut filled = 0;
+        while filled < capacity {
+            // SAFETY: the buffer is writable from `filled` to its length.
+            let read = raw_result(unsafe {
+                raw_syscall(
+                    libc::SYS_read,
+                    [
+                        file.raw(),
+                        contents[filled..].as_mut_ptr() as u64,
+                        (capacity - filled) as u64,
+                        0,
+                        0,
+                        0,
+                    ],
+                )
+            })? as usize;
+            if read == 0 {
+                contents.truncate(filled);
+                return Ok(contents);
+            }
+            filled += read;
+        }
+        capacity *= 2;
+    }
+}
+
+/// `path` with every symbolic link followed and every `.` and `..` resolved,
+/// as glibc's `realpath` (`std::fs::canonicalize`) gives it: relative paths
+/// from the working directory, and the same errors for an empty path
+/// (`ENOENT`), a missing component (`ENOENT`), a component that is not a
+/// directory but is followed by more, by `.`, `..` or a trailing `/`
+/// (`ENOTDIR`), and links nested too deep (`ELOOP` after 40, Linux's
+/// `MAXSYMLINKS`).
+///
+/// Walked with raw `getcwd`, `readlinkat` and `newfstatat` into buffers from
+/// Rust's allocator, never with `std::fs::canonicalize`: that calls glibc's
+/// `realpath`, whose result comes from the C library's `malloc`. Where
+/// Detcore runs in the guest's process (SaBRe, in-guest LiteInst), that heap
+/// is the guest's, and the allocation moves the guest's own `malloc` results
+/// and can grow its program break (see `find_in_directory`).
+pub fn canonicalize(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+    let error = std::io::Error::from_raw_os_error;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty() {
+        return Err(error(libc::ENOENT));
+    }
+    // What is left to walk, as `/`-separated pieces in reverse, so the next
+    // is at the end. A trailing `/` is kept as a final `.` piece: Linux then
+    // requires a directory, as it does before `.` and `..`.
+    let mut pending: Vec<Vec<u8>> = Vec::new();
+    let push = |pending: &mut Vec<Vec<u8>>, bytes: &[u8]| {
+        let mut pieces: Vec<Vec<u8>> = bytes
+            .split(|&byte| byte == b'/')
+            .filter(|piece| !piece.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
+        if bytes.len() > 1 && bytes.ends_with(b"/") {
+            pieces.push(b".".to_vec());
+        }
+        pieces.reverse();
+        pending.extend(pieces);
+    };
+    let mut resolved = if bytes.starts_with(b"/") {
+        PathBuf::from("/")
+    } else {
+        // The kernel answers within one PATH_MAX page and fails
+        // ENAMETOOLONG past it, where glibc's getcwd walks `..` itself; so
+        // does this (path_of_directory).
+        let mut cwd = vec![0_u8; libc::PATH_MAX as usize];
+        // SAFETY: the buffer is writable for its length. The kernel's length
+        // counts the terminating NUL.
+        let length = unsafe {
+            raw_syscall(
+                libc::SYS_getcwd,
+                [cwd.as_mut_ptr() as u64, cwd.len() as u64, 0, 0, 0, 0],
+            )
+        };
+        let length = if length == -(libc::ENAMETOOLONG as i64) {
+            let here = RawFd::open(
+                std::path::Path::new("."),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            )?;
+            cwd = path_of_directory(here)?;
+            cwd.push(0);
+            cwd.len()
+        } else {
+            raw_result(length)? as usize
+        };
+        cwd.truncate(length.saturating_sub(1));
+        // A working directory outside the process's root reads as
+        // "(unreachable)..."; glibc's getcwd fails ENOENT there.
+        if !cwd.starts_with(b"/") {
+            return Err(error(libc::ENOENT));
+        }
+        PathBuf::from(std::ffi::OsStr::from_bytes(&cwd))
+    };
+    push(&mut pending, bytes);
+    let is_directory = |path: &std::path::Path| {
+        raw_stat(path).map(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    };
+    let mut links = 0;
+    while let Some(piece) = pending.pop() {
+        if piece == b"." || piece == b".." {
+            if !is_directory(&resolved)? {
+                return Err(error(libc::ENOTDIR));
+            }
+            if piece == b".." {
+                resolved.pop();
+            }
+            continue;
+        }
+        let candidate = resolved.join(std::ffi::OsStr::from_bytes(&piece));
+        let spelled = std::ffi::CString::new(candidate.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // A target that fills the buffer may have been cut short: read again
+        // into a larger one.
+        let mut target = vec![0_u8; libc::PATH_MAX as usize];
+        let read = loop {
+            // SAFETY: a NUL-terminated path and a buffer writable for its
+            // length.
+            let read = unsafe {
+                raw_syscall(
+                    libc::SYS_readlinkat,
+                    [
+                        libc::AT_FDCWD as u64,
+                        spelled.as_ptr() as u64,
+                        target.as_mut_ptr() as u64,
+                        target.len() as u64,
+                        0,
+                        0,
+                    ],
+                )
+            };
+            if read != target.len() as i64 {
+                break read;
+            }
+            target.resize(target.len() * 2, 0);
+        };
+        if read == -(libc::EINVAL as i64) {
+            // There, and not a link.
+            resolved = candidate;
+            continue;
+        }
+        let read = raw_result(read)? as usize;
+        links += 1;
+        if links > 40 {
+            return Err(error(libc::ELOOP));
+        }
+        if target[..read].starts_with(b"/") {
+            resolved = PathBuf::from("/");
+        }
+        push(&mut pending, &target[..read]);
+    }
+    Ok(resolved)
+}
+
+/// The absolute path of the directory open at `start`: each directory's
+/// name is found among its parent's entries by device and inode, walking `..`
+/// up to the process's root, as glibc's getcwd does where the kernel's
+/// `getcwd` cannot answer (a path longer than a page). Raw syscalls
+/// throughout. `ENOENT` where a directory is missing from its parent (it was
+/// removed, or lies outside the root).
+fn path_of_directory(start: RawFd) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    let mut current = start;
+    loop {
+        let here = current.stat()?;
+        let parent = current.open_at(
+            std::ffi::OsStr::new(".."),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )?;
+        let above = parent.stat()?;
+        if (above.st_dev, above.st_ino) == (here.st_dev, here.st_ino) {
+            break;
+        }
+        let name = find_in_open_directory(&parent, |name| {
+            parent
+                .stat_at(name)
+                .is_ok_and(|stat| (stat.st_dev, stat.st_ino) == (here.st_dev, here.st_ino))
+                .then(|| name.as_bytes().to_vec())
+        })?
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        names.push(name);
+        current = parent;
+    }
+    let mut path = Vec::new();
+    for name in names.iter().rev() {
+        path.push(b'/');
+        path.extend_from_slice(name);
+    }
+    if path.is_empty() {
+        path.push(b'/');
+    }
+    Ok(path)
+}
+
+/// Calls `visit` with each name in directory `path`, without `.` and `..`,
+/// in the kernel's order, until it returns `Some`, and returns that value
+/// (`None` when every name was visited).
+///
+/// Read with raw `getdents64` into one fixed buffer from Rust's allocator,
+/// never with `std::fs::read_dir`: that calls glibc's `opendir`, whose
+/// directory buffer comes from the C library's `malloc`. Under in-guest
+/// LiteInst, Detcore runs inside the guest and that heap is the guest's: the
+/// freed buffer would keep the kernel's bytes (raw `/proc` inode numbers, say)
+/// where the guest's next allocation finds them, so the guest could observe
+/// host-chosen data, for example in the padding of its own `getdents64`
+/// records. Rust's allocator is private to the runtime there (inside a Tool
+/// callback or an allocation scope). The names are streamed, not collected,
+/// so a directory of any size costs the one buffer.
+pub fn find_in_directory<T>(
+    path: &std::path::Path,
+    visit: impl FnMut(&std::ffi::OsStr) -> Option<T>,
+) -> std::io::Result<Option<T>> {
+    // Raw syscalls throughout (see raw_syscall); the descriptor closes when
+    // dropped, a panicking visitor included.
+    let directory = RawFd::open(path, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    find_in_open_directory(&directory, visit)
+}
+
+/// [`find_in_directory`] of a directory already open at `directory`, from
+/// its current offset.
+pub fn find_in_open_directory<T>(
+    directory: &RawFd,
+    mut visit: impl FnMut(&std::ffi::OsStr) -> Option<T>,
+) -> std::io::Result<Option<T>> {
+    use std::os::unix::ffi::OsStrExt;
+    let fd = directory.raw();
+    let mut buffer = vec![0_u8; 32 * 1024];
+    'listing: loop {
+        // SAFETY: the buffer is writable for its length.
+        let read = unsafe {
+            raw_syscall(
+                libc::SYS_getdents64,
+                [fd, buffer.as_mut_ptr() as u64, buffer.len() as u64, 0, 0, 0],
+            )
+        };
+        if read < 0 {
+            break Err(std::io::Error::from_raw_os_error(-read as i32));
+        }
+        if read == 0 {
+            break Ok(None);
+        }
+        let mut offset = 0_usize;
+        let read = read as usize;
+        // A record: d_ino (8), d_off (8), d_reclen (2), d_type (1), d_name.
+        while offset + 19 <= read {
+            let reclen = u16::from_ne_bytes([buffer[offset + 16], buffer[offset + 17]]) as usize;
+            if reclen < 19 || offset + reclen > read {
+                break;
+            }
+            let name = &buffer[offset + 19..offset + reclen];
+            let name = &name[..name
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(name.len())];
+            if name != b"."
+                && name != b".."
+                && let Some(found) = visit(std::ffi::OsStr::from_bytes(name))
+            {
+                break 'listing Ok(Some(found));
+            }
+            offset += reclen;
+        }
+    }
+}
+
+#[cfg(test)]
+mod find_in_directory_tests {
+    use super::*;
+
+    /// Every name `std::fs::read_dir` finds is visited once, the visit stops
+    /// at the first `Some`, and a path that is not a directory is an error.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // std::fs::read_dir is the reference
+    fn find_in_directory_visits_every_name_and_stops_at_the_first_find() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..300 {
+            std::fs::write(
+                directory
+                    .path()
+                    .join(format!("entry-with-a-long-name-{index}")),
+                b"",
+            )
+            .unwrap();
+        }
+        let mut visited = Vec::new();
+        let none: Option<()> = find_in_directory(directory.path(), |name| {
+            visited.push(name.to_owned());
+            None
+        })
+        .unwrap();
+        assert!(none.is_none());
+        visited.sort();
+        let mut expected: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        expected.sort();
+        assert_eq!(visited.len(), 300);
+        assert_eq!(visited, expected);
+        let mut calls = 0;
+        let found = find_in_directory(directory.path(), |name| {
+            calls += 1;
+            (calls == 7).then(|| name.to_owned())
+        })
+        .unwrap();
+        assert!(found.is_some());
+        assert_eq!(calls, 7);
+        let file = directory.path().join("entry-with-a-long-name-0");
+        assert!(find_in_directory(&file, |_| Some(())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod canonicalize_tests {
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+
+    use super::*;
+
+    /// A directory's path is found by walking `..` where it is longer than
+    /// the kernel's getcwd answers (a page), as glibc's getcwd does.
+    #[test]
+    fn a_long_directory_path_is_found_by_walking_up() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        #[allow(clippy::disallowed_methods)] // std::fs::canonicalize is the independent oracle
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let name = "d".repeat(200);
+        let spelled = std::ffi::CString::new(name.as_str()).unwrap();
+        let mut levels = vec![RawFd::open(&root, libc::O_RDONLY | libc::O_DIRECTORY).unwrap()];
+        let mut expected = root.clone();
+        // 25 levels of 201 bytes: past the 4096-byte page.
+        for _ in 0..25 {
+            let parent = levels.last().unwrap();
+            // SAFETY: a NUL-terminated name relative to an open directory.
+            assert_eq!(
+                unsafe { libc::mkdirat(parent.raw() as i32, spelled.as_ptr(), 0o700) },
+                0
+            );
+            let child = parent
+                .open_at(
+                    std::ffi::OsStr::new(&name),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                )
+                .unwrap();
+            levels.push(child);
+            expected.push(&name);
+        }
+        assert!(expected.as_os_str().len() > 4096);
+        let deepest = levels
+            .last()
+            .unwrap()
+            .open_at(
+                std::ffi::OsStr::new("."),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            )
+            .unwrap();
+        let found = path_of_directory(deepest).unwrap();
+        // A path short enough for the kernel is found the same way.
+        let short = RawFd::open(&root, libc::O_RDONLY | libc::O_DIRECTORY).unwrap();
+        let short = path_of_directory(short).unwrap();
+        // The tree is too deep for a path-based removal: remove it level by
+        // level before asserting.
+        for parent in levels[..25].iter().rev() {
+            // SAFETY: a NUL-terminated name relative to an open directory.
+            unsafe { libc::unlinkat(parent.raw() as i32, spelled.as_ptr(), libc::AT_REMOVEDIR) };
+        }
+        assert_eq!(std::ffi::OsStr::from_bytes(&found), expected.as_os_str());
+        assert_eq!(std::ffi::OsStr::from_bytes(&short), root.as_os_str());
+    }
+
+    /// The walk gives what glibc's `realpath` gives (`std::fs::canonicalize`,
+    /// allowed here as the reference) through absolute, relative and chained
+    /// links, `..` across a link, and procfs's own links; and the same errors
+    /// for a missing component, a file used as a directory, and a link loop.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // std::fs::canonicalize is the reference
+    fn canonicalize_matches_realpath() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+        std::fs::write(root.join("a/b/c/file"), b"").unwrap();
+        symlink(root.join("a/b"), root.join("absolute")).unwrap();
+        symlink("a/b/c", root.join("relative")).unwrap();
+        symlink("relative", root.join("chained")).unwrap();
+        symlink("../../b", root.join("a/b/c/up")).unwrap();
+        symlink("loop2", root.join("loop1")).unwrap();
+        symlink("loop1", root.join("loop2")).unwrap();
+        for spelled in [
+            root.join("a/b/c/file"),
+            root.join("absolute/c/file"),
+            root.join("relative/file"),
+            root.join("chained/./file"),
+            root.join("chained/../c/file"),
+            root.join("a/b/c/up/c/file"),
+            root.join("absolute/c/up/../.."),
+            Path::new("/proc/self").to_path_buf(),
+            Path::new("/proc/self/exe").to_path_buf(),
+            Path::new("/").to_path_buf(),
+        ] {
+            assert_eq!(
+                canonicalize(&spelled).unwrap(),
+                std::fs::canonicalize(&spelled).unwrap(),
+                "{spelled:?}"
+            );
+        }
+        // Trailing separators and `.` on directories, and a link to one.
+        for spelled in [
+            root.join("a/b/"),
+            root.join("a/b/."),
+            root.join("absolute/"),
+            root.join("relative/."),
+        ] {
+            assert_eq!(
+                canonicalize(&spelled).unwrap(),
+                std::fs::canonicalize(&spelled).unwrap(),
+                "{spelled:?}"
+            );
+        }
+        // The same errors as realpath, including after a regular file.
+        let error = |spelled: &Path| canonicalize(spelled).unwrap_err().raw_os_error();
+        let reference = |spelled: &Path| std::fs::canonicalize(spelled).unwrap_err().raw_os_error();
+        let file = root.join("a/b/c/file");
+        let violating = [
+            Path::new("").to_path_buf(),
+            root.join("missing/file"),
+            root.join("a/b/c/file/x"),
+            root.join("loop1"),
+            file.join(""),
+            Path::new(&format!("{}/.", file.display())).to_path_buf(),
+            Path::new(&format!("{}/..", file.display())).to_path_buf(),
+            Path::new(&format!("{}/../file", file.display())).to_path_buf(),
+        ];
+        for spelled in &violating {
+            assert_eq!(error(spelled), reference(spelled), "{spelled:?}");
+        }
+        assert_eq!(error(&violating[0]), Some(libc::ENOENT));
+        assert_eq!(error(&violating[3]), Some(libc::ELOOP));
+        assert_eq!(error(&violating[5]), Some(libc::ENOTDIR));
+        // A relative path starts from the working directory.
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            canonicalize(Path::new(".")).unwrap(),
+            std::fs::canonicalize(&here).unwrap()
         );
     }
 }

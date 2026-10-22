@@ -1,21 +1,23 @@
 [package]
 name = "detcore-dbt"
 description = "DynamoRIO DBT backend glue for Detcore, the Hermit deterministic execution engine."
-version = "0.4.0"
+version = "0.5.1"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
 publish = false
 
+# libdetcore_dbt.so is built by detcore-dbt-cdylib, so this crate stays an rlib
+# and its dependents can start from its metadata.
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
-detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }
-hermit-resources = { version = "0.4.0", path = "../hermit-resources" }
+detcore = { package = "hermit-detcore", version = "0.5.1", path = "../detcore" }
+hermit-resources = { version = "0.5.1", path = "../hermit-resources" }
 libc = "0.2.186"
 rand = "0.10.2"
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "c7a1ed25bca339daa0e69241353fc9882da63d7a" }
-reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "c7a1ed25bca339daa0e69241353fc9882da63d7a", default-features = false }
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "9b1ba3cfbea21152a11b190112757c2274d9bca3" }
+reverie-dbt = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "9b1ba3cfbea21152a11b190112757c2274d9bca3", default-features = false }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tracing = "0.1.41"

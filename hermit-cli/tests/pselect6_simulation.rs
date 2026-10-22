@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -13,9 +16,7 @@ use std::process::Output;
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -31,7 +32,8 @@ fn pselect6_preserves_kernel_abi_and_unblocks_scheduler() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("pselect6-simulation");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pselect6-simulation-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create pselect6 guest build directory");
     let guest = build_root.join("pselect6_simulation");
 
@@ -86,4 +88,183 @@ fn pselect6_preserves_kernel_abi_and_unblocks_scheduler() {
             || verify_stderr.contains("Determinism verified"),
         "Hermit omitted its determinism marker\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
     );
+}
+
+/// pselect6 sleeps under its temporary signal mask for the whole call, as
+/// Linux installs it (https://github.com/rrnewton/hermit/issues/3991).
+///
+/// - `blocks`: the timer's SIGALRM, unblocked in the waiter's own mask and
+///   blocked by the call's mask, must not end the call. It returned EINTR.
+/// - `blocks-early`: `blocks`, with the timer firing as the call starts,
+///   before the wait blocks signals. The handler must not run in the middle of
+///   the call, with the pipe still empty: it ran there, and the call restarted
+///   (review of https://github.com/rrnewton/hermit/pull/4051).
+/// - `unblocks`: a SIGALRM blocked in the waiter's own mask and unblocked by
+///   the call's mask must end it with EINTR, with the handler run before
+///   pselect returns. It returned EINTR, but the handler did not run until the
+///   guest unblocked SIGALRM itself.
+/// - `unblocks-rewritten`: `unblocks`, with a sibling rewriting the call's mask
+///   buffer to block SIGALRM while the call sleeps. Linux copied the mask at
+///   entry; delivering under a mask read again from the buffer returned 0 from
+///   an untimed call (review of https://github.com/rrnewton/hermit/pull/4051).
+/// - `unblocks-timed`: the same with a 5 s timeout, whose remaining time the
+///   guest prints. The kernel must not write it, measured on the host clock,
+///   over the remaining virtual time Hermit writes.
+///
+/// The guest checks each result against Linux's and exits nonzero on a
+/// mismatch. Each mode runs under strict verification, which must compare a
+/// nonzero number of INFO messages on each side.
+#[test]
+fn pselect6_sleeps_under_its_temporary_mask() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pselect-temporary-mask-{}", std::process::id()));
+    fs::create_dir_all(&build_root).expect("failed to create pselect guest build directory");
+    let guest = build_root.join("pselect_temporary_mask");
+    let mut compile = Command::new("cc");
+    compile
+        .args(["-O0", "-g", "-pthread", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/pselect_temporary_mask.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "pselect temporary-mask guest compilation");
+
+    for mode in [
+        "blocks",
+        "blocks-early",
+        "unblocks",
+        "unblocks-timed",
+        "unblocks-rewritten",
+    ] {
+        let verdict = build_root.join(format!("verify-{mode}.json"));
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--base-env=minimal",
+            ])
+            .arg(format!("--verify-json={}", verdict.display()))
+            .arg("--")
+            .arg(&guest)
+            .arg(mode);
+        let output = command_output(command, &format!("pselect temporary mask {mode}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("pselect-temporary-mask mode={mode}")),
+            "guest omitted its result line\nstdout:\n{stdout}"
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(&verdict).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(report["verdict"], serde_json::json!("matched"), "{mode}");
+        assert_eq!(report["bitwise_parity"], serde_json::json!(true), "{mode}");
+        for side in ["left", "right"] {
+            assert!(
+                report["compared_log_messages"][side]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "{mode}: strict verification compared no {side} INFO messages: {report}"
+            );
+        }
+    }
+}
+
+// This is a Linux-semantics control, not a repeat-parity claim. Native and
+// ptrace are the reference; the feature-gated DBT leg requires its real runtime.
+#[test]
+fn pselect6_wrapper_validation_preserves_pending_signals() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pselect-validation-pending-{}", std::process::id()));
+    fs::create_dir_all(&build_root).unwrap();
+    let guest = build_root.join("pselect6_wrapper_validation");
+    let mut compile = Command::new("cc");
+    compile
+        .args([
+            "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+        ])
+        .arg(repository.join("tests/c/pselect6_wrapper_validation.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "pselect validation guest compilation");
+    #[cfg(not(feature = "dbt"))]
+    let backends = ["native", "ptrace"];
+    #[cfg(feature = "dbt")]
+    let backends = ["native", "ptrace", "dbt"];
+    for backend in backends {
+        for mode in ["validation-empty", "validation-pending"] {
+            let mut command = if backend == "native" {
+                Command::new(&guest)
+            } else {
+                let mut command = Command::new(hermit_test::hermit_binary());
+                command
+                    .arg(format!("--backend={backend}"))
+                    .args([
+                        "--log=info",
+                        "run",
+                        "--strict",
+                        "--epoch=2026-01-01T00:00:00Z",
+                        "--base-env=minimal",
+                        "--",
+                    ])
+                    .arg(&guest);
+                command
+            };
+            command.arg(mode);
+            if backend != "native" {
+                hermit_test::configure_guest_execution(&mut command);
+            }
+            let output = command_output(command, &format!("wrapper-validation {backend} {mode}"));
+            let queued = i32::from(mode == "validation-pending");
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!(
+                    "mode={} result=-1 errno=22 pending={queued} blocked=1 handled=0 timeout=0,1000000000\n",
+                    if queued == 1 { "pending" } else { "empty" }
+                ),
+                "wrapper-validation {backend} {mode}"
+            );
+        }
+        for mode in [
+            "argument-validation-order",
+            "wrapper-protected-tail",
+            "wrapper-unmapped-tail",
+        ] {
+            let mut command = if backend == "native" {
+                Command::new(&guest)
+            } else {
+                let mut command = Command::new(hermit_test::hermit_binary());
+                command
+                    .arg(format!("--backend={backend}"))
+                    .args([
+                        "--log=info",
+                        "run",
+                        "--strict",
+                        "--epoch=2026-01-01T00:00:00Z",
+                        "--base-env=minimal",
+                        "--",
+                    ])
+                    .arg(&guest);
+                command
+            };
+            command.arg(mode);
+            if backend != "native" {
+                hermit_test::configure_guest_execution(&mut command);
+            }
+            let output = command_output(command, &format!("wrapper-validation {backend} {mode}"));
+            assert_eq!(
+                output.stdout, b"pselect6-simulation-ok\n",
+                "wrapper-validation {backend} {mode}"
+            );
+        }
+    }
 }

@@ -1,6 +1,9 @@
 // Strict mode serializes the two writers, so exactly one thread's ten bytes
-// survive. Which thread wins is a property of the scheduler, not of this test,
-// so accept either and check determinism with --verify instead.
+// survive. Which thread wins depends on which side of the clone runs first
+// (--runs-post-fork), not on this test, so the default run accepts either
+// and checks determinism with --verify; a parent-first run pins its order.
 RUN: %hermit run --env=TMPDIR=/tmp -- %me | FileCheck %s
 RUN: %hermit run --env=TMPDIR=/tmp --verify -- %me
+RUN: %hermit run --env=TMPDIR=/tmp --runs-post-fork=parent -- %me | FileCheck --check-prefix=PARENT %s
 CHECK: {{^(1{10}|2{10})$}}
+PARENT: {{^1{10}$}}

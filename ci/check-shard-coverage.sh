@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # check-shard-coverage.sh — fail-closed correspondence guard for the parallel
 # portable fan-out. Asserts that ci/portable-shards.json assigns EVERY step in
 # the committed DAG's hosted-portable label selection to exactly one job, with no overlap
@@ -32,9 +32,10 @@ cd "$ROOT_DIR"
 shards="ci/portable-shards.json"
 # The hosted-portable E2E population: portable cells minus the backends that
 # HOSTED_PORTABLE_EXCLUDED_BACKENDS (ci/manifest-plan/src/validation_dag.rs)
-# omits because GitHub-hosted runners have no PMU for KVM guests. The workflow
+# omits because GitHub-hosted runners have no PMU for KVM guests and no CPUID
+# faulting for the in-guest LiteInst runtime (liteinst, in-guest-trap). The workflow
 # reducer must apply this exact filter; a generator test keeps it in sync.
-hosted_e2e_cell_filter='select(.lane == "portable" and .backend != "kvm")'
+hosted_e2e_cell_filter='select(.lane == "portable" and .backend != "kvm" and .backend != "liteinst" and .backend != "in-guest-trap")'
 workflow=".github/workflows/ci-portable.yml"
 hosted_runner="ci/run-hosted-node.sh"
 command -v jq >/dev/null 2>&1 || { echo "check-shard-coverage.sh: jq is required" >&2; exit 2; }
@@ -351,8 +352,9 @@ debug_artifact_contract() {
 # No release-profile producer exists since d44bbbb79ac
 # (https://github.com/rrnewton/hermit/issues/3458), so the debug tree is the
 # only carrier of the install resources that build.e2e_artifact publishes and
-# the release shards read, and of the profile-staged LiteInst runtime that
-# test.liteinst_strict stages. hermit-install links three of those resources
+# the release shards read, and of the profile-staged Reverie LiteInst runtime
+# that hermit-install writes beside the validate-profile Hermit. hermit-install
+# links three of those resources
 # into target/validate, which the tree does not carry whole, so the pack step
 # must replace every link with a regular copy and refuse a leftover one. The
 # replacement loop is pinned whole and must precede the tar: its dangling-link
@@ -420,6 +422,45 @@ prepared_nextest_artifact_contract() {
         grep -Fqx '          tar --zstd -xf "$NEXTEST_TARBALL"' <<<"$body" &&
         grep -Fqx '          require -x target/debug/nextest-cpu-wrapper' <<<"$body" &&
         grep -Fqx '          require -f target/ci/nextest-binaries/current.json' <<<"$body"
+}
+
+# Every node of test-debug and test-release runs inside ci/run-hosted-node.sh's
+# network namespace, where Cargo cannot download anything. lint.clippy compiles
+# against the locked registry crates and git checkouts, and every
+# prepared-Nextest consumer re-hashes each git dependency's Cargo checkout
+# (sources() in ci/manifest-plan/src/nextest_binaries.rs). A rust-cache restore
+# does not supply them: its key hashes the runner's installed toolchains, so it
+# misses whenever a runner image's default stable rustc differs from
+# build-debug's. Run 37469056816 failed three shards that way. Each job must
+# therefore run an unconditional `cargo fetch --locked` step before the step
+# that enters the namespace. strict-compat is not listed because neither of its
+# nodes runs Cargo or verifies the prepared-Nextest record.
+locked_source_jobs=(test-debug test-release)
+locked_sources_fetched_contract() {
+    local workflow_text=$1 job body step fetch_line enter_line
+    for job in "${locked_source_jobs[@]}"; do
+        body=$(workflow_job_body "$job" "$workflow_text") || return 1
+        step=$(workflow_step_body "Fetch locked workspace dependencies" "$body" |
+            grep -Ev '^[[:space:]]*(#|$)') || return 1
+        [[ $step == '        run: cargo fetch --locked' ]] || return 1
+        fetch_line=$(grep -nFx '      - name: Fetch locked workspace dependencies' <<<"$body" | cut -d: -f1)
+        enter_line=$(grep -m1 -nE '^        run: \./ci/run-hosted-node\.sh ' <<<"$body" | cut -d: -f1)
+        [[ $fetch_line =~ ^[0-9]+$ && $enter_line =~ ^[0-9]+$ ]] &&
+            ((fetch_line < enter_line)) || return 1
+    done
+}
+
+# Remove one named step, and the lines that belong to it, from one job only.
+drop_job_step() {
+    local job=$1 step_name=$2 workflow_text=$3 body mutated
+    body=$(workflow_job_body "$job" "$workflow_text") || return 1
+    mutated=$(awk -v marker="      - name: $step_name" '
+        $0 == marker { skip = 1; next }
+        skip && /^      (- |# )/ { skip = 0 }
+        !skip { print }
+    ' <<<"$body")
+    [[ $mutated != "$body" ]] || return 1
+    printf '%s' "${workflow_text/"$body"/"$mutated"}"
 }
 
 # The completed-build job is the literal contraction
@@ -725,6 +766,30 @@ LINE
         grep -Fqx '          if [[ "$run_e2e" == "true" && "$run_strict" != "true" ]]; then' <<<"$workflow_text"
 }
 
+# GitHub reports one result for the whole test-debug matrix, so a strict-compat
+# job left on the default success() condition is skipped when any leg fails,
+# also one that runs none of its predecessors, and its parity archives never
+# reach the reducer (runs 38106386550 and 38110887257). Each leg records its
+# success and strict-compat, run under !cancelled() once both builds succeeded,
+# requires the records of exactly the legs its dependency closure needs
+# (ci/debug-shard-success.sh).
+workflow_strict_compat_dependency_contract() {
+    local workflow_text=$1 debug_body strict_body
+    debug_body=$(workflow_job_body test-debug "$workflow_text") || return 1
+    strict_body=$(workflow_job_body strict-compat "$workflow_text") || return 1
+    grep -Fqx '        run: ./ci/debug-shard-success.sh record "${{ matrix.slug }}" "${{ matrix.nodes }}"' \
+        <<<"$debug_body" &&
+        workflow_artifact_edge test-debug name \
+            'debug-shard-ok-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slug }}' \
+            strict-compat pattern 'debug-shard-ok-${{ github.run_id }}-${{ github.run_attempt }}-*' \
+            "$workflow_text" &&
+        grep -Fqx '      !cancelled()' <<<"$strict_body" &&
+        grep -Fqx "      && needs.build-debug.result == 'success'" <<<"$strict_body" &&
+        grep -Fqx "      && needs.build-complete.result == 'success'" <<<"$strict_body" &&
+        grep -Fqx "        run: ./ci/debug-shard-success.sh require ignored/debug-shard-ok \"\$(jq -r '.strict_compat_nodes|join(\",\")' ci/portable-shards.json)\"" \
+            <<<"$strict_body"
+}
+
 workflow_wiring_contract() {
     local workflow_text=$1
 
@@ -976,6 +1041,52 @@ do
         fi
     done
 done
+if ! locked_sources_fetched_contract "$workflow_text"; then
+    echo "check-shard-coverage.sh: FAIL — ${locked_source_jobs[*]} must each run an unconditional 'cargo fetch --locked' step before ci/run-hosted-node.sh enters the network namespace (run 37469056816)" >&2
+    status=1
+fi
+# Each mutation must be refused: the fetch step deleted from one job, made
+# conditional, run without --locked, or moved after the namespace entry.
+for job in "${locked_source_jobs[@]}"; do
+    if ! unfetched_job=$(drop_job_step "$job" "Fetch locked workspace dependencies" "$workflow_text") ||
+        [[ $unfetched_job == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — locked-source fetch deletion did not change $job" >&2
+        status=1
+    elif locked_sources_fetched_contract "$unfetched_job"; then
+        echo "check-shard-coverage.sh: FAIL — locked-source guard accepted $job without its fetch step" >&2
+        status=1
+    fi
+done
+fetch_from=(
+    '        run: cargo fetch --locked'
+    '        run: cargo fetch --locked'
+)
+fetch_to=(
+    $'        if: false\n        run: cargo fetch --locked'
+    '        run: cargo fetch'
+)
+for index in "${!fetch_from[@]}"; do
+    if ! weakened_fetch=$(mutate_job_step test-debug "Fetch locked workspace dependencies" \
+        "${fetch_from[index]}" "${fetch_to[index]}" "$workflow_text") ||
+        [[ $weakened_fetch == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — locked-source fetch mutation $index did not change test-debug" >&2
+        status=1
+    elif locked_sources_fetched_contract "$weakened_fetch"; then
+        echo "check-shard-coverage.sh: FAIL — locked-source guard accepted a weakened test-debug fetch (mutation $index)" >&2
+        status=1
+    fi
+done
+late_run_line='        run: ./ci/run-hosted-node.sh portable "${{ matrix.nodes }}"'
+if ! late_fetch=$(drop_job_step test-release "Fetch locked workspace dependencies" "$workflow_text") ||
+    ! late_fetch=$(mutate_job_step test-release 'Run shard nodes (${{ matrix.slug }})' "$late_run_line" \
+        "$late_run_line"$'\n      - name: Fetch locked workspace dependencies\n        run: cargo fetch --locked' "$late_fetch") ||
+    [[ $late_fetch == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — locked-source late-fetch mutation did not change test-release" >&2
+    status=1
+elif locked_sources_fetched_contract "$late_fetch"; then
+    echo "check-shard-coverage.sh: FAIL — locked-source guard accepted a test-release fetch after the namespace entry" >&2
+    status=1
+fi
 if ! prepared_nextest_producer_contract "$workflow_text"; then
     echo "check-shard-coverage.sh: FAIL — build-debug must re-assert the prepared Nextest record after its last Cargo build and before packing" >&2
     status=1
@@ -1017,6 +1128,29 @@ for mutation in pack count; do
         status=1
     fi
 done
+
+if ! workflow_strict_compat_dependency_contract "$workflow_text"; then
+    echo "check-shard-coverage.sh: FAIL — strict-compat must run whenever its own debug predecessors succeeded: each test-debug leg records its success, and strict-compat runs under !cancelled() and requires the records of its predecessors' legs (ci/debug-shard-success.sh)" >&2
+    status=1
+fi
+for mutation in record require condition; do
+    case $mutation in
+    record) planted=${workflow_text/$'        run: ./ci/debug-shard-success.sh record "${{ matrix.slug }}" "${{ matrix.nodes }}"\n'/} ;;
+    require) planted=${workflow_text/$'        run: ./ci/debug-shard-success.sh require ignored/debug-shard-ok'/$'        run: true ignored/debug-shard-ok'} ;;
+    condition) planted=${workflow_text/$'      !cancelled()\n      && needs.select.outputs.run_strict_compat != \'false\''/$'      needs.select.outputs.run_strict_compat != \'false\''} ;;
+    esac
+    if [[ $planted == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — strict-compat dependency $mutation mutation did not change the workflow fixture" >&2
+        status=1
+    elif workflow_strict_compat_dependency_contract "$planted"; then
+        echo "check-shard-coverage.sh: FAIL — strict-compat dependency guard accepted a planted $mutation defect" >&2
+        status=1
+    fi
+done
+if ! bash "$ROOT_DIR/ci/debug-shard-success.sh" self-test; then
+    echo "check-shard-coverage.sh: FAIL — ci/debug-shard-success.sh self-test" >&2
+    status=1
+fi
 
 for step_name in 'Run constructed E2E node (${{ matrix.node }})' 'Run constructed E2E verdict'; do
     original="      - name: $step_name"

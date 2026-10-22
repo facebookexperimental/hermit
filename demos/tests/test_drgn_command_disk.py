@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Tests for demo 7's command-disk resume, QMP socket path, process cleanup,
 and RESULT line."""
 
@@ -64,21 +58,26 @@ class CommandDiskProtocolTest(unittest.TestCase):
         program._qmp = qmp
         program._qemu_pid = 456
         program._tracer_tgid = 123
+        program._tracer = mock.Mock(tgid=123)
+        program._tracer.send.return_value = True
         program._serial_write_fd = 99
         program._wait_for_serial = mock.Mock()
 
-        with (
-            mock.patch.object(dh.os, "write") as serial_write,
-            mock.patch.object(dh.os, "kill"),
-            mock.patch.object(dh, "_freeze_exact_tracer", return_value=(456, 789)),
-        ):
+        with mock.patch.object(dh.os, "write") as serial_write, mock.patch.object(
+            dh.os, "kill"
+        ) as kill, mock.patch.object(dh, "_freeze_exact_tracer") as freeze:
             program.advance("echo deterministic", b"done")
 
         serial_write.assert_not_called()
         program._wait_for_serial.assert_called_once_with(b"done")
         self.assertEqual(qmp.commands, ["cont", "stop"])
         self.assertTrue(program._frozen)
-        self.assertEqual(program._tracer_tgid, 789)
+        # The tracer is resumed through the pidfd it is held by, never by pid,
+        # and the same held tracer is frozen again.
+        program._tracer.send.assert_called_once_with(dh.signal.SIGCONT)
+        kill.assert_not_called()
+        freeze.assert_called_once_with(456, program._tracer)
+        self.assertEqual(program._tracer_tgid, 123)
 
     def test_advance_rejects_command_other_than_preloaded_disk(self):
         program = dh.HermitGuestProgram(SimpleNamespace(advance_command="expected"))
@@ -86,6 +85,7 @@ class CommandDiskProtocolTest(unittest.TestCase):
         program._qmp = FakeQmp()
         program._qemu_pid = 456
         program._tracer_tgid = 123
+        program._tracer = mock.Mock(tgid=123)
 
         with self.assertRaisesRegex(ValueError, "preloaded command disk"):
             program.advance("different", b"done")
@@ -143,28 +143,27 @@ class QmpSocketPathTest(unittest.TestCase):
         # Relocated sockets go under QEMU_SOCKET_DIR. Point it at a private
         # directory, outside host /tmp as make_socket_path requires, so the
         # test leaves nothing in the shared /var/tmp/hermit-qmp-<uid>.
-        socket_dir = tempfile.TemporaryDirectory(
-            dir="/var/tmp", prefix="drgn-qmp-test-"
-        )
+        socket_dir = tempfile.TemporaryDirectory(dir="/var/tmp", prefix="drgn-qmp-test-")
         self.addCleanup(socket_dir.cleanup)
         self.socket_dir = Path(socket_dir.name)
-        environment = mock.patch.dict(
-            os.environ, {"QEMU_SOCKET_DIR": str(self.socket_dir)}
-        )
+        environment = mock.patch.dict(os.environ, {"QEMU_SOCKET_DIR": str(self.socket_dir)})
         environment.start()
         self.addCleanup(environment.stop)
 
     def _config(self, artifact_dir: Path) -> dh.GuestConfig:
         inputs = self.work / "inputs"
         inputs.mkdir(exist_ok=True)
-        for name in (
-            "hermit",
-            "qemu",
-            "bzImage",
-            "initramfs.cpio.gz",
-            "hermit-boot.qcow2",
-        ):
+        for name in ("hermit", "qemu", "bzImage", "initramfs.cpio.gz", "hermit-boot.qcow2"):
             (inputs / name).write_bytes(b"")
+        # The record demo 5 writes, so that start() restores the snapshot: a
+        # stand-in qemu-assets.sh in the checkout names the initramfs version.
+        script = self.work / "demos/lib/qemu-assets.sh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("INITRAMFS_VERSION=9\n")
+        snapshot = inputs / "hermit-boot.qcow2"
+        dc.write_boot_snapshot_record(
+            snapshot, dc.hash_file(snapshot), dc.initramfs_producer(self.work, inputs)
+        )
         return dh.GuestConfig(
             root=self.work,
             hermit=inputs / "hermit",
@@ -172,10 +171,11 @@ class QmpSocketPathTest(unittest.TestCase):
             kernel=inputs / "bzImage",
             initrd=inputs / "initramfs.cpio.gz",
             vmlinux=inputs / "vmlinux",
-            snapshot_disk=inputs / "hermit-boot.qcow2",
+            snapshot_disk=snapshot,
             snapshot_name="hermit-boot",
             advance_command="echo deterministic",
             artifact_dir=artifact_dir,
+            assets=inputs,
         )
 
     def _start_until_qmp_connect(self, artifact_dir: Path):
@@ -184,11 +184,12 @@ class QmpSocketPathTest(unittest.TestCase):
         program = dh.HermitGuestProgram(config)
         popen = mock.Mock(return_value=mock.Mock(pid=4242))
         connect = mock.Mock(side_effect=_StopAtQmpConnect)
-        with (
-            mock.patch.object(dh, "ensure_vmlinux", return_value=config.vmlinux),
-            mock.patch.object(dh.subprocess, "Popen", popen),
-            mock.patch.object(dh.os, "getpgid", return_value=4242),
-            mock.patch.object(dh.QmpClient, "connect", connect),
+        with mock.patch.object(
+            dh, "ensure_vmlinux", return_value=config.vmlinux
+        ), mock.patch.object(dh.subprocess, "Popen", popen), mock.patch.object(
+            dh.os, "getpgid", return_value=4242
+        ), mock.patch.object(
+            dh.QmpClient, "connect", connect
         ):
             with self.assertRaises(_StopAtQmpConnect):
                 program.start()
@@ -207,9 +208,7 @@ class QmpSocketPathTest(unittest.TestCase):
 
     def test_a_deep_checkout_hands_qemu_a_socket_path_that_fits(self):
         artifact_dir = self.work / ("a" * 100) / "artifacts"
-        program, qemu_socket, connect_socket = self._start_until_qmp_connect(
-            artifact_dir
-        )
+        program, qemu_socket, connect_socket = self._start_until_qmp_connect(artifact_dir)
 
         default = program.run_dir / "qmp.sock"
         default_bytes = len(str(default).encode())
@@ -245,16 +244,12 @@ class QmpSocketPathTest(unittest.TestCase):
 
     def test_a_short_checkout_keeps_the_socket_in_the_run_directory(self):
         artifact_dir = self.work / "artifacts"
-        program, qemu_socket, connect_socket = self._start_until_qmp_connect(
-            artifact_dir
-        )
+        program, qemu_socket, connect_socket = self._start_until_qmp_connect(artifact_dir)
 
         self.assertEqual(qemu_socket, program.run_dir / "qmp.sock")
         self.assertLessEqual(len(str(qemu_socket).encode()), dc.AF_UNIX_PATH_MAX)
         self.assertEqual(connect_socket, qemu_socket)
-        self.assertFalse(
-            (self.socket_dir / "hermit-qmp-{}".format(os.getuid())).exists()
-        )
+        self.assertFalse((self.socket_dir / "hermit-qmp-{}".format(os.getuid())).exists())
 
     def test_close_removes_only_a_relocated_socket(self):
         run_dir = self.work / "run.example"
@@ -346,9 +341,14 @@ class TaskEvolutionResultTest(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(self.module, "_run_once", return_value=passes)
             )
+            # The boot snapshot check is tested in test_boot_snapshot_record.
+            ensure = stack.enter_context(
+                mock.patch.object(self.module, "_ensure_boot_snapshot")
+            )
             stack.enter_context(mock.patch.dict(os.environ, environment))
             stack.enter_context(contextlib.redirect_stdout(output))
             self.assertEqual(self.module.main(), 0)
+        ensure.assert_called_once_with()
         lines = output.getvalue().splitlines()
         results = [line for line in lines if line.startswith("RESULT: ")]
         self.assertEqual(len(results), 1, output.getvalue())
@@ -377,6 +377,75 @@ class TaskEvolutionResultTest(unittest.TestCase):
     def test_the_readme_shows_the_result_line_the_script_prints(self):
         readme = (DEMO07_DIR / "README.md").read_text()
         self.assertIn("\n" + self._result_line() + "\n", readme)
+
+
+class TaskListDisplayTest(unittest.TestCase):
+    """Demo 7 prints only the first rows of each task list.
+
+    The comparison uses every row, so a row that is not printed can be in the
+    task-list diff. The line that counts the rows left out must not call them
+    unchanged.
+    """
+
+    def setUp(self):
+        self.module = _load_task_evolution()
+
+    def _printed(self, label, rows, limit):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.module._print_tasks(label, rows, limit)
+        return output.getvalue().splitlines()
+
+    def test_rows_left_out_are_counted_but_not_called_unchanged(self):
+        before = [(0, "swapper/0"), (1, "init"), (95, "sleep")]
+        after = [(0, "swapper/0"), (1, "sh"), (101, "sleep"), (102, "sleep")]
+        removed, added = self.module._task_diff(before, after)
+        # Every row after the first, which is the only one shown, is in the
+        # difference.
+        self.assertEqual(sorted(removed + added), sorted(before[1:] + after[1:]))
+        for label, rows, omitted in (("before", before, 2), ("after", after, 3)):
+            with self.subTest(label=label):
+                lines = self._printed(label, rows, 1)
+                self.assertEqual(
+                    lines,
+                    [
+                        "{} tasks ({} total; first 1 shown, pid comm):".format(
+                            label, len(rows)
+                        ),
+                        "      0 swapper/0",
+                        "  ... {} rows omitted from display".format(omitted),
+                    ],
+                )
+                self.assertNotIn("unchanged", "\n".join(lines))
+
+    def test_a_list_within_the_limit_has_no_omission_line(self):
+        # Positive control: nothing is left out, so nothing is counted.
+        rows = [(0, "swapper/0"), (1, "init")]
+        self.assertEqual(
+            self._printed("before", rows, 16),
+            [
+                "before tasks (2 total; first 2 shown, pid comm):",
+                "      0 swapper/0",
+                "      1 init",
+            ],
+        )
+
+    def test_the_readme_shows_the_omission_lines_the_script_prints(self):
+        readme = (DEMO07_DIR / "README.md").read_text()
+        headers = re.findall(
+            r"^(before|after) tasks \((\d+) total; first (\d+) shown, pid comm\):$",
+            readme,
+            re.MULTILINE,
+        )
+        self.assertEqual([label for label, _, _ in headers], ["before", "after"])
+        expected = []
+        for label, total, shown in headers:
+            rows = [(pid, "task") for pid in range(int(total))]
+            expected.append(self._printed(label, rows, int(shown))[-1])
+        in_readme = re.findall(
+            r"^  \.\.\. .*omitted from display$", readme, re.MULTILINE
+        )
+        self.assertEqual(in_readme, expected)
 
 
 if __name__ == "__main__":

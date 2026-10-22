@@ -15,6 +15,8 @@ remain ignored because they can be regenerated.
   on first use. `components = ["clippy", "rustfmt"]` is part of that pin
   because rustup does not add them to a freshly installed dated toolchain
   otherwise.
+- `flock` (util-linux). The first Reindeer invocation on a cache builds
+  under a lock.
 - `rust-script` 0.36.0. Dependency regeneration runs one checked-in
   rust-script postprocessor that materializes Reverie DBT's native source tree;
   install the pinned version with
@@ -55,6 +57,7 @@ stamped build embeds one:
 
 ```sh
 HERMIT_STAMP_GIT_SHA=1 cargo build --release --workspace --features hermit/third-party-backends
+target/release/stage-detcore-liteinst --git target
 ```
 
 Then invoke the guarded wrapper with explicit absolute paths:
@@ -379,10 +382,104 @@ publisher and verifier inventory every entry of a runtime closure, including
 directories and special files, and refuse any special file in a complete
 bundle, which its regular-file manifest could not bind.
 
+### Buck as the E2E runner
+
+A second, independent opt-in changes who runs the E2E cells, not which binary
+they test:
+
+```sh
+./scripts/validate.rs full --e2e-runner buck-hybrid \
+  --buck2 ~/.config/hermit/buck2.dotslash
+```
+
+`--e2e-runner` takes `cargo` (the default), `buck-local` (every cell runs on
+this host) or `buck-hybrid` (cells routed to remote execution run there, the
+rest locally). A Buck runner is accepted only for the complete `full` level,
+never with `--only`, `--selected` or `--buck-release`, and only with `--buck2`
+naming an absolute, executable, non-symlink file. That file is the host's own
+Buck2 launcher. Remote execution needs an internal Buck2 build, whose DotSlash
+descriptor is **never committed** to this repository: keep it outside the
+checkout (for example `~/.config/hermit/buck2.dotslash`) and pass its path.
+Nothing is inferred from ambient environment, and nothing falls back to Cargo.
+
+The plan is the committed `full` plan with the `full-buck-e2e` label swapped
+in (`buck_e2e_selection` in `ci/manifest-plan/src/validation_dag.rs`): the 16
+Cargo E2E bucket nodes, the compatibility scorecard and the five nodes that
+only fed them leave the plan, and `e2e.buck_stage`, `e2e.buck_cells`, one
+`<bucket>_buck` import twin per bucket and `full-scorecard.compatibility_buck`
+take their place. `e2e.buck_stage` (`ci/buck-e2e/validate-node --stage-only`)
+builds the inputs Buck does not build yet with Cargo
+(`ci/buck-e2e/stage --from-cargo`). It depends only on `pre.reverie_pin`, so it
+runs beside `build.rust_scripts` and `setup.manifest_plan` instead of after
+them; each uses its own Cargo profile directory. `e2e.buck_cells`
+(`ci/buck-e2e/validate-node --cells-only`) waits for it, refuses before any
+step unless `ci/buck-e2e/staged/SOURCE_SHA` names the checkout's `HEAD`,
+regenerates the third-party rules, stages the remote-execution inputs for
+`buck-hybrid`, and runs every cell with `-c hermit_e2e.hermit=staged`. Run
+without an argument, `ci/buck-e2e/validate-node` does both in one process, as
+before. Each twin then judges its bucket's rows with the same
+`test-harness run` verdict as the Cargo bucket, reading them through
+`E2E_IMPORT_RESULTS`.
+
+One ordering difference follows. In the Cargo plan, eight nodes run before the
+E2E buckets, directly or through `compatprep.fixtures`: `check.dbt_runtime_abi`,
+`doc.doctests`, `doc.rustdoc`, `lint.clippy`, `test.detcore_unit`,
+`test.hermit_unit`, `test.regular_crates` and `test.rr_suite_contract`. In the
+Buck plan nothing waits for them. They still run, and a failure still fails the
+validation, but the Buck cells no longer wait on them, so a failure among them
+no longer stops the cells early.
+
+The cells therefore test the Cargo-built validate-profile
+`target/validate/hermit`: `ci/buck-e2e/stage --from-cargo` builds it on the
+host in the checkout's `target/stage-hermit/`, beside its other Cargo builds,
+and copies the binary to `target/validate/hermit`. It has the same features,
+debug assertions and overflow checks as a Cargo-runner build; it differs only
+in the DynamoRIO build paths `reverie-dbt` records as a fallback, since Hermit
+finds that runtime through `install_pkg`. After its final Cargo invocation the
+stager runs `target/validate/stage-detcore-liteinst --source-copy target` against
+the explicit copied-source authority; supplied `--bundle` resources must already
+carry the same ordinary-runtime qualification receipt. A bare Cargo installation
+is incomplete until `target/release/stage-detcore-liteinst --git target` succeeds.
+The shadow command verifies that finalized caller installation before its initial
+resource snapshot; it does not rebuild or substitute a runtime. The ledger row records `release_builder: cargo`,
+the Cargo `e2e_payload` identity unchanged, and `e2e_runner` (`cargo`,
+`buck-local` or `buck-hybrid`). A Buck-runner request is never answered from the
+tree cache, and a Buck-runner row never answers a cargo request: the cache reads
+`e2e_runner` as well as the payload. The host prerequisites below apply, and
+`HERMIT_GIT_DEP_MIRRORS` must be set in the validation's environment when the
+proxy refuses GitHub to Reindeer.
+
+## Host prerequisites for Buck validation
+
+The Buck E2E flow (`shim/modes/stage-re-inputs`, `ci/buck-e2e/stage`, then
+`ci/buck-e2e/run`) copies some host libraries and tools into its inputs rather
+than building them. On CentOS Stream 9 or Fedora:
+
+```sh
+sudo dnf install -y libunwind-devel xz-devel cmake patchelf binutils podman
+```
+
+| Package | Needed by | For |
+|---|---|---|
+| `libunwind-devel` | `stage-re-inputs`, `stage` | the libunwind link inputs remote actions link against, and the runtime closure shipped beside the staged `hermit` |
+| `xz-devel` | `stage-re-inputs` | `liblzma`, which `//hermit-cli:hermit-release` links on remote execution |
+| `cmake` | `stage` | the host Cargo build of `reverie-dbt`, which builds DynamoRIO (remote actions use the pinned cmake wheel `stage-re-inputs` stages instead) |
+| `patchelf` | `stage` | the `DT_RPATH` through which the staged `hermit` finds the libunwind closure beside it |
+| `binutils` | `stage` | `strip` for the staged harness, and `readelf`, with which `ci/publish-hermit-e2e-artifact.sh` checks the staged `hermit`'s runtime closure |
+| `podman` | `ci/buck-e2e/cell.sh` | privileged-lane, pinned-root-only and local DBT cells, which run inside `ci/hermetic/run-in-pinned-root.sh` exactly as the Cargo flow runs them |
+
+Those cells also need the pinned root image: build it once with
+`ci/hermetic/build-image.sh`. Without it they fail with `pinned-root image
+unavailable`; they never fall back to running on the host. A missing package
+stops `stage-re-inputs` or `stage` before anything is built, with a message
+naming the package; nothing downloads a substitute. `stage-re-inputs`
+downloads its pinned cmake wheel from `files.pythonhosted.org`, so on a Meta
+host run it under `with-proxy`.
+
 ## On a Meta host
 
-A Meta devserver needs five things the steps above do not mention. All five are
-host facts rather than repository defects; a machine with direct internet
+A Meta devserver needs the following, which the steps above do not mention. All
+are host facts rather than repository defects; a machine with direct internet
 access and no internal `dotslash` needs none of them.
 
 **Every network-touching command needs `with-proxy`** — the clone, the
@@ -430,6 +527,34 @@ CARGO_HTTP_PROXY=http://fwdproxy:8080 \
   ./bootstrap/regenerate-rust-deps
 ```
 
+**A proxy that refuses `github.com` to the build needs local git mirrors.**
+`Cargo.lock` locks some crates to git commits (`rust-shed`, `liteinst2` and
+`reverie` today), and Reindeer's Cargo fetches them from GitHub even when the
+host's `~/.cargo/git` already holds them. If the proxy refuses that fetch
+(`CONNECT tunnel failed, response 403`), mirror each source with whatever
+route does reach GitHub, then point `HERMIT_GIT_DEP_MIRRORS` at the directory:
+
+```sh
+mirrors=~/.cache/hermit-git-mirrors
+mkdir -p "$mirrors"
+for url in $(sed -n 's/^source = "git+\([^?#"]*\).*/\1/p' Cargo.lock | sort -u); do
+  name=${url##*/}
+  with-proxy git clone --mirror "$url" "$mirrors/${name%.git}.git"
+done
+HERMIT_GIT_DEP_MIRRORS=$mirrors \
+CARGO_HTTP_CAINFO=/etc/pki/tls/certs/ca-bundle.crt \
+CARGO_HTTP_PROXY=http://fwdproxy:8080 \
+  ./bootstrap/regenerate-rust-deps
+```
+
+Each mirror is named after its URL's last component without `.git`, plus
+`.git`. Once the variable is set, every git source must come from it:
+`regenerate-rust-deps` refuses a missing mirror, or one that lacks a commit
+`Cargo.lock` pins, before Reindeer runs, and prints the `git clone` or `git
+fetch` that fixes it. Because each source is pinned to a commit, a mirror
+changes only where the objects come from, never what is built. After a
+`Cargo.lock` change, `git -C <mirror> fetch` brings a mirror up to date.
+
 ## Pinned versions
 
 The wrappers use immutable versions rather than live branch tips:
@@ -455,7 +580,19 @@ project root, so the Hermit pin governs the whole build.
 The first Reindeer invocation downloads the pinned source revision, installs the
 pinned Rust toolchain if needed, and compiles Reindeer into the user cache
 (about 1m25s cold). Set `HERMIT_BUCK2_TOOL_CACHE` to place that cache
-elsewhere. DotSlash downloads and verifies the platform-specific Buck2 release
+elsewhere. Each build is named by the tool revision, the toolchain and the
+build recipe in `bootstrap/run-pinned-tool`: its source checkout, target
+directory and lock all carry that name. Concurrent first invocations of one
+build compile it once under the lock, and a checkout left by an interrupted
+build is started again. The build ignores the caller's `RUSTFLAGS`,
+`RUSTC_WRAPPER` and `CARGO_PROFILE_*` settings, which are not part of the name.
+`HERMIT_BUCK2_SHARED_TOOL_CACHE` names a cache shared with other checkouts,
+such as one per validation host, and takes precedence over
+`HERMIT_BUCK2_TOOL_CACHE`; older checkouts, which lack the lock, ignore it. A
+shared cache trusts every checkout that writes to it: a hit runs the cached
+binary without checking it. Nothing is evicted; each build takes about 1 GB.
+
+DotSlash downloads and verifies the platform-specific Buck2 release
 binary; `DOTSLASH_CACHE` relocates its cache.
 
 `regenerate-rust-deps` starts without generated dependency output, vendors the
@@ -466,6 +603,48 @@ Reverie consume this graph. The repository-root `.gitignore` excludes generated
 paths. Those patterns must not move into `shim/.gitignore`: pinned Reindeer
 reads ignore files through the shim cell root and would otherwise generate
 empty crates.
+
+What Reindeer generates (the vendored crates, its BUCK before the
+postprocessing, and the vendored-sources `.cargo/config.toml`) is kept in a
+cache entry named by everything Reindeer reads. `bootstrap/rust-deps-cache-key.rs`
+computes the name and lists what it covers: `Cargo.lock` (which pins git
+dependencies by commit), every `Cargo.toml` Git lists and each workspace member
+manifest `cargo metadata` names, ignored or not, the toolchain file and cargo
+version, the compiler Reindeer queries (`RUSTC`, else `rustc`) with its
+`-vV` output and its `--print=cfg` output for each platform target in
+`reindeer.toml`, every file under `shim/third-party/rust` whether Git ignores it
+or not and following links (apart from the generated `vendor`, `BUCK` and
+`.cargo` and Cargo's `registry`, `git`, `target` and `.package-cache`), the
+ignore files on the way to them, and the Reindeer pin and scripts. It reads
+`reindeer.toml` and the `cargo metadata` output with TOML and JSON parsers, so
+quoting and escapes do not hide a setting or a path from it. A `reindeer.toml`
+that makes Reindeer read something the key does not cover (`fixups_dir`,
+`cargo.cargo`, `cargo.rustc`, `vendor.gitignore_checksum_exclude`, or a key the
+helper does not know) or that defines no platform table (Reindeer then uses
+built-in platforms) is not cached: the run warns and vendors. So is a checkout
+whose key cannot be computed, because a command fails, an input cannot be read
+or something does not parse: the run warns, vendors and stores nothing.
+
+A checkout whose inputs match an earlier run's restores the entry instead of
+vendoring, about 2.5 s instead of 26 s with local mirrors (the key itself takes
+about 0.3 s), and then runs the postprocessing and its comparison as a
+generated checkout does. The two-run comparison of Reindeer's own output ran
+when the entry was generated. Output is stored only when `Cargo.lock` is
+unchanged after Reindeer ran and the key computed again then matches the one
+computed before, so a run that rewrites the lock or whose inputs change while
+it runs stores nothing, and so does one whose inputs can no longer be read. An
+entry is built in a staging directory, published and evicted by renaming it in
+and out of place under the cache lock, and a restore requires its raw BUCK, so
+an interrupted publish or eviction leaves nothing a restore accepts. A publish
+holds a lock on its staging directory until it is renamed in, and a later
+publish removes only staging whose lock nobody holds. The cache
+lives at `rust-deps/` under the Buck2 tool cache root above, so
+`HERMIT_BUCK2_SHARED_TOOL_CACHE` shares it across a validation host's
+checkouts; it trusts its writers as that cache does. Each entry takes about
+400 MB and the newest `HERMIT_RUST_DEPS_CACHE_KEEP` (default 3) by last use are
+kept. `HERMIT_RUST_DEPS_CACHE=off` vendors every time; the release build sets
+it. Cargo's download caches under `shim/third-party/rust/.cargo` are removed
+after vendoring, so a generated and a restored checkout hold the same files.
 
 ## What a reproduction should produce
 

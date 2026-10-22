@@ -17,10 +17,13 @@
 //!
 //! This is an ordinary `cargo test` target on purpose. An earlier version of
 //! this regression test lived in `detcore/tests/lit/`, which nothing in this
-//! repository executes: there is no lit runner, no `lit.cfg`, and the handful
-//! of `detcore/tests/lit/` fixtures that do run are the ones enumerated by path
-//! in `hermit-cli/tests/hermit_modes.rs`. A test that compiles but never runs
-//! is worse than no test, so the fixture moved here.
+//! repository executed when it moved: there was no lit runner and no
+//! `lit.cfg`. A test that compiles but never runs is worse than no test, so
+//! the fixture moved here. (`hermit-cli/tests/lit.rs` now runs those
+//! fixtures.)
+
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
 
 use std::fs;
 use std::path::Path;
@@ -35,7 +38,8 @@ fn build_fixture() -> PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sched-setattr-abi");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sched-setattr-abi-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let guest = build_root.join("sched_setattr_abi");
 
@@ -61,9 +65,7 @@ fn build_fixture() -> PathBuf {
 /// Run `command`, require a clean exit, and return its stdout.
 fn transcript(mut command: Command, label: &str) -> String {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} exited nonzero: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

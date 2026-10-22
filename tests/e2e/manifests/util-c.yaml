@@ -21,16 +21,27 @@ test:
       verify:
         ci:
           ptrace: true
+          kvm: true
+          dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
+          - kvm
+          - dbt
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         expected_guest_exit:
           code: 3
           reason: Detcore refuses guest ptrace with a deterministic EPERM (the privileged-observation boundary), so PTRACE_TRACEME fails in the child and this host PMU diagnostic exits with its dedicated refused-ptrace status 3 (EXIT_PTRACE_REFUSED), distinct from the EXIT_FAILURE that every other failure path returns.
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -45,6 +56,7 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
         backends_enabled: []
@@ -54,6 +66,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
         backends_enabled: []
@@ -63,3 +76,4 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap

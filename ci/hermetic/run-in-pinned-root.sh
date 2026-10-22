@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Run a command inside the nix-pinned validate root. The canonical host-side
 # validate plan uses this wrapper for each build and test DAG node.
 #
@@ -78,7 +72,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# $1 is "admission" for --check-image and "late" before a node's own run.
 check_pinned_image() {
+    local caller=$1
     if [[ -z "$digest" ]]; then
         [[ -f "$DIGEST_FILE" ]] || {
             echo "run-in-pinned-root: no --digest and no $DIGEST_FILE." >&2
@@ -109,6 +105,15 @@ check_pinned_image() {
         echo "run-in-pinned-root: image $digest is not present locally (Podman status 1)." >&2
         echo "  This path does not fall back to a tag or to the host." >&2
         echo "  Rebuild it from the committed lock: ci/hermetic/build-image.sh" >&2
+    elif [[ "$caller" == late && ( "$status" == 124 || "$status" == 137 ) ]]; then
+        # A timed-out query says nothing about the image: on 2026-10-08, with
+        # the host at load average 780, a query that normally takes 0.05 s
+        # missed the bound for 25 nodes, which then failed as if their tests
+        # had. Before a node's run, the run itself is the exact check: it uses
+        # --pull=never, so a missing image still fails there and nothing is
+        # fetched. Admission (--check-image) keeps refusing on a timeout.
+        echo "run-in-pinned-root: inspection of $digest timed out (probe status $status; 10s query bound); the run below uses --pull=never and fails if the image is absent." >&2
+        return 0
     else
         echo "run-in-pinned-root: inspection unavailable for $digest (probe status $status; 10s query bound, 2s forced-stop grace)." >&2
     fi
@@ -121,7 +126,7 @@ if "$check_image"; then
         exit 2
     }
     status=0
-    check_pinned_image || status=$?
+    check_pinned_image admission || status=$?
     exit "$status"
 fi
 
@@ -143,7 +148,7 @@ fi
 # silently produce a run that is not hermetic while still reporting success --
 # which is worse than not running at all, because the receipt would claim a
 # pinned root it did not use.
-check_pinned_image || exit $?
+check_pinned_image late || exit $?
 
 pinned_home="$out/home"
 # `agent-utils/rs/bin/*` deliberately keeps its Cargo target, provenance lock,
@@ -246,6 +251,34 @@ if [[ -f "$src/.git" ]]; then
     # A submodule root's core.worktree points back to its host parent. Override
     # only private config copies, never shared metadata or a global Git env var:
     # nested git -C commands must continue to discover their own repositories.
+    #
+    # The common config of a linked worktree is the shared checkout's config,
+    # which every agent on the host rewrites by lock-and-rename. A rename over a
+    # bind-mount destination detaches that mount in every mount namespace, so a
+    # copy bound over it vanishes mid-run: the container's mount table changes
+    # and its Git silently reads the host file again
+    # (https://github.com/rrnewton/hermit/issues/3920). A linked worktree needs
+    # that copy only when the common config sets core.worktree and
+    # extensions.worktreeConfig applies it to every worktree; without the
+    # extension Git applies it to the main worktree alone. Otherwise the common
+    # config is left as it is and nothing is bound over it.
+    common_override=true
+    if [[ $root_git_dir != "$git_common_dir" ]]; then
+        common_worktree_status=0
+        src_git config --includes --file "$git_common_dir/config" --get core.worktree \
+            >/dev/null || common_worktree_status=$?
+        worktree_config_status=0
+        worktree_config=$(src_git config --includes --file "$git_common_dir/config" \
+            --type=bool --get extensions.worktreeConfig) || worktree_config_status=$?
+        # --includes reads the config as Git does, following include.path.
+        # Any status other than found (0) or absent (1), such as a malformed
+        # boolean (exit 128, which also stops every other Git command in the
+        # repository), keeps the private copy, as before this check.
+        case "$common_worktree_status:$worktree_config_status" in
+            1:0 | 1:1 | 0:1) common_override=false ;;
+            0:0) [[ $worktree_config == true ]] || common_override=false ;;
+        esac
+    fi
     root_config_dir=$(mktemp -d "$out/git-root-configs.XXXXXX")
     for config_name in config config.worktree; do
         config_source="$git_common_dir/config"
@@ -253,6 +286,8 @@ if [[ -f "$src/.git" ]]; then
         if [[ $config_name == config.worktree ]]; then
             config_source="$root_git_dir/config.worktree"
             config_destination="$guest_root_git_dir/config.worktree"
+        elif [[ $common_override == false ]]; then
+            continue
         fi
         [[ -f $config_source ]] || continue
         config_copy="$root_config_dir/$config_name"
@@ -443,10 +478,81 @@ PY
     env_args+=(-e "HERMIT_PROC_LOCKS_LEASE_ID=$proc_locks_identity")
 fi
 
+# No optional Git locks. `git status` takes .git/index.lock to refresh the index
+# opportunistically, even when it then writes nothing, so a read-only status
+# creates and deletes a file in the repository it reads. Pinned-root nodes run
+# side by side over the same Cargo git checkouts: the LiteInst tests resolve
+# their compiled Reverie sources with `git status` (reverie/scripts/
+# m1_artifact.rs) while source_copy::gitless_standalone_compiler_sources
+# `cp -a`s that same checkout, and cp failed with "cannot stat
+# '.git/index.lock'" (71e738ab's validation, 2026-10-15). Reproduced: 10 of 40
+# copies failed beside a `git status` loop, 0 of 40 with GIT_OPTIONAL_LOCKS=0.
+# ci/verify-submodules.sh already reads repositories this way.
+env_args+=(-e GIT_OPTIONAL_LOCKS=0)
+
+# Cargo decides a path crate is fresh by the checksums its dep-info records
+# (-Zchecksum-freshness), not by mtimes. Every validation builds in a fresh
+# checkout, whose files are all newer than the warm target's dep-info
+# (ci-hub/validate/warm_target.py), so by mtime every workspace crate rebuilt
+# on every run, changed or not. Set for EVERY pinned-root container, because
+# they share /src/target: a build without it after one with it marks each
+# unit dirty ("the prior compilation used checksum freshness and this one does
+# not") and rebuilds everything. A seed built without it lacks the checksums,
+# so its first run rebuilds in full; that is the fallback.
+# Measured 2026-10-16 (host, validate profile, the
+# build.workspace_compile_in_pinned_root cargo commands, 32 jobs): a warm build
+# reproduced every rlib, shared object and executable of a cold build byte for
+# byte (1,253 of 1,258 identical) for a pin bump (10a7b59d), a Detcore change
+# (6b9c57af) and a CI-only change (548b2db5). The 5 others differ between two
+# cold builds too: libmimalloc_sys's C objects and detcore-sabre, which this
+# node cleans and rebuilds every run. The CI-only build took 207 s warm
+# against 282 s cold.
+env_args+=(-e CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true)
+
 # `--network=none` is the point, not a precaution: if the run can reach the
 # network it can pick up something the lock does not describe, and the rebuild
 # guarantee is void. CARGO_NET_OFFLINE in the image makes that fail loudly.
+# --pull=never: the exact digest must already be in the local store; the run
+# never fetches it, so a missing image fails here rather than being pulled.
+
+# A container runtime can widen the task affinity even with cgroups disabled.
+# Restore the actual caller's set inside the container before executing the
+# command; util-linux/taskset is already in the pinned image. This preserves
+# placement as well as the outer cgroup limits. Calibration still independently
+# compares the resulting live affinity with its earlier host observation.
+#
+# Read with bash builtins from /proc/self/status (the kernel's
+# Cpus_allowed_list, ascending ranges such as 0-3,8) and expanded to the
+# explicit ascending list sched_getaffinity(2) gives. Not by starting python3:
+# on a loaded host that interpreter start took 16.8 s, every second of it on a
+# node's critical path, and validate_pinned_image's forced-stop test failed at
+# 20.2 s against its 20 s bound when five validations ran at once (f9d81a69).
+caller_affinity=
+while IFS=$'\t' read -r status_key status_value; do
+    if [[ $status_key == Cpus_allowed_list: ]]; then
+        IFS=, read -r -a affinity_ranges <<< "$status_value"
+        for affinity_range in "${affinity_ranges[@]}"; do
+            if [[ $affinity_range =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                for ((cpu = BASH_REMATCH[1]; cpu <= BASH_REMATCH[2]; cpu++)); do
+                    caller_affinity+=${caller_affinity:+,}$cpu
+                done
+            elif [[ $affinity_range =~ ^[0-9]+$ ]]; then
+                caller_affinity+=${caller_affinity:+,}$affinity_range
+            else
+                caller_affinity=
+                break
+            fi
+        done
+        break
+    fi
+done < /proc/self/status
+[[ $caller_affinity =~ ^[0-9]+(,[0-9]+)*$ ]] || {
+    echo "run-in-pinned-root: cannot read a nonempty caller CPU affinity" >&2
+    exit 2
+}
+
 exec podman run --rm \
+    --pull=never \
     --cgroups=disabled \
     --privileged \
     --hostname=hermetic-container.local \
@@ -470,4 +576,5 @@ exec podman run --rm \
     -e CARGO_TARGET_DIR=/src/target \
     -w /src \
     "$digest" \
+    /bin/taskset --cpu-list "$caller_affinity" \
     "$@"

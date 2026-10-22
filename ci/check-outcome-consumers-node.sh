@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # CI node entrypoint for check.check_outcome_consumers.
 #
 # WHY THIS WRAPPER EXISTS. The node's command used to be the two checkers run

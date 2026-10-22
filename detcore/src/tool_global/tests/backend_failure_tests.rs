@@ -1,7 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
- *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
@@ -137,7 +136,7 @@ async fn selected_cleanup(daemon_first: bool) {
             },
         );
         sched.priorities.insert(waiter, DEFAULT_PRIORITY);
-        sched.sleep_futex_waiter(&waiter, futex, None, u32::MAX);
+        sched.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
         waiter_response = sched.next_turns[&waiter].resp.clone();
     }
     let (chosen, request, response) = state.sched.lock().unwrap().select_test_turn().unwrap();
@@ -371,6 +370,8 @@ async fn cancelled_constructed_child(register: bool, terminal: bool) {
         thread: parent_thread,
         requests: Mutex::new(Vec::new()),
         post_exec: false,
+        ppid: None,
+        private_memory: None,
     };
     if register {
         let mut registration = std::pin::pin!(tool.register_external_child(
@@ -535,10 +536,12 @@ async fn ordinary_unknown_started_owner_is_not_acknowledged_as_unstarted() {
 async fn dbt_missing_physical_id_start_preserves_tombstone_deregistration_accounting() {
     let config = Config {
         sequentialize_threads: true,
-        cancel_killed_thread_rpcs: true,
-        backend_requires_thread_directed_process_signals: true,
         ..Config::default()
-    };
+    }
+    .with_backend(|backend| {
+        backend.needs_killed_thread_rpc_cancellation = true;
+        backend.requires_thread_directed_process_signals = true;
+    });
     let state = GlobalState::initialize(&config, false);
     let tid = DetTid::from_raw(19);
     let process = DetPid::from_raw(17);
@@ -723,6 +726,8 @@ async fn thread_start_marker_is_set_before_the_first_registration_wait() {
         thread,
         requests: Mutex::new(Vec::new()),
         post_exec: false,
+        ppid: None,
+        private_memory: None,
     };
     // This test Guest's pid accessor expects the normal process identity.
     guest.thread.detpid = Some(DetPid::from_raw(17));

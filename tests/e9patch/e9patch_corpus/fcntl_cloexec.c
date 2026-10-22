@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /* fd-hygiene: F_GETFD on stdout and on a freshly opened descriptor both report
  * no close-on-exec bit (flags 0). Regresses that e9patch preprocessing does
  * not set stray FD_CLOEXEC on inherited or guest-opened descriptors. */

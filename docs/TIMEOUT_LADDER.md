@@ -36,8 +36,8 @@ agreeing with each other.
 | container finalize budget | **the teardown after a run has published its result**: the container child's own exit, and reaping what is left in its namespace | `FINALIZE_BUDGET` in `hermit-cli/src/bin/hermit/owned_container.rs`: 20s, a margin of 13x over the largest measured teardown (1.52s on a saturated 316-CPU host; the Buck-parallel tail that exceeded the old 2s was not measured); `HERMIT_FINALIZE_BUDGET_MS` overrides it | the parent cancels the child (SIGKILL) and waits up to the same budget again, so a child that never exits costs up to **2 x budget** (40s) | exit 125, "container child published its result but did not exit within the ... finalize budget" |
 | nextest per-test CPU limit | one cargo test process and its descendants | 22s base, scaled by the machine CPU multiplier | owned attempt cgroup: `SIGTERM`, 2s grace, then `cgroup.kill`; retain typed `cpu_timeout` | nextest fails the named test; CPU report identifies the inner limit |
 | nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 57s base, scaled by the machine wall multiplier | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
-| manifest cell CPU limit | all process-group CPU consumed by a cell's executions, aggregated across attempts or seeds | `cpu_timeout_seconds`: 22s default plus measured cell overrides, scaled by the machine CPU multiplier | the harness stops the process group and retains `error_kind=cpu-timeout` | typed cell `ERROR` |
-| manifest cell wall limit | fixture preparation and, separately, the complete execution phase | `timeout_seconds`: 57s default plus measured cell overrides, scaled by the machine wall multiplier | the harness stops the process group and retains `error_kind=wall-timeout` | typed cell `ERROR` |
+| manifest cell CPU limit | all CPU consumed by a cell's executions, aggregated across attempts or seeds; each execution is measured live in a cgroup of its own (see below) | `cpu_timeout_seconds`: 22s default plus measured cell overrides, scaled by the machine CPU multiplier | the harness stops the process group, kills what is left in the execution's cgroup, and retains `error_kind=cpu-timeout` | typed cell `ERROR` |
+| manifest cell wall limit | fixture preparation and, separately, the complete execution phase | `timeout_seconds`: 57s default plus measured cell overrides, scaled by the machine wall multiplier | the harness stops the process group, and the execution's cgroup when it has one, and retains `error_kind=wall-timeout` | typed cell `ERROR` |
 | dagrun step wall/CPU limits | **one DAG node**, i.e. a whole batch of cells or tests | explicit `timeout` and `cpu_timeout` on each node in the single `ci/dag/validate.json`, selected by profile labels | dagrun stops the step | node failure |
 | validate run budget | the whole outer validate graph | `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS` or `--run-timeout` | dagrun stops admitting work and records unfinished nodes | incomplete validation, with named unfinished nodes |
 | validate systemd scope | the same outer run plus teardown grace | validate's safe-ci scope | systemd stops the whole process tree | outer-scope timeout |
@@ -93,6 +93,56 @@ effective bounds as
 `execution_cpu_timeout_seconds` and `execution_wall_timeout_seconds`; readers
 accept older rows with neither field but refuse current publication unless both
 are present and consistent.
+
+Manifest cells measure live CPU from a cgroup as well. Before exec, each
+budgeted execution joins a cgroup v2 child that the harness creates below its
+own cgroup, and the harness reads that child's `cpu.stat` `usage_usec` every
+100 ms, so a descendant that leaves the process group, for example through
+`setsid`, stays charged. The final charge is still the leader's `wait4` usage,
+raised to the triggering live sample when the CPU budget stopped it. Once the
+leader is reaped, whatever is left in the cgroup is killed there and the cgroup
+is removed, together with any cgroups the command made below it (as a nested
+runner does), deepest first. A wall or CPU stop sends `SIGTERM` to the process
+group and waits up to 10 s for the leader to exit; it then sends `SIGKILL` to
+the process group,
+kills the whole cgroup through `cgroup.kill`, and sends `SIGKILL` to the leader
+through a pidfd before it waits for the leader, so a leader that moved to
+another process group cannot hold the stop open. A process can move itself out
+of that cgroup into the harness's own, where the counter no longer sees its
+CPU, so before every live sample, before a wall stop, and once the leader has
+been waited for, the harness reads the cgroup v2 line of `/proc/<pid>/cgroup`
+for the leader and for every live member of its process group. Any of them
+outside the execution's cgroup, or a check that cannot be made, stops the
+execution through the same sequence (only `SIGKILL` to the process group when
+the leader has already exited), charges no CPU, records the termination
+`cgroup_membership_stop`, and makes the cell an `ERROR`. A process that leaves
+both the process group and the cgroup, or leaves the cgroup and exits between
+two checks, is not seen; the process-group scan the cgroup replaced could not
+charge it either. A command that empties the cgroup, makes it threaded through
+`cgroup.type` and moves only its main thread back is not refused either, and
+its other threads' CPU then goes to the harness's cgroup; the process-group
+scan did count those threads. A sample that cannot be read,
+or that is lower than one already read, is a failed sample. CPU that stays
+unmeasurable for 1 s, timed from when
+the first failed sample returned, stops the execution rather than letting it run
+without its budget. An execution whose cgroup cannot be created, for example
+because the harness's own cgroup is not writable, has no CPU source at all, so
+it is refused before it starts and the cell is an `ERROR`; that grace is only
+for a meter that was established and then failed. The one exception is a
+launcher that ran without cgroups on purpose and set
+`HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1`: the agent-utils process-group
+scan then measures the execution, and its rows name
+`agent_utils_paired_pidfd_stat_v1` instead of `cgroup_v2_invocation_cpu_stat_v1`
+as their CPU source. `scripts/validate.rs` sets the marker only for a run that
+`--allow-cgroup-failure` left unboxed, and refuses to start a boxed run whose
+caller set it. `ci/run-dag.sh` sets it only for `--unsafe-no-cgroups`, the
+privileged workflow only for its unboxed occasional KVM probe step,
+`ci/buck-e2e/cell.sh` only for cells on the RE route (an RE worker's cgroup is
+not writable by the test; local and pinned-root cells drop a caller's marker),
+and `ci/compat-envelope/pressure-test.rs` never. The boxed-run refusal therefore
+covers only cells executed on the validating host: a boxed
+`--e2e-runner buck-hybrid` run still imports RE rows whose CPU source is
+`agent_utils_paired_pidfd_stat_v1`.
 
 ## Regular Nextest calibration and enclosing budgets
 

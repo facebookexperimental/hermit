@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Resume the QEMU boot snapshot, run a command, and auto-verify repeats."""
 
 import argparse
 import hashlib
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 
 
 DEMO_DIR = Path(__file__).resolve().parent
@@ -24,8 +18,10 @@ ROOT = DEMOS_DIR.parent
 sys.path.insert(0, str(DEMOS_DIR / "lib"))
 
 from demo_common import (  # noqa: E402
+    accept_snapshot_after_failed_rebuild,
     acquire_demo_lock,
     banner,
+    BootSnapshotMismatch,
     canonicalize_qcow2_snapshot_timestamp,
     check_dependencies,
     compare_runs,
@@ -38,8 +34,8 @@ from demo_common import (  # noqa: E402
     hermit_binary,
     hermit_log_environment,
     hermit_tmp_args,
-    load_anchor,
     LogCapExceeded,
+    load_anchor,
     make_run_dir,
     print_comparison,
     print_header,
@@ -50,14 +46,15 @@ from demo_common import (  # noqa: E402
     stage_guest_controller,
     stop_process,
     stop_process_group,
+    verify_boot_snapshot,
     wait_for_process,
 )
 from qemu_controller import (  # noqa: E402
     BEGIN_LINE,
-    build_qemu_command,
     CommandTranscriptParser,
-    parse_command_transcript,
     StaleGuestInitError,
+    build_qemu_command,
+    parse_command_transcript,
 )
 from signal_33 import settle_signal_33_disposition  # noqa: E402
 
@@ -133,8 +130,8 @@ def guest_environment_args() -> list:
 
 # Seconds to wait, after Hermit exits, for its last output to reach the log.
 # Processes Hermit left running can hold its output open meanwhile;
-# drain_output keeps QEMU_MAX_LOG_BYTES in force and stops them when this
-# runs out.
+# drain_output keeps QEMU_MAX_LOG_BYTES in force and, when this runs out,
+# signals Hermit's process group, which reaches those still in it.
 OUTPUT_DRAIN_TIMEOUT = 60
 
 
@@ -230,9 +227,15 @@ def failed_run_message(return_code: int, serial_log: Path) -> str:
 def guest_command_progress(serial_log: Path, hermit_exited: bool = False) -> str:
     """Say how far the guest's command had got, from the serial log.
 
-    ``hermit_exited`` says Hermit had exited (processes it left running were
-    stopped later), so a finished command is not reported as one whose Hermit
-    had not exited.
+    ``hermit_exited`` says Hermit had exited (the demo signalled Hermit's
+    process group later, for processes it left running), so a finished
+    command is not reported as one whose Hermit had not exited. A BEGIN line
+    without an END line shows only that the command was not seen to finish: a
+    command still running and one whose END line a kernel message hid leave
+    the same serial log. In the same way, no
+    BEGIN line shows only that the command was not seen to start: a BEGIN line
+    that a kernel message split does not start the frame (see
+    STALE_BEGIN_PREFIX_RE in qemu_controller).
     """
     try:
         transcript = serial_log.read_bytes()
@@ -254,34 +257,47 @@ def guest_command_progress(serial_log: Path, hermit_exited: bool = False) -> str
         )
     if parser.started:
         return (
-            "the guest command had not finished: the serial log has the {} line "
-            "but no END line".format(BEGIN_LINE.decode())
+            "the guest command was not seen to finish: the serial log has the {} "
+            "line but no END line".format(BEGIN_LINE.decode())
         )
-    return (
-        "the guest had not started the command: the serial log has no {} line".format(
-            BEGIN_LINE.decode()
-        )
+    return "the guest was not seen to start the command: the serial log has no {} line".format(
+        BEGIN_LINE.decode()
     )
 
 
 def stopped_run_message(error: Exception, serial_log: Path) -> str:
-    """Name what stopped an unfinished resume, and how far the guest had got.
+    """Name the bound an unfinished resume reached and how far the guest got.
 
     A command that never exits, or one whose END line a kernel message hid,
-    keeps the run going until a bound stops it. With the default settings the
+    keeps the run going until it reaches a bound. With the default settings the
     INFO log cap is reached first: on 2026-10-03 Hermit wrote 18.5 to 19.2 MB
-    of INFO log per second of resume, so the 512 MiB cap stopped a
-    `sleep 1000000` after about 29 seconds, well before the 120-second
-    QEMU_TIMEOUT. Neither bound can end in SUCCESS. The cap also holds after
-    Hermit exits, while processes it left running still write to its output
-    (see drain_output); LogCapExceeded then carries Hermit's exit status.
+    of INFO log per second of resume, so a `sleep 1000000` reached the 512 MiB
+    cap after about 29 seconds, well before the 120-second QEMU_TIMEOUT.
+    Neither bound can end in SUCCESS. The cap also holds after Hermit exits,
+    while processes it left running still write to its output (see
+    drain_output); LogCapExceeded then carries Hermit's exit status. It
+    carries it too when the log was found past the cap by the check made once
+    Hermit had exited, or once the copy of its output had ended
+    (``final_check``); nothing was then seen still writing.
+
+    The time a cap message gives is when the size was found past the cap, read
+    before anything was signalled. The message names QEMU_TIMEOUT without saying
+    whether it had passed by then: the size is checked before the deadline, so
+    a log past the cap is what is reported even when both bounds were passed.
+
+    By the time this runs, wait_for_process or drain_output has signalled
+    Hermit's process group, the one the demo started Hermit in (see
+    stop_process_group), and that is all a cap message says about it: nothing
+    reports whether the group emptied, and a process outside it is not
+    signalled. Under a wrapper such as bin/safehermit, Hermit, its tracer and
+    QEMU can run outside that group.
     """
-    if isinstance(error, LogCapExceeded) and error.exit_status is not None:
+    if isinstance(error, LogCapExceeded) and error.final_check:
         cause = (
-            "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
-            "(QEMU_MAX_LOG_BYTES), {:.1f}s into the resume, after Hermit had "
-            "exited with status {}: processes it left running still wrote to its "
-            "output, and were stopped".format(
+            "Hermit's INFO log {} was {} bytes, past the {}-byte cap "
+            "(QEMU_MAX_LOG_BYTES), when checked {:.1f}s into the resume, after "
+            "Hermit had exited with status {}, and the demo then signalled "
+            "Hermit's process group".format(
                 error.log_path,
                 error.log_size,
                 error.max_log_bytes,
@@ -289,14 +305,27 @@ def stopped_run_message(error: Exception, serial_log: Path) -> str:
                 error.exit_status,
             )
         )
-        return "{}; {}".format(
-            cause, guest_command_progress(serial_log, hermit_exited=True)
+        return "{}; {}".format(cause, guest_command_progress(serial_log, hermit_exited=True))
+    if isinstance(error, LogCapExceeded) and error.exit_status is not None:
+        cause = (
+            "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
+            "(QEMU_MAX_LOG_BYTES), {:.1f}s into the resume, after Hermit had "
+            "exited with status {}: processes it left running still wrote to its "
+            "output, and the demo then signalled Hermit's process group".format(
+                error.log_path,
+                error.log_size,
+                error.max_log_bytes,
+                error.elapsed,
+                error.exit_status,
+            )
         )
+        return "{}; {}".format(cause, guest_command_progress(serial_log, hermit_exited=True))
     if isinstance(error, LogCapExceeded):
         cause = (
             "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
-            "(QEMU_MAX_LOG_BYTES), {:.1f}s into the resume, so the run was "
-            "stopped before QEMU_TIMEOUT ({}s)".format(
+            "(QEMU_MAX_LOG_BYTES), when checked {:.1f}s into the resume "
+            "(QEMU_TIMEOUT is {}s), so the demo signalled Hermit's process "
+            "group".format(
                 error.log_path,
                 error.log_size,
                 error.max_log_bytes,
@@ -310,23 +339,77 @@ def stopped_run_message(error: Exception, serial_log: Path) -> str:
 
 
 def ensure_boot_snapshot() -> None:
-    """Build demo 5's default boot snapshot; never guess for custom paths."""
-    if BOOT_SNAPSHOT_DISK.is_file():
-        return
+    """Use demo 5's boot snapshot only if it was booted from the current initramfs.
+
+    The snapshot's memory holds the guest /init that runs the command, so a
+    snapshot booted from another initramfs runs another /init (see
+    verify_boot_snapshot). The default snapshot is built, or rebuilt, by running
+    demo 5. A custom QEMU_BOOT_SNAPSHOT_DISK is never built or replaced here: if
+    it is missing or does not match, the demo stops and says how to rebuild it.
+    """
     default_snapshot = ASSETS / "hermit-boot.qcow2"
-    if BOOT_SNAPSHOT_DISK != default_snapshot:
-        raise RuntimeError(
-            "missing custom boot snapshot: {}; produce it before Demo 6".format(
-                BOOT_SNAPSHOT_DISK
+    custom = BOOT_SNAPSHOT_DISK != default_snapshot
+    stale = False
+    if not BOOT_SNAPSHOT_DISK.is_file():
+        if custom:
+            raise RuntimeError(
+                "missing custom boot snapshot: {}; produce it before Demo 6".format(
+                    BOOT_SNAPSHOT_DISK
+                )
             )
+        print("Demo 5 boot snapshot missing; running demo 5 first...", flush=True)
+    else:
+        try:
+            verify_boot_snapshot(BOOT_SNAPSHOT_DISK, ROOT, ASSETS)
+            return
+        except BootSnapshotMismatch as mismatch:
+            if custom:
+                raise RuntimeError(
+                    "refusing to restore the custom boot snapshot {} "
+                    "(QEMU_BOOT_SNAPSHOT_DISK): {}. The snapshot's memory holds "
+                    "the guest /init that runs the command and frames its output, "
+                    "so a snapshot booted from another initramfs runs another "
+                    "/init; an /init from an older initramfs runs the command as "
+                    "root with the console as its standard input. Rebuild it by "
+                    "running demo 5 with QEMU_SNAPSHOT_DISK={} and the same "
+                    "QEMU_ASSETS, or unset QEMU_BOOT_SNAPSHOT_DISK to use the "
+                    "default snapshot, which demo 6 rebuilds itself".format(
+                        BOOT_SNAPSHOT_DISK, mismatch, BOOT_SNAPSHOT_DISK
+                    )
+                ) from mismatch
+            print(
+                "Demo 5 boot snapshot {} is not from the current initramfs: {}; "
+                "running demo 5 again to rebuild it...".format(
+                    BOOT_SNAPSHOT_DISK, mismatch
+                ),
+                flush=True,
+            )
+            stale = True
+    try:
+        run_checked(
+            ["make", "--no-print-directory", "-C", str(DEMOS_DIR), "demo5"],
+            cwd=ROOT,
         )
-    print("Demo 5 boot snapshot missing; running demo 5 first...", flush=True)
-    run_checked(
-        ["make", "--no-print-directory", "-C", str(DEMOS_DIR), "demo5"],
-        cwd=ROOT,
-    )
+    except subprocess.CalledProcessError as failure:
+        if not stale:
+            raise
+        # The snapshot did not match the current initramfs, so demo 5's saved
+        # reference run may not either, and demo 5 then exits non-zero after
+        # saving a current snapshot. Its record, not its exit status, is the
+        # verdict.
+        accept_snapshot_after_failed_rebuild(
+            BOOT_SNAPSHOT_DISK, ROOT, ASSETS, failure, "demo 6"
+        )
+        return
     if not BOOT_SNAPSHOT_DISK.is_file():
         raise RuntimeError("Demo 5 did not produce {}".format(BOOT_SNAPSHOT_DISK))
+    try:
+        verify_boot_snapshot(BOOT_SNAPSHOT_DISK, ROOT, ASSETS)
+    except BootSnapshotMismatch as mismatch:
+        raise RuntimeError(
+            "Demo 5 ran, but {} still does not match the current initramfs: "
+            "{}".format(BOOT_SNAPSHOT_DISK, mismatch)
+        ) from mismatch
 
 
 def resume_once(guest_command: str, save_snapshot: bool) -> str:
@@ -352,9 +435,7 @@ def resume_once(guest_command: str, save_snapshot: bool) -> str:
     # A --no-save-snapshot run writes no post-command snapshot and runs a
     # different controller command line (so a different Hermit log), so it can
     # never match a reference that saved one. It keeps its own reference.
-    reference_key = (
-        command_digest if save_snapshot else command_digest + "-no-save-snapshot"
-    )
+    reference_key = command_digest if save_snapshot else command_digest + "-no-save-snapshot"
     command_root = ASSETS / "resume-metadata" / reference_key
     lock = acquire_demo_lock(ASSETS / ".qemu-demo.lock")
     run_dir = make_run_dir(command_root, "resume")
@@ -372,6 +453,19 @@ def resume_once(guest_command: str, save_snapshot: bool) -> str:
     saved_snapshot = save_snapshot
 
     try:
+        # Demo 5 does not take the demo lock, so it may have replaced the boot
+        # snapshot, or its record, since ensure_boot_snapshot checked them.
+        # Check the copy that QEMU restores.
+        try:
+            verify_boot_snapshot(BOOT_SNAPSHOT_DISK, ROOT, ASSETS, disk=SNAPSHOT_DISK)
+        except BootSnapshotMismatch as mismatch:
+            raise RuntimeError(
+                "the copy {} of the boot snapshot {} does not match demo 5's "
+                "record: {}; demo 5 may have replaced the boot snapshot after "
+                "this demo checked it, so run demo 6 again".format(
+                    SNAPSHOT_DISK, BOOT_SNAPSHOT_DISK, mismatch
+                )
+            ) from mismatch
         for runtime_path in (qmp_socket, serial_log):
             runtime_path.unlink(missing_ok=True)
         # The command reaches the guest on a disk, not through the console. The
@@ -456,8 +550,8 @@ def resume_once(guest_command: str, save_snapshot: bool) -> str:
                 stderr=subprocess.STDOUT,
                 env=environment,
                 cwd=str(ROOT),
-                # Own process group, so stop_process can stop Hermit and every
-                # process it started, not only the first one.
+                # Own process group, so stop_process_group can signal every
+                # process in it, not only the first one.
                 start_new_session=True,
             )
             launched = time.monotonic()

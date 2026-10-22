@@ -1,12 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/*
  * An inode identifies an open object, not its descriptor-table slot. Exercise
  * ordinary files and pipes installed at fds 0–2, plus their duplicates.
  * descriptor-reuse checks descriptors, ordinary paths, fdinfo and pipe links.

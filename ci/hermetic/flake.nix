@@ -140,12 +140,16 @@
       # selected manifest entry's requirements/program, and commands invoked by
       # shell fixtures. The second line supplies the previously missing lua, m4,
       # node, ssh-keygen, ruby, tclsh, uuidgen, mcookie, hexdump and ps.
+      # curl is the guest of test.record_replay's
+      # curl_recording_replays_offline_with_identical_logs, which finds it on
+      # PATH (https://github.com/rrnewton/hermit/issues/3786). The root already
+      # held libcurl as a dependency, but not the curl executable.
       guestTools = with pkgs; [
         bash coreutils diffutils findutils gnugrep gnused gawk
         openssl zstd gnutar gzip xz jq sqlite git perl python3 redis
         lua5_4 gnum4 nodejs openssh ruby tcl util-linux procps
         # These outputs are not implied by their runtime libraries.
-        bzip2.bin glibc.bin hostname
+        bzip2.bin curl.bin glibc.bin hostname
       ];
 
       # The CLI replay tests run GDB outside Hermit and execute Python commands.
@@ -155,7 +159,14 @@
       # Native libraries need both their runtime and development outputs. A Nix
       # image does not populate FHS search paths, so the environment below makes
       # these exact pinned outputs visible to build scripts and the C compiler.
-      nativeLibs = with pkgs; [ libunwind elfutils zlib openssl ];
+      # xz supplies liblzma. Nixpkgs' libunwind.pc lists `-llzma` in
+      # Libs.private, and reverie-ptrace's build script asks pkg-config for
+      # libunwind-ptrace's --static closure, so every link of a crate that
+      # depends on reverie-ptrace names -llzma. The library was already in the
+      # image closure (libunwind's runtime and dev outputs reference it) but
+      # not on LIBRARY_PATH, which made the link fail with
+      # `unable to find library -llzma`.
+      nativeLibs = with pkgs; [ libunwind elfutils zlib openssl xz ];
       # ⚠️ unixtools.xxd IS A BUILD DEPENDENCY, NOT A CONVENIENCE. e9patch's Makefile
       # generates two C sources by running `xxd -i` over its loader binaries
       # (Makefile:73 and :79). Without it the build dies at `Error 127` -- command not

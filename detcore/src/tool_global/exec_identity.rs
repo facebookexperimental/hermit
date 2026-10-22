@@ -1,7 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
- *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
@@ -49,7 +48,7 @@ impl GlobalState {
             || !sched.rpc_incarnation_matches(former, prepared.mm)
             || !sched.next_turns.contains_key(&former)
             || (self.cfg.sequentialize_threads
-                && (sched.next_turns[&former].req.try_read().is_some()
+                && (sched.next_turns[&former].req.is_full()
                     || (sched.next_turns.contains_key(&current)
                         && !sched.exec_sibling_retirement_observed(current, process, prepared.mm))))
             || !self.global_time.lock().unwrap().contains_thread(former)
@@ -78,6 +77,11 @@ impl GlobalState {
             reconnect_priority: None,
         });
         global_time.reassign_thread(former, current);
+        // The exec'ing thread keeps its root under its new number.
+        self.process_auxv
+            .lock()
+            .unwrap()
+            .transfer_root(former, current);
         self.completed_exec_transfers.lock().unwrap().insert(
             process,
             ExecTransferReceipt {
@@ -239,6 +243,11 @@ where
                 thread.max_timeslice_end = Some(deadline);
             }
         }
+        // The continuation's slice end, just installed, takes the grant's
+        // deadline cap like any other
+        // (<https://github.com/rrnewton/hermit/issues/4121>).
+        let deadline = guest.thread_state_mut().last_grant_deadline.take();
+        super::cap_timeslice_at_deadline(guest, deadline);
     }
     Ok(())
 }

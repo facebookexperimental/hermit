@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # GNU awk's rand() is a pseudo-random generator that must be seeded before it
 # produces varying output; an unseeded rand() is fixed. The idiomatic entropy
 # source is srand() (time in seconds), but that has one-second granularity and

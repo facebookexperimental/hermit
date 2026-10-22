@@ -43,21 +43,21 @@
  * Mixed entry types (regular files, subdirectories, symlinks) are included so
  * the contract covers d_type variation and not just names.
  *
- * MEASURED AT THE TIME OF WRITING (hermit ptrace, --strict, on a shared dev
+ * MEASURED WHEN THIS FIXTURE WAS WRITTEN (hermit ptrace, --strict, shared dev
  * host): native   small order_identical=0 seams_rev=23   large
  * order_identical=0 seams_rev=1999 hermit   small order_identical=1 seams_rev=0
- * large order_identical=0 seams_rev=1 SMALL is fully determinized. LARGE is
+ * large order_identical=0 seams_rev=1 SMALL was fully determinized. LARGE was
  * NOT, and seams_rev=1 is the precise signature of a per-BUFFER sort: 2000
- * reverse-created names come back as TWO sorted runs joined at ONE seam -- the
- * 32 KiB getdents64 buffer boundary. The stream is 99.95% sorted and still not
+ * reverse-created names came back as TWO sorted runs joined at ONE seam -- the
+ * 32 KiB getdents64 buffer boundary. The stream was 99.95% sorted and still not
  * sorted.
  *
- * THE LARGE LINE PINS A KNOWN GAP, NOT A DESIRED STATE. It is recorded rather
- * than hidden so the gap cannot be lost, and so that FIXING the sort (drain +
- * sort the whole stream at first getdents64, cache per open-file-description,
- * synthesize monotonic d_off) turns this test RED and forces a deliberate
- * update to order_identical=1 seams_rev=0. Do NOT resolve a future red here by
- * relaxing the assertion.
+ * THAT GAP IS CLOSED. Hermit now drains and sorts the whole stream at the first
+ * getdents on an open file description, serves it from that snapshot, and
+ * synthesizes d_off as the entry index. The LARGE line is therefore now a
+ * contract too: `--require-large-determinized` requires order_identical=1 AND
+ * seams_fwd=0 seams_rev=0, i.e. both enumerations identical and globally
+ * sorted. Do NOT resolve a future red here by relaxing the assertion.
  */
 
 #define _GNU_SOURCE
@@ -142,12 +142,14 @@ static int enumerate(const char* dir, char names[][NAME_CAP], int cap) {
  * enumerate both, and report whether the two orders agree. */
 /* Returns 1 when the two creation orders enumerated identically, 0 when they
  * diverged, and -1 on a setup error. */
+/* *sorted is set to 1 when both enumerations are globally sorted, else 0. */
 static int probe(
     const char* root,
     const char* label,
     int count,
     char names_a[][NAME_CAP],
-    char names_b[][NAME_CAP]) {
+    char names_b[][NAME_CAP],
+    int* sorted) {
   char da[PATH_CAP], db[PATH_CAP];
   snprintf(da, sizeof da, "%s/%s_fwd", root, label);
   snprintf(db, sizeof db, "%s/%s_rev", root, label);
@@ -193,6 +195,7 @@ static int probe(
   }
 
   int identical = (first_diff == -1) && (wa == wb);
+  *sorted = seams_a == 0 && seams_b == 0;
   printf(
       "%s n=%d order_identical=%d first_diff=%d seams_fwd=%d seams_rev=%d words_equal=%d\n",
       label,
@@ -216,9 +219,12 @@ static int probe(
  * unconditional assertion would make the documented baseline "fail".
  *
  * With `--require-small-determinized` the SMALL probe becomes fatal. Small fits
- * in one getdents64 buffer and IS determinized today, so that is a contract we
- * hold and can regress. LARGE stays reported-only because it pins a KNOWN GAP
- * (per-buffer sort, seams_rev=1); making it fatal would land a red test.
+ * in one getdents64 buffer, so this holds even for a per-buffer sort.
+ *
+ * With `--require-large-determinized` the LARGE probe becomes fatal, and it
+ * must also be globally sorted (no seams in either enumeration). Large spans
+ * several getdents64 buffers, so only a whole-stream order satisfies it; the
+ * per-buffer sort this fixture was written against (seams_rev=1) fails it.
  *
  * Why this matters: the harness's `verify` mode grades a cell on the EXIT
  * STATUS of `hermit --strict --verify` and never compares the observation hash
@@ -229,10 +235,16 @@ static int probe(
  * fail at all.
  */
 int main(int argc, char** argv) {
-  int require_small = 0;
+  int require_small = 0, require_large = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--require-small-determinized") == 0)
       require_small = 1;
+    else if (strcmp(argv[i], "--require-large-determinized") == 0)
+      require_large = 1;
+    else {
+      fprintf(stderr, "unknown argument: %s\n", argv[i]);
+      return 2;
+    }
   }
 
   char root[] = "/tmp/readdir_order_identity_XXXXXX";
@@ -242,14 +254,17 @@ int main(int argc, char** argv) {
   }
 
   static char small_a[SMALL_N][NAME_CAP], small_b[SMALL_N][NAME_CAP];
-  int small_ok = probe(root, "small", SMALL_N, small_a, small_b);
+  int small_sorted = 0;
+  int small_ok = probe(root, "small", SMALL_N, small_a, small_b, &small_sorted);
   if (small_ok < 0) {
     fprintf(stderr, "small probe failed\n");
     return 2;
   }
 
   static char large_a[LARGE_N][NAME_CAP], large_b[LARGE_N][NAME_CAP];
-  if (probe(root, "large", LARGE_N, large_a, large_b) < 0) {
+  int large_sorted = 0;
+  int large_ok = probe(root, "large", LARGE_N, large_a, large_b, &large_sorted);
+  if (large_ok < 0) {
     fprintf(stderr, "large probe failed\n");
     return 2;
   }
@@ -260,6 +275,15 @@ int main(int argc, char** argv) {
         "CONTRACT VIOLATED: small (single-buffer) enumeration is no longer "
         "creation-order independent; directory order is leaking guest-visible "
         "state. Do not resolve this by relaxing the assertion.\n");
+    return 1;
+  }
+  if (require_large && !(large_ok && large_sorted)) {
+    fprintf(
+        stderr,
+        "CONTRACT VIOLATED: large (multi-buffer) enumeration is not one "
+        "creation-order independent, globally sorted stream; directory order "
+        "is leaking guest-visible state across getdents64 buffers. Do not "
+        "resolve this by relaxing the assertion.\n");
     return 1;
   }
   return 0;

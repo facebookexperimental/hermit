@@ -25,6 +25,7 @@ use detcore_model::summary::RunSummary;
 use hermit::Context;
 use hermit::Error;
 use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
+use hermit::canonical_verdict::BranchCounterVerdict;
 use hermit::canonical_verdict::ComparedLogMessages;
 use hermit::canonical_verdict::ComparedLogScope;
 use hermit::canonical_verdict::ComparedOutput;
@@ -37,11 +38,13 @@ use hermit::canonical_verdict::InfrastructureError;
 pub(crate) use hermit::canonical_verdict::LogCompareStrictness;
 pub(crate) use hermit::canonical_verdict::NoResultReason;
 use hermit::canonical_verdict::RecordEnvelopeReport;
+use hermit::canonical_verdict::RunFailure;
 use hermit::canonical_verdict::RuntimeStats;
 pub(crate) use hermit::canonical_verdict::Verdict;
 pub(crate) use hermit::canonical_verdict::VerificationReport;
 pub(crate) use hermit::canonical_verdict::VerificationRun;
 pub(crate) use hermit::canonical_verdict::VerificationRuntime;
+use hermit::nonwaiting_write::write_without_waiting;
 use pretty_assertions::Comparison;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
@@ -49,6 +52,7 @@ use tempfile::NamedTempFile;
 use tempfile::TempPath;
 use tracing::metadata::LevelFilter;
 
+use super::container::LogCapExceeded;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopePolicy;
@@ -141,6 +145,13 @@ pub(crate) struct ComparisonOptions {
     /// This is absent when the caller explicitly requested `--keep-logs`; an
     /// explicit evidence directory remains entirely caller-owned.
     pub failed_log_retention: Option<FailedVerifyLogRetention>,
+    /// The logs belong to the caller (two `hermit run --verify-run`
+    /// directories): the comparison neither moves, deletes nor announces
+    /// them, whatever it finds, and [`Self::keep_logs`] and
+    /// [`Self::failed_log_retention`] do not apply. The caller hands the
+    /// comparison links to them, so a log the comparison drops on an early
+    /// error is only the link.
+    pub caller_owns_logs: bool,
     /// Typed, versioned record envelope applied before selecting messages.
     /// Its policy identity is serialized beside the verdict.
     pub record_envelope: RecordEnvelope,
@@ -515,6 +526,14 @@ pub struct VerificationOutcome {
     /// Why verification did not reach a verdict. None for a completed match or
     /// divergence; current no-result producers must provide a typed reason.
     pub no_result_reason: Option<NoResultReason>,
+    /// The log comparator's exact refusal (a log cut at its size bound), kept
+    /// even when an observed output or exit-status difference selected
+    /// [`Verdict::Diverged`] and so left [`Self::no_result_reason`] empty. The
+    /// ordinary report does not carry it, because the report schema allows a
+    /// `no_result_reason` only beside a `no_result` verdict;
+    /// [`write_skid_overshoot_verification_json`] reads it so that an overshoot
+    /// cannot erase the refusal.
+    pub refused_log_comparison: Option<String>,
     /// Exit status of the second (replay / repeat) run, propagated verbatim.
     pub guest_status: ExitStatus,
     /// The exact common output/log comparison used for [`Self::verdict`],
@@ -536,6 +555,11 @@ pub struct VerificationOutcome {
     /// Scheduler turn at the first log divergence, when a preceding COMMIT
     /// identified the turn.
     pub first_divergent_scheduler_turn: Option<u64>,
+    /// The first different record's position in each run's log, as
+    /// `detcore::logdiff::log_record_events` counts records (`None` for a log
+    /// that ended before it), when the logs were compared and differ. Not part
+    /// of the report: `hermit::host_input_change` places an open against it.
+    pub first_divergent_record_positions: Option<(Option<usize>, Option<usize>)>,
     /// Virtual nanoseconds at that same COMMIT, when the log recorded them.
     pub first_divergent_virtual_nanoseconds: Option<u64>,
     /// 1-based index of the first differing compared record.
@@ -695,7 +719,35 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
         first_divergent_syscall: outcome.first_divergent_syscall,
         first_divergent_left_message: outcome.first_divergent_left_message.clone(),
         first_divergent_right_message: outcome.first_divergent_right_message.clone(),
+        exact_branch_counter: None,
     }
+}
+
+/// The `exact_branch_counter` verdict every verification report this process
+/// writes carries, once [`record_exact_branch_counter`] has run.
+static EXACT_BRANCH_COUNTER: std::sync::OnceLock<BranchCounterVerdict> = std::sync::OnceLock::new();
+
+/// Record, once per process, the `exact_branch_counter` verdict that
+/// `hermit host-capabilities` reports, so that every verification report this
+/// process writes from then on carries it ([`write_report_json`]). Called by a
+/// run on a backend whose virtual clock is the retired-branch counter, after
+/// its PMU configuration is installed: Reverie's validation reads that
+/// configuration and fixes it for the process.
+pub(crate) fn record_exact_branch_counter(verdict: BranchCounterVerdict) {
+    let _ = EXACT_BRANCH_COUNTER.set(verdict);
+}
+
+/// `report` with the recorded `exact_branch_counter` verdict (`recorded`),
+/// unless it already carries one.
+fn with_exact_branch_counter(
+    report: &VerificationReport,
+    recorded: Option<&BranchCounterVerdict>,
+) -> VerificationReport {
+    let mut report = report.clone();
+    if report.exact_branch_counter.is_none() {
+        report.exact_branch_counter = recorded.cloned();
+    }
+    report
 }
 
 /// Write the verification report as a single JSON line to `path`.
@@ -710,6 +762,21 @@ pub fn write_verification_json(path: &Path, outcome: &VerificationOutcome) -> Re
 /// Write a completed comparison that cannot be accepted because precise PMU
 /// timer delivery passed its target. The comparison remains available for
 /// diagnosis, while the canonical verdict makes the refusal unambiguous.
+///
+/// A comparison the comparator itself refused (a log cut at its size bound)
+/// is written as that refusal instead: verdict `no_result` with its
+/// `comparison_refused` reason. That holds whether the comparator selected
+/// `no_result` or, because an output or exit-status difference was also
+/// observed, `diverged`; the overshoot already made that difference
+/// unattributable, and the refusal must not disappear with it. The report
+/// schema allows a `no_result_reason` only beside a `no_result` verdict, so
+/// one report cannot carry both causes, and converting this one to an
+/// overshoot would erase the refusal. The refusal is the failure a fresh
+/// attempt could hide: a reader that may retry a pure overshoot
+/// (<https://github.com/rrnewton/hermit/issues/1845>) must not mistake this
+/// attempt for one. The overshoot itself is still reported, by the
+/// `HERMIT_SKID_OVERSHOOT` lines on stderr and by the caller's skid-overshoot
+/// exit status.
 pub fn write_skid_overshoot_verification_json(
     path: &Path,
     outcome: &VerificationOutcome,
@@ -719,12 +786,57 @@ pub fn write_skid_overshoot_verification_json(
         count > 0,
         "a skid-overshoot report requires a positive count"
     );
+    let refusal = outcome.refused_log_comparison.clone().or_else(|| {
+        match (&outcome.verdict, &outcome.no_result_reason) {
+            (Verdict::NoResult, Some(NoResultReason::ComparisonRefused { detail })) => {
+                Some(detail.clone())
+            }
+            _ => None,
+        }
+    });
+    if let Some(detail) = refusal {
+        let refused = VerificationOutcome {
+            verdict: Verdict::NoResult,
+            no_result_reason: Some(NoResultReason::ComparisonRefused { detail }),
+            ..outcome.clone()
+        };
+        return write_report_json(path, &verification_report(&refused));
+    }
     let mut report = verification_report(outcome);
     report.verified = false;
     report.bitwise_parity = false;
     report.verdict = Verdict::InfrastructureError;
     report.no_result_reason = None;
     report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
+    report.dbt_counted_branches = None;
+    write_report_json(path, &report)
+}
+
+/// Write a divergence that a host file changed during one of the runs
+/// explains (`change` is [`InfrastructureError::HostInputChanged`], from
+/// `hermit::host_input_change`). The comparison and the divergence position
+/// are kept as evidence; the verdict says the divergence is not attributed to
+/// Hermit.
+pub fn write_host_input_change_verification_json(
+    path: &Path,
+    outcome: &VerificationOutcome,
+    change: InfrastructureError,
+) -> Result<(), Error> {
+    assert_eq!(
+        outcome.verdict,
+        Verdict::Diverged,
+        "only a divergence can be explained by a host input change"
+    );
+    assert!(
+        matches!(change, InfrastructureError::HostInputChanged { .. }),
+        "not a host input change: {change:?}"
+    );
+    let mut report = verification_report(outcome);
+    report.verified = false;
+    report.bitwise_parity = false;
+    report.verdict = Verdict::InfrastructureError;
+    report.no_result_reason = None;
+    report.infrastructure_error = Some(change);
     report.dbt_counted_branches = None;
     write_report_json(path, &report)
 }
@@ -777,10 +889,25 @@ pub(crate) fn emit_compared_guest_output(
     first: &Output,
     second: &Output,
 ) -> io::Result<()> {
-    use std::io::Write;
+    emit_compared_guest_output_to(
+        verified,
+        first,
+        second,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+}
+
+fn emit_compared_guest_output_to(
+    verified: bool,
+    first: &Output,
+    second: &Output,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> io::Result<()> {
     if verified || (first.stdout == second.stdout && first.stderr == second.stderr) {
-        std::io::stdout().write_all(&first.stdout)?;
-        std::io::stderr().write_all(&first.stderr)?;
+        stdout.write_all(&first.stdout)?;
+        stderr.write_all(&first.stderr)?;
     }
     Ok(())
 }
@@ -794,31 +921,153 @@ pub(crate) fn run_verification_execution<T>(
     execute: impl FnOnce() -> Result<T, Error>,
 ) -> Result<T, Error> {
     execute().map_err(|error| {
-        let Some(super::container::ContainerChildExit(status)) =
-            error.downcast_ref::<super::container::ContainerChildExit>()
-        else {
+        let Some(disposition) = container_failure_of(&error) else {
             return error;
         };
         let Some(path) = path else { return error };
-        let disposition = match *status {
-            ExitStatus::Exited(code) => ContainerDisposition::Exited { code },
-            ExitStatus::Signaled(signal, core_dumped) => ContainerDisposition::Signaled {
-                signal: signal as i32,
-                core_dumped,
-            },
-        };
-        let mut report = VerificationReport::no_result();
-        report.no_result_reason = Some(NoResultReason::ContainerFailed(ContainerFailure {
-            run,
-            disposition,
-        }));
-        match write_report_json(path, &report) {
+        match write_report_json(path, &container_failed_report(run, disposition)) {
             Ok(()) => error,
             Err(secondary) => {
                 retain_verification_error(error, "publishing container failure", secondary)
             }
         }
     })
+}
+
+/// The disposition of the container child whose unexpected exit `error`
+/// reports ([`super::container::ContainerChildExit`]), or `None` for any other
+/// error.
+pub(crate) fn container_failure_of(error: &Error) -> Option<ContainerDisposition> {
+    let super::container::ContainerChildExit(status) =
+        error.downcast_ref::<super::container::ContainerChildExit>()?;
+    Some(match *status {
+        ExitStatus::Exited(code) => ContainerDisposition::Exited { code },
+        ExitStatus::Signaled(signal, core_dumped) => ContainerDisposition::Signaled {
+            signal: signal as i32,
+            core_dumped,
+        },
+        ExitStatus::SignaledRaw(signal, core_dumped) => ContainerDisposition::Signaled {
+            signal,
+            core_dumped,
+        },
+    })
+}
+
+/// The no-result report of verification run `run`, whose container child
+/// exited with `disposition` before returning the guest's output.
+pub(crate) fn container_failed_report(
+    run: VerificationRun,
+    disposition: ContainerDisposition,
+) -> VerificationReport {
+    let mut report = VerificationReport::no_result();
+    report.no_result_reason = Some(NoResultReason::ContainerFailed(ContainerFailure {
+        run,
+        disposition,
+    }));
+    report
+}
+
+/// The typed failure, if any, of a verification run Hermit had started.
+///
+/// A skid overshoot is not one: it already published its infrastructure
+/// error. Neither is an untyped error (a bad flag, an unreadable path), which
+/// leaves the pending stamp.
+pub(crate) fn run_failure_of(error: &Error) -> Option<RunFailure> {
+    if error.downcast_ref::<hermit::SkidOvershootError>().is_some() {
+        None
+    } else if error
+        .downcast_ref::<super::run::DeterminismLossRecorded>()
+        .is_some()
+    {
+        Some(RunFailure::DeterminismLoss)
+    } else if error.downcast_ref::<hermit::BackendRunFailure>().is_some() {
+        Some(RunFailure::BackendFailure)
+    } else if error
+        .downcast_ref::<super::container::PolicyRefusal>()
+        .is_some()
+    {
+        Some(RunFailure::PolicyRefusal)
+    } else {
+        None
+    }
+}
+
+/// The run_failed detail keeps the failure's message chain, bounded so one
+/// pathological message cannot grow the report without limit.
+const RUN_FAILED_DETAIL_MAX_BYTES: usize = 4096;
+
+/// Replace the pending stamp with `run_failed` when `error` is a typed failure
+/// of verification run `run` ([`RunFailure`]), and return `error` unchanged.
+/// Call it only where `run` had been started: a refusal before any run (the
+/// host's seccomp filter, an inexact branch counter) is a host condition, not
+/// a result of this guest on this backend.
+pub(crate) fn publish_run_failure(
+    path: Option<&Path>,
+    run: VerificationRun,
+    error: Error,
+) -> Error {
+    let (Some(path), Some(failure)) = (path, run_failure_of(&error)) else {
+        return error;
+    };
+    match write_report_json(path, &run_failed_report(run, failure, format!("{error:#}"))) {
+        Ok(()) => error,
+        Err(secondary) => retain_verification_error(error, "publishing run failure", secondary),
+    }
+}
+
+pub(crate) fn run_failed_report(
+    run: VerificationRun,
+    failure: RunFailure,
+    mut detail: String,
+) -> VerificationReport {
+    if detail.len() > RUN_FAILED_DETAIL_MAX_BYTES {
+        let mut end = RUN_FAILED_DETAIL_MAX_BYTES;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+    }
+    let mut report = VerificationReport::no_result();
+    report.no_result_reason = Some(NoResultReason::RunFailed {
+        run,
+        failure,
+        detail,
+    });
+    report
+}
+
+/// While alive, Detcore's terminal deadlock exit during verification run `run`
+/// first records the run at `path` as `run_failed` with `deadlock`.
+///
+/// That exit ends the process from the scheduler (`immediate_fatal_exit`), so
+/// no error ever returns to verify and the pending stamp would remain. Only a
+/// backend whose scheduler runs in this process (DBT) installs it; a backend
+/// whose scheduler runs in a container child reports the same exit as a
+/// container failure.
+#[cfg(feature = "dbt")]
+pub(crate) struct TerminalDeadlockRecording;
+
+#[cfg(feature = "dbt")]
+impl Drop for TerminalDeadlockRecording {
+    fn drop(&mut self) {
+        detcore::set_terminal_deadlock_hook(None);
+    }
+}
+
+#[cfg(feature = "dbt")]
+pub(crate) fn record_terminal_deadlock(
+    path: Option<&Path>,
+    run: VerificationRun,
+) -> Option<TerminalDeadlockRecording> {
+    let path = path?.to_owned();
+    detcore::set_terminal_deadlock_hook(Some(Box::new(move |deadlock: &str| {
+        // Best effort: the process exits next whatever this returns.
+        let _ = write_report_json(
+            &path,
+            &run_failed_report(run, RunFailure::Deadlock, deadlock.trim_end().to_owned()),
+        );
+    })));
+    Some(TerminalDeadlockRecording)
 }
 
 /// Keep the original typed error as anyhow's cause and the actual secondary
@@ -859,12 +1108,58 @@ pub(crate) fn retain_logs_after_verification_error<const N: usize>(
     mut primary: Error,
     logs: [(&str, TempPath); N],
 ) -> Error {
+    if primary.downcast_ref::<LogCapExceeded>().is_some() {
+        return retain_logs_after_log_cap(primary, logs);
+    }
     // Attempt every requested retention, even if an earlier one fails.
     eprintln!(":: Verification logs retained:");
     for (label, log) in logs {
         if let Err(secondary) = retain_verification_log(label, log) {
             primary = retain_verification_error(primary, "retaining verification log", secondary);
         }
+    }
+    primary
+}
+
+/// [`retain_logs_after_verification_error`] for a run that the log cap ended.
+/// The logs are kept as for any other failure, but the report that names them
+/// is attempted without waiting and is left out when stderr cannot take it at
+/// once (see [`write_without_waiting`]). Through `eprintln!` it would wait on a
+/// full stderr pipe, and panic, exiting 101 instead of 123, on one whose reader
+/// has gone (round-3 review of https://github.com/rrnewton/hermit/pull/3686,
+/// finding 4).
+///
+/// Lines are packed into writes of at most `PIPE_BUF` bytes, so that a pipe
+/// takes each write whole or not at all; a line longer than that is left out
+/// rather than cut.
+fn retain_logs_after_log_cap<const N: usize>(
+    mut primary: Error,
+    logs: [(&str, TempPath); N],
+) -> Error {
+    let mut lines = vec![":: Verification logs retained:\n".to_owned()];
+    // Attempt every requested retention, even if an earlier one fails.
+    for (label, log) in logs {
+        match log.keep() {
+            Ok(path) => lines.push(format!("::   {label}: {}\n", path.display())),
+            Err(secondary) => {
+                primary = retain_verification_error(
+                    primary,
+                    "retaining verification log",
+                    secondary.into(),
+                );
+            }
+        }
+    }
+    let mut chunk = String::new();
+    for line in lines.iter().filter(|line| line.len() <= libc::PIPE_BUF) {
+        if chunk.len() + line.len() > libc::PIPE_BUF {
+            write_without_waiting(libc::STDERR_FILENO, chunk.as_bytes());
+            chunk.clear();
+        }
+        chunk.push_str(line);
+    }
+    if !chunk.is_empty() {
+        write_without_waiting(libc::STDERR_FILENO, chunk.as_bytes());
     }
     primary
 }
@@ -892,7 +1187,8 @@ fn staging_directory(path: &Path) -> &Path {
 pub fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(), Error> {
     use std::io::Write as _;
 
-    let json = serde_json::to_string(report)?;
+    let report = with_exact_branch_counter(report, EXACT_BRANCH_COUNTER.get());
+    let json = serde_json::to_string(&report)?;
     // Same directory as the target so the rename below stays within one
     // filesystem and is therefore atomic.
     let mut temp = NamedTempFile::new_in(staging_directory(path))
@@ -949,18 +1245,39 @@ pub fn temp_log_files(name1: &str, name2: &str) -> io::Result<(NamedTempFile, Na
     temp_log_files_in(name1, name2, None)
 }
 
+/// The directory for the temporary run logs of a verify that names no
+/// directory of its own, instead of the system temporary directory.
+///
+/// A verify that is killed leaves its two logs where they were created: the
+/// first cut off, the second often empty. A caller that kills runs at a
+/// deadline sets this to a directory it removes afterwards, so the host's
+/// temporary directory is not filled. Setting TMPDIR instead would also
+/// change the guest's environment; this variable is removed from the
+/// environment a guest inherits from Hermit (`--base-env=host`).
+pub const VERIFY_TMPDIR_ENV: &str = "HERMIT_VERIFY_TMPDIR";
+
 pub fn temp_log_files_in(
     name1: &str,
     name2: &str,
     directory: Option<&Path>,
 ) -> io::Result<(NamedTempFile, NamedTempFile)> {
+    let fallback = std::env::var_os(VERIFY_TMPDIR_ENV).filter(|value| !value.is_empty());
     let create = |name: &str| {
         let prefix = format!("{}_log_", name);
         let mut builder = tempfile::Builder::new();
         builder.prefix(&prefix).rand_bytes(5);
-        match directory {
-            Some(directory) => builder.tempfile_in(directory),
-            None => builder.tempfile(),
+        match (directory, fallback.as_deref()) {
+            (Some(directory), _) => builder.tempfile_in(directory),
+            (None, Some(fallback)) => builder.tempfile_in(fallback).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot create a verify log in {VERIFY_TMPDIR_ENV}={}: {error}",
+                        Path::new(fallback).display()
+                    ),
+                )
+            }),
+            (None, None) => builder.tempfile(),
         }
     };
     let file1 = create(name1)?;
@@ -974,8 +1291,8 @@ pub fn setup_double_run(
     name1: &str,
     name2: &str,
     strictness: LogCompareStrictness,
-) -> ((GlobalOpts, NamedTempFile), (GlobalOpts, NamedTempFile)) {
-    let (file1, file2) = temp_log_files(name1, name2).unwrap();
+) -> io::Result<((GlobalOpts, NamedTempFile), (GlobalOpts, NamedTempFile))> {
+    let (file1, file2) = temp_log_files(name1, name2)?;
 
     let path1 = PathBuf::from(file1.path());
     let path2 = PathBuf::from(file2.path());
@@ -988,7 +1305,7 @@ pub fn setup_double_run(
 
     let mut global2 = global.clone();
     global2.log_file = Some(path2);
-    ((global, file1), (global2, file2))
+    Ok(((global, file1), (global2, file2)))
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1024,6 +1341,227 @@ pub(crate) fn retain_verification_logs<const N: usize>(
         retained.push(retain_verification_log(label, log)?);
     }
     Ok(retained)
+}
+
+/// How many of a run's last INFO DETLOG records [`signal_termination_report`]
+/// shows.
+const SIGNAL_REPORT_RECORDS: usize = 20;
+/// How much of the end of a run's log [`signal_termination_report`] reads.
+const SIGNAL_REPORT_TAIL_BYTES: u64 = 4 << 20;
+/// The longest record [`signal_termination_report`] shows before cutting it.
+const SIGNAL_REPORT_LINE_BYTES: usize = 400;
+
+/// What the guest of a run was doing when a signal terminated it: the last
+/// INFO DETLOG records of its log, the records `--verify` compares, for
+/// printing to stderr. `None` unless `status` is a termination by a signal.
+/// The DEBUG records a verification log also holds (register dumps, scheduler
+/// steps) would otherwise push the guest's last system calls out of the
+/// report.
+///
+/// A verify log lives where `--verify-log-dir` put it, which for a test is
+/// usually inside a disposable checkout, and `--keep-logs` keeps it only as
+/// long as that checkout. Stderr is what a test runner keeps, so a crash
+/// under `--verify` that the caller never reproduces is still diagnosable
+/// from these records; see https://github.com/rrnewton/hermit/issues/3833,
+/// where it was not.
+///
+/// The wait status carries only the signal and whether a core was dumped, not
+/// the faulting address or thread, so the records are the evidence of where.
+/// Each is shown without its machine-readable suffix and cut at
+/// [`SIGNAL_REPORT_LINE_BYTES`], so the report stays a few kilobytes.
+pub(crate) fn signal_termination_report(
+    label: &str,
+    status: ExitStatus,
+    log: &Path,
+) -> Option<String> {
+    let (number, name, core_dumped) = match status {
+        ExitStatus::Signaled(signal, core_dumped) => {
+            (signal as i32, format!("{signal:?}"), core_dumped)
+        }
+        // A realtime signal, which nix's Signal cannot name
+        // (https://github.com/rrnewton/reverie/issues/997).
+        ExitStatus::SignaledRaw(signal, core_dumped) => {
+            (signal, format!("SIG{signal}"), core_dumped)
+        }
+        ExitStatus::Exited(_) => return None,
+    };
+    let core = if core_dumped { ", core dumped" } else { "" };
+    let heading = format!(":: The {label} guest was terminated by signal {number} ({name}{core}).");
+    let tail = match read_log_tail(log, SIGNAL_REPORT_TAIL_BYTES) {
+        Ok(tail) => tail,
+        Err(error) => {
+            return Some(format!(
+                "{heading} Its log {} could not be read: {error}\n",
+                log.display()
+            ));
+        }
+    };
+    let records: Vec<&str> = tail
+        .lines()
+        .filter(|line| is_info_detlog(line))
+        .map(|line| {
+            // The last separator, as the DETLOG reader splits: the human
+            // text before it can hold the same characters, in a pathname.
+            line.rsplit_once(detcore::detlog::RECORD_SEPARATOR)
+                .map_or(line, |(human, _)| human)
+        })
+        .collect();
+    if records.is_empty() {
+        return Some(format!(
+            "{heading} The last {} bytes of its log {} hold no INFO DETLOG record.\n",
+            SIGNAL_REPORT_TAIL_BYTES,
+            log.display()
+        ));
+    }
+    let shown = &records[records.len().saturating_sub(SIGNAL_REPORT_RECORDS)..];
+    let mut report = format!(
+        "{heading} Its last {} INFO DETLOG records, from {}:\n",
+        shown.len(),
+        log.display()
+    );
+    for record in shown {
+        report.push_str("::   ");
+        report.push_str(cut_at_char_boundary(record, SIGNAL_REPORT_LINE_BYTES));
+        if record.len() > SIGNAL_REPORT_LINE_BYTES {
+            report.push_str(" [cut]");
+        }
+        report.push('\n');
+    }
+    Some(report)
+}
+
+/// The [`signal_termination_report`]s of a verification's runs, prepared
+/// while each run's log exists, because the comparison consumes the logs.
+///
+/// When this is dropped they are queued, unless [`Self::verified`] discarded
+/// them first. So every way a verification ends without verifying its runs
+/// reports the signals that ended them: a status `--verify-allow` refuses, a
+/// comparison that rejects runs whose statuses `--verify-allow=both` or
+/// `failure` admitted, or an error. A verification that verifies its runs has
+/// nothing to explain and prints nothing.
+///
+/// `main` writes the queue with [`write_queued_signal_reports`], after
+/// everything else hermit says, so the report can neither delay nor replace
+/// the verification's own disposition: nothing waits behind it, and it never
+/// waits itself.
+#[must_use]
+#[derive(Default)]
+pub(crate) struct SignalTerminationReports(Vec<String>);
+
+/// The reports of verifications that ended unverified, for
+/// [`write_queued_signal_reports`].
+static QUEUED_SIGNAL_REPORTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Write the queued [`SignalTerminationReports`] to stderr. `main` calls this
+/// last, just before hermit exits.
+///
+/// No write waits for the reader of stderr, with or without
+/// `--max-log-bytes`: each goes through
+/// [`hermit::nonwaiting_write::write_without_waiting_for_a_reader`], and the
+/// first one that stderr refuses or that fails ends the report. A pipe nobody
+/// reads therefore gets what fits and hermit exits; the line that filled it
+/// may be cut.
+pub(crate) fn write_queued_signal_reports() {
+    let reports = std::mem::take(
+        &mut *QUEUED_SIGNAL_REPORTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    write_signal_reports(libc::STDERR_FILENO, &reports);
+}
+
+/// Write `reports` to `fd` for [`write_queued_signal_reports`], one line per
+/// write.
+///
+/// ⚠️ ONE WRITE OF A WHOLE REPORT CAN PUT NOTHING IN A PIPE THAT HAS ROOM. A
+/// non-blocking write to a Linux pipe adds to the pipe's last page only the
+/// part of the write past its last whole page, and only when all of that part
+/// fits there; the rest needs an empty page. A report of 7.8 KB written to a
+/// one-page pipe that already holds 700 bytes is therefore refused whole,
+/// although 3.4 KB of the page are free: whether its first line arrived
+/// depended on how much hermit had said before it, and the no-perf-counters
+/// warning a GitHub-hosted runner prints was enough to lose it. Records are
+/// cut at [`SIGNAL_REPORT_LINE_BYTES`], far less than a page, so each line is
+/// added to the last page while it fits.
+fn write_signal_reports(fd: libc::c_int, reports: &[String]) {
+    for line in reports
+        .iter()
+        .flat_map(|report| report.split_inclusive('\n'))
+    {
+        let mut rest = line.as_bytes();
+        while !rest.is_empty() {
+            match hermit::nonwaiting_write::write_without_waiting_for_a_reader(fd, rest) {
+                Ok(written) if written > 0 => rest = &rest[written..],
+                _ => return,
+            }
+        }
+    }
+}
+
+impl SignalTerminationReports {
+    /// Prepare the report of run `label`, if `status` is a termination by a
+    /// signal. `log` must still hold the run's log.
+    pub(crate) fn prepare(&mut self, label: &str, status: ExitStatus, log: &Path) {
+        self.0.extend(signal_termination_report(label, status, log));
+    }
+
+    /// The runs verified: discard the reports.
+    pub(crate) fn verified(mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for SignalTerminationReports {
+    fn drop(&mut self) {
+        if std::thread::panicking() || self.0.is_empty() {
+            return;
+        }
+        QUEUED_SIGNAL_REPORTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .append(&mut self.0);
+    }
+}
+
+/// Whether `line` is an INFO DETLOG record. A record starts with its level,
+/// after the timestamp a log file gives it.
+fn is_info_detlog(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let info = match words.next() {
+        Some("INFO") => true,
+        Some(_) => words.next() == Some("INFO"),
+        None => false,
+    };
+    info && line.contains(" DETLOG ")
+}
+
+/// The last `max` bytes of `path`, from the first line that starts within
+/// them, with invalid UTF-8 replaced.
+fn read_log_tail(path: &Path, max: u64) -> io::Result<String> {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+
+    let mut file = File::open(path)?;
+    let start = file.metadata()?.len().saturating_sub(max);
+    // From one byte earlier, which tells whether `start` begins a line.
+    file.seek(SeekFrom::Start(start.saturating_sub(1)))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if start > 0 {
+        // Drop that byte, and the rest of the line it ends or is part of.
+        let first_line_end = bytes.iter().position(|&byte| byte == b'\n');
+        bytes.drain(..first_line_end.map_or(bytes.len(), |end| end + 1));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn cut_at_char_boundary(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn retain_verification_log(label: &str, log: TempPath) -> Result<PathBuf, Error> {
@@ -1306,6 +1844,7 @@ fn compare_two_runs_with_unsupported_scan(
     // "compared nothing" from "compared and matched".
     let mut compared_log_messages: Option<ComparedLogCounts> = None;
     let mut first_divergent_scheduler_turn = None;
+    let mut first_divergent_record_positions = None;
     let mut first_divergent_virtual_nanoseconds = None;
     let mut first_divergent_record = None;
     let mut first_divergent_syscall = None;
@@ -1422,6 +1961,20 @@ fn compare_two_runs_with_unsupported_scan(
                 left: summary.compared_left,
                 right: summary.compared_right,
             });
+            // A recvmsg whose buffers could not be observed after the call is
+            // logged as an `unobserved` buffer-digest record and compared like
+            // any other; every verification path reports how many there were,
+            // so the gap is never silent.
+            let unobserved = [log1.as_ref(), log2.as_ref()].map(|log: &std::path::Path| {
+                logdiff::count_unobserved_receives(log)
+                    .map_or_else(|_| "unreadable".to_string(), |count| count.to_string())
+            });
+            if unobserved.iter().any(|count| count != "0") {
+                eprintln!(
+                    ":: recvmsg calls whose buffers were unobservable after the call (compared as 'unobserved' buffer-digest entries): run1={}, run2={}",
+                    unobserved[0], unobserved[1]
+                );
+            }
             if summary.diff_found {
                 failed = true;
                 if let Some(refusal_reason) = summary.refusal_reason.clone() {
@@ -1430,6 +1983,7 @@ fn compare_two_runs_with_unsupported_scan(
                     observed_divergence = true;
                 }
                 first_divergent_scheduler_turn = summary.first_divergent_scheduler_turn;
+                first_divergent_record_positions = summary.first_divergent_record_positions;
                 first_divergent_virtual_nanoseconds = summary.first_divergent_virtual_nanoseconds;
                 // Set inside this `diff_found` arm, matching its two siblings
                 // above.
@@ -1485,49 +2039,55 @@ fn compare_two_runs_with_unsupported_scan(
         Ok(())
     })();
 
-    if let Err(error) = log_processing_result {
-        if options.keep_logs || failed {
+    if options.caller_owns_logs {
+        // Links to the caller's logs: dropping them leaves the logs.
+        drop((log1, log2));
+        log_processing_result?;
+    } else {
+        if let Err(error) = log_processing_result {
+            if options.keep_logs || failed {
+                if let Some(retention) = &options.failed_log_retention {
+                    eprintln!(":: Verification logs retained:");
+                    retain_failed_verification_logs([(label1, log1), (label2, log2)], retention)?;
+                } else {
+                    retain_verification_logs([(label1, log1), (label2, log2)])?;
+                }
+            }
+            return Err(error);
+        }
+
+        // Divergence historically retained both diagnostics, and it still does.
+        // `--keep-logs` extends retention to successful comparisons, but a match
+        // needs only one log: once the two logs compared equal under the selected
+        // policy, the first is kept as the golden log and the second is deleted.
+        // It is deleted only when the logs were actually compared and no result
+        // the caller already observed overrides the match; every other outcome
+        // keeps both, as the failure path always has.
+        let keep_golden_log_only = options.keep_logs
+            && !failed
+            && !options.match_overridden
+            && compared_log_messages.is_some();
+        if keep_golden_log_only {
+            retain_verification_logs([(label1, log1)])?;
+            let matched_log = log2.to_path_buf();
+            log2.close().with_context(|| {
+                format!(
+                    "could not delete {label2}'s log {}, which matched {label1}'s",
+                    matched_log.display()
+                )
+            })?;
+            // Deliberately not in the `::   <label>: <path>` shape printed for a
+            // retained log: the deleted file has no path left to report.
+            eprintln!(
+                ":: Deleted {label2}'s log: it matched {label1}'s, which is kept as the golden log"
+            );
+        } else if options.keep_logs || failed {
             if let Some(retention) = &options.failed_log_retention {
                 eprintln!(":: Verification logs retained:");
                 retain_failed_verification_logs([(label1, log1), (label2, log2)], retention)?;
             } else {
                 retain_verification_logs([(label1, log1), (label2, log2)])?;
             }
-        }
-        return Err(error);
-    }
-
-    // Divergence historically retained both diagnostics, and it still does.
-    // `--keep-logs` extends retention to successful comparisons, but a match
-    // needs only one log: once the two logs compared equal under the selected
-    // policy, the first is kept as the golden log and the second is deleted.
-    // It is deleted only when the logs were actually compared and no result
-    // the caller already observed overrides the match; every other outcome
-    // keeps both, as the failure path always has.
-    let keep_golden_log_only = options.keep_logs
-        && !failed
-        && !options.match_overridden
-        && compared_log_messages.is_some();
-    if keep_golden_log_only {
-        retain_verification_logs([(label1, log1)])?;
-        let matched_log = log2.to_path_buf();
-        log2.close().with_context(|| {
-            format!(
-                "could not delete {label2}'s log {}, which matched {label1}'s",
-                matched_log.display()
-            )
-        })?;
-        // Deliberately not in the `::   <label>: <path>` shape printed for a
-        // retained log: the deleted file has no path left to report.
-        eprintln!(
-            ":: Deleted {label2}'s log: it matched {label1}'s, which is kept as the golden log"
-        );
-    } else if options.keep_logs || failed {
-        if let Some(retention) = &options.failed_log_retention {
-            eprintln!(":: Verification logs retained:");
-            retain_failed_verification_logs([(label1, log1), (label2, log2)], retention)?;
-        } else {
-            retain_verification_logs([(label1, log1), (label2, log2)])?;
         }
     }
 
@@ -1542,6 +2102,7 @@ fn compare_two_runs_with_unsupported_scan(
         let no_result_reason =
             (verdict == Verdict::NoResult).then(|| NoResultReason::ComparisonRefused {
                 detail: comparison_refusal_reason
+                    .clone()
                     .expect("a refused comparison retains its producer reason"),
             });
 
@@ -1552,6 +2113,7 @@ fn compare_two_runs_with_unsupported_scan(
         Ok(VerificationOutcome {
             verdict,
             no_result_reason,
+            refused_log_comparison: comparison_refusal_reason,
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
@@ -1559,6 +2121,7 @@ fn compare_two_runs_with_unsupported_scan(
             dbt_counted_branches: None,
             runtime: None,
             first_divergent_scheduler_turn,
+            first_divergent_record_positions,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
             first_divergent_syscall,
@@ -1569,6 +2132,7 @@ fn compare_two_runs_with_unsupported_scan(
         Ok(VerificationOutcome {
             verdict: Verdict::Matched,
             no_result_reason: None,
+            refused_log_comparison: None,
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
@@ -1576,6 +2140,7 @@ fn compare_two_runs_with_unsupported_scan(
             dbt_counted_branches: None,
             runtime: None,
             first_divergent_scheduler_turn,
+            first_divergent_record_positions,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
             first_divergent_syscall,
@@ -1692,6 +2257,12 @@ pub enum SecondRun {
 /// comparison can be read as that claim.
 pub(crate) const BITWISE_PARITY_CLAIM: &str = "bitwise parity established";
 
+/// Set when a run or recording in this process used `--cpu-profile
+/// x86-64-v3`, so that a match also states what that profile's qualification
+/// leaves uncovered.
+pub(crate) static CPU_PROFILE_V3_RAN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Write the announcement for `outcome` to `out`.
 ///
 /// On a match, the caller's success message is followed by a line that states
@@ -1723,6 +2294,11 @@ fn write_verification_announcement(
                 ":: {}",
                 matched_comparison_qualifier(outcome, second_run)
             )?;
+            // What a match under x86-64-v3 does not cover
+            // (https://github.com/rrnewton/hermit/issues/4243).
+            if CPU_PROFILE_V3_RAN.load(std::sync::atomic::Ordering::SeqCst) {
+                writeln!(out, ":: {}", detcore_model::cpu_profile::V3_RESIDUAL)?;
+            }
         }
         Verdict::Diverged => writeln!(out, ":: {}", failure_message.red().bold())?,
         Verdict::NoResult => writeln!(
@@ -1834,6 +2410,210 @@ mod tests {
 
     use super::*;
 
+    /// A report larger than a page reaches a one-page pipe that has room for
+    /// its first lines. Written as one write it put nothing there: 3600 bytes
+    /// waiting plus the 1004 bytes past the report's whole page do not fit in
+    /// the page, and a one-page pipe has no empty page for the rest.
+    #[test]
+    fn signal_reports_fill_a_pipe_that_cannot_take_them_whole() {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (read_end, write_end) = (fds[0], fds[1]);
+        // SAFETY: F_SETPIPE_SZ only resizes the pipe.
+        assert_eq!(
+            unsafe { libc::fcntl(write_end, libc::F_SETPIPE_SZ, 4096) },
+            4096
+        );
+        let waiting = vec![b'.'; 3600];
+        // SAFETY: `waiting` is valid for its length.
+        let wrote = unsafe { libc::write(write_end, waiting.as_ptr().cast(), waiting.len()) };
+        assert_eq!(wrote, 3600);
+
+        let heading = format!(
+            "{:<99}\n",
+            ":: The run 1 guest was terminated by signal 10 (SIGUSR1)."
+        );
+        let record = format!("{:<99}\n", "record");
+        let report = format!("{heading}{}", record.repeat(50));
+        assert_eq!(report.len() % 4096, 1004);
+        write_signal_reports(write_end, &[report]);
+        // SAFETY: closes only the pipe's write end, opened above.
+        unsafe { libc::close(write_end) };
+
+        let mut delivered = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            // SAFETY: `buffer` is valid for its length.
+            let read = unsafe { libc::read(read_end, buffer.as_mut_ptr().cast(), buffer.len()) };
+            assert!(read >= 0, "{}", std::io::Error::last_os_error());
+            if read == 0 {
+                break;
+            }
+            delivered.extend_from_slice(&buffer[..read as usize]);
+        }
+        // SAFETY: closes only the pipe's read end, opened above.
+        unsafe { libc::close(read_end) };
+        // The four whole lines that fit: a line is never split across the
+        // page's end, because the part past a whole page must fit whole.
+        assert_eq!(delivered.len(), 4000);
+        assert_eq!(&delivered[3600..3700], heading.as_bytes());
+    }
+
+    #[test]
+    fn signal_termination_report_shows_the_last_detlog_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run1_log");
+        let mut text = String::new();
+        for record in 0..25 {
+            text.push_str(&format!(
+                "2026-10-07T00:00:00.000000Z INFO detcore: [dtid 3] DETLOG [syscall] record {record}{}{{\"schema\":1}}\n",
+                detcore::detlog::RECORD_SEPARATOR
+            ));
+            text.push_str("2026-10-07T00:00:00.000000Z INFO detcore::scheduler: COMMIT turn\n");
+            text.push_str(
+                "2026-10-07T00:00:00.000000Z DEBUG detcore: DETLOG (post) registers [dtid 3]\n",
+            );
+        }
+        fs::write(&log, text).unwrap();
+
+        let status = ExitStatus::Signaled(reverie::process::Signal::SIGSEGV, true);
+        let report = signal_termination_report("run 1", status, &log).unwrap();
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!(
+                ":: The run 1 guest was terminated by signal 11 (SIGSEGV, core dumped). \
+                 Its last 20 INFO DETLOG records, from {}:",
+                log.display()
+            )
+        );
+        assert_eq!(lines.len(), 21, "{report}");
+        assert!(lines[1].ends_with("DETLOG [syscall] record 5"), "{report}");
+        assert!(
+            lines[20].ends_with("DETLOG [syscall] record 24"),
+            "{report}"
+        );
+        assert!(!report.contains("COMMIT") && !report.contains("DETLOG_RECORD"));
+        assert!(!report.contains("registers"), "{report}");
+    }
+
+    #[test]
+    fn signal_termination_report_is_only_for_a_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run1_log");
+        fs::write(&log, "INFO detcore: DETLOG [syscall] exit_group\n").unwrap();
+        for code in [0, 1, 139] {
+            assert_eq!(
+                signal_termination_report("run 1", ExitStatus::Exited(code), &log),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn signal_termination_report_names_a_log_it_cannot_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = ExitStatus::Signaled(reverie::process::Signal::SIGKILL, false);
+
+        let missing = dir.path().join("absent");
+        let report = signal_termination_report("run 2", status, &missing).unwrap();
+        assert!(
+            report.starts_with(":: The run 2 guest was terminated by signal 9 (SIGKILL). Its log ")
+                && report.contains("could not be read"),
+            "{report}"
+        );
+
+        let empty = dir.path().join("empty");
+        fs::write(&empty, "INFO detcore::scheduler: COMMIT turn\n").unwrap();
+        let report = signal_termination_report("run 2", status, &empty).unwrap();
+        assert!(report.contains("hold no INFO DETLOG record"), "{report}");
+    }
+
+    #[test]
+    fn signal_termination_report_keeps_a_separator_inside_the_human_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run1_log");
+        // A pathname may hold the separator's characters; only the last
+        // separator starts the machine-readable suffix.
+        let human = format!(
+            "INFO detcore: DETLOG [syscall] openat(AT_FDCWD, \"/tmp/p{}guest\", O_RDONLY) = Ok(3)",
+            detcore::detlog::RECORD_SEPARATOR
+        );
+        fs::write(
+            &log,
+            format!(
+                "{human}{}{{\"schema\":1}}\n",
+                detcore::detlog::RECORD_SEPARATOR
+            ),
+        )
+        .unwrap();
+        let status = ExitStatus::Signaled(reverie::process::Signal::SIGSEGV, false);
+        let report = signal_termination_report("run 1", status, &log).unwrap();
+        assert_eq!(
+            report.lines().nth(1),
+            Some(format!("::   {human}").as_str())
+        );
+    }
+
+    #[test]
+    fn signal_termination_report_cuts_long_records_on_a_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run1_log");
+        // "é" is two bytes, so the cut falls inside one unless it is moved.
+        let line = format!(
+            "INFO detcore: DETLOG x{}",
+            "é".repeat(SIGNAL_REPORT_LINE_BYTES)
+        );
+        fs::write(&log, format!("{line}\n")).unwrap();
+        let status = ExitStatus::Signaled(reverie::process::Signal::SIGABRT, false);
+        let report = signal_termination_report("run 1", status, &log).unwrap();
+        let shown = report.lines().nth(1).unwrap();
+        assert!(shown.ends_with(" [cut]"), "{shown}");
+        assert!(shown.len() <= "::   ".len() + SIGNAL_REPORT_LINE_BYTES + " [cut]".len());
+    }
+
+    #[test]
+    fn a_log_tail_starts_at_a_whole_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        fs::write(&log, "first line\nsecond line\nthird\n").unwrap();
+        // 29 bytes; "second line" starts 18 bytes from the end.
+        assert_eq!(read_log_tail(&log, 15).unwrap(), "third\n");
+        assert_eq!(read_log_tail(&log, 17).unwrap(), "third\n");
+        assert_eq!(read_log_tail(&log, 18).unwrap(), "second line\nthird\n");
+        assert_eq!(read_log_tail(&log, 19).unwrap(), "second line\nthird\n");
+        assert_eq!(
+            read_log_tail(&log, 1 << 20).unwrap(),
+            "first line\nsecond line\nthird\n"
+        );
+    }
+
+    #[test]
+    fn a_recorded_branch_counter_verdict_is_stamped_on_every_report_once() {
+        let recorded = BranchCounterVerdict {
+            present: true,
+            evidence: "fixture CPU: Reverie performance-counter validation passed".into(),
+        };
+        // Nothing recorded (another backend): the report is written as built.
+        let report = VerificationReport::no_result();
+        assert_eq!(with_exact_branch_counter(&report, None), report);
+        // Recorded: every report gains it, the pending no-result stamp included.
+        let stamped = with_exact_branch_counter(&report, Some(&recorded));
+        assert_eq!(stamped.exact_branch_counter.as_ref(), Some(&recorded));
+        // A report that already carries a verdict keeps its own.
+        let own = BranchCounterVerdict {
+            present: false,
+            evidence: "fixture: own verdict".into(),
+        };
+        let mut carrying = VerificationReport::no_result();
+        carrying.exact_branch_counter = Some(own.clone());
+        assert_eq!(
+            with_exact_branch_counter(&carrying, Some(&recorded)).exact_branch_counter,
+            Some(own)
+        );
+    }
+
     fn classified_container<T: serde::Serialize + serde::de::DeserializeOwned>(
         mut child: impl FnMut() -> Result<T, Error>,
     ) -> Result<T, Error> {
@@ -1931,6 +2711,7 @@ mod tests {
             101,
             detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
             hermit::HERMIT_DEADLINE_EXIT,
+            hermit::HERMIT_LOG_CAP_EXIT,
             detcore_model::signal_exit_status(libc::SIGTERM),
         ] {
             write_pending_verification_json(&path).unwrap();
@@ -1969,6 +2750,18 @@ mod tests {
                     );
                     assert_eq!(report, VerificationReport::no_result());
                 }
+                123 => {
+                    assert!(
+                        error
+                            .downcast_ref::<super::super::container::LogCapExceeded>()
+                            .is_some()
+                    );
+                    assert_eq!(report, VerificationReport::no_result());
+                    assert_eq!(
+                        super::super::failure_exit_code(&error),
+                        hermit::HERMIT_LOG_CAP_EXIT
+                    );
+                }
                 _ => {
                     assert!(
                         error
@@ -1977,6 +2770,72 @@ mod tests {
                     );
                     assert_eq!(report, VerificationReport::no_result());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_typed_run_failure_replaces_the_stamp_and_an_untyped_error_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.json");
+        let cases: Vec<(Error, Option<RunFailure>)> = vec![
+            (
+                Error::new(hermit::BackendRunFailure)
+                    .context("drrun started and the DBT run then failed: missing FINAL frames"),
+                Some(RunFailure::BackendFailure),
+            ),
+            (
+                Error::new(super::super::run::DeterminismLossRecorded::new(
+                    "run 1",
+                    "process 3 exited without deregistering",
+                )),
+                Some(RunFailure::DeterminismLoss),
+            ),
+            (
+                Error::msg("the guest program is statically linked")
+                    .context(super::super::container::PolicyRefusal),
+                Some(RunFailure::PolicyRefusal),
+            ),
+            // Already published as its infrastructure error.
+            (
+                Error::new(hermit::SkidOvershootError::new(2))
+                    .context(super::super::container::PolicyRefusal),
+                None,
+            ),
+            (Error::msg("unknown flag --frobnicate"), None),
+        ];
+        // The type decides, never the text: the same message without its type
+        // leaves the stamp.
+        for (error, _) in &cases {
+            write_pending_verification_json(&path).unwrap();
+            drop(publish_run_failure(
+                Some(&path),
+                VerificationRun::Run1,
+                Error::msg(format!("{error:#}")),
+            ));
+            assert_eq!(
+                VerificationReport::from_current_json_slice(&fs::read(&path).unwrap()).unwrap(),
+                VerificationReport::no_result()
+            );
+        }
+        for (error, expected) in cases {
+            write_pending_verification_json(&path).unwrap();
+            let message = format!("{error:#}");
+            let returned = publish_run_failure(Some(&path), VerificationRun::Run2, error);
+            // The caller's error comes back unchanged, typed as it was.
+            assert_eq!(format!("{returned:#}"), message);
+            let report =
+                VerificationReport::from_current_json_slice(&fs::read(&path).unwrap()).unwrap();
+            match expected {
+                Some(failure) => assert_eq!(
+                    report.no_result_reason,
+                    Some(NoResultReason::RunFailed {
+                        run: VerificationRun::Run2,
+                        failure,
+                        detail: message,
+                    })
+                ),
+                None => assert_eq!(report, VerificationReport::no_result()),
             }
         }
     }
@@ -2106,12 +2965,381 @@ mod tests {
         }
     }
 
+    /// How the child of [`retention_report_in_child`], which reported its kept
+    /// verification log, ended.
+    #[derive(Debug, PartialEq, Eq)]
+    enum RetentionChild {
+        /// The report returned, the error kept its exit class and the log
+        /// was kept.
+        Returned,
+        /// The report panicked. In hermit that is exit 101, not the
+        /// primary error's status.
+        Panicked,
+        /// The report was still running after [`RETENTION_CHILD_BOUND`], and
+        /// the child was killed.
+        StillRunning,
+        /// Any other end, as the raw wait status.
+        Other(libc::c_int),
+    }
+
+    /// Far longer than a report that does not wait takes on a loaded host. A
+    /// report blocked on a full pipe never ends by itself, so waiting longer
+    /// would show nothing more.
+    const RETENTION_CHILD_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Set in the re-executed child of [`retention_report_in_child`]: the
+    /// primary error, "log cap" or "timeout".
+    const RETENTION_CHILD_PRIMARY: &str = "HERMIT_TEST_RETENTION_CHILD_PRIMARY";
+
+    /// Set with [`RETENTION_CHILD_PRIMARY`]: the directory for the child's log.
+    const RETENTION_CHILD_DIR: &str = "HERMIT_TEST_RETENTION_CHILD_DIR";
+
+    /// The child's exit code when the report returned, the error kept its
+    /// exit class and the log was kept. It is not 0, which is what the test
+    /// binary exits with when its name filter matched no test.
+    const RETENTION_CHILD_RETURNED: libc::c_int = 10;
+
+    /// The child's exit code when an `eprint!` did not reach its descriptor
+    /// 2, so that a blocking or panicking `eprintln!` could not be seen. The
+    /// child runs with `--nocapture`, so this would mean libtest captured
+    /// its output anyway; the test then fails rather than pass without
+    /// testing anything.
+    const RETENTION_CHILD_OUTPUT_CAPTURED: libc::c_int = 5;
+
+    /// The first statement of each test that runs [`retention_report_in_child`].
+    /// In that child, the variables above are set: report, then exit with
+    /// the result instead of returning into the test harness. Elsewhere,
+    /// return.
+    fn retention_child_entry() {
+        let (Ok(primary), Some(dir)) = (
+            std::env::var(RETENTION_CHILD_PRIMARY),
+            std::env::var_os(RETENTION_CHILD_DIR),
+        ) else {
+            return;
+        };
+        let primary = match primary.as_str() {
+            "log cap" => log_cap_error,
+            "timeout" => timeout_error,
+            other => panic!("unknown primary error {other:?}"),
+        };
+        let code = retention_report_child_body(primary, Path::new(&dir));
+        // SAFETY: _exit has no preconditions.
+        unsafe { libc::_exit(code) }
+    }
+
+    /// Run the test named `test` in a new process of this test binary, with
+    /// descriptor 2 a copy of `stderr`, the write end of a pipe. That test
+    /// starts with [`retention_child_entry`], so the child calls
+    /// `retain_logs_after_verification_error` with the `primary` error for
+    /// one log it creates in `dir`. Wait for it for at most
+    /// [`RETENTION_CHILD_BOUND`].
+    ///
+    /// The child runs with `--nocapture`. A forked child would inherit
+    /// libtest's output capture when this test runs under `cargo test`
+    /// without `--nocapture`, and its `eprint!` would then never reach its
+    /// descriptor 2.
+    ///
+    /// The child keeps SIGPIPE ignored, as hermit's outer process does: the
+    /// Rust runtime ignores it at startup and hermit never restores it. A
+    /// write to a pipe without a reader therefore fails with EPIPE, which
+    /// `eprintln!` turns into a panic. Unit tests never enable the exit
+    /// bound that `main` arms for a capped run
+    /// (`tracing::bound_log_cap_exit`), so what this observes is the report
+    /// itself, not that bound covering for it.
+    fn retention_report_in_child(
+        test: &str,
+        primary: &str,
+        stderr: &std::os::fd::OwnedFd,
+        dir: &Path,
+    ) -> RetentionChild {
+        use std::os::unix::process::ExitStatusExt as _;
+        // The Command, and with it this process's copy of `stderr`, is
+        // dropped at the end of this statement.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(RETENTION_CHILD_PRIMARY, primary)
+            .env(RETENTION_CHILD_DIR, dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr.try_clone().unwrap())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if start.elapsed() >= RETENTION_CHILD_BOUND {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                return RetentionChild::StillRunning;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_ne!(
+            status.code(),
+            Some(RETENTION_CHILD_OUTPUT_CAPTURED),
+            "eprint! in the child did not reach its descriptor 2"
+        );
+        match status.code() {
+            Some(RETENTION_CHILD_RETURNED) => RetentionChild::Returned,
+            Some(101) => RetentionChild::Panicked,
+            _ => RetentionChild::Other(status.into_raw()),
+        }
+    }
+
+    /// The body of the child of [`retention_report_in_child`]; returns its
+    /// exit code.
+    fn retention_report_child_body(primary: fn() -> Error, dir: &Path) -> i32 {
+        // SAFETY: the calls below only change this process's SIGPIPE
+        // disposition and descriptors, and read into a local buffer. The
+        // test harness's other thread is waiting for this test and writes
+        // nothing to descriptor 2 meanwhile.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            let stderr = libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 3);
+            let mut probe = [0; 2];
+            if stderr < 0
+                || libc::pipe2(probe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) != 0
+                || libc::dup2(probe[1], libc::STDERR_FILENO) < 0
+            {
+                return 6;
+            }
+            eprint!("probe");
+            let mut seen = [0u8; 8];
+            if libc::read(probe[0], seen.as_mut_ptr().cast(), seen.len()) != 5
+                || &seen[..5] != b"probe"
+            {
+                return RETENTION_CHILD_OUTPUT_CAPTURED;
+            }
+            if libc::dup2(stderr, libc::STDERR_FILENO) < 0 {
+                return 6;
+            }
+        }
+        let Ok(log) = tempfile::NamedTempFile::new_in(dir) else {
+            return 6;
+        };
+        let log = log.into_temp_path();
+        let path = log.to_path_buf();
+        let class = super::super::failure_exit_code(&primary());
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            retain_logs_after_verification_error(primary(), [("run 1", log)])
+        })) {
+            Err(_) => 101,
+            Ok(error) if super::super::failure_exit_code(&error) != class => 3,
+            // A TempPath that was not kept deletes its file when dropped.
+            Ok(_) if !path.exists() => 4,
+            Ok(_) => RETENTION_CHILD_RETURNED,
+        }
+    }
+
+    fn retention_stderr_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        // SAFETY: pipe2 writes two new descriptors into `fds`.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: both descriptors were just created and are owned only here.
+        unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    fn files_in(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    fn log_cap_error() -> Error {
+        Error::new(super::super::container::LogCapExceeded)
+    }
+
+    fn timeout_error() -> Error {
+        Error::new(super::super::container::RunTimeoutMarker)
+    }
+
+    /// Round-3 review of https://github.com/rrnewton/hermit/pull/3686, finding
+    /// 4: after the log cap ends run 1 or run 2, `--verify --keep-logs`
+    /// reports the logs it kept. Through `eprintln!`, that report panicked
+    /// when stderr was a pipe whose reader had gone, so hermit exited 101
+    /// instead of 123. The report is now tried once without waiting and is
+    /// omitted when it cannot be delivered; the log is still kept.
+    #[test]
+    fn log_cap_retention_report_survives_a_stderr_without_a_reader() {
+        retention_child_entry();
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, writer) = retention_stderr_pipe();
+        drop(reader);
+        assert_eq!(
+            retention_report_in_child(
+                "verify::tests::log_cap_retention_report_survives_a_stderr_without_a_reader",
+                "log cap",
+                &writer,
+                dir.path()
+            ),
+            RetentionChild::Returned
+        );
+        assert_eq!(files_in(dir.path()).len(), 1, "the log was not kept");
+    }
+
+    /// The same finding with stderr a full pipe that its reader never
+    /// drains: the `eprintln!` report waited for it forever.
+    #[test]
+    fn log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe() {
+        retention_child_entry();
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, writer) = retention_stderr_pipe();
+        // Fill the pipe in non-blocking mode, then make the write end
+        // blocking again, as an inherited stderr is.
+        // SAFETY: fcntl and write act only on this test's own descriptor,
+        // and write reads only the chunk it is given.
+        unsafe {
+            assert_eq!(
+                libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK),
+                0
+            );
+            for chunk in [&[b'x'; 4096][..], &[b'x'; 1][..]] {
+                while libc::write(writer.as_raw_fd(), chunk.as_ptr().cast(), chunk.len()) > 0 {}
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EAGAIN)
+                );
+            }
+            assert_eq!(libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, 0), 0);
+        }
+        assert_eq!(
+            retention_report_in_child(
+                "verify::tests::log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe",
+                "log cap",
+                &writer,
+                dir.path()
+            ),
+            RetentionChild::Returned
+        );
+        drop(reader);
+        assert_eq!(files_in(dir.path()).len(), 1, "the log was not kept");
+    }
+
+    /// Where stderr can take the report at once, the report reads exactly
+    /// as it did before the fix above, for the cap and for every other
+    /// failure class (a timeout stands for those here).
+    #[test]
+    fn retention_report_reads_as_before_when_stderr_has_room() {
+        use std::io::Read as _;
+        retention_child_entry();
+        for class in ["log cap", "timeout"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (reader, writer) = retention_stderr_pipe();
+            assert_eq!(
+                retention_report_in_child(
+                    "verify::tests::retention_report_reads_as_before_when_stderr_has_room",
+                    class,
+                    &writer,
+                    dir.path()
+                ),
+                RetentionChild::Returned,
+                "{class}"
+            );
+            drop(writer);
+            let mut report = String::new();
+            File::from(reader).read_to_string(&mut report).unwrap();
+            let kept = files_in(dir.path());
+            assert_eq!(kept.len(), 1, "{class}: the log was not kept");
+            assert_eq!(
+                report,
+                format!(
+                    ":: Verification logs retained:\n::   run 1: {}\n",
+                    kept[0].display()
+                ),
+                "{class}"
+            );
+        }
+    }
+
     fn output(status: i32, stdout: &[u8], stderr: &[u8]) -> Output {
         Output {
             status: ExitStatus::Exited(status),
             stdout: stdout.to_vec(),
             stderr: stderr.to_vec(),
         }
+    }
+
+    #[test]
+    fn compared_guest_output_uses_the_common_agreement_policy() {
+        let first = output(0, b"stdout\0without newline", b"stderr\xff");
+        for verified in [true, false] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            // The verdict/status need not match for these output bytes to be
+            // unambiguous. A log-only divergence still emits them once.
+            let second = output(23, &first.stdout, &first.stderr);
+            emit_compared_guest_output_to(verified, &first, &second, &mut stdout, &mut stderr)
+                .unwrap();
+            assert_eq!(stdout, first.stdout);
+            assert_eq!(stderr, first.stderr);
+        }
+        for second in [
+            output(0, b"different stdout", &first.stderr),
+            output(0, &first.stdout, b"different stderr"),
+        ] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            emit_compared_guest_output_to(false, &first, &second, &mut stdout, &mut stderr)
+                .unwrap();
+            assert!(stdout.is_empty());
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn compared_guest_output_preserves_write_error_order() {
+        struct FailAfterByte {
+            bytes: Vec<u8>,
+            errno: i32,
+        }
+        impl io::Write for FailAfterByte {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.is_empty() {
+                    return Ok(0);
+                }
+                if self.bytes.is_empty() {
+                    self.bytes.push(bytes[0]);
+                    Ok(1)
+                } else {
+                    Err(io::Error::from_raw_os_error(self.errno))
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("the common output policy does not add a flush")
+            }
+        }
+        let first = output(0, b"out", b"err");
+        let mut stdout = FailAfterByte {
+            bytes: Vec::new(),
+            errno: libc::EPIPE,
+        };
+        let mut stderr = Vec::new();
+        let error = emit_compared_guest_output_to(false, &first, &first, &mut stdout, &mut stderr)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
+        assert_eq!(stdout.bytes, b"o");
+        assert!(stderr.is_empty(), "stdout failure must stop before stderr");
+
+        let mut stdout = Vec::new();
+        let mut stderr = FailAfterByte {
+            bytes: Vec::new(),
+            errno: libc::ENOSPC,
+        };
+        let error = emit_compared_guest_output_to(true, &first, &first, &mut stdout, &mut stderr)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert_eq!(stdout, first.stdout);
+        assert_eq!(stderr.bytes, b"e");
     }
 
     fn empty_logs() -> (TempPath, TempPath) {
@@ -2136,9 +3364,10 @@ mod tests {
         GlobalOpts {
             log,
             log_file: None,
+            max_log_bytes: None,
+            log_budget: None,
             log_file_handle: None,
-            run_evidence_log_handle: None,
-            run_evidence_write_error: None,
+            unsafe_ignore_host_seccomp: false,
             backend: None,
         }
     }
@@ -2261,6 +3490,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope,
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
     }
@@ -2534,6 +3764,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
         .unwrap();
@@ -2749,6 +3980,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
         .unwrap();
@@ -3004,6 +4236,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
         .unwrap();
@@ -3162,6 +4395,7 @@ mod tests {
                 failed_log_retention: Some(FailedVerifyLogRetention::new(root.clone(), 2)),
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
         .unwrap();
@@ -3201,6 +4435,7 @@ mod tests {
                 failed_log_retention: Some(retention),
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         )
         .unwrap();
@@ -3342,6 +4577,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
             |_| Err(io::Error::other("injected unsupported-syscall scan error")),
         )
@@ -3408,6 +4644,7 @@ mod tests {
                 failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
+                caller_owns_logs: false,
             },
         );
 
@@ -3663,10 +4900,6 @@ mod tests {
     /// Runs from a temporary working directory so the target really is a bare
     /// relative name. Under the old code this failed on any host where the
     /// working directory and `TMPDIR` are on different filesystems.
-    #[cfg_attr(
-        fbcode_build,
-        ignore = "fbsource-disabled: compile-time CARGO_MANIFEST_DIR is not present at test runtime"
-    )]
     #[test]
     fn a_bare_filename_target_is_overwritten_not_left_stale() {
         // `set_current_dir` is process-global; serialize against any other test
@@ -3674,18 +4907,18 @@ mod tests {
         static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = CWD.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Root the working directory where the process already runs, not in
-        // TMPDIR. A plain `tempdir()` lands beside the staged file and the
-        // cross-filesystem rename never happens, so the test would pass
-        // against the defect -- measured: it did. Where the run directory and
-        // /tmp are distinct filesystems, as a checkout beside a tmpfs /tmp
-        // ordinarily is, cross-filesystem rename(2) is EXDEV, which is what
-        // makes this end-to-end rather than decorative.
-        let previous = std::env::current_dir().unwrap();
+        // Root the working directory in the SOURCE TREE, not in TMPDIR. A
+        // plain `tempdir()` lands beside the staged file and the cross-
+        // filesystem rename never happens, so the test would pass against the
+        // defect -- measured: it did. On this host the checkout and /tmp are
+        // distinct btrfs subvolumes (st_dev 46 vs 47), and cross-subvolume
+        // rename(2) is EXDEV, which is what makes this end-to-end rather than
+        // decorative.
         let dir = tempfile::Builder::new()
             .prefix("verify-json-bare-")
-            .tempdir_in(&previous)
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
             .unwrap();
+        let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
 
         let outcome = (|| {
@@ -3795,6 +5028,84 @@ mod tests {
         assert!(report.comparison.is_some());
         assert!(report.compared_log_messages.is_some());
         assert_eq!(report.guest_exit_code, Some(0));
+    }
+
+    /// An overshoot that coincides with a refused comparison is written as
+    /// the refusal. The log cut at its size bound is a separate failure that
+    /// a fresh attempt must not be allowed to hide, and the report schema
+    /// allows its reason only beside a `no_result` verdict
+    /// (<https://github.com/rrnewton/hermit/issues/1845>).
+    ///
+    /// That holds whichever verdict the comparator selected: with identical
+    /// outputs it selects `no_result`, and when an output or exit-status
+    /// difference is also observed it selects `diverged` and its ordinary
+    /// report carries no refusal reason. A divergence with intact logs is the
+    /// control: it has no refusal to keep, so the overshoot report is written.
+    #[test]
+    fn skid_overshoot_refusal_keeps_a_refused_comparisons_reason() {
+        let same = output(0, b"hello\n", b"");
+        for (label, right, comparator_verdict) in [
+            ("identical outputs", same.clone(), Verdict::NoResult),
+            ("stdout", output(0, b"goodbye\n", b""), Verdict::Diverged),
+            (
+                "stderr",
+                output(0, b"hello\n", b"oops\n"),
+                Verdict::Diverged,
+            ),
+            ("exit status", output(3, b"hello\n", b""), Verdict::Diverged),
+        ] {
+            let file = NamedTempFile::new().unwrap();
+            let path = file.path().to_path_buf();
+            let (log1, log2) = logs_truncated_at_the_bound();
+            let outcome = compare(&same, log1, &right, log2).unwrap();
+            assert_eq!(outcome.verdict, comparator_verdict, "{label}");
+            if comparator_verdict == Verdict::Diverged {
+                // Without an overshoot nothing changes: the divergence is the
+                // report, as `an_observed_difference_outranks_a_refused_comparison`
+                // requires.
+                let ordinary = verification_report(&outcome);
+                assert_eq!(ordinary.verdict, Verdict::Diverged, "{label}");
+                assert_eq!(ordinary.no_result_reason, None, "{label}");
+            }
+
+            write_skid_overshoot_verification_json(&path, &outcome, 3).unwrap();
+
+            let report = VerificationReport::from_current_json_value(
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(report.verdict, Verdict::NoResult, "{label}");
+            assert_eq!(report.infrastructure_error, None, "{label}");
+            assert!(
+                matches!(
+                    report.no_result_reason.as_ref(),
+                    Some(NoResultReason::ComparisonRefused { detail })
+                        if detail.contains("truncated at the configured size bound")
+                ),
+                "{label}: the overshoot report must keep the comparator's refusal: {report:?}"
+            );
+            assert!(!report.verified, "{label}");
+            assert!(!report.bitwise_parity, "{label}");
+            assert_eq!(report.comparison, None, "{label}");
+            assert_eq!(report.compared_outputs, None, "{label}");
+        }
+
+        let file = NamedTempFile::new().unwrap();
+        let (log1, log2) = empty_logs();
+        let outcome = compare(&same, log1, &output(0, b"goodbye\n", b""), log2).unwrap();
+        assert_eq!(outcome.verdict, Verdict::Diverged);
+        assert_eq!(outcome.refused_log_comparison, None);
+        write_skid_overshoot_verification_json(file.path(), &outcome, 3).unwrap();
+        let report = VerificationReport::from_current_json_value(
+            serde_json::from_str(&fs::read_to_string(file.path()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.verdict, Verdict::InfrastructureError);
+        assert_eq!(
+            report.infrastructure_error,
+            Some(InfrastructureError::SkidOvershoot { count: 3 })
+        );
+        assert_eq!(report.no_result_reason, None);
     }
 
     #[test]
@@ -4051,6 +5362,7 @@ mod tests {
         let diverged = VerificationOutcome {
             verdict: Verdict::Diverged,
             no_result_reason: None,
+            refused_log_comparison: None,
             guest_status: ExitStatus::Exited(0),
             comparison: full,
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
@@ -4075,6 +5387,7 @@ mod tests {
             dbt_counted_branches: None,
             runtime: None,
             first_divergent_scheduler_turn: None,
+            first_divergent_record_positions: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,

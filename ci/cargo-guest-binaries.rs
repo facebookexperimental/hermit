@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Cargo guest fixtures required by hermit_modes.
 // Keep the exact names shared by the producer and the consumer.
 pub const CARGO_GUEST_BINARIES: [&str; 21] = [

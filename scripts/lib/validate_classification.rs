@@ -1,10 +1,8 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
 
 //! Classify selected validation nodes without rewriting their raw evidence.
 
@@ -88,9 +86,11 @@ fn refused_without_writing_any_report(attempt: &NodeAttempt) -> bool {
     refusal_cause(attempt).is_some_and(|cause| cause.starts_with(RESULTS_NEVER_WRITTEN))
 }
 
-/// The one case with no evidence in either direction: the node's own command
-/// succeeded, and the only thing marking it not-ok is a report that was never
-/// written. Nothing failed that anybody measured.
+/// The node's own command succeeded, and the only thing marking it not-ok is a
+/// report that was never written. That is not product-failure EVIDENCE (no
+/// measured condition failed), so it does not outrank an infrastructure
+/// diagnosis; with no diagnosis, the node is still a failure (see
+/// [`attempt_classification`]).
 ///
 /// The command's own status is tested here rather than inferred from where
 /// this is called. A node that exited nonzero DID fail a condition; a missing
@@ -188,16 +188,10 @@ pub(super) fn attempt_classification(attempt: &NodeAttempt) -> NodeClassificatio
     if attempt.understood_infrastructure_class.is_some() {
         return NodeClassification::UnderstoodInfrastructureFailure;
     }
-    // Last, so that every measured condition above still wins: a node whose
-    // command succeeded and whose required report was never written produced
-    // no evidence either way. `no_result` keeps it out of the failure count
-    // and equally out of any green evidence for landing, which is both halves
-    // of the ruling. It is deliberately NOT UnderstoodInfrastructureFailure:
-    // nothing here diagnosed a cause, and that bucket is projected with a
-    // named cause it would have to leave empty.
-    if absent_report_is_the_only_failure(attempt) {
-        return NodeClassification::NoResult;
-    }
+    // Everything else that completed not-ok failed, including a node whose
+    // command exited 0 but never wrote the structured test report it is
+    // required to write: that is a defect of the node, so it is a failure of
+    // the node rather than a separate "undetermined" class.
     NodeClassification::ProductFailure
 }
 
@@ -246,6 +240,19 @@ pub(super) struct RunClassification {
 }
 
 impl RunClassification {
+    /// Account `--frozen-run` withheld nodes exactly as host-inapplicable ones
+    /// are: understood prerequisite failures. They are planned (see
+    /// `plan_planned_tags`), never a pass and never unaccounted, and the run
+    /// that carries one is incomplete, so even a row that lost its
+    /// intentional-skip entry reads as a short run rather than a clean one.
+    pub(super) fn account_withheld(&mut self, withheld: &[String]) {
+        for tag in withheld {
+            self.no_result_nodes.remove(tag);
+            self.understood_prerequisite_failure_nodes
+                .insert(tag.clone());
+        }
+    }
+
     pub(super) fn no_results(&self) -> usize {
         self.understood_infrastructure_failure_nodes.len()
             + self.understood_prerequisite_failure_nodes.len()
@@ -459,7 +466,7 @@ fn fold_bracket() -> Result<(), String> {
             || classified.product_failure_nodes.len() != failed
             || classified.no_results() != usize::from(incomplete)
             || validation_is_complete(true, &classified, &planned) == incomplete
-            || super::completed_exit_code(failed, classified.no_results(), false, false)
+            || super::completed_exit_code(failed, classified.no_results() == 0)
                 != if failed > 0 {
                     1
                 } else if incomplete {
@@ -479,8 +486,8 @@ fn fold_bracket() -> Result<(), String> {
     Ok(())
 }
 
-/// A report that was never written is an absence of evidence, not a failure --
-/// and every other measured condition still outranks that absence.
+/// A report that was never written is a failure of the node that owed it, and
+/// every other measured condition still outranks that absence.
 ///
 /// The fixture deliberately starts from a plain failing outcome with NO
 /// infrastructure diagnosis, so the only thing that can satisfy the
@@ -505,10 +512,9 @@ fn absent_report_bracket() -> Result<(), String> {
     let unreadable = "cannot read structured test results /src/counts.json: \
                       No such file or directory (os error 2)";
 
-    if attempt_classification(&refused_only(never_written)) != NodeClassification::NoResult {
+    if attempt_classification(&refused_only(never_written)) != NodeClassification::ProductFailure {
         return Err(
-            "classification: a report that was never written was reported as a product failure"
-                .into(),
+            "classification: a node that never wrote its required report was not a failure".into(),
         );
     }
     for (label, cause) in [("malformed", malformed), ("unreadable", unreadable)] {
@@ -534,7 +540,11 @@ fn absent_report_bracket() -> Result<(), String> {
     }
     // The legacy reason contract, which older attempts are still read back with.
     for (label, cause, want) in [
-        ("never written", never_written, NodeClassification::NoResult),
+        (
+            "never written",
+            never_written,
+            NodeClassification::ProductFailure,
+        ),
         ("malformed", malformed, NodeClassification::ProductFailure),
     ] {
         let mut legacy = reported_attempt(&clean, 1);
@@ -614,9 +624,9 @@ fn absent_report_bracket() -> Result<(), String> {
     }
     // The projection a consumer actually reads, and it must not invent a cause.
     let gate = super::ledger_gate_with_attempts(&clean, &[refused_only(never_written)]);
-    if gate["result"] != "no_result" || gate["failure_class"] != "no_result" {
+    if gate["result"] != "fail" || gate["failure_class"] != "product_failure" {
         return Err(format!(
-            "classification: absent-report projection did not read as no_result; gate={gate}"
+            "classification: absent-report projection did not read as a failure; gate={gate}"
         ));
     }
     Ok(())
@@ -933,7 +943,7 @@ pub(super) fn self_test() -> Result<String, String> {
     product_evidence_bracket()?;
     absent_report_bracket()?;
     populations_bracket()?;
-    Ok("classification: exact selected populations; stale/raw fold agreement; failed tests and node limits outrank infrastructure; an unwritten required report is undetermined rather than failed; missing super repetitions remain unmeasured".into())
+    Ok("classification: exact selected populations; stale/raw fold agreement; failed tests and node limits outrank infrastructure; an unwritten required report fails its node; missing super repetitions remain unmeasured".into())
 }
 
 #[cfg(test)]
@@ -949,7 +959,7 @@ mod tests {
         product_evidence_bracket().unwrap();
     }
     #[test]
-    fn an_unwritten_report_is_undetermined_and_never_outranks_a_measured_condition() {
+    fn an_unwritten_report_fails_its_node_and_never_outranks_a_measured_condition() {
         absent_report_bracket().unwrap();
     }
     #[test]
@@ -1019,7 +1029,7 @@ mod tests {
                 true,
                 0,
                 None,
-                &dir.path().join(format!("{name}.log")),
+                &super::super::seeded_lane_log(dir.path().join(format!("{name}.log"))),
                 None,
                 false,
             );
@@ -1095,10 +1105,10 @@ mod tests {
     /// the identical step, differing only in whether the report is produced,
     /// passes. So the absence is the single variable.
     #[test]
-    fn a_real_lane_that_writes_no_required_report_is_undetermined_not_failed() {
+    fn a_real_lane_that_writes_no_required_report_is_a_failure() {
         let dir = tempfile::tempdir().unwrap();
         for (name, write_report, wanted) in [
-            ("absent", false, NodeClassification::NoResult),
+            ("absent", false, NodeClassification::ProductFailure),
             ("wrote", true, NodeClassification::Pass),
         ] {
             // Exits 0 either way. A command that failed on its own would be a
@@ -1135,7 +1145,7 @@ mod tests {
                 true,
                 0,
                 None,
-                &dir.path().join(format!("{name}.log")),
+                &super::super::seeded_lane_log(dir.path().join(format!("{name}.log"))),
                 None,
                 false,
             );
@@ -1307,10 +1317,11 @@ mod ledger_tests {
                 profile: "full".into(),
                 selection_mode: "full".into(),
                 release_builder: super::super::RELEASE_BUILDER_CARGO,
+                e2e_runner: super::super::E2E_RUNNER_CARGO,
                 cache_state: "warm".into(),
                 commit: "535b48a113390f0084eac204b54de67dacc24f29".into(),
                 tree: "d0fc13f45eb671585d1aa26c7fcf3fdb4ca480c7".into(),
-                git_depth: 1,
+                git_depth: Some(1),
                 git_ahead: Some(0),
                 git_behind: Some(0),
                 commit_anchored: false,
@@ -1450,7 +1461,7 @@ mod timeout_tests {
             true,
             0,
             None,
-            &dir.path().join("node-limit.log"),
+            &super::super::seeded_lane_log(dir.path().join("node-limit.log")),
             None,
             false,
         );
@@ -1469,9 +1480,7 @@ mod timeout_tests {
         assert_eq!(
             super::super::completed_exit_code(
                 classified.blocking_failures(&BTreeSet::new()),
-                classified.no_results(),
-                result.run_timed_out,
-                false
+                classified.no_results() == 0 && !result.run_timed_out
             ),
             1
         );
@@ -1486,21 +1495,34 @@ mod timeout_tests {
                 pending.deps = vec!["classification.cutoff".into()];
                 steps.extend([make_step("cutoff", "sleep 10", 10), pending]);
             } else {
-                // The runner correctly refuses an individual node whose own
-                // bound cannot fit the remaining run budget. Exercise an active
-                // whole-run cutoff using three individually bounded steps whose
-                // sequential total exceeds that allowance instead.
+                // The runner refuses a lane in which any node's own bound is
+                // not below the remaining run budget, so an active whole-run
+                // cutoff needs a chain of individually bounded steps whose
+                // sequential total exceeds the budget. Each step sleeps 1 s
+                // under its own 4 s bound: 3 s of slack, so only the whole-run
+                // deadline can stop the chain. (Three 1.5 s sleeps under 2 s
+                // bounds left 0.5 s; at a load average of 210 one took 2.358 s,
+                // hit its own bound, and the run completed without a cutoff.)
+                // Ten steps take 10 s against an 8 s budget, whose floor at
+                // dispatch stays above the 4 s bounds after 3 s of setup.
                 if prior_failure {
                     steps.push(make_step("prior_failure", "exit 1", 2));
                 }
-                let first = make_step("cutoff", "sleep 1.5", 2);
-                let mut second = make_step("cutoff_second", "sleep 1.5", 2);
-                second.deps = vec![first.tag()];
-                let mut third = make_step("cutoff_third", "sleep 1.5", 2);
-                third.deps = vec![second.tag()];
-                let mut pending = make_step("pending", "true", 2);
-                pending.deps = vec![third.tag()];
-                steps.extend([first, second, third, pending]);
+                let mut previous: Option<String> = None;
+                for index in 0..10 {
+                    let job = if index == 0 {
+                        "cutoff".to_string()
+                    } else {
+                        format!("cutoff_{index}")
+                    };
+                    let mut step = make_step(&job, "sleep 1", 4);
+                    step.deps = previous.iter().cloned().collect();
+                    previous = Some(step.tag());
+                    steps.push(step);
+                }
+                let mut pending = make_step("pending", "true", 4);
+                pending.deps = previous.into_iter().collect();
+                steps.push(pending);
             }
             let cfg = super::super::DagConfig {
                 steps,
@@ -1516,7 +1538,7 @@ mod timeout_tests {
             let allowance = if cold_log {
                 2_000_000_000
             } else {
-                5_000_000_000
+                8_000_000_000
             };
             let deadline = super::super::monotonic_now_ns().unwrap() + allowance;
             let result =
@@ -1568,9 +1590,7 @@ mod timeout_tests {
             ));
             let exit = super::super::completed_exit_code(
                 classified.blocking_failures(&BTreeSet::new()),
-                classified.no_results(),
-                result.run_timed_out,
-                false,
+                validation_is_complete(result.complete, &classified, &planned),
             );
             assert_eq!(
                 exit,
@@ -1579,10 +1599,6 @@ mod timeout_tests {
                 } else {
                     super::super::NO_RESULT_EXIT_CODE as u8
                 }
-            );
-            assert_eq!(
-                super::super::exit_code_with_execution_completeness(exit, false),
-                exit
             );
             println!(
                 "actual whole-run cutoff prior_failure={prior_failure}: {classified:?}; outcomes={:?}",

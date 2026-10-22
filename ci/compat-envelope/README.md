@@ -45,10 +45,10 @@ refuses retirement. Selection changes do not fabricate a result or timestamp.
 
 The denominator is the complete comparable manifest matrix, not just the
 combinations selected by one validate path. For `N` manifest tests, verify,
-replay, and chaos span five Hermit backends, while native contributes one
-naked-execution control: `N × (5 × 3 + 1)` cells. Native is shown as a sixth
-backend in the table, but it does not have replay or chaos cells, so the formula
-is not `N × 6 × 3`. Explicit `custom` commands still run when selected by
+replay, and chaos span six Hermit backends (`in-guest-trap` became the sixth on
+2026-10-08), while native contributes one naked-execution control:
+`N × (6 × 3 + 1)` cells. Native is shown as a seventh backend in the table, but
+it does not have replay or chaos cells, so the formula is not `N × 7 × 3`. Explicit `custom` commands still run when selected by
 ordinary validation, but they are not multiplied across every test/backend
 pair: unlike the three common modes, they do not define a uniform product-wide
 denominator.
@@ -59,7 +59,7 @@ population actually recorded Green on ptrace. Missing backend evidence stays
 in that common population and earns no comparison credit.
 
 For one dated example only: on 2026-08-13, `N = 336`, so the comparable matrix
-has `336 × (5 × 3 + 1) = 5,376` cells. The checked-in table is generated from
+had `336 × (5 × 3 + 1) = 5,376` cells, with five Hermit backends. The checked-in table is generated from
 the live manifest and changes automatically when a manifest test is added.
 
 `hermit-manifest-plan --format matrix-json` emits every cell in the manifest,
@@ -303,10 +303,19 @@ instead of resolving the conflict by file order.
 
 A retained pass under a declared stripped comparator (the default `--verify`,
 below L2) is selected in its own comparison domain, so a cell's newest stripped
-pass and its newest canonical comparison are each imported. The stripped pass
-records a Pass bound to its exact run, outer attempt and evidence digest. It
-records no canonical comparison, establishes no canonical coverage, and retires
-no canonical result, so an older canonical failure stays active beside it.
+pass and its newest canonical comparison are each imported. Every outer attempt
+of a retained run is read before one is selected: a run whose attempts declare
+different comparators is refused, and the selected attempt is the latest one
+that carries a comparison, so a retry that produced none does not erase an
+earlier failure; a pass followed by such a retry is not counted. The stripped
+pass records a Pass bound to its exact run, outer attempt and evidence digest.
+It records no canonical comparison and establishes no canonical coverage. A
+canonical failure in the same input stays active beside it unless canonical
+evidence supersedes it: a newer retained canonical pass, or a current
+classification described below. Because the import rebuilds its ordinary
+projection from the input, it refuses, before writing anything, an input that
+supplies a cell's stripped pass but no canonical comparison while the tracked
+projection holds a canonical comparison for that cell.
 
 A retained comparison without a divergence position is imported as historical
 evidence with its own SHA. A retained position is handled only after a current
@@ -314,9 +323,25 @@ pressure summary classifies it: FRESH imports the matching retained position;
 DRIFTED replaces it with the current position; WRONG discards it because the
 current comparison matches; UNCHECKABLE withholds it because the current row
 did not establish a trustworthy result. Each outcome is printed per cell.
+Only current rows counted as canonical can make the outcome FRESH, DRIFTED or
+WRONG. A row counts as a match only if its typed verification report is a
+canonical bitwise match (`require_canonical_match`), and as a divergence only
+if the report compared canonical evidence (`require_canonical_comparison`). A
+pass without a report shows no canonical comparison, so it is not counted and
+cannot retire a retained canonical divergence; pressure evidence alone
+therefore cannot retire a chaos cell's canonical divergence when its chaos
+rows are such passes. A row without a report and without a verdict still
+counts, and keeps the outcome UNCHECKABLE. Any other row, such as a below-L2
+stripped match, is counted apart and named in the printed reason; with no
+canonical current row the outcome is UNCHECKABLE. A current pass whose matched
+report is neither a verified bitwise-identical match nor a verified stripped
+match without bitwise parity, such as a canonical match without bitwise
+parity, is refused as internally inconsistent and leaves the outcome
+UNCHECKABLE.
 One matching run is UNCHECKABLE rather than WRONG because these cells can match
-once and diverge on another run. WRONG requires at least two distinct current
-runs and no divergence; every classification prints the run count it used.
+once and diverge on another run. WRONG requires at least two distinct canonical
+current matches and no current divergence under any comparison; every
+classification prints the run count it used.
 
 The writers refuse unrelated tracked changes. `import-results` may replace its
 own two generated outputs so the same retained corpus can be imported again.
@@ -487,7 +512,7 @@ the selection itself with `--stress-count`, retries are off, and each failure is
 classified from the typed `type` on the JUnit `<failure>` that nextest writes:
 
 ```console
-scripts/stress-test.sh -n 500 -- -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore
+scripts/stress-test.sh -n 500 -- -p hermit-detcore-tests --test tests_misc -j 1 -- --skip has_rdrand_without_detcore
 ```
 
 This ports the useful one-box-per-red-cell shape from the old parent-workspace
@@ -505,7 +530,11 @@ After a clean periodic run, deliberately merge its red-cell measurements with:
 
 The command requires the summary's Hermit commit and Detcore tree to equal the
 clean checkout at `HEAD`, refuses infrastructure-error rows, and updates only
-red-cell observations. For repeated measurements of the same Detcore tree, it
+red-cell observations. A `pass` row whose typed report is a match is merged
+only if that report is a verified bitwise-identical match or a verified
+stripped match without bitwise parity; any other matched report, such as a
+canonical match without bitwise parity, is skipped and named as internally
+inconsistent, and a summary whose every row is skipped is refused. For repeated measurements of the same Detcore tree, it
 retains the exact Hermit commits measured, every observed result, and the
 earliest and latest first-divergence scheduler turn and virtual nanosecond. A
 determinism, replay, or parity failure with no measurable divergence point

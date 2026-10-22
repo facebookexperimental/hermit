@@ -11,6 +11,8 @@
 use std::env;
 use std::ffi::OsString;
 use std::io;
+use std::io::Write;
+use std::net::TcpListener;
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
 use std::os::fd::IntoRawFd;
@@ -33,14 +35,29 @@ struct ReplayOptions {
 struct Options {
     gdb: OsString,
     replay: Option<ReplayOptions>,
+    listen: Option<Listen>,
+}
+
+/// Where `--listen` or `--listen-fd` takes its one client from.
+#[derive(Debug, PartialEq)]
+enum Listen {
+    Address(String),
+    Fd(i32),
 }
 
 fn usage() {
     println!(
-        "Usage: hermit-dap [--gdb PATH] [--replay ID [--data-dir DIR] [--gdbserver-port PORT]]\n\n\
+        "Usage: hermit-dap [--gdb PATH] [--listen [HOST:]PORT | --listen-fd FD] [--replay ID [--data-dir DIR] [--gdbserver-port PORT]]\n\n\
          Start a Debug Adapter Protocol server for a Hermit GDB remote target.\n\
          The DAP attach request must include the guest executable as 'program'\n\
          and the Hermit GDB server address as 'target'.\n\n\
+         By default the DAP client speaks to hermit-dap on stdin and stdout.\n\
+         With --listen, hermit-dap instead waits for one DAP client on a TCP port\n\
+         (HOST defaults to 127.0.0.1; port 0 picks a free one), writes\n\
+         `hermit-dap: listening on HOST:PORT` to stderr, and serves that client.\n\
+         --listen-fd FD does the same on a TCP socket already bound and listening\n\
+         on descriptor FD, which `hermit run --dap-listen` uses so that it, not\n\
+         hermit-dap, reports an address it cannot listen on.\n\n\
          With --replay, hermit-dap starts and manages `hermit replay --serve-only`,\n\
          enabling source-level stepBack and reverseContinue by replaying from the beginning."
     );
@@ -60,6 +77,7 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut gdb = None;
+    let mut listen = None;
     let mut replay = None;
     let mut data_dir = None;
     let mut gdbserver_port = 1234;
@@ -73,6 +91,26 @@ where
                 .ok_or_else(|| "--gdb requires a path".to_owned())?;
             if gdb.replace(path).is_some() {
                 return Err("--gdb may only be specified once".to_owned());
+            }
+        } else if argument == "--listen" {
+            let address = args
+                .next()
+                .ok_or_else(|| "--listen requires [HOST:]PORT".to_owned())?;
+            let address = listen_address(&address.to_string_lossy())?;
+            if listen.replace(Listen::Address(address)).is_some() {
+                return Err("--listen and --listen-fd may only be specified once".to_owned());
+            }
+        } else if argument == "--listen-fd" {
+            let fd = args
+                .next()
+                .ok_or_else(|| "--listen-fd requires a descriptor".to_owned())?
+                .to_string_lossy()
+                .parse::<i32>()
+                .ok()
+                .filter(|fd| *fd > 2)
+                .ok_or_else(|| "--listen-fd requires a descriptor above 2".to_owned())?;
+            if listen.replace(Listen::Fd(fd)).is_some() {
+                return Err("--listen and --listen-fd may only be specified once".to_owned());
             }
         } else if argument == "--replay" {
             let id = args
@@ -117,12 +155,77 @@ where
 
     Ok(Some(Options {
         gdb: gdb.unwrap_or_else(default_gdb),
+        listen,
         replay: replay.map(|id| ReplayOptions {
             id,
             data_dir,
             gdbserver_port,
         }),
     }))
+}
+
+/// The socket address `--listen` binds: `PORT` alone means loopback, so the
+/// adapter is not reachable from other hosts unless HOST says so.
+fn listen_address(argument: &str) -> Result<String, String> {
+    let (host, port) = match argument.rsplit_once(':') {
+        Some((host, port)) => (host, port),
+        None => ("127.0.0.1", argument),
+    };
+    if host.is_empty() {
+        return Err("--listen requires a host before ':'".to_owned());
+    }
+    let port: u16 = port
+        .parse()
+        .map_err(|_| "--listen requires a valid port".to_owned())?;
+    Ok(format!("{host}:{port}"))
+}
+
+/// Waits for one DAP client on `address` and makes its connection this
+/// process's stdin and stdout, which GDB's DAP interpreter then serves.
+///
+/// Only the first client is accepted: GDB serves one session and exits when
+/// it ends. The listening socket is closed before GDB starts (it is also
+/// close-on-exec), so a second client is refused rather than left waiting.
+fn accept_client(listen: &Listen) -> Result<(), String> {
+    let listener = match listen {
+        Listen::Address(address) => TcpListener::bind(address).map_err(|error| {
+            format!(
+                "could not listen on {address}: {error}; pass another port, or port 0 \
+                 to let the system pick a free one"
+            )
+        })?,
+        Listen::Fd(fd) => {
+            // Not inherited by GDB: its duplicate on stdin and stdout is.
+            // SAFETY: fcntl on a descriptor number; it touches no memory.
+            if unsafe { libc::fcntl(*fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                return Err(format!(
+                    "--listen-fd {fd} is not a usable descriptor: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            // SAFETY: the caller hands this open descriptor over by
+            // --listen-fd and keeps no other use of it in this process.
+            unsafe { <TcpListener as std::os::fd::FromRawFd>::from_raw_fd(*fd) }
+        }
+    };
+    let local = listener
+        .local_addr()
+        .map_err(|error| format!("--listen-fd's descriptor is not a TCP socket: {error}"))?;
+    // Tools that pass port 0 read the chosen port from this line, often by
+    // polling a file that stderr goes to. One write: `eprintln!` can split a
+    // line into several writes, and a reader between them saw a truncated
+    // address (test.cli in the validation of 263f7477, 2026-10-17).
+    let _ = io::stderr().write_all(format!("hermit-dap: listening on {local}\n").as_bytes());
+    let _ = io::stderr().flush();
+    let (client, peer) = listener
+        .accept()
+        .map_err(|error| format!("could not accept a DAP client on {local}: {error}"))?;
+    drop(listener);
+    nix::unistd::dup2_stdin(&client)
+        .and_then(|()| nix::unistd::dup2_stdout(&client))
+        .map_err(|error| format!("could not serve the DAP client {peer}: {error}"))?;
+    eprintln!("hermit-dap: serving the DAP client at {peer}");
+    Ok(())
 }
 
 fn replay_command(options: &ReplayOptions) -> Result<Vec<String>, String> {
@@ -206,6 +309,15 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Some(listen) = &options.listen {
+        // Before client_fds() below, which duplicates the client's stdin
+        // and stdout for managed replay's refusals.
+        if let Err(error) = accept_client(listen) {
+            eprintln!("hermit-dap: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     let mut gdb_command = Command::new(&options.gdb);
     gdb_command
         .arg("--quiet")
@@ -265,6 +377,50 @@ mod tests {
                 data_dir: Some("/tmp/recordings".into()),
                 gdbserver_port: 2345,
             })
+        );
+    }
+
+    #[test]
+    fn listen_defaults_to_loopback() {
+        let listen = |argument: &str| {
+            parse_options(["--listen".into(), argument.into()])
+                .map(|options| options.unwrap().listen)
+        };
+        let address = |text: &str| Ok(Some(Listen::Address(text.to_owned())));
+        assert_eq!(listen("4711"), address("127.0.0.1:4711"));
+        assert_eq!(listen("0.0.0.0:0"), address("0.0.0.0:0"));
+        assert_eq!(listen("[::1]:4711"), address("[::1]:4711"));
+        assert_eq!(
+            listen(":4711"),
+            Err("--listen requires a host before ':'".to_owned())
+        );
+        assert_eq!(
+            listen("70000"),
+            Err("--listen requires a valid port".to_owned())
+        );
+        assert_eq!(
+            parse_options(["--listen".into(), "1".into(), "--listen".into(), "2".into()]),
+            Err("--listen and --listen-fd may only be specified once".to_owned())
+        );
+        let listen_fd = |argument: &str| {
+            parse_options(["--listen-fd".into(), argument.into()])
+                .map(|options| options.unwrap().listen)
+        };
+        assert_eq!(listen_fd("7"), Ok(Some(Listen::Fd(7))));
+        for refused in ["1", "x", "-3"] {
+            assert_eq!(
+                listen_fd(refused),
+                Err("--listen-fd requires a descriptor above 2".to_owned())
+            );
+        }
+        assert_eq!(
+            parse_options([
+                "--listen".into(),
+                "1".into(),
+                "--listen-fd".into(),
+                "7".into()
+            ]),
+            Err("--listen and --listen-fd may only be specified once".to_owned())
         );
     }
 

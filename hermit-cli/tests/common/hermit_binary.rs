@@ -11,7 +11,57 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
 use std::sync::OnceLock;
+
+// The typed skid-overshoot classifier and retry loop that `hermit_output`
+// applies. Not every including binary calls them.
+#[allow(dead_code)]
+#[path = "skid_overshoot.rs"]
+pub mod skid_overshoot;
+
+/// Attempts a Hermit run gets when Hermit refuses it for a late PMU interrupt
+/// (exit 122, `cause=skid-overshoot`). A refusal measures the host's
+/// interrupt latency under load, not the guest
+/// (https://github.com/rrnewton/hermit/issues/1845).
+#[allow(dead_code)]
+pub const SKID_ATTEMPTS: u32 = 5;
+
+/// Run `command` (a direct or timeout-wrapped Hermit command), and run it
+/// again, up to [`SKID_ATTEMPTS`] in all, only after an attempt whose output
+/// is exactly a typed skid-overshoot refusal
+/// ([`skid_overshoot::skid_overshoot_refusal`]). Every other outcome returns
+/// at once, for the caller to check as a single run. Each retry prints a
+/// `SKID-RETRY` line and is counted by `ci/run-nextest-counted.sh`.
+#[allow(dead_code)]
+pub fn hermit_output(label: &str, command: &mut Command) -> Output {
+    hermit_output_attempts(label, SKID_ATTEMPTS, command)
+}
+
+/// [`hermit_output`] with a bound of `max_attempts` instead of
+/// [`SKID_ATTEMPTS`], for a test whose per-test CPU budget cannot pay for
+/// more attempts of its costliest run.
+#[allow(dead_code)]
+pub fn hermit_output_attempts(label: &str, max_attempts: u32, command: &mut Command) -> Output {
+    pin_canonical_epoch(command);
+    skid_overshoot::retry_typed_skid_refusal(label, max_attempts, || {
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start {label}: {command:?}: {error}"));
+        (output, ())
+    })
+    .1
+}
+
+/// [`hermit_output`] for a caller that makes each attempt itself, with state
+/// of its own per attempt (a fresh scratch directory, a recording, a report
+/// path): `attempt` runs Hermit and returns its output beside that state, and
+/// the state of the attempt that is returned comes back with it.
+#[allow(dead_code)]
+pub fn hermit_output_with<T>(label: &str, attempt: impl FnMut() -> (Output, T)) -> (Output, T) {
+    let (_, output, kept) = skid_overshoot::retry_typed_skid_refusal(label, SKID_ATTEMPTS, attempt);
+    (output, kept)
+}
 
 /// Resolve the Hermit executable selected for this test process.
 ///
@@ -133,6 +183,21 @@ where
     Ok(args)
 }
 
+/// Give a Hermit command the canonical test epoch
+/// ([`detcore_model::config::CANONICAL_TEST_EPOCH`]) through `HERMIT_EPOCH`,
+/// so its runs do not depend on when they ran: `hermit run --strict` refuses
+/// an epoch drawn from the host clock. A command that sets or removes
+/// `HERMIT_EPOCH` itself, or a test process that inherited one (Buck gives
+/// every cell of a run one), keeps it.
+#[allow(dead_code)]
+pub fn pin_canonical_epoch(command: &mut Command) {
+    if std::env::var_os("HERMIT_EPOCH").is_none()
+        && !command.get_envs().any(|(key, _)| key == "HERMIT_EPOCH")
+    {
+        command.env("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH);
+    }
+}
+
 /// Insert the validate v3 guest arguments into a direct or timeout-wrapped
 /// Hermit command. Call this before configuring standard I/O, process-group or
 /// user/group identity, pre-exec callbacks, or clearing the environment. The
@@ -140,6 +205,7 @@ where
 /// arguments, current directory and explicit environment entries.
 #[allow(dead_code)]
 pub fn configure_guest_execution(command: &mut Command) {
+    pin_canonical_epoch(command);
     let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
     configure_guest_execution_for(command, requested.as_deref())
         .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));

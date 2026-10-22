@@ -99,7 +99,7 @@ After building the initramfs, run:
 
 ```bash
 timeout --kill-after=10s --signal=TERM 180s \
-  target/release/hermit --log error run --strict -- \
+  target/release/hermit --log error run --strict --epoch=2026-01-01T00:00:00Z -- \
   qemu-system-x86_64 \
   -nodefaults \
   -nic none \

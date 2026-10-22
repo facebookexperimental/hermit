@@ -1,7 +1,5 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
@@ -14,7 +12,15 @@ use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 
 pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
-const KVM_USER_LIMIT: usize = (1_usize << 47) - 4096;
+#[cfg(test)]
+const FOUR_LEVEL_USER_LIMIT: usize = reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT as usize;
+/// A four-level x86-64 guest whose kernel (Linux 6.4 or later) shortens a lone
+/// vector to `MAX_RW_COUNT` before checking it.
+#[cfg(test)]
+const FOUR_LEVEL: UserAddressLimit = UserAddressLimit {
+    max_end: FOUR_LEVEL_USER_LIMIT,
+    caps_single_vector: true,
+};
 
 /// A copied descriptor with its length capped by Linux's aggregate read limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,66 +29,52 @@ pub(crate) struct ImportedIovec {
     pub(crate) len: usize,
 }
 
-/// Structural address policy, independent of whether pages are mapped.
-#[derive(Clone, Copy)]
-pub(crate) enum UserAddressPolicy {
-    Native,
-    Kvm,
+/// How the guest's kernel checks a user range, as its backend reports it
+/// through `Guest::user_address_limit`: the bound that Linux's `access_ok`
+/// places on a range of guest memory, independent of whether pages are mapped,
+/// and whether a lone vector is shortened to `MAX_RW_COUNT` before that check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserAddressLimit {
+    max_end: usize,
+    caps_single_vector: bool,
 }
 
-impl UserAddressPolicy {
-    pub(crate) fn validate(self, iovecs: &[ImportedIovec]) -> Result<(), Error> {
-        match self {
-            Self::Kvm => validate_ranges(iovecs, KVM_USER_LIMIT).map_err(Error::from),
-            Self::Native => {
-                let local: Vec<_> = iovecs
-                    .iter()
-                    .map(|iov| libc::iovec {
-                        iov_base: iov.base as *mut libc::c_void,
-                        iov_len: iov.len,
-                    })
-                    .collect();
-                // Linux imports the local vectors before observing zero remote
-                // vectors. That zero returns before PID lookup, page pinning,
-                // mapping checks or copying (mm/process_vm_access.c). Asking
-                // the running kernel preserves native LA57 without guessing
-                // its TASK_SIZE from CPU capabilities. KVM uses its own limit.
-                let result = unsafe {
-                    libc::process_vm_readv(
-                        libc::getpid(),
-                        local.as_ptr(),
-                        local.len() as libc::c_ulong,
-                        std::ptr::null(),
-                        0,
-                        0,
-                    )
-                };
-                native_import_result(result, Errno::last())
-            }
+impl UserAddressLimit {
+    /// The limit from the guest's answer to `Guest::user_address_limit`. A
+    /// query that fails is the tool's failure, never a guest errno.
+    pub(crate) fn from_query(
+        limit: Result<reverie::UserAddressLimit, Error>,
+    ) -> Result<Self, Error> {
+        match limit {
+            Ok(limit) => Ok(Self {
+                max_end: usize::try_from(limit.max_end).unwrap_or(usize::MAX),
+                caps_single_vector: limit.caps_single_vector,
+            }),
+            Err(error) => Err(Error::Tool(anyhow::anyhow!(
+                "the guest's user address limit query failed: {error}"
+            ))),
         }
     }
-}
 
-fn native_import_result(result: isize, error: Errno) -> Result<(), Error> {
-    match (result, error) {
-        (0, _) => Ok(()),
-        (-1, Errno::EFAULT) => Err(Errno::EFAULT.into()),
-        _ => Err(Error::Tool(anyhow::anyhow!(
-            "native iovec range validation failed: result={result}, errno={error}"
-        ))),
+    /// Check the ranges as Linux's `import_iovec` does, against this limit.
+    pub(crate) fn validate(self, iovecs: &[ImportedIovec]) -> Result<(), Error> {
+        validate_ranges(iovecs, self).map_err(Error::from)
     }
 }
 
-fn validate_ranges(iovecs: &[ImportedIovec], limit: usize) -> Result<(), Errno> {
+fn validate_ranges(iovecs: &[ImportedIovec], limit: UserAddressLimit) -> Result<(), Errno> {
     for iov in iovecs {
-        // import_iovec uses import_ubuf only for one descriptor. Multiple
-        // descriptors validate original ranges, even beyond the eventual cap.
-        let len = if iovecs.len() == 1 {
+        // Since Linux 6.4, import_iovec imports one descriptor with
+        // import_ubuf, which shortens it to MAX_RW_COUNT before access_ok;
+        // the guest's kernel reports whether it does. Earlier kernels, and
+        // every kernel for multiple descriptors, validate original ranges,
+        // even beyond the eventual cap.
+        let len = if iovecs.len() == 1 && limit.caps_single_vector {
             iov.len.min(MAX_RW_COUNT)
         } else {
             iov.len
         };
-        if len > limit || iov.base > limit - len {
+        if len > limit.max_end || iov.base > limit.max_end - len {
             return Err(Errno::EFAULT);
         }
     }
@@ -99,11 +91,16 @@ fn cap_lengths(iovecs: &mut [ImportedIovec]) {
 
 /// Import every descriptor before copying output. Callers must check fd/access
 /// first; guest mapping/protection failures are left for the later data copy.
+///
+/// `limit` is asked for the guest's user address limit only once the count is
+/// known to need one, so a count of zero or above `UIO_MAXIOV` returns its
+/// result before any query can fail, as Linux's `import_iovec` checks the
+/// count before any range.
 pub(crate) fn import_read_iovecs(
     memory: &impl MemoryAccess,
     address: usize,
     raw_count: usize,
-    policy: UserAddressPolicy,
+    limit: impl FnOnce() -> Result<UserAddressLimit, Error>,
 ) -> Result<Vec<ImportedIovec>, Error> {
     // Linux's unsigned-long vlen is narrowed by import_iovec's unsigned nr_segs.
     let count = raw_count as u32 as usize;
@@ -113,10 +110,11 @@ pub(crate) fn import_read_iovecs(
     if count > libc::UIO_MAXIOV as usize {
         return Err(Errno::EINVAL.into());
     }
+    let limit = limit()?;
     let array_bytes = count * std::mem::size_of::<libc::iovec>();
     // Two descriptors prevent the single-vector MAX_RW_COUNT special case
     // from shortening the array-range check.
-    policy.validate(&[
+    limit.validate(&[
         ImportedIovec {
             base: address,
             len: array_bytes,
@@ -141,7 +139,7 @@ pub(crate) fn import_read_iovecs(
         }
         imported.push(ImportedIovec { base, len });
     }
-    policy.validate(&imported)?;
+    limit.validate(&imported)?;
     cap_lengths(&mut imported);
     Ok(imported)
 }
@@ -208,6 +206,61 @@ mod tests {
         }
     }
 
+    fn four_level() -> Result<UserAddressLimit, Error> {
+        Ok(FOUR_LEVEL)
+    }
+
+    fn no_query() -> Result<UserAddressLimit, Error> {
+        panic!("the count must be checked before the user address limit is queried")
+    }
+
+    #[test]
+    fn guest_reported_user_address_limit_is_the_one_enforced() {
+        // The limit the KVM executor enforces, written out as before.
+        assert_eq!(FOUR_LEVEL_USER_LIMIT, (1_usize << 47) - 4096);
+        let five_level = (1_usize << 56) - 4096;
+        for caps_single_vector in [true, false] {
+            for (reported, max_end) in [
+                (
+                    reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT,
+                    FOUR_LEVEL_USER_LIMIT,
+                ),
+                (five_level as u64, five_level),
+                (u64::MAX, usize::MAX),
+            ] {
+                assert_eq!(
+                    UserAddressLimit::from_query(Ok(reverie::UserAddressLimit {
+                        max_end: reported,
+                        caps_single_vector,
+                    }))
+                    .unwrap(),
+                    UserAddressLimit {
+                        max_end,
+                        caps_single_vector,
+                    }
+                );
+            }
+        }
+        // No limit is built in: the byte at the four-level limit is valid
+        // exactly when the guest reports a limit above it.
+        let at_four_level = [ImportedIovec {
+            base: FOUR_LEVEL_USER_LIMIT,
+            len: 1,
+        }];
+        let reported = |max_end| {
+            UserAddressLimit::from_query(Ok(reverie::UserAddressLimit {
+                max_end,
+                caps_single_vector: true,
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            errno(reported(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT).validate(&at_four_level)),
+            Errno::EFAULT
+        );
+        assert!(reported(five_level as u64).validate(&at_four_level).is_ok());
+    }
+
     #[test]
     fn rng_iovecs_normalize_count_before_limits_or_memory() {
         let memory = ArrayMemory::new(vec![ImportedIovec {
@@ -215,23 +268,18 @@ mod tests {
             len: 3,
         }]);
         assert!(
-            import_read_iovecs(&memory, usize::MAX, 1 << 32, UserAddressPolicy::Kvm)
+            import_read_iovecs(&memory, usize::MAX, 1 << 32, no_query)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(memory.reads.get(), 0);
         assert_eq!(
-            errno(import_read_iovecs(
-                &memory,
-                0,
-                (1 << 32) | 1025,
-                UserAddressPolicy::Kvm
-            )),
+            errno(import_read_iovecs(&memory, 0, (1 << 32) | 1025, no_query)),
             Errno::EINVAL
         );
         assert_eq!(memory.reads.get(), 0);
         assert_eq!(
-            import_read_iovecs(&memory, 0x1000, (1 << 32) | 1, UserAddressPolicy::Kvm).unwrap(),
+            import_read_iovecs(&memory, 0x1000, (1 << 32) | 1, four_level).unwrap(),
             memory.vectors
         );
         assert_eq!(memory.reads.get(), 1);
@@ -246,20 +294,15 @@ mod tests {
         assert_eq!(
             errno(import_read_iovecs(
                 &memory,
-                KVM_USER_LIMIT - 8,
+                FOUR_LEVEL_USER_LIMIT - 8,
                 2,
-                UserAddressPolicy::Kvm
+                four_level
             )),
             Errno::EFAULT
         );
         assert_eq!(memory.reads.get(), 0);
         assert_eq!(
-            errno(import_read_iovecs(
-                &memory,
-                0x1000,
-                2,
-                UserAddressPolicy::Kvm
-            )),
+            errno(import_read_iovecs(&memory, 0x1000, 2, four_level)),
             Errno::EINVAL
         );
         assert_eq!(memory.reads.get(), 1);
@@ -278,12 +321,7 @@ mod tests {
             },
         ]);
         assert_eq!(
-            errno(import_read_iovecs(
-                &memory,
-                0x1000,
-                2,
-                UserAddressPolicy::Kvm
-            )),
+            errno(import_read_iovecs(&memory, 0x1000, 2, four_level)),
             Errno::EINVAL
         );
         assert_eq!(memory.reads.get(), 2);
@@ -297,17 +335,12 @@ mod tests {
         };
         let memory = ArrayMemory::new(vec![large]);
         assert_eq!(
-            import_read_iovecs(&memory, 0x1000, 1, UserAddressPolicy::Kvm).unwrap()[0].len,
+            import_read_iovecs(&memory, 0x1000, 1, four_level).unwrap()[0].len,
             MAX_RW_COUNT
         );
         let memory = ArrayMemory::new(vec![large, ImportedIovec { base: 0, len: 0 }]);
         assert_eq!(
-            errno(import_read_iovecs(
-                &memory,
-                0x1000,
-                2,
-                UserAddressPolicy::Kvm
-            )),
+            errno(import_read_iovecs(&memory, 0x1000, 2, four_level)),
             Errno::EFAULT
         );
         let memory = ArrayMemory::new(vec![
@@ -321,26 +354,60 @@ mod tests {
             },
         ]);
         assert_eq!(
-            errno(import_read_iovecs(
-                &memory,
-                0x1000,
-                2,
-                UserAddressPolicy::Kvm
-            )),
+            errno(import_read_iovecs(&memory, 0x1000, 2, four_level)),
             Errno::EFAULT
         );
+
+        // A guest whose kernel predates Linux 6.4 checks a lone vector whole,
+        // as every kernel checks each of several, and still applies the
+        // aggregate cap to what it accepts.
+        let before_6_4 = UserAddressLimit {
+            caps_single_vector: false,
+            ..FOUR_LEVEL
+        };
+        let memory = ArrayMemory::new(vec![large]);
+        assert_eq!(
+            errno(import_read_iovecs(&memory, 0x1000, 1, || Ok(before_6_4))),
+            Errno::EFAULT
+        );
+        let accepted = ImportedIovec {
+            base: 0,
+            len: MAX_RW_COUNT + 4096,
+        };
+        let memory = ArrayMemory::new(vec![accepted]);
+        assert_eq!(
+            import_read_iovecs(&memory, 0x1000, 1, || Ok(before_6_4)).unwrap(),
+            [ImportedIovec {
+                base: 0,
+                len: MAX_RW_COUNT
+            }]
+        );
+        // The range that tells the two kernels apart: one byte past the limit
+        // whole, exactly at the limit once shortened to MAX_RW_COUNT.
+        let straddle = [ImportedIovec {
+            base: FOUR_LEVEL_USER_LIMIT - MAX_RW_COUNT,
+            len: MAX_RW_COUNT + 1,
+        }];
+        assert_eq!(validate_ranges(&straddle, FOUR_LEVEL), Ok(()));
+        assert_eq!(validate_ranges(&straddle, before_6_4), Err(Errno::EFAULT));
+        let at_limit = [ImportedIovec {
+            len: MAX_RW_COUNT,
+            ..straddle[0]
+        }];
+        assert_eq!(validate_ranges(&at_limit, FOUR_LEVEL), Ok(()));
+        assert_eq!(validate_ranges(&at_limit, before_6_4), Ok(()));
     }
 
     #[test]
     fn rng_iovecs_preserve_zero_length_ceiling_inclusivity() {
         for (base, len, expected) in [
-            (KVM_USER_LIMIT, 0, Ok(())),
-            (KVM_USER_LIMIT, 1, Err(Errno::EFAULT)),
-            (KVM_USER_LIMIT + 1, 0, Err(Errno::EFAULT)),
+            (FOUR_LEVEL_USER_LIMIT, 0, Ok(())),
+            (FOUR_LEVEL_USER_LIMIT, 1, Err(Errno::EFAULT)),
+            (FOUR_LEVEL_USER_LIMIT + 1, 0, Err(Errno::EFAULT)),
             (0, 0, Ok(())),
         ] {
             assert_eq!(
-                validate_ranges(&[ImportedIovec { base, len }], KVM_USER_LIMIT),
+                validate_ranges(&[ImportedIovec { base, len }], FOUR_LEVEL),
                 expected
             );
         }
@@ -355,7 +422,11 @@ mod tests {
             };
             1024
         ];
-        assert!(validate_ranges(&vectors, (1 << 56) - 4096).is_ok());
+        let five_level = UserAddressLimit {
+            max_end: (1 << 56) - 4096,
+            caps_single_vector: true,
+        };
+        assert!(validate_ranges(&vectors, five_level).is_ok());
         cap_lengths(&mut vectors);
         assert_eq!(vectors[0].len, MAX_RW_COUNT);
         assert!(vectors[1..].iter().all(|iov| iov.len == 0));
@@ -382,7 +453,7 @@ mod tests {
                     },
                 ]);
                 memory.read_error = Some((attempt, error));
-                let result = import_read_iovecs(&memory, 0x1000, 2, UserAddressPolicy::Kvm);
+                let result = import_read_iovecs(&memory, 0x1000, 2, four_level);
                 assert_eq!(
                     memory.reads.get(),
                     attempt,
@@ -407,13 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn rng_iovecs_native_oracle_failures_keep_their_tool_identity() {
-        assert!(native_import_result(0, Errno::EPERM).is_ok());
-        assert_eq!(
-            errno(native_import_result(-1, Errno::EFAULT)),
-            Errno::EFAULT
-        );
+    fn rng_iovecs_limit_query_failures_keep_their_tool_identity() {
+        // A failed query is the tool's failure, never a guest result, even
+        // when it carries EFAULT, which the guest would read as a bad range.
         for error in [
+            Errno::EFAULT,
             Errno::ENOSYS,
             Errno::EPERM,
             Errno::EINVAL,
@@ -421,13 +490,30 @@ mod tests {
             Errno::EIO,
         ] {
             assert!(matches!(
-                native_import_result(-1, error),
+                UserAddressLimit::from_query(Err(error.into())),
                 Err(Error::Tool(_))
             ));
         }
         assert!(matches!(
-            native_import_result(1, Errno::EFAULT),
+            UserAddressLimit::from_query(Err(Error::Tool(anyhow::anyhow!("query failed")))),
             Err(Error::Tool(_))
         ));
+        assert!(matches!(
+            UserAddressLimit::from_query(Err(
+                std::io::Error::from_raw_os_error(libc::EFAULT).into()
+            )),
+            Err(Error::Tool(_))
+        ));
+        // A count that needs ranges checked asks the guest first, and its
+        // failure stops the import before any guest memory is read.
+        let memory = ArrayMemory::new(vec![ImportedIovec {
+            base: 0x2000,
+            len: 3,
+        }]);
+        let result = import_read_iovecs(&memory, 0x1000, 1, || {
+            UserAddressLimit::from_query(Err(Errno::EFAULT.into()))
+        });
+        assert!(matches!(result, Err(Error::Tool(_))), "{result:?}");
+        assert_eq!(memory.reads.get(), 0);
     }
 }

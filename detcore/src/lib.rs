@@ -41,29 +41,55 @@ mod consts;
 mod cpuid;
 mod digest;
 mod dirents;
+#[cfg(feature = "dispatch-observer")]
+pub mod dispatch_observer;
 /// Schedule-alignment and edit-distance algorithms shared by Hermit tools.
 #[allow(missing_docs)]
 pub mod edit_distance;
+pub mod exec_record;
+pub mod exit_dependencies;
+mod fatal_core;
 mod fd;
+mod fifo_peer;
+pub mod guest_log;
+mod host_inputs;
+pub mod in_guest_launch;
+pub mod in_guest_site_patching;
 mod io_buffers;
 mod iovecs;
 #[allow(unused)]
 mod ivar;
 pub mod logdiff;
+pub mod machine;
 mod memory;
+pub mod native_exec;
 pub mod netlink_route;
+pub mod nonwaiting_write;
+mod pipe_wake;
 mod procfs;
+mod procfs_inode;
 mod procmaps;
+pub mod race_probe;
 pub mod random;
 mod record_or_replay;
+pub mod refused_signal_controls;
 mod resources;
 mod scheduler;
+mod shared_open_files;
+mod sigalrm_phase1;
+#[cfg(test)]
+mod signal_announcement_tests;
+mod signal_state;
 mod sock_diag;
 mod stat;
 mod syscall_classification;
 mod syscall_time;
 mod syscalls;
+#[cfg(test)]
+mod test_pages;
 mod tool_global;
+#[cfg(feature = "physical-mm-test-support")]
+pub use tool_global::initial_mm_probe;
 mod tool_local;
 pub mod util;
 
@@ -80,12 +106,22 @@ use std::time::Duration;
 pub use config::BlockingMode;
 pub use config::CONFIG_FINGERPRINT_ENV;
 pub use config::Config;
+pub use config::FatalCoreCapture;
+pub use config::InheritedSeccomp;
+pub use config::LITEINST_CONFIG_FINGERPRINT_ENV;
+pub use config::LaunchImage;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
+pub use config::config_fingerprint_mismatch;
 pub use config::config_wire_fingerprint;
+pub use config::decode_backend_config_json;
+pub use config::encode_backend_config_json;
+pub use config::from_legacy_backend_json;
+pub use config::to_legacy_backend_json;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
+use detcore_model::bundled_signal_facts;
 pub use digest::Digest;
 #[cfg(test)]
 use rand::RngExt as _;
@@ -116,20 +152,28 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 pub use scheduler::Priority;
+pub use scheduler::TerminalDeadlockHook;
 pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
+pub use scheduler::set_terminal_deadlock_hook;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
 use tool_global::ThreadDeregistration;
 use tool_global::acknowledge_robust_list_exit_time;
+pub use tool_global::cancel_exec;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
+pub use tool_global::native_exec as native_exec_control;
 pub use tool_global::prepare_exec;
 use tool_global::report_unsupported_syscall;
+use tool_global::robust_list_wakes_after_exec;
 use tool_global::robust_list_wakes_after_exit;
+pub use tool_global::shared_open_file_reply;
+pub use tool_global::shared_open_file_request;
+pub use tool_local::initial_resource_limit;
 
 fn select_thread_exit_detpid(
     thread_detpid: Option<DetPid>,
@@ -145,8 +189,49 @@ fn select_thread_start_detpid(thread_detpid: Option<DetPid>, guest_pid: Pid) -> 
     thread_detpid.unwrap_or_else(|| DetPid::from_raw(guest_pid.into()))
 }
 
-fn is_root_thread_start(is_root_process: bool, dettid: DetTid, detpid: DetPid) -> bool {
-    is_root_process && dettid == detpid
+/// What a stop of thread `tid` of `pid` did with a copy of the standard
+/// `signal` (`kept`: resumed into the thread, or else dropped), for the
+/// scheduler's record of copies Linux discarded when they were sent
+/// (`scheduler::discarded_at_send`, <https://github.com/rrnewton/hermit/issues/4293>).
+/// Reads, after the stop, the thread's queues and its mask, which decides
+/// whether a kept copy is requeued at the resume (`ptrace_signal`). `None`
+/// for a signal the record does not track, or a state that cannot be read,
+/// which changes nothing.
+fn consumed_signal_control(
+    pid: Pid,
+    tid: Pid,
+    signal: i32,
+    kept: bool,
+) -> Option<scheduler::discarded_at_send::DiscardedSignalControl> {
+    use scheduler::discarded_at_send::Consumption;
+    use scheduler::discarded_at_send::DiscardedSignalControl;
+    if !(1..32).contains(&signal) {
+        return None;
+    }
+    let state = syscalls::read_kernel_signal_state(pid, tid).ok()?;
+    let bit = scheduler::kernel_signal_bit(signal);
+    let how = if kept {
+        Consumption::KeptResume {
+            blocked: state.blocked & bit != 0,
+        }
+    } else {
+        Consumption::Dropped
+    };
+    Some(DiscardedSignalControl::Consumed {
+        signal,
+        how,
+        thread_holds: state.thread_pending & bit != 0,
+        process_holds: state.shared_pending & bit != 0,
+    })
+}
+
+fn thread_start_needs_registration(
+    is_root_process: bool,
+    past_first_execve: bool,
+    dettid: DetTid,
+    detpid: DetPid,
+) -> bool {
+    dettid == detpid && (is_root_process || !past_first_execve)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -162,6 +247,15 @@ impl std::fmt::Display for UnsupportedSyscallError {
 }
 
 impl std::error::Error for UnsupportedSyscallError {}
+pub use fd::OpenFileLease;
+pub use fd::OpenFileModel;
+pub use fd::SharedOpenFileChannel;
+pub use fd::SharedOpenFileError;
+pub use fd::install_shared_open_file_channel;
+pub use shared_open_files::ChunkedOpenFileChannel;
+pub use shared_open_files::OpenFileControl;
+pub use shared_open_files::OpenFileControlReply;
+pub use shared_open_files::OpenFileControlTransport;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 /// Returns whether the audited runtime policy classifies `sysno` as unsupported.
@@ -214,13 +308,15 @@ pub fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
 /// Returns whether Detcore deterministically refuses `sysno` with a fixed
 /// errno when the fail-closed policy is active, without consulting the host.
 ///
-/// This is the boundary backends that execute guest syscalls outside Detcore's
-/// `handle_syscall_event` dispatcher (the DBT copied-child fast path and the
-/// KVM executor) consult to enforce the same fixed refusal the ptrace path
-/// enforces. It deliberately excludes emulated / no-op / host-forwarding
-/// families (credential no-ops, `timer_create`, AF_UNIX autobind, `openat2`,
-/// `copy_file_range`), because fail-closing a copied child for those would
-/// diverge from the ptrace path rather than match it.
+/// A backend that lets a guest execute a syscall outside Detcore's
+/// `handle_syscall_event` dispatcher consults this to enforce the same fixed
+/// refusal the ptrace path enforces. The only production consumer is the DBT
+/// copied pre-exec child policy in `detcore-dbt`, which runs without a Detcore
+/// tool; the KVM backend, like ptrace, delivers these syscalls to
+/// `handle_syscall_event`. It deliberately excludes emulated / no-op /
+/// host-forwarding families (credential no-ops, `timer_create`, AF_UNIX
+/// autobind), because fail-closing a copied child for those would diverge from
+/// the ptrace path rather than match it.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-978): Review the copied-DBT-child deterministic-refusal surface.
 pub fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
@@ -250,6 +346,7 @@ pub use util::punch_out_print;
 
 use crate::resources::Permission;
 use crate::resources::ResourceID;
+use crate::scheduler::itimer_coalesce::GuestSigalrmTarget;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
@@ -305,6 +402,14 @@ fn rcb_timer_overshot(delta_rcbs: u64, last_timer: u64) -> bool {
     delta_rcbs > last_timer
 }
 
+/// The branches from `now` to the point the last handler armed the thread's
+/// timer for: `armed` branches past `committed`, that handler's clock value
+/// (`keep_timer_across_dropped_signal`). At least one: a stop at or past the
+/// point fires the event at once, where the backend records any overshoot.
+fn kept_timer_rcbs(committed: u64, armed: u64, now: u64) -> u64 {
+    committed.saturating_add(armed).saturating_sub(now).max(1)
+}
+
 fn choose_rcb_timer(
     max_rcbs_remaining: u64,
     current_rcbs: u64,
@@ -319,11 +424,390 @@ fn choose_rcb_timer(
     (max_rcbs_remaining, true)
 }
 
+/// The registers a syscall's completion leaves, computed from `entry`, the
+/// context at its entry (`rip` at the `syscall` instruction): `rax` holds the
+/// result, `rip` follows the instruction, and the instruction's own clobbers
+/// hold `rcx` = that `rip` and `r11` = `rflags` (signal phase 1's completed
+/// projection, design section 4). Only read, never written back.
+fn completed_syscall_projection(
+    entry: libc::user_regs_struct,
+    result: i64,
+) -> libc::user_regs_struct {
+    const SYSCALL_INSTRUCTION_LENGTH: u64 = 2;
+    let mut completed = entry;
+    completed.rax = result as u64;
+    completed.rip = entry.rip.wrapping_add(SYSCALL_INSTRUCTION_LENGTH);
+    completed.rcx = completed.rip;
+    completed.r11 = entry.eflags;
+    completed
+}
+
+/// Why this configuration cannot keep the two-phase delivery protocol
+/// (`Tool::announce_signal_event`), if it cannot: a part of the commit would
+/// file a scheduler request, or would read what only exists after the
+/// kernel's dequeue (the thread's queues, or the delivery's siginfo).
+fn two_phase_refusal(cfg: &Config) -> Option<&'static str> {
+    if scheduler::discarded_at_send::records(cfg) {
+        return Some(
+            "the record of copies Linux discarded at send reads the thread's queues after the dequeue",
+        );
+    }
+    if cfg.backend.reports_kernel_child_exit_signals {
+        return Some("a child-exit SIGCHLD is told apart from the scheduler's copy by its siginfo");
+    }
+    if cfg.sequentialize_threads && cfg.backend.requires_thread_directed_process_signals {
+        return Some("a fatal delivery files its thread group's exit");
+    }
+    if cfg.target_timeslice.or(cfg.max_timeslice).is_some() {
+        return Some("the post-handler hook can end the timeslice");
+    }
+    if cfg.should_trace_schedevent() {
+        return Some(
+            "a recorded or replayed schedule traces the delivery, and a replay can hand off",
+        );
+    }
+    if cfg.pipe_wake_latency_in_effect().is_some() {
+        return Some("the post-handler hook can hand the pipe off");
+    }
+    None
+}
+
+/// Whether delivering `signal` now runs a handler the guest installed, as
+/// Detcore's copy of the dispositions holds them or else as the kernel
+/// reports them (`ThreadState::delivered_since_request`). A thread whose state
+/// cannot be read counts as running one, which keeps the continuation;
+/// `MAX_SIGRETURN_CONTINUATIONS` still bounds it.
+fn delivery_runs_handler<G, T>(guest: &G, signal: i32) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let bit = crate::syscalls::kernel_sigset_bit(signal);
+    match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal) {
+        Some(copied) => copied.caught & bit != 0,
+        None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
+            .map_or(true, |state| state.caught & bit != 0),
+    }
+}
+
+/// Whether a delivery's turn settles what only a delivery justifies
+/// (`Detcore::inbound_turn`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnScope {
+    /// A delivery the kernel already dequeued: everything (ptrace's stop).
+    Delivery,
+    /// An announcement made before the kernel's dequeue
+    /// (`Tool::announce_signal_event`): the turn alone; its commit settles
+    /// the rest.
+    Announcement,
+}
+
+/// What returned control to Detcore, as far as ending a timeslice is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckIn {
+    /// A syscall, signal, timer, exec or thread start: any expired slice ends.
+    Event,
+    /// A trapped `rdtsc` or `cpuid` in the middle of user code: see
+    /// [`ThreadState::instruction_trap_ends_timeslice`].
+    InstructionTrap,
+}
+
+/// The feature words the x86-64-v3 table advertises, as `(leaf, subleaf,
+/// register, bits)` with registers 0-3 for EAX-EDX, for the CLI's check that
+/// the host has every one of them natively
+/// (<https://github.com/rrnewton/hermit/issues/4243>). Leaf 0xD, which comes
+/// from the host, is not among them.
+pub fn v3_feature_words() -> Vec<(u32, u32, usize, u32)> {
+    cpuid::v3_feature_words()
+}
+
+/// Why a CPU profile configuration cannot run at all, or `None`. Host mode
+/// requires CPUID and time virtualization; Detcore answers a v3
+/// guest from the qualified host's facts, so a configuration without them is
+/// refused rather than given a guessed leaf 0xD. Whether those facts came from
+/// a real qualification is Hermit's to check, at its launch functions
+/// (`cpu_profile_admission::refuse_unadmitted_launch`), before any backend
+/// starts (<https://github.com/rrnewton/hermit/issues/4243>).
+pub fn cpu_profile_admission_refusal(cfg: &Config) -> Option<&'static str> {
+    use detcore_model::cpu_profile::CpuProfile;
+    match cfg.cpu_profile {
+        CpuProfile::X86_64V3 if cfg.cpu_profile_host.is_none() => {
+            Some("the configuration carries no qualified host facts")
+        }
+        CpuProfile::HostNoRdrand if !cfg.virtualize_cpuid => {
+            Some("CPUID interception is required; remove --no-virtualize-cpuid")
+        }
+        CpuProfile::HostNoRdrand if !cfg.virtualize_time => {
+            Some("virtual time is required for RDTSC/RDTSCP; remove --no-virtualize-time")
+        }
+        CpuProfile::HostNoRdrand if cfg.cpu_profile_source.is_none() => {
+            Some("the configuration carries no admitted host CPUID source CPU")
+        }
+        _ => None,
+    }
+}
+
+/// The digest of the CPUID table and bound host xstate facts `cfg` selects,
+/// which a recording carries so that replay can refuse a different table
+/// (<https://github.com/rrnewton/hermit/issues/4243>).
+pub fn virtual_cpuid_digest(cfg: &Config) -> [u8; 32] {
+    cpuid::InterceptedCpuid::for_config(cfg).digest(cfg.cpu_profile_host.as_ref())
+}
+
+/// Whether Detcore under `cfg` reads the backend's reports of the guest's
+/// `rt_sigreturn`, which a gdbserver turns off. A recording and its replays
+/// must all answer no, or they could take different signal continuations
+/// (`ThreadState::returned_from_sigreturn`).
+pub fn observes_sigreturns(cfg: &Config) -> bool {
+    syscalls::signal_shadow::observes_sigreturns(cfg)
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Whether `signal`, passed on to a guest thread without a report, could
+    /// have entered a handler the thread's signal-state copy never saw: where
+    /// the copy is kept against the kernel's own state, for any signal but
+    /// Reverie's preemption signal, SIGKILL and SIGSTOP, which never reach a
+    /// guest handler.
+    fn copy_misses_unreported(&self, signal: i32) -> bool {
+        self.cfg.signal_state_copy
+            && self.cfg.sequentialize_threads
+            && bundled_signal_facts::kernel_signal_state_is_guests(&self.cfg.backend)
+            && signal != reverie::PERF_EVENT_SIGNAL as i32
+            && signal != libc::SIGKILL
+            && signal != libc::SIGSTOP
+    }
+
+    /// Rule 4 for the coalescing ITIMER_REAL: tell the scheduler about a
+    /// committed guest SIGALRM send (https://github.com/rrnewton/hermit/issues/4139).
+    async fn note_guest_sigalrm<G: Guest<Self>>(&self, guest: &mut G, target: GuestSigalrmTarget) {
+        if guest.config().sequentialize_threads {
+            crate::tool_global::note_sigalrm_event(
+                guest,
+                crate::tool_global::GlobalRequest::NoteGuestSigalrm(target),
+            )
+            .await;
+        }
+    }
+
+    /// The table Detcore answers a guest's CPUID instruction from. Both the
+    /// instruction (`handle_cpuid_event`) and `/proc/cpuinfo` take it from
+    /// here, so a CPU profile such as
+    /// <https://github.com/rrnewton/hermit/issues/4243> proposes cannot give
+    /// the two views different CPUs.
+    pub(crate) fn virtual_cpuid(&self) -> cpuid::InterceptedCpuid {
+        cpuid::InterceptedCpuid::for_config(&self.cfg)
+    }
+
+    /// The procfs files this session renders (`procfs::RenderedFiles`):
+    /// `/proc/cpuinfo` among them where the guest's CPUID instruction is
+    /// answered from [`Self::virtual_cpuid`], which is where CPUID is
+    /// virtualized and the backend delivers the instruction to Detcore.
+    ///
+    /// Recomputed at each lookup from this run's configuration and the
+    /// guest's backend: one capability read, no injected call, and no state
+    /// shared with another session in the process. The answer is the same at
+    /// every lookup of a run: Reverie arms CPUID interception before the
+    /// guest's first callback (ptrace in its post-spawn preinit, before
+    /// `handle_thread_start`, and again at each `exec`; KVM from the Tool's
+    /// subscription before the first entry; DBT always intercepts), and a new
+    /// task takes its parent's.
+    pub(crate) fn rendered_files<G: Guest<Self>>(&self, guest: &G) -> procfs::RenderedFiles {
+        procfs::RenderedFiles::of(
+            self.cfg.virtualize_cpuid,
+            guest.has_cpuid_interception(),
+            self.cfg.container_mount_table.is_some(),
+        )
+    }
+
+    /// Give this image's descriptor table the session's answer to whether it
+    /// renders `/proc/cpuinfo` ([`Self::rendered_files`]), at the image's
+    /// first guest callback and before guest code runs, so that a placeholder
+    /// the table rediscovered without a guest at hand (an in-guest backend's
+    /// image after `exec`) is trusted exactly where the session renders the
+    /// file (`FileMetadata::decide_cpuinfo_placeholders`).
+    fn decide_cpuinfo_placeholders<G: Guest<Self>>(&self, guest: &G) -> Result<(), Errno> {
+        let rendered = self.rendered_files(guest).cpuinfo;
+        guest
+            .thread_state()
+            .file_metadata
+            .lock()
+            .unwrap()
+            .decide_cpuinfo_placeholders(rendered)
+    }
+
+    /// Signal phase 1, step I4 (design section 4, "The commit"): when the
+    /// caller's process holds a SIGALRM entry that is due for it, run the
+    /// signal pipeline ptrace runs at a signal-delivery stop (step 2), take
+    /// the entry inside that pipeline's `InboundSignal` turn (step 3), and
+    /// hand the delivery to the backend (steps 4 to 8). An entry taken that
+    /// the backend cannot deliver is a determinism loss.
+    ///
+    /// `before_syscall` is the I4 addendum's point c: the delivery happens at
+    /// the current syscall's entry and the syscall, not yet run, starts again
+    /// after the handler. Returns whether a delivery was handed to the
+    /// backend; at a syscall's entry the caller then must not run the syscall.
+    ///
+    /// `completed` is the syscall's result at its completion (None at its
+    /// entry): the signal pipeline then reads the completed register
+    /// projection (design section 4).
+    async fn deliver_due_sigalrm<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        before_syscall: bool,
+        completed: Option<i64>,
+    ) -> bool {
+        if !tool_global::sigalrm_refuses(guest, tool_global::SigalrmControl::DueEntry).await {
+            return false;
+        }
+        if let Some(result) = completed {
+            let entry = guest.regs().await;
+            guest.thread_state_mut().signal_register_projection =
+                Some(completed_syscall_projection(entry, result));
+        }
+        let pipeline = self.handle_signal_event(guest, Signal::SIGALRM).await;
+        guest.thread_state_mut().signal_register_projection = None;
+        let delivering = matches!(pipeline, Ok(Some(_)));
+        // A suppressed signal's entry is dropped and nothing is delivered.
+        if !tool_global::sigalrm_refuses(guest, tool_global::SigalrmControl::TakeEntry).await
+            || !delivering
+        {
+            return false;
+        }
+        let info = scheduler::discarded_at_send::itimer_real_siginfo();
+        let target = reverie::SignalTarget::Process { pid: guest.pid() };
+        let delivered = match reverie::SignalEvent::new(libc::SIGALRM, info, target) {
+            Ok(event) if before_syscall => guest
+                .defer_signal_delivery_before_syscall(event)
+                .await
+                .is_ok(),
+            Ok(event) => guest.defer_signal_delivery(event).await.is_ok(),
+            Err(_) => false,
+        };
+        if !delivered {
+            self.stop_after_sigalrm_loss(guest).await;
+        }
+        if before_syscall {
+            // Faithful in its position relative to the guest's syscalls, but
+            // not in the interrupted registers the handler sees: recorded as a
+            // determinism loss, so verification refuses the run rather than
+            // compare it (round 4 of the I4 review; the faithful alternative
+            // is a delivery from the trampoline's return, before the syscall
+            // instruction runs).
+            tool_global::sigalrm_refuses(
+                guest,
+                tool_global::SigalrmControl::EntryDeliveryUnfaithful,
+            )
+            .await;
+        }
+        delivered
+    }
+
+    /// A SIGALRM entry this thread took cannot be delivered (or its virtual
+    /// mask cannot be read): record the determinism loss in the coordinator,
+    /// where the verifier reads it, and stop the process before any guest
+    /// instruction runs. Linux would have delivered the signal; continuing
+    /// would run the guest as if it never fired.
+    ///
+    /// The stop is the backend's `exit_group`, not `std::process::exit`: under
+    /// in-guest LiteInst the latter is the guest's own `exit`, which runs the
+    /// guest's `atexit` handlers and ELF finalizers.
+    async fn stop_after_sigalrm_loss<G: Guest<Self>>(&self, guest: &mut G) -> ! {
+        tool_global::sigalrm_refuses(guest, tool_global::SigalrmControl::DeliveryLost).await;
+        guest_log::flush_unsent();
+        match guest
+            .tail_inject(
+                reverie::syscalls::ExitGroup::new()
+                    .with_status(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            )
+            .await {}
+    }
+
+    /// Signal phase 1: before a callback can file a scheduler request, make
+    /// the scheduler's SIGALRM-blocked bit match the runtime's virtual mask. A
+    /// handler's start and return change that mask with no syscall, so the bit
+    /// may be stale at any callback (a syscall, or a trapped instruction whose
+    /// hooks may end a timeslice). Reads the runtime's virtual bit (one query
+    /// it answers from its virtual state) and publishes it when it differs from
+    /// the bit this thread last published, inside the thread's turn (no
+    /// firing commits while it holds it). Returns the bit.
+    async fn sync_sigalrm_eligibility<G: Guest<Self>>(&self, guest: &mut G) -> bool {
+        let Ok(blocked) = crate::syscalls::virtual_sigalrm_blocked(guest).await else {
+            self.stop_after_sigalrm_loss(guest).await
+        };
+        if blocked != guest.thread_state().sigalrm_blocked_published {
+            tool_global::sigalrm_refuses(
+                guest,
+                tool_global::SigalrmControl::PublishBlocked(blocked),
+            )
+            .await;
+            guest.thread_state_mut().sigalrm_blocked_published = blocked;
+        }
+        blocked
+    }
+
+    /// Publish the posthook happens-before anchors the current syscall entry
+    /// reached at its prehook, now that `res` is the result the guest will
+    /// get: after the last observer that can replace it, on every path that
+    /// returns a guest result, including an observer's own final errno (the
+    /// Codex review of https://github.com/rrnewton/hermit/pull/4048). Which
+    /// results are a completion is decided by [`posthook_checkpoint`]; the
+    /// pending names are consumed either way.
+    async fn publish_posthook_checkpoint<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        count: u64,
+        res: &Result<i64, Error>,
+    ) {
+        let posthook = std::mem::take(&mut guest.thread_state_mut().stats.hb_pending_posthook);
+        if let Some(checkpoint) = posthook_checkpoint(count, posthook, res) {
+            let request = guest.thread_state().mk_request(checkpoint, Permission::R);
+            resource_request(guest, request).await;
+        }
+    }
+
+    /// The completion of a syscall that can resume the guest (a result or an
+    /// errno, not a backend failure): in a process that handles SIGALRM, a due
+    /// entry is delivered here, where Linux would deliver a signal that became
+    /// pending while the call ran (design section 4, point a).
+    async fn complete_syscall<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        res: Result<i64, Error>,
+    ) -> Result<i64, Error> {
+        if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
+            let completed = match &res {
+                Ok(value) => Some(*value),
+                Err(Error::Errno(errno)) => Some(-i64::from(errno.into_raw())),
+                Err(_) => None,
+            };
+            if completed.is_some() {
+                self.deliver_due_sigalrm(guest, false, completed).await;
+            }
+        }
+        res
+    }
+
+    /// Signal phase 1 at a syscall's entry, before its first scheduler
+    /// request, in a process that handles SIGALRM: sync the scheduler's
+    /// blocked bit ([`Self::sync_sigalrm_eligibility`]), and while SIGALRM is
+    /// unblocked deliver an entry that is already due before this syscall (the
+    /// I4 addendum's point c). An entry is due here when it became deliverable
+    /// with no syscall completing (a handler returned and unblocked SIGALRM),
+    /// or committed during a scheduler yield inside a trapped instruction's
+    /// hooks; Linux delivers it before any further guest instruction. Returns
+    /// whether a delivery was prepared; the syscall then must not run.
+    async fn sigalrm_at_syscall_entry<G: Guest<Self>>(&self, guest: &mut G) -> bool {
+        let blocked = self.sync_sigalrm_eligibility(guest).await;
+        !blocked && self.deliver_due_sigalrm(guest, true, None).await
+    }
+
     /// Registers a child whose native backend executed the clone syscall.
     ///
     /// The caller must initialize the child's local thread state from the same
     /// parent state and clone flags before the child enters its start hook.
+    /// No backend that reaches this keeps a signal-state copy; one that does
+    /// must call `signal_shadow::before_clone` before its native clone, as
+    /// `handle_clone_family` does.
     // TODO-HUMAN-REVIEW(PR-743): Review the backend-neutral native child registration API.
     pub async fn register_external_child<G: Guest<Self>>(
         &self,
@@ -403,6 +887,59 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         report_unsupported_syscall(guest, call.number()).await;
         self.passthrough(guest, call).await
+    }
+
+    /// Linux's `restart_syscall`. When no handler runs, the kernel restarts a wait
+    /// that returned `ERESTART_RESTARTBLOCK` by running this call at the
+    /// interrupted call's address, and the wait resumes with its original deadline
+    /// (https://github.com/rrnewton/hermit/issues/3358). Detcore emulates those
+    /// waits, so it resumes them from the record the wait kept
+    /// (`syscalls::helpers::RestartBlock`). Any other `restart_syscall` keeps the
+    /// unsupported-syscall policy.
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3361): Review the
+    // emulated `restart_syscall` resumption and the record it consumes.
+    async fn handle_restart_syscall<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        restart_block: Option<syscalls::helpers::RestartBlock>,
+        dettid: DetTid,
+        panic_on_unsupported_syscalls: bool,
+    ) -> Result<i64, Error> {
+        let rip = guest.regs().await.rip;
+        let Some(block) = restart_block.and_then(|block| block.resumed_at(rip)) else {
+            trace!(
+                "[detcore, dtid {}] restart_syscall at {:#x} restarts no wait Detcore emulated ({:?})",
+                dettid, rip, restart_block
+            );
+            return self
+                .handle_unsupported_syscall(guest, call, dettid, panic_on_unsupported_syscalls)
+                .await;
+        };
+        trace!(
+            "[detcore, dtid {}] restart_syscall resumes {:?}",
+            dettid, block
+        );
+        match block.call {
+            syscalls::helpers::RestartCall::Poll(poll) => {
+                self.handle_internal_poll_until(guest, poll, block.deadline)
+                    .await
+            }
+            syscalls::helpers::RestartCall::Futex(futex) => {
+                self.handle_futex_from(
+                    guest,
+                    futex,
+                    syscalls::FutexDeadline::Restart(block.deadline),
+                )
+                .await
+            }
+            syscalls::helpers::RestartCall::Nanosleep(call) => {
+                let deadline = block
+                    .deadline
+                    .expect("a claimed nanosleep keeps its absolute deadline");
+                self.resume_nanosleep(guest, call, deadline).await
+            }
+        }
     }
 
     /// Defense-in-depth determinism for the registers the syscall instruction
@@ -572,10 +1109,602 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// A common hook called at the start of *every* handler, just after we receive
     /// control from the guest.
-    async fn pre_handler_hook<G: Guest<Self>>(&self, guest: &mut G, precise_branch: bool) {
+    /// The guest's registers as Detcore's hooks report them: the completed
+    /// projection while a SIGALRM delivery's signal pipeline runs at a
+    /// syscall's completion, otherwise the backend's.
+    async fn observed_regs<G: Guest<Self>>(&self, guest: &mut G) -> libc::user_regs_struct {
+        match guest.thread_state().signal_register_projection {
+            Some(projection) => projection,
+            None => guest.regs().await,
+        }
+    }
+
+    /// Detcore's handling of an inbound signal, for both of Reverie's signal
+    /// hooks (`Tool::handle_signal_event`, and `Tool::handle_raw_signal_event`
+    /// for a realtime signal): a signal-delivery stop, the delivery of
+    /// `signal` the backend reports once, after the kernel dequeued it (the
+    /// ptrace backend's stop). The signal takes its turn in the schedule
+    /// before it is delivered. Returns the signal to deliver, or `None` to
+    /// suppress it. It runs
+    /// the stop's three parts in order: what the dequeue settles
+    /// ([`Self::inbound_dequeued`]), the delivery's turn
+    /// ([`Self::inbound_turn`]), and what the granted delivery settles
+    /// ([`Self::inbound_delivered`]). A backend that announces a delivery
+    /// before the kernel dequeues it runs the turn first and the rest at its
+    /// commit (`Tool::announce_signal_event`, `Tool::commit_signal_event`).
+    async fn handle_inbound_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+    ) -> Result<Option<SigWrapper>, Errno> {
+        let stop = self.inbound_stop(guest);
+        let Some(timer_entry) = self.inbound_dequeued(guest, signal).await? else {
+            return Ok(None);
+        };
+        let turn = self
+            .inbound_turn(guest, signal, stop, TurnScope::Delivery)
+            .await;
+        self.inbound_delivered(guest, signal, turn, timer_entry)
+            .await
+    }
+
+    /// What a delivery knows before anything of it can hand the thread to
+    /// the scheduler.
+    fn inbound_stop<G: Guest<Self>>(&self, guest: &mut G) -> tool_local::InboundStop {
+        // Whether this stop comes before any scheduling point of the thread
+        // since its previous handler's delivery was granted, or right after a
+        // reported `rt_sigreturn` where reports are read
+        // (`ThreadState::returned_from_sigreturn`).
+        let reported = std::mem::take(&mut guest.thread_state_mut().returned_from_sigreturn)
+            && crate::syscalls::signal_shadow::observes_sigreturns(&self.cfg);
+        // The thread's grants so far: a grant before this delivery's request
+        // (a slice end, a schedule-replay trace, any other hand-off) means
+        // other threads may have run, so the delivery continues nothing.
+        let grants_at_stop = guest.thread_state().scheduler_grants;
+        tool_local::InboundStop {
+            reported,
+            grants_at_stop,
+        }
+    }
+
+    #[cfg(test)]
+    fn note_test_phase(phase: &'static str) {
+        signal_announcement_tests::note_phase(phase);
+    }
+
+    /// What the kernel's dequeue of `signal` settles before the delivery's
+    /// turn: an operator's SIGINT, the `ITIMER_REAL` re-arm, a duplicate
+    /// child-exit `SIGCHLD`, a stale POSIX timer entry. `None` when the
+    /// delivery is dropped; otherwise whether it is a POSIX timer's entry.
+    async fn inbound_dequeued<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+    ) -> Result<Option<bool>, Errno> {
+        if signal.signal() == Some(Signal::SIGINT) && self.cfg.sigint_instakill {
+            warn!("Fatal: Exiting hermit container immediately upon SIGINT");
+            // ⚠️ NOT A REFUSAL. The operator interrupted the run; hermit examined
+            // nothing and decided nothing. Reporting `128 + SIGINT` is what every
+            // other tool reports for this, and it keeps 122 meaning one thing.
+            unrecoverable_shutdown(guest, detcore_model::HERMIT_SIGINT_DEATH_EXIT).await
+        }
+        if signal.signal() == Some(Signal::SIGALRM) {
+            self.normalize_reported_itimer_real(guest).await;
+        }
+        if signal.signal() == Some(Signal::SIGCHLD)
+            && self.cfg.backend.reports_kernel_child_exit_signals
+            && !self.child_exit_sigchld_delivers(guest).await
+        {
+            // A claimed copy that is dropped has no delivery to place, but
+            // the claim may have held this duplicate while the claimed copy
+            // is still pending (`syscalls::signal::claim_still_pending`).
+            let (pid, tid) = (guest.pid(), guest.tid());
+            let claimed =
+                crate::syscalls::claim_still_pending(guest.thread_state().claimed_sigchld, || {
+                    crate::syscalls::read_thread_signal_state(pid, tid)
+                });
+            guest.thread_state_mut().claimed_sigchld = claimed;
+            self.keep_timer_across_dropped_signal(guest);
+            return Ok(None);
+        }
+        // The test-only claim fault drops the claimed copy here, as the
+        // ledger drops a duplicate above (`syscalls::signal::take_claim_fault`).
+        if signal.signal() == Some(Signal::SIGCHLD)
+            && guest.thread_state().claimed_sigchld
+            && crate::syscalls::take_claim_fault(crate::syscalls::ClaimFault::DropClaimed)
+        {
+            warn!(
+                "[dtid {}] claim fault hook: dropped the claimed SIGCHLD",
+                guest.thread_state().dettid
+            );
+            guest.thread_state_mut().claimed_sigchld = false;
+            self.keep_timer_across_dropped_signal(guest);
+            return Ok(None);
+        }
+        // A POSIX timer's entry: delivered with its own siginfo, or, if its
+        // timer was set again since it was queued, skipped as Linux skips
+        // it inside the dequeue, with no turn
+        // (<https://github.com/rrnewton/hermit/issues/4262>).
+        let mut timer_entry = false;
+        let stop_time = guest.thread_state().thread_logical_time.as_nanos();
+        if scheduler::discarded_at_send::records(&self.cfg) && (1..32).contains(&signal.raw()) {
+            use scheduler::discarded_at_send::DiscardedSignalAnswer;
+            use scheduler::discarded_at_send::DiscardedSignalControl;
+            use scheduler::posix_timer_coalesce::DeliveryAnswer;
+            let control = DiscardedSignalControl::Dequeue {
+                signal: signal.raw(),
+                at: stop_time,
+            };
+            let answer = tool_global::discarded_signal(guest, control).await;
+            timer_entry = answer == DiscardedSignalAnswer::Delivery(DeliveryAnswer::TimerEntry);
+            match answer {
+                DiscardedSignalAnswer::Delivery(DeliveryAnswer::Suppress) => {
+                    info!(
+                        "[dtid {}] signal {} is a stale POSIX timer entry; skipped",
+                        guest.thread_state().dettid,
+                        signal
+                    );
+                    self.keep_timer_across_dropped_signal(guest);
+                    return Ok(None);
+                }
+                DiscardedSignalAnswer::Delivery(DeliveryAnswer::Rewrite(info)) => {
+                    if let Err(errno) = guest.set_signal_info(info.to_user()) {
+                        warn!(
+                            "[dtid {}] signal {} keeps its physical siginfo: {}",
+                            guest.thread_state().dettid,
+                            signal,
+                            errno
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        #[cfg(test)]
+        Self::note_test_phase("dequeued");
+        Ok(Some(timer_entry))
+    }
+
+    /// The delivery's turn: its hooks, its count and trace, and its
+    /// `InboundSignal` request. For an announcement
+    /// ([`TurnScope::Announcement`]) it is the request and its hooks alone:
+    /// what only a delivery justifies (ending the sender's hold, the count
+    /// and trace, a claimed `SIGCHLD`'s placement, marking a handler as run)
+    /// waits for the commit ([`Self::inbound_turn_settled`]).
+    async fn inbound_turn<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+        stop: tool_local::InboundStop,
+        scope: TurnScope,
+    ) -> tool_local::InboundTurn {
+        let tool_local::InboundStop {
+            reported,
+            grants_at_stop,
+        } = stop;
+        let delivery = scope == TurnScope::Delivery;
+        // The kernel dequeued `signal` before this stop: a hold for it ends
+        // here, and this stop's hooks may end the slice
+        // (`own_signal_turn_hold`).
+        if delivery && guest.thread_state().own_signal_turn_hold == Some(signal.raw()) {
+            guest.thread_state_mut().own_signal_turn_hold = None;
+        }
+        let timeslice = guest.thread_state().stats.timeslice_count;
+        self.pre_handler_hook(guest, false, CheckIn::Event).await;
+        // The delivery continues the thread's turn only while the slice
+        // its previous delivery ran in is still open. A stop that ends the
+        // slice is Linux's TIF_NEED_RESCHED case: other threads run
+        // (`schedule()`) before this one resumes and delivers, so the
+        // delivery waits its place behind them instead of being taken
+        // right after the yield. And at most
+        // `MAX_SIGRETURN_CONTINUATIONS` in a row
+        // (`consecutive_continuations`): in every mode, that cap is what
+        // stops a handler that raises its own signal from holding the
+        // CPU for ever.
+        let slice_open = guest.thread_state().stats.timeslice_count == timeslice;
+
+        // For `hermit run --verify`: a guest that faulted on an illegal
+        // instruction may have run code that made syscalls Detcore never
+        // saw, so the run reports `/`, the ancestor of every path, and
+        // names no host input change. A false alarm only withholds a name.
+        // The case this was written for no longer reaches here: on ptrace,
+        // a syscall issued from the untraced stub of Reverie's private page
+        // is followed by a `ud2`, and Reverie now ends the run at that
+        // SIGILL (`UntracedStubSyscall`, a policy refusal) before any Tool
+        // sees it. A stub syscall that never returns to the `ud2` (execve,
+        // exit, rt_sigreturn) raises no SIGILL at all
+        // (https://github.com/rrnewton/reverie/issues/1064). This stays as
+        // the conservative answer for any other illegal instruction. A
+        // guest that first rewrites or replaces the page's code is reported
+        // when it does so (`record_untraced_code_change`).
+        if signal.signal() == Some(Signal::SIGILL) && self.cfg.record_host_inputs {
+            tool_global::record_host_mutation(guest, String::from("/")).await;
+        }
+
+        let dettid = guest.thread_state().dettid;
+        let mycount = guest.thread_state().stats.signal_count;
+        if delivery {
+            info!(
+                "[dtid {}] handling inbound signal (#{}) {}",
+                dettid, mycount, signal
+            );
+            guest.thread_state_mut().stats.count_signal();
+        } else {
+            // Counted, and logged with its ordinal, at its commit
+            // (`inbound_turn_settled`).
+            info!("[dtid {}] announcing inbound signal {}", dettid, signal);
+        }
+        let time = &guest.thread_state().thread_logical_time;
+        let nanos = time.as_nanos();
+
+        if delivery && self.cfg.sequentialize_threads && self.cfg.should_trace_schedevent() {
+            trace_schedevent(
+                guest,
+                SchedEvent {
+                    dettid,
+                    op: Op::SignalReceived(signal),
+                    count: 1,
+                    start_rip: None,
+                    end_rip: None,
+                    end_time: Some(nanos),
+                },
+                true,
+            )
+            .await;
+        }
+
+        // The delivery of a `SIGCHLD` this thread claimed is placed, so its
+        // turn is not deferred behind runnable work
+        // (`ThreadState::claimed_sigchld`).
+        if delivery
+            && signal.signal() == Some(Signal::SIGCHLD)
+            && std::mem::take(&mut guest.thread_state_mut().claimed_sigchld)
+        {
+            tool_global::child_exit_sigchld(
+                guest,
+                scheduler::child_exit_sigchld::ChildExitSigchldControl::ClaimedDelivery,
+            )
+            .await;
+        }
+        // Read-write marks this as the delivery itself, which the
+        // scheduler's write-only wakes of a signaled sleeper are not
+        // (`Scheduler::thread_timer_copies`).
+        let mut request = guest
+            .thread_state_mut()
+            .mk_request(ResourceID::InboundSignal(signal), Permission::RW);
+        // Decided here, after every await of this stop that can hand the
+        // thread to the scheduler (the hooks above, the trace), from the
+        // window as it stands now.
+        // An announcement continues as the delivery before it at the same
+        // return would let it on ptrace, when the announcements come in the
+        // order the kernel delivers them: an outstanding announcement whose
+        // delivery runs a handler stands for the `delivered_since_request` its
+        // commit will set. When a signal arrives between them and changes that
+        // order, or an announcement that consumed `returned_from_sigreturn` is
+        // withdrawn, the turns differ from ptrace's: the named difference of a
+        // signal arriving between a delivery's turn and its final read.
+        let announced_handler = !delivery
+            && guest
+                .thread_state()
+                .signal_announcements
+                .iter()
+                .any(|held| delivery_runs_handler(guest, held.signal));
+        request.continues_sigreturn =
+            (guest.thread_state().delivered_since_request || reported || announced_handler)
+                && guest.thread_state().scheduler_grants == grants_at_stop
+                && guest.thread_state().consecutive_continuations
+                    < crate::tool_local::MAX_SIGRETURN_CONTINUATIONS
+                && signal.signal() != Some(Signal::SIGCHLD)
+                && slice_open;
+        resource_request(guest, request).await;
+        // The delivery is granted; if it runs a handler, a stop that
+        // comes before the thread files another request continues it.
+        if delivery && delivery_runs_handler(guest, signal.raw()) {
+            guest.thread_state_mut().delivered_since_request = true;
+        }
+        tool_local::InboundTurn { dettid, mycount }
+    }
+
+    /// What an announced delivery's turn left for its commit
+    /// ([`TurnScope::Announcement`]), in the order a whole delivery does it:
+    /// the sender's hold ends, the delivery is counted and traced, a claimed
+    /// `SIGCHLD` is placed, and a handler that runs marks the thread's next
+    /// request as continuing it.
+    /// Returns the delivery's ordinal, the thread's signal count before it.
+    async fn inbound_turn_settled<G: Guest<Self>>(&self, guest: &mut G, signal: SigWrapper) -> u64 {
+        if guest.thread_state().own_signal_turn_hold == Some(signal.raw()) {
+            guest.thread_state_mut().own_signal_turn_hold = None;
+        }
+        let mycount = guest.thread_state().stats.signal_count;
+        info!(
+            "[dtid {}] handling inbound signal (#{}) {}",
+            guest.thread_state().dettid,
+            mycount,
+            signal
+        );
+        guest.thread_state_mut().stats.count_signal();
+        if self.cfg.sequentialize_threads && self.cfg.should_trace_schedevent() {
+            let dettid = guest.thread_state().dettid;
+            let nanos = guest.thread_state().thread_logical_time.as_nanos();
+            trace_schedevent(
+                guest,
+                SchedEvent {
+                    dettid,
+                    op: Op::SignalReceived(signal),
+                    count: 1,
+                    start_rip: None,
+                    end_rip: None,
+                    end_time: Some(nanos),
+                },
+                true,
+            )
+            .await;
+        }
+        if signal.signal() == Some(Signal::SIGCHLD)
+            && std::mem::take(&mut guest.thread_state_mut().claimed_sigchld)
+        {
+            tool_global::child_exit_sigchld(
+                guest,
+                scheduler::child_exit_sigchld::ChildExitSigchldControl::ClaimedDelivery,
+            )
+            .await;
+        }
+        if delivery_runs_handler(guest, signal.raw()) {
+            guest.thread_state_mut().delivered_since_request = true;
+        }
+        mycount
+    }
+
+    /// What the granted delivery of `signal` settles: a fatal delivery's
+    /// group exit, a timer entry's siginfo, robust-list wakes, the handler's
+    /// restore mask, and the post-handler hook.
+    async fn inbound_delivered<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+        turn: tool_local::InboundTurn,
+        timer_entry: bool,
+    ) -> Result<Option<SigWrapper>, Errno> {
+        let tool_local::InboundTurn { dettid, mycount } = turn;
+        // Under `--pipe-wake-latency`, a delivery that ends the process
+        // dooms its threads at this committed turn, before their
+        // host-timed removal (`scheduler::pipe_wake`).
+        if self.cfg.pipe_wake_latency_in_effect().is_some()
+            && match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal.raw()) {
+                Some(copied) => crate::syscalls::default_action_ends_process(
+                    copied.ignored,
+                    copied.caught,
+                    signal.raw(),
+                ),
+                None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
+                    .is_ok_and(|state| state.default_action_ends_process(signal.raw())),
+            }
+        {
+            tool_global::record_fatal_signal(guest).await;
+        }
+        // A timer entry's siginfo, with its overrun counted now that the
+        // delivery's turn is granted, where the handler's time begins.
+        if timer_entry {
+            use scheduler::discarded_at_send::DiscardedSignalAnswer;
+            use scheduler::posix_timer_coalesce::DeliveryAnswer;
+            let control = scheduler::discarded_at_send::DiscardedSignalControl::DeliveryInfo {
+                signal: signal.raw(),
+                at: guest.thread_state().thread_logical_time.as_nanos(),
+            };
+            if let DiscardedSignalAnswer::Delivery(DeliveryAnswer::Rewrite(info)) =
+                tool_global::discarded_signal(guest, control).await
+                && let Err(errno) = guest.set_signal_info(info.to_user())
+            {
+                warn!(
+                    "[dtid {}] signal {} keeps its physical siginfo: {}",
+                    guest.thread_state().dettid,
+                    signal,
+                    errno
+                );
+            }
+        }
+        if self
+            .end_thread_group_before_fatal_delivery(guest, signal)
+            .await
+        {
+            // As an exit_group does after its grant, file nothing more:
+            // the group's turns are held until it has ended, which needs
+            // this thread to die (Claude review of
+            // https://github.com/rrnewton/hermit/pull/4387, finding 4).
+            info!(
+                "[dtid {}] finish delivering signal (#{}) {}",
+                dettid, mycount, signal
+            );
+            return Ok(Some(signal));
+        }
+        // A delivered signal may be caught, ignored, or terminate the
+        // thread group. Reading the lists is harmless; the collected
+        // wakes remain inert unless the ptrace exit callback later reports
+        // that this exact signal caused physical exit.
+        self.stage_thread_group_robust_list_wakes(
+            guest,
+            tool_local::RobustListExit::Signal(signal.raw()),
+        )
+        .await;
+        info!(
+            "[dtid {}] finish delivering signal (#{}) {}",
+            dettid, mycount, signal
+        );
+        self.record_handler_restore_mask(guest, signal).await;
+
+        self.post_handler_hook(guest, CheckIn::Event).await;
+        #[cfg(test)]
+        Self::note_test_phase("delivered");
+        #[cfg(test)]
+        signal_announcement_tests::grant_during_commit_if_asked(guest.thread_state_mut());
+        Ok(Some(signal))
+    }
+
+    /// Take back the POSIX timer copies a successful exec flushes
+    /// (`Scheduler::take_exec_timer_flush`), one zero-timeout
+    /// `rt_sigtimedwait` each, before the new image runs. Linux discards a
+    /// queued timer signal at exec (`flush_itimer_signals`) and keeps every
+    /// other pending signal; Hermit sends a timer's expiration as an ordinary
+    /// signal, which exec would keep
+    /// (<https://github.com/rrnewton/hermit/issues/4184>). A copy that cannot
+    /// be singled out refuses the run by name.
+    async fn flush_exec_timer_copies<G: Guest<Self>>(&self, guest: &mut G) {
+        let dettid = guest.thread_state().dettid;
+        let refusal = match tool_global::exec_timer_flush(guest).await {
+            Err(reason) => Some(reason),
+            Ok(flush) => {
+                let mut refusal = None;
+                // The thread's own queue is dequeued first, as Linux does.
+                for set in [flush.own, flush.shared] {
+                    for signo in
+                        (1..=64).filter(|signo| set & scheduler::kernel_signal_bit(*signo) != 0)
+                    {
+                        match syscalls::take_pending_signal(guest, signo).await {
+                            Ok(taken) if taken == signo as i64 => info!(
+                                "[detcore, dtid {}] exec flushed a POSIX timer's pending signal {}",
+                                dettid, signo
+                            ),
+                            other => {
+                                refusal = Some(format!(
+                                    "taking back a POSIX timer's pending signal {signo} at exec answered {other:?}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+                refusal
+            }
+        };
+        if let Some(reason) = refusal {
+            let message = format!(
+                "hermit: thread {dettid} exec'd with a POSIX timer's signal possibly pending: {reason}; Linux discards a queued timer signal at exec, and Detcore cannot single this one out, so the run is refused (https://github.com/rrnewton/hermit/issues/4184)"
+            );
+            error!("{message}");
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+                .await;
+        }
+    }
+
+    /// After a dropped signal's delivery stop, which made no other hook run:
+    /// request the thread's timer event again for the same point of its
+    /// branch clock as the last handler armed it (`post_handler_hook`). The
+    /// stop is a Tool callback, which cancels the event, and nothing else
+    /// re-arms it, so a thread spinning in user code would run on unpreempted
+    /// until its next system call: measured, a chaos schedule whose sibling
+    /// took a dropped kernel `SIGCHLD` spun about 4e10 branches past its
+    /// 2e7-branch slice (https://github.com/rrnewton/hermit/issues/4304). The
+    /// point is fixed by the clock value of that handler, not by when the
+    /// host-timed stop came, and no logical time is charged here, so the stop
+    /// stays invisible to the schedule.
+    fn keep_timer_across_dropped_signal<G: Guest<Self>>(&self, guest: &mut G) {
+        if !self.cfg.use_preemption_timer() {
+            return;
+        }
+        let thread_state = guest.thread_state();
+        let Some(armed) = thread_state.last_rcb_timer else {
+            return;
+        };
+        let thread_state_committed = thread_state.committed_clock_value;
+        // The stop cancelled the event: an unreadable clock leaves the thread
+        // unpreempted, so it fails closed, as every handler's clock read does.
+        let now = guest.read_clock().expect("Couldn't read clock");
+        assert!(thread_state_committed <= now);
+        let schedule = TimerSchedule::Rcbs(kept_timer_rcbs(thread_state_committed, armed, now));
+        let armed = if guest.config().imprecise_timers {
+            guest.set_timer(schedule)
+        } else {
+            guest.set_timer_precise(schedule)
+        };
+        armed.expect("Failed to set timer");
+    }
+
+    /// Install Linux timer metadata only for the exact first kept expiry
+    /// claimed before this callback advances logical time.
+    async fn normalize_reported_itimer_real<G: Guest<Self>>(&self, guest: &mut G) {
+        use scheduler::discarded_at_send::DiscardedSignalAnswer;
+        use scheduler::discarded_at_send::DiscardedSignalControl;
+        if !scheduler::discarded_at_send::records(&self.cfg) {
+            return;
+        }
+        let Some(info) = guest.signal_info() else {
+            return;
+        };
+        if info == scheduler::discarded_at_send::itimer_real_siginfo() {
+            // A claimed copy may have requeued after a blocked resume. Its
+            // canonical payload is already installed; do not claim a newer
+            // publication that arrived while this copy was in flight.
+            return;
+        }
+        if tool_global::discarded_signal(guest, DiscardedSignalControl::ClaimItimerReal).await
+            != DiscardedSignalAnswer::ItimerReal(true)
+        {
+            return;
+        }
+        if let Err(errno) =
+            guest.set_signal_info(scheduler::discarded_at_send::itimer_real_siginfo())
+        {
+            tool_global::report_determinism_loss(
+                guest,
+                format!("ITIMER_REAL_SIGINFO_UNAVAILABLE: owned timer delivery cannot install Linux siginfo: {errno}"),
+            ).await;
+            guest_log::flush_unsent();
+            match guest
+                .tail_inject(
+                    reverie::syscalls::ExitGroup::new()
+                        .with_status(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                )
+                .await {}
+        }
+    }
+
+    /// Whether a `SIGCHLD` that stopped this thread is delivered, on a backend
+    /// that reports child-exit publication, where both the kernel and the
+    /// scheduler send a child's exit `SIGCHLD` (`scheduler::child_exit_sigchld`).
+    /// The first one delivered for a child's exit stands for it, and a copy
+    /// of either kind that arrives after it is not delivered. The scheduler's
+    /// copy (`SI_USER` from this tracer) is delivered with the siginfo Linux
+    /// gives the parent. Any other `SIGCHLD` is delivered as it is.
+    async fn child_exit_sigchld_delivers<G: Guest<Self>>(&self, guest: &mut G) -> bool {
+        use scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use scheduler::child_exit_sigchld::OwnCopy;
+        let Some(info) = guest.signal_info() else {
+            return true;
+        };
+        // A delivery stop: a kept copy's `InboundSignal` request follows.
+        let control = scheduler::child_exit_sigchld::taken_control(&info, true);
+        match tool_global::child_exit_sigchld(guest, control).await {
+            ChildExitSigchldAnswer::Claimed(dropped) => !dropped,
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate) => false,
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
+            | ChildExitSigchldAnswer::ClaimedFor(own) => {
+                if let Err(errno) = guest.set_signal_info(own.to_bytes()) {
+                    warn!(
+                        "[dtid {}] the SIGCHLD for child {} keeps its siginfo: {}",
+                        guest.thread_state().dettid,
+                        own.pid,
+                        errno
+                    );
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    async fn pre_handler_hook<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        precise_branch: bool,
+        boundary: CheckIn,
+    ) {
         // A handler that left early (an error return) may not have cleared
-        // this; no request made by this new handler belongs to that syscall.
+        // these; no request made by this new handler belongs to that syscall,
+        // and a wake that syscall made no longer ends the slice.
         guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
+        guest.thread_state_mut().yield_after_futex_wake = false;
+        guest.thread_state_mut().returned_from_sigreturn = false;
         let dettid = guest.thread_state().dettid;
         let evs = self.update_logical_time_rcbs(guest, precise_branch).await;
 
@@ -584,7 +1713,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "(pre) registers [dtid {}][rcbs {}]. {}",
                 dettid,
                 guest.thread_state().thread_logical_time.rcbs(),
-                guest.regs().await.display()
+                self.observed_regs(guest).await.display()
             );
         }
         trace!(
@@ -597,17 +1726,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
-        self.end_timeslice_if_needed(guest).await;
+        self.pipe_hand_off_if_due(guest).await;
+        self.end_timeslice_if_needed(guest, boundary).await;
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     /// Yield when accumulated logical time reaches the syscall-boundary target deadline.
-    async fn end_timeslice_if_needed<G: Guest<Self>>(&self, guest: &mut G) {
+    async fn end_timeslice_if_needed<G: Guest<Self>>(&self, guest: &mut G, boundary: CheckIn) {
         let thread_state = guest.thread_state();
+        // A thread that sent a signal to its own process keeps its turn until
+        // it dequeues that signal (`own_signal_turn_hold`).
+        if let Some(signal) = thread_state.own_signal_turn_hold {
+            trace!(
+                "[dtid {}] keeps its turn until it takes signal {}",
+                thread_state.dettid, signal
+            );
+            return;
+        }
         let Some(slice_end) = thread_state.end_of_timeslice else {
             return;
         };
-        if !thread_state.timeslice_expired() {
+        let ends = match boundary {
+            CheckIn::Event => thread_state.timeslice_expired(),
+            CheckIn::InstructionTrap => thread_state.instruction_trap_ends_timeslice(&self.cfg),
+        };
+        if !ends {
             return;
         }
 
@@ -625,8 +1768,31 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// However, note that the thread's timeslice (turn) may have expired DURING this handler.
     /// Therefore the timeslice can end in the posthook as well as in the prehook.
-    async fn post_handler_hook<G: Guest<Self>>(&self, guest: &mut G) {
-        self.end_timeslice_if_needed(guest).await;
+    async fn post_handler_hook<G: Guest<Self>>(&self, guest: &mut G, boundary: CheckIn) {
+        // Only `kill` and `rt_sigqueueinfo` set the hold, and they wake no
+        // futex waiter (https://github.com/rrnewton/hermit/issues/4034).
+        assert!(
+            guest.thread_state().own_signal_turn_hold.is_none()
+                || !guest.thread_state().yield_after_futex_wake,
+            "a futex wake must not end the turn a signal to the sender's own process holds"
+        );
+        if std::mem::take(&mut guest.thread_state_mut().yield_after_futex_wake) {
+            // A turn of its own, outside the timeslice bookkeeping: the slice
+            // keeps its deadlines, draws nothing from the thread's chaos PRNG
+            // and consumes no recorded preemption point, so a replay that
+            // makes the same decision stays aligned with its record. (Under
+            // a random `--sched-heuristic` the turn's selection draws from the
+            // run queue's generator, as every turn does, identically in record
+            // and replay.)
+            trace!(
+                "posthook [dtid {}] FUTEX_WAKE woke a waiter; yielding to it",
+                guest.thread_state().dettid
+            );
+            let request = Self::yield_request(guest);
+            resource_request(guest, request).await;
+        }
+        self.pipe_hand_off_if_due(guest).await;
+        self.end_timeslice_if_needed(guest, boundary).await;
 
         let dettid = guest.thread_state().dettid;
         let mut current_time = guest.thread_state().thread_logical_time.as_nanos();
@@ -642,6 +1808,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             let epsilon = Duration::from_nanos((NANOS_PER_RCB * clock_multiplier).ceil() as u64);
 
             if replay_rcb_end.is_none() && current_time + epsilon > max_timeslice_end {
+                if guest.thread_state().own_signal_turn_hold.is_some() {
+                    // No guest instruction runs before the delivery stop that
+                    // ends the hold, and that stop's post-hook ends this slice
+                    // and sets the next timer (`own_signal_turn_hold`).
+                    trace!(
+                        "posthook [dtid {}] past PMU maximum {} while it keeps its turn",
+                        dettid, max_timeslice_end
+                    );
+                    return;
+                }
                 trace!(
                     "posthook [dtid {}] less than one RCB remains before PMU maximum {}; ending slice",
                     dettid, max_timeslice_end
@@ -715,26 +1891,33 @@ impl<T: RecordOrReplay> Detcore<T> {
                 );
             }
             assert!(rcbs_remaining > 0);
-            trace!(
-                "posthook [dtid {}] Resetting timer to {:?} RCBs in the future (current {})",
-                dettid,
-                rcbs_remaining,
-                guest.thread_state().thread_logical_time.rcbs()
-            );
-            {
-                let thread_state = guest.thread_state_mut();
-                thread_state.last_rcb_timer = Some(rcbs_remaining);
-                thread_state.last_rcb_timer_is_max = timer_is_max;
-            }
+            // The maximum also governs logical expiry and instruction traps.
+            // Delivery capability gates only the physical arm and its record.
+            if guest.config().use_preemption_timer() {
+                trace!(
+                    "posthook [dtid {}] Resetting timer to {:?} RCBs in the future (current {})",
+                    dettid,
+                    rcbs_remaining,
+                    guest.thread_state().thread_logical_time.rcbs()
+                );
+                {
+                    let thread_state = guest.thread_state_mut();
+                    thread_state.last_rcb_timer = Some(rcbs_remaining);
+                    thread_state.last_rcb_timer_is_max = timer_is_max;
+                }
 
-            if guest.config().imprecise_timers {
-                guest
-                    .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
-                    .expect("Failed to set timer");
+                if guest.config().imprecise_timers {
+                    guest
+                        .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
+                        .expect("Failed to set timer");
+                } else {
+                    guest
+                        .set_timer_precise(TimerSchedule::Rcbs(rcbs_remaining))
+                        .expect("Failed to set timer");
+                }
             } else {
-                guest
-                    .set_timer_precise(TimerSchedule::Rcbs(rcbs_remaining))
-                    .expect("Failed to set timer");
+                guest.thread_state_mut().last_rcb_timer = None;
+                guest.thread_state_mut().last_rcb_timer_is_max = false;
             }
         } else {
             assert!(guest.config().max_timeslice.is_none());
@@ -747,7 +1930,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "(post) registers [dtid {}][rcbs {}]. {}",
                 dettid,
                 guest.thread_state().thread_logical_time.rcbs(),
-                guest.regs().await.display(),
+                self.observed_regs(guest).await.display(),
             );
         }
     }
@@ -960,10 +2143,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             return Ok(());
         }
+        // Where Detcore answers brk from its model (a launcher run), the
+        // kernel's `[heap]` is the launcher's, not the guest's.
+        let modeled_brk = guest
+            .thread_state()
+            .memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .brk_model
+            .is_some();
         let mut labelled_heap = false;
         for mmap in procmaps::from_pid(guest.pid(), |map| match map.pathname {
             procmaps::MMapPath::Stack if self.cfg.detlog_stack => true,
-            procmaps::MMapPath::Heap if self.cfg.detlog_heap => true,
+            procmaps::MMapPath::Heap if self.cfg.detlog_heap && !modeled_brk => true,
             _ => false,
         })? {
             labelled_heap |= matches!(mmap.pathname, procmaps::MMapPath::Heap);
@@ -983,6 +2175,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // than a wrong one: downstream a zero-record heap comparison reads as
         // "compared and matched" rather than "never measured". Fall back to the
         // brk range Detcore observed, which identifies the heap on every backend.
+        // Where Detcore models the break, the observed range is the model's.
         if self.cfg.detlog_heap && !labelled_heap {
             self.detlog_brk_heap(guest)?;
         }
@@ -1021,6 +2214,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         else {
             return Ok(());
         };
+        let modeled = guest
+            .thread_state()
+            .memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .brk_model
+            .is_some();
+        if modeled {
+            return self.detlog_modeled_brk_heap(guest, start, end);
+        }
         let enclosing = procmaps::from_pid(guest.pid(), |map| {
             matches!(map.pathname, procmaps::MMapPath::Anonymous)
                 && map.address.0 <= start
@@ -1036,6 +2239,40 @@ impl<T: RecordOrReplay> Detcore<T> {
             procmaps::display_range_as(&mmap, start, end, "[heap]"),
             procmaps::compute_hash_range(guest, start, end)?
         );
+        Ok(())
+    }
+
+    /// The heap records where Detcore models the break (a launcher run): one
+    /// per anonymous mapping that holds part of the modeled `[start, end)`,
+    /// clipped to it, as Linux's `[heap]` is one mapping per piece once an
+    /// mprotect splits it, and up to the break's page-aligned end, where the
+    /// kernel's `[heap]` mapping ends. So the records are the ones the
+    /// kernel's `[heap]` mappings give where the kernel's break is the
+    /// guest's, and a heap whose pages the guest unmapped gives none, as
+    /// Linux's label goes with its last page.
+    fn detlog_modeled_brk_heap<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        start: u64,
+        end: u64,
+    ) -> Result<(), reverie::Error> {
+        // The page brk(2) rounds the break up to.
+        let end = end.checked_add(4095).map_or(end, |end| end & !4095);
+        let pieces = procmaps::from_pid(guest.pid(), |map| {
+            matches!(map.pathname, procmaps::MMapPath::Anonymous)
+                && map.address.0 < end
+                && start < map.address.1
+        })?;
+        let dettid = guest.thread_state().dettid;
+        for piece in pieces {
+            let (from, to) = (piece.address.0.max(start), piece.address.1.min(end));
+            detlog!(
+                "[memory][dtid {}] {}->{}",
+                dettid,
+                procmaps::display_range_as(&piece, from, to, "[heap]"),
+                procmaps::compute_hash_range(guest, from, to)?
+            );
+        }
         Ok(())
     }
 }
@@ -1129,13 +2366,99 @@ fn failure_proves_outputs_unwritten(result: &Result<i64, Error>) -> bool {
     matches!(result, Err(Error::Errno(errno)) if *errno != Errno::EFAULT)
 }
 
+/// The happens-before request a syscall entry makes once its result is
+/// decided, for the posthook anchors it reached at its prehook (`anchors`), or
+/// `None` (<https://github.com/rrnewton/hermit/issues/3929>):
+/// - a value or a guest errno other than an internal restart code is a
+///   completion: Linux returns it unchanged, so the anchors fire
+///   ([`ResourceID::HappensBeforeSyscallCheckpoint`]);
+/// - an internal restart code (`ERESTARTSYS`, `ERESTARTNOINTR`,
+///   `ERESTARTNOHAND`, `ERESTART_RESTARTBLOCK`) is refused
+///   ([`ResourceID::HappensBeforePosthookInterrupted`]): the kernel decides
+///   only at signal delivery, after this point, whether the guest sees `EINTR`
+///   or the entry is restarted and never returns, so neither firing nor not
+///   firing would keep the anchor's promise;
+/// - a tool or backend failure is not a result the guest receives; nothing
+///   fires, and the failure ends the run on its own path.
+fn posthook_checkpoint(
+    count: u64,
+    anchors: Vec<String>,
+    result: &Result<i64, Error>,
+) -> Option<ResourceID> {
+    if anchors.is_empty() {
+        return None;
+    }
+    match result {
+        Err(Error::Errno(
+            errno @ (Errno::ERESTARTSYS
+            | Errno::ERESTARTNOINTR
+            | Errno::ERESTARTNOHAND
+            | Errno::ERESTART_RESTARTBLOCK),
+        )) => Some(ResourceID::HappensBeforePosthookInterrupted {
+            count,
+            anchors,
+            code: errno
+                .name()
+                .map_or_else(|| errno.to_string(), str::to_owned),
+        }),
+        Ok(_) | Err(Error::Errno(_)) => {
+            Some(ResourceID::HappensBeforeSyscallCheckpoint { count, anchors })
+        }
+        Err(_) => None,
+    }
+}
+
 #[reverie::tool]
 impl<T: RecordOrReplay> Tool for Detcore<T> {
     type GlobalState = GlobalState;
     type ThreadState = ThreadState<T::ThreadState>;
 
-    fn observe_signal_dequeues(config: &Config) -> bool {
-        config.kvm_shared_dequeue_timers && config.sequentialize_threads && config.backend_is_kvm
+    /// Only a sequentialized run on a backend with process signal control
+    /// can install that control. Whether this run observes dequeues is
+    /// decided after installation by [`GlobalState`]'s
+    /// `GlobalTool::observe_signal_dequeues`.
+    fn may_observe_signal_dequeues(config: &Config) -> bool {
+        config.backend.provides_process_signal_control && config.sequentialize_threads
+    }
+
+    /// The same runs require the control: real-timer signals on such a run
+    /// travel only through acknowledged shared dequeues. Reverie refuses it
+    /// before any guest code, with ENOSYS on a runner that offers no control,
+    /// as Detcore's own installation did before this check moved into
+    /// Reverie, and with EINVAL on a runner whose offer was not taken. So
+    /// Detcore's scheduler needs no refusal of its own for a capable backend
+    /// without a control.
+    fn requires_signal_control(config: &Config) -> bool {
+        config.backend.provides_process_signal_control && config.sequentialize_threads
+    }
+
+    /// A sequentialized run lets one guest thread run guest code at a time,
+    /// and Detcore refuses every way to install a seccomp filter: `seccomp(2)`
+    /// (`handle_seccomp`, EOPNOTSUPP or an earlier argument error) and
+    /// `prctl(PR_SET_SECCOMP)` (not a supported option, ENOSYS). Both
+    /// refusals need the call intercepted, so the declaration also requires
+    /// both in the subscriptions. The ptrace backend then keeps the guest's
+    /// SIGTRAP action and mask across its own single-steps
+    /// (<https://github.com/rrnewton/hermit/issues/4409>).
+    ///
+    /// One exception to "one at a time": a call the scheduler runs in the
+    /// background (`BlockingExternalIO`, `BlockingRtSigsuspend`) is injected
+    /// with a returning `inject`, so its thread runs only that syscall, in the
+    /// kernel, and stops before any guest instruction. It can install no
+    /// filter. Its injection is single-stepped, though, and that step's trap,
+    /// at a host-timed moment, can reset the process's shared SIGTRAP action
+    /// while another thread's injection is kept. An ignored, or caught and
+    /// blocked, SIGTRAP can then end at `SIG_DFL`, where an undeclared run
+    /// always leaves it; the blocked mask is per thread and is not affected.
+    fn enforces_serialized_execution(config: &Config) -> bool {
+        let subscriptions = Self::subscriptions(config);
+        config.sequentialize_threads
+            && subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::seccomp)
+            && subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::prctl)
     }
 
     async fn handle_signal_dequeue<G: Guest<Self>>(
@@ -1150,10 +2473,58 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     fn new(pid: Pid, cfg: &Config) -> Self {
         let detpid = DetPid::from_raw(pid.into()); // TODO(T78538674): virtualize pid.
         cfg.validate_invariants();
+        if let Some(policy) = &cfg.in_guest_detlog_forward_policy {
+            // This image's forwarder was set up before the Tool (SaBRe's
+            // connect, the LiteInst constructor); without one, or with another
+            // policy, refuse.
+            detlog::require_forwarding(policy);
+        }
+        if cfg.in_guest_site_patching_off {
+            // Record the host's request; the preload constructor compares it
+            // with the settings the runtime captured once installation
+            // returns (see in_guest_site_patching).
+            in_guest_site_patching::require_site_patching_off();
+        }
+        // Read before any guest syscall, so a readlink of another process's
+        // pipe or socket never depends on the tracer's descriptors then. The
+        // outcome is kept; a failure is reported only if a guest needs it.
+        let _ = syscalls::anonymous_object_devices();
         Self {
             detpid,
             cfg: cfg.clone(),
             record_or_replay: T::new(pid, cfg),
+        }
+    }
+
+    /// The signal-state copy follows handler returns from the backend's
+    /// reports where it has them (`syscalls::signal_shadow`).
+    fn observes_sigreturns(config: &Config) -> bool {
+        crate::syscalls::signal_shadow::observes_sigreturns(config)
+    }
+
+    fn handle_sigreturn(
+        &self,
+        thread_state: &mut Self::ThreadState,
+        report: reverie::SigreturnReport,
+    ) {
+        crate::syscalls::signal_shadow::record_sigreturn_report(thread_state, report);
+        thread_state.returned_from_sigreturn = true;
+    }
+
+    /// Counts each signal the backend passes on without reporting it, which
+    /// could reach a guest handler, so the delivery counters show what no
+    /// delivery check saw (A5 step 3.2b).
+    fn note_unreported_signal(
+        &self,
+        thread_state: &mut Self::ThreadState,
+        signal: &reverie::UnreportedSignal,
+        kept: bool,
+    ) {
+        if kept && self.copy_misses_unreported(signal.number()) {
+            let dettid = thread_state.dettid;
+            thread_state
+                .delivery_counters
+                .count_unreported(dettid, signal.reason());
         }
     }
 
@@ -1171,11 +2542,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // re-executes the host instruction, so trapping does not change what the guest
             // sees, but the subscription makes Reverie probe and enable CPUID faulting and log
             // an ERROR for each exec on hosts that lack it
-            // (https://github.com/rrnewton/hermit/issues/3460). A backend that installs its
-            // own CPUID table (KVM) still needs the trap for the guest to see host values.
+            // (https://github.com/rrnewton/hermit/issues/3460). No backend installs a CPUID
+            // table of its own, so an untrapped guest CPUID is the host's on every backend.
             let mut subscription = Subscription::all_syscalls();
             subscription.rdtsc();
-            if config.virtualize_cpuid || config.cpuid_virtualized_by_backend {
+            if config.virtualize_cpuid {
                 subscription.cpuid();
             }
             subscription
@@ -1201,6 +2572,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::openat,
                 Sysno::open,
                 Sysno::creat,
+                // Detcore answers access and extended-attribute requests on the
+                // procfs files it renders
+                // (https://github.com/rrnewton/hermit/issues/4213); a backend
+                // keeps no copy of them, so these must not bypass Detcore.
+                Sysno::access,
+                Sysno::faccessat,
+                Sysno::faccessat2,
+                Sysno::getxattr,
+                Sysno::lgetxattr,
+                Sysno::setxattr,
+                Sysno::lsetxattr,
+                Sysno::removexattr,
+                Sysno::lremovexattr,
+                Sysno::listxattr,
+                Sysno::llistxattr,
                 Sysno::close,
                 Sysno::read,
                 Sysno::pread64,
@@ -1396,11 +2782,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         ecx: u32,
     ) -> Result<CpuIdResult, Errno> {
         trace!("handle_cpuid_event: eax: {}, ecx: {}", eax, ecx);
-        self.pre_handler_hook(guest, false).await;
+        // A trapped instruction stops the guest in user code (A5 step 3.2).
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+        if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
+            self.sync_sigalrm_eligibility(guest).await;
+        }
+        self.pre_handler_hook(guest, false, CheckIn::InstructionTrap)
+            .await;
         let res = if self.cfg.virtualize_cpuid {
             let dettid = guest.thread_state().dettid;
             let time = &mut guest.thread_state_mut().thread_logical_time;
-            let intercepted = cpuid::InterceptedCpuid::new();
+            let intercepted = self.virtual_cpuid();
             time.add_cpuid();
             let nanos = time.as_nanos();
             trace!(
@@ -1437,7 +2829,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         } else {
             cpuid!(eax, ecx)
         };
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::InstructionTrap)
+            .await;
         Ok(res)
     }
 
@@ -1447,11 +2840,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         request: Rdtsc,
     ) -> Result<RdtscResult, Errno> {
         trace!("handle_rdtsc_event: {:?}", request);
-        self.pre_handler_hook(guest, false).await;
+        // A trapped instruction stops the guest in user code (A5 step 3.2).
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+        if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
+            self.sync_sigalrm_eligibility(guest).await;
+        }
+        self.pre_handler_hook(guest, false, CheckIn::InstructionTrap)
+            .await;
         let result = if guest.config().virtualize_time {
             let dettid = guest.thread_state().dettid;
             guest.thread_state_mut().thread_logical_time.add_rdtsc();
-            info!(
+            crate::ordered_info!(
                 "[dtid {}] inbound rdtsc, new logical time: {:?}",
                 dettid,
                 guest.thread_state().thread_logical_time
@@ -1491,7 +2890,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .handle_rdtsc_event(&mut guest.into_guest(), request)
                 .await
         };
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::InstructionTrap)
+            .await;
         result
     }
 
@@ -1501,63 +2901,322 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         signal: Signal,
     ) -> Result<Option<Signal>, Errno> {
-        if signal == Signal::SIGINT && self.cfg.sigint_instakill {
-            warn!("Fatal: Exiting hermit container immediately upon SIGINT");
-            // ⚠️ NOT A REFUSAL. The operator interrupted the run; hermit examined
-            // nothing and decided nothing. Reporting `128 + SIGINT` is what every
-            // other tool reports for this, and it keeps 122 meaning one thing.
-            unrecoverable_shutdown(guest, detcore_model::HERMIT_SIGINT_DEATH_EXIT).await
-        } else {
-            self.pre_handler_hook(guest, false).await;
+        let delivered = self
+            .handle_inbound_signal(guest, SigWrapper::from(signal))
+            .await?;
+        if scheduler::discarded_at_send::records(&self.cfg)
+            && let Some(control) = consumed_signal_control(
+                guest.pid(),
+                guest.tid(),
+                signal as i32,
+                delivered.is_some(),
+            )
+        {
+            tool_global::discarded_signal(guest, control).await;
+        }
+        if delivered.is_some() {
+            crate::syscalls::signal_shadow::check_and_record_delivery(guest, signal as i32).await;
+        }
+        Ok(delivered.map(|_| signal))
+    }
 
-            let dettid = guest.thread_state().dettid;
-            let mycount = guest.thread_state().stats.signal_count;
-            info!(
-                "[dtid {}] handling inbound signal (#{}) {}",
-                dettid, mycount, signal
+    /// A realtime signal (32 to 64), which `Signal` cannot name: handled as
+    /// any other (`handle_inbound_signal`), so it takes its turn in the
+    /// schedule (<https://github.com/rrnewton/reverie/issues/207>).
+    async fn handle_raw_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+    ) -> Result<Option<i32>, Errno> {
+        let delivered = self
+            .handle_inbound_signal(guest, SigWrapper(signal))
+            .await?;
+        if delivered.is_some() {
+            crate::syscalls::signal_shadow::check_and_record_delivery(guest, signal).await;
+        }
+        Ok(delivered.map(|signal| signal.raw()))
+    }
+
+    /// The first half of a delivery a backend announces before the kernel
+    /// dequeues it (an in-guest backend's prediction at a return to guest
+    /// code): the delivery's turn alone (`inbound_turn` with
+    /// `TurnScope::Announcement`), kept under the announcement's token
+    /// (`ThreadState::signal_announcements`). Detcore never suppresses here:
+    /// its drop decisions (a duplicate child-exit `SIGCHLD`, a stale POSIX
+    /// timer entry) exist only in configurations it refuses. A signal outside
+    /// 1 to 64 is `EINVAL`. A configuration in which the commit could not
+    /// keep the protocol, or a thread holding a claimed `SIGCHLD`, is refused
+    /// here, before any turn, with `EOPNOTSUPP` (`two_phase_refusal`).
+    async fn announce_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+    ) -> Result<Option<reverie::SignalAnnouncement>, Errno> {
+        if !(1..=64).contains(&signal) {
+            return Err(Errno::EINVAL);
+        }
+        let refusal = two_phase_refusal(&self.cfg).or_else(|| {
+            guest
+                .thread_state()
+                .claimed_sigchld
+                .then_some("a claimed SIGCHLD must be placed before its delivery's turn")
+        });
+        if let Some(reason) = refusal {
+            warn!(
+                "[dtid {}] refusing a two-phase delivery of signal {}: {}",
+                guest.thread_state().dettid,
+                signal,
+                reason
             );
-            guest.thread_state_mut().stats.count_signal();
-            let time = &guest.thread_state().thread_logical_time;
-            let nanos = time.as_nanos();
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let stop = self.inbound_stop(guest);
+        let turn = self
+            .inbound_turn(guest, SigWrapper(signal), stop, TurnScope::Announcement)
+            .await;
+        let state = guest.thread_state_mut();
+        let token = state.next_signal_announcement;
+        state.next_signal_announcement = token.wrapping_add(1);
+        state
+            .signal_announcements
+            .push(tool_local::SignalAnnouncementState {
+                token,
+                signal,
+                turn,
+            });
+        Ok(Some(reverie::SignalAnnouncement::new(signal, token)))
+    }
 
-            if self.cfg.sequentialize_threads && self.cfg.should_trace_schedevent() {
-                trace_schedevent(
-                    guest,
-                    SchedEvent {
-                        dettid,
-                        op: Op::SignalReceived(signal.into()),
-                        count: 1,
-                        start_rip: None,
-                        end_rip: None,
-                        end_time: Some(nanos),
-                    },
-                    true,
+    /// The second half of an announced delivery, once the backend's final
+    /// read confirmed it, in ptrace's order: what the dequeue settles
+    /// (`inbound_dequeued`), what the announcement's turn left
+    /// (`inbound_turn_settled`, which also gives the delivery its ordinal),
+    /// what the granted delivery settles (`inbound_delivered`), and the
+    /// delivery's record (`check_and_record_delivery`, whose
+    /// `Guest::deliver_signal` is the backend's check of its prediction and
+    /// whose siginfo read gets none). An announcement this thread does not
+    /// hold, signal and token both, is `EINVAL`; a drop decision, which only
+    /// refused configurations make, is `EPROTO`.
+    ///
+    /// It must not wait for a turn. The announcement refused every
+    /// configuration in which one of its parts files a scheduler request; if
+    /// the thread was granted a turn all the same, the backend's final read
+    /// no longer holds, so the commit fails closed with `EDEADLK`, after
+    /// `inbound_delivered`'s effects but before the record. Any `Err` ends
+    /// the run.
+    async fn commit_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        announcement: reverie::SignalAnnouncement,
+    ) -> Result<(), Errno> {
+        let Some(index) = guest
+            .thread_state()
+            .signal_announcements
+            .iter()
+            .position(|held| {
+                held.token == announcement.token() && held.signal == announcement.signal()
+            })
+        else {
+            return Err(Errno::EINVAL);
+        };
+        let held = guest.thread_state_mut().signal_announcements.remove(index);
+        let grants = guest.thread_state().scheduler_grants;
+        let signal = SigWrapper(held.signal);
+        let Some(timer_entry) = self.inbound_dequeued(guest, signal).await? else {
+            warn!(
+                "[dtid {}] announced signal {} was dropped at its commit",
+                guest.thread_state().dettid,
+                held.signal
+            );
+            return Err(Errno::EPROTO);
+        };
+        let mycount = self.inbound_turn_settled(guest, signal).await;
+        let turn = tool_local::InboundTurn {
+            dettid: held.turn.dettid,
+            mycount,
+        };
+        self.inbound_delivered(guest, signal, turn, timer_entry)
+            .await?;
+        if guest.thread_state().scheduler_grants != grants {
+            warn!(
+                "[dtid {}] the commit of announced signal {} was granted a turn; \
+                 the backend's final read no longer holds",
+                guest.thread_state().dettid,
+                held.signal
+            );
+            return Err(Errno::EDEADLK);
+        }
+        crate::syscalls::signal_shadow::check_and_record_delivery(guest, held.signal).await;
+        #[cfg(test)]
+        Self::note_test_phase("recorded");
+        if guest.thread_state().scheduler_grants != grants {
+            warn!(
+                "[dtid {}] recording announced signal {} was granted a turn",
+                guest.thread_state().dettid,
+                held.signal
+            );
+            return Err(Errno::EDEADLK);
+        }
+        Ok(())
+    }
+
+    /// An announced delivery that does not happen at the backend's return:
+    /// its turn stays taken (one more turn than ptrace, which never reports a
+    /// delivery that does not happen), and nothing else was done for it, so
+    /// the signal, still pending, is announced again at a later return.
+    fn withdraw_signal_event(
+        &self,
+        thread_state: &mut Self::ThreadState,
+        announcement: reverie::SignalAnnouncement,
+    ) {
+        thread_state.signal_announcements.retain(|held| {
+            held.token != announcement.token() || held.signal != announcement.signal()
+        });
+    }
+
+    /// A `SIGCHLD` the backend passes on without reporting it is dropped when
+    /// it is the kernel's copy of a child-exit notification the scheduler
+    /// sends itself (`scheduler::child_exit_sigchld`). A copy the scheduler
+    /// sent is kept, with the siginfo the tracer gave it: this hook cannot
+    /// replace it.
+    ///
+    /// Either way, the scheduler's record of copies Linux discarded when they
+    /// were sent learns what became of the copy (`consumed_signal_control`,
+    /// <https://github.com/rrnewton/hermit/issues/4293>).
+    async fn filter_unreported_signal<R: GlobalRPC<Self::GlobalState>>(
+        &self,
+        rpc: &R,
+        unreported: reverie::UnreportedSignal,
+    ) -> bool {
+        if unreported.signal() == Some(Signal::SIGALRM)
+            && scheduler::discarded_at_send::records(&self.cfg)
+        {
+            let tid = DetTid::from_raw(unreported.tid().as_raw());
+            rpc.send_rpc((
+                DetTime::default(),
+                MmId::initial(tid),
+                tool_global::GlobalRequest::DiscardedSignal(
+                    scheduler::discarded_at_send::DiscardedSignalControl::UnreportedAlarm,
+                ),
+            ))
+            .await;
+        }
+        // A POSIX timer's stale entry is skipped, as Linux skips it inside the
+        // dequeue (<https://github.com/rrnewton/hermit/issues/4262>).
+        let stale_timer_entry = scheduler::discarded_at_send::records(&self.cfg)
+            && (1..32).contains(&unreported.number())
+            && {
+                let tid = DetTid::from_raw(unreported.tid().as_raw());
+                let control = scheduler::discarded_at_send::DiscardedSignalControl::Unreported {
+                    signal: unreported.number(),
+                };
+                // Carries no logical time; answered before any clock accounting.
+                let (_, response) = rpc
+                    .send_rpc((
+                        DetTime::default(),
+                        MmId::initial(tid),
+                        tool_global::GlobalRequest::DiscardedSignal(control),
+                    ))
+                    .await;
+                matches!(
+                    response,
+                    tool_global::GlobalResponse::DiscardedSignal(
+                        scheduler::discarded_at_send::DiscardedSignalAnswer::Delivery(
+                            scheduler::posix_timer_coalesce::DeliveryAnswer::Suppress
+                        )
+                    )
                 )
-                .await;
+            };
+        let kept = !stale_timer_entry && async {
+            // The test-only claim fault drops the claimed copy here too, where a
+            // relative `nanosleep`'s restart code makes the backend pass it on
+            // unreported (`syscalls::signal::take_claim_fault`).
+            if unreported.signal() == Some(Signal::SIGCHLD)
+                && crate::syscalls::take_claim_fault(crate::syscalls::ClaimFault::DropClaimed)
+            {
+                warn!(
+                    "[tid {}] claim fault hook: dropped the claimed SIGCHLD",
+                    unreported.tid()
+                );
+                return false;
+            }
+            if unreported.signal() != Some(Signal::SIGCHLD)
+                || !self.cfg.backend.reports_kernel_child_exit_signals
+            {
+                return true;
+            }
+            let Some(info) = unreported.siginfo() else {
+                return true;
+            };
+            let tid = DetTid::from_raw(unreported.tid().as_raw());
+            // Passed on unreported, a kept copy makes no `InboundSignal` request.
+            match scheduler::child_exit_sigchld::control_for(&info, std::process::id(), false) {
+                None => true,
+                Some(control) => {
+                    use scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+                    use scheduler::child_exit_sigchld::OwnCopy;
+                    // The control message carries no logical time; the scheduler answers
+                    // it before any clock accounting.
+                    let (_, response) = rpc
+                        .send_rpc((
+                            DetTime::default(),
+                            MmId::initial(tid),
+                            tool_global::GlobalRequest::ChildExitSigchld(control),
+                        ))
+                        .await;
+                    match response {
+                        tool_global::GlobalResponse::ChildExitSigchld(
+                            ChildExitSigchldAnswer::Claimed(dropped),
+                        ) => !dropped,
+                        tool_global::GlobalResponse::ChildExitSigchld(
+                            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate),
+                        ) => false,
+                        tool_global::GlobalResponse::ChildExitSigchld(
+                            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
+                            | ChildExitSigchldAnswer::ClaimedFor(own),
+                        ) => {
+                            warn!(
+                                "[dtid {}] the SIGCHLD for child {} passed on unreported keeps its delivered siginfo",
+                                tid, own.pid
+                            );
+                            true
+                        }
+                        _ => true,
+                    }
+                }
             }
 
-            let request = guest.thread_state_mut().mk_request(
-                ResourceID::InboundSignal(SigWrapper::from(signal)),
-                Permission::RW,
-            );
-            resource_request(guest, request).await;
-            // A delivered signal may be caught, ignored, or terminate the
-            // thread group. Reading the lists is harmless; the collected
-            // wakes remain inert unless the ptrace exit callback later reports
-            // that this exact signal caused physical exit.
-            self.stage_thread_group_robust_list_wakes(
-                guest,
-                tool_local::RobustListExit::Signal(signal as i32),
-            )
-            .await;
-            info!(
-                "[dtid {}] finish delivering signal (#{}) {}",
-                dettid, mycount, signal
-            );
-
-            self.post_handler_hook(guest).await;
-            Ok(Some(signal))
         }
+        .await;
+        if scheduler::discarded_at_send::records(&self.cfg)
+            && let Some(control) = consumed_signal_control(
+                unreported.pid(),
+                unreported.tid(),
+                unreported.number(),
+                kept,
+            )
+        {
+            let tid = DetTid::from_raw(unreported.tid().as_raw());
+            // Carries no logical time; answered before any clock accounting.
+            rpc.send_rpc((
+                DetTime::default(),
+                MmId::initial(tid),
+                tool_global::GlobalRequest::DiscardedSignal(control),
+            ))
+            .await;
+        }
+        // The signal-state copy lives in this process wherever it is kept
+        // (`syscalls::signal_shadow`); a signal that reaches a handler
+        // unreported is one it never saw.
+        let signal = unreported.number();
+        if kept && self.copy_misses_unreported(signal) {
+            crate::syscalls::signal_shadow::note_unreported(
+                unreported.pid().as_raw(),
+                unreported.tid().as_raw(),
+                signal,
+            );
+        }
+        kept
     }
 
     fn init_thread_state(
@@ -1591,6 +3250,58 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     pts.1.prepare_child_process_cpu_time(dettid);
                 }
                 let guest_clock = Arc::clone(&pts.1.guest_clock);
+                // A pending unreported signal may already have changed the
+                // parent's actions unseen: the child gets no copy then.
+                let child_signal_shadow = pts
+                    .1
+                    .signal_shadow
+                    .as_ref()
+                    .filter(|_| !crate::syscalls::signal_shadow::unreported_pending())
+                    .and_then(|shadow| shadow.for_clone(clone_flags.bits()));
+                // A child sharing the actions without a copy could change them
+                // unrecorded: they become unknown to every sharer.
+                if child_signal_shadow.is_none()
+                    && clone_flags.contains(CloneFlags::CLONE_SIGHAND)
+                    && let Some(shadow) = pts.1.signal_shadow.as_ref()
+                {
+                    shadow.forget_dispositions();
+                }
+                if child_signal_shadow.is_some() {
+                    trace!(
+                        "[dtid {}] signal-state copy: child {} gets a copy",
+                        pts.1.dettid, dettid
+                    );
+                } else if pts.1.signal_shadow.is_some() {
+                    debug!(
+                        "[dtid {}] signal-state copy: child {} gets none (created inside a \
+                         handler, an unreported signal pending, or the actions unknown)",
+                        pts.1.dettid, dettid
+                    );
+                } else if pts.1.signal_shadow_lost {
+                    debug!(
+                        "[dtid {}] signal-state copy: child {} gets none (its creator's was lost)",
+                        pts.1.dettid, dettid
+                    );
+                }
+                debug!(
+                    "[init_thread-state, parent dtid = {}] child thread {}, clone_flags = {:x?}",
+                    pts.0, tid, clone_flags
+                );
+                let file_metadata = if clone_flags.contains(CloneFlags::CLONE_FILES) {
+                    pts.1.file_metadata.clone()
+                } else {
+                    Arc::new(Mutex::new(
+                        pts.1.file_metadata.lock().unwrap().fork_for(dettid),
+                    ))
+                };
+                // A thread is of its creator's process. A new process leads a
+                // thread group of its own, whose table is the one it starts
+                // with: its creator's under CLONE_FILES, a copy otherwise.
+                let process_files = if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                    pts.1.process_files
+                } else {
+                    Some(file_metadata.lock().unwrap().files_id)
+                };
 
                 ThreadState {
                     dettid,
@@ -1618,24 +3329,30 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     pedigree: child_pedigree.clone(),
                     initialized_random_auxv: None,
                     stats: ThreadStats::new(),
-                    file_metadata: {
-                        debug!(
-                            "[init_thread-state, parent dtid = {}] child thread {}, clone_flags = {:x?}",
-                            pts.0, tid, clone_flags
-                        );
-                        if clone_flags.contains(CloneFlags::CLONE_FILES) {
-                            pts.1.file_metadata.clone()
-                        } else {
-                            Arc::new(Mutex::new(
-                                pts.1.file_metadata.lock().unwrap().fork_for(dettid),
-                            ))
-                        }
-                    },
-                    discover_live_file_metadata: pts.1.discover_live_file_metadata,
+                    file_metadata,
+                    process_files,
+                    tool_shares_guest_descriptor_table: pts.1.tool_shares_guest_descriptor_table,
                     // Linux copies the creating thread's current timer slack
                     // into both fields of every new task (thread or process).
                     timer_slack_ns: pts.1.timer_slack_ns,
                     default_timer_slack_ns: pts.1.timer_slack_ns,
+                    // A new process created with CLONE_NEWPID is the init of
+                    // a namespace below its creator's; everything else lives
+                    // in its creator's.
+                    nested_pid_namespace: pts.1.nested_pid_namespace
+                        || (clone_flags.contains(CloneFlags::CLONE_NEWPID)
+                            && !clone_flags.contains(CloneFlags::CLONE_THREAD)),
+                    // A new task starts in its creator's root, and with
+                    // CLONE_FS keeps sharing it.
+                    changed_root: if clone_flags.contains(CloneFlags::CLONE_FS) {
+                        Arc::clone(&pts.1.changed_root)
+                    } else {
+                        Arc::new(std::sync::atomic::AtomicBool::new(
+                            pts.1.changed_root.load(std::sync::atomic::Ordering::SeqCst),
+                        ))
+                    },
+                    // A new task runs its creator's image.
+                    exe: pts.1.exe.clone(),
                     // POSIX timers are shared among threads of a process but are
                     // NOT inherited across fork(2). Share the table for a new
                     // thread (CLONE_THREAD); give a new process a fresh, empty
@@ -1672,6 +3389,46 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     } else {
                         Some(Arc::clone(&pts.1.process_cpu_time))
                     },
+                    parent_cpu_publication: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        pts.1.parent_cpu_publication.clone()
+                    } else if self.cfg.backend.emulates_child_waits
+                        && self.cfg.sequentialize_threads
+                    {
+                        Some(pts.1.prepare_child_cpu_publication(dettid))
+                    } else {
+                        None
+                    },
+                    // A new thread has made no syscall yet.
+                    restart_block: None,
+                    // A fork child inherits its parent's signal dispositions.
+                    sigalrm_handled: pts.1.sigalrm_handled,
+                    signal_shadow: child_signal_shadow.clone(),
+                    // A parent whose shared actions were unknown gives its
+                    // child no copy, and that child is never seeded either.
+                    // Only a divergence marks a lineage as never to be seeded
+                    // again; a child denied a copy for a quiet reason is
+                    // seeded at its exec.
+                    signal_shadow_lost: pts.1.signal_shadow_lost,
+                    // A new thread's first stop is at the exit of the call
+                    // that made it, which Detcore did not finish for it.
+                    delivery_interruption: None,
+                    delivery_frame_handler: 0,
+                    delivery_frame_signal: 0,
+                    delivery_frame_orig_ax: 0,
+                    delivery_counters: Default::default(),
+                    // The threads of a process share the record of what the
+                    // scheduler holds for it; a new process has nothing
+                    // published.
+                    // The scheduler holds no mask for a new thread.
+                    published_mask: Some(None),
+                    published_dispositions: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.published_dispositions)
+                    } else {
+                        Arc::default()
+                    },
+                    sigalrm_blocked_published: pts.1.sigalrm_blocked_published,
+                    handler_restore_rt_reported: pts.1.handler_restore_rt_reported,
+                    signal_register_projection: None,
                     last_accounted_user_time,
                     last_accounted_system_time,
                     thread_cpu_start_user_time: last_accounted_user_time,
@@ -1705,6 +3462,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // bootstrapping thread, so it starts outside any window.
                     uncharged_bootstrap_syscalls: 0,
                     in_uncharged_bootstrap_syscall: false,
+                    yield_after_futex_wake: false,
+                    pipe_handoff_due: None,
+                    own_signal_turn_hold: None,
+                    delivered_since_request: false,
+                    returned_from_sigreturn: false,
+                    // A child starts with no announcement: its parent
+                    // settles its own before it returns from the clone.
+                    signal_announcements: Vec::new(),
+                    next_signal_announcement: 0,
+                    consecutive_continuations: 0,
+                    scheduler_grants: 0,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
@@ -1713,8 +3481,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     chaos_epoch: tool_local::chaos_epoch_sentinel(),
                     chaos_slowdown_factor: RcbTimeMultiplier::ONE,
                     chaos_slowdown_active: false,
+                    claimed_sigchld: false,
                     pending_chaos_epochs: Vec::new(),
                     max_timeslice_end: None,
+                    last_grant_deadline: None,
+                    published_runtime_private_memory: None,
                     last_rcb_timer: None,
                     last_rcb_timer_is_max: false,
 
@@ -1739,12 +3510,28 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
     }
 
+    fn on_initial_image_attached(
+        &self,
+        tid: Tid,
+        state: &mut Self::ThreadState,
+    ) -> Result<(), Error> {
+        state.bind_initial_current_image(DetTid::from_raw(tid.as_raw()))?;
+        self.record_or_replay
+            .on_initial_image_attached(tid, state.as_mut())
+    }
+
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
         guest.thread_state_mut().thread_start_entered = true;
+        self.decide_cpuinfo_placeholders(guest)?;
         let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
         assert_eq!(new_dettid, guest.thread_state().dettid);
         let detpid = select_thread_start_detpid(guest.thread_state().detpid, guest.pid());
-        let is_root_thread = is_root_thread_start(guest.is_root_process(), new_dettid, detpid);
+        let needs_registration = thread_start_needs_registration(
+            guest.is_root_process(),
+            guest.thread_state().past_global_first_execve,
+            new_dettid,
+            detpid,
+        );
         trace!(
             "[tid {}] detcore handle_thread_start, pid={}",
             guest.tid(),
@@ -1763,16 +3550,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
             create_vfork_child_thread(guest, new_dettid, vfork).await;
-        } else if is_root_thread {
-            // There is no fork event to catch for the root thread.
+        } else if needs_registration {
+            // A root has no parent registration. A fresh runtime after exec
+            // also needs this handshake, even when the Guest has an in-tree
+            // parent: the global owner consumes its prepared exec and returns
+            // the replacement MmId before any ordinary image request. State
+            // inherited from a parent is already past the first exec and does
+            // not register a second birth here.
             debug!(
-                "[detcore, dtid {}] root thread start, scheduling.. full config:\n {:?}",
+                "[detcore, dtid {}] thread start registration, scheduling.. full config:\n {:?}",
                 &new_dettid,
                 guest.config()
             );
             let physical_ids = if guest
                 .config()
-                .backend_requires_thread_directed_process_signals
+                .backend
+                .requires_thread_directed_process_signals
             {
                 Some((
                     guest.pid().as_raw(),
@@ -1790,6 +3583,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 guest.thread_state_mut().mm_id = post_exec_mm;
             }
         }
+        if new_dettid.as_raw() == detpid.as_raw() {
+            // A process's first thread, with its final address space: a forked
+            // child's copy of its parent's unsent warning count is not its own.
+            guest_log::starts_new_process(guest.thread_state().mm_id);
+        }
 
         // Except for the root task, let's block until it's our turn to go:
         let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
@@ -1800,10 +3598,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             ts.preemption_points = th.map(|x| x.into_iter());
             ts.next_timeslice(&self.cfg); // Must be after preemption_points is set.
         }
+        // The start grant's deadline hint arrived before the first slice
+        // existed; cap the slice now.
+        let deadline = guest.thread_state_mut().last_grant_deadline.take();
+        tool_global::cap_timeslice_at_deadline(guest, deadline);
 
         // The prehook is a noop for a thread just starting.  Can't end the timeslice.  There's no
         // RCB progress to record.  However, we call it for consistency with all the other handlers.
-        self.pre_handler_hook(guest, true).await;
+        self.pre_handler_hook(guest, true, CheckIn::Event).await;
         // ^ precise_branch=true: There should have been ZERO prior instructions before this,
         // because the thread hasn't done anything yet.
 
@@ -1811,11 +3613,28 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .handle_thread_start(&mut guest.into_guest())
             .await?;
 
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::Event).await;
         Ok(())
     }
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        // The new image's first stop is at the exit of the exec Detcore did not
+        // finish (A5 step 3.2). The old image's delivery counts are logged
+        // under the identity they were taken under, and the new image counts
+        // afresh.
+        guest.thread_state_mut().delivery_interruption = None;
+        let dettid = guest.thread_state().dettid;
+        let counters = std::mem::take(&mut guest.thread_state_mut().delivery_counters);
+        counters.log(dettid);
+        // The new image's table may hold placeholders it rediscovered before
+        // this, the image's first guest callback.
+        self.decide_cpuinfo_placeholders(guest)?;
+        // Exec resets caught signals to their defaults, on a private copy of
+        // the actions; a thread without a copy (the first image, or one given
+        // up quietly) is seeded instead. Before any request: a nonleader
+        // exec's reconnect asks for a turn, and every request first publishes
+        // the process's dispositions, which must be the new image's.
+        crate::syscalls::signal_shadow::at_exec(guest);
         // A nonleader exec preserves the survivor's state and PMU counter, but
         // Linux changes its TID. Bind that state before any image callback RPC.
         match tool_global::reconnect_exec(guest).await {
@@ -1835,7 +3654,65 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             result => result?,
         }
+        // Every non-default profile requires Detcore's CPUID answers. Ptrace
+        // verifies faulting before each new image; this backend-independent
+        // guard also refuses a missing interception capability before the
+        // image executes. Native CPUID must never leak hardware randomness
+        // under host-no-rdrand (https://github.com/rrnewton/hermit/issues/4534).
+        if !self.cfg.cpu_profile.is_default() && !guest.has_cpuid_interception() {
+            let message = format!(
+                "--cpu-profile {} refused: CPUID faulting is not active for this image, \
+                 so the guest would see the host's CPUID; use a host and kernel with CPUID faulting",
+                self.cfg.cpu_profile
+            );
+            error!("{message}");
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+                .await;
+        }
+        // Refuse an invalid profile configuration before the guest's first
+        // instruction, instead of reaching its CPUID provider.
+        if let Some(why) = cpu_profile_admission_refusal(&self.cfg) {
+            let message = format!("--cpu-profile {} refused: {why}", self.cfg.cpu_profile);
+            error!("{message}");
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+                .await;
+        }
+        // Exec gives the task filesystem information of its own
+        // (`unshare_fs_struct`): a root it shared through CLONE_FS is now its
+        // own, as it stands.
+        let changed_root = guest
+            .thread_state()
+            .changed_root
+            .load(std::sync::atomic::Ordering::SeqCst);
+        guest.thread_state_mut().changed_root =
+            Arc::new(std::sync::atomic::AtomicBool::new(changed_root));
+        // The exec'ing thread is its process's only thread now, and leads
+        // it, so the table it holds is the process's. (Where Detcore handles
+        // the execve, `handle_execveat` already installed it; a backend that
+        // runs execve natively, as DBT does, reaches only this callback.)
+        guest.thread_state_mut().adopt_process_files();
+        // The guest's first image is entered by an execve. A backend that traces
+        // the guest from before it (ptrace) intercepts that execve and counts it
+        // as the guest's first syscall. A backend that starts the guest already
+        // executing its image (DBT under DynamoRIO, SaBRe) reaches this callback
+        // with nothing counted, so under DBT, which then sees every later
+        // syscall, numbers and virtual time ran exactly one syscall behind
+        // ptrace's. Count that execve here, at its own cost. (SaBRe also misses
+        // the dynamic loader's syscalls before its plugin starts; this closes
+        // only the execve's share of that gap.)
+        let thread = guest.thread_state_mut();
+        if !thread.past_global_first_execve && thread.stats.syscall_count == 0 {
+            thread.stats.count_syscall();
+            thread
+                .thread_logical_time
+                .add_syscall_with_cost(syscall_time::cost_ns(Sysno::execve));
+        }
         guest.thread_state_mut().past_global_first_execve = true;
+        // exec resets a handled signal to its default action.
+        guest.thread_state_mut().sigalrm_handled = false;
+        guest.thread_state_mut().sigalrm_blocked_published = false;
         // Only a successful exec reaches this callback. Delete the old image's
         // POSIX timer IDs while exec still owns its scheduler turn; the global
         // notification below cancels their deadlines before the pre-handler
@@ -1851,18 +3728,91 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if guest.config().sequentialize_threads {
             tool_global::set_child_tid_address(guest, 0).await;
         }
+        // The exec walked the old thread group's robust lists; wake one waiter
+        // per owner word it marked FUTEX_OWNER_DIED.
+        let robust_wakes = guest.thread_state().take_robust_list_wakes_for_exec();
+        let identities: Vec<_> = robust_wakes
+            .iter()
+            .map(|(owner, wake)| (*owner, wake.futex))
+            .collect();
+        let counts = robust_list_wakes_after_exec(guest, robust_wakes).await;
+        for ((owner, futex), count) in identities.into_iter().zip(counts) {
+            info!(
+                "[detcore, dtid {}] robust-list owner death woke {} waiter(s) on futex {:?} at exec",
+                owner, count, futex,
+            );
+        }
 
-        tool_global::mark_past_first_execve(guest).await;
-        self.pre_handler_hook(guest, false).await;
+        // In a run that declares a launcher, an exec Detcore did not prepare
+        // leaves the new image without a record: resolve it here from the
+        // path the exec was given.
+        let unprepared_exe = if self.declares_launcher() {
+            self.exec_image_from_execfn(guest)
+        } else {
+            None
+        };
+        tool_global::mark_past_first_execve(guest, unprepared_exe).await;
+        // That request also took the process out of its old descriptor table
+        // in `procfs::locks::LockLedger`; name the descriptions whose locks
+        // Detcore follows that survived the exec (its close-on-exec slots are
+        // gone from this table). A failed exec reaches neither.
+        let surviving = guest.thread_state().lock_tracked_slots();
+        if !surviving.is_empty() {
+            tool_global::note_table_exec(guest, surviving).await;
+        }
+        // The new image's auxiliary vector, as it finds it on its initial
+        // stack, for its `/proc/<pid>/auxv` (package K slice K2 of
+        // https://github.com/rrnewton/hermit/issues/4213). Not under record
+        // and replay, where Detcore renders no procfs file.
+        // Boxed, so its injected calls do not grow the post-exec future,
+        // which a backend may poll on a small stack.
+        if !self.cfg.recordreplay_modes {
+            Box::pin(self.record_process_auxv(guest)).await;
+        }
+        // The new image's program-break model, checked against the kernel's
+        // once its exec record is in place.
+        self.check_brk_model(guest).await;
+        // Linux discards every queued POSIX timer signal at exec
+        // (`flush_itimer_signals`), and Hermit's are ordinary signals it sent:
+        // take them back before the new image runs
+        // (https://github.com/rrnewton/hermit/issues/4184).
+        if scheduler::timer_copies_recorded() || scheduler::real_time_expiration_kept_pending() {
+            self.flush_exec_timer_copies(guest).await;
+        }
+        self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
         let auxv = guest.auxv();
         let initialized = guest
             .thread_state_mut()
             .complete_initial_random_auxv(auxv.at_random().map(|p| p.as_raw()))
             .expect("authenticated initial random handoff no longer matches this image");
-        // The successful early write already emitted the ordinary auxv INFO
-        // record. Consume only its fact here: no second draw, write or event.
-        if !initialized && let Some(ptr) = auxv.at_random() {
+        // A backend that wrote AT_RANDOM before this callback (the loader
+        // handoff) emitted no record: emit it here from the bytes it wrote, with
+        // no second draw or write, so the record sits where every backend puts
+        // it, after the root thread's seeding records. The loader's getrandom
+        // fills (glibc's early initialization makes one) and resource-limit
+        // reads (glibc's startup reads RLIMIT_STACK) emitted none either: their
+        // records follow, in order, as when this thread's own handlers serve
+        // them after this callback.
+        if let Some((bytes, early_requests)) = initialized {
+            let dettid = guest.thread_state().dettid;
+            random::record_initial_auxv(dettid, &bytes);
+            for request in early_requests {
+                match request {
+                    random::EarlyRequest::Getrandom(fill) => {
+                        random::record_early_getrandom(dettid, fill)
+                    }
+                    random::EarlyRequest::LimitRead {
+                        call,
+                        resource,
+                        current,
+                        maximum,
+                    } => {
+                        syscalls::sysinfo::record_early_limit_read(call, resource, current, maximum)
+                    }
+                }
+            }
+        } else if let Some(ptr) = auxv.at_random() {
             // It is safe to mutate this address since libc has not yet had a
             // chance to modify or copy the auxv table.
             let memory = guest.memory();
@@ -1883,12 +3833,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .handle_post_exec(&mut guest.into_guest())
             .await?;
 
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::Event).await;
         Ok(())
     }
 
     /// A timer fires to preempt the guest and give other threads a turn.
     async fn handle_timer_event<G: Guest<Self>>(&self, guest: &mut G) {
+        // A preemption stops the guest in user code (A5 step 3.2).
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
         info!(
             "[detcore, dtid {}] inbound timer preemption event",
             guest.thread_state().dettid
@@ -1899,6 +3851,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     Some(path) => Box::new(
                         File::create(path).expect("Failed to open preemption stacktrace log file"),
                     ),
+                    // Under --max-log-bytes a full stderr must not stop the
+                    // run before the cap; see `util::DroppingStderr`.
+                    None if crate::nonwaiting_write::diagnostics_must_not_wait() => {
+                        Box::new(crate::util::DroppingStderr)
+                    }
                     None => Box::new(std::io::stderr()),
                 };
             let ts = guest.thread_state();
@@ -1922,7 +3879,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // This may LOOK like a noop, but actually all of the logic for ending the timeslice is in
         // the prehook.  All the timer has to do is interrupt the guest and generate an extra call
         // to this prehook.
-        self.pre_handler_hook(guest, true).await;
+        self.pre_handler_hook(guest, true, CheckIn::Event).await;
         if guest.config().no_rcb_time && guest.thread_state().last_rcb_timer_is_max {
             let max_timeslice_end = guest
                 .thread_state()
@@ -1965,11 +3922,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 thread_state.last_rcb_timer = None;
                 thread_state.last_rcb_timer_is_max = false;
                 thread_state.stats.reset_timeslice();
-            } else {
+            } else if guest.thread_state().own_signal_turn_hold.is_none() {
                 self.end_timeslice(guest).await;
             }
         }
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::Event).await;
     }
 
     async fn handle_syscall_event<G: Guest<Self>>(
@@ -1977,7 +3934,74 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
-        self.pre_handler_hook(guest, false).await;
+        #[cfg(feature = "dispatch-observer")]
+        if let Some(observer) = dispatch_observer::installed() {
+            // This is the genuine incoming event. An entry record does not
+            // establish that subsequent signal gates or handling completed.
+            let registers = guest.regs().await;
+            let (number, arguments) = call.into_parts();
+            observer(dispatch_observer::Entry {
+                pid: guest.pid().as_raw(),
+                tid: guest.tid().as_raw(),
+                dettid: guest.thread_state().dettid.as_raw(),
+                number: number as u64,
+                instruction_pointer: registers.rip,
+                arguments: [
+                    arguments.arg0 as u64,
+                    arguments.arg1 as u64,
+                    arguments.arg2 as u64,
+                    arguments.arg3 as u64,
+                    arguments.arg4 as u64,
+                    arguments.arg5 as u64,
+                ],
+            });
+        }
+        // A FIFO open's path page that a killed task of this address space
+        // left mapped goes before this call runs (and, below, before a call
+        // that was waiting returns).
+        Self::unmap_orphaned_staging_pages(guest).await;
+        crate::syscalls::signal_shadow::at_syscall_entry(guest);
+        // Until Detcore finishes it, the kernel may run it (A5 step 3.2).
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::KernelRun {
+            syscall: call.number() as i64,
+        });
+        // Signal controls an in-guest runtime refused since this process's
+        // last report, which Detcore did not see as calls.
+        crate::refused_signal_controls::report(guest).await;
+        // Signal phase 1: before this syscall's first scheduler request. A
+        // delivery prepared here runs the guest's handler before the syscall,
+        // which then starts again; what this returns is discarded.
+        if self.cfg.backend.virtualizes_guest_sigalrm
+            && guest.thread_state().sigalrm_handled
+            && self.sigalrm_at_syscall_entry(guest).await
+        {
+            return Ok(0);
+        }
+
+        // A thread that keeps its turn for a signal it sent its own process
+        // takes that signal before it can make another syscall.
+        if let Some(signal) = guest.thread_state_mut().own_signal_turn_hold.take() {
+            tracing::error!(
+                "[detcore, dtid {}] reached a syscall without taking signal {} it sent to its own \
+                 process (https://github.com/rrnewton/hermit/issues/4034)",
+                guest.thread_state().dettid,
+                signal
+            );
+        }
+        // A claimed `SIGCHLD` stays claimed only while it is still pending for
+        // this thread (`syscalls::signal::claim_still_pending`).
+        let (pid, tid) = (guest.pid(), guest.tid());
+        let claimed =
+            crate::syscalls::claim_still_pending(guest.thread_state().claimed_sigchld, || {
+                crate::syscalls::read_thread_signal_state(pid, tid)
+            });
+        guest.thread_state_mut().claimed_sigchld = claimed;
+        self.pre_handler_hook(guest, false, CheckIn::Event).await;
+
+        // Linux's restart of an interrupted wait is the thread's very next syscall,
+        // so the record a wait kept for it lives only until then
+        // (`handle_restart_syscall`).
+        let restart_block = guest.thread_state_mut().restart_block.take();
 
         let dettid = guest.thread_state().dettid;
 
@@ -2103,32 +4127,163 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         };
 
         // Happens-before enforcement checkpoint. When the run carries a
-        // happens-before program with syscall-count anchors, every intercepted
-        // syscall checks in with the scheduler at its prehook, carrying this
-        // thread's running syscall count. The scheduler fires any anchor at
-        // `Position::SyscallCount(new_count)` on this thread and parks the thread
-        // (out of the run queue) when that anchor is the AFTER endpoint of a Hard
-        // edge whose BEFORE endpoint has not fired yet. This is the gate that
-        // makes an authored partial order reproduce a known race deterministically
-        // (see detcore-model `happens_before`). It requires sequentialized
-        // threads (enforced by the CLI) so the scheduler owns ordering.
-        if guest
-            .config()
-            .happens_before
-            .as_ref()
-            .is_some_and(|p| p.has_syscall_count_anchors())
-        {
-            let request = guest.thread_state().mk_request(
-                ResourceID::HappensBeforeCheckpoint(new_count),
-                Permission::R,
-            );
+        // happens-before program and an anchor at exactly
+        // `Position::SyscallCount(new_count)` names this thread (by dettid, or by
+        // a spawn ordinal only the scheduler can resolve), this syscall checks in
+        // with the scheduler at its prehook, carrying this thread's running
+        // syscall count.
+        // The scheduler fires any anchor at that count on this thread and parks
+        // the thread (out of the run queue) when that anchor is the AFTER
+        // endpoint of a Hard edge whose BEFORE endpoint has not fired yet. For
+        // any other (thread, count) the scheduler would find no anchor and do
+        // nothing, so the request is skipped: one scheduler round trip per anchor
+        // the thread reaches rather than per syscall
+        // (https://github.com/rrnewton/hermit/issues/3877), and threads the spec
+        // does not name keep their schedule.
+        // This is the gate that makes an authored partial order reproduce a known
+        // race deterministically (see detcore-model `happens_before`). It
+        // requires sequentialized threads (enforced by the CLI) so the scheduler
+        // owns ordering.
+        //
+        // A syscall-occurrence anchor ("the thread's Nth writev to fd 9") is
+        // counted here, in this thread's own counters, once per syscall entry;
+        // the thread checks in only when a call is some such anchor's nth
+        // occurrence, naming the anchors it reached.
+        let hb_checkpoint = if guest.config().happens_before.is_some() {
+            let dettid = guest.thread_state().dettid;
+            let mut counters = std::mem::take(&mut guest.thread_state_mut().stats.hb_occurrences);
+            let program = guest
+                .config()
+                .happens_before
+                .as_ref()
+                .expect("checked above");
+            // A posthook anchor this entry reaches checks in when the call
+            // completes, below, not here
+            // (https://github.com/rrnewton/hermit/issues/3929).
+            let mut reached = if program.has_syscall_occurrence_anchors() {
+                let (sysno, args) = call.into_parts();
+                program.count_syscall_occurrences(
+                    &mut counters,
+                    dettid,
+                    sysno,
+                    [args.arg0, args.arg1],
+                    new_count,
+                )
+            } else {
+                Vec::new()
+            };
+            let posthook: Vec<String> = reached
+                .extract_if(.., |name| {
+                    program
+                        .anchors
+                        .get(name)
+                        .is_some_and(|a| a.fires_at_posthook())
+                })
+                .collect();
+            let checkpoint = if !reached.is_empty() {
+                Some(ResourceID::HappensBeforeSyscallCheckpoint {
+                    count: new_count,
+                    anchors: reached,
+                })
+            } else if program.may_have_syscall_count_anchor_at(dettid, new_count) {
+                Some(ResourceID::HappensBeforeCheckpoint(new_count))
+            } else {
+                None
+            };
+            guest.thread_state_mut().stats.hb_occurrences = counters;
+            guest.thread_state_mut().stats.hb_pending_posthook = posthook;
+            checkpoint
+        } else {
+            None
+        };
+        if let Some(checkpoint) = hb_checkpoint {
+            let request = guest.thread_state().mk_request(checkpoint, Permission::R);
             resource_request(guest, request).await;
         }
+
+        // For `hermit run --verify`: a name the guest itself rebinds is not a
+        // host input change (see `detcore_model::host_input`). Reported before
+        // the call runs, whatever its outcome, so that a change the kernel
+        // commits is never missing from the record, even if the run ends
+        // before this handler returns.
+        if self.cfg.record_host_inputs {
+            self.record_host_namespace_change(guest, &call).await;
+            self.record_untraced_code_change(guest, &call).await;
+        }
+
+        // The inodes whose last name this call removes, stat'ed before it runs
+        // and retired once it succeeds, so that a host reusing one cannot hand
+        // a new file the old file's number
+        // (https://github.com/rrnewton/hermit/issues/3840).
+        let removed_inodes = self.last_names_removed_by(guest, &call).await;
+        // The guest-made FIFOs whose name this call removes, forgotten once it
+        // succeeds (https://github.com/rrnewton/hermit/issues/2203).
+        let removed_guest_fifos = self.guest_made_fifos_removed_by(guest, &call).await;
 
         // Only an emulated RNG readv supplies authoritative imported geometry.
         // A generic pre-dispatch snapshot would become stale across pipe waits.
         let mut rng_readv_output = None;
+        // Signal phase 1: a process that handles SIGALRM runs only the calls
+        // its table places (`sigalrm_phase1`).
+        let sigalrm_refusal = if guest.thread_state().sigalrm_handled {
+            self.sigalrm_phase1_gate(guest, call)
+        } else {
+            None
+        };
+        // A `/proc` name outside the run's `--proc` level does not exist. A
+        // procfs file Detcore renders answers, as Linux does, the calls that
+        // would reach the placeholder standing in for it.
+        // A rendered procfs descriptor that reached this table over
+        // SCM_RIGHTS is adopted as the file it is before anything answers a
+        // call through it.
+        let adoption = if sigalrm_refusal.is_none() {
+            self.adopt_received_placeholders(guest, &call).await
+        } else {
+            Ok(())
+        };
+        let rendered_procfs_answer = if let Err(error) = adoption {
+            Some(Err(error))
+        } else if sigalrm_refusal.is_none() {
+            match self
+                .refuse_procfs_name_outside_level(guest, &call)
+                .await
+                .transpose()
+            {
+                Some(refusal) => Some(refusal),
+                None => match self.answer_rendered_procfs_operation(guest, &call).await {
+                    Some(answer) => Some(answer),
+                    None => match self.answer_rendered_procfs_mapping(guest, &call).await {
+                        Some(answer) => Some(answer),
+                        None => self
+                            .answer_rendered_procfs_path_call(guest, &call)
+                            .await
+                            .transpose(),
+                    },
+                },
+            }
+        } else {
+            None
+        };
         let res = match classify_syscall(call.number()) {
+            _ if sigalrm_refusal.is_some() => Err(sigalrm_refusal.expect("checked").into()),
+            _ if rendered_procfs_answer.is_some() => rendered_procfs_answer.expect("checked"),
+            SyscallClassification::PassThrough if call.number() == Sysno::chroot => {
+                let result = self.passthrough(guest, call).await;
+                if result.is_ok() {
+                    guest
+                        .thread_state()
+                        .changed_root
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    // Another process's view of this one's mount table
+                    // follows its root (`Detcore::rendered_procfs_at`).
+                    crate::tool_global::mark_changed_root(guest).await;
+                }
+                result
+            }
+            // Outbound TCP channels under a network trace mode; never with no mode.
+            _ if self.network_trace_owns(guest, &call) => {
+                self.handle_network_trace_syscall(guest, call).await
+            }
             // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
             // future typed representation preserves this explicit policy.
             SyscallClassification::Determinized if call.number() == Sysno::rseq => {
@@ -2155,13 +4310,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized if call.number() == Sysno::pidfd_send_signal => {
                 match call {
                     Syscall::Other(_, args) => {
-                        self.handle_pidfd_send_signal(
-                            guest,
-                            call,
-                            args.arg0 as RawFd,
-                            args.arg3 as u32,
-                        )
-                        .await
+                        let result = self
+                            .handle_pidfd_send_signal(
+                                guest,
+                                call,
+                                args.arg0 as RawFd,
+                                args.arg1 as i32,
+                                args.arg3 as u32,
+                            )
+                            .await;
+                        if args.arg1 as i32 == libc::SIGALRM && result.is_ok() {
+                            self.note_guest_sigalrm(guest, GuestSigalrmTarget::Unclassified)
+                                .await;
+                        }
+                        result
                     }
                     _ => unreachable!("pidfd_send_signal unexpectedly gained a typed variant"),
                 }
@@ -2234,13 +4396,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-855): Fail-closed runs cannot expose
-            // unmodeled pipe-buffer ownership or vmsplice page pinning. Return
-            // ENOSYS so callers use read/write fallbacks, but preserve host
-            // pass-through under the explicit compatibility opt-out used by the
-            // existing rr splice test.
+            // unmodeled pipe-buffer ownership or vmsplice page pinning, but
+            // preserve host pass-through under the explicit compatibility
+            // opt-out, `hermit run --allow-unsupported-syscalls`. splice and tee
+            // refuse with EINVAL, the errno Linux returns when a descriptor
+            // pair cannot be spliced and the one callers fall back to
+            // read/write on: GNU grep 3.12 drains a pipe into /dev/null with
+            // splice and falls back on EINVAL, but on ENOSYS it reports a read
+            // error and exits 2. vmsplice keeps ENOSYS.
             SyscallClassification::Determinized if is_zero_copy_pipe_syscall(call.number()) => {
                 if panic_on_unsupported_syscalls {
-                    Err(Error::Errno(Errno::ENOSYS))
+                    if call.number() == Sysno::vmsplice {
+                        Err(Error::Errno(Errno::ENOSYS))
+                    } else {
+                        Err(Error::Errno(Errno::EINVAL))
+                    }
                 } else {
                     self.passthrough(guest, call).await
                 }
@@ -2458,6 +4628,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.handle_epoll_pwait2(guest, call).await
             }
             SyscallClassification::Determinized => match call {
+                Syscall::Getpid(_) | Syscall::Gettid(_) => {
+                    // Keep the inner Tool's syscall observation/injection and
+                    // all errors, then project a successful own ID from shared
+                    // state. Do not return early past the normal posthooks.
+                    self.passthrough(guest, call)
+                        .await
+                        .map(|result| self.project_own_getter_result(guest, call, result))
+                }
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#547)
@@ -2544,6 +4722,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Setpgid(s) => self.handle_setpgid(guest, s).await,
                 Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Getpgrp(_) | Syscall::Getpgid(_) | Syscall::Getsid(_) => {
+                    self.handle_group_or_session_getter(guest, call).await
+                }
                 // Without virtual time the guest reads the host clock. Each of these
                 // must have a record/replay handler: a recording captures the value
                 // the guest observed, and replay returns it without reading the host.
@@ -2634,8 +4816,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Exit(s) => self.handle_exit(guest, s).await,
 
                 Syscall::Dup(w) => self.handle_dup(guest, w).await.map_err(Into::into),
-                Syscall::Dup2(w) => self.handle_dup2(guest, w).await.map_err(Into::into),
-                Syscall::Dup3(w) => self.handle_dup3(guest, w).await.map_err(Into::into),
+                Syscall::Dup2(w) => self.handle_dup2(guest, w).await,
+                Syscall::Dup3(w) => self.handle_dup3(guest, w).await,
                 Syscall::Pipe(w) => self.handle_pipe2(guest, w.into()).await,
                 Syscall::Pipe2(w) => self.handle_pipe2(guest, w).await,
                 Syscall::Getrandom(s) => self.handle_getrandom(guest, s).await,
@@ -2832,19 +5014,71 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::RtSigpending(s) => self.handle_rt_sigpending(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Kill(s) => self.handle_kill(guest, s).await,
+                Syscall::Kill(s) => {
+                    let result = self.handle_kill(guest, s).await;
+                    let result = self
+                        .report_backend_signal_refusal(guest, Sysno::kill, result)
+                        .await;
+                    if s.sig() == libc::SIGALRM && result.is_ok() {
+                        let target = if guest.thread_state().nested_pid_namespace {
+                            Some(GuestSigalrmTarget::Unclassified)
+                        } else {
+                            match s.pid() {
+                                pid if pid > 0 => {
+                                    Some(GuestSigalrmTarget::Process(DetPid::from_raw(pid)))
+                                }
+                                0 => Some(GuestSigalrmTarget::Group(None)),
+                                -1 => Some(GuestSigalrmTarget::All),
+                                libc::pid_t::MIN => None,
+                                pid => {
+                                    Some(GuestSigalrmTarget::Group(Some(DetPid::from_raw(-pid))))
+                                }
+                            }
+                        };
+                        if let Some(target) = target {
+                            self.note_guest_sigalrm(guest, target).await;
+                        }
+                    }
+                    result
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Tgkill(s) => self.handle_tgkill(guest, s).await,
+                Syscall::Tgkill(s) => {
+                    let result = self.handle_tgkill(guest, s).await;
+                    self.report_backend_signal_refusal(guest, Sysno::tgkill, result)
+                        .await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#812)
-                Syscall::Tkill(s) => self.handle_tkill(guest, s).await,
+                Syscall::Tkill(s) => {
+                    let result = self.handle_tkill(guest, s).await;
+                    self.report_backend_signal_refusal(guest, Sysno::tkill, result)
+                        .await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#812)
-                Syscall::RtSigqueueinfo(s) => self.handle_rt_sigqueueinfo(guest, s).await,
+                Syscall::RtSigqueueinfo(s) => {
+                    let result = self.handle_rt_sigqueueinfo(guest, s).await;
+                    let result = self
+                        .report_backend_signal_refusal(guest, Sysno::rt_sigqueueinfo, result)
+                        .await;
+                    if s.sig() == libc::SIGALRM && result.is_ok() {
+                        let target = if guest.thread_state().nested_pid_namespace {
+                            GuestSigalrmTarget::Unclassified
+                        } else {
+                            GuestSigalrmTarget::Process(DetPid::from_raw(s.tgid()))
+                        };
+                        self.note_guest_sigalrm(guest, target).await;
+                    }
+                    result
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#812)
-                Syscall::RtTgsigqueueinfo(s) => self.handle_rt_tgsigqueueinfo(guest, s).await,
+                Syscall::RtTgsigqueueinfo(s) => {
+                    let result = self.handle_rt_tgsigqueueinfo(guest, s).await;
+                    self.report_backend_signal_refusal(guest, Sysno::rt_tgsigqueueinfo, result)
+                        .await
+                }
 
                 Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
                 Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
@@ -2867,7 +5101,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Getresuid(s) => self.handle_getresuid(guest, s).await,
                 Syscall::Getresgid(s) => self.handle_getresgid(guest, s).await,
                 Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
-                Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
+                Syscall::RtSigaction(s) => {
+                    let result = self.handle_rt_sigaction(guest, s).await;
+                    // Rule 5, decided from the installed disposition: an
+                    // old-action fault after the install still installed it
+                    // (https://github.com/rrnewton/hermit/issues/4139).
+                    if s.signum() == libc::SIGALRM
+                        && s.action().is_some()
+                        && guest.config().sequentialize_threads
+                    {
+                        crate::tool_global::note_sigalrm_event(
+                            guest,
+                            crate::tool_global::GlobalRequest::NoteSigalrmDisposition,
+                        )
+                        .await;
+                    }
+                    result
+                }
                 Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
                 Syscall::Pause(s) => self.handle_pause(guest, s).await,
 
@@ -2914,6 +5164,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
+            // Where the run declares a launcher, the kernel's program break
+            // is the launcher's: Detcore answers brk from its model of the
+            // guest's (`Detcore::handle_brk`).
+            SyscallClassification::PassThrough
+                if call.number() == Sysno::brk && self.declares_launcher() =>
+            {
+                self.handle_brk(guest, call).await
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-2985): Review scheduler tracking of set_tid_address.
             // Linux and the backend own the pass-through call. Detcore also
@@ -2943,12 +5201,41 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // PassThrough syscall, through the blanket arm below.
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
+            // A pass-through whose restored mask may deliver a pending real-time
+            // timer expiration (https://github.com/rrnewton/hermit/issues/4089).
+            SyscallClassification::PassThrough if call.number() == Sysno::rt_sigreturn => {
+                crate::syscalls::signal_shadow::record_rt_sigreturn(guest).await;
+                self.observe_sigreturn_mask(guest).await;
+                self.passthrough(guest, call).await
+            }
             SyscallClassification::PassThrough => self.passthrough(guest, call).await,
+            // The kernel's restart of a wait Detcore emulates resumes it; any other
+            // `restart_syscall` keeps the unsupported-syscall policy below.
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            SyscallClassification::Unsupported if call.number() == Sysno::restart_syscall => {
+                self.handle_restart_syscall(
+                    guest,
+                    call,
+                    restart_block,
+                    dettid,
+                    panic_on_unsupported_syscalls,
+                )
+                .await
+            }
             SyscallClassification::Unsupported => {
                 self.handle_unsupported_syscall(guest, call, dettid, panic_on_unsupported_syscalls)
                     .await
             }
         };
+        // A call Detcore injected that the backend left to the Tool
+        // (`UnsupportedOperation::ToolDecided`), such as the getpgrp a clone3
+        // race passes through (https://github.com/rrnewton/hermit/issues/4531),
+        // ends the run as an internal failure before its ENOSYS can reach the
+        // guest, when it is the event's last injection. The check reads only
+        // the handler's latest refusal, and only if no consumer took it
+        // first; it is not a general guard (see
+        // `fail_on_tool_decided_injection`).
+        crate::syscalls::helpers::fail_on_tool_decided_injection::<T, G>(guest, call.number());
 
         // A copy may already have changed guest memory before reporting a
         // terminal backend error. Do not perform even the syscall-result
@@ -2960,6 +5247,45 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             return res;
         }
 
+        if res.is_ok() && !removed_inodes.is_empty() {
+            self.retire_removed_inodes(guest, removed_inodes).await;
+        }
+        if res.is_ok() {
+            for fifo in removed_guest_fifos {
+                crate::fifo_peer::forget_guest_made(fifo);
+            }
+            self.note_guest_made_fifo(guest, &call).await;
+        }
+        // A read or write that moved bytes through a pipe or FIFO readies the
+        // threads polling its other direction (`--pipe-wake-latency`).
+        if let Ok(moved) = res
+            && moved > 0
+            && let Some((fd, wants)) = crate::pipe_wake::progress_of(&call)
+        {
+            self.note_fd_readied(guest, fd, wants).await;
+        }
+        Self::unmap_orphaned_staging_pages(guest).await;
+
+        // With asynchronous exit completion, a descriptor that would make this
+        // guest serve another guest's exit ends the run before anything
+        // observes the result (crate::exit_dependencies).
+        if let Ok(ret) = res {
+            self.refuse_exit_dependencies(guest, &call, ret).await;
+        }
+
+        // The guest resumes with this result in its return register (A5 step
+        // 3.2). An error that is not an errno names no register value.
+        let finished = match &res {
+            Ok(value) => Some(*value),
+            Err(Error::Errno(errno)) => Some(-(errno.into_raw() as i64)),
+            Err(_) => None,
+        };
+        if let Some(result) = finished {
+            guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::Return {
+                syscall: call.number() as i64,
+                result,
+            });
+        }
         detlog!(
             event = crate::detlog::DetLogEvent::SyscallResult {
                 finished_syscall_number: new_count,
@@ -2996,7 +5322,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .observe_brk(brk as u64);
         }
 
-        self.detlog_memory_maps(guest)?;
+        if let Err(error) = self.detlog_memory_maps(guest) {
+            let res = Err(error);
+            self.publish_posthook_checkpoint(guest, new_count, &res)
+                .await;
+            return self.complete_syscall(guest, res).await;
+        }
         // Same control point again, for the bytes this syscall moved through a guest buffer.
         // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
         // arguments, so it does not matter whether the buffer lives on the stack, in the brk
@@ -3004,8 +5335,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // can see. Only successful calls moved anything.
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
+            && let Err(error) = io_buffers::detlog_io_buffers(
+                guest,
+                &call,
+                *ret,
+                dettid,
+                rng_readv_output.as_deref(),
+            )
         {
-            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid, rng_readv_output.as_deref())?;
+            let res = Err(error);
+            self.publish_posthook_checkpoint(guest, new_count, &res)
+                .await;
+            return self.complete_syscall(guest, res).await;
         }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
@@ -3020,19 +5361,26 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await;
         }
 
+        // Posthook happens-before anchors this call reached fire now that its
+        // result is decided and before the guest resumes
+        // (https://github.com/rrnewton/hermit/issues/3929).
+        self.publish_posthook_checkpoint(guest, new_count, &res)
+            .await;
+
         // The syscall is finished; a turn the post-hook takes (a timeslice
         // end) is the thread's own and advances global time as usual.
         guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::Event).await;
 
         // Defense-in-depth: unless the backend already owns this guarantee,
         // force the syscall-clobbered registers (%rcx/%r11 on x86-64) to
         // deterministic values before returning to the guest.
-        if !self.cfg.syscall_clobbers_virtualized_by_backend {
+        if !self.cfg.backend.virtualizes_syscall_clobbers {
             self.canonicalize_syscall_clobbers(guest).await;
         }
 
-        res
+        // Signal phase 1, step I4: a due SIGALRM entry is delivered here.
+        self.complete_syscall(guest, res).await
     }
 
     async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
@@ -3043,6 +5391,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
         let dettid = thread_state.dettid;
+        thread_state.delivery_counters.log(dettid);
         // Cancellation can consume the backend's transferred state before the
         // successful-exec callback has rebound its logical identity.
         let current = DetTid::from_raw(tid.as_raw());
@@ -3056,10 +5405,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // full slice.
         let now = thread_state.thread_logical_time.as_nanos();
         thread_state.stats.close_final_timeslice(now);
-        // Reverie invokes this callback while the backend still owns the exit
-        // event, before the guest parent can consume it with wait. Ptrace also
-        // guarantees that the process leader exits after the other threads, so
-        // the final published aggregate is complete when wait returns.
+        // Ptrace keeps its exit event stopped while this hook runs. KVM runs
+        // this owner hook after worker joins and child waitability publication.
+        // Publish final CPU in this synchronous prefix: serial KVM waitid waits
+        // for that owned notification before consuming, not for the hook tail.
         // DETERMINISTIC RECOVERY (TODO-HUMAN-REVIEW(PR-1147)). `ThreadState::detpid`
         // is `Option` and starts as `None` ("Initialized later" at the clone site),
         // so a thread that reaches the exit hook before its per-thread identity is
@@ -3095,13 +5444,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // precedes local rebinding. Its snapshot includes the worker's tail;
         // the earlier displaced-leader snapshot is only a prefix.
         if current == detpid {
-            thread_state.record_exited_child_process_cpu_time(detpid);
+            if !thread_state.record_exited_child_process_cpu_time(detpid) {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "child CPU publication ownership changed before final exit"
+                )));
+            }
         } else {
             thread_state.account_process_cpu_time();
         }
         let mm_id = thread_state.mm_id;
         let exit_signal = match &exit_status {
             ExitStatus::Signaled(signal, _) => Some(*signal as i32),
+            ExitStatus::SignaledRaw(signal, _) => Some(*signal),
             ExitStatus::Exited(_) => None,
         };
         // Publish each owner's final clock under its own RPC identity before
@@ -3122,7 +5476,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if !exit_time_accounted {
             // Preserve benign cleanup for a retired incarnation without
             // acknowledging an unaccounted owner or releasing its staged wakes.
-            thread_state.record_robust_list_head(None);
+            thread_state.drop_robust_list_head_at_exit();
         }
         if exit_time_accounted
             && let Some((_group_time, ready)) = thread_state.take_robust_list_wakes_after_exit(
@@ -3148,6 +5502,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 );
             }
         }
+        // Warnings this address space could not send, this hook's own among
+        // them, go out while the hook's connection still serves it
+        // (`crate::guest_log`).
+        guest_log::flush_unsent_through(global_state).await;
         let pending_chaos_epochs = thread_state.take_pending_chaos_epochs();
         let deregistration = ThreadDeregistration {
             dettid,
@@ -3272,6 +5630,24 @@ mod subscription_tests {
             delivered.contains(&Sysno::syslog),
             "syslog must reach its deterministic Detcore handler"
         );
+        for sysno in [
+            Sysno::access,
+            Sysno::faccessat,
+            Sysno::faccessat2,
+            Sysno::getxattr,
+            Sysno::lgetxattr,
+            Sysno::setxattr,
+            Sysno::lsetxattr,
+            Sysno::removexattr,
+            Sysno::lremovexattr,
+            Sysno::listxattr,
+            Sysno::llistxattr,
+        ] {
+            assert!(
+                delivered.contains(&sysno),
+                "{sysno} must reach Detcore, which answers it for the procfs files it renders"
+            );
+        }
     }
 
     #[test]
@@ -3412,18 +5788,30 @@ mod subscription_tests {
                 "passthru_opt={passthru_opt}: the syscall set must not depend on CPUID virtualization"
             );
         }
+    }
 
-        // KVM installs its own CPUID table, so with virtualization off the guest
-        // sees host values only through the trap: keep subscribing there.
-        let kvm_host_cpuid = Config {
-            virtualize_cpuid: false,
-            cpuid_virtualized_by_backend: true,
+    /// Detcore declares the serialized-execution contract only where it holds:
+    /// threads sequentialized, and both seccomp-filter routes intercepted and
+    /// refused.
+    #[test]
+    fn serialized_execution_is_declared_only_where_detcore_enforces_it() {
+        let enforces = <Detcore as Tool>::enforces_serialized_execution;
+        for passthru_opt in [false, true] {
+            let config = strict_config(passthru_opt);
+            let subscriptions = <Detcore as Tool>::subscriptions(&config);
+            for sysno in [Sysno::seccomp, Sysno::prctl] {
+                assert!(
+                    subscriptions.iter_syscalls().any(|s| s == sysno),
+                    "passthru_opt={passthru_opt}: {sysno} must reach its refusal"
+                );
+            }
+            assert!(enforces(&config), "passthru_opt={passthru_opt}");
+        }
+        assert!(!enforces(&Config {
+            sequentialize_threads: false,
             ..strict_config(false)
-        };
-        assert_eq!(
-            <Detcore as Tool>::subscriptions(&kvm_host_cpuid),
-            Subscription::all()
-        );
+        }));
+        // The refusals themselves are pinned in `syscalls::misc`'s tests.
     }
 
     #[test]
@@ -3589,6 +5977,20 @@ mod rcb_overshoot_tests {
 mod timeslice_timer_tests {
     use super::*;
 
+    /// A dropped signal's stop re-requests the timer event for the point the
+    /// last handler armed, whenever the host-timed stop came: before it, the
+    /// remaining branches; at or past it, at once
+    /// (https://github.com/rrnewton/hermit/issues/4304).
+    #[test]
+    fn a_kept_timer_aims_at_the_armed_point() {
+        assert_eq!(kept_timer_rcbs(1_000, 500, 1_000), 500);
+        assert_eq!(kept_timer_rcbs(1_000, 500, 1_200), 300);
+        assert_eq!(kept_timer_rcbs(1_000, 500, 1_499), 1);
+        assert_eq!(kept_timer_rcbs(1_000, 500, 1_500), 1);
+        assert_eq!(kept_timer_rcbs(1_000, 500, 40_000_000_000), 1);
+        assert_eq!(kept_timer_rcbs(u64::MAX - 10, 500, u64::MAX - 5), 5);
+    }
+
     #[test]
     fn manual_interrupts_can_shorten_but_not_extend_maximum() {
         assert_eq!(choose_rcb_timer(100, 100, Some(150)), (50, false));
@@ -3637,6 +6039,98 @@ mod process_tree_guest_clock_tests {
         );
 
         assert!(Arc::ptr_eq(&parent.guest_clock, &child.guest_clock));
+    }
+}
+
+#[cfg(test)]
+mod process_files_tests {
+    use super::*;
+
+    fn child(
+        tool: &Detcore,
+        parent: &mut ThreadState<()>,
+        tid: i32,
+        clone_flags: CloneFlags,
+    ) -> ThreadState<()> {
+        parent.clone_flags = Some(clone_flags);
+        let mut child = <Detcore as Tool>::init_thread_state(
+            tool,
+            Tid::from_raw(tid),
+            Some((Tid::from_raw(parent.dettid.as_raw()), parent)),
+        );
+        child.detpid = Some(if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+            parent.detpid.unwrap()
+        } else {
+            DetPid::from_raw(tid)
+        });
+        child
+    }
+
+    /// The table a thread group's leader holds, which procfs reads for the
+    /// process's descriptor links, is known to every thread of the group,
+    /// through every way a table is made: the root's, a thread's shared or
+    /// own, a forked process's, a process made with `CLONE_FILES` (whose
+    /// table was made for another process) and its threads, and the table an
+    /// exec gives a thread that did not lead its process.
+    #[test]
+    fn every_thread_knows_the_table_its_process_holds() {
+        let config = Config::default();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let thread = CloneFlags::CLONE_VM
+            | CloneFlags::CLONE_FS
+            | CloneFlags::CLONE_FILES
+            | CloneFlags::CLONE_SIGHAND
+            | CloneFlags::CLONE_THREAD;
+        let mut root = ThreadState::new(DetPid::from_raw(3), &config, ());
+        root.detpid = Some(DetPid::from_raw(3));
+        assert!(root.holds_process_files());
+
+        // A thread that shares the leader's table holds it; one cloned
+        // without CLONE_FILES holds its own.
+        let shared = child(&tool, &mut root, 4, thread);
+        assert_eq!(shared.process_files, root.process_files);
+        assert!(shared.holds_process_files());
+        let split = child(&tool, &mut root, 5, thread - CloneFlags::CLONE_FILES);
+        assert_eq!(split.process_files, root.process_files);
+        assert!(!split.holds_process_files());
+
+        // A forked process holds its copy; its creator's group is unchanged.
+        let mut forked = child(&tool, &mut root, 6, CloneFlags::empty());
+        assert_ne!(forked.process_files, root.process_files);
+        assert!(forked.holds_process_files());
+        assert_eq!(root.process_files, Some(root.files_id()));
+
+        // A process made with CLONE_FILES shares its creator's table, made
+        // for that creator, and leads a group of its own: its thread holds
+        // the process's table although the table's creator is neither the
+        // thread nor its leader.
+        let mut shares_files = child(&tool, &mut forked, 7, CloneFlags::CLONE_FILES);
+        assert_eq!(shares_files.files_id(), forked.files_id());
+        assert_eq!(shares_files.process_files, Some(forked.files_id()));
+        let its_thread = child(&tool, &mut shares_files, 8, thread);
+        assert_ne!(its_thread.files_id().creator(), DetPid::from_raw(7));
+        assert!(its_thread.holds_process_files());
+
+        // A thread that did not lead its process execs, as handle_execveat
+        // gives it its new table: the new table is the process's, and a
+        // thread the new image creates holds it. A failed exec restores
+        // both.
+        let mut worker = child(&tool, &mut root, 9, thread);
+        let old_metadata = Arc::clone(&worker.file_metadata);
+        let old_process_files = worker.process_files;
+        let new_metadata = worker.file_metadata.lock().unwrap().for_exec(worker.dettid);
+        worker.file_metadata = Arc::new(Mutex::new(new_metadata));
+        worker.adopt_process_files();
+        assert_eq!(worker.files_id().creator(), DetPid::from_raw(9));
+        assert!(worker.holds_process_files());
+        assert_ne!(worker.process_files, root.process_files);
+        assert_eq!(root.process_files, Some(root.files_id()));
+        let after_exec = child(&tool, &mut worker, 10, thread);
+        assert!(after_exec.holds_process_files());
+        worker.file_metadata = old_metadata;
+        worker.process_files = old_process_files;
+        assert_eq!(worker.process_files, root.process_files);
+        assert!(worker.holds_process_files());
     }
 }
 
@@ -3748,6 +6242,34 @@ mod thread_exit_identity_tests {
 }
 
 #[cfg(test)]
+mod completed_syscall_projection_tests {
+    use super::*;
+
+    /// Signal phase 1: the signal pipeline at a syscall's completion reads
+    /// the result in rax, rip after the two-byte syscall instruction, and the
+    /// instruction's clobbers; every other register is the entry's.
+    #[test]
+    fn a_completed_syscall_shows_its_result_and_return_address() {
+        let mut entry: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        entry.rip = 0x40_1000;
+        entry.rax = libc::SYS_pause as u64;
+        entry.rcx = 0x1111;
+        entry.r11 = 0x2222;
+        entry.eflags = 0x246;
+        entry.rdi = 7;
+        entry.rsp = 0x7ffd_0000;
+        let completed = completed_syscall_projection(entry, -i64::from(libc::EINTR));
+        assert_eq!(completed.rax, (-i64::from(libc::EINTR)) as u64);
+        assert_eq!(completed.rip, 0x40_1002);
+        assert_eq!(completed.rcx, 0x40_1002);
+        assert_eq!(completed.r11, 0x246);
+        assert_eq!(completed.rdi, 7);
+        assert_eq!(completed.rsp, 0x7ffd_0000);
+        assert_eq!(completed.eflags, 0x246);
+    }
+}
+
+#[cfg(test)]
 mod thread_start_identity_tests {
     use super::*;
 
@@ -3767,9 +6289,34 @@ mod thread_start_identity_tests {
     #[test]
     fn root_thread_uses_deterministic_process_identity() {
         let detpid = DetPid::from_raw(3);
-        assert!(is_root_thread_start(true, DetTid::from_raw(3), detpid));
-        assert!(!is_root_thread_start(false, DetTid::from_raw(3), detpid));
-        assert!(!is_root_thread_start(true, DetTid::from_raw(4), detpid));
+        for past_first_execve in [false, true] {
+            assert!(thread_start_needs_registration(
+                true,
+                past_first_execve,
+                DetTid::from_raw(3),
+                detpid
+            ));
+            for is_root_process in [false, true] {
+                assert!(!thread_start_needs_registration(
+                    is_root_process,
+                    past_first_execve,
+                    DetTid::from_raw(4),
+                    detpid
+                ));
+            }
+        }
+        assert!(thread_start_needs_registration(
+            false,
+            false,
+            DetTid::from_raw(3),
+            detpid
+        ));
+        assert!(!thread_start_needs_registration(
+            false,
+            true,
+            DetTid::from_raw(3),
+            detpid
+        ));
     }
 }
 
@@ -3902,9 +6449,9 @@ mod finished_syscall_display_tests {
         stat
     }
 
-    fn sentinel_statx() -> libc::statx {
+    fn sentinel_statx() -> reverie::syscalls::linux_abi::Statx {
         // SAFETY: all-zero is a valid `struct statx`.
-        let mut statx: libc::statx = unsafe { std::mem::zeroed() };
+        let mut statx: reverie::syscalls::linux_abi::Statx = unsafe { std::mem::zeroed() };
         statx.stx_mode = (libc::S_IFREG | 0o644) as u16;
         statx.stx_size = SENTINEL as u64;
         statx
@@ -3920,14 +6467,16 @@ mod finished_syscall_display_tests {
         )
     }
 
-    fn statx(path: &CString, statx: &libc::statx) -> Syscall {
+    fn statx(path: &CString, statx: &reverie::syscalls::linux_abi::Statx) -> Syscall {
         Syscall::Statx(
             Statx::new()
                 .with_dirfd(libc::AT_FDCWD)
                 .with_path(PathPtr::from_ptr(path.as_ptr()))
                 .with_flags(AtFlags::empty())
                 .with_mask(StatxMask::STATX_BASIC_STATS)
-                .with_statx(StatxPtr::from_ptr(statx as *const libc::statx)),
+                .with_statx(StatxPtr::from_ptr(
+                    statx as *const reverie::syscalls::linux_abi::Statx,
+                )),
         )
     }
 
@@ -3981,7 +6530,10 @@ mod finished_syscall_display_tests {
 
         assert_no_struct_rendered(&line);
         assert!(
-            line.contains(&format!("{:p}", &buf as *const libc::statx)),
+            line.contains(&format!(
+                "{:p}",
+                &buf as *const reverie::syscalls::linux_abi::Statx
+            )),
             "statx pointer missing: {line}"
         );
         assert!(line.contains("ENOENT"), "errno missing: {line}");
@@ -3996,7 +6548,7 @@ mod finished_syscall_display_tests {
         assert!(
             line.contains(&format!(
                 "{:p} -> {{st_mode=SFlag(S_IFREG) | 0644, st_size={}, ...}}",
-                &buf as *const libc::statx, SENTINEL
+                &buf as *const reverie::syscalls::linux_abi::Statx, SENTINEL
             )),
             "statx struct missing: {line}"
         );
@@ -4053,7 +6605,7 @@ mod finished_syscall_display_tests {
         assert!(
             line.contains(&format!(
                 "{:p} -> {{st_mode=SFlag(S_IFREG) | 0644, st_size={}, ...}}",
-                &buf as *const libc::statx, SENTINEL
+                &buf as *const reverie::syscalls::linux_abi::Statx, SENTINEL
             )),
             "partial statx copy hidden on EFAULT: {line}"
         );
@@ -4074,6 +6626,50 @@ mod finished_syscall_display_tests {
             line.contains(&format!("tv_sec: {SENTINEL}")),
             "partial timespec copy hidden on EFAULT: {line}"
         );
+    }
+
+    /// A posthook anchor fires on a value or a final guest errno, `EINTR`
+    /// included; an internal restart code is refused; a tool error and an
+    /// entry with no posthook anchor make no request
+    /// (https://github.com/rrnewton/hermit/issues/3929).
+    #[test]
+    fn a_posthook_checkpoint_fires_only_on_a_final_result() {
+        let anchors = || vec!["p".to_owned()];
+        let fires = |result: Result<i64, Error>| {
+            matches!(
+                posthook_checkpoint(9, anchors(), &result),
+                Some(ResourceID::HappensBeforeSyscallCheckpoint { count: 9, anchors })
+                    if anchors == ["p"]
+            )
+        };
+        assert!(fires(Ok(0)));
+        assert!(fires(Ok(6)));
+        for errno in [Errno::EINTR, Errno::EAGAIN, Errno::EBADF, Errno::EFAULT] {
+            assert!(fires(Err(errno.into())), "{errno}");
+        }
+        for errno in [
+            Errno::ERESTARTSYS,
+            Errno::ERESTARTNOINTR,
+            Errno::ERESTARTNOHAND,
+            Errno::ERESTART_RESTARTBLOCK,
+        ] {
+            match posthook_checkpoint(9, anchors(), &Err(errno.into())) {
+                Some(ResourceID::HappensBeforePosthookInterrupted {
+                    count: 9,
+                    anchors,
+                    code,
+                }) => {
+                    assert_eq!(anchors, ["p"]);
+                    assert_eq!(Some(code.as_str()), errno.name());
+                }
+                other => panic!("{errno}: {other:?}"),
+            }
+        }
+        assert!(
+            posthook_checkpoint(9, anchors(), &Err(Error::Tool(anyhow::anyhow!("tool")))).is_none()
+        );
+        assert!(posthook_checkpoint(9, Vec::new(), &Ok(0)).is_none());
+        assert!(posthook_checkpoint(9, Vec::new(), &Err(Errno::ERESTARTSYS.into())).is_none());
     }
 
     /// A tool error is not the syscall's result and proves nothing about the

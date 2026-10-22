@@ -104,6 +104,34 @@ fn require_store() -> Result<PodmanStore, Error> {
 }
 
 impl OciOpts {
+    /// The embedded run participates in the outer invocation's verdict stamp.
+    pub(crate) fn verify_json_path(&self) -> Option<&std::path::Path> {
+        match &self.command {
+            OciSubcommand::Run(opts) => opts.run.verify_json_path(),
+            _ => None,
+        }
+    }
+
+    /// Refuse pending runtime integration before host probes or image access.
+    pub(crate) fn refuse_unready_exec_stop(&self) -> Result<(), Error> {
+        if let OciSubcommand::Run(opts) = &self.command {
+            opts.run.refuse_unready_exec_stop()?;
+        }
+        Ok(())
+    }
+
+    /// Preserve the embedded run's explicit maximum separately from its default.
+    pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
+        if let OciSubcommand::Run(opts) = &mut self.command {
+            opts.run.capture_max_timeslice_source(matches);
+        }
+    }
+
+    /// Whether this `hermit oci` subcommand starts a guest.
+    pub(crate) fn starts_guest(&self) -> bool {
+        matches!(self.command, OciSubcommand::Run(_))
+    }
+
     /// Resolve the embedded run's omitted epoch at the same outer process
     /// boundary as a top-level `hermit run` invocation.
     pub(crate) fn capture_default_run_epoch(
@@ -233,6 +261,7 @@ fn report(store: &PodmanStore, image: &ResolvedImage) -> Result<(), Error> {
 
 impl OciRunOpts {
     fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.run.refuse_unready_exec_stop()?;
         // `hermit oci run` takes its image as a positional; the inherited
         // `--image` flag would be a second, unresolved way to say the same
         // thing. Reject the ambiguity rather than silently picking one.
@@ -242,6 +271,17 @@ impl OciRunOpts {
                  `--image {flag}` and pass {:?} once. `--image` on `hermit run` \
                  bypasses reference resolution, which is what `hermit oci run` \
                  exists to do.",
+                self.image_ref
+            )));
+        }
+        // A run config records a `hermit run` command line, and this run's
+        // image is resolved from the store rather than given as an option, so
+        // a saved config could not reproduce it.
+        if let Some(option) = self.run.run_config_option() {
+            return Err(Error::msg(format!(
+                "`hermit oci run` does not accept {option}: run configs are read and written \
+                 only by `hermit run`. Resolve the image id with `hermit oci inspect {:?}` and \
+                 run `hermit run --image <ID> {option} ...` instead.",
                 self.image_ref
             )));
         }
@@ -333,6 +373,73 @@ mod tests {
                 assert!(!run.pull, "--pull must default off so run never downloads");
             }
             other => panic!("expected the run subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oci_run_forwards_maximum_source_to_timerless_config_validation() {
+        use clap::CommandFactory;
+
+        for (maximum, refuses) in [
+            (None, false),
+            (Some("--max-timeslice=disabled"), false),
+            (Some("--max-timeslice=200000000"), true),
+        ] {
+            let mut argv = vec![
+                "hermit",
+                "--backend=dbt",
+                "oci",
+                "run",
+                "example.invalid/image:tag",
+                "--epoch=2000-12-31T23:59:59Z",
+            ];
+            argv.extend(maximum);
+            argv.extend(["--", "/nonexistent-oci-preemption-guest"]);
+            let matches = crate::Args::command().try_get_matches_from(argv).unwrap();
+            let args = crate::args_from_matches_with_clock(&matches, || {
+                panic!("an explicit epoch must not sample the host clock")
+            })
+            .unwrap();
+            let crate::Subcommand::Oci(oci) = args.command else {
+                panic!("expected oci subcommand");
+            };
+            let OciSubcommand::Run(mut options) = oci.command else {
+                panic!("expected embedded run subcommand");
+            };
+            // Use the same global selection RunOpts::main installs, without
+            // resolving an OCI store or claiming this backend supports images.
+            options.run.set_backend(args.global.backend);
+            assert_eq!(options.run.global_backend_arg(), " --backend=dbt");
+            let result = options.run.validate_args();
+            if refuses {
+                let error = result.unwrap_err();
+                let message = format!("{error:#}");
+                assert!(
+                    error
+                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .is_some(),
+                    "{message}"
+                );
+                assert!(
+                    message
+                        .contains("unsupported_preemption: --backend=dbt refuses --max-timeslice"),
+                    "{message}"
+                );
+                assert_eq!(
+                    options.run.det_opts.det_config.max_timeslice.map(u64::from),
+                    Some(200_000_000)
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    options.run.det_opts.det_config.max_timeslice.map(u64::from),
+                    if maximum.is_none() {
+                        Some(200_000_000)
+                    } else {
+                        None
+                    }
+                );
+            }
         }
     }
 

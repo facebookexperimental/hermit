@@ -380,7 +380,11 @@ fn main() {
     // pin.
     println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/Cargo.lock");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/Cargo.toml");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/build.rs");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/artifact.rs");
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/runtime/Cargo.toml");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/runtime/src/lib.rs");
 
     // Cargo sets PROFILE to "release" for `release` and for every custom
     // profile that inherits from it, such as the validation profile
@@ -419,6 +423,14 @@ fn main() {
     fs::create_dir_all(&build_root)
         .unwrap_or_else(|error| panic!("failed to create {}: {error}", build_root.display()));
 
+    // These two current-profile runtimes remain ordinary installation links.
+    // Ordinary Detcore LiteInst is finalized AFTER outer Cargo exits, using
+    // the existing liteinst-runtime profile and shared physical/source proof.
+    // Never expose this invocation's validate/LTO-off DSO as an installed one.
+    // The absent resource makes an unfinalized installation fail closed.
+    println!(
+        "cargo:warning=finish LiteInst packaging with target/<profile>/stage-detcore-liteinst --git target (make install-deps does this automatically)"
+    );
     for library in ["libdetcore_dbt.so", "libdetcore_sabre.so"] {
         replace_symlink(
             &resources.join(library),

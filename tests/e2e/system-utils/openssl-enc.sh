@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # `openssl enc -salt` prepends a random 8-byte salt (drawn from libcrypto's
 # DRBG, seeded by the kernel CSPRNG) before deriving the PBKDF2 key, so the
 # base64 ciphertext varies natively run to run but is determinized by Hermit.

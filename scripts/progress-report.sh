@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Generate a Hermit progress report with LIVE test numbers.
 #
 # Runs the strict/fail-closed ratchet, the working-envelope vector (L1-L4+rr),

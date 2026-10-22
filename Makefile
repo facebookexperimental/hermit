@@ -43,7 +43,7 @@ HERMIT_DEBUG_BIN ?= target/debug/hermit
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
 	validate-self-test validate-timeout-layers-test lint lint-parent-checks lint-script-tests \
-	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
+	validate-kvm validate-dbt validate-sabre validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
 	@echo 'make: building the hermit binary (dev profile, third-party-backends) -- expect ~45s warm, longer cold'
@@ -68,8 +68,9 @@ install-deps: install-hooks check-submodules ## Build and stage all third-party 
 	@echo 'make: building the third-party backend runtimes (release profile) -- expect ~60s cold'
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
-		-p detcore-dbt -p detcore-sabre -p hermit-install
-	@echo 'make: backend runtimes OK (release profile: detcore-dbt, detcore-sabre, hermit-install)'
+		-p detcore-dbt -p detcore-dbt-cdylib -p detcore-sabre -p detcore-liteinst -p hermit-install
+	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO_PROXY) target/release/stage-detcore-liteinst --git target
+	@echo 'make: backend runtimes OK (release profile: detcore-dbt, detcore-dbt-cdylib, detcore-sabre, detcore-liteinst, hermit-install)'
 
 # Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
 # fresh clone/worktree gets the BLOCKING local pin-consistency check plus the
@@ -178,36 +179,169 @@ lint-parent-checks: ## The lint checker that needs the dev-hermit parent (CI nod
 # child enters the stop-test seam before admission or the DAG. The full run also
 # exercises the final-status contract, so it replaces the narrower self-test here.
 #
-# ⚠️ Comments INSIDE the recipe below must be TAB-indented. A comment at column 0 ends
-# the recipe, silently dropping every line after it.
-lint-checks: ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
+# ONE TARGET PER CHECKER, so `make -j` runs them concurrently. check.lint_checks
+# runs `make -j8 -k -Otarget lint-checks` (ci/lint-checks-node.sh): measured
+# 2026-10-04, the 47 lines took about 366 s serially, their CPU sum. A plain
+# `make lint-checks` still runs them one at a time in the order listed. To add a
+# checker, write a `lint-check-<name>:` target below and list it in
+# LINT_CHECK_TARGETS. A target that is not listed is not run, and
+# scripts/check-checker-scheduling.rs does not count it as scheduled. A target
+# holds more than one line only when the lines must run in order: a self-test
+# and then the real check of the same tool.
+#
+# ⚠️ Every checker must be safe to run concurrently with the others: no writes
+# inside the checkout, no fixed /tmp paths or ports. lint-check-whitespace,
+# lint-check-verify-submodules and check-checker-scheduling read the tree while
+# the others run.
+#
+# ⚠️ Comments INSIDE these recipes must be TAB-indented. A comment at column 0 ends
+# the recipe for scripts/check-checker-scheduling.rs, so every line after it would
+# stop counting as scheduled.
+LINT_CHECK_TARGETS := \
+    lint-check-skill-discovery \
+    lint-check-github-actions-triggers \
+    lint-check-docs-pages-contract \
+    lint-check-pre-push-submodule-diagnosis \
+    lint-check-doc-bare-urls \
+    lint-check-pre-push-doc-bare-urls \
+    lint-check-required-check-outcomes \
+    lint-check-check-status-outcome \
+    lint-check-check-outcome-adapter-authority \
+    lint-check-authority-obtained-once \
+    lint-check-compat-localhost-port \
+    lint-check-compat-git-location \
+    lint-check-run-pinned-tool \
+    lint-check-git-dep-mirrors \
+    lint-check-rust-deps-cache \
+    lint-check-fill-git-mirrors \
+    lint-check-validate-stop-paths \
+    lint-check-merge-gate-policy \
+    lint-check-configure-merge-gate-ruleset \
+    lint-check-pr-status \
+    lint-check-bisect-probe \
+    lint-check-lint-checks-node \
+    lint-check-assert-build-dependencies \
+    lint-check-image-provenance \
+    lint-check-retry-fetch \
+    lint-check-apt-install-cached \
+    lint-check-pinned-root-cache \
+    lint-check-checker-scheduling \
+    lint-check-validate-refusal-predicate \
+    lint-check-audit-test-binary-registration \
+    lint-check-shellcheck \
+    lint-check-whitespace \
+    lint-check-verify-submodules \
+    lint-check-reverie-pin \
+    lint-check-nested-lockfiles \
+    lint-check-record-version-floor \
+    lint-check-buck-reindeer-features \
+    lint-check-reverie-dbt-buck-inventory \
+    lint-check-core-review-protocol \
+    lint-check-audit-test-binary-registration-test \
+    lint-check-buck-e2e-ingest \
+    lint-check-buck-e2e-verdict \
+    lint-check-buck-e2e-cell \
+    lint-check-buck-e2e-stage \
+    lint-check-buck-e2e-stages \
+    lint-check-guest-preload-gate \
+    lint-check-reverie-dbt-budget \
+    lint-check-conformance-test-counts
+.PHONY: lint-checks $(LINT_CHECK_TARGETS)
+lint-checks: $(LINT_CHECK_TARGETS) ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
+
+lint-check-skill-discovery:
 	./scripts/check-skill-discovery.rs
+
+lint-check-github-actions-triggers:
 	./scripts/check-github-actions-triggers.rs
+
+lint-check-docs-pages-contract:
+	./scripts/docs-pages-contract.rs
+
+lint-check-pre-push-submodule-diagnosis:
 	./scripts/test-pre-push-submodule-diagnosis.sh
+
+lint-check-doc-bare-urls:
+	./scripts/check-doc-bare-urls.rs
+
+lint-check-pre-push-doc-bare-urls:
+	./scripts/test-pre-push-doc-bare-urls.sh
+
+lint-check-required-check-outcomes:
 	./scripts/test-required-check-outcomes.sh
+
+lint-check-check-status-outcome:
 	./scripts/test-check-status-outcome.sh
+
+lint-check-check-outcome-adapter-authority:
 	python3 ./scripts/test_check_outcome_adapter_authority.py
+
+lint-check-authority-obtained-once:
 	./scripts/test-authority-obtained-once.sh
+
+lint-check-compat-localhost-port:
 	bash ./tests/compat/real_compat_workload.sh --self-test-localhost-port
+
+lint-check-compat-git-location:
 	bash ./tests/compat/real_compat_workload.sh --self-test-git-location
+
+lint-check-run-pinned-tool:
 	./bootstrap/test-run-pinned-tool.sh
+
+lint-check-git-dep-mirrors:
+	./bootstrap/test-git-dep-mirrors.sh
+
+lint-check-rust-deps-cache:
+	./bootstrap/test-rust-deps-cache.sh
+
+lint-check-fill-git-mirrors:
+	./scripts/test-fill-git-mirrors.sh
+
+lint-check-validate-stop-paths:
 	python3 ./scripts/test_validate_stop_paths.py --exclude-canonical-adapter-accept-arm
+
+lint-check-merge-gate-policy:
 	./scripts/check-merge-gate-policy.sh
+
+lint-check-configure-merge-gate-ruleset:
 	./scripts/test-configure-merge-gate-ruleset.sh
+
+lint-check-pr-status:
 	python3 ./scripts/test_pr_status.py
+
+lint-check-bisect-probe:
 	./scripts/bisect-probe.rs --self-test
+
+lint-check-lint-checks-node:
 	./ci/lint-checks-node.sh --self-test
-	./ci/liteinst-strict-node.sh --self-test
+
+lint-check-assert-build-dependencies:
 	./ci/hermetic/assert-build-dependencies.sh --self-test
+
+lint-check-image-provenance:
 	./ci/hermetic/check-image-provenance.rs
+
+lint-check-retry-fetch:
 	./ci/hermetic/tests/test-retry-fetch.sh
+
+lint-check-apt-install-cached:
 	./ci/apt-install-cached-test.sh
+
+lint-check-pinned-root-cache:
 	python3 ./ci/hermetic/run-in-pinned-root-cache-test.py
+
+lint-check-checker-scheduling:
 	./scripts/check-checker-scheduling.rs --self-test
 	./scripts/check-checker-scheduling.rs
+
+lint-check-validate-refusal-predicate:
 	python3 ./scripts/check-validate-refusal-predicate.py --self-test
 	python3 ./scripts/check-validate-refusal-predicate.py
+
+lint-check-audit-test-binary-registration:
 	python3 ./ci/audit-test-binary-registration.py
+
+lint-check-shellcheck:
 	@sh_files="$$(git ls-files '*.sh' ':!:third-party/**')"; \
 		if [ -z "$$sh_files" ]; then \
 			echo 'lint: no tracked shell scripts to check'; \
@@ -217,19 +351,61 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 			echo 'error: shellcheck is not installed (see https://www.shellcheck.net)' >&2; \
 			exit 1; \
 		fi
+
+lint-check-whitespace:
 	@git diff --check
+
+lint-check-verify-submodules:
 	./ci/verify-submodules.sh --self-test
 	./ci/verify-submodules.sh
+
+lint-check-reverie-pin:
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh $(_VALIDATE_PIN_ARG)
+
+lint-check-nested-lockfiles:
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
-	./scripts/check-record-version-floor.rs
+
+lint-check-record-version-floor:
+	./scripts/check-record-version-floor.rs $(_VALIDATE_PIN_ARG)
+
+lint-check-buck-reindeer-features:
 	./scripts/check-buck-reindeer-features.rs
+
+lint-check-reverie-dbt-buck-inventory:
 	./scripts/patch-reverie-dbt-buck.rs --check-inventory
+
+lint-check-core-review-protocol:
 	./scripts/core-review-protocol-lint-test.sh
+
+lint-check-audit-test-binary-registration-test:
 	python3 ./ci/test_audit_test_binary_registration.py
+
+lint-check-buck-e2e-ingest:
 	python3 ./ci/test_buck_e2e_ingest.py
+
+lint-check-buck-e2e-verdict:
 	python3 ./ci/test_buck_e2e_verdict.py
+
+lint-check-buck-e2e-cell:
+	python3 ./ci/test_buck_e2e_cell.py
+
+lint-check-buck-e2e-stage:
+	python3 ./ci/test_buck_e2e_stage.py
+
+lint-check-buck-e2e-stages:
+	python3 ./ci/test_buck_e2e_stages.py
+
+lint-check-guest-preload-gate:
+	python3 ./ci/test_guest_preload_gate.py
+	python3 ./ci/test_packaged_detcore.py
+
+lint-check-reverie-dbt-budget:
 	./ci/run-with-reverie-dbt-budget-test.sh
+	./ci/retry-on-compiler-crash.sh --self-test
+	./ci/clean-stale-reverie-dbt.sh --self-test
+
+lint-check-conformance-test-counts:
+	./ci/conformance-test-counts.sh --self-test
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
 # check.script_unit_tests, so they run beside lint-checks instead of inside its
@@ -250,7 +426,6 @@ help: ## Show this help (the list of make targets)
 	@printf '  validate-kvm       KVM manifest cells    (needs /dev/kvm)            not yet timed\n'
 	@printf '  validate-dbt       DBT manifest cells    (third-party-backends)      not yet timed\n'
 	@printf '  validate-sabre     SaBRe corpus          (needs HERMIT_SABRE_BINARY) ~10-20 min\n'
-	@printf '  validate-liteinst  LiteInst strict corpus                            ~5-15 min\n'
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
 	@printf '\nThe full multi-backend suite is ./scripts/validate.rs (see ./scripts/validate.rs --help).\n'
 
@@ -369,9 +544,6 @@ validate-dbt: check-submodules ## Run ONLY the DBT cells of the E2E manifests (t
 
 validate-sabre: check-submodules ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
 	./scripts/validate.rs --sabre-compat-only
-
-validate-liteinst: check-submodules ## Run ONLY the LiteInst strict compatibility corpus
-	./scripts/validate.rs --liteinst-compat-only
 
 validate-e9patch: check-submodules ## Run ONLY the e9patch (ptrace-preprocessing) compat corpus (needs HERMIT_E9PATCH_BACKEND)
 	./scripts/validate.rs --e9patch-compat-only

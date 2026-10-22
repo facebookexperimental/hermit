@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # shellcheck shell=bash
 # Sourced by run.sh and prepare-assets.sh, which both require two chaos runs of
 # one seed to print the same AddressSanitizer report. Defines asan_report and

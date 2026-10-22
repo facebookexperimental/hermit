@@ -26,9 +26,7 @@ static FP_REDUCTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 fn command_output(mut command: Command, label: &str) -> Output {
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -45,8 +43,8 @@ fn fp_reduction_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root =
-                Path::new(env!("CARGO_TARGET_TMPDIR")).join("fp-reduction-determinism");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("fp-reduction-determinism-{}", std::process::id()));
             fs::create_dir_all(&build_root).expect("failed to create FP reduction build directory");
             let binary = build_root.join("fp-reduction");
 

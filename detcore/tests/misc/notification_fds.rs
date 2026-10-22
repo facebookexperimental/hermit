@@ -27,9 +27,12 @@ fn run_five_times(guest: fn()) {
     let mut expected = None;
 
     for run in 1..=RUNS {
-        let (output, _state) =
-            detcore_testutils::test_fn_with_config::<Detcore, _>(guest, config.clone(), true)
-                .unwrap_or_else(|error| panic!("notification guest run {run} failed: {error:#}"));
+        let (output, _state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
+            guest,
+            detcore_testutils::prepare_ptrace_timer_config(config.clone()),
+            true,
+        )
+        .unwrap_or_else(|error| panic!("notification guest run {run} failed: {error:#}"));
         assert_eq!(
             output.status,
             ExitStatus::Exited(0),

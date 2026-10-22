@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # End-to-end jq (JSON processor) determinism fixture.
 #
 # jq's `now` builtin reads the wall clock (gettimeofday) and returns fractional

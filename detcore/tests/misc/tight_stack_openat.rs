@@ -27,7 +27,7 @@ const PATH: &CStr = c"/dev/null";
 
 /// What lies directly below the writable stack bytes.
 #[derive(Clone, Copy, Debug)]
-enum BelowStack {
+pub(super) enum BelowStack {
     /// A `PROT_NONE` guard page, as below a thread or fiber stack.
     GuardPage,
     /// Nothing mapped, as below the lowest page of the main-thread stack VMA,
@@ -78,7 +78,10 @@ fn fstat(fd: i32) -> libc::stat {
 
 /// Map two pages, leave only the upper one writable, and return the address
 /// `writable_bytes` above its lower end together with the mapping to release.
-fn tight_stack(below: BelowStack, writable_bytes: usize) -> (*mut u8, *mut libc::c_void, usize) {
+pub(super) fn tight_stack(
+    below: BelowStack,
+    writable_bytes: usize,
+) -> (*mut u8, *mut libc::c_void, usize) {
     let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
     assert!(writable_bytes <= page);
     let region = unsafe {
@@ -110,7 +113,31 @@ fn tight_stack(below: BelowStack, writable_bytes: usize) -> (*mut u8, *mut libc:
 
 #[test]
 fn openat_succeeds_without_writable_stack_below_rsp() {
-    super::det_test_fn_sequential_without_pmu(|| {
+    super::det_test_fn_sequential_without_pmu(tight_stack_opens);
+}
+
+/// The same opens under record and replay, where Detcore also reads each
+/// new descriptor's `/proc/self/fd` link through the recording to classify
+/// an open its spelling does not (https://github.com/rrnewton/hermit/issues/4266).
+/// That read's scratch must not fail the open either.
+#[test]
+fn openat_succeeds_without_writable_stack_below_rsp_under_record() {
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        recordreplay_modes: true,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        tight_stack_opens,
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+fn tight_stack_opens() {
+    {
         // The descriptor and metadata an ordinary open of the same file yields.
         let expected = unsafe { libc::open(PATH.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         assert!(expected >= 0, "ordinary open of {PATH:?} failed");
@@ -159,5 +186,5 @@ fn openat_succeeds_without_writable_stack_below_rsp() {
         let again = unsafe { libc::open(PATH.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         assert_eq!(again, expected, "a descriptor leaked");
         assert_eq!(unsafe { libc::close(again) }, 0);
-    });
+    }
 }

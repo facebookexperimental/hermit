@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /* fd-hygiene: closing a descriptor frees its number for reuse by the next
  * open (a=3, b=4, close a, c reuses 3). Regresses that the guest fd table is
  * identical under e9patch preprocessing and plain ptrace. */

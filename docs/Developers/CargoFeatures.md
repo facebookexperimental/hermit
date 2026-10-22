@@ -40,7 +40,7 @@ build therefore remains the lean release configuration.
 | --- | --- | --- | --- |
 | [`reverie-dbt`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-dbt/Cargo.toml) | `prototype-runtime` | On | The bundled prototype runtime and its exported callbacks. Hermit disables this default and supplies Detcore's runtime. |
 | [`reverie-e9patch`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-e9patch/Cargo.toml) | `preload-constructor` | On | Automatic runtime installation from the shared library constructor. |
-| [`reverie-liteinst`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-liteinst/Cargo.toml) | `preload-constructor` | On | Automatic LiteInst runtime installation. Hermit disables this default for its host-hybrid integration. |
+| [`reverie-liteinst`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-liteinst/Cargo.toml) | `preload-constructor` | On | Automatic LiteInst runtime installation. Hermit and `detcore-liteinst` disable this default; `detcore-liteinst`'s own constructor installs Detcore in the guest. |
 | [`reverie-preload`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-preload/Cargo.toml) | `preload-constructor` | On | Automatic preload runtime installation. |
 | `reverie-preload` | `coordinator-rpc` | Off | The synchronous coordinator RPC client and its optional serialization/Reverie dependencies. |
 | [`reverie-process`](https://github.com/rrnewton/reverie/blob/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/reverie-process/Cargo.toml) | `nightly` | Off | Nightly-only process-container code paths. Its `default` feature set is empty. |
@@ -56,7 +56,7 @@ the repeated name is intentional rather than a shared feature.
 | --- | --- | --- | --- |
 | `ptrace` | Yes | None | Host ptrace, namespaces, seccomp, and PMU when preemption is enabled. |
 | `kvm` | Yes | None | `/dev/kvm` and the KVM guest ABI. |
-| `liteinst` | No | `liteinst` | Staged `libreverie_liteinst.so`; Hermit uses `reverie-liteinst` with its constructor default disabled. |
+| `liteinst` | No | `liteinst` | `libdetcore_liteinst.so`, staged as `rsrcs/libdetcore_liteinst.so` by `hermit-install` or built beside Hermit (`cargo build -p detcore-liteinst`); Hermit uses `reverie-liteinst` with its constructor default disabled. |
 | `dbt` | No | `dbt` | Staged DynamoRIO, native client, and `libdetcore_dbt.so`. |
 | `sabre` | No | `sabre` | Staged SaBRe loader and `libdetcore_sabre.so`. |
 | `e9patch` | No | `e9patch` | Staged `e9tool` and `e9patch`; execution remains ptrace-backed preprocessing rather than a separate Detcore runtime. |
@@ -74,7 +74,7 @@ host libc/libunwind. LiteInst is no longer part of the core release: it sits
 behind the optional `liteinst` feature
 ([#3516](https://github.com/rrnewton/hermit/pull/3516)), and `release-core`
 refuses `--backend=liteinst`. A build that enables `liteinst` still needs the
-separately staged `libreverie_liteinst.so` before that selection is runnable.
+separately built `libdetcore_liteinst.so` before that selection is runnable.
 
 ## Conditional Compilation Audit
 
@@ -102,7 +102,7 @@ behave differently.
 
 1. Resolve the release-contract ambiguity: "single static binary" is not true
    for a runnable LiteInst configuration today, because the `liteinst` feature
-   needs a staged runtime. Specify whether a LiteInst deliverable is a feature
+   needs a separately built in-guest runtime. Specify whether a LiteInst deliverable is a feature
    build plus its runtime package or an embedded runtime.
 2. Keep `hermit`'s Cargo `default` feature set empty. Express the all-backend
    developer policy in `make`, not by changing the published crate defaults.

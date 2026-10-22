@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Controlled Cargo fixture for the actual prepared-test producer/consumer test.
 
 No test is executed here. The driver asserts the exact build calls and runs the
@@ -70,6 +64,27 @@ for selection in selections:
 packages["hermetic_infra_hermit_tests"] = {
     name: {"name": name, "kind": ["bin"], "test": False} for name in guest_names
 }
+# A profile that selects record_replay also prepares the record/replay
+# workloads, whose Rust targets come from the same package build. The producer
+# checks each one's Cargo target name and source, so they carry src_path as real
+# Cargo metadata does. The driver writes this map from RUST_SOURCES in
+# ci/record-replay-workloads.rs: Cargo target name -> repository-relative source.
+record_sources = json.loads((root / "record-workloads.json").read_text())
+for name, source in record_sources.items():
+    packages["hermetic_infra_hermit_tests"][name] = {
+        "name": name,
+        "kind": ["bin"],
+        "test": False,
+        "src_path": str(root / source),
+    }
+
+# A profile that selects lit also builds detcore/tests/lit-guests' programs.
+lit_guest_package, lit_guest_names = json.loads(
+    (root / "lit-guest-names.json").read_text()
+)
+packages[lit_guest_package] = {
+    name: {"name": name, "kind": ["bin"], "test": False} for name in lit_guest_names
+}
 
 packages["hermit-manifest-plan"] = {
     "nextest-cpu-wrapper": {
@@ -91,7 +106,17 @@ if args[:1] == ["metadata"]:
                         "name": name,
                         "id": package_id(name),
                         "source": None,
-                        "manifest_path": str(root / "Cargo.toml"),
+                        # Cargo names each package's own manifest. The guest
+                        # package is tests/Cargo.toml, which the record
+                        # workload producer requires of it.
+                        "manifest_path": str(
+                            root
+                            / (
+                                "tests/Cargo.toml"
+                                if name == "hermetic_infra_hermit_tests"
+                                else "Cargo.toml"
+                            )
+                        ),
                         "targets": list(targets.values()),
                     }
                     for name, targets in packages.items()
@@ -171,18 +196,38 @@ elif (
         for binary in metadata["rust-binaries"].values()
     )
     print(json.dumps({"rust-suites": {}}))
-elif args[:1] == ["build"] and "hermit-manifest-plan" in args:
-    assert args == [
-        "build",
-        "--locked",
-        "--message-format=json-render-diagnostics",
-        "-p",
-        "hermit-manifest-plan",
-        "--bin",
-        "nextest-cpu-wrapper",
-    ], args
+elif args[:1] == ["build"] and (
+    "hermit-manifest-plan" in args or ("--workspace" in args and "--all-targets" in args)
+):
+    # The CPU wrapper: built by itself, or (validate-profile graph profiles) by
+    # the producer's unified workspace build, which also reports the bin's own
+    # unit-test build under the same target name.
+    unified = "--workspace" in args
+    if unified:
+        assert args[:4] == ["build", "--locked", "--profile", "validate"], args
+        assert args[-1] == "--message-format=json-render-diagnostics", args
+    else:
+        assert args == [
+            "build",
+            "--locked",
+            "--message-format=json-render-diagnostics",
+            "-p",
+            "hermit-manifest-plan",
+            "--bin",
+            "nextest-cpu-wrapper",
+        ], args
     mode = os.environ.get("CARGO_ARTIFACT_MODE", "current")
-    path = target / "debug" / "nextest-cpu-wrapper"
+    if unified and mode == "current":
+        unit_test = target / "validate" / "deps" / "nextest_cpu_wrapper-0123"
+        write_binary(unit_test)
+        print(json.dumps({
+            "reason": "compiler-artifact",
+            "package_id": package_id("hermit-manifest-plan"),
+            "target": {"name": "nextest-cpu-wrapper", "kind": ["bin"]},
+            "profile": {"test": True},
+            "executable": str(unit_test),
+        }))
+    path = target / ("validate" if unified else "debug") / "nextest-cpu-wrapper"
     if mode != "wrapper-missing":
         write_binary(path)
     event = {
@@ -195,20 +240,46 @@ elif args[:1] == ["build"] and "hermit-manifest-plan" in args:
     print(json.dumps(event))
     if mode == "wrapper-ambiguous":
         print(json.dumps(event))
-elif args[:1] == ["build"] and "hermetic_infra_hermit_tests" in args:
-    for name in guest_names:
-        path = target / "debug" / name
+elif args[:1] == ["build"] and lit_guest_package in args:
+    # `--bins` builds every lit guest.
+    for spec in packages[lit_guest_package].values():
+        path = target / "debug" / spec["name"]
         write_binary(path)
         print(
             json.dumps(
                 {
                     "reason": "compiler-artifact",
-                    "package_id": package_id("hermetic_infra_hermit_tests"),
-                    "target": {"name": name, "kind": ["bin"]},
+                    "package_id": package_id(lit_guest_package),
+                    "target": {"name": spec["name"], "kind": ["bin"]},
                     "profile": {"test": False},
                     "executable": str(path),
                 }
             )
         )
+    print(json.dumps({"reason": "build-finished", "success": True}))
+elif args[:1] == ["build"] and "hermetic_infra_hermit_tests" in args:
+    # `--bins` builds every binary of the package: the hermit_modes guests and
+    # the record workloads' Rust targets.
+    for spec in packages["hermetic_infra_hermit_tests"].values():
+        name = spec["name"]
+        path = target / "debug" / name
+        write_binary(path)
+        artifact_target = {"name": name, "kind": ["bin"]}
+        if "src_path" in spec:
+            artifact_target["src_path"] = spec["src_path"]
+        print(
+            json.dumps(
+                {
+                    "reason": "compiler-artifact",
+                    "package_id": package_id("hermetic_infra_hermit_tests"),
+                    "target": artifact_target,
+                    "profile": {"test": False},
+                    "executable": str(path),
+                }
+            )
+        )
+    # Cargo's JSON stream ends with this; the record workload producer refuses
+    # a build that does not report success.
+    print(json.dumps({"reason": "build-finished", "success": True}))
 else:
     raise SystemExit(f"unexpected Cargo invocation: {args!r}")

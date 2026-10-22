@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // This is a host-permission/lifecycle diagnostic, not a determinism claim.
 // The C guest uses only real syscalls; no production failure injection is used.
 mod real_random {
@@ -287,10 +279,14 @@ mod real_random {
                 };
                 config.validate();
                 let config = crate::prepare_backend_config(config, crate::Backend::Ptrace);
-                let tracer = reverie_ptrace::TracerBuilder::<detcore::Detcore>::new(command)
-                    .config(config)
-                    .spawn()
-                    .await?;
+                let tracer = hermit_run_ptrace::spawn_tracer(
+                    command,
+                    config,
+                    None,
+                    false,
+                    reverie::BackendStatsRequest::DISABLED,
+                )
+                .await?;
                 let root = tracer.guest_pid().as_raw();
                 {
                     let mut facts = future_facts.borrow_mut();

@@ -5,7 +5,6 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-
 //! Pin the `plan` CALL SITE, not the helper it calls.
 //!
 //! ⚠️ WHY THIS FILE EXISTS. `ManifestSet::knows_test` has a unit test, and that test

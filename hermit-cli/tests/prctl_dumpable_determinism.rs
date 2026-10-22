@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -14,7 +17,8 @@ fn dumpability_controls_are_deterministic() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("prctl-dumpable");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("prctl-dumpable-{}", std::process::id()));
     std::fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let guest = build_root.join("prctl-dumpable");
 
@@ -31,21 +35,22 @@ fn dumpability_controls_are_deterministic() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let verify = Command::new("timeout")
-        .args(["--kill-after", "5s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=info",
-            "--backend=ptrace",
-            "run",
-            "--strict",
-            "--verify",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(&guest)
-        .output()
-        .expect("failed to run prctl dumpable guest");
+    let verify = hermit_test::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after", "5s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log=info",
+                "--backend=ptrace",
+                "run",
+                "--strict",
+                "--verify",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(&guest),
+    );
     let stdout = String::from_utf8_lossy(&verify.stdout);
     let stderr = String::from_utf8_lossy(&verify.stderr);
     assert!(

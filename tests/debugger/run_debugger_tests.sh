@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Standalone runner for the Hermit debugger (gdb / lldb) integration tests.
 #
 # It builds the hermit binary if needed, makes the `lldb` Python module

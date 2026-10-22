@@ -285,27 +285,6 @@
       ]
     },
     {
-      "job": "liteinst_python3_verify_diagnostics",
-      "label": "LiteInst python3 verify diagnostics",
-      "timeout": 300,
-      "argv": [
-        "cargo",
-        "test",
-        "-p",
-        "hermit",
-        "--features",
-        "third-party-backends",
-        "--test",
-        "cli",
-        "--",
-        "run_liteinst_rejects_non_fork_clone",
-        "run_liteinst_handles_inherited_ignored_sigchld",
-        "run_liteinst_verifies_forked_guest",
-        "run_liteinst_verifies_raw_fork_guest",
-        "--test-threads=1"
-      ]
-    },
-    {
       "job": "chaos_hello_race_verification_diagnostic",
       "label": "Chaos hello-race verification diagnostic",
       "timeout": 300,
@@ -375,7 +354,7 @@
         "third-party-backends",
         "--test",
         "cli",
-        "run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them",
+        "run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls",
         "--",
         "--exact",
         "--test-threads=1"

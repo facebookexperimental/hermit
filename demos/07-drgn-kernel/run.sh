@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Demo 7: reproducible Linux task evolution, observed with drgn from outside
 # the guest, starting from demo 5's QEMU snapshot.
 
@@ -35,7 +29,8 @@ Useful overrides:
   DEMO07_TASK_LIMIT=16       displayed task-list prefix (all rows are compared)
   QEMU_BIN=/path             qemu-system-x86_64 binary
   QEMU_ASSETS=/path          bzImage/initramfs cache
-  DEMO07_SNAPSHOT_DISK=/path demo 5 boot snapshot
+  DEMO07_SNAPSHOT_DISK=/path demo 5 boot snapshot, used only with demo 5's matching
+                             record (the default one is rebuilt by demo 5)
   DEMO07_SNAPSHOT_NAME=name  internal snapshot name (default: hermit-boot)
   DEMO07_VMLINUX=/path       matching ELF debug/BTF image (extracted from bzImage by default)
   DEMO07_TIMEOUT=240         restore/advance timeout in seconds
@@ -86,26 +81,19 @@ if [ ! -r "$DEMO07_KERNEL" ] || [ ! -r "$DEMO07_INITRD" ]; then
   echo "error: QEMU kernel/initramfs provisioning failed under $ASSETS" >&2
   exit 1
 fi
-if [ ! -r "$DEMO07_SNAPSHOT_DISK" ]; then
-  default_snapshot="$ASSETS/hermit-boot.qcow2"
-  if [ "$DEMO07_SNAPSHOT_DISK" != "$default_snapshot" ]; then
-    echo "error: missing custom boot snapshot: $DEMO07_SNAPSHOT_DISK" >&2
-    exit 1
-  fi
-  echo "Demo 5 boot snapshot missing; running demo 5 first..."
-  QEMU_ASSETS="$ASSETS" QEMU_BIN="$QEMU_BIN" \
-    make -C "$DEMOS_DIR" --no-print-directory demo5
-fi
-if [ ! -r "$DEMO07_SNAPSHOT_DISK" ]; then
-  echo "error: demo 5 did not produce $DEMO07_SNAPSHOT_DISK" >&2
-  exit 1
-fi
+# The boot snapshot is not checked here: that it exists says nothing about
+# the /init in its memory. task_evolution.py restores it only when demo 5's
+# record of it (<snapshot>.producer.json) names it and the initramfs in
+# $ASSETS now, with demo 6's rules: it runs demo 5 to build or rebuild the
+# default snapshot, and refuses a DEMO07_SNAPSHOT_DISK without such a record,
+# saying how to rebuild it. Each pass checks its copy of the snapshot again.
 
 DEMO07_VMLINUX="${DEMO07_VMLINUX:-$ASSETS/vmlinux}"
 mkdir -p "$ARTIFACTS"
 
 export QEMU_BIN DEMO07_KERNEL DEMO07_INITRD DEMO07_VMLINUX
 export DEMO07_SNAPSHOT_DISK
+export DEMO07_ASSETS="$ASSETS"
 export DEMO07_SNAPSHOT_NAME="${DEMO07_SNAPSHOT_NAME:-hermit-boot}"
 export DEMO07_ARTIFACTS="$ARTIFACTS"
 export DEMO07_QEMU_BIOS="${DEMO07_QEMU_BIOS:-}"

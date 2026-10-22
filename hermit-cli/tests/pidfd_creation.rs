@@ -36,7 +36,8 @@ fn pidfd_creation_is_tracked_across_descriptor_operations() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("pidfd-creation");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pidfd-creation-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create pidfd guest build directory");
 
     for (source, marker, syscalls) in CASES {
@@ -70,9 +71,7 @@ fn pidfd_creation_is_tracked_across_descriptor_operations() {
             ])
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut trace_command);
-        let trace = trace_command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to trace {source}: {error}"));
+        let trace = hermit_test::hermit_output(&format!("{trace_command:?}"), &mut trace_command);
         assert!(
             trace.status.success(),
             "{source} trace failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -108,9 +107,8 @@ fn pidfd_creation_is_tracked_across_descriptor_operations() {
             ])
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut verify_command);
-        let verify = verify_command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to verify {source}: {error}"));
+        let verify =
+            hermit_test::hermit_output(&format!("{verify_command:?}"), &mut verify_command);
         assert!(
             verify.status.success(),
             "{source} verification failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

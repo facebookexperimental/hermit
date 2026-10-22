@@ -131,14 +131,12 @@ step to the slope (half of it at `--counts 0,2`), so the harness reports it
 but leaves it out of the fit, and `--counts` needs at least two positive
 values.
 
-Build Hermit and stage the LiteInst runtime beside it first (the top-level
-`README.md` describes the staging script), then run from the repository root:
+Build Hermit and the in-guest LiteInst runtime beside it first (the top-level
+`README.md` describes the runtime), then run from the repository root:
 
 ```sh
-./scripts/stage-liteinst-runtime.sh release \
-  "$PWD/target/release/libreverie_liteinst.so" \
-  "$PWD/target/liteinst-runtime-build"
 cargo build --locked --release -p hermit --features liteinst --bin hermit
+cargo build --locked --release -p detcore-liteinst
 ./benchmarks/getpid_cost.rs
 ./benchmarks/getpid_cost.rs --backends ptrace --counts 50000,100000 --iterations 3
 ./benchmarks/getpid_cost.rs --hermit "/path/to/wrapper target/release/hermit"
@@ -146,9 +144,9 @@ cargo build --locked --release -p hermit --features liteinst --bin hermit
 
 Hermit runs use the same hardware-independent configuration as `run.py`
 (see Methodology above), so no PMU timer is armed. The slope is interception
-plus Detcore's handling of `getpid`, not interception alone. In the current
-LiteInst backend Detcore runs in the ptrace host, so even a call through a
-patched site ends in a `SIGTRAP` that the host must service. Each round runs
+plus Detcore's handling of `getpid`, not interception alone. The LiteInst
+backend runs Detcore inside the guest, so a call through a patched site reaches
+Detcore without a tracer stop. Each round runs
 every count, and the variant order rotates from round to round so no variant
 always runs first. A sample counts only if it exits 0 and prints exactly
 `calls=N`; failed and timed-out samples are kept in the output, the variant

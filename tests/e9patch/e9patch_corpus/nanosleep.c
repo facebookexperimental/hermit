@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 static long sc(long n, long a, long b, long c, long d, long e, long f) {
   long r;
   register long r10 __asm__("r10") = d;

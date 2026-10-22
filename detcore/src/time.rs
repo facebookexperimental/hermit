@@ -89,8 +89,8 @@ impl From<Timespec> for libc::timespec {
     }
 }
 
-impl From<&libc::statx_timestamp> for Timespec {
-    fn from(tp: &libc::statx_timestamp) -> Self {
+impl From<&reverie::syscalls::linux_abi::StatxTimestamp> for Timespec {
+    fn from(tp: &reverie::syscalls::linux_abi::StatxTimestamp) -> Self {
         Timespec {
             tv_sec: tp.tv_sec as _,
             tv_nsec: tp.tv_nsec as _,
@@ -98,18 +98,18 @@ impl From<&libc::statx_timestamp> for Timespec {
     }
 }
 
-impl From<&Timespec> for libc::statx_timestamp {
+impl From<&Timespec> for reverie::syscalls::linux_abi::StatxTimestamp {
     fn from(tp: &Timespec) -> Self {
-        libc::statx_timestamp {
-            tv_sec: tp.tv_sec as _,
-            tv_nsec: tp.tv_nsec as _,
-            __statx_timestamp_pad1: [0],
-        }
+        // SAFETY: the syscall timestamp consists only of integer fields.
+        let mut out: reverie::syscalls::linux_abi::StatxTimestamp = unsafe { std::mem::zeroed() };
+        out.tv_sec = tp.tv_sec as _;
+        out.tv_nsec = tp.tv_nsec as _;
+        out
     }
 }
 
-impl From<libc::statx_timestamp> for Timespec {
-    fn from(tp: libc::statx_timestamp) -> Self {
+impl From<reverie::syscalls::linux_abi::StatxTimestamp> for Timespec {
+    fn from(tp: reverie::syscalls::linux_abi::StatxTimestamp) -> Self {
         Timespec {
             tv_sec: tp.tv_sec as _,
             tv_nsec: tp.tv_nsec as _,
@@ -117,13 +117,13 @@ impl From<libc::statx_timestamp> for Timespec {
     }
 }
 
-impl From<Timespec> for libc::statx_timestamp {
+impl From<Timespec> for reverie::syscalls::linux_abi::StatxTimestamp {
     fn from(tp: Timespec) -> Self {
-        libc::statx_timestamp {
-            tv_sec: tp.tv_sec as _,
-            tv_nsec: tp.tv_nsec as _,
-            __statx_timestamp_pad1: [0],
-        }
+        // SAFETY: the syscall timestamp consists only of integer fields.
+        let mut out: reverie::syscalls::linux_abi::StatxTimestamp = unsafe { std::mem::zeroed() };
+        out.tv_sec = tp.tv_sec as _;
+        out.tv_nsec = tp.tv_nsec as _;
+        out
     }
 }
 

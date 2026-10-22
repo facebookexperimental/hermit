@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /* Backend-parity fixture: renameat2 flag semantics.
  *
  * Extends the rename_ops row with the flag-carrying renameat2(2) syscall:

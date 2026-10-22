@@ -110,7 +110,8 @@ pub struct AnalyzeOpts {
     )]
     pub run1_preemptions: Option<PathBuf>,
 
-    /// Load target execution from hermit run --record-schedule-to.
+    /// Not implemented: `hermit analyze` refuses this option (exit 122).
+    /// Identify the target run with --run1-preemptions or --run1-seed.
     #[clap(
         long,
         conflicts_with = "run1_seed",
@@ -138,7 +139,8 @@ pub struct AnalyzeOpts {
     )]
     pub run2_preemptions: Option<PathBuf>,
 
-    /// Load baseline execution from hermit run --record-schedule-to.
+    /// Not implemented: `hermit analyze` refuses this option (exit 122).
+    /// Identify the baseline run with --run2-preemptions or --run2-seed.
     #[clap(
         long,
         conflicts_with = "run2_seed",
@@ -200,6 +202,20 @@ pub struct AnalyzeOpts {
     /// `run` has no `--backend` of its own, so this is the only way to choose it.
     #[clap(skip)]
     pub backend: Option<hermit::Backend>,
+
+    /// The invocation's `--max-log-bytes` limit and its ONE shared budget,
+    /// which every trial charges; taken from the global options by
+    /// [`AnalyzeOpts::main`].
+    #[clap(skip)]
+    pub max_log_bytes: Option<u64>,
+    #[clap(skip)]
+    pub log_budget: Option<crate::tracing::LogBudget>,
+
+    /// Why this host's retired-branch counter is inexact, if it is; handed to
+    /// every trial's `RunOpts` for the `--strict` refusal. Tests replace it to
+    /// reach that refusal on a host whose counters pass.
+    #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
+    pub inexact_branch_counter: fn() -> Option<String>,
 }
 
 // TODO: introduce a new type to encapsulate the state of the search, and make it immutable.

@@ -1,0 +1,6 @@
+oncall("hermit")
+
+# The digest and edit-distance crates that used to be defined here do not exist
+# in this tree. Their code lives in detcore/src/digest.rs and
+# detcore/src/edit_distance/, and callers reach it through detcore rather than
+# through separate crates.

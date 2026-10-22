@@ -18,6 +18,9 @@
 //! is a determinism witness for the io_uring path — including the fallback that
 //! real async runtimes rely on — rather than a passthrough assertion.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -41,9 +44,7 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -59,7 +60,8 @@ fn io_uring_ring_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("io-uring-ring-determinism");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("io-uring-ring-determinism-{}", std::process::id()));
         fs::create_dir_all(&build_root)
             .expect("failed to create io_uring-ring guest build directory");
         let output = build_root.join("io_uring_ring_determinism");

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Serialized terminal result written by the validation framework.
 
 use std::collections::BTreeSet;
@@ -18,7 +10,11 @@ pub const HISTORICAL_SCHEMA_VERSION: u64 = 1;
 pub const WRITEBACK_SCHEMA_VERSION: u64 = 2;
 pub const SELECTION_SCHEMA_VERSION: u64 = 3;
 pub const TEST_COUNTS_SCHEMA_VERSION: u64 = 4;
-pub const SCHEMA_VERSION: u64 = 5;
+pub const DETAIL_SCHEMA_VERSION: u64 = 5;
+/// Schema 6 keeps the schema-5 field set and adds the `delegated` scorecard
+/// write-back variant, so a run whose publication belongs to the launcher says
+/// so explicitly instead of writing an ambiguous null.
+pub const SCHEMA_VERSION: u64 = 6;
 pub const HISTORICAL_FIELD_NAMES: [&str; 7] = [
     "schema_version",
     "commit",
@@ -121,15 +117,21 @@ impl FinalValidateStatus {
 #[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ScorecardWriteback {
     Completed,
-    Failed { error: String },
+    /// The write-back was skipped in this process because the launcher owns
+    /// publication. It claims nothing about whether publication happened, and
+    /// it never changes the command exit. Schema 6 and later only.
+    Delegated,
+    Failed {
+        error: String,
+    },
 }
 
 impl ScorecardWriteback {
-    pub const ALL: [&'static str; 2] = ["completed", "failed"];
+    pub const ALL: [&'static str; 3] = ["completed", "delegated", "failed"];
 
     pub fn field_names(status: &str) -> &'static [&'static str] {
         match status {
-            "completed" => &["status"],
+            "completed" | "delegated" => &["status"],
             "failed" => &["status", "error"],
             _ => &[],
         }
@@ -192,10 +194,10 @@ impl ValidationServiceResult {
             WRITEBACK_SCHEMA_VERSION => WRITEBACK_FIELD_NAMES.into_iter().collect(),
             SELECTION_SCHEMA_VERSION => SELECTION_FIELD_NAMES.into_iter().collect(),
             TEST_COUNTS_SCHEMA_VERSION => TEST_COUNTS_FIELD_NAMES.into_iter().collect(),
-            SCHEMA_VERSION => FIELD_NAMES.into_iter().collect(),
+            DETAIL_SCHEMA_VERSION | SCHEMA_VERSION => FIELD_NAMES.into_iter().collect(),
             other => {
                 return Err(format!(
-                    "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {other}"
+                    "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, {DETAIL_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {other}"
                 ));
             }
         };
@@ -204,6 +206,24 @@ impl ValidationServiceResult {
             return Err(format!(
                 "validation-service-result-fields: schema {schema_version} expected {expected_fields:?}, got {actual_fields:?}"
             ));
+        }
+        // serde does not apply `deny_unknown_fields` to the fieldless tagged
+        // variants, so hold each write-back object to its exact declared fields.
+        if let Some(writeback) = object.get("scorecard_writeback").and_then(Value::as_object) {
+            let status = writeback
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let declared: BTreeSet<&str> = ScorecardWriteback::field_names(status)
+                .iter()
+                .copied()
+                .collect();
+            let actual: BTreeSet<&str> = writeback.keys().map(String::as_str).collect();
+            if !declared.is_empty() && actual != declared {
+                return Err(format!(
+                    "validation-service-result-shape: scorecard_writeback {status:?} expected {declared:?}, got {actual:?}"
+                ));
+            }
         }
         let result: Self = serde_json::from_value(value)
             .map_err(|error| format!("validation-service-result-shape: {error}"))?;
@@ -217,12 +237,13 @@ impl ValidationServiceResult {
             WRITEBACK_SCHEMA_VERSION,
             SELECTION_SCHEMA_VERSION,
             TEST_COUNTS_SCHEMA_VERSION,
+            DETAIL_SCHEMA_VERSION,
             SCHEMA_VERSION,
         ]
         .contains(&self.schema_version)
         {
             return Err(format!(
-                "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {}",
+                "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, {DETAIL_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {}",
                 self.schema_version
             ));
         }
@@ -256,7 +277,7 @@ impl ValidationServiceResult {
                 );
             }
         }
-        if self.schema_version != SCHEMA_VERSION && self.detail.is_some() {
+        if self.schema_version < DETAIL_SCHEMA_VERSION && self.detail.is_some() {
             return Err(format!(
                 "validation-service-result-historical-fields: schema {} cannot carry detail",
                 self.schema_version
@@ -290,6 +311,14 @@ impl ValidationServiceResult {
                         .to_string(),
                 );
             }
+            if self.schema_version < SCHEMA_VERSION
+                && self.scorecard_writeback == Some(ScorecardWriteback::Delegated)
+            {
+                return Err(format!(
+                    "validation-service-result-scorecard_writeback: schema {} cannot carry delegated",
+                    self.schema_version
+                ));
+            }
             if let Some(ScorecardWriteback::Failed { error }) = &self.scorecard_writeback {
                 if error.trim().is_empty() {
                     return Err(
@@ -298,14 +327,19 @@ impl ValidationServiceResult {
                     );
                 }
             }
-            let expected_command_exit = match (
-                self.final_validate_status,
-                self.scorecard_writeback.as_ref(),
-            ) {
-                (FinalValidateStatus::Passed, Some(ScorecardWriteback::Failed { .. })) => 75,
-                _ => validation_exit,
-            };
-            if self.exit_code != expected_command_exit {
+            // A write-back failure is reported in the result; it does not
+            // change the command exit. Producers before 2026-10-08 turned a
+            // PASSED run's failed write-back into exit 75, so records they
+            // wrote stay readable.
+            let expected_command_exit = validation_exit;
+            let historical_writeback_exit = self.final_validate_status
+                == FinalValidateStatus::Passed
+                && matches!(
+                    self.scorecard_writeback,
+                    Some(ScorecardWriteback::Failed { .. })
+                )
+                && self.exit_code == 75;
+            if self.exit_code != expected_command_exit && !historical_writeback_exit {
                 return Err(format!(
                     "validation-service-result-exit_code: {} with scorecard_writeback {:?} requires {expected_command_exit}, got {}",
                     self.final_validate_status.as_str(),
@@ -350,17 +384,17 @@ impl ValidationServiceResult {
                 ));
             }
         }
-        if self.schema_version >= TEST_COUNTS_SCHEMA_VERSION
-            && self.final_validate_status == FinalValidateStatus::Passed
-        {
-            let passed = self.passed_tests.ok_or_else(|| {
-                "validation-service-result-passed_tests: current PASSED result requires an exact count"
-                    .to_string()
-            })?;
-            let executed = self.executed_tests.ok_or_else(|| {
-                "validation-service-result-executed_tests: current PASSED result requires an exact count"
-                    .to_string()
-            })?;
+        // An unknown count does not stop a PASSED result from being reported:
+        // whether a run's counts qualify it as landing evidence is ci-hub's
+        // qualifying-receipt predicate's decision (profile full, at least one
+        // executed test, passed == executed). A count that IS present must
+        // still agree with itself.
+        if let (true, Some(passed), Some(executed)) = (
+            self.schema_version >= TEST_COUNTS_SCHEMA_VERSION
+                && self.final_validate_status == FinalValidateStatus::Passed,
+            self.passed_tests,
+            self.executed_tests,
+        ) {
             if passed != executed {
                 return Err(format!(
                     "validation-service-result-passed_tests: current PASSED result requires passed_tests == executed_tests, got {passed} != {executed}"
@@ -419,21 +453,19 @@ mod tests {
     }
 
     #[test]
-    fn failed_writeback_preserves_pass_and_requires_loud_command_exit() {
+    fn failed_writeback_preserves_pass_and_its_exit() {
         let mut result = valid();
-        result.exit_code = 75;
         result.scorecard_writeback = Some(ScorecardWriteback::Failed {
             error: "fixture refusal".into(),
         });
         result.validate().unwrap();
 
-        result.exit_code = 0;
-        assert!(
-            result
-                .validate()
-                .unwrap_err()
-                .contains("requires 75, got 0")
-        );
+        // Records written before the write-back stopped changing the exit.
+        result.exit_code = 75;
+        result.validate().unwrap();
+
+        result.exit_code = 1;
+        assert!(result.validate().unwrap_err().contains("requires 0, got 1"));
     }
 
     #[test]
@@ -522,6 +554,116 @@ mod tests {
         assert_eq!(decoded.schema_version, TEST_COUNTS_SCHEMA_VERSION);
         assert_eq!(decoded.passed_tests, Some(2129));
         assert_eq!(decoded.detail, None);
+
+        // Schema 5 had the current field set and the two-variant write-back.
+        for writeback in [
+            Value::Null,
+            serde_json::json!({"status": "completed"}),
+            serde_json::json!({"status": "failed", "error": "fixture refusal"}),
+        ] {
+            let mut value = serde_json::to_value(valid()).unwrap();
+            value["schema_version"] = Value::from(DETAIL_SCHEMA_VERSION);
+            if writeback["status"] == "failed" {
+                value["exit_code"] = Value::from(75);
+            }
+            value["scorecard_writeback"] = writeback.clone();
+            let decoded =
+                ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
+                    .unwrap();
+            assert_eq!(decoded.schema_version, DETAIL_SCHEMA_VERSION);
+            assert_eq!(
+                serde_json::to_value(&decoded.scorecard_writeback).unwrap(),
+                writeback
+            );
+        }
+        let mut value = serde_json::to_value(valid()).unwrap();
+        value["schema_version"] = Value::from(DETAIL_SCHEMA_VERSION);
+        value.as_object_mut().unwrap().remove("detail");
+        assert!(
+            ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
+                .unwrap_err()
+                .contains("schema 5 expected")
+        );
+    }
+
+    #[test]
+    fn delegated_writeback_is_schema_6_only_and_never_changes_the_exit() {
+        let mut delegated = valid();
+        delegated.scorecard_writeback = Some(ScorecardWriteback::Delegated);
+        delegated.validate().unwrap();
+        let encoded = serde_json::to_value(&delegated).unwrap();
+        assert_eq!(
+            encoded["scorecard_writeback"],
+            serde_json::json!({"status": "delegated"})
+        );
+        assert_eq!(
+            ValidationServiceResult::from_json_slice(&serde_json::to_vec(&encoded).unwrap())
+                .unwrap(),
+            delegated
+        );
+
+        // Delegation is not a write-back failure: PASSED keeps exit 0.
+        let mut loud = delegated.clone();
+        loud.exit_code = 75;
+        assert!(
+            loud.validate().unwrap_err().contains("requires 0, got 75"),
+            "delegated PASSED must not demand the write-back-failure exit"
+        );
+        for status in [
+            FinalValidateStatus::Failed,
+            FinalValidateStatus::CouldNotRun,
+        ] {
+            let mut other = delegated.clone();
+            other.final_validate_status = status;
+            other.exit_code = status.exit_code();
+            if status == FinalValidateStatus::CouldNotRun {
+                other.executed_tests = None;
+                other.passed_tests = None;
+            } else {
+                other.passed_tests = Some(2128);
+            }
+            other.validate().unwrap();
+        }
+
+        for version in [
+            WRITEBACK_SCHEMA_VERSION,
+            SELECTION_SCHEMA_VERSION,
+            TEST_COUNTS_SCHEMA_VERSION,
+            DETAIL_SCHEMA_VERSION,
+        ] {
+            let mut historical = delegated.clone();
+            historical.schema_version = version;
+            if version == WRITEBACK_SCHEMA_VERSION {
+                historical.selection_mode = None;
+            }
+            if version < TEST_COUNTS_SCHEMA_VERSION {
+                historical.passed_tests = None;
+            }
+            assert_eq!(
+                historical.validate().unwrap_err(),
+                format!(
+                    "validation-service-result-scorecard_writeback: schema {version} cannot carry delegated"
+                )
+            );
+        }
+        let mut value = encoded.clone();
+        value["schema_version"] = Value::from(DETAIL_SCHEMA_VERSION);
+        assert!(
+            ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
+                .unwrap_err()
+                .contains("schema 5 cannot carry delegated")
+        );
+
+        for status in ["delegated", "completed"] {
+            let mut extra = encoded.clone();
+            extra["scorecard_writeback"] = serde_json::json!({"status": status, "error": "x"});
+            assert!(
+                ValidationServiceResult::from_json_slice(&serde_json::to_vec(&extra).unwrap())
+                    .unwrap_err()
+                    .contains("validation-service-result-shape"),
+                "{status} with an extra field must be refused"
+            );
+        }
     }
 
     #[test]
@@ -531,7 +673,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 5 expected")
+                .contains("schema 6 expected")
         );
     }
 
@@ -542,7 +684,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 5 expected")
+                .contains("schema 6 expected")
         );
     }
 
@@ -553,7 +695,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 5 expected")
+                .contains("schema 6 expected")
         );
     }
 
@@ -564,7 +706,7 @@ mod tests {
         let error =
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&missing).unwrap())
                 .unwrap_err();
-        assert!(error.contains("schema 5 expected"), "{error}");
+        assert!(error.contains("schema 6 expected"), "{error}");
 
         for status in [FinalValidateStatus::Passed, FinalValidateStatus::Failed] {
             let mut result = valid();
@@ -635,6 +777,14 @@ mod tests {
                 .unwrap_err()
                 .contains("cannot be present when executed_tests is null")
         );
+
+        // Both counts unknown: the PASSED result is reported; ci-hub's
+        // qualifying-receipt predicate, not this schema, refuses it as
+        // landing evidence.
+        let mut unknown = valid();
+        unknown.executed_tests = None;
+        unknown.passed_tests = None;
+        unknown.validate().unwrap();
     }
 
     #[test]

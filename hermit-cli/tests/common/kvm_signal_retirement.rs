@@ -1,10 +1,6 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+// Licensed under the BSD-style license in the LICENSE file.
 
 //! A real caught process timer and a sibling group exit, in both receiver roles.
 //! This exercises the complete CLI path without forcing the scheduler-grant to

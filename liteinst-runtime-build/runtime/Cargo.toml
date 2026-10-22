@@ -1,8 +1,11 @@
 [package]
 name = "hermit-liteinst-runtime-artifact"
-version = "0.4.0"
+version = "0.5.1"
 edition = "2024"
 publish = false
 
 [dependencies]
-reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "c7a1ed25bca339daa0e69241353fc9882da63d7a", default-features = false, features = ["preload-constructor"] }
+reverie-liteinst-preload = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "9b1ba3cfbea21152a11b190112757c2274d9bca3", default-features = false }
+
+[features]
+allocator-fixture = ["reverie-liteinst-preload/allocator-fixture"]

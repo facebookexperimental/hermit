@@ -25,7 +25,7 @@ cargo build --release --locked -p hermit \
 HERMIT_INSTALL_FORCE_RESTAGE=local-sabre \
   cargo build --release --locked -p hermit-install
 
-target/release/hermit --backend sabre run --strict --verify -- /bin/echo hello
+target/release/hermit --backend sabre run --strict --epoch=2026-01-01T00:00:00Z --verify -- /bin/echo hello
 ```
 
 An explicit SaBRe request fails closed if the feature or artifacts are absent.

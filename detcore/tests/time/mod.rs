@@ -6,17 +6,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![allow(
-    unexpected_cfgs,
-    reason = "`fbcode_build` is supplied by the internal Buck build"
-)]
-
 //! Tests time-related functionality of detcore.
 
 use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time;
@@ -28,8 +24,38 @@ use detcore::types::NANOS_PER_RCB;
 use detcore::types::NANOS_PER_SYSCALL;
 use reverie::Rdtsc;
 use reverie::RdtscResult;
-use reverie_ptrace::testing::check_fn_with_config;
-use reverie_ptrace::testing::test_fn_with_config;
+
+// Preserve Reverie's original single-run path while binding the ptrace timer
+// fact. Test policy and the helper's logging/allocation context stay unchanged.
+fn test_fn_with_config<T, F>(
+    f: F,
+    config: detcore::Config,
+    capture_output: bool,
+) -> Result<(reverie::process::Output, T::GlobalState), reverie::Error>
+where
+    T: reverie::Tool + 'static,
+    T::GlobalState: reverie::GlobalTool<Config = detcore::Config>,
+    F: FnOnce(),
+{
+    reverie_ptrace::testing::test_fn_with_config::<T, F>(
+        f,
+        detcore_testutils::prepare_ptrace_timer_config(config),
+        capture_output,
+    )
+}
+
+fn check_fn_with_config<T, F>(f: F, config: detcore::Config, capture_output: bool) -> T::GlobalState
+where
+    T: reverie::Tool + 'static,
+    T::GlobalState: reverie::GlobalTool<Config = detcore::Config>,
+    F: FnOnce(),
+{
+    reverie_ptrace::testing::check_fn_with_config::<T, F>(
+        f,
+        detcore_testutils::prepare_ptrace_timer_config(config),
+        capture_output,
+    )
+}
 
 // Keep this synchronized with the clock-query category in `syscall_time`.
 const NANOS_PER_CLOCK_GETTIME: f64 = 10_000.0;
@@ -72,10 +98,6 @@ fn tod_from_epoch() {
     );
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: hangs or crashes at exit under v0.4.1; reworked upstream after v0.4.1 and re-enabled by the 0.5 import (D125030699)"
-)]
 /// `/proc/stat` `btime` is the fixed boot instant, so a fractional epoch must
 /// not make it move while the guest merely runs and sleeps. Deriving it as
 /// `floor(now) - floor(now - boot)` let the two floors round independently,
@@ -121,10 +143,6 @@ fn proc_stat_btime_is_fixed_for_a_fractional_epoch() {
     );
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: hangs or crashes at exit under v0.4.1; reworked upstream after v0.4.1 and re-enabled by the 0.5 import (D125030699)"
-)]
 /// Config accepts every u64 `sysinfo_uptime_offset`. An offset of 2^63 still
 /// places the boot instant inside time64_t (2026-01-01 minus 2^63 s is
 /// -9223372035087550208), so `/proc/stat` must render it exactly, and files
@@ -318,6 +336,12 @@ fn tod_gettimeofday_faulting_tz_writes_virtual_tv() {
             // A faulting `tv` fails before anything is stored.
             assert_eq!(
                 raw_gettimeofday(unmapped.cast(), ptr::null_mut()),
+                (-1, libc::EFAULT)
+            );
+            // So does one at the last byte of the address space, whose
+            // `tv_usec` has no address.
+            assert_eq!(
+                raw_gettimeofday(ptr::without_provenance_mut(usize::MAX), ptr::null_mut()),
                 (-1, libc::EFAULT)
             );
             assert_eq!(unsafe { libc::munmap(readonly.cast(), page_size) }, 0);
@@ -1102,10 +1126,6 @@ fn tod_clock_gettime() {
     );
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: hangs or crashes at exit under v0.4.1; reworked upstream after v0.4.1 and re-enabled by the 0.5 import (D125030699)"
-)]
 #[test]
 fn target_timeslice_yields_at_syscall_boundaries_without_pmu() {
     let config = detcore::Config {
@@ -1157,10 +1177,6 @@ fn target_timeslice_yields_at_syscall_boundaries_without_pmu() {
     );
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: hangs or crashes at exit under v0.4.1; reworked upstream after v0.4.1 and re-enabled by the 0.5 import (D125030699)"
-)]
 #[test]
 fn max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time() {
     let config = detcore::Config {
@@ -1199,6 +1215,492 @@ fn max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time() {
             );
             worker.join().unwrap();
         },
+        config,
+        true,
+    );
+}
+
+/// With `--target-timeslice-syscalls-only`, a thread that reads the TSC inside
+/// a spinlock must not yield there when its target timeslice expires. QEMU's `cpu_get_ticks` reads the host TSC under its
+/// `vm_clock_lock` spinlock; a vCPU that yielded at every expired target while
+/// reading the TSC held the lock at every yield, and the other vCPU never got it.
+///
+/// The holder's only check-in is the `rdtsc` inside the lock, so a trap that
+/// ends the expired target (the default) always yields with the lock held, and
+/// without the flag this test fails with the contender starved. The holder's syscall-free work outside the
+/// lock varies, so a PMU-maximum preemption lands outside the lock almost always.
+#[test]
+fn rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        target_timeslice: std::num::NonZeroU64::new(100_000),
+        target_timeslice_syscalls_only: true,
+        max_timeslice: std::num::NonZeroU64::new(2_000_000),
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let monotonic_ns = || {
+                let mut now = MaybeUninit::<libc::timespec>::uninit();
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_clock_gettime,
+                        libc::CLOCK_MONOTONIC,
+                        now.as_mut_ptr(),
+                    )
+                };
+                assert_eq!(result, 0);
+                let now = unsafe { now.assume_init() };
+                now.tv_sec as i128 * 1_000_000_000 + now.tv_nsec as i128
+            };
+
+            let lock = Arc::new(AtomicBool::new(false));
+            let acquired = Arc::new(AtomicBool::new(false));
+            let holder_lock = Arc::clone(&lock);
+            let holder_acquired = Arc::clone(&acquired);
+            let holder = thread::spawn(move || {
+                let mut round: u64 = 0;
+                while !holder_acquired.load(Ordering::Acquire) {
+                    round += 1;
+                    let mut work = 0u64;
+                    for i in 0..(50 + round % 37) {
+                        work = std::hint::black_box(work.wrapping_add(i));
+                    }
+                    while holder_lock.swap(true, Ordering::Acquire) {
+                        std::hint::spin_loop();
+                    }
+                    // SAFETY: rdtsc has no preconditions on x86_64.
+                    std::hint::black_box(unsafe { core::arch::x86_64::_rdtsc() });
+                    holder_lock.store(false, Ordering::Release);
+                }
+            });
+
+            let start = monotonic_ns();
+            let mut attempts: u64 = 0;
+            while lock.swap(true, Ordering::Acquire) {
+                attempts += 1;
+                if attempts.is_multiple_of(1_000) {
+                    let elapsed = monotonic_ns() - start;
+                    if elapsed >= 1_000_000_000 {
+                        // The forked-test harness reports a guest panic without
+                        // its message, and libtest captures `eprintln!`, so write
+                        // the reason to fd 2 directly.
+                        let why = format!(
+                            "contender starved for {elapsed} virtual ns ({attempts} attempts): \
+                             the holder yielded inside its spinlock\n"
+                        );
+                        unsafe { libc::write(2, why.as_ptr().cast(), why.len()) };
+                        panic!("contender starved");
+                    }
+                }
+                std::hint::spin_loop();
+            }
+            acquired.store(true, Ordering::Release);
+            lock.store(false, Ordering::Release);
+            holder.join().unwrap();
+        },
+        config,
+        true,
+    );
+}
+
+/// With `--futex-wake-yields`, a thread that releases a contended
+/// mutex yields right after its `FUTEX_WAKE`, behind the waiter it woke, so the
+/// waiter takes the mutex before the releaser can re-take it
+/// (https://github.com/rrnewton/hermit/issues/3874).
+///
+/// The holder keeps a `std::sync::Mutex` for nearly all of each round and makes
+/// no syscall except the wake in its unlock. The waiter starts while the holder
+/// has the mutex and blocks on it in the futex. With the policy it takes the
+/// mutex at the holder's first release. By default the holder's 1 ms target has
+/// not expired at the wake, so it keeps running, re-takes the mutex uncontended
+/// in every later round, and the waiter can get it only when a PMU-maximum
+/// preemption lands in the short window outside the mutex: in 500 rounds that
+/// never happened, and the waiter got the mutex only when the holder stopped,
+/// after 347,995,390 virtual ns.
+#[test]
+fn a_futex_wake_hands_a_contended_mutex_to_the_waiter() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        target_timeslice: std::num::NonZeroU64::new(1_000_000),
+        max_timeslice: std::num::NonZeroU64::new(5_000_000),
+        futex_wake_yields: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(contended_mutex_handoff, config, true);
+}
+
+/// Two runs of the mutex handoff with `--futex-wake-yields` produce the same
+/// output and the same Detcore log.
+#[test]
+fn a_futex_wake_handoff_is_deterministic() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        target_timeslice: std::num::NonZeroU64::new(1_000_000),
+        max_timeslice: std::num::NonZeroU64::new(5_000_000),
+        futex_wake_yields: true,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        contended_mutex_handoff,
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+/// Two threads that alternate `sched_yield` and clock reads, printing every
+/// value read, so the output is the clock's whole trajectory across turns.
+fn clock_reads_across_yields() {
+    fn monotonic_ns() -> u64 {
+        let mut now = MaybeUninit::<libc::timespec>::uninit();
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_clock_gettime,
+                libc::CLOCK_MONOTONIC,
+                now.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
+        let now = unsafe { now.assume_init() };
+        now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+    }
+    let reads = |name: &'static str| {
+        move || {
+            let mut values = Vec::new();
+            for _ in 0..20 {
+                values.push(monotonic_ns());
+                assert_eq!(unsafe { libc::sched_yield() }, 0);
+            }
+            assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+            (name, values)
+        }
+    };
+    let other = thread::spawn(reads("b"));
+    let mine = reads("a")();
+    let theirs = other.join().unwrap();
+    for (name, values) in [mine, theirs] {
+        let line = format!("{name}: {values:?}\n");
+        unsafe { libc::write(1, line.as_ptr().cast(), line.len()) };
+    }
+}
+
+/// With a small `--scheduler-turn-cost`, two runs read the same strictly
+/// increasing clock trajectory across thread switches.
+#[test]
+fn scheduler_turn_cost_runs_are_deterministic() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        scheduler_turn_cost: std::num::NonZeroU64::new(1_000),
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        clock_reads_across_yields,
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+/// A finite `poll` on a pipe nobody writes to still times out with a small
+/// `--scheduler-turn-cost`: its retries are turns that run no guest code, and
+/// only the scheduler charge moves the clock towards the deadline.
+#[test]
+fn a_finite_poll_times_out_with_a_small_scheduler_turn_cost() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        scheduler_turn_cost: std::num::NonZeroU64::new(1_000),
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let mut pollfd = libc::pollfd {
+                fd: fds[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 1) }, 0);
+            assert_eq!(pollfd.revents, 0);
+        },
+        config,
+        true,
+    );
+}
+
+/// Waits on a futex, wakes it from the main thread, and prints the wake count,
+/// whether the waiter had run by the time the wake returned, and whether a
+/// third, always runnable thread ran during the wake. With `wait` false nobody
+/// waits, so the wake finds no waiter.
+///
+/// The third thread makes both halves of `--futex-wake-yields` visible. It is
+/// queued ahead of the waker, and the waiter is queued behind the waker when
+/// woken. The waiter has run when the wake returns only if the waker was moved
+/// behind it (the requeue) and then gave up its turn (the yield); with the
+/// yield alone, the waker's turn comes before the waiter's. The third thread
+/// runs during the wake whenever the waker yields, so a wake that woke no one
+/// shows that it did not.
+fn futex_wake_snapshot(wait: bool) {
+    static GATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static READY: AtomicBool = AtomicBool::new(false);
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    static SIBLING_READY: AtomicBool = AtomicBool::new(false);
+    static SIBLING_TURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static STOP: AtomicBool = AtomicBool::new(false);
+    let mut waiter = Some(thread::spawn(move || {
+        READY.store(true, Ordering::Release);
+        if wait {
+            while GATE.load(Ordering::Acquire) == 0 {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        GATE.as_ptr(),
+                        libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                        0,
+                        ptr::null::<libc::timespec>(),
+                    )
+                };
+            }
+        }
+        SEEN.store(true, Ordering::Release);
+    }));
+    while !READY.load(Ordering::Acquire) {
+        unsafe { libc::sched_yield() };
+    }
+    if wait {
+        // Turns for the waiter to park; the wake count below shows it did.
+        unsafe { libc::sched_yield() };
+        unsafe { libc::sched_yield() };
+    } else {
+        waiter.take().unwrap().join().unwrap();
+    }
+    // Always runnable: each pass is one turn of its own.
+    let sibling = thread::spawn(|| {
+        SIBLING_READY.store(true, Ordering::Release);
+        while !STOP.load(Ordering::Acquire) {
+            SIBLING_TURNS.fetch_add(1, Ordering::AcqRel);
+            unsafe { libc::sched_yield() };
+        }
+    });
+    while !SIBLING_READY.load(Ordering::Acquire) {
+        unsafe { libc::sched_yield() };
+    }
+    GATE.store(1, Ordering::Release);
+    let before = SIBLING_TURNS.load(Ordering::Acquire);
+    let woken = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            GATE.as_ptr(),
+            libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+            1,
+        )
+    };
+    let seen = SEEN.load(Ordering::Acquire);
+    let sibling_ran = SIBLING_TURNS.load(Ordering::Acquire) != before;
+    STOP.store(true, Ordering::Release);
+    sibling.join().unwrap();
+    if let Some(waiter) = waiter {
+        waiter.join().unwrap();
+    }
+    // libtest captures `println!` in the forked guest, so write to fd 1.
+    let line = format!(
+        "wake={woken} seen={} sibling={}\n",
+        seen as u8, sibling_ran as u8
+    );
+    unsafe { libc::write(1, line.as_ptr().cast(), line.len()) };
+}
+
+/// Runs `guest` under `config` and returns its standard output.
+fn guest_stdout(guest: fn(), config: detcore::Config) -> String {
+    let (output, _) = test_fn_with_config::<Detcore, _>(guest, config, true).unwrap();
+    assert_eq!(output.status, reverie::ExitStatus::Exited(0));
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// A preemption record of a run with `--futex-wake-yields` replays to the
+/// same schedule under `--replay-preemptions-from`: the replay requeues and
+/// yields at the same wakes. (This in-process harness cannot replay a schedule
+/// with `--replay-schedule-from`: schedule replay asserts that the root
+/// thread's parent is Detcore's root process, and here it is the test.)
+/// The snapshot tells the policy's halves apart: the woken waiter has run by
+/// the time the wake returns only with both the requeue and the yield, the
+/// third thread runs during the wake only with the yield, and neither happens
+/// without the policy or at a wake that woke no one.
+#[test]
+fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
+    let base = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        ..Default::default()
+    };
+    let round_trip = |guest: fn(), yields: bool| {
+        let record = std::env::temp_dir().join(format!(
+            "hermit-futex-wake-yield-{}-{yields}-{:p}.json",
+            std::process::id(),
+            guest as *const ()
+        ));
+        let config = detcore::Config {
+            futex_wake_yields: yields,
+            ..base.clone()
+        };
+        let recorded = guest_stdout(
+            guest,
+            detcore::Config {
+                record_preemptions: true,
+                record_preemptions_to: Some(record.clone()),
+                ..config.clone()
+            },
+        );
+        let replayed = guest_stdout(
+            guest,
+            detcore::Config {
+                replay_preemptions_from: Some(record.clone()),
+                ..config
+            },
+        );
+        std::fs::remove_file(&record).unwrap();
+        assert_eq!(recorded, replayed, "yields={yields}");
+        recorded
+    };
+    assert_eq!(
+        round_trip(|| futex_wake_snapshot(true), true),
+        "wake=1 seen=1 sibling=1\n"
+    );
+    assert_eq!(
+        round_trip(|| futex_wake_snapshot(true), false),
+        "wake=1 seen=0 sibling=0\n"
+    );
+    // The waiter was joined before this wake, so only `sibling` can show a
+    // yield here.
+    assert_eq!(
+        round_trip(|| futex_wake_snapshot(false), true),
+        "wake=0 seen=1 sibling=0\n"
+    );
+}
+
+/// The guest of the two mutex-handoff tests: a holder that keeps a
+/// `std::sync::Mutex` for nearly all of each round and a waiter that needs it
+/// once. Fails if the waiter waits 20 ms of virtual time or more.
+fn contended_mutex_handoff() {
+    fn monotonic_ns() -> u64 {
+        let mut now = MaybeUninit::<libc::timespec>::uninit();
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_clock_gettime,
+                libc::CLOCK_MONOTONIC,
+                now.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
+        let now = unsafe { now.assume_init() };
+        now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+    }
+    fn spin(iterations: u64) {
+        let mut work = 0u64;
+        for i in 0..iterations {
+            work = std::hint::black_box(work.wrapping_add(i));
+        }
+    }
+
+    let mutex = Arc::new(std::sync::Mutex::new(()));
+    let acquired = Arc::new(AtomicBool::new(false));
+    let waited_ns = Arc::new(AtomicU64::new(0));
+    let mut guard = mutex.lock().unwrap();
+    let waiter = {
+        let mutex = Arc::clone(&mutex);
+        let acquired = Arc::clone(&acquired);
+        let waited_ns = Arc::clone(&waited_ns);
+        thread::spawn(move || {
+            let start = monotonic_ns();
+            let held = mutex.lock().unwrap();
+            waited_ns.store(monotonic_ns() - start, Ordering::Relaxed);
+            acquired.store(true, Ordering::Release);
+            drop(held);
+        })
+    };
+
+    let mut round: u64 = 0;
+    while !acquired.load(Ordering::Acquire) && round < 500 {
+        round += 1;
+        spin(20_000);
+        drop(guard);
+        spin(50 + round % 37);
+        guard = mutex.lock().unwrap();
+    }
+    drop(guard);
+    waiter.join().unwrap();
+
+    let waited = waited_ns.load(Ordering::Relaxed);
+    if waited >= 20_000_000 {
+        // The forked-test harness reports a guest panic without its
+        // message, and libtest captures `eprintln!`, so write the
+        // reason to fd 2 directly.
+        let why = format!(
+            "waiter took the mutex after {waited} virtual ns, holder round {round}: \
+             the releaser kept re-taking it after waking the waiter\n"
+        );
+        unsafe { libc::write(2, why.as_ptr().cast(), why.len()) };
+        panic!("mutex waiter starved");
+    }
+}
+
+/// Each committed scheduler turn adds `--scheduler-turn-cost` virtual
+/// nanoseconds (default 500,000) to the clock, so two reads around a
+/// `sched_yield`, which takes one turn, differ by that charge plus the two
+/// syscalls' own cost: measured 515,060 ns by default and 16,060 ns with a
+/// 1,000 ns charge. A smaller charge makes the jump smaller, and time still
+/// advances.
+#[test]
+fn scheduler_turn_cost_sets_the_clock_jump_across_a_turn() {
+    fn delta_across_a_yield() -> u64 {
+        let monotonic_ns = || {
+            let mut now = MaybeUninit::<libc::timespec>::uninit();
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_clock_gettime,
+                    libc::CLOCK_MONOTONIC,
+                    now.as_mut_ptr(),
+                )
+            };
+            assert_eq!(result, 0);
+            let now = unsafe { now.assume_init() };
+            now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+        };
+        let before = monotonic_ns();
+        assert_eq!(unsafe { libc::sched_yield() }, 0);
+        monotonic_ns() - before
+    }
+    fn check(delta: u64, low: u64, high: u64) {
+        if !(low..high).contains(&delta) {
+            // The forked-test harness reports a guest panic without its
+            // message, so write the reason to fd 2 directly.
+            let why = format!("clock moved {delta} ns across a yield, expected {low}..{high}\n");
+            unsafe { libc::write(2, why.as_ptr().cast(), why.len()) };
+            panic!("unexpected clock jump across a scheduler turn");
+        }
+    }
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || check(delta_across_a_yield(), 515_000, 515_200),
+        config.clone(),
+        true,
+    );
+    let config = detcore::Config {
+        scheduler_turn_cost: std::num::NonZeroU64::new(1_000),
+        ..config
+    };
+    check_fn_with_config::<Detcore, _>(
+        || check(delta_across_a_yield(), 16_000, 16_200),
         config,
         true,
     );
@@ -1361,10 +1863,6 @@ fn rdtsc_agrees_with_clock_gettime() {
     );
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: hangs or crashes at exit under v0.4.1; reworked upstream after v0.4.1 and re-enabled by the 0.5 import (D125030699)"
-)]
 /// A malformed `timespec` must fail EINVAL, not become an indefinite sleep.
 ///
 /// Detcore fed `Timespec`'s signed fields through `as u64`, so `tv_sec = -1`

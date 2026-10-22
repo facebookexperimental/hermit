@@ -7,8 +7,15 @@ name: Docs
 
 on:
   # Owner-authorized website refresh only; no automatic PR or main-push tests.
+  #
+  # GitHub runs a schedule as the user who last changed its cron syntax. This
+  # line was added by rrnewton-bots (419e47e6, 2026-09-21), which GitHub
+  # suspended on 2026-10-04, and no scheduled Docs run ever started. "0-6" is
+  # every day, the same schedule as "*", written differently so that the push
+  # carrying it makes the pusher the schedule's actor. If the schedule stops
+  # again, check who last changed this line before anything else.
   schedule:
-    - cron: "23 8 * * *"
+    - cron: "23 8 * * 0-6"
   workflow_dispatch:
     inputs:
       rebuild_compatibility:
@@ -49,12 +56,65 @@ jobs:
     if: >-
       github.repository == 'rrnewton/hermit' && github.ref == 'refs/heads/main' &&
       (github.event_name != 'schedule' || vars.COMPATIBILITY_NIGHTLY_ENABLED == 'true')
-    runs-on: ubuntu-latest
-    # Room for the 101-minute rebuild step below plus the steps around it
+    # A ledger rebuild runs on the self-hosted `gate` runner; every other Docs
+    # run stays on ubuntu-latest. The
+    # rebuild outgrew the hosted runner's 16 GB of memory: the builder's own
+    # process peaked at 23.2 GiB in stage1.export (24.9 GB reported by the
+    # builder, ledger 1d2bb9dc, 2026-10-12, measured locally), and both hosted
+    # rebuilds that day ended "cancelled" about 42 minutes into the rebuild
+    # step, with the always() steps after it skipped:
+    # https://github.com/rrnewton/hermit/actions/runs/38266575630 and
+    # https://github.com/rrnewton/hermit/actions/runs/38276042351. The `gate`
+    # runner is a native service on a large shared host with no memory limit of
+    # its own. The `pmu` runners are containers started with a 16 GB default
+    # limit (dev-hermit ci-hub/runners/init-runner.sh), so they would not help.
+    # The `gate` label alone does not select that runner: a `pmu` runner
+    # carries it too and took
+    # https://github.com/rrnewton/hermit/actions/runs/38285455905. So the job
+    # also asks for `docs-rebuild`, a label only the `gate` runner carries;
+    # until a runner has it, a rebuild run waits in the queue rather than
+    # starting on a runner too small for it. "Keep a self-hosted run off the
+    # host's shared state" and the runner.environment conditions below keep the
+    # job from changing that host. Return the rebuild to ubuntu-latest once the
+    # builder streams the ledger instead of holding it
+    # (https://github.com/rrnewton/dev-hermit/issues/515).
+    runs-on: ${{ (github.event_name == 'schedule' || inputs.rebuild_compatibility) && fromJSON('["self-hosted", "gate", "docs-rebuild"]') || 'ubuntu-latest' }}
+    # Room for the 180-minute rebuild step below plus the steps around it
     # (about 10 minutes on 2026-09-27, with an 11-minute public-byte check cap).
-    timeout-minutes: 150
+    timeout-minutes: 240
 
     steps:
+    # Before any git command: the runner's user has git URL rewrites in its
+    # global configuration that serve some GitHub URLs from stale local mirrors,
+    # so git reads an empty global configuration file instead (not /dev/null,
+    # which git rejected as "bad config line 1" on a `pmu` runner), and its
+    # PATH lacks the user's Rust toolchain. The rebuild's scratch and temporary
+    # files go in one job-owned directory, removed by the job's last step, never
+    # in the shared host's /tmp. That directory is outside the runner's work
+    # folder because the `gate` runner's work folder lies inside a dev-hermit
+    # checkout, and the builder refuses a website output root inside any
+    # checkout that contains its own source (build_and_serve.py,
+    # _output_location).
+    - name: Keep a self-hosted run off the host's shared state
+      if: runner.environment == 'self-hosted'
+      run: |
+        set -euo pipefail
+        # The workspace persists between runs here. The extracted website
+        # under target/doc is read-only (directories 0555, files 0444), and
+        # actions/checkout's clean could not remove it: the next run failed
+        # 13 s in, at checkout, on 2026-10-13 02:23 UTC. Make the previous
+        # run's files writable before checkout cleans them.
+        if [[ -d "$GITHUB_WORKSPACE" ]]; then
+          chmod -R u+w -- "$GITHUB_WORKSPACE"
+        fi
+        printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        mkdir -p "$HOME/.cache"
+        scratch=$(mktemp -d "$HOME/.cache/hermit-docs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.XXXXXX")
+        mkdir "$scratch/tmp"
+        : > "$scratch/gitconfig"
+        printf 'GIT_CONFIG_GLOBAL=%s\n' "$scratch/gitconfig" >> "$GITHUB_ENV"
+        printf 'COMPATIBILITY_SCRATCH_PARENT=%s\n' "$scratch" >> "$GITHUB_ENV"
+        printf 'TMPDIR=%s\n' "$scratch/tmp" >> "$GITHUB_ENV"
     - uses: actions/checkout@v4
       with:
         # The release download and deploy steps receive the token explicitly;
@@ -111,22 +171,130 @@ jobs:
         printf 'validation_history_commit=%s\n' "$history" >> "$GITHUB_OUTPUT"
         printf '%s\n' "$history" > "$RUNNER_TEMP/website-validation-history.txt"
     - name: Dependencies
+      # A self-hosted runner's host already builds Hermit and is not Debian.
+      if: runner.environment == 'github-hosted'
       run: sudo apt-get install -y libunwind-dev liblzma-dev
+    # The published ledger as an earlier run left it, so this run's fetch of the
+    # published commit (fetch_ledger) downloads only what changed since then:
+    # the restored repository holds the commit an earlier run built from
+    # (refs/cache/published), which the fetch offers as already present. A
+    # cold fetch moves a pack of about 711 MiB at a GitHub serving rate near
+    # 1 MB/s (2026-10-12), and ran past fetch_ledger's old 1,200 s limit on
+    # https://github.com/rrnewton/hermit/actions/runs/38256949845. Objects are
+    # named by their content and the captured commit is checked, so an
+    # outdated or foreign cache can cost a fetch, never a wrong byte.
+    - name: Restore the published cell ledger from an earlier run
+      id: website-ledger-cache
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      uses: actions/cache/restore@v4
+      with:
+        path: _website_source/hermit_test_ledger/.git
+        key: compatibility-ledger-${{ runner.os }}-${{ steps.website-source.outputs.ledger_commit }}
+        restore-keys: |
+          compatibility-ledger-${{ runner.os }}-
     - name: Prepare only the builder's public source dependencies
+      id: website-deps
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
       timeout-minutes: 15
       run: |
         set -euo pipefail
         # H history is required for source ancestry/depth. Do not recursively
         # initialize unrelated Reverie, rr, backend, or parent submodules.
-        git -C _website_source submodule update --init -- hermit hermit_test_ledger
+        git -C _website_source submodule update --init -- hermit
+        # The builder reads the cell ledger at one commit, so it needs no
+        # ledger history here; the rebuild fetches the captured commit and
+        # deepens only as far as the parity summary's commit
+        # (.github/scripts/rebuild-compatibility-site.py, fetch_ledger). The
+        # full-history clone ran past this step's timeout on
+        # https://github.com/rrnewton/hermit/actions/runs/38167459473.
+        #
+        # Only the commit the parent records is fetched here, never the
+        # ledger's main tip: `submodule update --init --depth 1` clones the
+        # default branch tip first, a tree of about 11 GiB that GitHub packs
+        # without its stored deltas, and this step then ran 527-913 s against
+        # its 900 s bound and timed out on
+        # https://github.com/rrnewton/hermit/actions/runs/38171598701 and
+        # https://github.com/rrnewton/hermit/actions/runs/38252248551 (2026-10-12),
+        # while the recorded commit is 9 files. The tip is fetched once, by
+        # fetch_ledger in the rebuild step, under its own timeout.
+        ledger_commit=$(git -C _website_source rev-parse HEAD:hermit_test_ledger)
+        ledger_url=$(git -C _website_source config -f .gitmodules --get submodule.hermit_test_ledger.url)
+        git -C _website_source submodule init -- hermit_test_ledger
+        # Reinitializing keeps a repository the cache step restored.
+        git init --quiet _website_source/hermit_test_ledger
+        if git -C _website_source/hermit_test_ledger remote get-url origin >/dev/null 2>&1; then
+          git -C _website_source/hermit_test_ledger remote set-url origin "$ledger_url"
+        else
+          git -C _website_source/hermit_test_ledger remote add origin "$ledger_url"
+        fi
+        git -C _website_source/hermit_test_ledger fetch --quiet --no-tags --depth 1 origin "$ledger_commit"
+        # --force: a restored repository's index already names this commit's
+        # files, so a plain checkout of the same commit leaves the restored,
+        # empty working tree as deletions, and the rebuild then refuses
+        # "website builder sources have local changes"; that refusal ended
+        # https://github.com/rrnewton/hermit/actions/runs/38288071928 one
+        # second into the rebuild step, on the first restored repository.
+        git -C _website_source/hermit_test_ledger checkout --quiet --force --detach "$ledger_commit"
         git -C _website_source/hermit submodule update --init --depth 1 -- agent-utils
         git -C _website_source/hermit fetch --no-tags origin main:refs/remotes/origin/main
         channel=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("_website_source/hermit/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
         rustup toolchain install "$channel" --profile minimal
-        RUSTUP_TOOLCHAIN="$channel" cargo install rust-script --version 0.36.0 --locked
-    - name: Add swap for the compatibility rebuild
+        printf 'channel=%s\n' "$channel" >> "$GITHUB_OUTPUT"
+    # The rebuild compiles two Rust programs: manifest-metadata (cargo run, into
+    # CARGO_TARGET_DIR) and the ci-hub.rs projection (rust-script, into
+    # ~/.cache/rust-script). Cold, they cost about 77 s and 150 s of the rebuild
+    # step on https://github.com/rrnewton/hermit/actions/runs/37208221642.
+    # The cache only supplies earlier build outputs: Cargo's own fingerprints
+    # decide what is fresh, and CARGO_UNSTABLE_CHECKSUM_FRESHNESS (rebuild step)
+    # makes that decision by source content, because checkout gives every source
+    # file a new modification time. An outdated cache can cost a rebuild, never
+    # a wrong binary. The key names the exact sources (the reviewed builder
+    # commit, whose gitlink fixes the Hermit sources too) and this workflow
+    # file (the build settings), so any change to either saves its build
+    # again; restore-keys reuses the newest earlier build. A key computed from
+    # file patterns missed sources reached through #[path] and include files.
+    - name: Restore the website builder's Rust build outputs
+      id: website-rust-cache
+      # Never on a self-hosted runner, where these home-directory paths are the
+      # host user's own rust-script and Cargo state.
+      if: >-
+        runner.environment == 'github-hosted' &&
+        (github.event_name == 'schedule' || inputs.rebuild_compatibility)
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cache/rust-script
+          ~/.cargo/bin/rust-script
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          ${{ runner.temp }}/compatibility-target
+        key: compatibility-rust-${{ runner.os }}-${{ steps.website-deps.outputs.channel }}-${{ steps.website-source.outputs.parent_commit }}-${{ hashFiles('.github/workflows/docs.yml') }}
+        restore-keys: |
+          compatibility-rust-${{ runner.os }}-${{ steps.website-deps.outputs.channel }}-
+    - name: Install rust-script
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      timeout-minutes: 10
+      env:
+        CHANNEL: ${{ steps.website-deps.outputs.channel }}
+      run: |
+        set -euo pipefail
+        # A restored rust-script is reused only at the exact pinned version.
+        if [[ "$(rust-script --version 2>/dev/null || true)" == "rust-script 0.36.0" ]]; then
+          echo "rust-script 0.36.0 restored from cache"
+        elif [[ "$RUNNER_ENVIRONMENT" == self-hosted ]]; then
+          # Install beside the job, never over the host user's rust-script.
+          RUSTUP_TOOLCHAIN="$CHANNEL" cargo install rust-script --version 0.36.0 --locked \
+            --root "$RUNNER_TEMP/rust-script"
+          printf '%s\n' "$RUNNER_TEMP/rust-script/bin" >> "$GITHUB_PATH"
+        else
+          RUSTUP_TOOLCHAIN="$CHANNEL" cargo install rust-script --version 0.36.0 --locked --force
+        fi
+    - name: Add swap for the compatibility rebuild
+      # Hosted only: a swapfile on a self-hosted runner would change its host.
+      if: >-
+        runner.environment == 'github-hosted' &&
+        (github.event_name == 'schedule' || inputs.rebuild_compatibility)
       timeout-minutes: 5
       # The rebuild's projection child peaked at 13.85 GB on 2026-10-03 (9.77 GB
       # on 2026-10-01), and the step's cgroup reached ~16.2 GB of the runner's
@@ -170,10 +338,24 @@ jobs:
       # (2026-09-23), 31.4, 36.9, 44.0, 49.5 min (2026-09-27). It grows with
       # the ledger, and the old 60-minute cap would have ended the build
       # within days. Keep a finite cap; the step still fails if it is reached.
-      timeout-minutes: 101
+      # On the self-hosted runner on 2026-10-12 the step took 51.7 min to the
+      # end of the build (about 22 of them the ledger fetch) and then needs the
+      # release upload, which each attempt bounds by the archive's size
+      # (rebuild-compatibility-site.py, upload_timeout): about 44 minutes for
+      # a 471 MB archive. 101 minutes would not hold a slow fetch, the build
+      # and one slow upload.
+      timeout-minutes: 180
       env:
         GH_TOKEN: ${{ github.token }}
         CARGO_TARGET_DIR: ${{ runner.temp }}/compatibility-target
+        # Decide Rust build freshness by source content, not modification time
+        # (see "Restore the website builder's Rust build outputs").
+        CARGO_UNSTABLE_CHECKSUM_FRESHNESS: "true"
+        # Incremental state and debug info only grow the cached target
+        # directory (1.2 GB with debug info, 567 MB without, for
+        # manifest-metadata, measured locally).
+        CARGO_INCREMENTAL: "0"
+        CARGO_PROFILE_DEV_DEBUG: "0"
         RUSTUP_AUTO_INSTALL: "0"
         PYTHONDONTWRITEBYTECODE: "1"
         # Print one wall/CPU line per build phase to this step's log, so the
@@ -184,10 +366,10 @@ jobs:
         VALIDATION_HISTORY_COMMIT: ${{ steps.website-history.outputs.validation_history_commit }}
       run: |
         set -euo pipefail
-        timeout --signal=TERM --kill-after=30s 6000s \
+        timeout --signal=TERM --kill-after=30s 10500s \
           python3 -B .github/scripts/rebuild-compatibility-site.py rebuild \
           --builder-parent "$GITHUB_WORKSPACE/_website_source" \
-          --scratch "$RUNNER_TEMP/compatibility-nightly-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+          --scratch "${COMPATIBILITY_SCRATCH_PARENT:-$RUNNER_TEMP}/compatibility-nightly-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
           --receipt "$RUNNER_TEMP/compatibility-rebuild.json" \
           --ledger-commit "$LEDGER_COMMIT" \
           --validation-history-commit "$VALIDATION_HISTORY_COMMIT"
@@ -198,6 +380,46 @@ jobs:
           jq -r '"Cell ledger: `" + .ledger_commit + "`", "Built identity: `" + .identity + "`", "Canonical validation history: `" + .validation_history_commit + "`"' "$RUNNER_TEMP/compatibility-rebuild.json"
           echo 'No Hermit tests ran. Measurement timestamps and unavailable evidence remain unchanged. Pages byte verification follows deployment.'
         } >> "$GITHUB_STEP_SUMMARY"
+    # Keep only what the next run's fetch can use: the commit this run fetched
+    # (refs/cache/published, written by fetch_ledger) and the checked-out
+    # commit the parent records. Older published commits' objects are dropped,
+    # so the cached repository stays about one published tree.
+    - name: Prepare the published cell ledger for the next run
+      id: website-ledger-keep
+      if: >-
+        always() &&
+        (github.event_name == 'schedule' || inputs.rebuild_compatibility) &&
+        steps.website-ledger-cache.outputs.cache-hit != 'true'
+      run: |
+        set -euo pipefail
+        ledger=_website_source/hermit_test_ledger
+        if git -C "$ledger" rev-parse --quiet --verify refs/cache/published >/dev/null; then
+          git -C "$ledger" repack -a -d -q
+          git -C "$ledger" count-objects -vH
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+        fi
+    - name: Save the published cell ledger for the next run
+      if: always() && steps.website-ledger-keep.outputs.ready == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: _website_source/hermit_test_ledger/.git
+        key: ${{ steps.website-ledger-cache.outputs.cache-primary-key }}
+    - name: Save the website builder's Rust build outputs
+      if: >-
+        runner.environment == 'github-hosted' &&
+        (github.event_name == 'schedule' || inputs.rebuild_compatibility) &&
+        steps.website-rebuild.outcome == 'success' &&
+        steps.website-rust-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cache/rust-script
+          ~/.cargo/bin/rust-script
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          ${{ runner.temp }}/compatibility-target
+        key: ${{ steps.website-rust-cache.outputs.cache-primary-key }}
     - name: Record swap use by the compatibility rebuild
       if: always() && (github.event_name == 'schedule' || inputs.rebuild_compatibility)
       # The rebuild's resource receipt does not count swapped-out pages, so its
@@ -254,7 +476,8 @@ jobs:
         pins=.github/compatibility-site-releases.json
         archives="$scratch/archives"
         pin_rows="$scratch/pins"
-        mkdir "$archives" "$pin_rows"
+        releases="$scratch/releases"
+        mkdir "$archives" "$pin_rows" "$releases"
 
         python3 .github/scripts/publish-compatibility-site.py validate "$pins" .
 
@@ -307,8 +530,7 @@ jobs:
           asset=$(jq -er '.asset' "$pin")
           archive_sha256=$(jq -er '.archive_sha256' "$pin")
           archive_bytes=$(jq -er '.archive_bytes' "$pin")
-          release_json="$scratch/release-$identity.json"
-          archive="$archives/$asset"
+          release_json="$releases/$identity.json"
 
           gh api "repos/$release_repository/releases/tags/$tag" > "$release_json"
           asset_id=$(
@@ -334,6 +556,20 @@ jobs:
                   else error("release asset metadata disagrees with the pin") end
               ' "$release_json"
           )
+          printf '%s\n' "$asset_id" > "$pin_rows/$index.asset"
+          ((index += 1))
+        done
+
+        # Every release above is checked, but only the newest builds allowed by
+        # the builder config's retention rule are downloaded and served. The
+        # others stay published as release assets and listed in releases.json.
+        retained="$scratch/retained.txt"
+        python3 .github/scripts/publish-compatibility-site.py retain \
+          "$pins" "$releases" .github/compatibility-site-builder.json > "$retained"
+        while read -r index identity <&3; do
+          asset=$(jq -er '.asset' "$pin_rows/$index.json")
+          asset_id=$(< "$pin_rows/$index.asset")
+          archive="$archives/$asset"
           gh api \
             -H 'Accept: application/octet-stream' \
             "repos/$release_repository/releases/assets/$asset_id" \
@@ -341,11 +577,11 @@ jobs:
 
           python3 .github/scripts/publish-compatibility-site.py extract "$archive" \
             "target/doc/compatibility/$identity" "$pins" "$index"
-          ((index += 1))
-        done
+        done 3< "$retained"
 
         python3 .github/scripts/publish-compatibility-site.py \
-          finalize "$pins" target/doc/compatibility
+          finalize "$pins" target/doc/compatibility "$releases" \
+          .github/compatibility-site-builder.json
     - name: Deploy to GitHub Pages
       # Only publish from the canonical branch, not from manual dispatch on a
       # feature branch.
@@ -387,3 +623,15 @@ jobs:
           echo 'cargo doc failed under -D warnings. The website was still deployed; fix the lint named in the "Build documentation" step.'
         } >> "$GITHUB_STEP_SUMMARY"
         exit 1
+    - name: Remove the self-hosted run's scratch directory
+      if: always() && runner.environment == 'self-hosted' && env.COMPATIBILITY_SCRATCH_PARENT != ''
+      # The built website is read-only (directories 0555, files 0444), so a
+      # bare rm -rf removed only the writable part and failed on
+      # https://github.com/rrnewton/hermit/actions/runs/38287816650.
+      run: |
+        set -euo pipefail
+        chmod -R u+w -- "${COMPATIBILITY_SCRATCH_PARENT:?}"
+        rm -rf -- "${COMPATIBILITY_SCRATCH_PARENT:?}"
+        if [[ -d target/doc ]]; then
+          chmod -R u+w -- target/doc
+        fi

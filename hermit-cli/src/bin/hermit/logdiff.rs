@@ -30,7 +30,9 @@ use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopeArg;
 use super::record_envelope::RecordEnvelopePolicy;
+use super::run::VerifyAllow;
 use super::verify::lock_failed_verification_logs_for_read;
+use super::verify_run;
 
 fn write_canonical_info(
     file: &Path,
@@ -184,6 +186,39 @@ pub struct LogDiffCLIOpts {
     #[clap(long, value_name = "POLLS", default_value = "3")]
     follow_settle_polls: u32,
 
+    /// Compare two `hermit run --verify-run` directories, given as the two
+    /// inputs, the way `hermit run --verify` compares its two runs, and write
+    /// that comparison's report (the report `--verify --verify-json` writes)
+    /// to FILE. The exit status is the one `hermit run --verify` would exit
+    /// with, and the guest's output is shown as it would show it. The
+    /// comparison is the one both runs' flags chose; runs that chose different
+    /// ones are refused. Where `run --verify` would not have started its
+    /// second run, the second directory need not exist.
+    #[clap(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["json", "canonical_info", "follow"]
+    )]
+    verify_json: Option<PathBuf>,
+
+    /// With --verify-json, the guest exit status run 1 must have, as `hermit
+    /// run --verify-allow` requires it. A recording needs none: `hermit
+    /// record start --verify` replays and compares every recording.
+    #[clap(
+        long,
+        value_name = "success|failure|both",
+        default_value = "success",
+        requires = "verify_json"
+    )]
+    verify_allow: VerifyAllow,
+
+    /// With --verify-json, keep the compared logs in DIR as `hermit run
+    /// --verify --keep-logs --verify-log-dir DIR` keeps them: run 1's alone
+    /// after a match, both otherwise. They are links; the --verify-run
+    /// directories keep their own.
+    #[clap(long = "verify-log-dir", value_name = "DIR", requires = "verify_json")]
+    verify_log_dir: Option<PathBuf>,
+
     #[clap(flatten)]
     pub more: logdiff::LogDiffOpts,
 }
@@ -201,8 +236,30 @@ impl LogDiffCLIOpts {
             follow_interval_ms: 500,
             follow_timeout_secs: 300,
             follow_settle_polls: 3,
+            verify_json: None,
+            verify_allow: VerifyAllow::Success,
+            verify_log_dir: None,
             more: Default::default(),
         }
+    }
+
+    /// Compare two `--verify-run` directories (`--verify-json`), or else print
+    /// or compare logs ([`Self::main`]).
+    pub fn run(&self, global: &GlobalOpts) -> Result<ExitStatus, hermit::Error> {
+        let Some(report) = &self.verify_json else {
+            return Ok(self.main(global));
+        };
+        let Some(file_b) = &self.file_b else {
+            return Err(hermit::Error::msg(
+                "hermit log-diff --verify-json compares two --verify-run directories",
+            ));
+        };
+        verify_run::compare(
+            [self.file_a.as_path(), file_b.as_path()],
+            Some(report),
+            self.verify_allow,
+            self.verify_log_dir.as_deref(),
+        )
     }
 
     fn one_input_uses_only_canonical_options(&self) -> bool {
@@ -688,6 +745,7 @@ fn pending_json_report(
         compared_left: 0,
         compared_right: 0,
         first_divergent_scheduler_turn: None,
+        first_divergent_record_positions: None,
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
         matched_prefix_messages: None,
@@ -1296,6 +1354,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             compared_left: 4,
             compared_right: 4,
             first_divergent_scheduler_turn: None,
+            first_divergent_record_positions: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             matched_prefix_messages: None,
@@ -1367,6 +1426,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             compared_left: 8,
             compared_right: 8,
             first_divergent_scheduler_turn: Some(17),
+            first_divergent_record_positions: None,
             first_divergent_virtual_nanoseconds: Some(123),
             first_divergent_record: Some(9),
             matched_prefix_messages: Some(5),
@@ -1454,6 +1514,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             compared_left: 8,
             compared_right: 8,
             first_divergent_scheduler_turn: None,
+            first_divergent_record_positions: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             matched_prefix_messages: Some(8),
@@ -1634,6 +1695,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             compared_left: 3,
             compared_right: 3,
             first_divergent_scheduler_turn: None,
+            first_divergent_record_positions: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             matched_prefix_messages: None,

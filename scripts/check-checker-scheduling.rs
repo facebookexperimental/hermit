@@ -1,12 +1,4 @@
 #!/usr/bin/env -S rust-script --force
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Refuse a checker that nothing schedules.
 //!
 //! THE GAP THIS CLOSES. `check.lint_checks` made a checker added to the Makefile's
@@ -121,6 +113,7 @@ fn is_checker_path(path: &str) -> bool {
 const CHECKER_PATHS: &[&str] = &[
     "ci/hermetic/check-image-provenance.rs",
     "scripts/bisect-probe.rs",
+    "scripts/docs-pages-contract.rs",
 ];
 
 /// Directory/prefix pairs that identify a checker entrypoint by convention.
@@ -381,9 +374,10 @@ fn main() {
             unscheduled.len()
         );
         eprintln!("  A checker nothing runs is indistinguishable from a checker that passes.");
-        eprintln!("  Add it to the Makefile's `lint-checks` recipe (which check.lint_checks");
-        eprintln!("  runs, so no DAG edit is needed), or to a DAG node, or add it to");
-        eprintln!("  ALLOWLIST in this file WITH A REASON.");
+        eprintln!("  Add it to the Makefile's `lint-checks` (a `lint-check-<name>:` target");
+        eprintln!("  listed in LINT_CHECK_TARGETS; check.lint_checks runs it, so no DAG edit");
+        eprintln!("  is needed), or to a DAG node, or add it to ALLOWLIST in this file WITH");
+        eprintln!("  A REASON.");
         for c in &unscheduled {
             eprintln!("    {c}");
         }
@@ -611,6 +605,16 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
 /// Erring toward a FALSE ORPHAN is the safe direction: it is loud and a human fixes
 /// it in one line, whereas a false "scheduled" is silent and defeats the guard.
 fn is_invoked(text: &str, path: &str) -> bool {
+    // A prefilter, not a clause: every clause below matches a needle that CONTAINS
+    // `path` verbatim (`./path`, `"$ROOT_DIR/path"`, `runner path`, a token equal to
+    // `path` or `./path`, or `path` at a line start), so text without `path` cannot
+    // satisfy any of them. Measured 2026-10-04: the fixpoint asks this about 863
+    // scripts per frontier text, and the line scans made the whole checker take
+    // 141 s of CPU. A future clause that matches anything other than the literal
+    // path (an unquoted or concatenated spelling, say) must remove this line.
+    if !text.contains(path) {
+        return false;
+    }
     // WARNING -- EVERY CLAUSE HERE GOES THROUGH `invokes_on_line`, AND THAT IS THE SHAPE
     // THAT MATTERS. This was a disjunction in which only the runner clause consulted a
     // guard and this one was a bare `text.contains`. Because the clauses are OR-ed the
@@ -1126,29 +1130,51 @@ fn extract_cmds(raw: &str) -> Vec<String> {
     out
 }
 
-/// Extract just the `lint-checks` recipe. Using the whole Makefile would count a
+/// Extract the `lint-checks` recipe: its own recipe lines plus the recipe of every
+/// target it names as a prerequisite. Using the whole Makefile would count a
 /// checker named anywhere in it -- including in `lint-cargo`, in a comment, or in
 /// an unrelated target -- as scheduled, which is the false-negative this guard
 /// exists to prevent.
+///
+/// ⚠️ THE PREREQUISITES ARE PART OF THE RECIPE. lint-checks runs one target per
+/// checker so that `make -j` can run them concurrently, which leaves its own recipe
+/// empty. Reading only that recipe would find no checker at all; reading every
+/// `lint-check-*` target instead would count a target nobody lists as scheduled.
+/// So follow exactly what make follows: the prerequisite list, with `$(VAR)`
+/// expanded from its `VAR :=` definition. Anything this cannot resolve -- another
+/// kind of expansion, a prerequisite with no recipe -- refuses rather than guesses.
 fn lint_checks_recipe(makefile: &str) -> String {
-    let mut out = String::new();
-    let mut inside = false;
-    for line in makefile.lines() {
-        if line.starts_with("lint-checks:") {
-            inside = true;
-            continue;
-        }
-        if inside {
-            // A recipe line is TAB-indented; anything else ends the recipe.
-            if line.starts_with('\t') {
-                let t = line.trim_start();
-                if !t.starts_with('#') {
-                    out.push_str(line);
-                    out.push('\n');
-                }
-            } else if !line.trim().is_empty() {
-                break;
-            }
+    let lines: Vec<&str> = makefile.lines().collect();
+    let Some(rule) = logical_line(&lines, |line| line.starts_with("lint-checks:")) else {
+        panic!(
+            "could not find a `lint-checks:` recipe in the Makefile; this guard would \
+             otherwise report every lint checker as an orphan"
+        );
+    };
+    let mut out = recipe_of(&lines, "lint-checks");
+    let prerequisites = rule["lint-checks:".len()..]
+        .split('#')
+        .next()
+        .unwrap_or_default();
+    for token in prerequisites.split_whitespace() {
+        let targets = match token.strip_prefix("$(").and_then(|t| t.strip_suffix(')')) {
+            Some(var) => variable_words(&lines, var),
+            None => vec![token.to_string()],
+        };
+        for target in targets {
+            assert!(
+                !target.contains('$'),
+                "lint-checks prerequisite `{target}` is an expansion this guard cannot \
+                 resolve; spell the target names out or list them in one `VAR :=`"
+            );
+            let recipe = recipe_of(&lines, &target);
+            assert!(
+                !recipe.is_empty(),
+                "lint-checks prerequisite `{target}` has no recipe in the Makefile; a \
+                 checker this guard cannot see would be reported as an orphan, or worse, \
+                 a missing target would read as nothing to schedule"
+            );
+            out.push_str(&recipe);
         }
     }
     assert!(
@@ -1156,6 +1182,104 @@ fn lint_checks_recipe(makefile: &str) -> String {
         "could not find a `lint-checks:` recipe in the Makefile; this guard would \
          otherwise report every lint checker as an orphan"
     );
+    out
+}
+
+/// The first line matching `starts`, joined with the lines its trailing
+/// backslashes continue onto.
+fn logical_line(lines: &[&str], starts: impl Fn(&str) -> bool) -> Option<String> {
+    let first = lines.iter().position(|line| starts(line))?;
+    let mut joined = String::new();
+    for line in &lines[first..] {
+        match line.strip_suffix('\\') {
+            Some(head) => {
+                joined.push_str(head);
+                joined.push(' ');
+            }
+            None => {
+                joined.push_str(line);
+                break;
+            }
+        }
+    }
+    Some(joined)
+}
+
+/// The words of `NAME := ...` (or `NAME = ...`). A missing definition refuses, and
+/// so does any second assignment to NAME: make uses the last `:=`/`=` and appends
+/// every `+=`, so reading only the first would schedule a different list than make
+/// runs. An assignment counts however make accepts it: indented (inside an
+/// `ifeq`), behind `override`/`export`/`private`, or as `define`/`undefine`.
+fn variable_words(lines: &[&str], name: &str) -> Vec<String> {
+    let assigns = |line: &str| {
+        let mut rest = line.trim_start();
+        while let Some((word, tail)) = rest.split_once(char::is_whitespace) {
+            match word {
+                "override" | "export" | "private" => rest = tail.trim_start(),
+                // make also accepts the operator attached to the name, as in
+                // `define NAME+=`, so compare the name without it.
+                "define" | "undefine" => {
+                    return tail.split_whitespace().next().map(|word| {
+                        word.trim_end_matches(['=', ':', '+', '?', '!'])
+                    }) == Some(name);
+                }
+                _ => break,
+            }
+        }
+        rest.strip_prefix(name).is_some_and(|rest| {
+            let rest = rest.trim_start();
+            ["=", ":=", "::=", ":::=", "+=", "?=", "!="]
+                .iter()
+                .any(|op| rest.starts_with(op))
+        })
+    };
+    let assignments = lines.iter().filter(|line| assigns(line)).count();
+    assert!(
+        assignments <= 1,
+        "the Makefile assigns {name} {assignments} times; this guard reads one \
+         definition, so keep the list in a single `{name} :=`"
+    );
+    let defines = |line: &str| {
+        line.strip_prefix(name).is_some_and(|rest| {
+            let rest = rest.trim_start();
+            rest.starts_with(":=") || rest.starts_with('=')
+        })
+    };
+    let Some(definition) = logical_line(lines, defines) else {
+        panic!("lint-checks names $({name}), but the Makefile does not define {name}");
+    };
+    let value = definition.split_once('=').map(|(_, v)| v).unwrap_or_default();
+    value
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The TAB-indented recipe lines of `target`, without recipe comments.
+fn recipe_of(lines: &[&str], target: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for line in lines {
+        if !inside {
+            inside = line
+                .strip_prefix(target)
+                .is_some_and(|rest| rest.starts_with(':'));
+            continue;
+        }
+        // A recipe line is TAB-indented; anything else ends the recipe.
+        if line.starts_with('\t') {
+            let t = line.trim_start();
+            if !t.starts_with('#') {
+                out.push_str(line);
+                out.push('\n');
+            }
+        } else if !line.trim().is_empty() {
+            break;
+        }
+    }
     out
 }
 
@@ -1381,6 +1505,11 @@ fn self_test() {
     assert!(
         is_checker_path("ci/hermetic/check-image-provenance.rs"),
         "the nested hermetic image-provenance gate must stay in the checker population"
+    );
+    assert!(
+        is_checker_path("scripts/docs-pages-contract.rs"),
+        "the docs Pages contract is run only by `make lint-checks`; dropping it from the \
+         population would let that line be deleted with nothing going red"
     );
     // ⚠️ AND THE LIMIT, MEASURED RATHER THAN ASSUMED. Widening the population to every
     // tracked executable under scripts/ and ci/ was measured 2026-08-26 at 32 checkers
@@ -1668,6 +1797,108 @@ mod tests {
         let r = lint_checks_recipe(mk);
         assert!(r.contains("check-x.sh"));
         assert!(!r.contains("clippy"));
+    }
+
+    /// The shape the real Makefile uses: one target per checker, listed in a
+    /// variable that lint-checks names as its prerequisites.
+    const PER_TARGET_MK: &str = "LINT_CHECK_TARGETS := \\\n    lint-check-a \\\n\tlint-check-b\n\
+        .PHONY: lint-checks $(LINT_CHECK_TARGETS)\n\
+        lint-checks: $(LINT_CHECK_TARGETS) ## run the checkers\n\n\
+        lint-check-a:\n\t./scripts/check-a.sh\n\n\
+        lint-check-b:\n\t./scripts/check-b.sh --self-test\n\t# a recipe comment\n\t./scripts/check-b.sh\n\n\
+        lint-check-unlisted:\n\t./scripts/check-c.sh\n\n\
+        lint-check-a-longer:\n\t./scripts/check-d.sh\n";
+
+    #[test]
+    fn recipe_extraction_follows_the_prerequisites() {
+        let r = lint_checks_recipe(PER_TARGET_MK);
+        assert!(r.contains("check-a.sh"), "{r}");
+        assert!(r.contains("check-b.sh --self-test"), "{r}");
+        assert!(r.contains("\t./scripts/check-b.sh\n"), "{r}");
+        assert!(!r.contains("recipe comment"), "{r}");
+        // A target nobody lists is not run, so it must not count as scheduled.
+        assert!(!r.contains("check-c.sh"), "{r}");
+        // `lint-check-a` must not also pick up a target it is a prefix of.
+        assert!(!r.contains("check-d.sh"), "{r}");
+    }
+
+    #[test]
+    fn a_direct_prerequisite_is_followed_too() {
+        let mk = "lint-checks: lint-check-a\n\nlint-check-a:\n\t./scripts/check-a.sh\n";
+        assert!(lint_checks_recipe(mk).contains("check-a.sh"));
+    }
+
+    #[test]
+    fn an_unresolvable_prerequisite_refuses() {
+        let cases = [
+            // Listed, but no such target.
+            PER_TARGET_MK.replace("\tlint-check-b\n", "\tlint-check-b lint-check-gone\n"),
+            // The variable is not defined.
+            "lint-checks: $(UNDEFINED)\n".to_string(),
+            // An expansion this parser does not evaluate.
+            "lint-checks: $(addprefix lint-check-,a)\n\nlint-check-a:\n\t./scripts/check-a.sh\n"
+                .to_string(),
+            // A listed target with an empty recipe, such as a nested aggregate.
+            "lint-checks: lint-check-group\nlint-check-group: lint-check-a\n\n\
+             lint-check-a:\n\t./scripts/check-a.sh\n"
+                .to_string(),
+            // A second definition: make uses the last one, the first-match read would not.
+            format!("{PER_TARGET_MK}LINT_CHECK_TARGETS := lint-check-unlisted\n"),
+            // An append: make runs lint-check-unlisted too.
+            format!("{PER_TARGET_MK}LINT_CHECK_TARGETS += lint-check-unlisted\n"),
+        ];
+        for mk in cases {
+            let r = std::panic::catch_unwind(|| lint_checks_recipe(&mk));
+            assert!(r.is_err(), "must refuse, not under-count:\n{mk}");
+        }
+    }
+
+    /// Every way make lets a second line change the list is counted as an
+    /// assignment, and the refusal is THIS guard's, not some later panic.
+    #[test]
+    fn a_second_assignment_in_any_form_is_refused_by_the_count() {
+        let forms = [
+            "  LINT_CHECK_TARGETS += lint-check-unlisted\n",
+            "ifeq ($(X),)\n\tLINT_CHECK_TARGETS += lint-check-unlisted\nendif\n",
+            "override LINT_CHECK_TARGETS += lint-check-unlisted\n",
+            "export LINT_CHECK_TARGETS += lint-check-unlisted\n",
+            "private LINT_CHECK_TARGETS = lint-check-unlisted\n",
+            "override export LINT_CHECK_TARGETS+=lint-check-unlisted\n",
+            "define LINT_CHECK_TARGETS +=\nlint-check-unlisted\nendef\n",
+            "define LINT_CHECK_TARGETS+=\nlint-check-unlisted\nendef\n",
+            "define LINT_CHECK_TARGETS:=\nlint-check-unlisted\nendef\n",
+            "undefine LINT_CHECK_TARGETS\n",
+        ];
+        for form in forms {
+            let mk = format!("{PER_TARGET_MK}{form}");
+            let err = std::panic::catch_unwind(|| lint_checks_recipe(&mk))
+                .expect_err(&format!("must refuse:\n{mk}"));
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains("assigns LINT_CHECK_TARGETS 2 times"),
+                "refused for the wrong reason ({msg}):\n{mk}"
+            );
+        }
+    }
+
+    /// Lines that only mention the name, or assign a longer name, are not
+    /// assignments to it.
+    #[test]
+    fn a_line_that_only_mentions_the_list_is_not_an_assignment() {
+        for line in [
+            "LINT_CHECK_TARGETS_EXTRA := lint-check-unlisted\n",
+            "$(info $(LINT_CHECK_TARGETS))\n",
+            "export LINT_CHECK_TARGETS\n",
+            "define LINT_CHECK_TARGETS_HELP\nlint-check-unlisted\nendef\n",
+        ] {
+            let mk = format!("{PER_TARGET_MK}{line}");
+            let r = std::panic::catch_unwind(|| lint_checks_recipe(&mk));
+            assert!(r.is_ok(), "must not refuse:\n{mk}");
+        }
     }
 
     #[test]

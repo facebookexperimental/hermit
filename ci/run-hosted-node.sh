@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Run a committed hosted validation node inside the user namespace that gives
 # its nested per-physical-run mount namespace CAP_SYS_ADMIN. GitHub's runner
 # account can create a user namespace, but cannot unshare CLONE_NEWNS directly;

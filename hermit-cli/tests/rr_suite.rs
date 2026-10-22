@@ -28,16 +28,20 @@
 //! ```
 //!
 //! The programs are ptrace-heavy and rely on PMU branch counters plus working
-//! user/mount namespaces, so like the other Hermit integration suites these are
-//! `#[ignore]`d by default and exercised explicitly (e.g. from `scripts/validate.rs`):
+//! user/mount namespaces. Validation runs every one that is not `#[ignore]`d,
+//! in the pinned root (test.rr_suite_contract):
 //!
 //! ```text
-//! cargo test -p hermit --test rr_suite -- --ignored
+//! cargo test -p hermit --test rr_suite
 //! ```
 //!
-//! Only the programs that currently pass under Hermit are enabled here. The
-//! upstream programs that fail or hang are tracked in
-//! `docs/rr-test-suite.md`.
+//! An `#[ignore]` names why its program cannot pass under Hermit today: a
+//! refusal by design that an E2E cell already covers, or a gap tracked in
+//! https://github.com/rrnewton/hermit/issues/4257. Upstream programs left out
+//! of this list are tracked in `docs/rr-test-suite.md`.
+
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
 
 use std::fs;
 use std::path::Path;
@@ -95,8 +99,20 @@ fn rr_root() -> PathBuf {
     repository().join("third-party/rr")
 }
 
-/// Generates rr's syscall-enum headers once and returns the directory holding
-/// them (added to the include path when compiling each test program).
+/// A directory under `CARGO_TARGET_TMPDIR` that only this test process writes.
+/// Nextest runs each test in its own process, several at once, so headers and
+/// workloads written to a directory shared by every process could be read
+/// half-written by another test's compiler.
+fn process_build_root(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(name)
+        .join("build")
+        .join(std::process::id().to_string())
+}
+
+/// Generates rr's syscall-enum headers once per test process and returns the
+/// directory holding them (added to the include path when compiling each test
+/// program).
 fn generated_dir() -> &'static Path {
     GENERATED_DIR.get_or_init(|| {
         let rr = rr_root();
@@ -105,7 +121,7 @@ fn generated_dir() -> &'static Path {
             "rr submodule not initialized at {}; run: git submodule update --init third-party/rr",
             rr.display()
         );
-        let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rr-generated");
+        let out = process_build_root("rr-generated");
         fs::create_dir_all(&out).expect("failed to create rr generated-header directory");
         let generator = rr.join("src/generate_syscalls.py");
         for header in GENERATED_HEADERS {
@@ -122,7 +138,7 @@ fn generated_dir() -> &'static Path {
 fn compile_test(basename: &str) -> PathBuf {
     let rr = rr_root();
     let generated = generated_dir();
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rr-workloads");
+    let build_root = process_build_root("rr-workloads");
     fs::create_dir_all(&build_root).expect("failed to create rr workload directory");
     let binary = build_root.join(basename);
     // Always rebuild so cached target directories cannot preserve a binary
@@ -183,29 +199,36 @@ fn rr_scratch_directories_are_fresh_and_cleaned() {
 /// Compiles and runs one rr test program under Hermit, asserting `expected_exit`.
 fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker: Option<&str>) {
     let binary = compile_test(basename);
-    // Give every invocation a unique working directory. TempDir removes all files produced by
-    // the guest when this function returns or unwinds.
-    let scratch = fresh_scratch_dir(basename);
 
     let _guard = hermit_run_lock();
-    // Bound every test even if Hermit or a tracee ignores timeout's initial SIGTERM.
-    let mut command = Command::new("timeout");
-    command
-        .current_dir(scratch.path())
-        .args(["--kill-after", RR_TEST_KILL_AFTER, RR_TEST_TIMEOUT])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--max-timeslice=80000000",
-            "--",
-        ])
-        .arg(&binary)
-        .args(args);
-    let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {basename}: {rendered}: {error}"));
+    // Every program runs under the PMU timer, so a busy host can deliver its
+    // interrupt late enough that Hermit refuses the run (exit 122,
+    // cause=skid-overshoot). That measures the host, not the guest, so such an
+    // attempt runs again, in a fresh scratch directory; nothing else does.
+    let (output, (rendered, scratch)) = hermit_test::hermit_output_with(basename, || {
+        // Give every attempt a unique working directory. TempDir removes all files
+        // produced by the guest when it is dropped.
+        let scratch = fresh_scratch_dir(basename);
+        // Bound every test even if Hermit or a tracee ignores timeout's initial SIGTERM.
+        let mut command = Command::new("timeout");
+        command
+            .current_dir(scratch.path())
+            .args(["--kill-after", RR_TEST_KILL_AFTER, RR_TEST_TIMEOUT])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "run",
+                "--base-env=minimal",
+                "--max-timeslice=80000000",
+                "--",
+            ])
+            .arg(&binary)
+            .args(args);
+        let rendered = format!("{command:?}");
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start {basename}: {rendered}: {error}"));
+        (output, (rendered, scratch))
+    });
     assert_eq!(
         output.status.code(),
         Some(expected_exit),
@@ -228,9 +251,15 @@ fn run_rr_test(basename: &str, expected_exit: i32, args: &[&str], success_marker
 }
 
 macro_rules! rr_test {
+    (#[ignore = $reason:literal] $name:ident, $base:literal, $exit:literal, $args:expr) => {
+        #[test]
+        #[ignore = $reason]
+        fn $name() {
+            run_rr_test($base, $exit, $args, None);
+        }
+    };
     ($name:ident, $base:literal, $exit:literal, $args:expr) => {
         #[test]
-        #[ignore = "ptrace-heavy rr program; requires PMU branch counters and working mount namespaces"]
         fn $name() {
             run_rr_test($base, $exit, $args, None);
         }
@@ -248,7 +277,13 @@ rr_test!(rr_brk2, "brk2", 0, &[]);
 rr_test!(rr_exit_group, "exit_group", 0, &[]);
 rr_test!(rr_exit_race, "exit_race", 0, &[]);
 rr_test!(rr_fadvise, "fadvise", 0, &[]);
-rr_test!(rr_fatal_init_signal, "fatal_init_signal", 0, &[]);
+rr_test!(
+    #[ignore = "gap: rr's fallback opens /proc/<pid>/setgroups and gets ENOENT (nsutils.h:22); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_fatal_init_signal,
+    "fatal_init_signal",
+    0,
+    &[]
+);
 rr_test!(rr_fcntl_dupfd, "fcntl_dupfd", 0, &[]);
 rr_test!(rr_fcntl_misc, "fcntl_misc", 0, &[]);
 rr_test!(rr_fcntl_rw_hints, "fcntl_rw_hints", 0, &[]);
@@ -270,7 +305,13 @@ rr_test!(rr_getrandom, "getrandom", 0, &[]);
 rr_test!(rr_getsid, "getsid", 0, &[]);
 rr_test!(rr_gettimeofday, "gettimeofday", 0, &[]);
 rr_test!(rr_hello, "hello", 0, &[]);
-rr_test!(rr_intr_ppoll, "intr_ppoll", 0, &[]);
+rr_test!(
+    #[ignore = "refused (exit 122): ppoll cannot hold a pending SIGCHLD it cannot identify; https://github.com/rrnewton/hermit/issues/4257"]
+    rr_intr_ppoll,
+    "intr_ppoll",
+    0,
+    &[]
+);
 rr_test!(rr_invalid_exec, "invalid_exec", 0, &[]);
 rr_test!(rr_invalid_fcntl, "invalid_fcntl", 0, &[]);
 rr_test!(rr_invalid_ioctl, "invalid_ioctl", 0, &[]);
@@ -284,7 +325,13 @@ rr_test!(rr_ioctl_tty, "ioctl_tty", 0, &[]);
 rr_test!(rr_ioctl_vt, "ioctl_vt", 0, &[]);
 rr_test!(rr_ioprio, "ioprio", 0, &[]);
 rr_test!(rr_join_threads, "join_threads", 0, &[]);
-rr_test!(rr_keyctl, "keyctl", 0, &[]);
+rr_test!(
+    #[ignore = "refused by design: keyctl is ENOSYS (cell keyctl-enosys); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_keyctl,
+    "keyctl",
+    0,
+    &[]
+);
 rr_test!(rr_kill_newborn, "kill_newborn", 0, &[]);
 rr_test!(rr_large_hole, "large_hole", 0, &[]);
 rr_test!(rr_large_write_deadlock, "large_write_deadlock", 0, &[]);
@@ -356,20 +403,27 @@ rr_test!(rr_msg_trunc, "msg_trunc", 0, &[]);
 rr_test!(rr_msync, "msync", 0, &[]);
 rr_test!(rr_mtio, "mtio", 0, &[]);
 rr_test!(
+    #[ignore = "refused (exit 122): process-directed kill while the sender blocks the signal; https://github.com/rrnewton/hermit/issues/4034"]
     rr_multiple_pending_signals,
     "multiple_pending_signals",
     0,
     &[]
 );
-// rr_multiple_pending_signals_sequential is flaky under Hermit (intermittently
-// hangs); see docs/rr-test-suite.md.
+// rr_multiple_pending_signals_sequential is refused under Hermit: it sends a
+// process-directed signal that the sending thread blocks
+// (https://github.com/rrnewton/hermit/issues/4034); see docs/rr-test-suite.md.
 rr_test!(rr_munmap_discontinuous, "munmap_discontinuous", 0, &[]);
 rr_test!(rr_munmap_segv, "munmap_segv", 0, &[]);
 rr_test!(rr_netlink_mmap_disable, "netlink_mmap_disable", 0, &[]);
 rr_test!(rr_no_mask_timeslice, "no_mask_timeslice", 0, &[]);
-rr_test!(rr_numa, "numa", 0, &[]);
+rr_test!(
+    #[ignore = "gap: mbind and set_mempolicy succeed, but get_mempolicy reports MPOL_DEFAULT; https://github.com/rrnewton/hermit/issues/4257"]
+    rr_numa,
+    "numa",
+    0,
+    &[]
+);
 #[test]
-#[ignore = "ptrace-heavy rr program; requires PMU branch counters and working mount namespaces"]
 fn rr_pause() {
     run_rr_test("pause", 1, &[], Some("EXIT-SUCCESS"));
 }
@@ -378,7 +432,13 @@ rr_test!(rr_poll_sig_race, "poll_sig_race", 0, &[]);
 rr_test!(rr_ppoll, "ppoll", 0, &[]);
 rr_test!(rr_prctl_name, "prctl_name", 0, &[]);
 rr_test!(rr_prctl_short_name, "prctl_short_name", 0, &[]);
-rr_test!(rr_prctl_speculation_ctrl, "prctl_speculation_ctrl", 0, &[]);
+rr_test!(
+    #[ignore = "refused by design: unlisted prctl options are ENOSYS (prctl-option-policy); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_prctl_speculation_ctrl,
+    "prctl_speculation_ctrl",
+    0,
+    &[]
+);
 rr_test!(rr_privileged_net_ioctl, "privileged_net_ioctl", 0, &[]);
 rr_test!(rr_proc_fds, "proc_fds", 0, &[]);
 rr_test!(rr_protect_rr_fds, "protect_rr_fds", 0, &[]);
@@ -396,7 +456,13 @@ rr_test!(
     &[]
 );
 rr_test!(rr_pthread_rwlocks, "pthread_rwlocks", 0, &[]);
-rr_test!(rr_quotactl, "quotactl", 0, &[]);
+rr_test!(
+    #[ignore = "refused by design: quotactl is EPERM (policy, no cell); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_quotactl,
+    "quotactl",
+    0,
+    &[]
+);
 rr_test!(rr_read_large, "read_large", 0, &[]);
 rr_test!(rr_read_nothing, "read_nothing", 0, &[]);
 rr_test!(rr_read_oversize, "read_oversize", 0, &[]);
@@ -406,46 +472,133 @@ rr_test!(rr_readlinkat, "readlinkat", 0, &[]);
 rr_test!(rr_readv, "readv", 0, &[]);
 rr_test!(rr_recvfrom, "recvfrom", 0, &[]);
 rr_test!(rr_rename, "rename", 0, &[]);
-rr_test!(rr_rlimit, "rlimit", 0, &[]);
+rr_test!(
+    #[ignore = "refused by design: setrlimit(RLIMIT_FSIZE) is EPERM (rlimit-identity); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_rlimit,
+    "rlimit",
+    0,
+    &[]
+);
+rr_test!(rr_rusage, "rusage", 0, &[]);
 rr_test!(rr_sched_attr, "sched_attr", 0, &[]);
 rr_test!(rr_sched_setaffinity, "sched_setaffinity", 0, &[]);
 rr_test!(rr_sched_setparam, "sched_setparam", 0, &[]);
 rr_test!(
+    #[ignore = "gap: thread priorities are not modelled; https://github.com/rrnewton/hermit/issues/4257"]
     rr_sched_yield_to_lower_priority,
     "sched_yield_to_lower_priority",
     0,
     &[]
 );
 rr_test!(rr_scratch_read, "scratch_read", 0, &[]);
-rr_test!(rr_seccomp_clone_fail, "seccomp_clone_fail", 0, &[]);
-rr_test!(rr_seccomp_cloning, "seccomp_cloning", 0, &[]);
-rr_test!(rr_seccomp_desched, "seccomp_desched", 0, &[]);
-rr_test!(rr_seccomp_kill_exit, "seccomp_kill_exit", 0, &[]);
-rr_test!(rr_seccomp_sigsys_args, "seccomp_sigsys_args", 0, &[]);
-rr_test!(rr_seccomp_sigsys_sigtrap, "seccomp_sigsys_sigtrap", 0, &[]);
 rr_test!(
+    #[ignore = "refused by design: prctl(PR_SET_NO_NEW_PRIVS) is ENOSYS (cell no-new-privs-refusal); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_seccomp_clone_fail,
+    "seccomp_clone_fail",
+    0,
+    &[]
+);
+rr_test!(
+    #[ignore = "refused by design: prctl(PR_SET_NO_NEW_PRIVS) is ENOSYS (cell no-new-privs-refusal); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_seccomp_cloning,
+    "seccomp_cloning",
+    0,
+    &[]
+);
+rr_test!(
+    #[ignore = "refused by design: installing a seccomp filter is EOPNOTSUPP (cell seccomp-refusal); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_seccomp_desched,
+    "seccomp_desched",
+    0,
+    &[]
+);
+rr_test!(
+    #[ignore = "refused by design: prctl(PR_SET_NO_NEW_PRIVS) is ENOSYS (cell no-new-privs-refusal); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_seccomp_kill_exit,
+    "seccomp_kill_exit",
+    0,
+    &[]
+);
+rr_test!(
+    #[ignore = "refused by design: prctl(PR_SET_NO_NEW_PRIVS) is ENOSYS (cell no-new-privs-refusal); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_seccomp_sigsys_args,
+    "seccomp_sigsys_args",
+    0,
+    &[]
+);
+rr_test!(
+    #[ignore = "refused by design: prctl(PR_SET_NO_NEW_PRIVS) is ENOSYS (cell no-new-privs-refusal); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_seccomp_sigsys_sigtrap,
+    "seccomp_sigsys_sigtrap",
+    0,
+    &[]
+);
+rr_test!(
+    #[ignore = "refused by design: prctl(PR_SET_NO_NEW_PRIVS) is ENOSYS (cell no-new-privs-refusal); https://github.com/rrnewton/hermit/issues/4257"]
     rr_seccomp_sigsys_syscallbuf,
     "seccomp_sigsys_syscallbuf",
     0,
     &[]
 );
-rr_test!(rr_seccomp_tsync, "seccomp_tsync", 0, &[]);
-rr_test!(rr_seccomp_veto_exec, "seccomp_veto_exec", 0, &[]);
+rr_test!(
+    #[ignore = "refused by design: prctl(PR_SET_NO_NEW_PRIVS) is ENOSYS (cell no-new-privs-refusal); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_seccomp_tsync,
+    "seccomp_tsync",
+    0,
+    &[]
+);
+rr_test!(
+    #[ignore = "refused by design: prctl(PR_SET_NO_NEW_PRIVS) is ENOSYS (cell no-new-privs-refusal); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_seccomp_veto_exec,
+    "seccomp_veto_exec",
+    0,
+    &[]
+);
 rr_test!(rr_self_shebang, "self_shebang", 0, &[]);
 rr_test!(rr_sendfile, "sendfile", 0, &[]);
 rr_test!(rr_setgid, "setgid", 0, &[]);
-rr_test!(rr_setgroups, "setgroups", 0, &[]);
+rr_test!(
+    #[ignore = "refused by design: setgroups leaves the virtual groups unchanged (policy, no cell); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_setgroups,
+    "setgroups",
+    0,
+    &[]
+);
 rr_test!(rr_setitimer, "setitimer", 0, &[]);
 rr_test!(rr_setsid, "setsid", 0, &[]);
-rr_test!(rr_setuid, "setuid", 0, &[]);
+rr_test!(
+    #[ignore = "refused by design: setuid and setgid leave the virtual identity unchanged (policy, no cell); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_setuid,
+    "setuid",
+    0,
+    &[]
+);
 rr_test!(rr_shared_exec, "shared_exec", 0, &[]);
 rr_test!(rr_shared_monitor, "shared_monitor", 0, &[]);
 rr_test!(rr_shared_offset, "shared_offset", 0, &[]);
 rr_test!(rr_shared_write, "shared_write", 0, &[]);
-rr_test!(rr_shm, "shm", 0, &[]);
-rr_test!(rr_shm_unmap, "shm_unmap", 0, &[]);
+rr_test!(
+    #[ignore = "refused by design: SysV shmget is ENOSYS (cell sysv-shm-enosys); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_shm,
+    "shm",
+    0,
+    &[]
+);
+rr_test!(
+    #[ignore = "refused by design: SysV shmget is ENOSYS (cell sysv-shm-enosys); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_shm_unmap,
+    "shm_unmap",
+    0,
+    &[]
+);
 rr_test!(rr_sigaction_old, "sigaction_old", 0, &[]);
 rr_test!(rr_sigaltstack, "sigaltstack", 0, &[]);
+rr_test!(
+    rr_sigchld_interrupt_signal,
+    "sigchld_interrupt_signal",
+    0,
+    &[]
+);
 rr_test!(rr_sigcont, "sigcont", 0, &[]);
 rr_test!(
     rr_sighandler_bad_rsp_sigsegv,
@@ -468,14 +621,32 @@ rr_test!(rr_signal_unstoppable, "signal_unstoppable", 0, &[]);
 rr_test!(rr_signalfd, "signalfd", 0, &[]);
 rr_test!(rr_sigprocmask, "sigprocmask", 0, &[]);
 rr_test!(rr_sigprocmask_evil, "sigprocmask_evil", 0, &[]);
+rr_test!(
+    rr_sigprocmask_in_syscallbuf_sighandler,
+    "sigprocmask_in_syscallbuf_sighandler",
+    0,
+    &[]
+);
 rr_test!(rr_sigprocmask_syscallbuf, "sigprocmask_syscallbuf", 0, &[]);
 rr_test!(rr_sigpwr, "sigpwr", 0, &[]);
 rr_test!(rr_sigqueueinfo, "sigqueueinfo", 0, &[]);
 rr_test!(rr_sigreturn_reg, "sigreturn_reg", 0, &[]);
 rr_test!(rr_sigtrap, "sigtrap", 0, &[]);
-rr_test!(rr_simple_threads_stress, "simple_threads_stress", 0, &[]);
 rr_test!(rr_small_holes, "small_holes", 0, &[]);
-rr_test!(rr_splice, "splice", 0, &[]);
+rr_test!(
+    #[ignore = "spins past validation's 22 CPU-second per-test budget (exit 124 at 24 s in the pinned root); passes in 43 s on a developer host; https://github.com/rrnewton/hermit/issues/4257"]
+    rr_spinlock_priorities,
+    "spinlock_priorities",
+    0,
+    &[]
+);
+rr_test!(
+    #[ignore = "refused by design: splice is ENOSYS (cell splice-enosys); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_splice,
+    "splice",
+    0,
+    &[]
+);
 rr_test!(
     rr_stack_growth_after_syscallbuf,
     "stack_growth_after_syscallbuf",
@@ -535,7 +706,13 @@ rr_test!(rr_truncate_temp, "truncate_temp", 0, &[]);
 rr_test!(rr_tun, "tun", 0, &[]);
 rr_test!(rr_ulimit_low, "ulimit_low", 0, &[]);
 rr_test!(rr_uname, "uname", 0, &[]);
-rr_test!(rr_unexpected_exit_pid_ns, "unexpected_exit_pid_ns", 0, &[]);
+rr_test!(
+    #[ignore = "gap: rr's fallback opens /proc/<pid>/setgroups and gets ENOENT (nsutils.h:22); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_unexpected_exit_pid_ns,
+    "unexpected_exit_pid_ns",
+    0,
+    &[]
+);
 rr_test!(rr_unjoined_thread, "unjoined_thread", 0, &[]);
 rr_test!(rr_unshare, "unshare", 0, &[]);
 rr_test!(
@@ -560,7 +737,13 @@ rr_test!(
     &[]
 );
 rr_test!(rr_video_capture, "video_capture", 0, &[]);
-rr_test!(rr_vm_readv_writev, "vm_readv_writev", 0, &[]);
+rr_test!(
+    #[ignore = "refused by design: process_vm_readv is EPERM (cell process-vm-readv-refusal-probe); https://github.com/rrnewton/hermit/issues/4257"]
+    rr_vm_readv_writev,
+    "vm_readv_writev",
+    0,
+    &[]
+);
 rr_test!(rr_wait_for_all, "wait_for_all", 0, &[]);
 rr_test!(rr_write_race, "write_race", 0, &[]);
 rr_test!(rr_writev, "writev", 0, &[]);

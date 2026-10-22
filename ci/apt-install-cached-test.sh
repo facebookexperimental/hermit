@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Self-test for ci/apt-install-cached.sh, the cached and bounded apt install
 # used by every `Dependencies` step of .github/workflows/ci-portable.yml
 # (https://github.com/rrnewton/hermit/issues/3487).

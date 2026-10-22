@@ -630,7 +630,8 @@ fn derive_run_plan(sel: &Selection, shards: &Shards, plan: &Plan, dag: &Dag) -> 
     for c in &cells {
         match c.backend.as_str() {
             "dbt" | "sabre" => build_dbt = true,
-            "liteinst" => build_aux = true,
+            // in-guest-trap runs the same in-guest LiteInst runtime.
+            "liteinst" | "in-guest-trap" => build_aux = true,
             _ => {}
         }
     }
@@ -1336,9 +1337,27 @@ fn self_test() {
     let rp_full = derive_run_plan(&lock, &shards, &plan, &dag);
     check("full ⇒ all shards", rp_full.shards.len() == total_shards);
     check("full ⇒ all cells", rp_full.cells.len() == total_cells);
+    // No release shard needs the aux build since test.liteinst_strict and its
+    // liteinst shard were retired (https://github.com/rrnewton/hermit/issues/3520),
+    // so a full run builds aux exactly when the plan has a liteinst cell.
+    let full_needs_aux = plan.cells.iter().any(|c| c.backend == "liteinst")
+        || shards.release.iter().any(|s| s.needs == "aux");
     check(
         "full ⇒ all builds",
-        rp_full.build_debug && rp_full.build_dbt && rp_full.build_aux,
+        rp_full.build_debug && rp_full.build_dbt && rp_full.build_aux == full_needs_aux,
+    );
+    // Positive control independent of the committed cell population: a
+    // planned liteinst cell must still request the aux build.
+    let liteinst_cell_fixture = Plan {
+        cells: vec![Cell {
+            category: "fixture-l".into(),
+            mode: "run".into(),
+            backend: "liteinst".into(),
+        }],
+    };
+    check(
+        "full with a liteinst cell ⇒ aux build",
+        derive_run_plan(&lock, &shards, &liteinst_cell_fixture, &dag).build_aux,
     );
 
     // DBT is a Cargo dependency of hermit. Package-level reverse-dependency
@@ -1402,9 +1421,11 @@ fn self_test() {
                 "fixture-b__verify__dbt".to_string(),
             ],
     );
+    // aux is no longer a reverse dependency of DBT: its one release shard
+    // (liteinst) was retired with test.liteinst_strict (https://github.com/rrnewton/hermit/issues/3520).
     check(
-        "dbt ⇒ reverse-dep builds dbt and aux",
-        rp_dbt.build_dbt && rp_dbt.build_aux,
+        "dbt ⇒ reverse-dep builds dbt, not aux",
+        rp_dbt.build_dbt && !rp_dbt.build_aux,
     );
     check(
         "dbt ⇒ cells are a strict subset",
@@ -1427,16 +1448,14 @@ fn self_test() {
         rp_sabre.build_dbt && !rp_sabre.build_aux,
     );
 
-    // LiteInst runtime change: only liteinst cells + liteinst shard.
+    // LiteInst runtime staging: hermit-install's build script runs this
+    // script for every Hermit build, and no node is its own consumer since
+    // test.liteinst_strict was retired (https://github.com/rrnewton/hermit/issues/3520),
+    // so the unmatched path must force the complete suite.
     let liteinst = select(&fp, &dag, &["scripts/stage-liteinst-runtime.sh".into()]);
-    let rp_lite = derive_run_plan(&liteinst, &shards, &plan, &dag);
     check(
-        "liteinst ⇒ liteinst shard",
-        rp_lite.shards.contains(&"liteinst".to_string()),
-    );
-    check(
-        "liteinst ⇒ only liteinst cells",
-        !rp_lite.cells.is_empty() && rp_lite.cells.iter().all(|c| c.backend == "liteinst"),
+        "liteinst runtime staging ⇒ full",
+        liteinst.decision == Decision::Full,
     );
 
     // Core change: all backends' cells (shared Detcore path).

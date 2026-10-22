@@ -1,10 +1,8 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
 
 //! Runtime admission control and process accounting for the validate driver.
 //!
@@ -106,119 +104,26 @@ pub fn understood_infrastructure_class(output: &str) -> Option<&'static str> {
     None
 }
 
-/// Infrastructure signatures emitted by tools below the validation runner.
-///
-/// They are inspected only inside the exact failed node's captured detail
-/// region. The runner records the resulting
-/// [`hermit_manifest_plan::runner::FailureClass`] directly; an outer ledger
-/// consumer must not reopen the aggregate log and infer the class again.
-const INFRASTRUCTURE_FAILURE_SIGNATURES: &[&str] = &[
-    "in archive is not an object",
-    "archive has no index",
-    "malformed archive",
-    "file format not recognized",
-    "bad file descriptor while reading archive",
-    "failed to verify the checksum",
-    "is different than the directory",
-    "does not match the source",
-    "corrupted",
-    "undefined reference to `dynamorio::",
-    ": failed to run command",
-];
-
-const PREREQUISITE_FAILURE_SIGNATURES: &[&str] = &[
-    ": command not found",
-    "unable to locate package",
-    "has no installation candidate",
-    "no match for argument",
-    "executable file not found in $path",
-];
-
-const PREPARE_FAILURE_PREFIXES: &[&str] = &[
-    "prepare failed for ",
-    "c program compilation failed for ",
-    "rust program compilation failed for ",
-];
-
-const PREPARE_PROGRESS_PREFIXES: &[&str] = &["built ", "skip ", "prebuilt "];
-
-const PREREQUISITE_PREPARE_SIGNATURES: &[&str] = &[
-    "not found",
-    "no such file or directory",
-    "command not found",
-    " on path",
-];
-
 /// Classify one failed node's exact captured detail region.
 ///
-/// `None` means the detail carried no recognized non-product evidence. The
-/// caller keeps the completed nonzero execution as `product_failure`; absence
-/// of a match is never converted into infrastructure or prerequisite success.
-/// The optional string is the closed evidence value written beside the class.
+/// Only the owner-classified environmental denials (the same closed classes
+/// [`environmental_block_observation`] names) move a completed nonzero node out
+/// of the product bucket. A generic phrase in a node's output ("corrupted",
+/// ": command not found", a preparation message) is not evidence of a cause:
+/// matching such phrases turned three otherwise complete full runs into
+/// NO-RESULT on 2026-10-05, so a node that failed with one of them is a
+/// product failure like any other. `None` keeps the completed nonzero
+/// execution as `product_failure`.
 pub fn failure_class_from_detail(
     output: &str,
 ) -> Option<(hermit_manifest_plan::runner::FailureClass, &'static str)> {
-    if let EnvBlockObservation::Denied(class) = environmental_block_observation(output) {
-        return Some((
+    match environmental_block_observation(output) {
+        EnvBlockObservation::Denied(class) => Some((
             hermit_manifest_plan::runner::FailureClass::UnderstoodInfrastructureFailure,
             class.as_str(),
-        ));
+        )),
+        _ => None,
     }
-
-    let lower = output.to_ascii_lowercase();
-    if let Some(signature) = INFRASTRUCTURE_FAILURE_SIGNATURES
-        .iter()
-        .copied()
-        .find(|signature| lower.contains(signature))
-    {
-        return Some((
-            hermit_manifest_plan::runner::FailureClass::UnderstoodInfrastructureFailure,
-            signature,
-        ));
-    }
-    if let Some(signature) = PREREQUISITE_FAILURE_SIGNATURES
-        .iter()
-        .copied()
-        .find(|signature| lower.contains(signature))
-    {
-        return Some((
-            hermit_manifest_plan::runner::FailureClass::UnderstoodPrerequisiteFailure,
-            signature,
-        ));
-    }
-
-    let lines: Vec<&str> = lower.lines().map(str::trim).collect();
-    for (index, line) in lines.iter().enumerate() {
-        if !PREPARE_FAILURE_PREFIXES
-            .iter()
-            .any(|prefix| line.starts_with(prefix))
-        {
-            continue;
-        }
-        let Some(reason) = lines.get(index + 1) else {
-            continue;
-        };
-        if PREPARE_FAILURE_PREFIXES
-            .iter()
-            .any(|prefix| reason.starts_with(prefix))
-            || PREPARE_PROGRESS_PREFIXES
-                .iter()
-                .any(|prefix| reason.starts_with(prefix))
-        {
-            continue;
-        }
-        if let Some(signature) = PREREQUISITE_PREPARE_SIGNATURES
-            .iter()
-            .copied()
-            .find(|signature| reason.contains(signature))
-        {
-            return Some((
-                hermit_manifest_plan::runner::FailureClass::UnderstoodPrerequisiteFailure,
-                signature,
-            ));
-        }
-    }
-    None
 }
 
 /// What an actual re-execution established about an environmental classification.
@@ -454,6 +359,253 @@ pub fn cpu_wall_line(
         ratio,
         host_cpus,
         hint
+    )
+}
+
+// ------------------------------------------------------------------ whole-run CPU
+
+/// User and system CPU seconds from a cgroup v2 `cpu.stat`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CgroupCpu {
+    pub user: f64,
+    pub sys: f64,
+}
+
+impl CgroupCpu {
+    pub fn total(self) -> f64 {
+        self.user + self.sys
+    }
+
+    fn plus(self, other: CgroupCpu) -> CgroupCpu {
+        CgroupCpu {
+            user: self.user + other.user,
+            sys: self.sys + other.sys,
+        }
+    }
+
+    fn since(self, base: CgroupCpu) -> CgroupCpu {
+        CgroupCpu {
+            user: (self.user - base.user).max(0.0),
+            sys: (self.sys - base.sys).max(0.0),
+        }
+    }
+}
+
+/// `user_usec` and `system_usec` of a `cpu.stat`, in seconds.
+pub fn parse_cpu_stat(text: &str) -> Option<CgroupCpu> {
+    let field = |name: &str| {
+        text.lines().find_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            (key == name)
+                .then(|| value.trim().parse::<u64>().ok())
+                .flatten()
+        })
+    };
+    Some(CgroupCpu {
+        user: field("user_usec")? as f64 / 1e6,
+        sys: field("system_usec")? as f64 / 1e6,
+    })
+}
+
+pub fn cgroup_cpu(dir: &Path) -> Option<CgroupCpu> {
+    parse_cpu_stat(&std::fs::read_to_string(dir.join("cpu.stat")).ok()?)
+}
+
+/// The cgroup holding this run's whole DAG, when this process is dagrun's
+/// `supervisor` leaf: that leaf's parent, the run's scope (or delegated root).
+/// Every node is a child of it, and so is every process a node starts that does
+/// not move itself out, including the pinned-root containers (`podman run
+/// --cgroups=disabled`), which `getrusage` never sees because conmon detaches
+/// from the node and is reaped by validate-lock's subreaper instead.
+pub fn own_run_cgroup() -> Option<PathBuf> {
+    run_cgroup_from(&std::fs::read_to_string("/proc/self/cgroup").ok()?)
+}
+
+fn run_cgroup_from(proc_self_cgroup: &str) -> Option<PathBuf> {
+    let relative = proc_self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let leaf = Path::new("/sys/fs/cgroup").join(relative.trim().trim_start_matches('/'));
+    if leaf.file_name()? != "supervisor" {
+        return None;
+    }
+    leaf.parent().map(Path::to_path_buf)
+}
+
+/// The systemd user manager's cgroup (`.../user@UID.service`) above `cgroup`.
+fn user_manager_cgroup(cgroup: &Path) -> Option<PathBuf> {
+    let mut path = PathBuf::new();
+    for component in cgroup.components() {
+        path.push(component);
+        let name = component.as_os_str().to_string_lossy();
+        if name.starts_with("user@") && name.ends_with(".service") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// The name prefix of the buck2 daemon scope for the Buck project at `checkout`.
+/// The host's buck2 runs with `buck2_resource_control` on (`~/.buckconfig.d`), so
+/// its daemon, and every local action it runs, live in a systemd scope of their
+/// own, `buck2.slice/buck2_daemon.<project>.<isolation>.<id>.scope`, named for
+/// the project root with `-` as `_`: outside the node that started it and outside
+/// the run's scope.
+pub fn buck_daemon_scope_prefix(checkout: &Path) -> Option<String> {
+    let name = checkout.file_name()?.to_str()?;
+    Some(format!("buck2_daemon.{}.", name.replace('-', "_")))
+}
+
+/// Per scope: (its CPU when first seen, if it was there at the first sweep; its
+/// latest CPU).
+type ScopeSamples = BTreeMap<String, (CgroupCpu, CgroupCpu)>;
+
+fn sample_buck_daemon_scopes(
+    parents: &[PathBuf],
+    prefix: &str,
+    first_sweep: bool,
+    scopes: &mut ScopeSamples,
+) {
+    for parent in parents {
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            let Some(cpu) = cgroup_cpu(&entry.path()) else {
+                continue;
+            };
+            let base = if first_sweep {
+                cpu
+            } else {
+                CgroupCpu::default()
+            };
+            scopes.entry(name).or_insert((base, cpu)).1 = cpu;
+        }
+    }
+}
+
+fn buck_daemon_total(scopes: &ScopeSamples) -> (CgroupCpu, usize) {
+    let total = scopes
+        .values()
+        .fold(CgroupCpu::default(), |sum, (base, last)| {
+            sum.plus(last.since(*base))
+        });
+    (total, scopes.len())
+}
+
+/// Samples the CPU of this checkout's buck2 daemon scope(s) for the whole run.
+/// A scope is gone once `ci/buck-e2e/validate-node` kills its daemon, so it is
+/// read while it lives; a daemon's last `period` before its kill is lost, and it
+/// is idle then.
+pub struct BuckDaemonCpuMonitor {
+    scopes: Arc<std::sync::Mutex<ScopeSamples>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BuckDaemonCpuMonitor {
+    /// `None` when this process is not in a dagrun run cgroup below a systemd
+    /// user manager, where the daemon scopes cannot be found.
+    pub fn start(checkout: &Path, period: Duration) -> Option<BuckDaemonCpuMonitor> {
+        let prefix = buck_daemon_scope_prefix(checkout)?;
+        let manager = user_manager_cgroup(&own_run_cgroup()?)?;
+        let parents = vec![manager.join("buck2.slice"), manager];
+        let monitor = BuckDaemonCpuMonitor {
+            scopes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let (scopes, stop) = (monitor.scopes.clone(), monitor.stop.clone());
+        std::thread::spawn(move || {
+            let mut first_sweep = true;
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(mut scopes) = scopes.lock() {
+                    sample_buck_daemon_scopes(&parents, &prefix, first_sweep, &mut scopes);
+                }
+                first_sweep = false;
+                std::thread::sleep(period);
+            }
+        });
+        Some(monitor)
+    }
+
+    /// Stop sampling; the CPU the scopes used during the run and how many there were.
+    pub fn finish(&self) -> (CgroupCpu, usize) {
+        self.stop.store(true, Ordering::Relaxed);
+        match self.scopes.lock() {
+            Ok(scopes) => buck_daemon_total(&scopes),
+            Err(_) => (CgroupCpu::default(), 0),
+        }
+    }
+}
+
+/// The run's local CPU from the cgroups that held its work.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WholeRunCpu {
+    /// The run's scope: validate itself, every node, the pinned-root containers.
+    pub in_box: CgroupCpu,
+    /// `Some` when the E2E cells ran under Buck: its daemon scope(s) and their count.
+    pub buck_daemon: Option<(CgroupCpu, usize)>,
+}
+
+impl WholeRunCpu {
+    pub fn total(&self) -> CgroupCpu {
+        self.buck_daemon
+            .map_or(self.in_box, |(daemon, _)| self.in_box.plus(daemon))
+    }
+}
+
+/// The summary's CPU line: the mode, and the run's local CPU from its cgroups
+/// when they could be read. `waited` is `getrusage` (self + reaped children),
+/// what the ledger's `cpu_user_s`/`cpu_sys_s` carry; at c4de94bb it was 2h04m of
+/// 6h33m, missing the containers (3h13m) and the Buck daemon (1h14m), so it is
+/// printed last and named for what it counts.
+pub fn run_cpu_line(
+    human: fn(f64) -> String,
+    mode: &str,
+    wall: f64,
+    waited: (f64, f64),
+    whole: Option<&WholeRunCpu>,
+    host_cpus: usize,
+) -> String {
+    let Some(whole) = whole else {
+        return format!(
+            "mode {mode} | {} | getrusage only (no run cgroup to read): misses containers \
+             and daemons validate never reaped",
+            cpu_wall_line(human, wall, waited.0, waited.1, host_cpus)
+        );
+    };
+    let total = whole.total();
+    let parts = match whole.buck_daemon {
+        None => format!("in box {}", human(whole.in_box.total())),
+        Some((_, 0)) => format!(
+            "in box {} + Buck daemon NOT FOUND (its CPU is missing)",
+            human(whole.in_box.total())
+        ),
+        Some((daemon, _)) => format!(
+            "in box {} + Buck daemon {}",
+            human(whole.in_box.total()),
+            human(daemon.total())
+        ),
+    };
+    let ratio = if wall > 0.0 {
+        format!("{:.1}", total.total() / wall)
+    } else {
+        "n/a".to_string()
+    };
+    let hint = cpu_wall_hint(total.total(), wall, host_cpus)
+        .map(|h| format!("  ({h})"))
+        .unwrap_or_default();
+    format!(
+        "mode {mode} | wall {} | CPU {} (user {}, sys {}) = {parts} | CPU/wall {ratio}x across \
+         {host_cpus} cores | validate-reaped only {}{hint}",
+        human(wall),
+        human(total.total()),
+        human(total.user),
+        human(total.sys),
+        human(waited.0 + waited.1),
     )
 }
 
@@ -1147,6 +1299,14 @@ pub struct PeerCensus {
     pub stale_reaped: usize,
 }
 
+/// The CPU a peer's process tree must burn between two census samples to count
+/// as ACTIVE: five clock ticks at the usual `USER_HZ` of 100. `/proc` reports CPU
+/// in whole ticks and truncates user and system time separately, so one
+/// process's measured delta can sit up to two ticks either side of the CPU it
+/// really burned; a threshold well above that keeps scheduler noise from reading
+/// as work.
+pub const PEER_ACTIVE_CPU_SECONDS: f64 = 0.05;
+
 /// Read the pid recorded in a `<pid>.run` file name.
 fn record_pid(path: &Path) -> Option<i32> {
     path.file_stem()?.to_str()?.parse().ok()
@@ -1187,10 +1347,8 @@ pub fn census_peers(dir: &Path, self_pid: i32, previous: &mut BTreeMap<i32, f64>
         c.live += 1;
         seen.push(pid);
         let now = tree_cpu_seconds(pid);
-        // A CPU delta of a full tick is the smallest thing /proc can even show;
-        // require more than that so scheduler noise is not "busy".
         if let Some(prev) = previous.insert(pid, now) {
-            if now - prev > 0.05 {
+            if now - prev > PEER_ACTIVE_CPU_SECONDS {
                 c.cpu_active += 1;
             }
         }
@@ -1359,6 +1517,165 @@ pub fn enter_cleanup_critical_section() {
 
 // ------------------------------------------------------------------ self-test
 
+/// The whole-run CPU account against the shapes measured at c4de94bb (validate
+/// claude-coord-c4de94bb16b3-...-54695dd8): getrusage 7,465 s, the 100 nodes'
+/// cgroups 18,900 s, validate-lock's COST ACTUAL 23,559 s.
+pub fn whole_run_cpu_self_test() -> Result<(), String> {
+    let stat = "usage_usec 30146781\nuser_usec 20000000\nsystem_usec 10146781\nnr_periods 0\n";
+    if parse_cpu_stat(stat)
+        != Some(CgroupCpu {
+            user: 20.0,
+            sys: 10.146781,
+        })
+    {
+        return Err(format!("cpu.stat: user/system not read from {stat:?}"));
+    }
+    if parse_cpu_stat("usage_usec 5\n").is_some() {
+        return Err("cpu.stat: a stat without user_usec/system_usec must read as unknown".into());
+    }
+    let boxed =
+        "0::/user.slice/user-1.slice/user@1.service/dagrun.slice/dagrun-7.scope/supervisor\n";
+    let run = run_cgroup_from(boxed);
+    if run.as_deref()
+        != Some(Path::new(
+            "/sys/fs/cgroup/user.slice/user-1.slice/user@1.service/dagrun.slice/dagrun-7.scope",
+        ))
+    {
+        return Err(format!(
+            "run cgroup: the supervisor leaf's parent, got {run:?}"
+        ));
+    }
+    if run_cgroup_from("0::/user.slice/user-1.slice/session-3.scope\n").is_some() {
+        return Err(
+            "run cgroup: a process outside dagrun's supervisor leaf has no run cgroup".into(),
+        );
+    }
+    if user_manager_cgroup(run.as_deref().unwrap_or(Path::new("/")))
+        != Some(PathBuf::from(
+            "/sys/fs/cgroup/user.slice/user-1.slice/user@1.service",
+        ))
+    {
+        return Err("run cgroup: the user manager above the run cgroup was not found".into());
+    }
+    let prefix =
+        buck_daemon_scope_prefix(Path::new("/w/validate-fresh-c4de94bb16b3-1064238-c98b8b6a"));
+    if prefix.as_deref() != Some("buck2_daemon.validate_fresh_c4de94bb16b3_1064238_c98b8b6a.") {
+        return Err(format!("buck daemon scope prefix: got {prefix:?}"));
+    }
+
+    // A scope there at the first sweep counts from that sweep; one that appears
+    // later counts from zero; another checkout's daemon is not counted.
+    let dir =
+        std::env::temp_dir().join(format!("validate-buck-cpu-selftest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let scope = |name: &str, user: u64, sys: u64| -> Result<(), String> {
+        let path = dir.join(name);
+        std::fs::create_dir_all(&path).map_err(|e| format!("buck daemon self-test: {e}"))?;
+        std::fs::write(
+            path.join("cpu.stat"),
+            format!(
+                "usage_usec {}\nuser_usec {user}\nsystem_usec {sys}\n",
+                user + sys
+            ),
+        )
+        .map_err(|e| format!("buck daemon self-test: {e}"))
+    };
+    let prefix = "buck2_daemon.validate_fresh_x.";
+    let mut scopes = ScopeSamples::new();
+    scope(
+        "buck2_daemon.validate_fresh_x.v2.a.scope",
+        5_000_000,
+        1_000_000,
+    )?;
+    scope("buck2_daemon.fbsource.v2.b.scope", 900_000_000, 0)?;
+    sample_buck_daemon_scopes(std::slice::from_ref(&dir), prefix, true, &mut scopes);
+    scope(
+        "buck2_daemon.validate_fresh_x.v2.a.scope",
+        65_000_000,
+        11_000_000,
+    )?;
+    scope(
+        "buck2_daemon.validate_fresh_x.v2.c.scope",
+        3_000_000,
+        2_000_000,
+    )?;
+    sample_buck_daemon_scopes(std::slice::from_ref(&dir), prefix, false, &mut scopes);
+    // The daemon is killed and its scope removed: the last sample stands.
+    let _ = std::fs::remove_dir_all(dir.join("buck2_daemon.validate_fresh_x.v2.c.scope"));
+    sample_buck_daemon_scopes(std::slice::from_ref(&dir), prefix, false, &mut scopes);
+    let _ = std::fs::remove_dir_all(&dir);
+    let (daemon, count) = buck_daemon_total(&scopes);
+    if count != 2
+        || daemon
+            != (CgroupCpu {
+                user: 63.0,
+                sys: 12.0,
+            })
+    {
+        return Err(format!(
+            "buck daemon total: want 63 s user + 12 s sys over 2 scopes, got {daemon:?} over {count}"
+        ));
+    }
+
+    let secs = |s: f64| format!("{}s", s.round() as i64);
+    let whole = WholeRunCpu {
+        in_box: CgroupCpu {
+            user: 12_000.0,
+            sys: 7_000.0,
+        },
+        buck_daemon: Some((
+            CgroupCpu {
+                user: 2_500.0,
+                sys: 1_900.0,
+            },
+            1,
+        )),
+    };
+    let line = run_cpu_line(
+        secs,
+        "buck-hybrid",
+        525.0,
+        (6_200.0, 1_265.0),
+        Some(&whole),
+        284,
+    );
+    let want = "mode buck-hybrid | wall 525s | CPU 23400s (user 14500s, sys 8900s) = in box 19000s + \
+                Buck daemon 4400s | CPU/wall 44.6x across 284 cores | validate-reaped only 7465s";
+    if line != want {
+        return Err(format!("run cpu line:\n want {want:?}\n  got {line:?}"));
+    }
+    let missing = WholeRunCpu {
+        buck_daemon: Some((CgroupCpu::default(), 0)),
+        ..whole
+    };
+    if !run_cpu_line(secs, "buck-local", 525.0, (1.0, 1.0), Some(&missing), 284)
+        .contains("= in box 19000s + Buck daemon NOT FOUND (its CPU is missing) |")
+    {
+        return Err(
+            "run cpu line: a Buck run whose daemon was never seen must say its CPU is missing"
+                .into(),
+        );
+    }
+    let cargo = WholeRunCpu {
+        buck_daemon: None,
+        ..whole
+    };
+    if !run_cpu_line(secs, "cargo", 525.0, (1.0, 1.0), Some(&cargo), 284)
+        .contains("CPU 19000s (user 12000s, sys 7000s) = in box 19000s |")
+    {
+        return Err("run cpu line: a Cargo run counts its box alone".into());
+    }
+    let unboxed = run_cpu_line(secs, "cargo", 600.0, (30.0, 10.0), None, 316);
+    if !unboxed.starts_with("mode cargo | wall 600s | CPU 40s")
+        || !unboxed.contains("getrusage only")
+    {
+        return Err(format!(
+            "run cpu line: an unboxed run must say it is getrusage only, got {unboxed:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Inert two-sided brackets for everything in this module.
 ///
 /// Nothing here runs a gate, publishes a label, writes the real ledger, or claims
@@ -1417,38 +1734,29 @@ pub fn self_test() -> Result<String, String> {
         );
     }
 
-    // The current writer records the owner's four failure classes directly.
-    // These brackets cover both non-product classes and prove that weak prose
-    // remains product evidence unless it occurs in the harness's preparation
-    // failure shape.
+    // Only an owner-classified environmental denial leaves the product
+    // bucket. Generic phrases, which once moved a failed node to
+    // infrastructure or prerequisite, stay product evidence.
     use hermit_manifest_plan::runner::FailureClass;
-    for (text, want_class, want_detail) in [
-        (
-            "error: failed to verify the checksum for `crate v1.0.0`",
+    let banner = "An action was blocked on this server based on a security policy!\n\
+                  Enforcer: FS, Reason: FILE_OPEN";
+    if failure_class_from_detail(banner)
+        != Some((
             FailureClass::UnderstoodInfrastructureFailure,
-            "failed to verify the checksum",
-        ),
-        (
-            "tool: command not found",
-            FailureClass::UnderstoodPrerequisiteFailure,
-            ": command not found",
-        ),
-        (
-            "prepare failed for language-runtimes/lua-random.sh\nno Lua interpreter on PATH",
-            FailureClass::UnderstoodPrerequisiteFailure,
-            " on path",
-        ),
-    ] {
-        if failure_class_from_detail(text) != Some((want_class, want_detail)) {
-            return Err(format!(
-                "failure class: expected {want_class:?}/{want_detail:?} for {text:?}, got {:?}",
-                failure_class_from_detail(text)
-            ));
-        }
+            EnvBlockClass::BpfjailerBanner.as_str(),
+        ))
+    {
+        return Err(format!(
+            "failure class: an environmental denial lost its class: {:?}",
+            failure_class_from_detail(banner)
+        ));
     }
     for text in [
         "assertion failed: expected key not found",
         "error[E0432]: unresolved import `detcore::sched`",
+        "error: failed to verify the checksum for `crate v1.0.0`",
+        "tool: command not found",
+        "prepare failed for language-runtimes/lua-random.sh\nno Lua interpreter on PATH",
         "",
     ] {
         if failure_class_from_detail(text).is_some() {
@@ -1746,6 +2054,7 @@ pub fn self_test() -> Result<String, String> {
             "cpu/wall: line must carry ratio AND hint, got {line:?}"
         ));
     }
+    whole_run_cpu_self_test()?;
 
     // ---- process CPU accounting must be live, not a stub ----
     let (u, s) = process_cpu_seconds();
@@ -2228,19 +2537,6 @@ pub fn self_test() -> Result<String, String> {
             "registry: a first sighting cannot be CPU-active, got {c:?}"
         ));
     }
-    // Now burn measurable CPU and re-census: the same peer must flip to active.
-    let mut spin = 0u64;
-    let t0 = std::time::Instant::now();
-    while t0.elapsed().as_millis() < 150 {
-        spin = spin.wrapping_add(1);
-    }
-    std::hint::black_box(spin);
-    let c2 = census_peers(&reg, -1, &mut prev);
-    if c2.live != 1 || c2.cpu_active != 1 {
-        return Err(format!(
-            "registry: a CPU-burning peer must read active, got {c2:?}"
-        ));
-    }
     drop(held);
     // And once it is gone the count returns to zero: the guard is not sticky.
     let c3 = census_peers(&reg, -1, &mut prev);
@@ -2249,6 +2545,9 @@ pub fn self_test() -> Result<String, String> {
             "registry: a finished peer must stop counting, got {c3:?}"
         ));
     }
+    // CPU activity is judged on a separate peer: this process cannot be its own
+    // idle peer, because each census it takes burns CPU in it.
+    let starved_window = census_activity_bracket(&sandbox)?;
 
     // A write failure is not a missing peer or a zero-peer observation. Inject
     // one at the write boundary and require the registration error to survive to
@@ -2292,6 +2591,670 @@ pub fn self_test() -> Result<String, String> {
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse / \
          {lock_safety_refuse} safety-refuse, \
          registry registration 1 success / 1 lock-refuse / 1 write-refuse / 1 \
-         create-before-flock race-refuse, census 1 live / 1 stale-reaped / 1 cpu-active"
+         create-before-flock race-refuse, census 1 live / 1 stale-reaped, burner peer \
+         1 cpu-active / 4 idle (the CPU-bounded burn read active though starved to \
+         {starved_window:.1?} of CPU in its first {OLD_SPIN_WALL:?})"
     ))
+}
+
+/// How many spinning threads share the starved peer's CPU: the peer then gets
+/// about a sixteenth of it.
+const STARVING_HOGS: usize = 15;
+
+/// The longest any burner-peer burn may take before it reports failure.
+const BURN_WALL_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long to wait for any burner-peer answer: a burn's own limit plus slack, so
+/// a peer that stops answering fails the self-test instead of hanging it.
+const ANSWER_LIMIT: Duration = Duration::from_secs(BURN_WALL_LIMIT.as_secs() + 30);
+
+/// The wall time the bracket this replaces spun for. The burner peer reports the
+/// CPU each burn got in its first `OLD_SPIN_WALL`: what that spin would have
+/// carried under the same starvation.
+const OLD_SPIN_WALL: Duration = Duration::from_millis(150);
+
+/// Census brackets against a peer whose CPU is controlled exactly: a forked
+/// child that burns a set amount of CPU TIME on command and is otherwise blocked
+/// on a pipe. Returns the CPU the starved burn got in its first `OLD_SPIN_WALL`.
+///
+/// The bracket this replaces spun for 150 ms of WALL time in this process and
+/// expected that to carry more than the threshold. On 2026-10-07 it ran in a step
+/// throttled by its cgroup CPU quota, carried less, and failed the exact-head
+/// validation with "a CPU-burning peer must read active". A burn bounded by CPU
+/// time carries the same CPU however starved it is, and starving it on purpose
+/// here proves that rather than depending on how loaded the host happens to be.
+fn census_activity_bracket(sandbox: &Path) -> Result<Duration, String> {
+    let tick = 1.0 / clk_tck();
+    // Three ticks clear of the threshold on each side, beyond the two ticks of
+    // truncation /proc can add or remove.
+    let above = PEER_ACTIVE_CPU_SECONDS + 3.0 * tick;
+    let below = PEER_ACTIVE_CPU_SECONDS - 3.0 * tick;
+    if below <= 0.0 {
+        return Err(format!(
+            "registry: a {tick}s clock tick leaves no idle margin under the activity threshold"
+        ));
+    }
+    let ns = |seconds: f64| (seconds * 1e9) as u64;
+    let plan = BurnPlan {
+        above_ns: ns(above),
+        below_ns: ns(below),
+        window_ns: OLD_SPIN_WALL.as_nanos() as u64,
+        wall_ns: BURN_WALL_LIMIT.as_nanos() as u64,
+    };
+    let dir = sandbox.join("burner-peer-runs");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("registry: burner bracket: {e}"))?;
+    require_fair_policy()?;
+    require_child_reaping()?;
+    let peer = BurnerPeer::spawn(plan)?;
+    // The record names the child and this process holds its flock, so the census
+    // proves liveness exactly as for a real peer and then measures the child's tree.
+    let record_path = dir.join(format!("{}.run", peer.pid));
+    let record = File::create(&record_path).map_err(|e| format!("registry: burner record: {e}"))?;
+    if !flock_nb(record.as_raw_fd()) {
+        return Err("registry: cannot lock the burner peer's record".into());
+    }
+    let self_pid = std::process::id() as i32;
+    let mut prev: BTreeMap<i32, f64> = BTreeMap::new();
+    let mut census = |cpu_active: usize, what: &str| -> Result<(), String> {
+        let c = census_peers(&dir, self_pid, &mut prev);
+        let want = PeerCensus {
+            live: 1,
+            cpu_active,
+            stale_reaped: 0,
+        };
+        if c != want {
+            return Err(format!("registry: {what}, got {c:?}"));
+        }
+        Ok(())
+    };
+    census(0, "a first sighting cannot be CPU-active")?;
+    census(0, "an idle peer must read idle")?;
+    peer.order(b'n')?;
+    census(
+        0,
+        "a peer that burned less than the threshold must read idle",
+    )?;
+
+    // Starve the peer: pin it to one CPU beside threads spinning there, so it
+    // gets about a sixteenth of that CPU, then burn above the threshold.
+    let cpu = last_allowed_cpu().ok_or("registry: cannot read this thread's CPU affinity")?;
+    pin_to_cpu(peer.pid, cpu)
+        .map_err(|e| format!("registry: cannot pin the burner peer to CPU {cpu}: {e}"))?;
+    let hogs = CpuHogs::start(cpu, STARVING_HOGS)?;
+    let window = peer.order(b'b')?;
+    drop(hogs);
+    census(1, "a CPU-burning peer must read active")?;
+    // The starvation must be deep enough that the old bracket would have failed
+    // under it: its spin would have carried `window`, and even with the two ticks
+    // /proc can add, that is not above the threshold. A shallower starvation
+    // would not have reproduced the failure this guards against.
+    let idle_bound = PEER_ACTIVE_CPU_SECONDS - 2.0 * tick;
+    if window.as_secs_f64() > idle_bound {
+        return Err(format!(
+            "registry: the starved burn got {window:?} of CPU in its first {OLD_SPIN_WALL:?}; \
+             above {idle_bound:.3}s a wall-bounded spin that long can read active, so this \
+             does not reproduce the starvation that made one read idle"
+        ));
+    }
+    census(0, "a peer must read idle again once it stops burning")?;
+    // Answers count only from a peer that was alive for all of them: one that died
+    // after its last answer would otherwise still pass.
+    peer.finish()?;
+    // Removing its record ends a peer, as when a real validation exits.
+    std::fs::remove_file(&record_path).map_err(|e| format!("registry: burner record: {e}"))?;
+    let c = census_peers(&dir, self_pid, &mut prev);
+    if c != (PeerCensus {
+        live: 0,
+        cpu_active: 0,
+        stale_reaped: 0,
+    }) {
+        return Err(format!(
+            "registry: a removed record must not count as a peer, got {c:?}"
+        ));
+    }
+    drop(record);
+    Ok(window)
+}
+
+/// What the burner peer burns for each command, in nanoseconds of CPU time; the
+/// wall time over which it reports how much CPU a burn got early on; and the wall
+/// time after which any burn gives up.
+#[derive(Clone, Copy)]
+struct BurnPlan {
+    above_ns: u64,
+    below_ns: u64,
+    window_ns: u64,
+    wall_ns: u64,
+}
+
+/// A forked child the census brackets measure. Command `b` / `n` burns
+/// `above_ns` / `below_ns` of CPU time, and `q` makes it answer `q` and exit 0.
+/// Every answer is nine bytes: a status of `k` (done), `t` (the wall limit
+/// expired first), `e` (refused) or `q`, then, little endian, the nanoseconds of
+/// CPU the burn got in its first `window_ns` of wall time. The peer starts by
+/// answering `r`.
+struct BurnerPeer {
+    pid: libc::pid_t,
+    cmd: File,
+    ack: File,
+    // This process's own read end of the command pipe, never read. While it is
+    // open a command sent to a dead peer stays in the pipe instead of raising
+    // SIGPIPE, which the rust-script prelude handles by exiting 0: a dead peer
+    // would otherwise end the self-test as a silent pass. The missing answer
+    // reports it instead.
+    _cmd_reader: File,
+    // Set once `finish` has reaped the peer, so `Drop` never signals a pid that
+    // may since have been reused.
+    reaped: bool,
+}
+
+impl BurnerPeer {
+    fn spawn(plan: BurnPlan) -> Result<BurnerPeer, String> {
+        let (cmd_r, cmd_w) = cloexec_pipe()?;
+        let (ack_r, ack_w) = cloexec_pipe()?;
+        let parent = unsafe { libc::getpid() };
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(format!(
+                "registry: cannot fork the burner peer: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if pid == 0 {
+            unsafe {
+                burner_peer_body(
+                    parent,
+                    [cmd_r.as_raw_fd(), ack_w.as_raw_fd()],
+                    [cmd_w.as_raw_fd(), ack_r.as_raw_fd()],
+                    plan,
+                )
+            }
+        }
+        // Only the peer holds the answer pipe's write end, so its exit reads as
+        // end of file.
+        drop(ack_w);
+        let peer = BurnerPeer {
+            pid,
+            cmd: cmd_w,
+            ack: ack_r,
+            _cmd_reader: cmd_r,
+            reaped: false,
+        };
+        match peer.answer()? {
+            (b'r', _) => Ok(peer),
+            (status, _) => Err(format!(
+                "registry: the burner peer did not start, answered {:?}",
+                char::from(status)
+            )),
+        }
+    }
+
+    /// Send one burn command and wait for its answer. Returns the CPU the burn got
+    /// in its first `window_ns` of wall time.
+    fn order(&self, op: u8) -> Result<Duration, String> {
+        (&self.cmd).write_all(&[op]).map_err(|e| {
+            format!(
+                "registry: cannot send {:?} to the burner peer: {e}",
+                char::from(op)
+            )
+        })?;
+        match self.answer()? {
+            (b'k', window) => Ok(window),
+            (b't', _) => Err(format!(
+                "registry: burner peer command {:?} could not burn its CPU within \
+                 {BURN_WALL_LIMIT:?} of wall time",
+                char::from(op)
+            )),
+            (status, _) => Err(format!(
+                "registry: burner peer command {:?} answered {:?}",
+                char::from(op),
+                char::from(status)
+            )),
+        }
+    }
+
+    /// The peer's next answer. Fails rather than hangs when the peer exits, or
+    /// has not answered within `ANSWER_LIMIT`.
+    fn answer(&self) -> Result<(u8, Duration), String> {
+        use std::io::Read;
+        let deadline = std::time::Instant::now() + ANSWER_LIMIT;
+        let mut buf = [0u8; 9];
+        let mut got = 0;
+        while got < buf.len() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(format!(
+                    "registry: the burner peer did not answer within {ANSWER_LIMIT:?}"
+                ));
+            }
+            let mut ready = libc::pollfd {
+                fd: self.ack.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Rounded up, so the last wait does not spin on a zero timeout.
+            let ms = left.as_millis() as libc::c_int + 1;
+            match unsafe { libc::poll(&mut ready, 1, ms) } {
+                0 => continue,
+                n if n < 0 => {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(format!("registry: cannot wait for the burner peer: {e}"));
+                }
+                _ => {}
+            }
+            match (&self.ack).read(&mut buf[got..]) {
+                Ok(0) => {
+                    return Err("registry: the burner peer exited without answering".into());
+                }
+                Ok(n) => got += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(format!("registry: cannot read the burner peer: {e}")),
+            }
+        }
+        let [status, ns @ ..] = buf;
+        Ok((status, Duration::from_nanos(u64::from_le_bytes(ns))))
+    }
+
+    /// End the peer in order: it must acknowledge `q` and exit with status 0. A
+    /// peer that died earlier reads end of file instead of the acknowledgement.
+    fn finish(mut self) -> Result<(), String> {
+        (&self.cmd)
+            .write_all(b"q")
+            .map_err(|e| format!("registry: cannot stop the burner peer: {e}"))?;
+        match self.answer()? {
+            (b'q', _) => {}
+            (status, _) => {
+                return Err(format!(
+                    "registry: the burner peer answered {:?} to its stop command",
+                    char::from(status)
+                ));
+            }
+        }
+        // The peer exits right after acknowledging, and reaping it has the same
+        // deadline as an answer: a peer stopped or looping after its acknowledgement,
+        // or a traced one whose exit its tracer has not consumed, fails the self-test
+        // instead of hanging it.
+        let status = match reap_within(self.pid, ANSWER_LIMIT) {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                return Err(format!(
+                    "registry: the burner peer acknowledged its stop command but did not \
+                     exit within {ANSWER_LIMIT:?}"
+                ));
+            }
+            Err(e) => {
+                // ECHILD: the peer is no longer this process's child, so its PID
+                // may already name another process. Never signal it.
+                self.reaped = e.raw_os_error() == Some(libc::ECHILD);
+                return Err(format!("registry: cannot reap the burner peer: {e}"));
+            }
+        };
+        self.reaped = true;
+        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "registry: the burner peer ended with wait status {status:#x}, not exit status 0"
+            ))
+        }
+    }
+}
+
+impl Drop for BurnerPeer {
+    // Error paths only: the bracket ends the peer with `finish`.
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        // Signal the peer only while it is this process's unreaped child, whose PID
+        // cannot name another process: not once it has been reaped here, and not if
+        // it is no longer a child at all.
+        let mut status = 0;
+        if unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) } != 0 {
+            return;
+        }
+        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        // SIGKILL ends an ordinary peer at once. A traced one is reported only once
+        // its tracer consumes its exit, so this wait is bounded too; a peer still
+        // unreaped after it is left for init to reap when this process exits.
+        let _ = reap_within(self.pid, REAP_AFTER_KILL_LIMIT);
+    }
+}
+
+/// How long `Drop` waits to reap a peer it has killed.
+const REAP_AFTER_KILL_LIMIT: Duration = Duration::from_secs(5);
+
+/// Reap the child `pid` if it is reported exited within `limit`, without ever
+/// blocking: a readable pidfd or a dead process does not mean `waitpid` can
+/// report it, because a tracer consumes a traced child's exit first. Returns its
+/// wait status, or `None` when it was not reported in time.
+fn reap_within(pid: libc::pid_t, limit: Duration) -> io::Result<Option<libc::c_int>> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let mut status = 0;
+        match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
+            0 => {}
+            r if r < 0 => {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+            _ => return Ok(Some(status)),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The burner peer's body, run in the forked child; it never returns. Another
+/// thread of the parent may have held any lock at the fork, so only
+/// async-signal-safe libc calls appear here: no allocation, no std I/O, nothing
+/// that can panic.
+///
+/// # Safety
+///
+/// Call only in a freshly forked child: it closes the raw descriptors in `close`.
+unsafe fn burner_peer_body(
+    parent: libc::pid_t,
+    keep: [libc::c_int; 2],
+    close: [libc::c_int; 2],
+    plan: BurnPlan,
+) -> ! {
+    let [cmd, ack] = keep;
+    unsafe {
+        for fd in close {
+            libc::close(fd);
+        }
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+        if libc::getppid() != parent {
+            libc::_exit(1);
+        }
+        set_fair_slice(MIN_SLICE_NS);
+        write_answer(ack, b'r', 0);
+        while let Some(op) = read_byte(cmd) {
+            if op == b'q' {
+                write_answer(ack, b'q', 0);
+                libc::_exit(0);
+            }
+            let burn = match op {
+                b'b' => Some(plan.above_ns),
+                b'n' => Some(plan.below_ns),
+                _ => None,
+            }
+            .map(|cpu_ns| burn_process_cpu(cpu_ns, plan.window_ns, plan.wall_ns));
+            let (status, window_ns) = match burn {
+                Some(burn) if burn.done => (b'k', burn.window_ns),
+                Some(burn) => (b't', burn.window_ns),
+                None => (b'e', 0),
+            };
+            if !write_answer(ack, status, window_ns) {
+                break;
+            }
+        }
+        libc::_exit(0)
+    }
+}
+
+/// One burner-peer burn: whether it burned all its CPU before the wall limit,
+/// and the CPU it had burned once its window of wall time had passed (all of it,
+/// if it finished sooner).
+struct Burn {
+    done: bool,
+    window_ns: u64,
+}
+
+/// Burn `cpu_ns` of this process's CPU time (`CLOCK_PROCESS_CPUTIME_ID`), giving
+/// up after `wall_ns` of `CLOCK_MONOTONIC`, and note the CPU burned in the first
+/// `window_ns`. Async-signal-safe, for the burner peer.
+fn burn_process_cpu(cpu_ns: u64, window_ns: u64, wall_ns: u64) -> Burn {
+    fn now_ns(clock: libc::clockid_t) -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe { libc::clock_gettime(clock, &mut ts) };
+        (ts.tv_sec as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(ts.tv_nsec as u64)
+    }
+    let cpu0 = now_ns(libc::CLOCK_PROCESS_CPUTIME_ID);
+    let wall0 = now_ns(libc::CLOCK_MONOTONIC);
+    let mut window = None;
+    loop {
+        // Wall time first: CPU read after it can only overstate the window's.
+        let wall = now_ns(libc::CLOCK_MONOTONIC).wrapping_sub(wall0);
+        let cpu = now_ns(libc::CLOCK_PROCESS_CPUTIME_ID).wrapping_sub(cpu0);
+        if wall >= window_ns && window.is_none() {
+            window = Some(cpu);
+        }
+        if cpu >= cpu_ns || wall >= wall_ns {
+            return Burn {
+                done: cpu >= cpu_ns,
+                window_ns: window.unwrap_or(cpu),
+            };
+        }
+    }
+}
+
+/// One byte from `fd`, retrying `EINTR`; `None` at end of file or on an error.
+/// Async-signal-safe, for the burner peer.
+fn read_byte(fd: libc::c_int) -> Option<u8> {
+    let mut b = 0u8;
+    loop {
+        let n = unsafe { libc::read(fd, (&mut b as *mut u8).cast(), 1) };
+        if n == 1 {
+            return Some(b);
+        }
+        if n < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+            continue;
+        }
+        return None;
+    }
+}
+
+/// Write one burner-peer answer to `fd`, retrying `EINTR`: `status`, then
+/// `window_ns` little endian. A pipe write this small is all or nothing.
+/// Async-signal-safe, for the burner peer.
+fn write_answer(fd: libc::c_int, status: u8, window_ns: u64) -> bool {
+    let n = window_ns.to_le_bytes();
+    let buf = [status, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]];
+    loop {
+        let written = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if written == buf.len() as isize {
+            return true;
+        }
+        if written < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+            continue;
+        }
+        return false;
+    }
+}
+
+fn cloexec_pipe() -> Result<(File, File), String> {
+    use std::os::unix::io::FromRawFd;
+    let mut fds: [libc::c_int; 2] = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!("registry: pipe2: {}", io::Error::last_os_error()));
+    }
+    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+}
+
+/// Restrict thread or process `pid` (0: the calling thread) to `cpu`.
+fn pin_to_cpu(pid: libc::pid_t, cpu: usize) -> io::Result<()> {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::CPU_SET(cpu, &mut set) };
+    if unsafe { libc::sched_setaffinity(pid, std::mem::size_of::<libc::cpu_set_t>(), &set) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// The highest-numbered CPU the calling thread may run on.
+fn last_allowed_cpu() -> Option<usize> {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    if unsafe { libc::sched_getaffinity(0, size, &mut set) } != 0 {
+        return None;
+    }
+    (0..libc::CPU_SETSIZE as usize)
+        .rev()
+        .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+}
+
+/// The shortest slice the kernel's fair scheduler (EEVDF) grants a task:
+/// `sched_attr.sched_runtime` is clamped to between 0.1 ms and 100 ms.
+const MIN_SLICE_NS: u64 = 100_000;
+
+/// `struct sched_attr` from sched_setattr(2), up to `sched_period`.
+#[repr(C)]
+#[derive(Default)]
+struct SchedAttr {
+    size: u32,
+    sched_policy: u32,
+    sched_flags: u64,
+    sched_nice: i32,
+    sched_priority: u32,
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
+}
+
+/// Give the calling thread a fair-scheduler slice of `ns`, keeping its policy and
+/// nice value. A fair task runs up to one slice each time it is picked, and a
+/// thread inherits the slice of the thread that created it, so a long slice set
+/// by whoever started the self-test would let the starved peer run tens of
+/// milliseconds at a time and escape the starvation the bracket relies on.
+/// Returns whether the slice was set; the bracket's starvation check still
+/// decides. Async-signal-safe (two raw system calls), for the burner peer.
+fn set_fair_slice(ns: u64) -> bool {
+    const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+    let mut attr = SchedAttr::default();
+    let size = std::mem::size_of::<SchedAttr>() as u32;
+    let read = unsafe {
+        libc::syscall(
+            libc::SYS_sched_getattr,
+            0,
+            &mut attr as *mut SchedAttr,
+            size,
+            0,
+        )
+    };
+    let policy = attr.sched_policy as libc::c_int;
+    if read != 0 || (policy != libc::SCHED_OTHER && policy != libc::SCHED_BATCH) {
+        return false;
+    }
+    attr.size = size;
+    attr.sched_flags &= SCHED_FLAG_RESET_ON_FORK;
+    attr.sched_runtime = ns;
+    unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0) == 0 }
+}
+
+/// Refuse every scheduling policy but SCHED_OTHER and SCHED_BATCH before the
+/// bracket starts its peer and spinning threads, which inherit this thread's
+/// policy. Those two are the only policies whose slice `set_fair_slice` can set:
+/// under SCHED_IDLE an inherited long slice would stay and let the peer escape the
+/// starvation, and under SCHED_FIFO the first spinning thread would never yield
+/// its CPU, so the others could never report that they are pinned.
+fn require_fair_policy() -> Result<(), String> {
+    const SCHED_RESET_ON_FORK: libc::c_int = 0x4000_0000;
+    let policy = unsafe { libc::sched_getscheduler(0) };
+    if policy < 0 {
+        return Err(format!(
+            "registry: cannot read this thread's scheduling policy: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    match policy & !SCHED_RESET_ON_FORK {
+        libc::SCHED_OTHER | libc::SCHED_BATCH => Ok(()),
+        p => Err(format!(
+            "registry: the starvation bracket needs the SCHED_OTHER or SCHED_BATCH \
+             scheduling policy, whose slice it sets, but this thread's policy is {p}"
+        )),
+    }
+}
+
+/// Refuse to fork the peer while SIGCHLD is ignored or carries SA_NOCLDWAIT. The
+/// kernel would then reap the peer itself when it exits, and its PID could name
+/// another process by the time this process signals it.
+fn require_child_reaping() -> Result<(), String> {
+    let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) } != 0 {
+        return Err(format!(
+            "registry: cannot read the SIGCHLD disposition: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if current.sa_sigaction == libc::SIG_IGN || current.sa_flags & libc::SA_NOCLDWAIT != 0 {
+        return Err(
+            "registry: the burner peer needs SIGCHLD neither ignored nor marked \
+                    SA_NOCLDWAIT, or the kernel reaps it on exit and its PID can be reused"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Threads that each pin themselves to one CPU and spin there, so a peer pinned
+/// to the same CPU gets only its fair share of it: a deterministic starved peer,
+/// with no sleep and no dependence on the host's load.
+struct CpuHogs {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl CpuHogs {
+    fn start(cpu: usize, count: usize) -> Result<CpuHogs, String> {
+        let mut hogs = CpuHogs {
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            threads: Vec::new(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..count {
+            let (stop, tx) = (hogs.stop.clone(), tx.clone());
+            let thread = std::thread::Builder::new()
+                .name("census-cpu-hog".into())
+                .spawn(move || {
+                    let pinned = pin_to_cpu(0, cpu).map_err(|e| e.to_string());
+                    set_fair_slice(MIN_SLICE_NS);
+                    let _ = tx.send(pinned);
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+                .map_err(|e| format!("registry: cannot start a CPU hog: {e}"))?;
+            hogs.threads.push(thread);
+        }
+        // A hog answers only after pinning itself, and spins from then on.
+        for _ in 0..count {
+            match rx.recv_timeout(ANSWER_LIMIT) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(format!("registry: a CPU hog cannot pin to CPU {cpu}: {e}"));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "registry: a CPU hog did not report pinning within {ANSWER_LIMIT:?}"
+                    ));
+                }
+                Err(e) => return Err(format!("registry: a CPU hog stopped before pinning: {e}")),
+            }
+        }
+        Ok(hogs)
+    }
+}
+
+impl Drop for CpuHogs {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
 }

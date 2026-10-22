@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Closed host-capability vocabulary and probes shared by validation records.
 
 use std::collections::BTreeMap;
@@ -65,15 +57,30 @@ pub type HostCapabilities = BTreeMap<HostCapability, CapabilityVerdict>;
 pub struct HostCapabilitiesReport {
     pub schema: u64,
     pub host_capabilities: HostCapabilities,
+    /// Whether this host's retired-conditional-branch counter, which drives
+    /// Hermit's virtual clock on the ptrace and e9patch backends, passes
+    /// Reverie's performance-counter validation. When it is absent,
+    /// `hermit run --strict` refuses those backends, and the E2E harness
+    /// reports their cells HOST-INAPPLICABLE.
+    ///
+    /// It is not one of [`HostCapability`]: only the hermit binary, which links
+    /// Reverie's ptrace backend, can run that validation, so no other process
+    /// can probe it, and adding a member to that closed set changes every
+    /// result and stress-series row. See
+    /// <https://github.com/rrnewton/hermit/issues/3794>.
+    pub exact_branch_counter: CapabilityVerdict,
 }
 
 impl HostCapabilitiesReport {
-    pub const SCHEMA: u64 = 1;
+    pub const SCHEMA: u64 = 2;
 
-    pub fn probe() -> Self {
+    /// Probe the closed set and record `exact_branch_counter`, which the
+    /// caller probes because this crate cannot.
+    pub fn probe(exact_branch_counter: CapabilityVerdict) -> Self {
         Self {
             schema: Self::SCHEMA,
             host_capabilities: probe_host_capabilities(),
+            exact_branch_counter,
         }
     }
 
@@ -99,6 +106,9 @@ impl HostCapabilitiesReport {
         }
         if self.host_capabilities.len() != HostCapability::ALL.len() {
             return Err("host-capabilities must contain the complete closed set".into());
+        }
+        if self.exact_branch_counter.evidence.trim().is_empty() {
+            return Err("host-capabilities exact_branch_counter evidence must be nonempty".into());
         }
         Ok(())
     }
@@ -244,11 +254,27 @@ fn cpuinfo_advertises_virtualization() -> Option<bool> {
 mod tests {
     use super::*;
 
+    fn exact_branch_counter(evidence: &str) -> CapabilityVerdict {
+        CapabilityVerdict {
+            present: true,
+            evidence: evidence.into(),
+        }
+    }
+
     #[test]
     fn complete_probe_records_every_closed_capability_with_evidence() {
-        let report = HostCapabilitiesReport::probe();
+        let report = HostCapabilitiesReport::probe(exact_branch_counter("fixture"));
         report.validate().unwrap();
         assert_eq!(report.host_capabilities.len(), HostCapability::ALL.len());
+    }
+
+    #[test]
+    fn exact_branch_counter_needs_evidence() {
+        let report = HostCapabilitiesReport::probe(exact_branch_counter(" "));
+        assert_eq!(
+            report.validate().unwrap_err(),
+            "host-capabilities exact_branch_counter evidence must be nonempty"
+        );
     }
 
     /// A missing `/dev/kvm` is absence even when /proc/cpuinfo advertises
@@ -268,7 +294,7 @@ mod tests {
 
     #[test]
     fn incomplete_report_refuses_by_capability_name() {
-        let mut report = HostCapabilitiesReport::probe();
+        let mut report = HostCapabilitiesReport::probe(exact_branch_counter("fixture"));
         report
             .host_capabilities
             .remove(&HostCapability::CpuidFaulting);

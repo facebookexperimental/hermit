@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Build the demo 9 initramfs: a static BusyBox plus the /init script beside
 # this file, archived reproducibly. The same BusyBox, /init, cpio, and gzip
 # give the same bytes under any umask, on the same kind of filesystem (see the

@@ -18,12 +18,22 @@ use chrono::Utc;
 use detcore_model::config::MountInfoRootRewrite;
 use detcore_model::procfs::MOUNT_PEER_PREFIXES;
 use detcore_model::procfs::MountInfoRow;
+pub(crate) use detcore_model::procfs::exclude_ephemeral_host_seed_mounts;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
 pub(crate) use detcore_model::procfs::parse_mountinfo;
+pub(crate) use fixed::FixedProcfsFile;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+use crate::machine::MachineDescription;
+use crate::syscalls::VIRTUAL_CPUSET_BYTES;
+
+mod fixed;
+pub(crate) mod ids;
+pub(crate) mod levels;
+pub(crate) mod listing;
+pub(crate) mod locks;
+pub(crate) mod private_maps;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
@@ -49,12 +59,8 @@ enum ProcfsKind {
     SystemStat,
     Cpuinfo,
     Diskstats,
-    Loadavg,
     ProcessIo,
     Uptime,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-863): Review canonical guest memory accounting.
-    Meminfo,
     BlockStat,
     NodeMeminfo,
     NodeNumastat,
@@ -64,14 +70,20 @@ enum ProcfsKind {
     PtyNr,
     SelfSched,
     Fdinfo,
-    AioNr,
-    AioMaxNr,
-    PipeMaxSize,
     NumaMaps,
     SmapsRollup,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
     ArchStatus,
+    /// `/proc/<pid>/cgroup`: every line's path becomes `/`, as for a process
+    /// in the root cgroup (https://github.com/rrnewton/hermit/issues/4378).
+    ProcessCgroup,
+    /// `/proc/<pid>/auxv`: the auxiliary vector on the process's initial stack
+    /// when its image was exec'd, as Detcore read it there
+    /// (`Detcore::record_process_auxv`): Linux's `saved_auxv`, binary pairs
+    /// through `AT_NULL`. Only rendered; a file the kernel opens keeps the
+    /// kernel's bytes, unclassified (`ProcfsFile::kernel_served`).
+    ProcessAuxv,
     CpuidleCounter,
     Smaps,
     /// `/proc/*/maps`. Its per-mapping line carries a DEVICE and an INODE for
@@ -79,29 +91,23 @@ enum ProcfsKind {
     /// so leaving it raw lets a guest read two different identities for one
     /// file depending on which route it asks through.
     Maps,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
-    KeyUsers,
     Pressure,
-    Buddyinfo,
-    Schedstat,
     SelfSchedstat,
     SoftnetStat,
-    FileNr,
-    FileMax,
-    Zoneinfo,
-    InodeNr,
-    InodeState,
     Protocols,
     BtrfsBytesReserved,
     BtrfsBytesPinned,
     Rtc,
-    DentryState,
+    /// `/proc/<pid>/mountinfo`. Where the run has a container mount table
+    /// (`Config::container_mount_table`), its bytes are that table's, on every
+    /// backend and under record and replay; otherwise the kernel's, sanitized.
     Mountinfo,
+    /// `/proc/<pid>/mounts`, and `/proc/mounts`, the link to the caller's.
+    /// Where the run has a container mount table, its bytes are that table's,
+    /// as `mountinfo`'s are; otherwise the kernel's, unchanged
+    /// (<https://github.com/rrnewton/hermit/issues/3719>).
+    ProcessMounts,
     RandomUuid,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
-    Swaps,
     Locks,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
@@ -132,28 +138,31 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-960): Review per-CPU host interrupt normalization.
     IrqPerCpuCount,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-883): Review interrupt and module accounting snapshots.
-    InterruptCounters,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-883): Review module reference-count normalization.
-    Modules,
     /// `/sys/module/<name>/refcnt`. Carries the module name so the value can be
-    /// derived from the SAME deterministic holder cardinality that
-    /// `sanitize_modules` publishes for `/proc/modules`.
+    /// derived from the SAME module table that `/proc/modules` shows
+    /// (`FixedProcfsFile::Modules`).
     ModuleRefcnt(String),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
     UeventSeqnum,
+    /// `/sys/devices/system/cpu/{online,possible,present,enabled}`: the host's
+    /// CPU list, reported as Hermit's single virtual CPU.
+    CpuList,
+    /// A CPU-mask file describing Hermit's single virtual CPU: `cpu0`'s
+    /// topology masks and `node0/cpumap`.
+    CpuMask,
+    /// A CPU or node file whose contents are fixed for Hermit's single
+    /// virtual CPU on a single node (see [`SingleCpuFile`]).
+    SingleCpuConstant(SingleCpuFile),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-957): Review Btrfs reservation normalization.
     BtrfsBytesMayUse,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-956): Review host block queue-depth normalization.
     BlockInflight,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
-    Vmstat,
+    /// A system-wide file with one fixed value, rendered by Detcore (see
+    /// [`FixedProcfsFile`]).
+    Fixed(FixedProcfsFile),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -302,8 +311,7 @@ fn is_cpuidle_counter_path(path: &Path) -> bool {
 }
 
 /// The module name for `/sys/module/<name>/refcnt`, or `None` for any other
-/// shape. Returning the name (rather than a bare bool) is what lets the sysfs
-/// value be derived from the same module's `/proc/modules` row.
+/// shape.
 fn module_refcnt_name(path: &Path) -> Option<String> {
     let relative = path.strip_prefix("/sys/module").ok()?;
     let mut components = relative.iter();
@@ -312,43 +320,6 @@ fn module_refcnt_name(path: &Path) -> Option<String> {
         return None;
     }
     components.next().is_none().then(|| module.to_owned())
-}
-
-/// The host `/proc/modules` text, or empty when it cannot be read. An empty
-/// source yields a holder count of zero, which is the same conservative value
-/// the pre-existing behaviour emitted -- so an unreadable source degrades to
-/// the old answer instead of leaking the native counter.
-fn read_host_modules() -> String {
-    std::fs::read_to_string("/proc/modules").unwrap_or_default()
-}
-
-/// The deterministic holder cardinality `sanitize_modules` publishes for
-/// `module` in `/proc/modules`: the number of comma-separated holder names in
-/// the fourth field, or zero when that field is `-`.
-///
-/// This is the SAME derivation `sanitize_modules` applies, so the two surfaces
-/// cannot disagree. Linux exposes structural dependency holds in both the
-/// `/proc/modules` use count and `/sys/module/<name>/refcnt`; publishing a
-/// normalized 1 in one place and a hard 0 in the other is not a coherent
-/// module view.
-fn deterministic_module_holder_count(modules: &str, module: &str) -> u64 {
-    modules
-        .lines()
-        .find_map(|line| {
-            let mut fields = line.split_whitespace();
-            (fields.next()? == module).then_some(fields)
-        })
-        .and_then(|mut fields| {
-            fields.next()?; // size
-            fields.next()?; // use count (volatile; recomputed below)
-            let holders = fields.next()?;
-            Some(if holders == "-" {
-                0
-            } else {
-                holders.split(',').filter(|h| !h.is_empty()).count() as u64
-            })
-        })
-        .unwrap_or(0)
 }
 
 fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
@@ -372,14 +343,546 @@ fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
     }
 }
 
+/// Whether the procfs file at `path`, one Detcore renders, is a `seq_file`, as
+/// every procfs file outside `/proc/sys` is, rather than a sysctl file. Linux
+/// opens a `seq_file` without `FMODE_PWRITE` (so `pwrite` is `ESPIPE`), seeks
+/// it only from its start or position (`seq_lseek`), and maps it through
+/// `proc_reg_mmap`, which has no method behind it (`EIO`); a sysctl file has
+/// none of these, so a mapping is `ENODEV` and `SEEK_END` lands at its size, 0.
+pub(crate) fn rendered_path_is_seq_file(path: &Path) -> bool {
+    // A process's `auxv` is a plain file of the memory map's `saved_auxv`
+    // (`auxv_read`, `generic_file_llseek` on size 0).
+    !path.starts_with("/proc/sys")
+        && !per_process_name(path).is_some_and(|name| name.filename == "auxv")
+}
+
+/// The most bytes a process's `auxv` holds: Linux's `saved_auxv` is
+/// `AT_VECTOR_SIZE` words, 52 on x86_64 (`2 * (AT_VECTOR_SIZE_ARCH 3 +
+/// AT_VECTOR_SIZE_BASE 22 + 1)`), 26 pairs with the `AT_NULL` that ends them.
+pub(crate) const MAX_AUXV_BYTES: usize = 52 * 8;
+
+/// The auxiliary vector on a new image's initial stack at `stack`, its stack
+/// pointer before its first instruction, read with `read` (a guest memory
+/// word at an address): past `argc`, the `argc` argument pointers and their
+/// NULL, and the environment pointers and their NULL, the key and value
+/// pairs through the `AT_NULL` pair, which Linux's `/proc/<pid>/auxv`
+/// includes, as native-endian bytes. `None` where a word cannot be read, the
+/// layout is implausible (more than 2^20 arguments or environment entries),
+/// no `AT_NULL` comes within [`MAX_AUXV_BYTES`], or the vector has no
+/// `AT_PAGESZ`, which Linux always gives an image: a walk from an address
+/// that is not an image's initial stack pointer is refused, not served.
+pub(crate) fn initial_stack_auxv(
+    stack: u64,
+    mut read: impl FnMut(u64) -> Option<u64>,
+) -> Option<Vec<u8>> {
+    const MAX_ENTRIES: u64 = 1 << 20;
+    let argc = read(stack)?;
+    if argc > MAX_ENTRIES {
+        return None;
+    }
+    let mut at = stack.checked_add(8 * (argc + 2))?;
+    let mut environment = 0;
+    while read(at)? != 0 {
+        environment += 1;
+        if environment > MAX_ENTRIES {
+            return None;
+        }
+        at = at.checked_add(8)?;
+    }
+    at = at.checked_add(8)?;
+    let mut bytes = Vec::new();
+    let mut page_size = false;
+    while bytes.len() < MAX_AUXV_BYTES {
+        let key = read(at)?;
+        let value = read(at.checked_add(8)?)?;
+        bytes.extend_from_slice(&key.to_ne_bytes());
+        bytes.extend_from_slice(&value.to_ne_bytes());
+        if key == libc::AT_NULL {
+            return page_size.then_some(bytes);
+        }
+        page_size |= key == libc::AT_PAGESZ;
+        at = at.checked_add(16)?;
+    }
+    None
+}
+
+/// What the name of the memfd standing in for a procfs file Detcore renders
+/// starts with (`syscalls::files::rendered_procfs`); the file's path follows.
+/// Linux shows a memfd named `N` as `/memfd:N (deleted)` in descriptor links.
+pub(crate) const PLACEHOLDER_NAME_PREFIX: &str = "hermit-procfs:";
+
+/// The procfs path a descriptor link names, if it names a placeholder for a
+/// procfs file Detcore renders in this session (`files`).
+pub(crate) fn placeholder_link_path(link: &[u8], files: RenderedFiles) -> Option<&'static Path> {
+    placeholder_link(link, files).map(|(path, _)| path)
+}
+
+/// The most bytes a placeholder's link (`/memfd:<name> (deleted)`) takes.
+pub(crate) const PLACEHOLDER_LINK_CAPACITY: usize = 288;
+
+/// The memfd name of a placeholder for the rendered file `path` holding the
+/// snapshot `snapshot`: `PLACEHOLDER_NAME_PREFIX`, the path, `@`, and the
+/// snapshot in hexadecimal. The name carries the snapshot across `exec` to a
+/// backend that rediscovers its descriptors; the file itself stays empty. A
+/// placeholder for a file whose every snapshot is the same carries none
+/// (`ProcfsFile::snapshot_is_rerendered`): the new image renders the same
+/// bytes, which for a table would not fit.
+///
+/// A per-process file's name also carries the identity of its task
+/// ([`TaskIncarnation`]) after a `#`, its process's incarnation and, for a
+/// thread's file, `.` and the thread's: `/proc/3/cgroup#1@`. A backend that
+/// rediscovers the placeholder after `exec` so finds the same file of the
+/// same task (`placeholder_link`).
+pub(crate) fn placeholder_name(path: &Path, snapshot: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut name = format!("{PLACEHOLDER_NAME_PREFIX}{}", path.display());
+    if let Some(PerProcessName {
+        incarnation: Some(incarnation),
+        ..
+    }) = per_process_name(path)
+    {
+        let _ = write!(name, "#{}", incarnation.process);
+        if let Some(thread) = incarnation.thread {
+            let _ = write!(name, ".{thread}");
+        }
+    }
+    name.push('@');
+    for byte in snapshot {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
+/// The rendered file, and the snapshot, that a placeholder's link names, if
+/// it names a file Detcore renders in this session (`files`).
+///
+/// A name is only a claim: a guest can name a memfd anything. Detcore makes a
+/// placeholder only for a file it renders, so in a session that does not
+/// render `/proc/cpuinfo` (`RenderedFiles::cpuinfo`) a memfd named for it is
+/// not one, and stays the ordinary memfd it is.
+pub(crate) fn placeholder_link(
+    link: &[u8],
+    files: RenderedFiles,
+) -> Option<(&'static Path, Vec<u8>)> {
+    let name = link
+        .strip_prefix(b"/memfd:")?
+        .strip_prefix(PLACEHOLDER_NAME_PREFIX.as_bytes())?
+        .strip_suffix(b" (deleted)")?;
+    let at = name.iter().rposition(|byte| *byte == b'@')?;
+    let (path, hex) = (&name[..at], &name[at + 1..]);
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    if !hex.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let snapshot = hex
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    // A per-process file's task identity follows its path after `#`.
+    let (path, identity) = match path.iter().rposition(|byte| *byte == b'#') {
+        Some(hash) => (&path[..hash], Some(&path[hash + 1..])),
+        None => (path, None),
+    };
+    let mut file = ProcfsFile::from_path(Path::new(
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
+    ))?;
+    match (file.per_process_name().is_some(), identity) {
+        (true, Some(identity)) => {
+            let identity = std::str::from_utf8(identity).ok()?;
+            let (process, thread) = match identity.split_once('.') {
+                Some((process, thread)) => (process, Some(thread.parse().ok()?)),
+                None => (identity, None),
+            };
+            let incarnation = TaskIncarnation {
+                process: process.parse().ok()?,
+                thread,
+            };
+            // A name no placeholder Detcore made carries: an incarnation that
+            // has no inode number (`procfs_inode::incarnation_fits`), or a
+            // thread's where the path names none.
+            if incarnation.thread.is_some() != file.bound_task()?.thread.is_some()
+                || !crate::procfs_inode::incarnation_fits(incarnation)
+            {
+                return None;
+            }
+            file.set_task_incarnation(incarnation);
+        }
+        (false, None) => {}
+        // A per-process file's placeholder always carries its task's
+        // identity, and no other file's carries one.
+        _ => return None,
+    }
+    let path = file.rendered_path(files)?;
+    Some((path, snapshot))
+}
+
+/// Which of the files Detcore can render it renders in one session: all of
+/// them, and `/proc/cpuinfo` exactly where it answers the guest's CPUID
+/// instruction from its own table, which is where CPUID is virtualized and the
+/// backend delivers the instruction to Detcore
+/// (`Detcore::rendered_files`). Rendering the virtual CPU's table where the
+/// guest's instruction sees the host's CPU would make the two disagree
+/// (<https://github.com/rrnewton/hermit/issues/4161>), so there the kernel
+/// opens the file and Detcore reads it as before.
+///
+/// Not process-wide state: each lookup takes the session's answer from its
+/// own configuration and the guest's backend (one capability read, no
+/// injected call), and passes it to the tables that name rendered files by
+/// path or kernel identity. Two sessions in one process, one after the
+/// other or at once, so each see their own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RenderedFiles {
+    /// Whether Detcore renders `/proc/cpuinfo`.
+    pub(crate) cpuinfo: bool,
+    /// Whether Detcore renders every process's `mountinfo` and `mounts` from
+    /// the run's container mount table: exactly where the run has one
+    /// (`Config::container_mount_table`, which hermit-cli builds for a run in
+    /// its container).
+    pub(crate) mounts: bool,
+}
+
+impl RenderedFiles {
+    /// Every file Detcore can render, `/proc/cpuinfo` and the mount table's
+    /// files too.
+    pub(crate) const ALL: Self = Self {
+        cpuinfo: true,
+        mounts: true,
+    };
+
+    /// The files Detcore renders in every session, without `/proc/cpuinfo`
+    /// and the mount table's files.
+    pub(crate) const WITHOUT_CPUINFO: Self = Self {
+        cpuinfo: false,
+        mounts: false,
+    };
+
+    /// The files a session renders whose configuration virtualizes CPUID
+    /// (`virtualize_cpuid`) and whose backend delivers the guest's CPUID
+    /// instruction to Detcore (`cpuid_interception`), with a container mount
+    /// table or without one (`mount_table`).
+    pub(crate) fn of(virtualize_cpuid: bool, cpuid_interception: bool, mount_table: bool) -> Self {
+        Self {
+            cpuinfo: virtualize_cpuid && cpuid_interception,
+            mounts: mount_table,
+        }
+    }
+}
+
+/// The two renderings of the container mount table
+/// (`detcore_model::container_mounts`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MountTableRendering {
+    /// `/proc/<pid>/mountinfo`.
+    Mountinfo,
+    /// `/proc/<pid>/mounts` and `/proc/mounts`.
+    Mounts,
+}
+
+/// How a `/proc` path names the process or thread a per-process file belongs
+/// to: the caller (`self` for its process, `thread-self` for its thread), a
+/// number, or something that names no task (a number with a leading zero, or
+/// one too large, which Linux's `name_to_int` refuses).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum TaskName {
+    Caller,
+    Number(i32),
+    Nothing,
+}
+
+impl TaskName {
+    fn parse(name: &str) -> Self {
+        match name.parse::<i32>() {
+            Ok(number) if number > 0 && !name.starts_with('0') => TaskName::Number(number),
+            _ => TaskName::Nothing,
+        }
+    }
+}
+
+/// The task a per-process procfs file's path names, before and after Detcore
+/// binds the caller's spellings to numbers: `/proc/<process>/<file>` or
+/// `/proc/<process>/task/<thread>/<file>`, where `thread-self` is the caller's
+/// process and thread (<https://github.com/rrnewton/hermit/issues/4213>).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ProcfsTask {
+    process: TaskName,
+    thread: Option<TaskName>,
+}
+
+/// The task a per-process procfs file belongs to, as the guest numbers it:
+/// the process (or, at `/proc/<tid>`, the thread) named at the top of
+/// `/proc`, and the thread named below its `task` directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub(crate) struct BoundTask {
+    pub(crate) process: i32,
+    pub(crate) thread: Option<i32>,
+}
+
+/// Open-time target authority shared by every alias of a maps description.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MapsTarget {
+    pub(crate) task: BoundTask,
+    pub(crate) incarnation: TaskIncarnation,
+    pub(crate) mm: detcore_model::futex::MmId,
+    pub(crate) private: reverie::RuntimePrivateMemorySnapshot,
+}
+
+impl MapsTarget {
+    /// Both observations bracket the kernel open; an intervening exec or PID
+    /// replacement cannot be rebound to the already-open description.
+    pub(crate) fn from_open(
+        task: BoundTask,
+        before: &listing::ProcfsTaskAnswer,
+        after: &listing::ProcfsTaskAnswer,
+    ) -> Option<Self> {
+        if !before.exists
+            || !after.exists
+            || before.without_mm
+            || after.without_mm
+            || before.incarnation() != after.incarnation()
+            || before.mm != after.mm
+            || before.runtime_private_memory != after.runtime_private_memory
+        {
+            return None;
+        }
+        let reverie::RuntimePrivateMemory::Ready(private) =
+            after.runtime_private_memory.as_ref()?
+        else {
+            return None;
+        };
+        Some(Self {
+            task,
+            incarnation: after.incarnation(),
+            mm: after.mm?,
+            private: private.clone(),
+        })
+    }
+}
+
+pub(crate) fn maps_task_at(path: &Path, pid: i32, tid: i32) -> Option<BoundTask> {
+    let normalized = normalize_observed_path(path)?;
+    ProcfsTask::parse(normalized.to_str()?, "maps")?
+        .bound_to(pid, tid)
+        .bound()
+}
+
+/// Which task holding a [`BoundTask`]'s numbers a per-process file belongs
+/// to: for each number, how many tasks of the run have held it, the one
+/// holding it now included (`InodePool::count_incarnation` in the global
+/// tool). Linux reuses a pid once its last holder is gone, and Detcore
+/// admits a task on a reused id (`Scheduler::forget_previous_process_exit`),
+/// so a number alone does not name one task for the whole run; the number
+/// and its incarnation do. 0 for an id no guest task has held (pid 1, the
+/// namespace's init, when no guest holds it).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub(crate) struct TaskIncarnation {
+    pub(crate) process: u32,
+    pub(crate) thread: Option<u32>,
+}
+
+impl ProcfsTask {
+    /// The task `path`, normalized, names for a per-process file called
+    /// `filename`, if it names that file.
+    fn parse(path: &str, filename: &str) -> Option<Self> {
+        let relative = path.strip_prefix("/proc/")?;
+        let components = relative.split('/').collect::<Vec<_>>();
+        let name = |text: &str, caller: &str| {
+            if text == caller {
+                Some(TaskName::Caller)
+            } else if is_numeric_id(text) {
+                Some(TaskName::parse(text))
+            } else {
+                None
+            }
+        };
+        match components.as_slice() {
+            ["thread-self", candidate] if *candidate == filename => Some(Self {
+                process: TaskName::Caller,
+                thread: Some(TaskName::Caller),
+            }),
+            [process, candidate] if *candidate == filename => Some(Self {
+                process: name(process, "self")?,
+                thread: None,
+            }),
+            [process, "task", thread, candidate] if *candidate == filename => Some(Self {
+                process: name(process, "self")?,
+                thread: Some(name(thread, "")?),
+            }),
+            _ => None,
+        }
+    }
+
+    /// This spelling with the caller's process `pid` and thread `tid` in
+    /// place of `self` and `thread-self`, as Linux resolves them at lookup.
+    fn bound_to(self, pid: i32, tid: i32) -> Self {
+        let process = match self.process {
+            TaskName::Caller => TaskName::Number(pid),
+            other => other,
+        };
+        let thread = self.thread.map(|thread| match thread {
+            TaskName::Caller => TaskName::Number(tid),
+            other => other,
+        });
+        Self { process, thread }
+    }
+
+    /// The task, once every name is a number; `None` while a name is the
+    /// caller's, and for a spelling that names no task.
+    fn bound(&self) -> Option<BoundTask> {
+        let number = |name: TaskName| match name {
+            TaskName::Number(number) => Some(number),
+            TaskName::Caller | TaskName::Nothing => None,
+        };
+        Some(BoundTask {
+            process: number(self.process)?,
+            thread: match self.thread {
+                Some(thread) => Some(number(thread)?),
+                None => None,
+            },
+        })
+    }
+}
+
+/// A per-process file Detcore renders, as its interned path names it: the
+/// task it belongs to, the incarnation of that task's numbers when Detcore
+/// bound it, and the file's name in the task's directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PerProcessName {
+    pub(crate) task: BoundTask,
+    pub(crate) incarnation: Option<TaskIncarnation>,
+    pub(crate) filename: &'static str,
+}
+
+/// The interned names of the per-process files Detcore has rendered, by the
+/// address and length of the path each was given (a prefix of one, such as
+/// its parent directory, starts at the same address and is not that file).
+static PER_PROCESS_NAMES_BY_PATH: std::sync::Mutex<
+    std::collections::BTreeMap<(usize, usize), PerProcessName>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The interned path of a per-process file Detcore renders,
+/// `/proc/<process>/<file>` or `/proc/<process>/task/<thread>/<file>`, for
+/// one task identity (`incarnation`). Rendered files are named by
+/// `&'static Path` throughout (the placeholder registry, descriptor links,
+/// inode keys); each (path, identity) is given its own path, made once and
+/// kept for the life of the tool process, so the path a descriptor holds
+/// carries the identity of the
+/// task its file belongs to ([`per_process_name`]), from which its inode
+/// is numbered (`procfs_inode::rendered_inode`). Two tasks that held the
+/// same pid have files with the same text but different paths. The table is
+/// not pruned: a descriptor or directory of a reaped task can still name its
+/// file, and a `&'static Path` cannot be taken back. It holds one path per
+/// per-process file, task generations and spelling the guest named. A thread
+/// group of N threads has N numbers that each name a `/proc/<n>` directory
+/// (Linux keeps a non-leader thread's, unlisted), and each of those has a
+/// `task` directory listing all N threads, so it can be named by up to N
+/// process spellings and N² thread spellings (`/proc/<n>/task/<m>`): at most
+/// `(N + N²) × PER_PROCESS_NAMES.len()` paths per group of task generations,
+/// each a few dozen bytes, and only those the guest named.
+fn per_process_path(
+    task: BoundTask,
+    filename: &'static str,
+    incarnation: Option<TaskIncarnation>,
+) -> &'static Path {
+    type Key = (BoundTask, &'static str, Option<TaskIncarnation>);
+    static PATHS: std::sync::Mutex<std::collections::BTreeMap<String, Vec<(Key, &'static str)>>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let text = match task.thread {
+        Some(thread) => format!("/proc/{}/task/{thread}/{filename}", task.process),
+        None => format!("/proc/{}/{filename}", task.process),
+    };
+    let key = (task, filename, incarnation);
+    let mut paths = PATHS.lock().expect("per-process path table poisoned");
+    let entries = paths.entry(text.clone()).or_default();
+    if let Some(interned) = entries
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map(|(_, interned)| *interned)
+    {
+        return Path::new(interned);
+    }
+    let leaked: &'static str = Box::leak(text.into_boxed_str());
+    entries.push((key, leaked));
+    PER_PROCESS_NAMES_BY_PATH
+        .lock()
+        .expect("per-process name table poisoned")
+        .insert(
+            (leaked.as_ptr() as usize, leaked.len()),
+            PerProcessName {
+                task,
+                incarnation,
+                filename,
+            },
+        );
+    Path::new(leaked)
+}
+
+/// The per-process file a rendered path names, if Detcore gave it that path
+/// ([`per_process_path`]).
+pub(crate) fn per_process_name(path: &Path) -> Option<PerProcessName> {
+    use std::os::unix::ffi::OsStrExt;
+    PER_PROCESS_NAMES_BY_PATH
+        .lock()
+        .expect("per-process name table poisoned")
+        .get(&(
+            path.as_os_str().as_bytes().as_ptr() as usize,
+            path.as_os_str().len(),
+        ))
+        .copied()
+}
+
+/// Whether `path`, a rendered file's, is a per-process file's, which Linux
+/// opens with the file operations of its `pid_entry` directly
+/// (`proc_single_file_operations` and the like), not through `proc_reg`: it
+/// has no `mmap` method, so a mapping is `ENODEV` as for a sysctl file, and
+/// it belongs to its process's owner, not to global root.
+pub(crate) fn rendered_path_is_per_process(path: &Path) -> bool {
+    path.strip_prefix("/proc")
+        .ok()
+        .and_then(|rest| rest.components().next())
+        .is_some_and(|first| first.as_os_str().to_str().is_some_and(is_numeric_id))
+}
+
 /// State for a procfs file whose volatile fields require normalization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ProcfsFile {
     kind: ProcfsKind,
+    /// The task a per-process file Detcore renders belongs to
+    /// ([`ProcfsFile::per_process_name`]), as its path named it; bound to
+    /// numbers at open ([`ProcfsFile::bind_task`]).
+    #[serde(default)]
+    task: Option<ProcfsTask>,
+    /// The identity of the task a per-process file belongs to
+    /// ([`TaskIncarnation`]), learned from Detcore's process table when it
+    /// was opened ([`ProcfsFile::set_task_incarnation`]).
+    #[serde(default)]
+    incarnation: Option<TaskIncarnation>,
+    /// Independent of rendered per-process kinds: these bytes originate from
+    /// an authenticated kernel object and retain its open-time mm.
+    #[serde(default)]
+    maps_target: Option<MapsTarget>,
     target_fd: Option<i32>,
     bound_thread_identity: Option<(i32, i32, i32)>,
     #[serde(default)]
     timer_slack_identity: Option<(u64, u64)>,
+    /// Detcore renders this file without the backend opening it: the guest's
+    /// descriptor is a placeholder and no kernel bytes exist to capture (see
+    /// [`ProcfsFile::rendered_path`]).
+    #[serde(default)]
+    rendered: bool,
+    /// The guest's number for each kernel process or thread number a
+    /// process's `stat` or `status` holds, where the kernel numbers processes
+    /// otherwise than Detcore (DBT; [`ProcfsFile::kernel_numbers_held`]).
+    #[serde(default)]
+    guest_numbers: Option<BTreeMap<i32, i32>>,
+    /// For a process's `mountinfo` or `mounts` the kernel opened, whether it
+    /// reads the kernel's view (its task's root had changed when it was
+    /// opened) rather than the container mount table, pinned at the open, as
+    /// Linux pins the task's root (`mounts_open_common`)
+    /// ([`ProcfsFile::pin_mount_view`]). `None` where nothing pinned it.
+    #[serde(default)]
+    mount_view_kernel: Option<bool>,
     contents: Option<Vec<u8>>,
     offset: usize,
 }
@@ -515,18 +1018,7 @@ impl MountInfoSnapshot {
             .iter()
             .flat_map(|row| [row.raw_mount_id, row.raw_parent_id])
             .collect::<std::collections::BTreeSet<_>>();
-        let mut derived_order = Vec::with_capacity(expected_mount_ids.len());
-        let mut seen = std::collections::BTreeSet::new();
-        for row in &rows {
-            if seen.insert(row.raw_mount_id) {
-                derived_order.push(row.raw_mount_id);
-            }
-        }
-        for row in &rows {
-            if seen.insert(row.raw_parent_id) {
-                derived_order.push(row.raw_parent_id);
-            }
-        }
+        let derived_order = mountinfo_observation_order(&rows);
         let mount_ids = if mount_id_order.is_empty() {
             derived_order
                 .into_iter()
@@ -600,7 +1092,50 @@ impl MountInfoSnapshot {
         self.mount_ids.get(&raw_mount_id).copied()
     }
 
+    /// Replace this snapshot's positional mount IDs with run-global ones.
+    ///
+    /// `virtual_ids[i]` is the run-global ID of `raw_order[i]`, and `raw_order`
+    /// must name exactly this snapshot's raw IDs. The positional numbering from
+    /// [`Self::new`] only orders the entries for that request. Rendering uses
+    /// the run-global numbers so mountinfo agrees with fdinfo and neither
+    /// depends on rows the guest never observed. Returns false, leaving the
+    /// snapshot unchanged, on a length, membership, or distinctness mismatch.
+    pub(crate) fn use_run_mount_ids(&mut self, raw_order: &[u64], virtual_ids: &[u64]) -> bool {
+        let mut distinct_raw = std::collections::BTreeSet::new();
+        let mut distinct_virtual = std::collections::BTreeSet::new();
+        if raw_order.len() != virtual_ids.len()
+            || raw_order.len() != self.mount_ids.len()
+            || !raw_order
+                .iter()
+                .all(|raw| self.mount_ids.contains_key(raw) && distinct_raw.insert(*raw))
+            || !virtual_ids.iter().all(|id| distinct_virtual.insert(*id))
+        {
+            return false;
+        }
+        self.mount_ids = raw_order
+            .iter()
+            .copied()
+            .zip(virtual_ids.iter().copied())
+            .collect();
+        true
+    }
+
+    /// Raw mount IDs in the order this view presents them to the guest: row
+    /// IDs in row order, then parent-only IDs in row order.
+    ///
+    /// Unlike [`Self::raw_mount_id_order`], this never depends on the
+    /// producer-captured namespace order, which can place a view's parent
+    /// before or after its rows depending on mounts the guest cannot see. The
+    /// run-global pool numbers unseen IDs in this order.
+    pub(crate) fn raw_mount_id_observation_order(&self) -> Vec<u64> {
+        mountinfo_observation_order(&self.rows)
+    }
+
     /// Raw mount IDs in the canonical order assigned by this snapshot.
+    ///
+    /// When a captured order was supplied, this is that order restricted to
+    /// the view, so it is used only to validate the view against the run's
+    /// captured namespace, never to number it.
     pub(crate) fn raw_mount_id_order(&self) -> Vec<u64> {
         let mut ordered = self
             .mount_ids
@@ -612,6 +1147,24 @@ impl MountInfoSnapshot {
     }
 }
 
+/// Row mount IDs in row order, then parent-only mount IDs in row order, each
+/// raw ID once.
+fn mountinfo_observation_order(rows: &[MountInfoRow]) -> Vec<u64> {
+    let mut order = Vec::with_capacity(rows.len().saturating_mul(2));
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        if seen.insert(row.raw_mount_id) {
+            order.push(row.raw_mount_id);
+        }
+    }
+    for row in rows {
+        if seen.insert(row.raw_parent_id) {
+            order.push(row.raw_parent_id);
+        }
+    }
+    order
+}
+
 /// Guest-visible values used to normalize one procfs snapshot.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProcfsSnapshotContext {
@@ -621,7 +1174,6 @@ pub(crate) struct ProcfsSnapshotContext {
     /// an unrepresentable boot instant refuses `/proc/stat` alone.
     pub(crate) virtual_boot_time_seconds: Option<i64>,
     pub(crate) virtual_realtime_seconds: i64,
-    pub(crate) virtual_memory_kb: u64,
     pub(crate) virtual_pid: i32,
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
@@ -640,15 +1192,56 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) mapping_identities: BTreeMap<(u64, u64), (u64, u64)>,
     pub(crate) mountinfo: Option<MountInfoSnapshot>,
     pub(crate) random_uuid: Option<[u8; 16]>,
+    /// `/proc/cpuinfo` rendered from the table Detcore answers the guest's
+    /// CPUID instruction from, when it does, so that the file describes that
+    /// virtual CPU rather than the host's
+    /// (<https://github.com/rrnewton/hermit/issues/4161>). Built by the caller
+    /// from `Detcore::virtual_cpuid`, the instruction's own source.
+    pub(crate) virtual_cpuinfo: Option<Vec<u8>>,
+    /// The machine the fixed files describe.
+    pub(crate) machine: MachineDescription,
+    /// For a status snapshot, the guest's own signal mask that the thread it
+    /// describes published while Detcore holds that thread under a private
+    /// blocking mask (`Scheduler::published_guest_sigmask`): reported as
+    /// `SigBlk` in place of the kernel's, which is Detcore's private mask
+    /// (Codex review of R2b-2 stage 2, P2;
+    /// https://github.com/rrnewton/hermit/issues/4273). Built by the caller.
+    pub(crate) published_sigblk: Option<u64>,
+    /// For `/proc/locks`, which of the kernel's rows, in order, the guest
+    /// owns (`locks::guest_lock_rows`); the others are dropped before the
+    /// sanitizer numbers identities. Built by the caller, which asks
+    /// Detcore's global state. `None` keeps every row, which only a snapshot
+    /// whose rows do not parse (refused whole by the sanitizer) or a unit
+    /// test gives.
+    pub(crate) lock_rows_kept: Option<Vec<bool>>,
 }
 
 impl ProcfsFile {
+    /// Whether taking this file's snapshot cannot wait interruptibly in the
+    /// kernel: signal phase 1 admits reads of these from a process that
+    /// handles SIGALRM (`sigalrm_phase1`). Exactly the kinds the phase's 6
+    /// target cells read after installing their handler; their capture takes
+    /// no interruptible lock (other kinds, such as the RTC files, do).
+    pub(crate) fn capture_cannot_wait(&self) -> bool {
+        matches!(
+            self.kind,
+            ProcfsKind::Uptime
+                | ProcfsKind::SystemStat
+                | ProcfsKind::Fixed(FixedProcfsFile::Interrupts | FixedProcfsFile::Softirqs)
+                | ProcfsKind::ProcessStat
+                | ProcfsKind::ProcessStatus
+                | ProcfsKind::SelfSchedstat
+                | ProcfsKind::BlockStat
+        )
+    }
+
     /// Recognizes procfs files that contain observed volatile fields.
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
         let path = normalize_observed_path(path)?;
         let path_text = path.to_str()?;
         let target_fd = parse_fdinfo_target(path_text);
         let kind = match path_text {
+            other if let Some(file) = FixedProcfsFile::from_path(other) => ProcfsKind::Fixed(file),
             "/proc/self/stat" => ProcfsKind::Stat,
             "/proc/self/status" => ProcfsKind::Status,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -666,35 +1259,14 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-861): Review deterministic kernel I/O accounting.
             "/proc/diskstats" => ProcfsKind::Diskstats,
-            "/proc/loadavg" => ProcfsKind::Loadavg,
             "/proc/uptime" => ProcfsKind::Uptime,
             "/proc/stat" => ProcfsKind::SystemStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-863): Review canonical guest memory accounting.
-            "/proc/meminfo" => ProcfsKind::Meminfo,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-914): Review host-global inode counter normalization.
-            "/proc/sys/fs/inode-nr" => ProcfsKind::InodeNr,
-            "/proc/sys/fs/inode-state" => ProcfsKind::InodeState,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-918): Review host-global dentry counter normalization.
-            "/proc/sys/fs/dentry-state" => ProcfsKind::DentryState,
-            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-873): Review deterministic kernel pseudo-file snapshots.
             other if is_process_file_path(other, "mountinfo") => ProcfsKind::Mountinfo,
+            "/proc/mounts" => ProcfsKind::ProcessMounts,
+            other if is_process_file_path(other, "mounts") => ProcfsKind::ProcessMounts,
             "/proc/sys/kernel/random/uuid" => ProcfsKind::RandomUuid,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
-            "/proc/sys/fs/aio-nr" => ProcfsKind::AioNr,
-            "/proc/sys/fs/aio-max-nr" => ProcfsKind::AioMaxNr,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-2568): Review determinizing the pipe ceiling read.
-            // The ceiling that decides whether a guest may raise a pipe above
-            // the pinned capacity. Reported raw it is the HOST's sysctl, so a
-            // guest that reads it and acts on it branches on the machine.
-            // Reported as the pinned capacity, it agrees with what
-            // `F_SETPIPE_SZ` actually allows.
-            "/proc/sys/fs/pipe-max-size" => ProcfsKind::PipeMaxSize,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-927): Review host-global PTY count normalization.
             "/proc/sys/kernel/pty/nr" => ProcfsKind::PtyNr,
@@ -702,11 +1274,17 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-866): Review host-global socket counter normalization.
             "/proc/net/sockstat" => ProcfsKind::Sockstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
-            "/proc/vmstat" => ProcfsKind::Vmstat,
-            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
             "/sys/kernel/uevent_seqnum" => ProcfsKind::UeventSeqnum,
+            "/sys/devices/system/cpu/online"
+            | "/sys/devices/system/cpu/possible"
+            | "/sys/devices/system/cpu/present"
+            | "/sys/devices/system/cpu/enabled" => ProcfsKind::CpuList,
+            other if is_virtual_cpu_list_path(other) => ProcfsKind::CpuList,
+            other if is_virtual_cpu_mask_path(other) => ProcfsKind::CpuMask,
+            other if let Some(file) = SingleCpuFile::from_path(other) => {
+                ProcfsKind::SingleCpuConstant(file)
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
             other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
@@ -725,36 +1303,23 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-944): Review AVX-512 elapsed-time normalization.
             other if is_process_file_path(other, "arch_status") => ProcfsKind::ArchStatus,
-            "/proc/swaps" => ProcfsKind::Swaps,
+            other if is_process_file_path(other, "cgroup") => ProcfsKind::ProcessCgroup,
+            other if is_process_file_path(other, "auxv") => ProcfsKind::ProcessAuxv,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
             other if is_process_file_path(other, "smaps") => ProcfsKind::Smaps,
             other if is_process_file_path(other, "maps") => ProcfsKind::Maps,
-            "/proc/key-users" => ProcfsKind::KeyUsers,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-903): Review host pressure accounting normalization.
             "/proc/pressure/cpu" | "/proc/pressure/io" | "/proc/pressure/memory" => {
                 ProcfsKind::Pressure
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-905): Review buddy allocator normalization.
-            "/proc/buddyinfo" => ProcfsKind::Buddyinfo,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-907): Review host scheduler accounting normalization.
-            "/proc/schedstat" => ProcfsKind::Schedstat,
-            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-922): Review per-process host scheduler normalization.
             other if is_process_schedstat_path(other) => ProcfsKind::SelfSchedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
             "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-910): Review host file-table normalization.
-            "/proc/sys/fs/file-nr" => ProcfsKind::FileNr,
-            "/proc/sys/fs/file-max" => ProcfsKind::FileMax,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-913): Review host memory-zone accounting normalization.
-            "/proc/zoneinfo" => ProcfsKind::Zoneinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-865): Review deterministic NUMA and hwmon snapshots.
             other if is_numa_node_file(other, "meminfo") => ProcfsKind::NodeMeminfo,
@@ -786,10 +1351,6 @@ impl ProcfsFile {
             "/proc/net/tcp" | "/proc/net/tcp6" | "/proc/net/udp" | "/proc/net/udp6" => {
                 ProcfsKind::InetSockets
             }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-883): Review interrupt and module accounting snapshots.
-            "/proc/interrupts" | "/proc/softirqs" => ProcfsKind::InterruptCounters,
-            "/proc/modules" => ProcfsKind::Modules,
             other if let Some(module) = module_refcnt_name(Path::new(other)) => {
                 ProcfsKind::ModuleRefcnt(module)
             }
@@ -823,14 +1384,341 @@ impl ProcfsFile {
             _ if is_irq_per_cpu_count_path(&path) => ProcfsKind::IrqPerCpuCount,
             _ => sysfs_rtc_kind(&path)?,
         };
+        // `/proc/mounts` is Linux's link to the caller's `self/mounts`.
+        let task_path = match path_text {
+            "/proc/mounts" => "/proc/self/mounts",
+            other => other,
+        };
+        let task = Self::per_process_name_of(&kind)
+            .and_then(|filename| ProcfsTask::parse(task_path, filename));
         Some(Self {
             kind,
+            task,
+            incarnation: None,
+            maps_target: None,
             target_fd,
             bound_thread_identity: None,
             timer_slack_identity: None,
+            rendered: false,
+            guest_numbers: None,
+            mount_view_kernel: None,
             contents: None,
             offset: 0,
         })
+    }
+
+    /// The path within procfs of a file whose every byte Detcore renders from
+    /// its own state, so that Detcore decides that it exists and what it
+    /// holds on every backend instead of the backend's `open`
+    /// (<https://github.com/rrnewton/hermit/issues/4213>). `None` for the files
+    /// whose bytes come from the kernel.
+    ///
+    /// `/proc/cpuinfo` is one only in a session that renders it (`files`),
+    /// and always once Detcore opened it so.
+    ///
+    /// A per-process file ([`Self::per_process_name`]) is one once its path
+    /// names its task by number ([`Self::bind_task`]); its path is then the
+    /// task's, `/proc/<pid>/<file>` or `/proc/<pid>/task/<tid>/<file>`, as
+    /// Linux names the file in descriptor links.
+    pub(crate) fn rendered_path(&self, files: RenderedFiles) -> Option<&'static Path> {
+        self.rendered_path_where(
+            self.rendered || files.cpuinfo,
+            self.rendered || files.mounts,
+        )
+    }
+
+    /// The path of this file where the reads of a descriptor open on it are
+    /// served from Detcore's rendering ([`Self::rendered_path`]), whichever
+    /// opened it. A per-process file only once Detcore opened it as rendered:
+    /// one the kernel opened (under record and replay, after `chroot`, in a
+    /// nested PID namespace, through `..`) keeps the kernel's bytes, sanitized,
+    /// as before per-process files were rendered.
+    pub(crate) fn served_rendered_path(&self, files: RenderedFiles) -> Option<&'static Path> {
+        if self.task.is_some() && !self.rendered {
+            return None;
+        }
+        self.rendered_path(files)
+    }
+
+    /// The name of a per-process file Detcore renders, as it appears in a
+    /// process's and a thread's directory: one whose bytes depend on no
+    /// kernel object, so Detcore decides that it exists, from its own process
+    /// table, and what it holds, on every backend
+    /// (<https://github.com/rrnewton/hermit/issues/4213>).
+    pub(crate) fn per_process_name(&self) -> Option<&'static str> {
+        self.task
+            .and_then(|_| Self::per_process_name_of(&self.kind))
+    }
+
+    /// The per-process files Detcore renders, by their name in a process's
+    /// directory.
+    fn per_process_name_of(kind: &ProcfsKind) -> Option<&'static str> {
+        Self::PER_PROCESS_KINDS
+            .iter()
+            .find(|(candidate, _)| candidate == kind)
+            .map(|(_, name)| *name)
+    }
+
+    /// The per-process files Detcore renders, and their names. `mountinfo`
+    /// and `mounts` only in a session with a container mount table
+    /// ([`RenderedFiles::mounts`]).
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 4] = [
+        (ProcfsKind::ProcessCgroup, "cgroup"),
+        (ProcfsKind::ProcessAuxv, "auxv"),
+        (ProcfsKind::Mountinfo, "mountinfo"),
+        (ProcfsKind::ProcessMounts, "mounts"),
+    ];
+
+    /// The names of the per-process files Detcore renders.
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 4] =
+        ["cgroup", "auxv", "mountinfo", "mounts"];
+
+    /// Pin which view of the mounts this kernel-opened `mountinfo` or `mounts`
+    /// reads: the kernel's (`kernel`, its task's root had changed when it was
+    /// opened) or the container mount table. Linux takes the task's root at
+    /// the open, so a later `chroot` changes nothing an open file reads.
+    pub(crate) fn pin_mount_view(&mut self, kernel: bool) {
+        self.mount_view_kernel = Some(kernel);
+    }
+
+    /// The view [`Self::pin_mount_view`] pinned, if any.
+    pub(crate) fn pinned_mount_view(&self) -> Option<bool> {
+        self.mount_view_kernel
+    }
+
+    /// Which rendering of the container mount table this file is, if it is
+    /// one: a process's `mountinfo` or its `mounts`.
+    pub(crate) fn mount_table_rendering(&self) -> Option<MountTableRendering> {
+        match self.kind {
+            ProcfsKind::Mountinfo => Some(MountTableRendering::Mountinfo),
+            ProcfsKind::ProcessMounts => Some(MountTableRendering::Mounts),
+            _ => None,
+        }
+    }
+
+    /// Whether a descriptor the kernel opened on this file (under record and
+    /// replay, after `chroot`, through `..`) is classified as this file, so
+    /// that Detcore serves its bytes sanitized: every file but a process's
+    /// `auxv`, whose bytes Detcore takes only from the guest's own stack, and
+    /// which a descriptor the kernel opened keeps reading from the kernel, as
+    /// before Detcore rendered it.
+    pub(crate) fn kernel_served(&self) -> bool {
+        self.kind != ProcfsKind::ProcessAuxv
+    }
+
+    /// Whether this is a per-process file whose `show` Linux runs when it is
+    /// read (`single_open`: the first read, a rewind, a read at another
+    /// position), which finds its task again: a process's `cgroup`. Not
+    /// `auxv`, whose snapshot Linux takes at the open (`auxv_open` pins the
+    /// memory map, and `auxv_read` reads its `saved_auxv`).
+    ///
+    /// Nor `mountinfo` or `mounts`, whose open takes the task's mount
+    /// namespace and root (`mounts_open_common`) and whose reads show that
+    /// namespace whatever became of the task since.
+    pub(crate) fn shows_at_read(&self) -> bool {
+        self.per_process_name().is_some()
+            && self.kind != ProcfsKind::ProcessAuxv
+            && self.mount_table_rendering().is_none()
+    }
+
+    /// Whether this is a process's `auxv`.
+    pub(crate) fn is_process_auxv(&self) -> bool {
+        self.kind == ProcfsKind::ProcessAuxv
+    }
+
+    /// Bind the caller's spellings (`self`, `thread-self`) of a per-process
+    /// file's task to the caller's process `pid` and thread `tid`, as Linux
+    /// resolves them when the path is looked up. Nothing for any other file.
+    pub(crate) fn bind_task(&mut self, pid: i32, tid: i32) {
+        if let Some(task) = self.task.as_mut() {
+            *task = task.bound_to(pid, tid);
+        }
+    }
+
+    /// The task a per-process file belongs to, once bound to numbers.
+    pub(crate) fn bound_task(&self) -> Option<BoundTask> {
+        self.task.as_ref().and_then(ProcfsTask::bound)
+    }
+
+    /// Record which task holding the bound numbers this per-process file
+    /// belongs to ([`TaskIncarnation`]), as Detcore's process table answers.
+    pub(crate) fn set_task_incarnation(&mut self, incarnation: TaskIncarnation) {
+        self.incarnation = Some(incarnation);
+    }
+
+    /// The identity of the task a per-process file belongs to, once known.
+    #[cfg(test)]
+    pub(crate) fn task_incarnation(&self) -> Option<TaskIncarnation> {
+        self.incarnation
+    }
+
+    /// This file as Detcore rendered it at `path`, one of its rendered paths:
+    /// the file's kind and task from the path, and for a per-process file the
+    /// task identity the path carries ([`per_process_name`]).
+    pub(crate) fn from_rendered_path(path: &Path) -> Option<Self> {
+        let mut file = Self::from_path(path)?;
+        if let Some(name) = per_process_name(path) {
+            file.incarnation = name.incarnation;
+        }
+        Some(file)
+    }
+
+    /// The path of this file if Detcore opened it without a kernel object
+    /// behind it ([`Self::is_rendered`]).
+    pub(crate) fn opened_path(&self) -> Option<&'static Path> {
+        self.rendered
+            .then(|| self.rendered_path_where(true, true))
+            .flatten()
+    }
+
+    /// [`Self::rendered_path`], where Detcore renders `/proc/cpuinfo` exactly
+    /// when `cpuinfo_rendered`, and a process's `mountinfo` and `mounts`
+    /// exactly when `mounts_rendered`.
+    fn rendered_path_where(
+        &self,
+        cpuinfo_rendered: bool,
+        mounts_rendered: bool,
+    ) -> Option<&'static Path> {
+        match self.kind {
+            ProcfsKind::RandomUuid => Some(Path::new("/proc/sys/kernel/random/uuid")),
+            ProcfsKind::PtyNr => Some(Path::new("/proc/sys/kernel/pty/nr")),
+            ProcfsKind::Uptime => Some(Path::new("/proc/uptime")),
+            ProcfsKind::SystemStat => Some(Path::new("/proc/stat")),
+            ProcfsKind::Cpuinfo if cpuinfo_rendered => Some(Path::new("/proc/cpuinfo")),
+            ProcfsKind::Fixed(file) => Some(file.path()),
+            ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts if !mounts_rendered => None,
+            _ if let Some(name) = Self::per_process_name_of(&self.kind) => {
+                Some(per_process_path(self.bound_task()?, name, self.incarnation))
+            }
+            _ => None,
+        }
+    }
+
+    /// This file, opened by Detcore without a kernel object behind it. It
+    /// must be one Detcore can render ([`RenderedFiles::ALL`]); the caller
+    /// decided that this session renders it.
+    pub(crate) fn into_rendered(self) -> Self {
+        assert!(
+            self.rendered_path_where(true, true).is_some(),
+            "{:?} is not rendered",
+            self.kind
+        );
+        Self {
+            rendered: true,
+            ..self
+        }
+    }
+
+    /// Whether Detcore opened this file without a kernel object behind it.
+    pub(crate) fn is_rendered(&self) -> bool {
+        self.rendered
+    }
+
+    /// The snapshot of this rendered file, once taken: at its open, or at its
+    /// first read for a file Linux renders when it is read
+    /// ([`Self::snapshot_at_first_read`]).
+    pub(crate) fn rendered_snapshot(&self) -> Option<&[u8]> {
+        self.contents.as_deref().filter(|_| self.rendered)
+    }
+
+    /// This rendered file, with the snapshot an earlier image of the process
+    /// took, which its placeholder carried across `exec`.
+    pub(crate) fn with_rendered_snapshot(self, snapshot: Vec<u8>) -> Self {
+        assert!(self.rendered, "{:?} is not rendered", self.kind);
+        Self {
+            contents: Some(snapshot),
+            ..self
+        }
+    }
+
+    /// Whether Linux reads this file through `read_iter`
+    /// (`FixedProcfsFile::has_read_iter`), which decides the `RWF_` flags a
+    /// vectored read of it accepts.
+    pub(crate) fn has_read_iter(&self) -> bool {
+        match self.kind {
+            ProcfsKind::Fixed(file) => file.has_read_iter(),
+            // `auxv_read` is a plain `read` (RWF_NOWAIT is EOPNOTSUPP).
+            ProcfsKind::ProcessAuxv => false,
+            _ => true,
+        }
+    }
+
+    /// Whether a rendered open of this file takes no snapshot, leaving it to
+    /// the first read, as for a captured file: Linux renders `/proc/uptime`
+    /// (`uptime_proc_show`) and `/proc/stat` (`show_stat`) when they are
+    /// read, and the time they show is the virtual time of that read, not of
+    /// the open. Each snapshot is a function of the uptime seconds of that
+    /// read and of facts fixed for the run, so the first read records those
+    /// seconds on the placeholder (`syscalls::files::rendered_procfs`), where
+    /// a process that shares the open file, or the image after `exec`, finds
+    /// them on a backend that keeps Detcore's state per process.
+    ///
+    /// A per-process file too: Linux's `single_open` file runs its `show`
+    /// method at the first read, which finds the task again (ESRCH once it is
+    /// gone), and again after a rewind (`set_offset`).
+    ///
+    /// And a process's `mountinfo` and `mounts`, whose snapshot numbers the
+    /// table's mounts and devices through the run's pools, which an open does
+    /// not reach (`Detcore::initialize_procfs_snapshot`).
+    pub(crate) fn snapshot_at_first_read(&self) -> bool {
+        self.snapshot_carries_uptime()
+            || self.shows_at_read()
+            || self.mount_table_rendering().is_some()
+    }
+
+    /// Whether the snapshot of this file a first read takes is a function of
+    /// that read's uptime, which its placeholder carries across `exec` and to
+    /// other processes sharing the open file (`Detcore::first_read_uptime`).
+    pub(crate) fn snapshot_carries_uptime(&self) -> bool {
+        matches!(self.kind, ProcfsKind::Uptime | ProcfsKind::SystemStat)
+    }
+
+    /// Whether this file's every snapshot is the same, a fact of the run's
+    /// [`MachineDescription`](crate::machine::MachineDescription), so that a
+    /// placeholder need not carry it across `exec`: the new image renders it
+    /// again (`placeholder_name`).
+    pub(crate) fn snapshot_is_fixed(&self) -> bool {
+        matches!(self.kind, ProcfsKind::Fixed(_))
+    }
+
+    /// Whether every snapshot of this rendered file is the same, so that its
+    /// placeholder need not carry it across `exec`: the new image renders it
+    /// again (`placeholder_name`). A fixed file ([`Self::snapshot_is_fixed`]),
+    /// and `/proc/cpuinfo`, a function of the configuration alone
+    /// (`Detcore::virtual_cpuid`), whose table would not fit a memfd name.
+    ///
+    /// `/proc/cpuinfo` is not fixed in the other sense: where the kernel opens
+    /// it (through a symbolic link, after `chroot`, under record and replay, or
+    /// where Detcore does not render it), its bytes come from the kernel's
+    /// file unless CPUID is virtualized and intercepted.
+    pub(crate) fn snapshot_is_rerendered(&self) -> bool {
+        self.snapshot_is_fixed() || self.kind == ProcfsKind::Cpuinfo
+    }
+
+    /// The kernel-shaped bytes a rendered file's snapshot starts from in place
+    /// of a capture. Its sanitizer replaces every byte of them.
+    pub(crate) fn rendering_template(&self) -> &'static [u8] {
+        assert!(self.rendered, "{:?} is not rendered", self.kind);
+        match self.kind {
+            ProcfsKind::RandomUuid => b"00000000-0000-4000-8000-000000000000\n",
+            ProcfsKind::PtyNr => b"0\n",
+            ProcfsKind::Uptime => b"0.00 0.00\n",
+            ProcfsKind::SystemStat => SYSTEM_STAT_TEMPLATE,
+            ProcfsKind::Cpuinfo | ProcfsKind::Fixed(_) => b"",
+            // Linux's `proc_cgroup_show` for a task in the root cgroup of
+            // the cgroup v2 hierarchy, the only one Hermit's machine has
+            // (`/proc/cgroups` lists every controller on the unified hierarchy, 0);
+            // the sanitizer keeps it.
+            ProcfsKind::ProcessCgroup => b"0::/\n",
+            // The bytes are the process's recorded auxiliary vector, which the
+            // open (or, for a descriptor rebuilt from its placeholder, its
+            // exec generation) supplies; nothing else is rendered.
+            ProcfsKind::ProcessAuxv => b"",
+            // The bytes are the session's container mount table, which the
+            // first read supplies (`Detcore::mount_table_snapshot`).
+            ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts => b"",
+            _ => unreachable!("{:?} has no rendered path", self.kind),
+        }
     }
 
     /// Returns true until the underlying procfs content has been captured.
@@ -840,12 +1728,126 @@ impl ProcfsFile {
         matches!(self.kind, ProcfsKind::Maps | ProcfsKind::Smaps)
     }
 
+    pub(crate) fn is_maps(&self) -> bool {
+        self.kind == ProcfsKind::Maps
+    }
+
+    pub(crate) fn bind_maps_target(&mut self, target: MapsTarget) {
+        assert!(self.is_maps());
+        self.maps_target = Some(target);
+    }
+
+    pub(crate) fn maps_target(&self) -> Option<MapsTarget> {
+        self.maps_target.clone()
+    }
+
+    /// True when this file lists the reading process's own virtual memory
+    /// areas, so a mapping created while capturing it would appear in it.
+    pub(crate) fn lists_address_space(&self) -> bool {
+        matches!(
+            self.kind,
+            ProcfsKind::Maps | ProcfsKind::Smaps | ProcfsKind::NumaMaps | ProcfsKind::SmapsRollup
+        )
+    }
+
     pub(crate) fn needs_mountinfo_identities(&self) -> bool {
         self.kind == ProcfsKind::Mountinfo
     }
 
+    /// Whether this is `/proc/locks` (see [`locks`]).
+    pub(crate) fn lists_locks(&self) -> bool {
+        self.kind == ProcfsKind::Locks
+    }
+
     pub(crate) fn needs_snapshot(&self) -> bool {
         !matches!(self.kind, ProcfsKind::TimerSlack(_)) && self.contents.is_none()
+    }
+
+    /// The kernel process and thread numbers in `contents`, a process's
+    /// `stat` or `status` named by number, where they name processes: the
+    /// pid, parent, process group, session and terminal group of `stat`, and
+    /// the `Tgid`, `Pid`, `PPid`, `NStgid` and `NSpid` of `status`. Empty for
+    /// any other file. Where the kernel numbers processes otherwise than
+    /// Detcore (DBT), the caller learns the guest's numbers for them
+    /// ([`ProcfsFile::set_guest_numbers`]) before the snapshot is taken.
+    pub(crate) fn kernel_numbers_held(&self, contents: &[u8]) -> Vec<i32> {
+        let positive = |text: &str| text.parse::<i32>().ok().filter(|id| *id > 0);
+        match self.kind {
+            ProcfsKind::ProcessStat => {
+                let Ok(text) = std::str::from_utf8(contents) else {
+                    return Vec::new();
+                };
+                let (Some(comm_start), Some(comm_end)) = (text.find(" ("), text.rfind(") ")) else {
+                    return Vec::new();
+                };
+                let fields = text[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
+                std::iter::once(&text[..comm_start])
+                    .chain(
+                        [1, 2, 3, 5]
+                            .into_iter()
+                            .filter_map(|index| fields.get(index).copied()),
+                    )
+                    .filter_map(positive)
+                    .collect()
+            }
+            ProcfsKind::ProcessStatus => String::from_utf8_lossy(contents)
+                .lines()
+                .filter_map(|line| {
+                    let (label, value) = line.split_once(':')?;
+                    STATUS_NUMBER_LABELS.contains(&label).then(|| {
+                        value
+                            .split_whitespace()
+                            .filter_map(positive)
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .flatten()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Renumber the kernel's process numbers in this file's snapshot with
+    /// `numbers`, the guest's number for each (see
+    /// [`ProcfsFile::kernel_numbers_held`]); a number with none is shown as
+    /// 0, as Linux shows a number from outside the reader's PID namespace.
+    pub(crate) fn set_guest_numbers(&mut self, numbers: BTreeMap<i32, i32>) {
+        self.guest_numbers = Some(numbers);
+    }
+
+    /// The guest thread whose signal mask this status snapshot reports as
+    /// `SigBlk`: the thread its own `Pid:` line names, for every status view.
+    /// A `/proc/<pid>` view maps that number to the guest's through
+    /// `guest_numbers` when the caller filled it (a backend whose kernel
+    /// numbers processes otherwise, DBT); the `/proc/self` and
+    /// `/proc/thread-self` views get no table (`kernel_numbers_held` is empty
+    /// for them), so their `Pid:` is taken as the kernel shows it, the guest's
+    /// number under ptrace, the one backend that blocks in place. The kernel resolves
+    /// `/proc/self` and `/proc/thread-self` when the file is opened, so the
+    /// snapshot describes the opener's process or thread whoever reads it:
+    /// a sibling through a shared descriptor, or a child through an inherited
+    /// one. The reader's identity must not stand in for it (Codex and Claude
+    /// re-checks of R2b-2 stage 2, P2). `None` for a file that is not a
+    /// status. The status views are `/proc/self/status` (`Status`),
+    /// `/proc/thread-self/status` (`ThreadStatus`) and
+    /// `/proc/<pid>[/task/<tid>]/status` (`ProcessStatus`); `stat` renders no
+    /// mask (`sanitize_stat` zeroes its signal fields).
+    pub(crate) fn status_mask_thread(&self, contents: &[u8]) -> Option<i32> {
+        if !matches!(
+            self.kind,
+            ProcfsKind::Status | ProcfsKind::ThreadStatus | ProcfsKind::ProcessStatus
+        ) {
+            return None;
+        }
+        let pid = contents
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| line.strip_prefix(b"Pid:"))
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.trim().parse::<i32>().ok())?;
+        Some(match &self.guest_numbers {
+            Some(numbers) => numbers.get(&pid).copied().unwrap_or(pid),
+            None => pid,
+        })
     }
 
     /// Returns true when the procfs inode binds to the thread that opened it.
@@ -879,6 +1881,63 @@ impl ProcfsFile {
         self.kind == ProcfsKind::RandomUuid
     }
 
+    /// Returns true for `/proc/cpuinfo`, which may be rendered from the
+    /// virtual CPUID table instead of the host's file.
+    pub(crate) fn is_cpuinfo(&self) -> bool {
+        self.kind == ProcfsKind::Cpuinfo
+    }
+
+    /// Whether Linux answers a read of this file at a nonzero position with
+    /// end of file: an integer sysctl (`proc_dointvec`,
+    /// `proc_doulongvec_minmax`) formats its value only for a read from
+    /// position 0, so a read that copied part of it is followed by end of
+    /// file. Of the integer sysctls Detcore serves, only those whose every
+    /// byte it renders follow this so far.
+    fn reads_only_from_the_start(&self) -> bool {
+        match self.kind {
+            ProcfsKind::PtyNr => true,
+            ProcfsKind::Fixed(file) => file.is_integer(),
+            _ => false,
+        }
+    }
+
+    /// Whether this is a process's cgroup file, which may be classified by
+    /// the procfs entry a descriptor reaches as well as by its spelling: its
+    /// rendering depends on no namespace, so it reads alike through any procfs
+    /// mount. Kinds bound to the guest's own mounts, such as mountinfo, are
+    /// not, as a file of another procfs mount fails their identity checks
+    /// (Claude re-check of https://github.com/rrnewton/hermit/pull/4386).
+    pub(crate) fn may_be_named_by_provenance(&self) -> bool {
+        self.kind == ProcfsKind::ProcessCgroup
+    }
+
+    /// Whether a seek of this snapshot moves only from the start or the
+    /// position, as the kernel's `seq_lseek` does, so that SEEK_END,
+    /// SEEK_DATA and SEEK_HOLE are EINVAL before and after the snapshot is
+    /// taken. Only `/proc/<pid>/cgroup` so far (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4386); the other process
+    /// files served from a snapshot still seek as a memory file once read.
+    pub(crate) fn seeks_only_from_start_or_position(&self) -> bool {
+        matches!(
+            self.kind,
+            ProcfsKind::ProcessCgroup | ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts
+        )
+    }
+
+    /// Whether a read that cannot copy everything it formats fails with
+    /// `EFAULT` and leaves the position where it was: a sysctl's
+    /// `proc_sys_call_handler` copies its buffer in one `copy_to_iter` and
+    /// reports any shortfall as a fault, where a `seq_file` returns the bytes
+    /// it copied before the fault. Of the sysctls Detcore serves, only those
+    /// whose every byte it renders follow this so far.
+    pub(crate) fn faults_on_a_short_copy(&self) -> bool {
+        match self.kind {
+            ProcfsKind::RandomUuid | ProcfsKind::PtyNr => true,
+            ProcfsKind::Fixed(file) => !file.is_seq_file(),
+            _ => false,
+        }
+    }
+
     /// Returns true when this snapshot renders `btime`, the boot instant.
     pub(crate) fn needs_boot_time(&self) -> bool {
         self.kind == ProcfsKind::SystemStat
@@ -892,7 +1951,6 @@ impl ProcfsFile {
             virtual_uptime_seconds,
             virtual_boot_time_seconds,
             virtual_realtime_seconds,
-            virtual_memory_kb,
             virtual_pid,
             virtual_ppid,
             virtual_pty_count,
@@ -900,13 +1958,19 @@ impl ProcfsFile {
             random_uuid,
             mapping_identities,
             mountinfo,
+            virtual_cpuinfo,
+            machine,
+            published_sigblk,
+            lock_rows_kept,
         } = context;
         let mapping_identities = &mapping_identities;
         self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
-            ProcfsKind::Status => {
-                sanitize_status(&contents, Some((virtual_pid, virtual_pid, virtual_ppid)))
-            }
+            ProcfsKind::Status => sanitize_status(
+                &contents,
+                Some((virtual_pid, virtual_pid, virtual_ppid)),
+                published_sigblk,
+            ),
             ProcfsKind::ThreadStat => {
                 let (_, tid, ppid) = self
                     .bound_thread_identity
@@ -917,11 +1981,23 @@ impl ProcfsFile {
                 let (tgid, tid, ppid) = self
                     .bound_thread_identity
                     .expect("thread-self status was not bound when opened");
-                sanitize_status(&contents, Some((tgid, tid, ppid)))
+                sanitize_status(&contents, Some((tgid, tid, ppid)), published_sigblk)
             }
-            ProcfsKind::ProcessStat => sanitize_stat(&contents, None),
+            ProcfsKind::ProcessStat => {
+                let sanitized = sanitize_stat(&contents, None);
+                match &self.guest_numbers {
+                    Some(numbers) => renumber_stat(&sanitized, numbers),
+                    None => sanitized,
+                }
+            }
             ProcfsKind::Statm => sanitize_statm(&contents),
-            ProcfsKind::ProcessStatus => sanitize_status(&contents, None),
+            ProcfsKind::ProcessStatus => {
+                let sanitized = sanitize_status(&contents, None, published_sigblk);
+                match &self.guest_numbers {
+                    Some(numbers) => renumber_status(&sanitized, numbers),
+                    None => sanitized,
+                }
+            }
             ProcfsKind::TimerSlack(_) => {
                 unreachable!("timer-slack procfs content is generated from ThreadState")
             }
@@ -929,55 +2005,73 @@ impl ProcfsFile {
                 &contents,
                 virtual_uptime_seconds,
                 virtual_boot_time_seconds.expect("system stat snapshot omitted its boot time"),
+                machine.cpus,
             ),
-            ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
+            // Rendered only where CPUID is virtualized and intercepted, so a
+            // rendered snapshot always has the virtual CPU's table; the
+            // kernel's file, which the template stands in for, was never read.
+            ProcfsKind::Cpuinfo if self.rendered => virtual_cpuinfo
+                .expect("Detcore renders /proc/cpuinfo only from the virtual CPUID table"),
+            ProcfsKind::Cpuinfo => virtual_cpuinfo.unwrap_or_else(|| sanitize_cpuinfo(&contents)),
             ProcfsKind::Diskstats => sanitize_diskstats(&contents),
-            ProcfsKind::Loadavg => sanitize_loadavg(&contents),
             ProcfsKind::ProcessIo => sanitize_process_io(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
-            ProcfsKind::Meminfo => sanitize_meminfo(&contents, virtual_memory_kb),
             ProcfsKind::BlockStat => sanitize_block_stat(&contents),
             ProcfsKind::NodeMeminfo => sanitize_node_meminfo(&contents),
             ProcfsKind::NodeNumastat => sanitize_node_numastat(&contents),
             ProcfsKind::HwmonInput => sanitize_numeric_scalar(&contents),
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
-            ProcfsKind::Vmstat => sanitize_vmstat(&contents),
             ProcfsKind::UeventSeqnum => sanitize_uevent_seqnum(&contents),
+            ProcfsKind::CpuList => sanitize_cpu_list(&contents),
+            ProcfsKind::CpuMask => sanitize_cpu_mask(&contents),
+            ProcfsKind::SingleCpuConstant(file) => file.contents(),
+            ProcfsKind::Fixed(file) => file.contents(&machine),
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
             ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
             ProcfsKind::PtyNr => sanitize_pty_nr(&contents, virtual_pty_count),
             ProcfsKind::SelfSched => sanitize_self_sched(&contents),
             ProcfsKind::Fdinfo => sanitize_fdinfo(&contents, fdinfo_identity),
-            ProcfsKind::AioNr => sanitize_aio_nr(&contents),
-            ProcfsKind::AioMaxNr => sanitize_aio_nr(&contents),
-            ProcfsKind::PipeMaxSize => sanitize_pipe_max_size(&contents),
             ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
-            ProcfsKind::Swaps => sanitize_swaps(&contents),
+            ProcfsKind::ProcessCgroup => sanitize_process_cgroup(&contents),
+            // Binary, and Detcore's own record: kept as it is.
+            ProcfsKind::ProcessAuxv => contents.to_vec(),
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents, mapping_identities),
-            ProcfsKind::Maps => sanitize_maps(&contents, mapping_identities),
-            ProcfsKind::KeyUsers => sanitize_key_users(&contents),
+            ProcfsKind::Maps => {
+                let rendered = sanitize_maps(&contents, mapping_identities);
+                // Retain the exact served vector when diagnosing a divergence,
+                // without a second procfs read. DEBUG formatting can allocate
+                // after capture; INFO runs do not format these bytes. Omission
+                // is explicit rather than a misleading truncated snapshot.
+                if rendered.len() <= 64 * 1024 {
+                    tracing::debug!(
+                        "PROCFS_MAPS_SNAPSHOT len={} bytes={:02x?}",
+                        rendered.len(),
+                        rendered.as_slice()
+                    );
+                } else {
+                    tracing::debug!(
+                        "PROCFS_MAPS_SNAPSHOT omitted=oversize len={}",
+                        rendered.len()
+                    );
+                }
+                rendered
+            }
             ProcfsKind::Pressure => sanitize_pressure(&contents),
-            ProcfsKind::Buddyinfo => sanitize_buddyinfo(&contents),
-            ProcfsKind::Schedstat => sanitize_schedstat(&contents),
             ProcfsKind::SelfSchedstat => sanitize_self_schedstat(&contents),
             ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),
-            ProcfsKind::FileNr => sanitize_file_nr(&contents),
-            ProcfsKind::FileMax => sanitize_file_max(&contents),
-            ProcfsKind::Zoneinfo => sanitize_zoneinfo(&contents),
-            ProcfsKind::InodeNr => sanitize_inode_nr(&contents),
-            ProcfsKind::InodeState => sanitize_inode_state(&contents),
             ProcfsKind::Protocols => sanitize_protocols(&contents),
             ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
-            ProcfsKind::DentryState => sanitize_dentry_state(&contents),
             ProcfsKind::NetlinkSockets => sanitize_netlink_sockets(&contents),
-            ProcfsKind::Locks => sanitize_locks(&contents),
+            ProcfsKind::Locks => {
+                sanitize_locks(&locks::keep_lock_rows(&contents, lock_rows_kept.as_deref()))
+            }
             ProcfsKind::NodeVmstat => sanitize_node_vmstat(&contents),
             ProcfsKind::CppcFeedback => sanitize_cppc_feedback(&contents),
             ProcfsKind::UnixSockets => sanitize_unix_sockets(&contents),
@@ -987,17 +2081,17 @@ impl ProcfsFile {
                 sanitize_sysfs_rtc_attribute(&contents, self.kind.clone(), virtual_realtime_seconds)
             }
             ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
-            ProcfsKind::InterruptCounters => sanitize_interrupt_counters(&contents),
-            ProcfsKind::Modules => sanitize_modules(&contents),
-            ProcfsKind::ModuleRefcnt(module) => {
-                sanitize_module_refcnt(&contents, module.as_str(), &read_host_modules())
-            }
+            ProcfsKind::ModuleRefcnt(module) => sanitize_module_refcnt(&contents, module.as_str()),
             ProcfsKind::Mountinfo => sanitize_mountinfo(
                 &contents,
                 mountinfo
                     .as_ref()
                     .expect("mountinfo identities were not prepared"),
             ),
+            // The container mount table's rendering, or the kernel's bytes
+            // where the run has no table: neither carries an identity Detcore
+            // numbers (no mount ID, device or peer group).
+            ProcfsKind::ProcessMounts => contents,
             ProcfsKind::RandomUuid => sanitize_random_uuid(
                 &contents,
                 random_uuid.expect("random UUID snapshot omitted deterministic bytes"),
@@ -1005,17 +2099,25 @@ impl ProcfsFile {
         });
     }
 
-    /// Returns the next bytes from the normalized snapshot.
+    /// Returns the next bytes from the normalized snapshot, consuming them as
+    /// a read that copies all of them would.
+    #[cfg(test)]
     pub(crate) fn take(&mut self, maximum: usize) -> Option<Vec<u8>> {
-        let bytes = self.take_at(self.offset, maximum)?;
-        self.offset = self.offset.saturating_add(bytes.len());
+        let offset = self.offset;
+        let bytes = self.take_at(offset, maximum)?;
+        self.commit_read(offset, bytes.len());
         Some(bytes)
     }
 
-    /// Whether this is a timer-slack procfs file, including the `self` alias
-    /// whose target is still unbound.
-    pub(crate) fn is_timer_slack(&self) -> bool {
-        matches!(self.kind, ProcfsKind::TimerSlack(_))
+    /// Advance the shared cursor by the bytes a sequential read copied to the
+    /// caller. Like a seq_file read, a read that faults before copying
+    /// anything leaves the cursor where it was.
+    pub(crate) fn commit_read(&mut self, offset: usize, copied: usize) {
+        assert_eq!(
+            self.offset, offset,
+            "procfs cursor changed between preview and commit"
+        );
+        self.offset = self.offset.saturating_add(copied);
     }
 
     /// Return the task id bound to a top-level timer-slack procfs file.
@@ -1110,6 +2212,9 @@ impl ProcfsFile {
     /// Returns bytes at an explicit offset without changing the shared cursor.
     pub(crate) fn take_at(&self, offset: usize, maximum: usize) -> Option<Vec<u8>> {
         let contents = self.contents.as_ref()?;
+        if offset > 0 && self.reads_only_from_the_start() {
+            return Some(Vec::new());
+        }
         let start = offset.min(contents.len());
         let end = start.saturating_add(maximum).min(contents.len());
         Some(contents[start..end].to_vec())
@@ -1129,9 +2234,29 @@ impl ProcfsFile {
         }
     }
 
+    /// Moves the shared cursor as the guest's `lseek` does: as
+    /// [`Self::set_offset`], and a rewind of a rendered per-process file
+    /// drops its snapshot, which the next read takes again, as Linux's
+    /// `single_open` file runs its `show` again after a rewind (and finds the
+    /// task gone, ESRCH, once it is). Adopting a position Detcore did not
+    /// choose (a placeholder's, after a backend rediscovers the descriptor)
+    /// is no rewind and keeps the snapshot.
+    pub(crate) fn seek_to(&mut self, offset: usize) {
+        self.set_offset(offset);
+        if offset == 0 && self.rendered && self.shows_at_read() {
+            self.contents = None;
+        }
+    }
+
     pub(crate) fn target_fd(&self) -> Option<i32> {
         self.target_fd
     }
+}
+
+/// Whether `path` spells `/proc/mounts`, Linux's symbolic link to the
+/// caller's `self/mounts`.
+pub(crate) fn is_proc_mounts_link(path: &Path) -> bool {
+    normalize_observed_path(path).as_deref() == Some(Path::new("/proc/mounts"))
 }
 
 fn normalize_observed_path(path: &Path) -> Option<PathBuf> {
@@ -1278,6 +2403,138 @@ fn is_block_stat_path(path: &str) -> bool {
         .is_some_and(|device| !device.is_empty() && !device.contains('/'))
 }
 
+/// The topology attributes Linux prints as CPU lists and as masks.
+const CPU_TOPOLOGY_ATTRIBUTES: [&str; 6] = [
+    "thread_siblings",
+    "core_cpus",
+    "core_siblings",
+    "cluster_cpus",
+    "die_cpus",
+    "package_cpus",
+];
+
+/// CPU lists that describe the CPUs sharing something with Hermit's single
+/// virtual CPU: `cpu0`'s topology lists, the CPUs sharing each of `cpu0`'s
+/// caches, and `node0`'s CPU list; and the node lists, which name Hermit's
+/// single virtual node, node 0. Other CPUs'
+/// and nodes' files are left to the directory listing, which should not show
+/// them at all.
+fn is_virtual_cpu_list_path(path: &str) -> bool {
+    path == "/sys/devices/system/node/node0/cpulist"
+        || path
+            .strip_prefix("/sys/devices/system/node/")
+            .is_some_and(|list| NODE_LISTS.contains(&list))
+        || is_cpu0_cache_file(path, "shared_cpu_list")
+        || path
+            .strip_prefix("/sys/devices/system/cpu/cpu0/topology/")
+            .and_then(|attribute| attribute.strip_suffix("_list"))
+            .is_some_and(|attribute| CPU_TOPOLOGY_ATTRIBUTES.contains(&attribute))
+}
+
+/// `cpu0/cache/index<N>/<attribute>`: the CPUs sharing one of cpu0's caches.
+fn is_cpu0_cache_file(path: &str, attribute: &str) -> bool {
+    path.strip_prefix("/sys/devices/system/cpu/cpu0/cache/index")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(index, leaf)| {
+            !index.is_empty()
+                && index.bytes().all(|byte| byte.is_ascii_digit())
+                && leaf == attribute
+        })
+}
+
+/// The node lists in `/sys/devices/system/node` that name nodes: those that
+/// are online, possible, or have CPUs or memory. Hermit's single virtual node
+/// is node 0, which has both.
+const NODE_LISTS: &[&str] = &[
+    "online",
+    "possible",
+    "has_cpu",
+    "has_memory",
+    "has_normal_memory",
+];
+
+/// CPU and node files whose contents Hermit fixes for its single virtual CPU
+/// on a single node, whatever the host reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum SingleCpuFile {
+    /// `cpu/kernel_max`, the highest CPU number the kernel supports
+    /// (`NR_CPUS - 1`): 127, the size of the 128-bit mask Detcore's
+    /// `sched_getaffinity` answers with ([`VIRTUAL_CPUSET_BYTES`]), so a
+    /// guest that sizes its CPU set from `kernel_max + 1`, as the kernel
+    /// documents, passes a buffer that call accepts. An SMP kernel reports at
+    /// least 1 here whatever CPUs are present; only a uniprocessor kernel
+    /// reports 0, and it has no `cpu/smt`.
+    KernelMax,
+    /// `cpu/smt/active`: no SMT sibling is online.
+    SmtActive,
+    /// `cpu/smt/control`: `notsupported`, as for a CPU without SMT.
+    SmtControl,
+    /// `cpu0`'s cluster, core, die and package IDs: 0. x86 reports a cluster
+    /// ID of 65535 when the CPU has none, but `/proc/cpuinfo`'s
+    /// `physical id` and `core id`, which Detcore reports as 0, are the same
+    /// numbering.
+    TopologyId,
+    /// `node/has_generic_initiator`: empty, as on a machine without generic
+    /// initiators.
+    GenericInitiators,
+    /// `node0/distance`: one distance per node, so only node 0's to itself,
+    /// which Linux reports as 10.
+    Node0Distance,
+}
+
+impl SingleCpuFile {
+    fn from_path(path: &str) -> Option<Self> {
+        Some(match path {
+            "/sys/devices/system/cpu/kernel_max" => Self::KernelMax,
+            "/sys/devices/system/cpu/smt/active" => Self::SmtActive,
+            "/sys/devices/system/cpu/smt/control" => Self::SmtControl,
+            "/sys/devices/system/node/has_generic_initiator" => Self::GenericInitiators,
+            "/sys/devices/system/node/node0/distance" => Self::Node0Distance,
+            _ => match path.strip_prefix("/sys/devices/system/cpu/cpu0/topology/")? {
+                "cluster_id" | "core_id" | "die_id" | "physical_package_id" => Self::TopologyId,
+                _ => return None,
+            },
+        })
+    }
+
+    fn contents(self) -> Vec<u8> {
+        match self {
+            Self::KernelMax => format!("{}\n", VIRTUAL_CPUSET_BYTES * 8 - 1).into_bytes(),
+            Self::SmtActive | Self::TopologyId => b"0\n".to_vec(),
+            Self::SmtControl => b"notsupported\n".to_vec(),
+            Self::GenericInitiators => b"\n".to_vec(),
+            Self::Node0Distance => b"10\n".to_vec(),
+        }
+    }
+}
+
+/// Whether `name`, an entry of the directory at the canonical path
+/// `directory`, is a CPU, node or cpufreq policy other than number 0, which a
+/// machine with one CPU and one node does not have. glibc's `get_nprocs_conf`
+/// (`sysconf(_SC_NPROCESSORS_CONF)`, `nproc --all`) counts the `cpuN` entries
+/// of `/sys/devices/system/cpu`, and libnuma counts them and the `nodeN`
+/// entries of `/sys/devices/system/node`.
+pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8]) -> bool {
+    let prefix: &[u8] = match directory.to_str() {
+        Some("/sys/devices/system/cpu" | "/sys/bus/cpu/devices") => b"cpu",
+        Some("/sys/devices/system/node" | "/sys/bus/node/devices") => b"node",
+        Some("/sys/devices/system/cpu/cpufreq") => b"policy",
+        _ => return false,
+    };
+    name.strip_prefix(prefix).is_some_and(|number| {
+        !number.is_empty() && number.iter().all(u8::is_ascii_digit) && number != b"0"
+    })
+}
+
+/// The mask forms of [`is_virtual_cpu_list_path`]'s files.
+fn is_virtual_cpu_mask_path(path: &str) -> bool {
+    path == "/sys/devices/system/node/node0/cpumap"
+        || is_cpu0_cache_file(path, "shared_cpu_map")
+        || path
+            .strip_prefix("/sys/devices/system/cpu/cpu0/topology/")
+            .is_some_and(|attribute| CPU_TOPOLOGY_ATTRIBUTES.contains(&attribute))
+}
+
 fn is_numa_node_file(path: &str, filename: &str) -> bool {
     path.strip_prefix("/sys/devices/system/node/node")
         .and_then(|path| path.split_once('/'))
@@ -1339,6 +2596,75 @@ fn sanitize_stat(contents: &[u8], virtual_identity: Option<(i32, i32)>) -> Vec<u
     format!("{pid}{comm} {}\n", fields.join(" ")).into_bytes()
 }
 
+/// The `status` lines whose values are process or thread numbers that
+/// [`renumber_status`] renumbers.
+const STATUS_NUMBER_LABELS: &[&str] = &["Tgid", "Pid", "PPid", "NStgid", "NSpid"];
+
+/// The guest's number for the kernel number `text`, where it is a positive
+/// number: from `numbers`, or 0 where it has none. Anything else (`-1`, `0`)
+/// is kept.
+fn renumbered(text: &str, numbers: &BTreeMap<i32, i32>) -> String {
+    match text.parse::<i32>() {
+        Ok(id) if id > 0 => numbers.get(&id).copied().unwrap_or(0).to_string(),
+        _ => text.to_owned(),
+    }
+}
+
+/// A process's sanitized `stat` with its pid, parent, process group, session
+/// and terminal group renumbered from the kernel's numbers to the guest's.
+fn renumber_stat(contents: &[u8], numbers: &BTreeMap<i32, i32>) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let (Some(comm_start), Some(comm_end)) = (text.find(" ("), text.rfind(") ")) else {
+        return contents.to_vec();
+    };
+    let mut fields = text[comm_end + 2..]
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    // `fields` starts with proc stat field 3 (state): 4 is the parent, 5 the
+    // process group, 6 the session, 8 the terminal's process group.
+    for index in [1, 2, 3, 5] {
+        if let Some(field) = fields.get_mut(index) {
+            *field = renumbered(field, numbers);
+        }
+    }
+    format!(
+        "{}{} {}\n",
+        renumbered(&text[..comm_start], numbers),
+        &text[comm_start..=comm_end],
+        fields.join(" ")
+    )
+    .into_bytes()
+}
+
+/// A process's sanitized `status` with the numbers in its
+/// [`STATUS_NUMBER_LABELS`] lines renumbered from the kernel's to the
+/// guest's.
+fn renumber_status(contents: &[u8], numbers: &BTreeMap<i32, i32>) -> Vec<u8> {
+    let mut renumbered_lines = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let text = String::from_utf8_lossy(line);
+        let body = text.strip_suffix('\n').unwrap_or(&text);
+        match body.split_once(':') {
+            Some((label, value)) if STATUS_NUMBER_LABELS.contains(&label) => {
+                let values = value
+                    .split_whitespace()
+                    .map(|value| renumbered(value, numbers))
+                    .collect::<Vec<_>>()
+                    .join("\t");
+                renumbered_lines.extend_from_slice(format!("{label}:\t{values}").as_bytes());
+                if line.ends_with(b"\n") {
+                    renumbered_lines.push(b'\n');
+                }
+            }
+            _ => renumbered_lines.extend_from_slice(line),
+        }
+    }
+    renumbered_lines
+}
+
 fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
     let fields = contents
         .split(|byte| byte.is_ascii_whitespace())
@@ -1357,7 +2683,11 @@ fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#553)
 // TODO-HUMAN-REVIEW(PR-723): Review /proc status identity field normalization.
-fn sanitize_status(contents: &[u8], virtual_identity: Option<(i32, i32, i32)>) -> Vec<u8> {
+fn sanitize_status(
+    contents: &[u8],
+    virtual_identity: Option<(i32, i32, i32)>,
+    published_sigblk: Option<u64>,
+) -> Vec<u8> {
     const STATE: &[u8] = b"State:";
     const TGID: &[u8] = b"Tgid:";
     const PID: &[u8] = b"Pid:";
@@ -1368,8 +2698,15 @@ fn sanitize_status(contents: &[u8], virtual_identity: Option<(i32, i32, i32)>) -
     const NS_PGID: &[u8] = b"NSpgid:";
     const NS_SID: &[u8] = b"NSsid:";
     const SIGQ: &[u8] = b"SigQ:";
+    const SIGBLK: &[u8] = b"SigBlk:";
     const CPUS_ALLOWED: &[u8] = b"Cpus_allowed:";
     const CPUS_ALLOWED_LIST: &[u8] = b"Cpus_allowed_list:";
+    // The nodes the task may allocate from: Hermit's single virtual node, as
+    // the node lists in /sys/devices/system/node report
+    // (https://github.com/rrnewton/hermit/issues/4160). The mask has 64 bits,
+    // a fixed width, as Cpus_allowed's 128 bits are.
+    const MEMS_ALLOWED: &[u8] = b"Mems_allowed:";
+    const MEMS_ALLOWED_LIST: &[u8] = b"Mems_allowed_list:";
     const VOLUNTARY: &[u8] = b"voluntary_ctxt_switches:";
     const NONVOLUNTARY: &[u8] = b"nonvoluntary_ctxt_switches:";
     const MEMORY_FIELDS: &[&[u8]] = &[
@@ -1428,11 +2765,23 @@ fn sanitize_status(contents: &[u8], virtual_identity: Option<(i32, i32, i32)>) -
         } else if body.starts_with(SIGQ) {
             normalized.extend_from_slice(SIGQ);
             normalized.extend_from_slice(b"\t0/0");
+        } else if let Some(mask) = published_sigblk
+            && body.starts_with(SIGBLK)
+        {
+            // The guest's own mask while Detcore holds the thread under a
+            // private one; the kernel's value is Detcore's.
+            normalized.extend_from_slice(format!("SigBlk:\t{mask:016x}").as_bytes());
         } else if body.starts_with(CPUS_ALLOWED) {
             normalized.extend_from_slice(CPUS_ALLOWED);
             normalized.extend_from_slice(b"\t00000000,00000000,00000000,00000001");
         } else if body.starts_with(CPUS_ALLOWED_LIST) {
             normalized.extend_from_slice(CPUS_ALLOWED_LIST);
+            normalized.extend_from_slice(b"\t0");
+        } else if body.starts_with(MEMS_ALLOWED) {
+            normalized.extend_from_slice(MEMS_ALLOWED);
+            normalized.extend_from_slice(b"\t00000000,00000001");
+        } else if body.starts_with(MEMS_ALLOWED_LIST) {
+            normalized.extend_from_slice(MEMS_ALLOWED_LIST);
             normalized.extend_from_slice(b"\t0");
         } else if body.starts_with(VOLUNTARY) {
             normalized.extend_from_slice(VOLUNTARY);
@@ -1455,23 +2804,87 @@ fn sanitize_status(contents: &[u8], virtual_identity: Option<(i32, i32, i32)>) -
     normalized
 }
 
+/// Reports `/proc/cpuinfo` for Hermit's single virtual CPU, the one
+/// `sched_getaffinity` returns. The kernel prints one block per online CPU,
+/// separated by blank lines; only the first block is kept, so the processor
+/// count no longer follows the host's. Its topology fields describe a
+/// one-core, one-thread package, and its frequency is the virtual 1 GHz.
 fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
-    const CPU_MHZ: &[u8] = b"cpu MHz";
+    const TOPOLOGY: &[(&[u8], &[u8])] = &[
+        (b"cpu MHz", b"cpu MHz\t\t: 1000.000"),
+        (b"physical id", b"physical id\t: 0"),
+        (b"siblings", b"siblings\t: 1"),
+        (b"core id", b"core id\t\t: 0"),
+        (b"cpu cores", b"cpu cores\t: 1"),
+        (b"apicid", b"apicid\t\t: 0"),
+        (b"initial apicid", b"initial apicid\t: 0"),
+    ];
 
     let mut normalized = Vec::with_capacity(contents.len());
+    let mut seen_processor = false;
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(CPU_MHZ) {
-            normalized.extend_from_slice(b"cpu MHz\t\t: 1000.000");
-        } else {
-            normalized.extend_from_slice(body);
+        if body.starts_with(b"processor") {
+            if seen_processor {
+                // The second CPU's block: the blank line that ended the first
+                // one has already been copied, as the kernel's file ends.
+                break;
+            }
+            seen_processor = true;
+        }
+        let key = body
+            .split(|byte| *byte == b':')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii_end();
+        match TOPOLOGY.iter().find(|(name, _)| key == *name) {
+            Some((_, replacement)) => normalized.extend_from_slice(replacement),
+            None => normalized.extend_from_slice(body),
         }
         if has_newline {
             normalized.push(b'\n');
         }
     }
     normalized
+}
+
+/// Reports a kernel CPU mask (comma-separated groups of hex digits, as in
+/// `cpu0/topology/thread_siblings` or `node0/cpumap`) as Hermit's single
+/// virtual CPU, `1`. Anything that is not a newline-terminated hex mask is
+/// returned unchanged.
+fn sanitize_cpu_mask(contents: &[u8]) -> Vec<u8> {
+    let Some(mask) = contents.strip_suffix(b"\n") else {
+        return contents.to_vec();
+    };
+    if mask.is_empty()
+        || !mask
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit() || *byte == b',')
+    {
+        return contents.to_vec();
+    }
+    b"1\n".to_vec()
+}
+
+/// Reports a kernel CPU list (`/sys/devices/system/cpu/online` and its
+/// `possible` and `present` siblings) as Hermit's single virtual CPU. glibc's
+/// `get_nprocs`, and so `sysconf(_SC_NPROCESSORS_ONLN)`, `getconf` and
+/// Python's `os.cpu_count`, read `online`; reported raw, they count the host's
+/// CPUs while `sched_getaffinity` reports one. Anything that is not a cpulist
+/// of digits, commas and ranges is returned unchanged.
+fn sanitize_cpu_list(contents: &[u8]) -> Vec<u8> {
+    let Some(list) = contents.strip_suffix(b"\n") else {
+        return contents.to_vec();
+    };
+    if list.is_empty()
+        || !list
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b',' || *byte == b'-')
+    {
+        return contents.to_vec();
+    }
+    b"0\n".to_vec()
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1800,14 +3213,6 @@ fn sanitize_btrfs_bytes_may_use(contents: &[u8]) -> Vec<u8> {
     }
 }
 
-fn sanitize_loadavg(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        b"0.00 0.00 0.00 1/1 1\n".to_vec()
-    }
-}
-
 fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
     if contents.is_empty() {
         Vec::new()
@@ -1818,309 +3223,74 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-843): Review deterministic procfs system accounting.
+/// `/proc/stat` for a snapshot the kernel's file was captured for (under
+/// record and replay, or after a `chroot`): the same bytes Detcore renders
+/// for its own open ([`render_system_stat`]), so that the file has one layout
+/// whichever opened it. Nothing of the capture is kept but whether it was
+/// empty: the host's lines, such as its `intr` line with a field per host
+/// interrupt number, would show the host.
 fn sanitize_system_stat(
     contents: &[u8],
     virtual_uptime_seconds: u64,
     virtual_boot_time_seconds: i64,
+    cpus: u32,
 ) -> Vec<u8> {
-    const VOLATILE_FIELDS: &[&[u8]] = &[
-        b"intr",
-        b"ctxt",
-        b"processes",
-        b"procs_running",
-        b"procs_blocked",
-        b"softirq",
-    ];
+    if contents.is_empty() {
+        Vec::new()
+    } else {
+        render_system_stat(virtual_uptime_seconds, virtual_boot_time_seconds, cpus)
+    }
+}
 
-    let cpu_count = contents
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.split(|byte| byte.is_ascii_whitespace()).next())
-        .filter(|name| name.starts_with(b"cpu") && *name != b"cpu")
-        .count() as u64;
-    let per_cpu_idle_ticks = virtual_uptime_seconds.saturating_mul(100);
-    let counters = sanitize_named_counters(
-        contents,
-        |name| name.starts_with(b"cpu") || VOLATILE_FIELDS.contains(&name),
-        |name, index| {
-            if index == 0 && name == b"cpu" {
-                per_cpu_idle_ticks.saturating_mul(cpu_count)
-            } else if index == 0 && name.starts_with(b"cpu") {
-                per_cpu_idle_ticks
-            } else {
-                0
-            }
-        },
+/// The kernel-shaped bytes a rendered `/proc/stat` snapshot starts from:
+/// [`render_system_stat`] at uptime 0 and boot time 0 on one CPU.
+const SYSTEM_STAT_TEMPLATE: &[u8] = b"cpu  0 0 0 0 0 0 0 0 0 0\n\
+cpu0 0 0 0 0 0 0 0 0 0 0\n\
+intr 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+ctxt 0\n\
+btime 0\n\
+processes 0\n\
+procs_running 0\n\
+procs_blocked 0\n\
+softirq 0 0 0 0 0 0 0 0 0 0 0\n";
+
+/// `/proc/stat` in the layout of Linux's `show_stat` (`fs/proc/stat.c`), for
+/// a machine of `cpus` CPUs whose uptime is `virtual_uptime_seconds` and whose
+/// boot instant is `virtual_boot_time_seconds`:
+///
+/// - the aggregate line, spelled `cpu` and two spaces as Linux spells it, and
+///   a `cpuN` line per CPU, each with Linux's ten columns in USER_HZ (100)
+///   ticks. Every CPU spent the whole uptime in the first column (user),
+///   none of it idle, as `/proc/uptime`'s idle time of 0 says; the aggregate
+///   is their sum.
+/// - `intr`, the total and one count per interrupt number, for the
+///   [`fixed::NR_IRQS`] numbers every x86 kernel has (`/proc/interrupts`
+///   lists lines below it); `ctxt`; `btime`, the boot instant, which is fixed
+///   for the run; `processes`, `procs_running` and `procs_blocked`; and
+///   `softirq`, the total and one count per softirq ([`fixed::SOFTIRQS`],
+///   Linux's `NR_SOFTIRQS`). Every count is 0, as `/proc/interrupts` and
+///   `/proc/softirqs` show.
+///
+/// Nothing here comes from the host, so every backend renders the same bytes.
+fn render_system_stat(
+    virtual_uptime_seconds: u64,
+    virtual_boot_time_seconds: i64,
+    cpus: u32,
+) -> Vec<u8> {
+    // USER_HZ.
+    let per_cpu = virtual_uptime_seconds.saturating_mul(100);
+    let total = per_cpu.saturating_mul(u64::from(cpus));
+    let idle_columns = " 0".repeat(9);
+    let mut out = format!("cpu  {total}{idle_columns}\n");
+    for cpu in 0..cpus {
+        out += &format!("cpu{cpu} {per_cpu}{idle_columns}\n");
+    }
+    out += &format!("intr 0{}\n", " 0".repeat(fixed::NR_IRQS));
+    out += &format!(
+        "ctxt 0\nbtime {virtual_boot_time_seconds}\nprocesses 0\nprocs_running 0\nprocs_blocked 0\n"
     );
-
-    let mut normalized = Vec::with_capacity(counters.len());
-    for line in counters.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(b"btime ") {
-            normalized.extend_from_slice(format!("btime {virtual_boot_time_seconds}").as_bytes());
-        } else {
-            normalized.extend_from_slice(body);
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-fn sanitize_named_counters(
-    contents: &[u8],
-    should_normalize: impl Fn(&[u8]) -> bool,
-    counter_value: impl Fn(&[u8], usize) -> u64,
-) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        let mut fields = body
-            .split(|byte| byte.is_ascii_whitespace())
-            .filter(|field| !field.is_empty());
-        let name = fields.next().unwrap_or_default();
-        if should_normalize(name) {
-            normalized.extend_from_slice(name);
-            for (index, _) in fields.enumerate() {
-                normalized.push(b' ');
-                normalized.extend_from_slice(counter_value(name, index).to_string().as_bytes());
-            }
-        } else {
-            normalized.extend_from_slice(body);
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-863): Review canonical /proc/meminfo guest accounting.
-/// Replaces host-global memory pressure with Hermit's configured guest memory.
-fn sanitize_meminfo(contents: &[u8], virtual_memory_kb: u64) -> Vec<u8> {
-    if contents.is_empty() {
-        return Vec::new();
-    }
-    format!(
-        "MemTotal:       {virtual_memory_kb} kB\n\
-         MemFree:        {virtual_memory_kb} kB\n\
-         MemAvailable:   {virtual_memory_kb} kB\n\
-         Buffers:        0 kB\n\
-         Cached:         0 kB\n\
-         SwapCached:     0 kB\n\
-         Active:         0 kB\n\
-         Inactive:       0 kB\n\
-         Shmem:          0 kB\n\
-         SReclaimable:   0 kB\n\
-         SwapTotal:      0 kB\n\
-         SwapFree:       0 kB\n"
-    )
-    .into_bytes()
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-951): Review the /proc/key-users quota accounting policy.
-fn sanitize_key_users(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let fields = body.split_whitespace().collect::<Vec<_>>();
-        let [uid, usage, key_counts, key_quota, byte_quota] = fields.as_slice() else {
-            return contents.to_vec();
-        };
-        let Some(uid) = uid
-            .strip_suffix(':')
-            .filter(|uid| uid.parse::<u32>().is_ok())
-        else {
-            return contents.to_vec();
-        };
-        if usage.parse::<u64>().is_err() || parse_key_user_pair(key_counts).is_none() {
-            return contents.to_vec();
-        }
-        let Some((_, max_keys)) = parse_key_user_pair(key_quota) else {
-            return contents.to_vec();
-        };
-        let Some((_, max_bytes)) = parse_key_user_pair(byte_quota) else {
-            return contents.to_vec();
-        };
-
-        normalized.extend_from_slice(format!("{uid}: 0 0/0 0/{max_keys} 0/{max_bytes}").as_bytes());
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-fn parse_key_user_pair(field: &str) -> Option<(u64, u64)> {
-    let (current, maximum) = field.split_once('/')?;
-    Some((current.parse().ok()?, maximum.parse().ok()?))
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-905): Review the /proc/buddyinfo field policy.
-fn sanitize_buddyinfo(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let fields = body.split_whitespace().collect::<Vec<_>>();
-        let is_buddy_row = fields.len() >= 5
-            && fields[0] == "Node"
-            && fields[1].ends_with(',')
-            && fields[2] == "zone"
-            && fields[4..].iter().all(|field| field.parse::<u64>().is_ok());
-
-        if is_buddy_row {
-            normalized.extend_from_slice(fields[..4].join(" ").as_bytes());
-            for _ in &fields[4..] {
-                normalized.extend_from_slice(b" 0");
-            }
-        } else {
-            normalized.extend_from_slice(body.as_bytes());
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-910): Review the /proc/sys/fs/file-nr policy.
-const VIRTUAL_FILE_MAX: u64 = i64::MAX as u64;
-
-fn sanitize_file_nr(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        format!("0\t0\t{VIRTUAL_FILE_MAX}\n").into_bytes()
-    }
-}
-
-fn sanitize_file_max(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        format!("{VIRTUAL_FILE_MAX}\n").into_bytes()
-    }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-914): Review the /proc/sys/fs/inode-nr field policy.
-fn sanitize_inode_nr(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        b"0\t0\n".to_vec()
-    }
-}
-
-fn sanitize_inode_state(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        b"0\t0\t0\t0\t0\t0\t0\n".to_vec()
-    }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-918): Review the /proc/sys/fs/dentry-state field policy.
-fn sanitize_dentry_state(contents: &[u8]) -> Vec<u8> {
-    if contents.is_empty() {
-        Vec::new()
-    } else {
-        b"0\t0\t45\t0\t0\t0\n".to_vec()
-    }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-945): Review the zeroed /proc/swaps Used column policy.
-fn sanitize_swaps(contents: &[u8]) -> Vec<u8> {
-    const HEADER: [&str; 5] = ["Filename", "Type", "Size", "Used", "Priority"];
-
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-    let mut lines = text.split_inclusive('\n');
-    let Some(header) = lines.next() else {
-        return Vec::new();
-    };
-    if !header.split_whitespace().eq(HEADER) {
-        return contents.to_vec();
-    }
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    normalized.extend_from_slice(header.as_bytes());
-    for line in lines {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let fields = body.split_whitespace().collect::<Vec<_>>();
-        let [filename, swap_type, size, used, priority] = fields.as_slice() else {
-            return contents.to_vec();
-        };
-        if size.parse::<u64>().is_err()
-            || used.parse::<u64>().is_err()
-            || priority.parse::<i32>().is_err()
-        {
-            return contents.to_vec();
-        }
-
-        normalized.extend_from_slice(
-            format!("{filename}\t{swap_type}\t{size}\t0\t{priority}").as_bytes(),
-        );
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-933): Review the /proc/sys/fs/aio-nr policy.
-/// Report the deterministic pipe ceiling rather than the host's sysctl.
-///
-/// `/proc/sys/fs/pipe-max-size` is host-global and commonly differs by a factor
-/// of sixteen between a default host (1048576) and a hardened one (65536). A
-/// guest that reads it branches on the machine it happens to be running on.
-///
-/// The value returned is [`DETERMINISTIC_PIPE_CAPACITY_BYTES`], which is also
-/// the ceiling `F_SETPIPE_SZ` enforces, so what the guest is told and what the
-/// guest is allowed are the same number by construction rather than by two
-/// constants agreeing today.
-///
-/// A file whose contents are not a plain integer is not this sysctl; return
-/// empty rather than inventing a value, matching `sanitize_aio_nr`.
-fn sanitize_pipe_max_size(contents: &[u8]) -> Vec<u8> {
-    let Ok(value) = std::str::from_utf8(contents) else {
-        return Vec::new();
-    };
-    value.trim().parse::<u64>().ok().map_or_else(Vec::new, |_| {
-        format!("{DETERMINISTIC_PIPE_CAPACITY_BYTES}\n").into_bytes()
-    })
-}
-
-fn sanitize_aio_nr(contents: &[u8]) -> Vec<u8> {
-    let Ok(value) = std::str::from_utf8(contents) else {
-        return Vec::new();
-    };
-    value
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map_or_else(Vec::new, |_| b"0\n".to_vec())
+    out += &format!("softirq 0{}\n", " 0".repeat(fixed::SOFTIRQS.len()));
+    out.into_bytes()
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2569,38 +3739,6 @@ fn sanitize_block_inflight(contents: &[u8]) -> Vec<u8> {
     }
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-938): Review the /proc/vmstat field policy.
-fn sanitize_vmstat(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-    let mut normalized = Vec::with_capacity(contents.len());
-    let mut row_count = 0;
-
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let fields = body.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 2 || fields[0].is_empty() || fields[1].parse::<u64>().is_err() {
-            return contents.to_vec();
-        }
-
-        normalized.extend_from_slice(fields[0].as_bytes());
-        normalized.extend_from_slice(b" 0");
-        if has_newline {
-            normalized.push(b'\n');
-        }
-        row_count += 1;
-    }
-
-    if row_count == 0 {
-        contents.to_vec()
-    } else {
-        normalized
-    }
-}
-
 fn sockstat_field(fields: &[String], name: &str) -> Option<String> {
     let index = fields.iter().position(|field| field == name)?;
     fields.get(index + 1).cloned()
@@ -2769,6 +3907,18 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
             // forward-compatible numeric telemetry deterministic without
             // accepting malformed or negative unknown fields.
             Some("0")
+        } else if right
+            .trim()
+            .parse::<f64>()
+            .is_ok_and(|value| value.is_finite() && !value.is_sign_negative())
+            && right.trim().contains('.')
+        {
+            // With kernel.sched_schedstats=1 the kernel adds nanosecond fields
+            // printed as milliseconds with six decimals (sum_sleep_runtime,
+            // wait_max, avg_atom, ...; kernel/sched/debug.c,
+            // proc_sched_show_task). They are host timing, so they become
+            // zero; refusing them emptied the whole file for the guest.
+            Some("0.000000")
         } else {
             return Vec::new();
         };
@@ -2978,6 +4128,45 @@ fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+/// A process's cgroup, as for a process in the root cgroup: every
+/// `hierarchy-ID:controllers:path` line keeps its ID and controllers and gets
+/// the path `/`. That agrees with the guest's other views, which are the
+/// initial cgroup namespace's (`/proc/self/ns/cgroup`) and the host's
+/// `/sys/fs/cgroup`. The host's path names whatever launched Hermit, such as a
+/// systemd unit named after its start time, so two separately launched runs
+/// read different bytes, and Go, which reads this file at every process start
+/// to size GOMAXPROCS from its cgroup's `cpu.max`, then took different
+/// branches, ran for different virtual times and wrote different timestamps
+/// into its build cache (https://github.com/rrnewton/hermit/issues/4378).
+/// With the path `/`, Go reads `/sys/fs/cgroup/cpu.max` instead: absent on a
+/// host's real root cgroup, but the launcher's quota at the root of a private
+/// cgroup namespace (a container), so launchers with different quotas can
+/// still differ (https://github.com/rrnewton/hermit/issues/4388).
+///
+/// Split on bytes: a cgroup directory name may hold any byte but `/` and NUL,
+/// and a name that is not UTF-8 must not pass through.
+fn sanitize_process_cgroup(contents: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|&byte| byte == b'\n') {
+        let has_newline = line.ends_with(b"\n");
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let mut fields = body.splitn(3, |&byte| byte == b':');
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some(hierarchy), Some(controllers), Some(_path)) => {
+                normalized.extend_from_slice(hierarchy);
+                normalized.push(b':');
+                normalized.extend_from_slice(controllers);
+                normalized.extend_from_slice(b":/");
+            }
+            _ => normalized.extend_from_slice(body),
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+    normalized
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-944): Review the /proc/self/arch_status field policy.
 fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
@@ -2989,10 +4178,14 @@ fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
     for line in text.split_inclusive('\n') {
         let has_newline = line.ends_with('\n');
         let body = line.strip_suffix('\n').unwrap_or(line);
+        // The kernel prints -1 for a task that has never used AVX-512
+        // (arch/x86/kernel/fpu/xstate.c, avx512_status), so whether a guest
+        // sees -1 or a time depends on whether the host's libraries chose
+        // AVX-512 code. Both become 0, the same on every host.
         let elapsed = body
             .strip_prefix("AVX512_elapsed_ms:")
             .map(str::trim)
-            .and_then(|value| value.parse::<u64>().ok());
+            .filter(|value| *value == "-1" || value.parse::<u64>().is_ok());
         if elapsed.is_some() {
             normalized.extend_from_slice(b"AVX512_elapsed_ms:\t0");
         } else {
@@ -3278,147 +4471,21 @@ fn sanitize_pressure(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
-fn sanitize_zoneinfo(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let trimmed = body.trim_start();
-        if trimmed.starts_with("Node ") || trimmed.starts_with("cpu: ") {
-            normalized.extend_from_slice(body.as_bytes());
-        } else {
-            normalized.extend_from_slice(zero_decimal_runs(body).as_bytes());
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-883): Review synthetic interrupt and module accounting values.
-fn sanitize_interrupt_counters(contents: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        let Some(colon) = body.iter().position(|byte| *byte == b':') else {
-            normalized.extend_from_slice(line);
-            continue;
-        };
-        let fields = body[colon + 1..]
-            .split(u8::is_ascii_whitespace)
-            .filter(|field| !field.is_empty())
-            .collect::<Vec<_>>();
-        let counter_count = fields
-            .iter()
-            .take_while(|field| field.iter().all(u8::is_ascii_digit))
-            .count();
-        if counter_count == 0 {
-            normalized.extend_from_slice(line);
-            continue;
-        }
-
-        normalized.extend_from_slice(&body[..=colon]);
-        for (index, field) in fields.iter().enumerate() {
-            normalized.push(b' ');
-            normalized.extend_from_slice(if index < counter_count { b"0" } else { field });
-        }
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-883): Review synthetic module reference counts.
-fn sanitize_modules(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let mut fields = body
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if fields.len() >= 4 {
-            let holders = if fields[3] == "-" {
-                0
-            } else {
-                fields[3]
-                    .split(',')
-                    .filter(|holder| !holder.is_empty())
-                    .count()
-            };
-            fields[2] = holders.to_string();
-        }
-        normalized.extend_from_slice(fields.join(" ").as_bytes());
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
-}
-
-fn sanitize_module_refcnt(contents: &[u8], module: &str, modules: &str) -> Vec<u8> {
+/// `/sys/module/<name>/refcnt` agrees with the published `/proc/modules`: that
+/// table lists no module, so nothing holds `module` and its count is 0.
+/// Deriving the count from the host holder list would leak the same host
+/// state `sanitize_modules` hides (a module loaded between runs changes the
+/// holders of the modules it depends on).
+fn sanitize_module_refcnt(contents: &[u8], _module: &str) -> Vec<u8> {
     let has_newline = contents.ends_with(b"\n");
     let value = contents.strip_suffix(b"\n").unwrap_or(contents);
     if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
         return contents.to_vec();
     }
 
-    // Publish the same deterministic count the guest sees in /proc/modules.
-    // Volatile transient references (open fds, in-flight calls) are dropped;
-    // structural dependency holds are kept, because they are reproducible and
-    // are part of what Linux reports here.
-    let count = deterministic_module_holder_count(modules, module);
-    let mut normalized = count.to_string().into_bytes();
+    let mut normalized = b"0".to_vec();
     if has_newline {
         normalized.push(b'\n');
-    }
-    normalized
-}
-
-fn sanitize_schedstat(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let mut fields = body
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-
-        let preserved_fields = match fields.first().map(String::as_str) {
-            Some("timestamp") => 1,
-            Some(label) if numbered_label(label, "cpu") => 1,
-            Some(label) if numbered_label(label, "domain") => 3,
-            _ => fields.len(),
-        };
-        for field in fields.iter_mut().skip(preserved_fields) {
-            if field.parse::<u128>().is_ok() {
-                *field = "0".to_owned();
-            }
-        }
-
-        normalized.extend_from_slice(fields.join(" ").as_bytes());
-        if has_newline {
-            normalized.push(b'\n');
-        }
     }
     normalized
 }
@@ -3568,12 +4635,6 @@ fn sanitize_random_uuid(contents: &[u8], mut random: [u8; 16]) -> Vec<u8> {
     .into_bytes()
 }
 
-fn numbered_label(label: &str, prefix: &str) -> bool {
-    label.strip_prefix(prefix).is_some_and(|suffix| {
-        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-    })
-}
-
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-922): Review the /proc/self/schedstat field policy.
 fn sanitize_self_schedstat(contents: &[u8]) -> Vec<u8> {
@@ -3599,23 +4660,6 @@ fn sanitize_softnet_stat(_contents: &[u8]) -> Vec<u8> {
     const VIRTUAL_SOFTNET_STAT: &[u8] =
         b"00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000\n";
     VIRTUAL_SOFTNET_STAT.to_vec()
-}
-
-fn zero_decimal_runs(text: &str) -> String {
-    let mut normalized = String::with_capacity(text.len());
-    let mut in_digits = false;
-    for character in text.chars() {
-        if character.is_ascii_digit() {
-            if !in_digits {
-                normalized.push('0');
-                in_digits = true;
-            }
-        } else {
-            in_digits = false;
-            normalized.push(character);
-        }
-    }
-    normalized
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3730,6 +4774,11 @@ fn sanitize_rtc(contents: &[u8], virtual_realtime_seconds: i64) -> Vec<u8> {
 // stay distinct, holder/waiter groups stay adjacent, and raw ID renumbering or
 // row reordering does not change the resulting snapshot. An unknown format
 // fails the complete snapshot closed instead of leaking any raw identities.
+//
+// The rows reaching this function are the guest's own: the caller has already
+// dropped every other process's rows (`locks::keep_lock_rows`), so a lock
+// outside the container neither adds a row nor shifts the numbering of the
+// guest's rows.
 fn sanitize_locks(contents: &[u8]) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return Vec::new();
@@ -3738,45 +4787,14 @@ fn sanitize_locks(contents: &[u8]) -> Vec<u8> {
         return Vec::new();
     }
 
-    #[derive(Clone)]
-    struct LockRow {
-        sequence: String,
-        waiter: bool,
-        fields: Vec<String>,
-        owner_index: usize,
-        object_index: usize,
-    }
+    use locks::LockLine as LockRow;
 
     let mut rows: Vec<LockRow> = Vec::new();
     for line in text.lines() {
-        let fields = line
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let waiter = fields.get(1).is_some_and(|field| field == "->");
-        let details = usize::from(waiter) + 1;
-        let owner_index = details + 3;
-        let object_index = details + 4;
-        let Some(sequence) = fields
-            .first()
-            .and_then(|field| field.strip_suffix(':'))
-            .filter(|field| !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit()))
-        else {
+        let Some(row) = locks::parse_line(line) else {
             return Vec::new();
         };
-        if fields.len() != details + 7
-            || fields[owner_index].parse::<i64>().is_err()
-            || fields[object_index].split(':').count() != 3
-        {
-            return Vec::new();
-        }
-        rows.push(LockRow {
-            sequence: sequence.to_owned(),
-            waiter,
-            fields,
-            owner_index,
-            object_index,
-        });
+        rows.push(row);
     }
 
     let mut object_signatures: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -4005,7 +5023,7 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/loadavg"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Loadavg
+            ProcfsKind::Fixed(FixedProcfsFile::Loadavg)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/uptime"))
@@ -4017,7 +5035,7 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/meminfo"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Meminfo
+            ProcfsKind::Fixed(FixedProcfsFile::Meminfo)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/net/sockstat"))
@@ -4029,7 +5047,7 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/vmstat"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Vmstat
+            ProcfsKind::Fixed(FixedProcfsFile::Vmstat)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/sys/block/md0/inflight"))
@@ -4090,13 +5108,13 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/sys/fs/aio-nr"))
                 .unwrap()
                 .kind,
-            ProcfsKind::AioNr
+            ProcfsKind::Fixed(FixedProcfsFile::AioNr)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/sys/fs/aio-max-nr"))
                 .unwrap()
                 .kind,
-            ProcfsKind::AioMaxNr
+            ProcfsKind::Fixed(FixedProcfsFile::AioMaxNr)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
@@ -4116,17 +5134,28 @@ mod tests {
                 .kind,
             ProcfsKind::ArchStatus
         );
+        for path in [
+            "/proc/self/cgroup",
+            "/proc/42/cgroup",
+            "/proc/42/task/43/cgroup",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::ProcessCgroup,
+                "{path}"
+            );
+        }
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/swaps"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Swaps
+            ProcfsKind::Fixed(FixedProcfsFile::Swaps)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/key-users"))
                 .unwrap()
                 .kind,
-            ProcfsKind::KeyUsers
+            ProcfsKind::Fixed(FixedProcfsFile::KeyUsers)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/123/io"))
@@ -4156,13 +5185,13 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/buddyinfo"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Buddyinfo
+            ProcfsKind::Fixed(FixedProcfsFile::Buddyinfo)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/schedstat"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Schedstat
+            ProcfsKind::Fixed(FixedProcfsFile::Schedstat)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/net/softnet_stat"))
@@ -4174,37 +5203,43 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr"))
                 .unwrap()
                 .kind,
-            ProcfsKind::FileNr
+            ProcfsKind::Fixed(FixedProcfsFile::FileNr)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/sys/fs/file-max"))
                 .unwrap()
                 .kind,
-            ProcfsKind::FileMax
+            ProcfsKind::Fixed(FixedProcfsFile::FileMax)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/zoneinfo"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Zoneinfo
+            ProcfsKind::Fixed(FixedProcfsFile::Zoneinfo)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/sys/fs/inode-nr"))
                 .unwrap()
                 .kind,
-            ProcfsKind::InodeNr
+            ProcfsKind::Fixed(FixedProcfsFile::InodeNr)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/sys/fs/inode-state"))
                 .unwrap()
                 .kind,
-            ProcfsKind::InodeState
+            ProcfsKind::Fixed(FixedProcfsFile::InodeState)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/net/protocols"))
                 .unwrap()
                 .kind,
             ProcfsKind::Protocols
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/cgroups"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Fixed(FixedProcfsFile::Cgroups)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/locks"))
@@ -4234,7 +5269,7 @@ mod tests {
             ProcfsFile::from_path(Path::new("/proc/sys/fs/dentry-state"))
                 .unwrap()
                 .kind,
-            ProcfsKind::DentryState
+            ProcfsKind::Fixed(FixedProcfsFile::DentryState)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/net/netlink"))
@@ -4537,6 +5572,10 @@ Rss:                   4 kB\n" as &[u8];
             ("/proc/37/mountinfo", ProcfsKind::Mountinfo),
             ("/proc/self/task/38/mountinfo", ProcfsKind::Mountinfo),
             ("/proc/37/task/38/mountinfo", ProcfsKind::Mountinfo),
+            ("/proc/mounts", ProcfsKind::ProcessMounts),
+            ("/proc/self/mounts", ProcfsKind::ProcessMounts),
+            ("/proc/thread-self/mounts", ProcfsKind::ProcessMounts),
+            ("/proc/37/task/38/mounts", ProcfsKind::ProcessMounts),
             ("/proc/sys/kernel/random/uuid", ProcfsKind::RandomUuid),
         ] {
             assert_eq!(ProcfsFile::from_path(Path::new(path)).unwrap().kind, kind);
@@ -4545,9 +5584,79 @@ Rss:                   4 kB\n" as &[u8];
             "/proc/task/mountinfo",
             "/proc/37/task/self/mountinfo",
             "/proc/37/task/38/mountinfo/extra",
+            "/proc/mounts/extra",
+            "/proc/37/task/self/mounts",
         ] {
-            assert!(ProcfsFile::from_path(Path::new(path)).is_none());
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
         }
+    }
+
+    /// A process's `mountinfo` and `mounts` are per-process files Detcore
+    /// renders exactly in a session with a container mount table
+    /// (https://github.com/rrnewton/hermit/issues/4213, K3a), at their task's
+    /// path, with their snapshot taken at the first read and no task check
+    /// at a read. `/proc/mounts` is the caller's `mounts`, through Linux's
+    /// link.
+    #[test]
+    fn the_mount_table_files_are_rendered_per_process_where_the_session_has_a_table() {
+        for (spelling, name, rendering) in [
+            (
+                "/proc/self/mountinfo",
+                "mountinfo",
+                MountTableRendering::Mountinfo,
+            ),
+            (
+                "/proc/thread-self/mountinfo",
+                "mountinfo",
+                MountTableRendering::Mountinfo,
+            ),
+            ("/proc/mounts", "mounts", MountTableRendering::Mounts),
+            ("/proc/self/mounts", "mounts", MountTableRendering::Mounts),
+        ] {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            assert_eq!(file.per_process_name(), Some(name), "{spelling}");
+            assert_eq!(file.mount_table_rendering(), Some(rendering), "{spelling}");
+            assert!(file.snapshot_at_first_read(), "{spelling}");
+            assert!(!file.shows_at_read(), "{spelling}");
+            assert!(file.kernel_served(), "{spelling}");
+            assert!(file.seeks_only_from_start_or_position(), "{spelling}");
+            assert_eq!(file.rendered_path(RenderedFiles::ALL), None, "unbound");
+            file.bind_task(37, 38);
+            let without = RenderedFiles::of(true, true, false);
+            assert_eq!(
+                file.rendered_path(without),
+                None,
+                "{spelling} without a table"
+            );
+            let expected = if spelling.starts_with("/proc/thread-self") {
+                format!("/proc/37/task/38/{name}")
+            } else {
+                format!("/proc/37/{name}")
+            };
+            let path = file.rendered_path(RenderedFiles::ALL).unwrap();
+            assert_eq!(path, Path::new(&expected), "{spelling}");
+            // Opened as rendered, it stays so whatever the session renders.
+            let rendered = file.into_rendered();
+            assert_eq!(rendered.rendered_path(without), Some(path));
+            assert_eq!(rendered.rendering_template(), b"");
+        }
+        // A kernel-opened file's view is pinned at its open, and survives a
+        // copy of the description.
+        let mut file = ProcfsFile::from_path(Path::new("/proc/self/mountinfo")).unwrap();
+        assert_eq!(file.pinned_mount_view(), None);
+        file.pin_mount_view(true);
+        assert_eq!(file.clone().pinned_mount_view(), Some(true));
+        let restored: ProcfsFile =
+            serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+        assert_eq!(restored.pinned_mount_view(), Some(true));
+        assert!(is_proc_mounts_link(Path::new("/proc/mounts")));
+        assert!(is_proc_mounts_link(Path::new("/proc/./mounts")));
+        assert!(!is_proc_mounts_link(Path::new("/proc/self/mounts")));
+        // Without a table, a kernel-opened `mounts` reads the kernel's bytes.
+        let mut file = ProcfsFile::from_path(Path::new("/proc/self/mounts")).unwrap();
+        let kernel = b"proc /proc proc rw 0 0\n".to_vec();
+        file.initialize(kernel.clone(), ProcfsSnapshotContext::default());
+        assert_eq!(file.contents.as_deref(), Some(kernel.as_slice()));
     }
 
     fn mountinfo_snapshot(contents: &[u8], devices: BTreeMap<u64, u64>) -> MountInfoSnapshot {
@@ -4771,6 +5880,145 @@ Rss:                   4 kB\n" as &[u8];
         }
     }
 
+    const SEED_ROW: &[u8] = b"76 1 0:50 / /mnt/xarfuse/uid-1000/e62a203d-seed-nspid4026531836_cgpid16161-ns-4026531832 rw,nosuid,nodev,relatime master:48 - fuse.squashfuse_ll squashfuse_ll rw,user_id=1000,group_id=100,allow_other\n";
+    const SEED_ROW_2: &[u8] = b"83 1 0:57 / /mnt/xarfuse/uid-0/695e3eea-seed-nspid4026531836_cgpid52904797-ns-4026531832 rw,nosuid,nodev,relatime master:55 - fuse.squashfuse_ll squashfuse_ll rw,user_id=0,group_id=0,allow_other\n";
+    const LEGIT_ROWS: &[u8] = b"18 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime master:18 - proc proc rw\n100 1 0:70 / /test rw,relatime - tmpfs none rw,uid=1000,gid=100\n37 32 0:36 / /data/users/example/local/fbsource rw,nosuid,relatime master:34 - fuse edenfs: rw,user_id=1000,group_id=100\n";
+
+    /// Discriminating regression for the host-membership leak: two host
+    /// tables differing only in seed-row membership/order (host churn
+    /// between two strict runs) must produce identical guest contents,
+    /// while every legitimate row survives in order.
+    #[test]
+    fn seed_churn_does_not_change_guest_mountinfo_membership() {
+        let mut churned_a = LEGIT_ROWS.to_vec();
+        churned_a.extend_from_slice(SEED_ROW);
+        let mut churned_b = Vec::new();
+        churned_b.extend_from_slice(SEED_ROW_2);
+        churned_b.extend_from_slice(LEGIT_ROWS);
+        churned_b.extend_from_slice(SEED_ROW);
+        assert_eq!(
+            exclude_ephemeral_host_seed_mounts(&churned_a),
+            LEGIT_ROWS.to_vec(),
+            "seed rows must be excluded, legitimate rows kept in order"
+        );
+        assert_eq!(
+            exclude_ephemeral_host_seed_mounts(&churned_a),
+            exclude_ephemeral_host_seed_mounts(&churned_b),
+            "host seed churn must not change guest-visible membership"
+        );
+        // And through the full sanitize path with identities assigned over
+        // the filtered membership, both churn variants render identically.
+        let render = |contents: &[u8]| {
+            let filtered = exclude_ephemeral_host_seed_mounts(contents);
+            let rows = parse_mountinfo(&filtered).unwrap();
+            let snapshot =
+                MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new()).unwrap();
+            sanitize_mountinfo(&filtered, &snapshot)
+        };
+        assert_eq!(render(&churned_a), render(&churned_b));
+        assert!(render(&churned_a).windows(5).any(|w| w == b"/test"));
+    }
+
+    /// Boundary behavior (not observed in real tables — seeds are leaves
+    /// with parent 1): if a retained row's parent mount were itself an
+    /// excluded seed, the snapshot constructor's parent pass still covers
+    /// retained parents deterministically and the child row renders; the
+    /// dangling raw parent ID never reaches guest output unrewritten.
+    #[test]
+    fn retained_row_with_seed_parent_still_snapshots() {
+        let contents =
+            b"99 1 0:1 / /mnt/xarfuse/uid-1/e62a203d-seed-nspid1_cgpid2-ns-3 rw - fuse.squashfuse_ll squashfuse_ll rw\n20 99 8:1 / /child rw - ext4 /dev/a rw\n";
+        let filtered = exclude_ephemeral_host_seed_mounts(contents);
+        let rows = parse_mountinfo(&filtered).unwrap();
+        let snapshot = MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new())
+            .expect("parent pass must cover the retained child");
+        let rendered = sanitize_mountinfo(&filtered, &snapshot);
+        assert!(rendered.windows(6).any(|w| w == b"/child"));
+        assert!(!rendered.windows(7).any(|w| w == b"xarfuse"));
+    }
+
+    /// Mountinfo renders the run-global numbers, not the snapshot's
+    /// positional ones, and a mismatched assignment leaves it unchanged.
+    #[test]
+    fn run_mount_ids_replace_positional_ids_only_when_they_cover_the_snapshot() {
+        let contents =
+            b"20 10 8:1 / /a rw - ext4 /dev/a rw\n30 20 8:2 / /a/b rw - ext4 /dev/b rw\n";
+        let snapshot = || {
+            let rows = parse_mountinfo(contents).unwrap();
+            MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new()).unwrap()
+        };
+        let positional = snapshot();
+        let raw_order = positional.raw_mount_id_order();
+        assert_eq!(raw_order, [20, 30, 10]);
+
+        for (raw, virtual_ids) in [
+            (vec![20, 30], vec![5, 6]),
+            (vec![20, 30, 10, 40], vec![5, 6, 7, 8]),
+            (vec![20, 30, 99], vec![5, 6, 7]),
+            (vec![20, 20, 10], vec![5, 6, 7]),
+            (vec![20, 30, 10], vec![5, 5, 7]),
+            (vec![20, 30, 10], vec![5, 6]),
+        ] {
+            let mut refused = snapshot();
+            assert!(
+                !refused.use_run_mount_ids(&raw, &virtual_ids),
+                "{raw:?} -> {virtual_ids:?} must be refused"
+            );
+            assert_eq!(
+                sanitize_mountinfo(contents, &refused),
+                sanitize_mountinfo(contents, &positional)
+            );
+        }
+
+        let mut run_global = snapshot();
+        assert!(run_global.use_run_mount_ids(&raw_order, &[7, 3, 9]));
+        assert_eq!(run_global.canonical_mount_id(20), Some(7));
+        assert_eq!(run_global.canonical_mount_id(30), Some(3));
+        assert_eq!(run_global.canonical_mount_id(10), Some(9));
+        assert_eq!(
+            sanitize_mountinfo(contents, &run_global),
+            b"7 9 8:1 / /a rw - ext4 /dev/a rw\n3 7 8:2 / /a/b rw - ext4 /dev/b rw\n"
+        );
+    }
+
+    /// The same chroot view (row 20 under parent 10, which is outside the
+    /// view) can sit in a captured namespace that lists 10 before 20 or after
+    /// it. The canonical order follows the capture and may differ; the
+    /// observation order, which numbers the view, must not.
+    #[test]
+    fn observation_order_follows_the_view_not_the_captured_namespace() {
+        let contents = b"20 10 8:1 / /proc rw - proc proc rw\n";
+        let snapshot = |captured: &[u64]| {
+            MountInfoSnapshot::new(
+                parse_mountinfo(contents).unwrap(),
+                captured,
+                false,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .unwrap()
+        };
+        let parent_first = snapshot(&[10, 20, 9]);
+        let parent_last = snapshot(&[20, 10]);
+        let uncaptured = snapshot(&[]);
+        assert_eq!(parent_first.raw_mount_id_order(), [10, 20]);
+        assert_eq!(parent_last.raw_mount_id_order(), [20, 10]);
+        for view in [&parent_first, &parent_last, &uncaptured] {
+            assert_eq!(view.raw_mount_id_observation_order(), [20, 10]);
+        }
+
+        // Numbering in observation order renders identical text either way.
+        let render = |mut view: MountInfoSnapshot| {
+            let order = view.raw_mount_id_observation_order();
+            assert!(view.use_run_mount_ids(&order, &[1, 2]));
+            sanitize_mountinfo(contents, &view)
+        };
+        let expected = b"1 2 8:1 / /proc rw - proc proc rw\n".to_vec();
+        assert_eq!(render(parent_first), expected);
+        assert_eq!(render(parent_last), expected);
+        assert_eq!(render(uncaptured), expected);
+    }
+
     #[test]
     fn duplicate_mount_id_or_unknown_proven_id_rejects_the_snapshot() {
         let duplicate = b"20 10 8:1 / /a rw - ext4 /dev/a rw\n20 10 8:1 / /b rw - ext4 /dev/a rw\n";
@@ -4971,7 +6219,7 @@ Rss:                   4 kB\n" as &[u8];
         );
         assert!(ProcfsFile::from_path(Path::new("node/vmstat")).is_none());
         assert!(ProcfsFile::from_path(Path::new("node0/meminfo")).is_none());
-        // /proc/vmstat is now recognized as ProcfsKind::Vmstat (PR-938).
+        // /proc/vmstat is now recognized as ProcfsKind::Fixed(FixedProcfsFile::Vmstat) (PR-938).
     }
 
     #[test]
@@ -5022,48 +6270,6 @@ Rss:                   4 kB\n" as &[u8];
     fn scaling_cur_freq_is_fixed() {
         assert_eq!(sanitize_scaling_cur_freq(b"2483951\n"), b"1000000\n");
         assert!(sanitize_scaling_cur_freq(b"").is_empty());
-    }
-
-    #[test]
-    fn swaps_preserves_configuration_and_zeros_usage() {
-        let contents = b"Filename\tType\tSize\tUsed\tPriority\n\
-/dev/nvme1n1p3 partition 2000892 0 5\n\
-/data/swapvol/swapfile file 134217724 69308912 -2\n";
-        assert_eq!(
-            sanitize_swaps(contents),
-            b"Filename\tType\tSize\tUsed\tPriority\n\
-/dev/nvme1n1p3\tpartition\t2000892\t0\t5\n\
-/data/swapvol/swapfile\tfile\t134217724\t0\t-2\n"
-        );
-        assert!(sanitize_swaps(b"").is_empty());
-        assert_eq!(
-            sanitize_swaps(b"Filename Type Size Used Priority\n/swap file 12 3 1 extra\n"),
-            b"Filename Type Size Used Priority\n/swap file 12 3 1 extra\n"
-        );
-        assert_eq!(
-            sanitize_swaps(b"Filename Type Size Used Priority\n/swap file 12 unknown\n"),
-            b"Filename Type Size Used Priority\n/swap file 12 unknown\n"
-        );
-    }
-
-    #[test]
-    fn key_users_preserves_uids_and_quota_limits() {
-        let contents = b"0: 15 15/15 15/1000000 2499/25000000\n\
-1000: 2 1/2 1/200 77/20000\n";
-        assert_eq!(
-            sanitize_key_users(contents),
-            b"0: 0 0/0 0/1000000 0/25000000\n\
-1000: 0 0/0 0/200 0/20000\n"
-        );
-        assert!(sanitize_key_users(b"").is_empty());
-        assert_eq!(
-            sanitize_key_users(b"0: 15 15/15 invalid 2499/25000000\n"),
-            b"0: 15 15/15 invalid 2499/25000000\n"
-        );
-        assert_eq!(
-            sanitize_key_users(b"0: 15 15/15 15/1000000 2499/25000000 extra\n"),
-            b"0: 15 15/15 15/1000000 2499/25000000 extra\n"
-        );
     }
 
     #[test]
@@ -5347,6 +6553,42 @@ Rss:                   4 kB\n" as &[u8];
         );
     }
 
+    /// Another process's `stat` and `status`, where the kernel numbers
+    /// processes otherwise than Detcore (DBT), show the guest's numbers for
+    /// the process, its parent, group and session, and 0 for one outside the
+    /// guest's numbering, as Linux shows a number from outside the reader's
+    /// PID namespace (slice B3a-4 of
+    /// https://github.com/rrnewton/hermit/issues/4266).
+    #[test]
+    fn process_files_are_renumbered_to_the_guests_numbers() {
+        let file = ProcfsFile::from_path(Path::new("/proc/3/stat")).unwrap();
+        let stat = format!("4 (bash) S 1 4 4 0 -1 {}\n", vec!["0"; 44].join(" "));
+        assert_eq!(file.kernel_numbers_held(stat.as_bytes()), [4, 1, 4, 4]);
+        let numbers = BTreeMap::from([(4, 3), (1, 1)]);
+        let renumbered = String::from_utf8(renumber_stat(stat.as_bytes(), &numbers)).unwrap();
+        assert!(
+            renumbered.starts_with("3 (bash) S 1 3 3 0 -1 "),
+            "{renumbered}"
+        );
+        let outside = BTreeMap::from([(4, 3)]);
+        let renumbered = String::from_utf8(renumber_stat(stat.as_bytes(), &outside)).unwrap();
+        assert!(
+            renumbered.starts_with("3 (bash) S 0 3 3 0 -1 "),
+            "{renumbered}"
+        );
+
+        let file = ProcfsFile::from_path(Path::new("/proc/3/status")).unwrap();
+        let status = "Name:\tbash\nTgid:\t4\nPid:\t4\nPPid:\t1\nNSpid:\t4\nUid:\t0\t0\t0\t0\n";
+        assert_eq!(file.kernel_numbers_held(status.as_bytes()), [4, 4, 1, 4]);
+        assert_eq!(
+            String::from_utf8(renumber_status(status.as_bytes(), &numbers)).unwrap(),
+            "Name:\tbash\nTgid:\t3\nPid:\t3\nPPid:\t1\nNSpid:\t3\nUid:\t0\t0\t0\t0\n"
+        );
+        // Not a process's file: nothing held.
+        let file = ProcfsFile::from_path(Path::new("/proc/self/stat")).unwrap();
+        assert!(file.kernel_numbers_held(stat.as_bytes()).is_empty());
+    }
+
     #[test]
     fn stat_normalizes_runtime_counters() {
         let input = b"3 (name with spaces) R 1 0 0 0 -1 0 89 0 1 2 3 4 5 6 20 0 1 7 520343512 2879488 123 18446744073709551615 100 200 300 0 0 0 0 3145728 0 0 0 0 17 114 0 0 9 10 11 400 500 600 700 800 900 1000 0\n";
@@ -5368,10 +6610,10 @@ Rss:                   4 kB\n" as &[u8];
     // TODO-HUMAN-REVIEW(#553)
     #[test]
     fn status_normalizes_affinity_and_context_switches() {
-        let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
+        let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nMems_allowed:\t00000000,00000003\nMems_allowed_list:\t0-1\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
-            sanitize_status(input, Some((3, 3, 1))),
-            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+            sanitize_status(input, Some((3, 3, 1)), None),
+            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
 
@@ -5412,21 +6654,84 @@ Rss:                   4 kB\n" as &[u8];
         );
         let status = b"Name:\thermit\nState:\tR (running)\nPid:\t1\nPPid:\t0\nVmSize:\t249000 kB\nVmRSS:\t30000 kB\n";
         assert_eq!(
-            sanitize_status(status, None),
+            sanitize_status(status, None, None),
             b"Name:\thermit\nState:\tS (sleeping)\nPid:\t1\nPPid:\t0\nVmSize:\t0 kB\nVmRSS:\t0 kB\n"
         );
     }
 
+    /// A status reports the guest's own mask, which the thread published
+    /// while Detcore holds it under a private blocking mask, in place of the
+    /// kernel's `SigBlk`, and leaves every other line as before; with nothing
+    /// published the kernel's value stands (Codex review of R2b-2 stage 2,
+    /// P2; https://github.com/rrnewton/hermit/issues/4273).
+    #[test]
+    fn a_status_reports_the_published_guest_mask_as_sigblk() {
+        let status = b"Name:\tworker\nPid:\t5\nSigPnd:\t0000000000000000\nSigBlk:\tfffffffe7ffb7eef\nSigIgn:\t0000000000000000\n";
+        assert_eq!(
+            sanitize_status(status, None, Some(0x800)),
+            b"Name:\tworker\nPid:\t5\nSigPnd:\t0000000000000000\nSigBlk:\t0000000000000800\nSigIgn:\t0000000000000000\n"
+        );
+        assert_eq!(
+            sanitize_status(status, None, None),
+            status.to_vec(),
+            "with nothing published, the kernel's mask stands"
+        );
+
+        // Which thread's published mask a status reports: the one its own
+        // `Pid:` line names, whoever reads it.
+        let process = ProcfsFile::from_path(Path::new("/proc/3/task/5/status")).unwrap();
+        assert_eq!(process.status_mask_thread(status), Some(5));
+        let own = ProcfsFile::from_path(Path::new("/proc/self/status")).unwrap();
+        assert_eq!(own.status_mask_thread(status), Some(5));
+        let mut thread_self = ProcfsFile::from_path(Path::new("/proc/thread-self/status")).unwrap();
+        thread_self.bind_thread_identity(3, 7, 1);
+        assert_eq!(thread_self.status_mask_thread(status), Some(5));
+        let stat = ProcfsFile::from_path(Path::new("/proc/3/task/5/stat")).unwrap();
+        assert_eq!(stat.status_mask_thread(status), None);
+    }
+
     #[test]
     fn system_stat_uses_virtual_uptime_and_boot_time() {
-        assert_eq!(
-            sanitize_system_stat(
-                b"cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\nintr 9 8 7\nbtime 1234\nprocesses 55\n",
-                120,
-                1_767_225_480,
+        // Linux's layout (`show_stat`): `cpu` and two spaces, ten columns, a
+        // count per interrupt number below NR_IRQS, and the ten softirqs.
+        let expected: &[u8] = b"cpu  12000 0 0 0 0 0 0 0 0 0\n\
+cpu0 12000 0 0 0 0 0 0 0 0 0\n\
+intr 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+ctxt 0\n\
+btime 1767225480\n\
+processes 0\n\
+procs_running 0\n\
+procs_blocked 0\n\
+softirq 0 0 0 0 0 0 0 0 0 0 0\n";
+        assert_eq!(render_system_stat(120, 1_767_225_480, 1), expected);
+        // A captured kernel file gives the same bytes, whatever the host's
+        // lines were: none of them is kept.
+        for host in [
+            &b"cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\nintr 9 8 7\nbtime 1234\nprocesses 55\n"[..],
+            b"cpu  1 2 3\ncpu0 1 2 3\ncpu1 4 5 6\nintr 400 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20\nctxt 99\nbtime 7\nsoftirq 5 1 1 1 1 1\n",
+            b"x",
+        ] {
+            assert_eq!(
+                sanitize_system_stat(host, 120, 1_767_225_480, 1),
+                expected,
+                "{}",
+                String::from_utf8_lossy(host)
+            );
+        }
+        assert_eq!(sanitize_system_stat(b"", 120, 1_767_225_480, 1), b"");
+        // Every column is a count of USER_HZ ticks; the aggregate is the sum
+        // of the CPUs', and saturates.
+        let two = String::from_utf8(render_system_stat(120, -5, 2)).unwrap();
+        assert!(
+            two.starts_with(
+                "cpu  24000 0 0 0 0 0 0 0 0 0\ncpu0 12000 0 0 0 0 0 0 0 0 0\n\
+                 cpu1 12000 0 0 0 0 0 0 0 0 0\nintr 0"
             ),
-            b"cpu 12000 0 0 0 0 0 0 0 0 0\ncpu0 12000 0 0 0 0 0 0 0 0 0\nintr 0 0 0\nbtime 1767225480\nprocesses 0\n"
+            "{two}"
         );
+        assert!(two.contains("\nbtime -5\n"), "{two}");
+        let huge = String::from_utf8(render_system_stat(u64::MAX / 10, 0, 1)).unwrap();
+        assert!(huge.starts_with(&format!("cpu  {} 0", u64::MAX)), "{huge}");
     }
 
     #[test]
@@ -5469,6 +6774,376 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     #[test]
+    fn cpuinfo_describes_the_virtual_cpu_when_cpuid_is_virtualized() {
+        let host = b"processor\t: 0\nmodel name\t: Example CPU\nflags\t\t: fpu avx512f\n\n";
+        let read = |virtual_cpuinfo: Option<Vec<u8>>| {
+            let mut file = ProcfsFile::from_path(Path::new("/proc/cpuinfo")).unwrap();
+            file.initialize(
+                host.to_vec(),
+                ProcfsSnapshotContext {
+                    virtual_cpuinfo,
+                    ..ProcfsSnapshotContext::default()
+                },
+            );
+            file.take(usize::MAX).unwrap()
+        };
+        let virtual_cpuinfo = crate::cpuid::InterceptedCpuid::new().cpuinfo();
+        // The host's file does not show through, whatever it says.
+        assert_eq!(read(Some(virtual_cpuinfo.clone())), virtual_cpuinfo);
+        // When the guest's CPUID is the host's, so is the file, normalized.
+        assert_eq!(read(None), sanitize_cpuinfo(host));
+    }
+
+    /// Detcore renders `/proc/cpuinfo` only where it answers the guest's CPUID
+    /// instruction from its own table; rendered, every byte is that table's,
+    /// from no kernel file, and its placeholder carries none of it across
+    /// `exec`, where the new image renders the same bytes again
+    /// (<https://github.com/rrnewton/hermit/issues/4213>).
+    #[test]
+    fn rendered_cpuinfo_is_the_virtual_cpu_table_alone() {
+        let file = ProcfsFile::from_path(Path::new("/proc/cpuinfo")).unwrap();
+        // Where the guest sees the host's CPU, the kernel opens the file
+        // (https://github.com/rrnewton/hermit/issues/4161).
+        assert_eq!(file.rendered_path(RenderedFiles::WITHOUT_CPUINFO), None);
+        assert_eq!(
+            file.rendered_path(RenderedFiles::ALL),
+            Some(Path::new("/proc/cpuinfo"))
+        );
+        assert_eq!(RenderedFiles::of(true, true, true), RenderedFiles::ALL);
+        for (virtualize, intercepted) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                RenderedFiles::of(virtualize, intercepted, false),
+                RenderedFiles::WITHOUT_CPUINFO
+            );
+        }
+        assert_eq!(file.opened_path(), None);
+        // Not a fixed file, which a kernel-opened alias would read as one.
+        assert!(!file.snapshot_is_fixed());
+        assert!(file.snapshot_is_rerendered());
+
+        let mut file = file.into_rendered();
+        // Opened so, it stays rendered whatever the session renders.
+        assert_eq!(
+            file.rendered_path(RenderedFiles::WITHOUT_CPUINFO),
+            Some(Path::new("/proc/cpuinfo"))
+        );
+        assert_eq!(file.opened_path(), Some(Path::new("/proc/cpuinfo")));
+        assert!(rendered_path_is_seq_file(file.opened_path().unwrap()));
+        assert!(file.has_read_iter());
+        assert!(!file.faults_on_a_short_copy());
+        let template = file.rendering_template().to_vec();
+        assert!(template.is_empty());
+        let virtual_cpuinfo = crate::cpuid::InterceptedCpuid::new().cpuinfo();
+        file.initialize(
+            template,
+            ProcfsSnapshotContext {
+                virtual_cpuinfo: Some(virtual_cpuinfo.clone()),
+                ..ProcfsSnapshotContext::default()
+            },
+        );
+        assert_eq!(file.rendered_snapshot(), Some(virtual_cpuinfo.as_slice()));
+        assert_eq!(file.take(usize::MAX), Some(virtual_cpuinfo));
+    }
+
+    /// A memfd named as a /proc/cpuinfo placeholder is one only in a session
+    /// that renders the file: elsewhere Detcore made none, so a guest's memfd
+    /// of that name (https://github.com/rrnewton/hermit/issues/4213, Codex
+    /// review) stays the ordinary memfd it is. The other rendered files are
+    /// placeholders in every session.
+    #[test]
+    fn a_cpuinfo_placeholder_name_counts_only_where_the_session_renders_it() {
+        let cpuinfo = b"/memfd:hermit-procfs:/proc/cpuinfo@ (deleted)";
+        assert_eq!(
+            placeholder_link(cpuinfo, RenderedFiles::ALL),
+            Some((Path::new("/proc/cpuinfo"), Vec::new()))
+        );
+        assert_eq!(
+            placeholder_link(cpuinfo, RenderedFiles::WITHOUT_CPUINFO),
+            None
+        );
+        let stat = b"/memfd:hermit-procfs:/proc/stat@ (deleted)";
+        for files in [RenderedFiles::ALL, RenderedFiles::WITHOUT_CPUINFO] {
+            assert_eq!(
+                placeholder_link_path(stat, files),
+                Some(Path::new("/proc/stat"))
+            );
+        }
+    }
+
+    /// A rendered `/proc/cpuinfo` has no kernel file to fall back to: a
+    /// snapshot without the virtual CPU's table is a broken invariant, not
+    /// the host's file normalized from an empty template.
+    #[test]
+    #[should_panic(expected = "only from the virtual CPUID table")]
+    fn rendered_cpuinfo_refuses_a_snapshot_without_the_table() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/cpuinfo"))
+            .unwrap()
+            .into_rendered();
+        let template = file.rendering_template().to_vec();
+        file.initialize(template, ProcfsSnapshotContext::default());
+    }
+
+    #[test]
+    fn cpuinfo_reports_one_virtual_cpu() {
+        let block = |n: u32| {
+            format!(
+                "processor\t: {n}\nmodel name\t: Example CPU\ncpu MHz\t\t: 2994.183\n\
+                 physical id\t: 1\nsiblings\t: 8\ncore id\t\t: {n}\ncpu cores\t: 4\n\
+                 apicid\t\t: {n}\ninitial apicid\t: {n}\nflags\t\t: fpu sse2\n\n"
+            )
+        };
+        let host = format!("{}{}{}", block(0), block(1), block(2));
+        assert_eq!(
+            String::from_utf8(sanitize_cpuinfo(host.as_bytes())).unwrap(),
+            "processor\t: 0\nmodel name\t: Example CPU\ncpu MHz\t\t: 1000.000\n\
+             physical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\n\
+             apicid\t\t: 0\ninitial apicid\t: 0\nflags\t\t: fpu sse2\n\n"
+        );
+        // A single-CPU host's file is already the virtual shape.
+        assert_eq!(
+            sanitize_cpuinfo(b"processor\t: 0\ncpu cores\t: 1\n\n"),
+            b"processor\t: 0\ncpu cores\t: 1\n\n"
+        );
+    }
+
+    #[test]
+    fn cpu_list_reports_one_virtual_cpu() {
+        assert_eq!(sanitize_cpu_list(b"0-315\n"), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"0-3,8,10-11\n"), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"0\n"), b"0\n");
+        // Not the kernel's cpulist format: left alone.
+        assert_eq!(sanitize_cpu_list(b"0-3"), b"0-3");
+        assert_eq!(sanitize_cpu_list(b"\n"), b"\n");
+        assert_eq!(sanitize_cpu_list(b"all\n"), b"all\n");
+        for path in ["online", "possible", "present", "enabled"] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(&format!("/sys/devices/system/cpu/{path}")))
+                    .unwrap()
+                    .kind,
+                ProcfsKind::CpuList,
+                "{path}"
+            );
+        }
+        assert!(ProcfsFile::from_path(Path::new("/sys/devices/system/cpu/offline")).is_none());
+    }
+
+    #[test]
+    fn cpu0_topology_and_node0_report_one_virtual_cpu() {
+        for path in [
+            "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
+            "/sys/devices/system/cpu/cpu0/topology/core_cpus_list",
+            "/sys/devices/system/cpu/cpu0/topology/package_cpus_list",
+            "/sys/devices/system/node/node0/cpulist",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::CpuList,
+                "{path}"
+            );
+        }
+        for path in [
+            "/sys/devices/system/cpu/cpu0/topology/thread_siblings",
+            "/sys/devices/system/cpu/cpu0/topology/package_cpus",
+            "/sys/devices/system/node/node0/cpumap",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::CpuMask,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            ProcfsFile::from_path(Path::new(
+                "/sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list"
+            ))
+            .unwrap()
+            .kind,
+            ProcfsKind::CpuList
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new(
+                "/sys/devices/system/cpu/cpu0/cache/index0/shared_cpu_map"
+            ))
+            .unwrap()
+            .kind,
+            ProcfsKind::CpuMask
+        );
+        // Other CPUs and nodes, and other topology attributes, are untouched.
+        for path in [
+            "/sys/devices/system/cpu/cpu1/topology/thread_siblings_list",
+            "/sys/devices/system/cpu/cpu1/topology/core_id",
+            "/sys/devices/system/node/node1/cpulist",
+            "/sys/devices/system/cpu/cpu1/cache/index3/shared_cpu_list",
+            "/sys/devices/system/cpu/cpu0/cache/index3/size",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
+        }
+        assert_eq!(sanitize_cpu_list(b"0,158\n"), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"0-15,158-173\n"), b"0\n");
+        assert_eq!(
+            sanitize_cpu_mask(b"00000000,00000000,00000000,00000001,00000000,00000001\n"),
+            b"1\n"
+        );
+        assert_eq!(sanitize_cpu_mask(b"ffffffff,ffffffff\n"), b"1\n");
+        // Not a mask: left alone.
+        assert_eq!(sanitize_cpu_mask(b"ff"), b"ff");
+        assert_eq!(sanitize_cpu_mask(b"0-3\n"), b"0-3\n");
+        assert_eq!(sanitize_cpu_mask(b"\n"), b"\n");
+    }
+
+    #[test]
+    fn kernel_max_smt_topology_ids_and_nodes_describe_one_cpu_and_node() {
+        let kind = |path: &str| ProcfsFile::from_path(Path::new(path)).map(|file| file.kind);
+        let constant = |path: &str| match kind(path) {
+            Some(ProcfsKind::SingleCpuConstant(file)) => file.contents(),
+            other => panic!("{path} is {other:?}, not a constant"),
+        };
+        assert_eq!(constant("/sys/devices/system/cpu/kernel_max"), b"127\n");
+        // The mask kernel_max sizes is one sched_getaffinity accepts.
+        assert_eq!((127 + 1) / 8, VIRTUAL_CPUSET_BYTES);
+        assert_eq!(constant("/sys/devices/system/cpu/smt/active"), b"0\n");
+        assert_eq!(
+            constant("/sys/devices/system/cpu/smt/control"),
+            b"notsupported\n"
+        );
+        for attribute in ["cluster_id", "core_id", "die_id", "physical_package_id"] {
+            assert_eq!(
+                constant(&format!(
+                    "/sys/devices/system/cpu/cpu0/topology/{attribute}"
+                )),
+                b"0\n",
+                "{attribute}"
+            );
+        }
+        assert_eq!(
+            constant("/sys/devices/system/node/has_generic_initiator"),
+            b"\n"
+        );
+        assert_eq!(constant("/sys/devices/system/node/node0/distance"), b"10\n");
+        for path in [
+            "/sys/devices/system/node/online",
+            "/sys/devices/system/node/possible",
+            "/sys/devices/system/node/has_cpu",
+            "/sys/devices/system/node/has_memory",
+            "/sys/devices/system/node/has_normal_memory",
+        ] {
+            assert_eq!(kind(path), Some(ProcfsKind::CpuList), "{path}");
+        }
+        // Another node's distances, another CPU's IDs and cpu0's PPIN are
+        // left to the directory listing or the host.
+        for path in [
+            "/sys/devices/system/node/node1/distance",
+            "/sys/devices/system/cpu/cpu1/topology/core_id",
+            "/sys/devices/system/cpu/cpu0/topology/ppin",
+            "/sys/devices/system/node/has_cpu_extra",
+        ] {
+            assert_eq!(kind(path), None, "{path}");
+        }
+        assert_eq!(sanitize_cpu_list(b"0-1\n"), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"\n"), b"\n");
+    }
+
+    #[test]
+    fn directory_listings_drop_cpus_and_nodes_other_than_zero() {
+        for (directory, absent, kept) in [
+            (
+                "/sys/devices/system/cpu",
+                &["cpu1", "cpu10", "cpu315"][..],
+                &[
+                    "cpu0",
+                    "cpufreq",
+                    "cpuidle",
+                    "online",
+                    "kernel_max",
+                    "cpu",
+                    "cpux1",
+                ][..],
+            ),
+            ("/sys/bus/cpu/devices", &["cpu7"], &["cpu0"]),
+            (
+                "/sys/devices/system/node",
+                &["node1", "node12"],
+                &["node0", "online", "has_cpu", "node"],
+            ),
+            ("/sys/bus/node/devices", &["node1"], &["node0"]),
+            (
+                "/sys/devices/system/cpu/cpufreq",
+                &["policy1", "policy315"],
+                &["policy0", "boost"],
+            ),
+        ] {
+            for name in absent {
+                assert!(
+                    is_absent_cpu_entry(Path::new(directory), name.as_bytes()),
+                    "{directory}/{name}"
+                );
+            }
+            for name in kept {
+                assert!(
+                    !is_absent_cpu_entry(Path::new(directory), name.as_bytes()),
+                    "{directory}/{name}"
+                );
+            }
+        }
+        // Other directories keep every entry.
+        for (directory, name) in [
+            ("/sys/devices/system/cpu/cpu0", "cpu1"),
+            ("/sys/devices/system", "node1"),
+            ("/tmp", "cpu1"),
+        ] {
+            assert!(
+                !is_absent_cpu_entry(Path::new(directory), name.as_bytes()),
+                "{directory}/{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn system_stat_reports_one_virtual_cpu() {
+        // The host's other CPUs are not shown: the machine has one, whose
+        // line is the aggregate's. The whole file is the rendered layout.
+        let stat = sanitize_system_stat(
+            b"cpu  1 2 3\ncpu0 1 2 3\ncpu1 4 5 6\ncpu315 7 8 9\nintr 9 8 7\nbtime 1234\n",
+            120,
+            1_767_225_480,
+            MachineDescription::default().cpus,
+        );
+        assert_eq!(
+            String::from_utf8(stat).unwrap(),
+            "cpu  12000 0 0 0 0 0 0 0 0 0\n\
+             cpu0 12000 0 0 0 0 0 0 0 0 0\n\
+             intr 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+             ctxt 0\n\
+             btime 1767225480\n\
+             processes 0\n\
+             procs_running 0\n\
+             procs_blocked 0\n\
+             softirq 0 0 0 0 0 0 0 0 0 0 0\n"
+        );
+        // Detcore's own open renders the same file from its template, at the
+        // uptime and boot instant of the first read.
+        let mut rendered = ProcfsFile::from_path(Path::new("/proc/stat"))
+            .unwrap()
+            .into_rendered();
+        assert!(rendered.snapshot_at_first_read());
+        assert!(!rendered.snapshot_is_fixed());
+        assert_eq!(rendered.rendering_template(), render_system_stat(0, 0, 1));
+        let template = rendered.rendering_template().to_vec();
+        rendered.initialize(
+            template,
+            ProcfsSnapshotContext {
+                virtual_uptime_seconds: 120,
+                virtual_boot_time_seconds: Some(1_767_225_480),
+                ..ProcfsSnapshotContext::default()
+            },
+        );
+        assert_eq!(
+            rendered.rendered_snapshot().unwrap(),
+            render_system_stat(120, 1_767_225_480, 1)
+        );
+    }
+
+    #[test]
     fn io_accounting_counters_use_synthetic_values() {
         assert_eq!(
             sanitize_diskstats(b"259 0 nvme0n1 100 2 300 4 500 6 700 8 9 10 11\n"),
@@ -5487,94 +7162,11 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     #[test]
-    fn loadavg_and_uptime_use_virtual_values() {
-        assert_eq!(
-            sanitize_loadavg(b"344.01 369.71 375.04 526/107858 512196\n"),
-            b"0.00 0.00 0.00 1/1 1\n"
-        );
+    fn uptime_uses_the_virtual_value() {
         assert_eq!(
             sanitize_uptime(b"156980.56 37990755.08\n", 120),
             b"120.00 0.00\n"
         );
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-914): Review inode counter fixture coverage.
-    #[test]
-    fn inode_nr_hides_host_global_allocation_counters() {
-        assert_eq!(sanitize_inode_nr(b"13929543\t1109179\n"), b"0\t0\n");
-        assert_eq!(
-            sanitize_inode_state(b"13929543\t1109179\t0\t0\t0\t0\t0\n"),
-            b"0\t0\t0\t0\t0\t0\t0\n"
-        );
-        assert!(sanitize_inode_nr(b"").is_empty());
-        assert!(sanitize_inode_state(b"").is_empty());
-    }
-
-    #[test]
-    fn buddyinfo_preserves_topology_and_zeros_free_lists() {
-        let contents = b"Node 0, zone DMA 0 1 2 3\n\
-Node 1, zone Normal 42 17 5 1\n\
-malformed buddy row\n";
-        assert_eq!(
-            sanitize_buddyinfo(contents),
-            b"Node 0, zone DMA 0 0 0 0\n\
-Node 1, zone Normal 0 0 0 0\n\
-malformed buddy row\n"
-        );
-    }
-
-    #[test]
-    fn file_nr_hides_host_global_allocations() {
-        assert_eq!(
-            sanitize_file_nr(b"245853\t0\t9223372036854775807\n"),
-            b"0\t0\t9223372036854775807\n"
-        );
-        assert_eq!(sanitize_file_max(b"1048576\n"), b"9223372036854775807\n");
-        assert!(sanitize_file_nr(b"").is_empty());
-        assert!(sanitize_file_max(b"").is_empty());
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-918): Review dentry counter fixture coverage.
-    #[test]
-    fn dentry_state_hides_host_global_cache_counters() {
-        assert_eq!(
-            sanitize_dentry_state(b"1888773\t1374220\t45\t0\t212904\t0\n"),
-            b"0\t0\t45\t0\t0\t0\n"
-        );
-        assert!(sanitize_dentry_state(b"").is_empty());
-    }
-
-    /// The advertised ceiling must be the ENFORCED ceiling, not the host's.
-    ///
-    /// A default host reports 1048576 and a hardened one 65536 -- a factor of
-    /// sixteen. A guest that reads this and branches on it was branching on the
-    /// machine. Both now read as the pinned capacity, which is the same number
-    /// `F_SETPIPE_SZ` will actually grant.
-    #[test]
-    fn pipe_max_size_reports_the_enforced_ceiling_not_the_host() {
-        let expected = format!("{DETERMINISTIC_PIPE_CAPACITY_BYTES}\n").into_bytes();
-        assert_eq!(sanitize_pipe_max_size(b"1048576\n"), expected);
-        assert_eq!(sanitize_pipe_max_size(b"65536\n"), expected);
-        assert_eq!(sanitize_pipe_max_size(b"4096\n"), expected);
-    }
-
-    /// Contents that are not a plain integer are not this sysctl. Return empty
-    /// rather than inventing a ceiling, matching `sanitize_aio_nr`.
-    #[test]
-    fn pipe_max_size_invents_nothing_from_unparsable_contents() {
-        assert!(sanitize_pipe_max_size(b"").is_empty());
-        assert!(sanitize_pipe_max_size(b"not a number\n").is_empty());
-        assert!(sanitize_pipe_max_size(&[0xff, 0xfe]).is_empty());
-    }
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-933): Review AIO count fixture coverage.
-    #[test]
-    fn aio_nr_hides_host_global_reservations() {
-        assert_eq!(sanitize_aio_nr(b"3040\n"), b"0\n");
-        assert!(sanitize_aio_nr(b"").is_empty());
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5608,19 +7200,19 @@ RAW: inuse 5\n"
             ProcfsFile::from_path(Path::new("/proc/interrupts"))
                 .unwrap()
                 .kind,
-            ProcfsKind::InterruptCounters
+            ProcfsKind::Fixed(FixedProcfsFile::Interrupts)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/softirqs"))
                 .unwrap()
                 .kind,
-            ProcfsKind::InterruptCounters
+            ProcfsKind::Fixed(FixedProcfsFile::Softirqs)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/modules"))
                 .unwrap()
                 .kind,
-            ProcfsKind::Modules
+            ProcfsKind::Fixed(FixedProcfsFile::Modules)
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/sys/module/ipmi_si/refcnt"))
@@ -5632,44 +7224,6 @@ RAW: inuse 5\n"
         assert!(ProcfsFile::from_path(Path::new("/sys/module/ipmi_si/coresize")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/sys/module/refcnt")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/sys/module/ipmi_si/holders/refcnt")).is_none());
-    }
-
-    #[test]
-    fn interrupt_and_module_accounting_is_synthetic() {
-        let interrupts = b"           CPU0       CPU1\n  9:        123          4 IR-PCI-MSI 0-edge acpi\nNMI:          8          9 Non-maskable interrupts\nERR:          5\n";
-        assert_eq!(
-            sanitize_interrupt_counters(interrupts),
-            b"           CPU0       CPU1\n  9: 0 0 IR-PCI-MSI 0-edge acpi\nNMI: 0 0 Non-maskable interrupts\nERR: 0\n"
-        );
-        assert_eq!(
-            sanitize_interrupt_counters(b"  9: 9 99 IR-PCI-MSI 0-edge acpi\nERR: 999999\n"),
-            sanitize_interrupt_counters(b"  9: 123456789 4 IR-PCI-MSI 0-edge acpi\nERR: 5\n"),
-            "native counter width and padding must not affect the snapshot"
-        );
-
-        let modules = b"kvm_amd 212992 95 - Live 0x0\nkvm 1200128 1 kvm_amd, Live 0x0\nllc 20480 2 bridge,stp, Live 0x0\n";
-        assert_eq!(
-            sanitize_modules(modules),
-            b"kvm_amd 212992 0 - Live 0x0\nkvm 1200128 1 kvm_amd, Live 0x0\nllc 20480 2 bridge,stp, Live 0x0\n"
-        );
-        // A module with no holders normalizes to 0, as before.
-        let source = std::str::from_utf8(modules).unwrap();
-        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm_amd", source), b"0\n");
-        assert_eq!(sanitize_module_refcnt(b"12", "kvm_amd", source), b"0");
-        // CROSS-SURFACE COHERENCE (the #1558 defect): kvm is held by kvm_amd,
-        // so /proc/modules publishes 1 and sysfs must publish 1 too -- not 0.
-        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm", source), b"1\n");
-        assert_eq!(sanitize_module_refcnt(b"9", "llc", source), b"2");
-        // Malformed contents still pass through untouched (fail open, unchanged).
-        assert_eq!(
-            sanitize_module_refcnt(b"not-a-count\n", "kvm", source),
-            b"not-a-count\n"
-        );
-        assert!(sanitize_module_refcnt(b"", "kvm", source).is_empty());
-        // An unknown module or unreadable source degrades to 0, the old answer,
-        // rather than leaking the native counter.
-        assert_eq!(sanitize_module_refcnt(b"7\n", "absent", source), b"0\n");
-        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm", ""), b"0\n");
     }
 
     #[test]
@@ -5723,22 +7277,6 @@ RAW 1008 0 -1 NI 0 yes kernel y y\n"
     }
 
     #[test]
-    fn schedstat_hides_host_scheduler_accounting() {
-        let contents = b"version 17\n\
-timestamp 4671819092\n\
-cpu0 1 2 3 4 5 6 129488086714063 39956207684532 545893933\n\
-domain0 SMT 00000003 1 2 3\n";
-
-        assert_eq!(
-            sanitize_schedstat(contents),
-            b"version 17\n\
-timestamp 0\n\
-cpu0 0 0 0 0 0 0 0 0 0\n\
-domain0 SMT 00000003 0 0 0\n"
-        );
-    }
-
-    #[test]
     fn self_schedstat_hides_host_scheduler_accounting() {
         assert_eq!(
             sanitize_self_schedstat(b"3029609 1559338 150\n"),
@@ -5754,26 +7292,6 @@ domain0 SMT 00000003 0 0 0\n"
 
         let invalid_counter = b"3029609 waiting 150\n";
         assert_eq!(sanitize_self_schedstat(invalid_counter), invalid_counter);
-    }
-
-    #[test]
-    fn zoneinfo_hides_host_memory_accounting() {
-        let contents = b"Node 3, zone    DMA32\n\
-  pages free     2816\n\
-      nr_inactive_anon 39937459\n\
-        protection: (0, 2117, 772897)\n\
-    cpu: 7\n\
-              count:    12\n";
-
-        assert_eq!(
-            sanitize_zoneinfo(contents),
-            b"Node 3, zone    DMA32\n\
-  pages free     0\n\
-      nr_inactive_anon 0\n\
-        protection: (0, 0, 0)\n\
-    cpu: 7\n\
-              count:    0\n"
-        );
     }
 
     #[test]
@@ -5964,6 +7482,16 @@ x86_Thread_features_locked:\t\n"
             sanitize_arch_status(b"AVX512_elapsed_ms:\tunknown\n"),
             b"AVX512_elapsed_ms:\tunknown\n"
         );
+        // A task that never used AVX-512 reads -1; it becomes 0 too.
+        assert_eq!(
+            sanitize_arch_status(b"AVX512_elapsed_ms:\t-1\n"),
+            b"AVX512_elapsed_ms:\t0\n"
+        );
+        // Any other negative value is not the kernel's format: left alone.
+        assert_eq!(
+            sanitize_arch_status(b"AVX512_elapsed_ms:\t-2\n"),
+            b"AVX512_elapsed_ms:\t-2\n"
+        );
     }
 
     #[test]
@@ -6134,6 +7662,47 @@ new.kernel.counter : 0\n\
 current_node=0, numa_group_id=0\n\
 numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0\n"
         );
+    }
+
+    // With kernel.sched_schedstats=1 the kernel adds these lines, printed with
+    // "%-45s:%14Ld.%06ld" and "%-45s:%21Ld" (kernel/sched/debug.c,
+    // proc_sched_show_task); avg_atom prints -1 as 0.000001. Each value
+    // becomes zero, and the file still reaches the guest.
+    #[test]
+    fn self_sched_hides_schedstats_fields() {
+        let core = "cat (3, #threads: 1)\n\
+se.exec_start : 377650149.445644\n\
+se.vruntime : 133948666.432951\n\
+se.sum_exec_runtime : 3.637972\n";
+        let decimal = |label: &str, value: &str| format!("{label:<45}:{value:>21}\n");
+        let mut contents = core.to_owned();
+        let mut expected = "cat (0, #threads: 1)\n\
+se.exec_start : 0.000000\n\
+se.vruntime : 0.000000\n\
+se.sum_exec_runtime : 0.000000\n"
+            .to_owned();
+        for (label, value, zero) in [
+            ("sum_sleep_runtime", "1234.567890", "0.000000"),
+            ("wait_max", "2.500000", "0.000000"),
+            ("wait_count", "7", "0"),
+            ("avg_atom", "0.000001", "0.000000"),
+        ] {
+            contents.push_str(&decimal(label, value));
+            expected.push_str(&format!("{label:<45}: {zero}\n"));
+        }
+        assert_eq!(
+            String::from_utf8(sanitize_self_sched(contents.as_bytes())).unwrap(),
+            expected
+        );
+
+        // A negative or non-finite unknown field still fails closed.
+        for value in ["-1.500000", "inf"] {
+            let refused = format!("{core}{}", decimal("wait_max", value));
+            assert!(
+                sanitize_self_sched(refused.as_bytes()).is_empty(),
+                "{value}"
+            );
+        }
     }
 
     #[test]
@@ -6407,46 +7976,27 @@ total_commit_ms 0\n"
         assert_eq!(sanitize_block_inflight(extra_row), extra_row);
     }
 
+    /// The sysctls Detcore renders fault on a short copy; its `seq_file`
+    /// files and the files whose bytes come from the kernel do not.
     #[test]
-    fn vmstat_hides_host_vm_accounting() {
-        let contents = b"nr_free_pages 4587515\npgfault 175926829665\noom_kill 30\n";
-        assert_eq!(
-            sanitize_vmstat(contents),
-            b"nr_free_pages 0\npgfault 0\noom_kill 0\n"
-        );
-        assert_eq!(
-            sanitize_vmstat(b"nr_free_pages 4587515"),
-            b"nr_free_pages 0"
-        );
-    }
-
-    #[test]
-    fn vmstat_leaves_unknown_formats_untouched() {
-        let extra_field = b"nr_free_pages 4587515 pages\n";
-        assert_eq!(sanitize_vmstat(extra_field), extra_field);
-
-        let invalid_counter = b"nr_free_pages many\n";
-        assert_eq!(sanitize_vmstat(invalid_counter), invalid_counter);
-    }
-
-    #[test]
-    fn meminfo_uses_configured_guest_memory() {
-        assert_eq!(
-            sanitize_meminfo(b"MemTotal: 791462432 kB\n", 1_048_576),
-            b"MemTotal:       1048576 kB\n\
-              MemFree:        1048576 kB\n\
-              MemAvailable:   1048576 kB\n\
-              Buffers:        0 kB\n\
-              Cached:         0 kB\n\
-              SwapCached:     0 kB\n\
-              Active:         0 kB\n\
-              Inactive:       0 kB\n\
-              Shmem:          0 kB\n\
-              SReclaimable:   0 kB\n\
-              SwapTotal:      0 kB\n\
-              SwapFree:       0 kB\n"
-        );
-        assert!(sanitize_meminfo(b"", 1_048_576).is_empty());
+    fn rendered_sysctls_fault_on_a_short_copy() {
+        let faults = |path: &str| {
+            ProcfsFile::from_path(Path::new(path))
+                .unwrap()
+                .faults_on_a_short_copy()
+        };
+        for path in [
+            "/proc/sys/kernel/random/uuid",
+            "/proc/sys/kernel/pty/nr",
+            "/proc/sys/kernel/pid_max",
+            "/proc/sys/kernel/random/boot_id",
+            "/proc/sys/kernel/osrelease",
+        ] {
+            assert!(faults(path), "{path}");
+        }
+        for path in ["/proc/version", "/proc/cmdline", "/proc/self/status"] {
+            assert!(!faults(path), "{path}");
+        }
     }
 
     #[test]
@@ -6468,20 +8018,24 @@ total_commit_ms 0\n"
 
     #[test]
     fn snapshot_supports_positional_reads_and_rewinds() {
-        let mut file = ProcfsFile::from_path(Path::new("/proc/sys/fs/file-nr")).unwrap();
+        // A `seq_file` file, which serves reads at any position.
+        let mut file = ProcfsFile::from_path(Path::new("/proc/version")).unwrap();
         file.initialize(
-            b"245853\t0\t1048576\n".to_vec(),
+            Vec::new(),
             ProcfsSnapshotContext {
                 virtual_pid: 1,
                 ..ProcfsSnapshotContext::default()
             },
         );
 
-        assert_eq!(file.take(2).unwrap(), b"0\t");
-        assert_eq!(file.take_at(4, 1).unwrap(), b"9");
+        assert_eq!(file.take(2).unwrap(), b"Li");
+        assert_eq!(file.take_at(4, 1).unwrap(), b"x");
         assert_eq!(file.position().0, 2, "pread must not move the cursor");
         file.set_offset(0);
-        assert_eq!(file.take(128).unwrap(), b"0\t0\t9223372036854775807\n");
+        assert_eq!(
+            file.take(128).unwrap(),
+            FixedProcfsFile::Version.contents(&crate::machine::MachineDescription::default())
+        );
     }
 
     /// Two-sided coverage for the #1558 fix-forward, counted on both sides.
@@ -6548,38 +8102,31 @@ total_commit_ms 0\n"
         assert_eq!(refused_count, 8, "all eight refused shapes were checked");
     }
 
-    /// CROSS-SURFACE: the two module surfaces must agree. `/proc/modules` field
-    /// 3 and `/sys/module/<name>/refcnt` are both derived from the holder list,
-    /// so for every module in the table the sysfs value equals the use count
-    /// `sanitize_modules` publishes. #1558 emitted a hard 0 in sysfs while
-    /// /proc/modules kept the holder cardinality; that pair is what this pins.
+    /// CROSS-SURFACE: the two module surfaces must agree. #1558 emitted a hard
+    /// 0 in `/sys/module/<name>/refcnt` while `/proc/modules` published a
+    /// nonzero use count. `/proc/modules` now publishes no module, so no module
+    /// is held and every sysfs refcnt must be 0, never a host-derived count.
     #[test]
     fn sysfs_refcnt_agrees_with_proc_modules_use_count() {
-        let modules = "kvm_amd 212992 95 - Live 0x0\n\
-                       kvm 1200128 1 kvm_amd, Live 0x0\n\
-                       llc 20480 2 bridge,stp, Live 0x0\n";
-        let normalized = sanitize_modules(modules.as_bytes());
-        let normalized = std::str::from_utf8(&normalized).unwrap();
-
-        let mut compared = 0;
-        for line in normalized.lines() {
-            let mut fields = line.split_whitespace();
-            let module = fields.next().unwrap();
-            fields.next().unwrap();
-            let proc_use_count: u64 = fields.next().unwrap().parse().unwrap();
-
-            let sysfs = sanitize_module_refcnt(b"999\n", module, modules);
-            let sysfs: u64 = std::str::from_utf8(&sysfs).unwrap().trim().parse().unwrap();
-
-            assert_eq!(
-                sysfs, proc_use_count,
-                "{module}: /proc/modules says {proc_use_count} but sysfs says {sysfs}"
-            );
-            compared += 1;
+        // `/proc/modules` lists no module, so nothing holds any module:
+        // every refcnt is 0.
+        assert!(
+            FixedProcfsFile::Modules
+                .contents(&crate::machine::MachineDescription::default())
+                .is_empty()
+        );
+        for module in ["kvm_amd", "kvm", "llc"] {
+            assert_eq!(sanitize_module_refcnt(b"999\n", module), b"0\n");
         }
-        assert_eq!(compared, 3, "all three modules were cross-checked");
-        // And the specific pair codex named: kvm is held by kvm_amd.
-        assert_eq!(sanitize_module_refcnt(b"1\n", "kvm", modules), b"1\n");
+        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm_amd"), b"0\n");
+        assert_eq!(sanitize_module_refcnt(b"12", "kvm_amd"), b"0");
+        assert_eq!(sanitize_module_refcnt(b"9", "llc"), b"0");
+        // Malformed contents still pass through untouched (fail open, unchanged).
+        assert_eq!(
+            sanitize_module_refcnt(b"not-a-count\n", "kvm"),
+            b"not-a-count\n"
+        );
+        assert!(sanitize_module_refcnt(b"", "kvm").is_empty());
     }
 
     /// ROUND-2 REGRESSION GUARD for the scoped fd-resolution fallback.
@@ -6651,5 +8198,419 @@ total_commit_ms 0\n"
             ProcfsKind::ModuleRefcnt("kvm".to_owned()),
             "resolution turns the unclassifiable spelling into the real kind"
         );
+    }
+    /// A process's cgroup reads as a cgroup namespace rooted at it shows it:
+    /// the host's path, which names whatever launched Hermit, becomes `/` on
+    /// every line, cgroup v1 or v2 (https://github.com/rrnewton/hermit/issues/4378).
+    #[test]
+    fn a_process_cgroup_reads_as_the_root_cgroup() {
+        assert_eq!(
+            sanitize_process_cgroup(
+                b"0::/user.slice/user-1.slice/app.slice/safehermit-20261015T004318Z-183710.service\n"
+            ),
+            b"0::/\n"
+        );
+        assert_eq!(
+            sanitize_process_cgroup(
+                b"12:pids:/user.slice\n11:cpu,cpuacct:/user.slice/x\n0::/a/b\n"
+            ),
+            b"12:pids:/\n11:cpu,cpuacct:/\n0::/\n"
+        );
+        assert_eq!(
+            sanitize_process_cgroup(b"not a cgroup line"),
+            b"not a cgroup line"
+        );
+        // A directory name that is not UTF-8 is replaced too.
+        assert_eq!(
+            sanitize_process_cgroup(b"0::/user.slice/\xff\xfe.scope\n"),
+            b"0::/\n"
+        );
+    }
+
+    /// A process's cgroup file is named, for rendering, by the task its path
+    /// names: `self` and `thread-self` bind to the caller's numbers at the
+    /// lookup, a number names itself, and a number Linux's `name_to_int`
+    /// refuses names no task. Every spelling of one task's file has one path,
+    /// the one its descriptor link shows, and so one inode; a thread's
+    /// `task/<tid>` file is another file.
+    #[test]
+    fn a_process_cgroup_is_rendered_for_the_task_its_path_names() {
+        let bound = |spelling: &str| {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            assert_eq!(file.per_process_name(), Some("cgroup"), "{spelling}");
+            file.bind_task(3, 5);
+            file.rendered_path(RenderedFiles::WITHOUT_CPUINFO)
+        };
+        for (spelling, path) in [
+            ("/proc/self/cgroup", Some("/proc/3/cgroup")),
+            ("/proc/3/cgroup", Some("/proc/3/cgroup")),
+            ("/proc/7/cgroup", Some("/proc/7/cgroup")),
+            ("/proc/thread-self/cgroup", Some("/proc/3/task/5/cgroup")),
+            ("/proc/self/task/5/cgroup", Some("/proc/3/task/5/cgroup")),
+            ("/proc/3/task/5/cgroup", Some("/proc/3/task/5/cgroup")),
+            ("/proc/7/task/9/cgroup", Some("/proc/7/task/9/cgroup")),
+            ("/proc/self/./cgroup", Some("/proc/3/cgroup")),
+            ("/proc/03/cgroup", None),
+            ("/proc/3/task/05/cgroup", None),
+            ("/proc/99999999999/cgroup", None),
+        ] {
+            assert_eq!(bound(spelling), path.map(Path::new), "{spelling}");
+        }
+        // Before the caller's spellings are bound there is no path.
+        let unbound = ProcfsFile::from_path(Path::new("/proc/self/cgroup")).unwrap();
+        assert_eq!(unbound.rendered_path(RenderedFiles::ALL), None);
+        assert_eq!(unbound.bound_task(), None);
+        // `thread-self` has no `task` below it, and other names are not the
+        // file.
+        assert!(ProcfsFile::from_path(Path::new("/proc/thread-self/task/5/cgroup")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/cgroups")).is_none());
+        // The two tables of per-process files agree.
+        assert_eq!(
+            ProcfsFile::PER_PROCESS_KINDS.map(|(_, name)| name),
+            ProcfsFile::PER_PROCESS_NAMES
+        );
+        // One interned path per task.
+        let first = bound("/proc/self/cgroup").unwrap();
+        let second = bound("/proc/3/cgroup").unwrap();
+        assert!(std::ptr::eq(first, second));
+        assert!(rendered_path_is_per_process(first));
+        assert!(!rendered_path_is_per_process(Path::new("/proc/stat")));
+        assert!(!rendered_path_is_per_process(Path::new(
+            "/proc/sys/kernel/pty/nr"
+        )));
+    }
+
+    /// The bytes are the root cgroup of the cgroup v2 hierarchy, rendered
+    /// with no kernel object; a file the kernel opened (under record and
+    /// replay, after `chroot`) keeps being served from the kernel's bytes,
+    /// sanitized, even where its path names a task by number.
+    #[test]
+    fn a_rendered_process_cgroup_is_the_root_cgroup_and_only_once_opened_so() {
+        let kernel_opened = ProcfsFile::from_path(Path::new("/proc/3/cgroup")).unwrap();
+        assert_eq!(
+            kernel_opened.rendered_path(RenderedFiles::ALL),
+            Some(Path::new("/proc/3/cgroup"))
+        );
+        assert_eq!(kernel_opened.served_rendered_path(RenderedFiles::ALL), None);
+        assert_eq!(kernel_opened.opened_path(), None);
+        let mut rendered = kernel_opened.into_rendered();
+        assert_eq!(
+            rendered.served_rendered_path(RenderedFiles::WITHOUT_CPUINFO),
+            Some(Path::new("/proc/3/cgroup"))
+        );
+        assert_eq!(rendered.opened_path(), Some(Path::new("/proc/3/cgroup")));
+        let template = rendered.rendering_template().to_vec();
+        rendered.initialize(template, ProcfsSnapshotContext::default());
+        assert_eq!(rendered.rendered_snapshot(), Some(&b"0::/\n"[..]));
+        assert!(rendered.seeks_only_from_start_or_position());
+        // A system-wide file is served from its rendering whichever opened it.
+        let stat = ProcfsFile::from_path(Path::new("/proc/stat")).unwrap();
+        assert_eq!(
+            stat.served_rendered_path(RenderedFiles::ALL),
+            Some(Path::new("/proc/stat"))
+        );
+    }
+
+    /// A placeholder's name carries a per-process file's task by number and
+    /// identity, as Detcore names every one it makes, and is read back as the
+    /// same file of the same task; a name with `self`, or without the task's
+    /// identity, names no file Detcore made.
+    #[test]
+    fn a_process_cgroup_placeholder_names_its_task() {
+        let file = |spelling: &str, incarnation| {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            file.bind_task(3, 5);
+            file.set_task_incarnation(incarnation);
+            file.into_rendered().opened_path().unwrap()
+        };
+        let process = file(
+            "/proc/self/cgroup",
+            TaskIncarnation {
+                process: 1,
+                thread: None,
+            },
+        );
+        let name = placeholder_name(process, b"");
+        assert_eq!(name, "hermit-procfs:/proc/3/cgroup#1@");
+        let link = format!("/memfd:{name} (deleted)");
+        let (path, snapshot) =
+            placeholder_link(link.as_bytes(), RenderedFiles::WITHOUT_CPUINFO).unwrap();
+        assert!(
+            std::ptr::eq(path, process),
+            "the same file of the same task"
+        );
+        assert!(snapshot.is_empty());
+        let thread = file(
+            "/proc/thread-self/cgroup",
+            TaskIncarnation {
+                process: 1,
+                thread: Some(2),
+            },
+        );
+        let name = placeholder_name(thread, b"");
+        assert_eq!(name, "hermit-procfs:/proc/3/task/5/cgroup#1.2@");
+        let read = placeholder_link_path(
+            format!("/memfd:{name} (deleted)").as_bytes(),
+            RenderedFiles::ALL,
+        )
+        .unwrap();
+        assert!(std::ptr::eq(read, thread));
+        for forged in [
+            "hermit-procfs:/proc/self/cgroup#1@",
+            "hermit-procfs:/proc/3/cgroup@",
+            "hermit-procfs:/proc/3/cgroup#1.2@",
+            "hermit-procfs:/proc/3/task/5/cgroup#1@",
+            "hermit-procfs:/proc/3/cgroup#x@",
+            "hermit-procfs:/proc/stat#1@",
+            "hermit-procfs:/proc/3/cgroup#256@",
+            "hermit-procfs:/proc/3/task/5/cgroup#1.256@",
+        ] {
+            assert_eq!(
+                placeholder_link_path(
+                    format!("/memfd:{forged} (deleted)").as_bytes(),
+                    RenderedFiles::ALL
+                ),
+                None,
+                "{forged}"
+            );
+        }
+    }
+
+    /// A process's `auxv` is a per-process file Detcore renders from its own
+    /// record, never from the kernel: a descriptor the kernel opened stays
+    /// unclassified. Linux snapshots it at the open (`auxv_open` pins the
+    /// memory map), so no read looks for the task again, and it is a plain
+    /// file, not a `seq_file`, read through `read`, not `read_iter`. Its
+    /// placeholder's name carries nothing: the snapshot stays with the open
+    /// file description.
+    #[test]
+    fn a_process_auxv_is_pinned_at_its_open() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/self/auxv")).unwrap();
+        assert_eq!(file.per_process_name(), Some("auxv"));
+        assert!(file.is_process_auxv());
+        assert!(!file.kernel_served());
+        assert!(!file.shows_at_read());
+        assert!(!file.snapshot_at_first_read());
+        assert!(!file.has_read_iter());
+        assert!(!file.seeks_only_from_start_or_position());
+        file.bind_task(3, 5);
+        file.set_task_incarnation(TaskIncarnation {
+            process: 1,
+            thread: None,
+        });
+        let rendered = file.into_rendered();
+        assert!(!rendered.snapshot_is_rerendered());
+        let path = rendered.opened_path().unwrap();
+        assert_eq!(path, Path::new("/proc/3/auxv"));
+        assert!(rendered_path_is_per_process(path));
+        assert!(!rendered_path_is_seq_file(path));
+        // A placeholder's name carries no `auxv` snapshot (it would not fit
+        // a memfd name): the snapshot stays with the open file description.
+        let name = placeholder_name(path, b"");
+        assert_eq!(name, "hermit-procfs:/proc/3/auxv#1@");
+        let (read, snapshot) = placeholder_link(
+            format!("/memfd:{name} (deleted)").as_bytes(),
+            RenderedFiles::WITHOUT_CPUINFO,
+        )
+        .unwrap();
+        assert!(std::ptr::eq(read, path), "the same file of the same task");
+        assert!(snapshot.is_empty());
+        let rebuilt = ProcfsFile::from_rendered_path(read)
+            .unwrap()
+            .into_rendered();
+        assert_eq!(rebuilt.rendered_snapshot(), None);
+        assert!(rebuilt.rendering_template().is_empty());
+        // A process's `cgroup` is shown at its reads.
+        let cgroup = ProcfsFile::from_path(Path::new("/proc/self/cgroup")).unwrap();
+        assert!(cgroup.kernel_served());
+        assert!(cgroup.shows_at_read());
+    }
+
+    /// The auxiliary vector on a new image's initial stack: past `argc`, its
+    /// arguments and their NULL, and the environment and its NULL, the pairs
+    /// through `AT_NULL`, which the file includes. A stack whose words cannot
+    /// be read, with an implausible `argc`, with no `AT_NULL` within Linux's
+    /// `saved_auxv`, or whose vector has no `AT_PAGESZ` (a walk from a stack
+    /// pointer that was not the image's first, as DBT's post-exec gave one),
+    /// gives nothing.
+    #[test]
+    fn the_initial_stack_auxv_is_the_pairs_through_at_null() {
+        let stack = 0x7ffe_0000_u64;
+        let words = |values: &[u64]| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (stack + 8 * index as u64, *value))
+                .collect::<std::collections::BTreeMap<u64, u64>>()
+        };
+        let read = |memory: &std::collections::BTreeMap<u64, u64>| {
+            let memory = memory.clone();
+            move |at: u64| memory.get(&at).copied()
+        };
+        // argc 2, two arguments, NULL, one environment entry, NULL, then
+        // AT_PAGESZ 4096, AT_RANDOM, AT_NULL.
+        let memory = words(&[
+            2,
+            0x1000,
+            0x1008,
+            0,
+            0x1010,
+            0,
+            libc::AT_PAGESZ,
+            4096,
+            libc::AT_RANDOM,
+            0x2000,
+            libc::AT_NULL,
+            0,
+            0xdead,
+        ]);
+        let expected: Vec<u8> = [
+            libc::AT_PAGESZ,
+            4096,
+            libc::AT_RANDOM,
+            0x2000,
+            libc::AT_NULL,
+            0,
+        ]
+        .iter()
+        .flat_map(|word| word.to_ne_bytes())
+        .collect();
+        assert_eq!(initial_stack_auxv(stack, read(&memory)), Some(expected));
+        // No arguments and no environment: the vector follows two NULLs.
+        let empty = words(&[0, 0, 0, libc::AT_PAGESZ, 4096, libc::AT_NULL, 0]);
+        assert_eq!(
+            initial_stack_auxv(stack, read(&empty)).map(|bytes| bytes.len()),
+            Some(32),
+            "AT_PAGESZ and AT_NULL"
+        );
+        // AT_NULL alone, as a walk from a stack pointer deep in the image's
+        // stack found it under DBT (16 bytes where the vector had 368): no
+        // AT_PAGESZ, so refused.
+        let lone = words(&[0, 0, 0, libc::AT_NULL, 0]);
+        assert_eq!(initial_stack_auxv(stack, read(&lone)), None);
+        // An unreadable word.
+        let short = words(&[0, 0, 0, libc::AT_PAGESZ, 4096]);
+        assert_eq!(initial_stack_auxv(stack, read(&short)), None);
+        // An implausible argc.
+        let huge = words(&[1 << 21, 0, 0, libc::AT_PAGESZ, 4096, libc::AT_NULL, 0]);
+        assert_eq!(initial_stack_auxv(stack, read(&huge)), None);
+        // No AT_NULL within MAX_AUXV_BYTES.
+        let mut endless = vec![0, 0, 0];
+        endless.extend(std::iter::repeat_n([libc::AT_PAGESZ, 4096], 30).flatten());
+        endless.extend([libc::AT_NULL, 0]);
+        assert_eq!(initial_stack_auxv(stack, read(&words(&endless))), None);
+        // Exactly MAX_AUXV_BYTES, the last pair AT_NULL.
+        let mut full = vec![0, 0, 0];
+        full.extend(std::iter::repeat_n([libc::AT_PAGESZ, 4096], 25).flatten());
+        full.extend([libc::AT_NULL, 0]);
+        assert_eq!(
+            initial_stack_auxv(stack, read(&words(&full))).map(|bytes| bytes.len()),
+            Some(MAX_AUXV_BYTES)
+        );
+    }
+
+    /// Two tasks that held the same pid have cgroup files with one text but
+    /// two paths and two inode numbers, and the number lays out the file's
+    /// identity: no two files of different tasks can share one (the 28-bit
+    /// hash of the text, which system-wide files keep, could: the paths of
+    /// 19899 and 172794 collided). A system-wide file keeps its number.
+    #[test]
+    fn a_process_cgroup_inode_is_its_tasks_identity() {
+        let file = |spelling: &str, pid, tid, incarnation| {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            file.bind_task(pid, tid);
+            file.set_task_incarnation(incarnation);
+            file.into_rendered().opened_path().unwrap()
+        };
+        let once = TaskIncarnation {
+            process: 1,
+            thread: None,
+        };
+        let twice = TaskIncarnation {
+            process: 2,
+            thread: None,
+        };
+        let first = file("/proc/self/cgroup", 3, 3, once);
+        let second = file("/proc/self/cgroup", 3, 3, twice);
+        assert_eq!(first, second, "one text");
+        assert!(!std::ptr::eq(first, second), "two files");
+        let inode = crate::procfs_inode::rendered_inode;
+        assert_ne!(inode(first), inode(second));
+        assert_eq!(inode(first), 1 << 63 | 1 << 60 | 3 << 38 | 1 << 8);
+        assert_eq!(inode(second), 1 << 63 | 1 << 60 | 3 << 38 | 2 << 8);
+        let thread = file(
+            "/proc/thread-self/cgroup",
+            3,
+            5,
+            TaskIncarnation {
+                process: 1,
+                thread: Some(1),
+            },
+        );
+        assert_eq!(
+            inode(thread),
+            1 << 63 | 1 << 60 | 3 << 38 | 5 << 16 | 1 << 8 | 1
+        );
+        // The last incarnation an inode number tells apart, for the process
+        // and the thread, and the greatest pid and tid Linux gives.
+        let last = file(
+            "/proc/4194303/task/4194303/cgroup",
+            3,
+            3,
+            TaskIncarnation {
+                process: crate::procfs_inode::MAX_INCARNATION,
+                thread: Some(crate::procfs_inode::MAX_INCARNATION),
+            },
+        );
+        assert_eq!(
+            inode(last),
+            1 << 63 | 1 << 60 | 4194303 << 38 | 4194303 << 16 | 255 << 8 | 255
+        );
+        let a = file("/proc/19899/cgroup", 3, 3, once);
+        let b = file("/proc/172794/cgroup", 3, 3, once);
+        assert_ne!(inode(a), inode(b));
+        assert_eq!(
+            crate::procfs_inode::rendered_inode(Path::new("/proc/19899/cgroup")) & 0x0fff_ffff,
+            crate::procfs_inode::rendered_inode(Path::new("/proc/172794/cgroup")) & 0x0fff_ffff,
+            "the text hash the structured number replaces does collide"
+        );
+        assert!(crate::procfs_inode::rendered_inode(Path::new("/proc/stat")) < 1 << 32);
+        // A rendered file read back from its path is the same task's file.
+        let reread = ProcfsFile::from_rendered_path(second).unwrap();
+        assert_eq!(reread.task_incarnation(), Some(twice));
+    }
+
+    /// A pid beyond Linux's `PID_MAX_LIMIT` does not fit an inode number's
+    /// field, and is refused rather than wrapped into another file's number.
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn a_process_cgroup_inode_refuses_a_pid_beyond_its_field() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/4194304/cgroup")).unwrap();
+        file.bind_task(1, 1);
+        file.set_task_incarnation(TaskIncarnation {
+            process: 1,
+            thread: None,
+        });
+        let path = file.into_rendered().opened_path().unwrap();
+        crate::procfs_inode::rendered_inode(path);
+    }
+
+    /// The 256th task to hold a number has no inode number of its own:
+    /// Detcore refuses to bind a file to it (`Detcore::bind_task_identity`,
+    /// `procfs_inode::incarnation_fits`), and numbering one anyway is a
+    /// defect that panics rather than wraps into another task's number.
+    #[test]
+    #[should_panic(expected = "pid incarnation 256")]
+    fn a_process_cgroup_inode_refuses_an_incarnation_beyond_its_field() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/3/cgroup")).unwrap();
+        file.bind_task(3, 3);
+        let beyond = TaskIncarnation {
+            process: crate::procfs_inode::MAX_INCARNATION + 1,
+            thread: None,
+        };
+        assert!(!crate::procfs_inode::incarnation_fits(beyond));
+        file.set_task_incarnation(beyond);
+        let path = file.into_rendered().opened_path().unwrap();
+        crate::procfs_inode::rendered_inode(path);
     }
 }

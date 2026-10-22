@@ -27,16 +27,52 @@ use crate::types::MmId;
 use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
 
-/// Identifies the outer resource turn for a physically nonblocking, guest-internal pipe
-/// operation. SaBRe reports these inherited stdio pipes as device resources before Detcore's
-/// `InternalIOPolling` turn, so the scheduler tags the outer turn for the same retry-count
-/// normalization as the polling turn itself.
-pub(crate) const SABRE_INTERNAL_PIPE_IO_FYI: &str = "sabre-internal-pipe-io";
+/// Names the outer resource turn for a physically nonblocking, guest-internal pipe
+/// operation on a backend whose internal pipe turns are host-timed
+/// (`BackendCapabilities::internal_pipe_turns_are_host_timed`; today only SaBRe). Such a
+/// backend reports these inherited stdio pipes as device resources before Detcore's
+/// `InternalIOPolling` turn. The name is descriptive only: the log comparison counts these
+/// turns like any other.
+pub(crate) const HOST_TIMED_INTERNAL_PIPE_IO_FYI: &str = "sabre-internal-pipe-io";
 
-/// Identifies the strong one-turn yield issued before a SaBRe task with a loopback peer performs
-/// a zero-timeout poll. The number of these guest polling-loop iterations depends on when the
-/// peer's kernel readiness becomes visible, so the verifier normalizes their scheduler-only turns.
-pub(crate) const SABRE_LOOPBACK_POLL_YIELD_FYI: &str = "sabre-loopback-poll-zero-timeout";
+/// Identifies the strong one-turn yield issued before a task with a loopback peer performs
+/// a zero-timeout poll, on a backend whose loopback pollers yield to their peers
+/// (`BackendCapabilities::loopback_pollers_yield_to_peers`; today only SaBRe). The scheduler
+/// keeps such a yield's one-turn exclusion even under chaos (`Scheduler::requeue_after`). The
+/// log comparison counts these turns like any other.
+pub(crate) const LOOPBACK_POLL_YIELD_FYI: &str = "sabre-loopback-poll-zero-timeout";
+
+/// Identifies an emulated `pause` request (`SleepUntil(INDEFINITE)`), which a SIGALRM
+/// ledger entry ends (`scheduler::sigalrm`), as does a cross-task signal that interrupts it
+/// (`scheduler::sleep_signal`). A `nanosleep` whose deadline saturates files the same
+/// resource, and is not a pause.
+pub(crate) const PAUSE_FYI: &str = "pause";
+
+/// Identifies an emulated `nanosleep` or `clock_nanosleep` request (`SleepUntil(deadline)`),
+/// which a cross-task signal that interrupts it ends before its deadline
+/// (`scheduler::sleep_signal`).
+pub(crate) const NANOSLEEP_FYI: &str = "nanosleep";
+
+/// The SIGALRM action read in the owner turn of an emulated in-guest sleep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum SigalrmSleepDisposition {
+    Default,
+    Ignored,
+    Handled,
+}
+
+/// Signal state attached to one exact emulated sleep, never a global cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InGuestSleepSigalrm {
+    pub disposition: SigalrmSleepDisposition,
+    pub blocked: bool,
+}
+
+impl InGuestSleepSigalrm {
+    pub(crate) fn ends_process(self) -> bool {
+        self.disposition == SigalrmSleepDisposition::Default && !self.blocked
+    }
+}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1151)
@@ -316,10 +352,43 @@ pub enum ResourceID {
     /// syscall count observed by the guest.
     HappensBeforeCheckpoint(u64),
 
+    /// A happens-before checkpoint at a syscall that is the `nth` occurrence of
+    /// one or more syscall-occurrence anchors on this thread (a named syscall,
+    /// optionally on one file descriptor, counted by the guest per thread).
+    /// Carries the post-increment syscall count, so count anchors at the same
+    /// syscall are evaluated too, and the names of the anchors reached. The
+    /// scheduler fires those that resolve to this thread.
+    HappensBeforeSyscallCheckpoint {
+        /// The post-increment syscall count observed by the guest.
+        count: u64,
+        /// The syscall-occurrence anchors this syscall is the `nth` occurrence
+        /// of, in name order.
+        anchors: Vec<String>,
+    },
+
+    /// A syscall entry that reached posthook happens-before anchors returned an
+    /// internal restart code, so whether it completes is decided by the kernel
+    /// after Hermit's checkpoint. The scheduler refuses the run
+    /// (`HERMIT_HB_POSTHOOK_INTERRUPTED`) and fires nothing
+    /// (<https://github.com/rrnewton/hermit/issues/3929>).
+    HappensBeforePosthookInterrupted {
+        /// The post-increment syscall count observed by the guest.
+        count: u64,
+        /// The posthook anchors the entry reached, in name order.
+        anchors: Vec<String>,
+        /// The restart code, by name.
+        code: String,
+    },
+
     /// A real `rt_sigsuspend` executing outside the runnable set while the kernel
     /// atomically installs its temporary signal mask. Unlike arbitrary external
     /// IO, this operation cannot complete without a signal.
     BlockingRtSigsuspend(ExternalOpId),
+
+    /// A one-shot SIGALRM consumed while its single-threaded in-guest target
+    /// was parked at a qualified emulated sleep. This authorizes only the
+    /// original sleep's typed fatal response, not a generic physical signal.
+    InGuestFatalAlarm,
 }
 
 /// Permission to a device, which behaves like a predefined "inode".
@@ -379,6 +448,163 @@ pub struct Resources {
     /// requests that do not go through `resource_request`.
     #[serde(default)]
     pub(crate) backend_runtime_bootstrap: bool,
+    /// The signal mask a thread sleeps under in the blocking call this request
+    /// begins (`BlockingExternalIO`, `BlockingRtSigsuspend`), when the call
+    /// installs its own: the mask argument of `rt_sigsuspend`, `ppoll` or
+    /// `pselect6`, read in the thread's turn, without `SIGKILL` and `SIGSTOP`,
+    /// which Linux never blocks. `None` for a call that sleeps under the
+    /// thread's own mask; the scheduler then reads that mask when it commits
+    /// the request, while the thread is still stopped at it. The scheduler
+    /// records the mask either way, because once the thread runs the call its
+    /// live mask is no longer ordered by the schedule, and a `SIGCHLD` target
+    /// must be chosen from masks that are
+    /// (<https://github.com/rrnewton/hermit/issues/3146>).
+    #[serde(default)]
+    pub(crate) blocked_signal_mask: Option<u64>,
+    /// Set on a `BlockingExternalIO` request whose call installs a temporary
+    /// signal mask that the thread's turn cannot vouch for: a record/replay
+    /// pselect6 whose mask Hermit could not read through the kernel at entry,
+    /// which keeps the guest's `{ sigmask, sigsetsize }` wrapper. A masked
+    /// record/replay pselect6, ppoll or epoll_pwait that may wait sleeps under
+    /// a private copy Hermit read at entry
+    /// (<https://github.com/rrnewton/hermit/issues/4095>), and sets it too, so
+    /// that recording and replay, which serves the call from the log without
+    /// the kernel installing anything, schedule the call alike. The scheduler
+    /// then records no sleeping mask for the thread
+    /// (`BlockedPool::out_of_scheduler_masks` holds `None`), so it neither arms
+    /// the thread for a committed signal nor chooses it as a `SIGCHLD` target,
+    /// as for every call outside the schedule before the scheduler modelled
+    /// signal targets (review of <https://github.com/rrnewton/hermit/pull/3989>).
+    #[serde(default)]
+    pub(crate) blocked_signal_mask_unknown: bool,
+    /// Set on a `BlockingExternalIO` request whose call `hermit replay` serves
+    /// from the recording. Such a call runs in the background as it did during
+    /// recording, so the schedule matches the recording's, but it cannot
+    /// block. The scheduler therefore commits no other turn until it has
+    /// finished, and readmits such calls before any other background call, so
+    /// that neither its effects nor when it rejoins depend on host timing.
+    /// `false` outside replay.
+    #[serde(default)]
+    pub(crate) replay_served_from_log: bool,
+    /// Set on a `BlockingExternalIO` request whose call reads a descriptor
+    /// Detcore records as a signalfd (`read`, `readv`, `preadv2`): run outside
+    /// the schedule, it can dequeue a pending signal of its own process at a
+    /// host-timed moment (`signalfd_dequeue` reads the calling task's queues).
+    /// The scheduler then does not arm another thread of that process for a
+    /// shared-queue signal the signalfd may read
+    /// (`Scheduler::another_call_may_take_waiting_signal`). Detcore's
+    /// descriptor table follows close, dup and close-on-exec, so a closed
+    /// signalfd sets nothing. `false` for every other request.
+    #[serde(default)]
+    pub(crate) reads_signalfd: bool,
+    /// The descriptor a `BlockingExternalIO` request's `read`, `readv` or
+    /// `preadv2` reads, whatever it is, with the identity of the descriptor
+    /// table it is in; `None` for every other request. Under
+    /// record and replay the scheduler asks the kernel, as it grants the
+    /// request, whether that descriptor is a signalfd and which signals it
+    /// reads, so that a signalfd Detcore's table does not record as one (one
+    /// received over `SCM_RIGHTS`) counts too, and a descriptor changed by
+    /// another thread's turn while this request waited is read as it is when
+    /// the call runs (`Scheduler::background_kernel_signalfd_reads`).
+    #[serde(default)]
+    pub(crate) read_fd: Option<(detcore_model::fd::FilesId, i32)>,
+    /// Set on a polling request whose attempts fail or succeed only through
+    /// guest actions: a retry on a container-internal descriptor (a pipe, a
+    /// socketpair end, or a FIFO polled as a pipe), or a FIFO open waiting for
+    /// a guest peer. Such a poller cannot make progress on its own, which is
+    /// what `Scheduler::nothing_else_can_run` asks
+    /// (<https://github.com/rrnewton/hermit/issues/2203>). `false` for a poll
+    /// whose outcome a host can change.
+    #[serde(default)]
+    pub(crate) polls_guest_state_only: bool,
+    /// Set by a blocking FIFO open waiting for a guest peer. When this polling
+    /// turn commits and nothing else can run (`Scheduler::nothing_else_can_run`),
+    /// the answer is `ResumeStatus::NothingElseCanRun`, and the open then waits
+    /// in the kernel holding the turn, as without the poll.
+    #[serde(default)]
+    pub(crate) waits_until_nothing_else_can_run: bool,
+    /// Set on a retry (`poll_attempt > 0`) whose previous attempt moved data
+    /// (a partial pipe write). Every other retry follows an attempt that would
+    /// have blocked and moved nothing, which `Scheduler::nothing_else_can_run`
+    /// needs to know: a guest-state poll grant is progress unless the thread's
+    /// next request is a retry without this flag.
+    #[serde(default)]
+    pub(crate) previous_attempt_made_progress: bool,
+    /// The `poll_attempt` a skipped retry had when the scheduler replaced it
+    /// with a runnable copy whose `poll_attempt` is 0
+    /// (`Scheduler::upgrade_polled_to_runnable`): the request is still that
+    /// retry, for `Scheduler::nothing_else_can_run`.
+    #[serde(default)]
+    pub(crate) upgraded_from_attempt: u32,
+    /// The pipe or FIFO this polling request waits on, and what it waits
+    /// for, under `--pipe-wake-latency` (`crate::pipe_wake`): an action of
+    /// another thread that can satisfy it hands this thread the turn. `None`
+    /// for every other request, and always with the option unset. Boxed:
+    /// inline, its 32 bytes in every request a handler future holds grew
+    /// `handle_syscall_event`'s debug-build stack past the 2 MiB test thread
+    /// that runs ptrace record through the library (`record_replay`'s
+    /// `public_record_*` tests).
+    #[serde(default)]
+    pub(crate) polls_channel: Option<Box<(crate::pipe_wake::ChannelId, crate::pipe_wake::Wants)>>,
+    /// The absolute virtual deadline of the timed wait that a polling request
+    /// (`poll_attempt > 0`) retries: `ppoll`, `poll`, `epoll_wait`,
+    /// `epoll_pwait`, `rt_sigtimedwait`, `select`, `pselect6` or a polling
+    /// `FUTEX_WAIT` with a timeout. Once committed virtual time passes it, the
+    /// scheduler restores the backed-off poller's normal priority so its next
+    /// retry can return the timeout
+    /// (`Scheduler::step2b_restore_due_pollers`,
+    /// <https://github.com/rrnewton/hermit/issues/3952>). `None` for every other
+    /// request, and always under record/replay.
+    #[serde(default)]
+    pub(crate) poll_deadline: Option<LogicalTime>,
+    /// The action and guest mask read in this exact emulated sleep's own turn.
+    /// Only its singleton SleepUntil request may use this snapshot.
+    #[serde(default)]
+    pub(crate) in_guest_sleep_sigalrm: Option<InGuestSleepSigalrm>,
+    /// The filing thread's process and thread as the backend names them for
+    /// `/proc` (`guest.pid()`, `guest.tid()`, as a futex wait's
+    /// `FutexSignalWatch` records them), on a restartable internal IO poll
+    /// (`retry_nonblocking_syscall_helper`, `execute_blocking_pipe_write`).
+    /// The scheduler reads that thread's live signal state there to decide
+    /// which pending signals end the poll
+    /// (`Scheduler::restartable_internal_io_interrupting_signals`). `None`
+    /// for every other request; a marked poll without it is not filtered.
+    #[serde(default)]
+    pub(crate) signal_state_task: Option<(i32, i32)>,
+    /// Set on a restartable internal IO poll that decides for itself whether
+    /// a `Signaled` wake interrupts it: a parked pipe `writev`
+    /// (`pipe_writev_resources`) polls with every ordinary signal blocked and
+    /// reads the target's disposition after the wake
+    /// (`wait_signal_disposition`). The scheduler's drain therefore does not
+    /// filter its signals by the thread's kernel state, whose mask it would
+    /// read as all-blocked, dropping every signal
+    /// (<https://github.com/rrnewton/hermit/issues/4187>).
+    #[serde(default)]
+    pub(crate) decides_signal_interruption_itself: bool,
+    /// Set on an `InboundSignal` request whose signal stop came before the
+    /// thread's next hand-off to the scheduler since its previous handler's
+    /// delivery was granted (`ThreadState::delivered_since_request` and
+    /// `ThreadState::note_scheduler_handoff`), in a timeslice that
+    /// stop did not end, at most `MAX_SIGRETURN_CONTINUATIONS` times in a
+    /// row: typically the delivery Linux makes on the return from that
+    /// handler's `rt_sigreturn`, before any instruction of the interrupted
+    /// code. Step 3 grants it before any other thread runs
+    /// (`Scheduler::first_sigreturn_continuation`,
+    /// <https://github.com/rrnewton/hermit/issues/4505>). Never set for
+    /// `SIGCHLD`, whose delivery the host-async rules place.
+    #[serde(default)]
+    pub(crate) continues_sigreturn: bool,
+    /// Set on a restartable internal IO poll on a pipe (`FdType::Pipe`:
+    /// pipes, and FIFOs that joined internal polling) by its `read`, `readv`
+    /// and scalar `write`: a `SIGCHLD` a guest sent the thread, which the
+    /// schedule recorded in its private queue (`Scheduler::private_sigchld`),
+    /// ends the call there as on Linux, where every other restartable call
+    /// holds it until it returns (R2b-2 stage 3,
+    /// <https://github.com/rrnewton/hermit/issues/4273>). `false` for every
+    /// other request, a socket call and a parked pipe `writev` (which decides
+    /// interruption itself) included.
+    #[serde(default)]
+    pub(crate) private_sigchld_decides: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -395,11 +621,63 @@ impl fmt::Debug for Resources {
         if self.backend_runtime_bootstrap {
             debug.field("backend_runtime_bootstrap", &true);
         }
+        if let Some(mask) = self.blocked_signal_mask {
+            debug.field("blocked_signal_mask", &mask);
+        }
+        if self.blocked_signal_mask_unknown {
+            debug.field("blocked_signal_mask_unknown", &true);
+        }
+        if self.replay_served_from_log {
+            debug.field("replay_served_from_log", &true);
+        }
+        if self.polls_guest_state_only {
+            debug.field("polls_guest_state_only", &true);
+        }
+        if self.waits_until_nothing_else_can_run {
+            debug.field("waits_until_nothing_else_can_run", &true);
+        }
+        if self.previous_attempt_made_progress {
+            debug.field("previous_attempt_made_progress", &true);
+        }
+        if self.upgraded_from_attempt != 0 {
+            debug.field("upgraded_from_attempt", &self.upgraded_from_attempt);
+        }
+        if let Some(channel) = &self.polls_channel {
+            debug.field("polls_channel", channel);
+        }
+        if let Some(deadline) = self.poll_deadline {
+            debug.field("poll_deadline", &deadline);
+        }
+        if let Some(snapshot) = self.in_guest_sleep_sigalrm {
+            debug.field("in_guest_sleep_sigalrm", &snapshot);
+        }
+        if let Some(task) = self.signal_state_task {
+            debug.field("signal_state_task", &task);
+        }
+        if self.decides_signal_interruption_itself {
+            debug.field("decides_signal_interruption_itself", &true);
+        }
+        if self.continues_sigreturn {
+            debug.field("continues_sigreturn", &true);
+        }
+        if self.private_sigchld_decides {
+            debug.field("private_sigchld_decides", &true);
+        }
         debug.finish()
     }
 }
 
 impl Resources {
+    /// The runnable copy of a skipped retry that
+    /// `Scheduler::upgrade_polled_to_runnable` puts in its place:
+    /// `poll_attempt` 0, with the retry number kept in `upgraded_from_attempt`.
+    pub(crate) fn upgraded_to_runnable(&self) -> Resources {
+        let mut runnable = self.clone();
+        runnable.upgraded_from_attempt = runnable.upgraded_from_attempt.max(runnable.poll_attempt);
+        runnable.poll_attempt = 0;
+        runnable
+    }
+
     /// Allocate a new, empty Resources request.
     pub fn new(tid: DetTid) -> Resources {
         Resources {
@@ -409,6 +687,22 @@ impl Resources {
             fyi: String::new(),
             signal_interrupt_errno: None,
             backend_runtime_bootstrap: false,
+            blocked_signal_mask: None,
+            blocked_signal_mask_unknown: false,
+            replay_served_from_log: false,
+            reads_signalfd: false,
+            read_fd: None,
+            polls_guest_state_only: false,
+            waits_until_nothing_else_can_run: false,
+            previous_attempt_made_progress: false,
+            upgraded_from_attempt: 0,
+            polls_channel: None,
+            poll_deadline: None,
+            in_guest_sleep_sigalrm: None,
+            signal_state_task: None,
+            decides_signal_interruption_itself: false,
+            continues_sigreturn: false,
+            private_sigchld_decides: false,
         }
     }
 
@@ -417,6 +711,9 @@ impl Resources {
     /// (NB: equivalent to Haskell `Data.Map.unionWith perm_union`)
     pub fn union(&mut self, other: &Resources) {
         assert_eq!(self.tid, other.tid);
+        // Union describes a combined operation, not the exact wait whose owner
+        // captured the snapshot. Never promote either operand's authority.
+        self.in_guest_sleep_sigalrm = None;
         for (id, perm2) in other.resources.iter() {
             match self.resources.entry(id.clone()) {
                 Entry::Occupied(mut e) => {
@@ -434,6 +731,64 @@ impl Resources {
             (Some(_), None) => {}
         }
         self.backend_runtime_bootstrap |= other.backend_runtime_bootstrap;
+        match (self.blocked_signal_mask, other.blocked_signal_mask) {
+            (None, mask) => self.blocked_signal_mask = mask,
+            (Some(left), Some(right)) => assert_eq!(left, right),
+            (Some(_), None) => {}
+        }
+        self.blocked_signal_mask_unknown |= other.blocked_signal_mask_unknown;
+        if self.signal_state_task.is_none() {
+            self.signal_state_task = other.signal_state_task;
+        }
+        self.decides_signal_interruption_itself |= other.decides_signal_interruption_itself;
+        // A combined operation is a continuation only if both parts are.
+        self.continues_sigreturn &= other.continues_sigreturn;
+        self.private_sigchld_decides |= other.private_sigchld_decides;
+        self.replay_served_from_log |= other.replay_served_from_log;
+        self.polls_guest_state_only |= other.polls_guest_state_only;
+        self.waits_until_nothing_else_can_run |= other.waits_until_nothing_else_can_run;
+        self.previous_attempt_made_progress |= other.previous_attempt_made_progress;
+        self.upgraded_from_attempt = self.upgraded_from_attempt.max(other.upgraded_from_attempt);
+        // A merged request waits for the earlier of two deadlines.
+        self.poll_deadline = match (self.poll_deadline, other.poll_deadline) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+    }
+
+    /// The deadline at which this request, still queued for a turn, would
+    /// time out: a sleep's wake-up time or a backed-off poll's timeout.
+    pub(crate) fn queued_deadline(&self) -> Option<LogicalTime> {
+        let sleep = self.resources.keys().find_map(|resource| match resource {
+            ResourceID::SleepUntil(deadline) if !deadline.is_indefinite() => Some(*deadline),
+            _ => None,
+        });
+        match (sleep, self.poll_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Return the owner snapshot only for an unmodified singleton sleep.
+    pub(crate) fn in_guest_sigalrm_sleep(&self) -> Option<(InGuestSleepSigalrm, LogicalTime)> {
+        if self.resources.len() != 1
+            || self.poll_attempt != 0
+            || self.signal_interrupt_errno.is_some()
+            || self.blocked_signal_mask.is_some()
+            || self.replay_served_from_log
+            || self.backend_runtime_bootstrap
+            || self.poll_deadline.is_some()
+        {
+            return None;
+        }
+        let (ResourceID::SleepUntil(deadline), Permission::W) = self.resources.iter().next()?
+        else {
+            return None;
+        };
+        if !(self.fyi == PAUSE_FYI && deadline.is_indefinite() || self.fyi == NANOSLEEP_FYI) {
+            return None;
+        }
+        Some((self.in_guest_sleep_sigalrm?, *deadline))
     }
 
     pub fn set_signal_interrupt_errno(&mut self, errno: Errno) {
@@ -541,6 +896,79 @@ mod tests {
                 parent: tid2,
                 child: tid1,
             }
+        );
+    }
+
+    fn owner_sleep(deadline: LogicalTime, fyi: &str) -> Resources {
+        let mut request = Resources::new(DetTid::from_raw(1));
+        request.insert(ResourceID::SleepUntil(deadline), Permission::W);
+        request.fyi(fyi);
+        request.in_guest_sleep_sigalrm = Some(InGuestSleepSigalrm {
+            disposition: SigalrmSleepDisposition::Default,
+            blocked: false,
+        });
+        request
+    }
+
+    #[test]
+    fn in_guest_sleep_snapshot_requires_exact_singleton_wait_shape() {
+        let deadline = LogicalTime::from_nanos(10);
+        for (deadline, fyi) in [
+            (LogicalTime::INDEFINITE, PAUSE_FYI),
+            (deadline, NANOSLEEP_FYI),
+        ] {
+            let request = owner_sleep(deadline, fyi);
+            assert_eq!(
+                request.in_guest_sigalrm_sleep(),
+                Some((request.in_guest_sleep_sigalrm.unwrap(), deadline))
+            );
+        }
+        for case in 0..11 {
+            let mut request = owner_sleep(deadline, NANOSLEEP_FYI);
+            match case {
+                0 => request.in_guest_sleep_sigalrm = None,
+                1 => request.fyi = PAUSE_FYI.to_owned(),
+                2 => request.fyi("unrelated"),
+                3 => request.insert(ResourceID::TraceReplay, Permission::W),
+                4 => {
+                    request
+                        .resources
+                        .insert(ResourceID::SleepUntil(deadline), Permission::R);
+                }
+                5 => request.poll_attempt = 1,
+                6 => request.signal_interrupt_errno = Some(libc::EINTR),
+                7 => request.blocked_signal_mask = Some(0),
+                8 => request.backend_runtime_bootstrap = true,
+                9 => request.poll_deadline = Some(deadline),
+                10 => request.replay_served_from_log = true,
+                _ => unreachable!(),
+            }
+            assert_eq!(request.in_guest_sigalrm_sleep(), None, "case {case}");
+        }
+    }
+
+    #[test]
+    fn merging_resources_cannot_spread_sleep_snapshot_authority() {
+        let deadline = LogicalTime::from_nanos(10);
+        for merge_sleep_first in [false, true] {
+            let mut sleep = owner_sleep(deadline, NANOSLEEP_FYI);
+            let mut unrelated = Resources::new(sleep.tid);
+            unrelated.insert(ResourceID::TraceReplay, Permission::W);
+            let merged = if merge_sleep_first {
+                sleep.union(&unrelated);
+                sleep
+            } else {
+                unrelated.union(&sleep);
+                unrelated
+            };
+            assert_eq!(merged.in_guest_sleep_sigalrm, None);
+            assert_eq!(merged.in_guest_sigalrm_sleep(), None);
+        }
+        let mut sleep = owner_sleep(deadline, NANOSLEEP_FYI);
+        sleep.union(&sleep.clone());
+        assert_eq!(
+            sleep.in_guest_sleep_sigalrm, None,
+            "even identical merged operations surrender their original wait identity"
         );
     }
 }

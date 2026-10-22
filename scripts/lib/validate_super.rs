@@ -1,10 +1,8 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
 
 //! Generator and reporting support for the committed super population.
 //!
@@ -19,12 +17,9 @@ use dagrun::model::Step;
 use dagrun::model::StepOutcome;
 use dagrun::model::StructuredTestResultsManifest;
 
+use crate::validate_plan::canonical_test_epoch::CANONICAL_TEST_EPOCH_ARG;
 use crate::validate_plan::node;
 use crate::validate_plan::shell_quote;
-
-/// `GATE_TIMEOUT_SECONDS` (validate.sh:400). A generated super node without
-/// an explicit override inherits this historical default before it is committed.
-pub const DEFAULT_GATE_TIMEOUT_S: i64 = 600;
 
 /// `SUPER_REPETITIONS` (validate.sh:682).
 pub const SUPER_REPETITIONS_DEFAULT: i64 = 20;
@@ -300,10 +295,10 @@ impl StressProbe {
         let dbg = shell_quote(debug_bin);
         match self {
             StressProbe::PtraceStrictVerify => format!(
-                "{bound}{rel} run --strict --verify -- /bin/echo hermit-super-{iteration} </dev/null"
+                "{bound}{rel} run --strict {CANONICAL_TEST_EPOCH_ARG} --verify -- /bin/echo hermit-super-{iteration} </dev/null"
             ),
             StressProbe::PtracePipeline => format!(
-                "{bound}{rel} run --strict --verify -- bash -c 'yes hermit | head -n 64 | sha256sum' </dev/null"
+                "{bound}{rel} run --strict {CANONICAL_TEST_EPOCH_ARG} --verify -- bash -c 'yes hermit | head -n 64 | sha256sum' </dev/null"
             ),
             StressProbe::PtraceRecordReplay => {
                 let dir = format!(
@@ -437,7 +432,7 @@ fn availability_nodes(debug_bin: &str, build_dep: &str, reps: i64) -> Vec<Step> 
                 "dbt_available",
                 "DBT backend availability (gates the DBT stress rows)",
                 format!(
-                    "{dbg} --log=info --backend dbt run --strict --verify -- \
+                    "{dbg} --log=info --backend dbt run --strict {CANONICAL_TEST_EPOCH_ARG} --verify -- \
                  /bin/echo hermit-dbt-probe </dev/null >/dev/null 2>&1"
                 ),
                 vec![build_dep.to_string()],
@@ -447,7 +442,8 @@ fn availability_nodes(debug_bin: &str, build_dep: &str, reps: i64) -> Vec<Step> 
             ),
             format!(
                 "Runs one real DBT run with the debug Hermit after {build_dep}: `hermit --log=info \
-             --backend dbt run --strict --verify -- /bin/echo hermit-dbt-probe`, the port of \
+             --backend dbt run --strict {CANONICAL_TEST_EPOCH_ARG} --verify -- /bin/echo \
+                 hermit-dbt-probe`, the port of \
                  validate.sh's dbt_backend_available. It is a node because the debug binary does not \
                  exist when the plan is built. Its only dependent is superstress.dbt_verify, {reps} \
                  repetitions of `hermit --backend dbt run --verify` of /bin/echo; when this probe \
@@ -604,9 +600,12 @@ pub fn stress_verdict(rates: &[ProbeRate], reps: i64, jobs: i64, host_cpus: usiz
 /// committed DAG became the sole source of super-plan construction.
 pub fn self_test(root: &Path) -> Result<String, String> {
     let gates = load_gates(root)?;
-    if gates.len() != 32 {
+    // 31 since the liteinst_python3_verify_diagnostics row left with the
+    // ptrace-hosted LiteInst hybrid (https://github.com/rrnewton/hermit/issues/3520);
+    // it had already stopped selecting any test.
+    if gates.len() != 31 {
         return Err(format!(
-            "super source table has {} rows; the mechanical extraction requires exactly 32",
+            "super source table has {} rows; the mechanical extraction requires exactly 31",
             gates.len()
         ));
     }
@@ -752,7 +751,7 @@ pub fn self_test(root: &Path) -> Result<String, String> {
     let standin = stress_standin_bracket(root)?;
 
     Ok(format!(
-        "super source: 32 rows, 3 synthetic expansions, {nextest_rows} nextest rows, {refused} malformed tables refused; stress verdict bracketed; {standin}"
+        "super source: 31 rows, 3 synthetic expansions, {nextest_rows} nextest rows, {refused} malformed tables refused; stress verdict bracketed; {standin}"
     ))
 }
 
@@ -794,12 +793,17 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
     // bound is measured rather than assumed. Repetition 3 ends its output
     // without a newline; 5 outlives the bound; 6 also ignores SIGTERM; 7 prints
     // timeout's KILL message itself; 8 and 9 exit 137 and 124 themselves.
+    // Repetition 6 ignores SIGTERM on its first line, before the bookkeeping:
+    // installed after it, a loaded host could let timeout's TERM arrive first,
+    // and the repetition exited 124 instead of waiting for the KILL
+    // (https://github.com/rrnewton/hermit/issues/4226).
     let standin = dir.join("hermit");
     write_executable(
         &standin,
         &format!(
             "#!/usr/bin/env bash\n\
              rep=${{!#}}; rep=${{rep##*-}}; d={dir}\n\
+             [ \"$rep\" = 6 ] && trap '' TERM\n\
              mkdir \"$d/running.$rep\"\n\
              ls -d \"$d\"/running.* | wc -l >\"$d/peak.$rep\"\n\
              sleep 0.2\n\
@@ -809,7 +813,7 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
              3) printf 'hermit-super-3'; exit 0;;\n\
              4) echo \"stand-in diagnostic $rep\" >&2; exit 3;;\n\
              5) sleep 5;;\n\
-             6) trap '' TERM; sleep 5;;\n\
+             6) sleep 10;;\n\
              7) echo \"timeout: sending signal KILL to command 'x'\"; exit 5;;\n\
              8) exit 137;;\n\
              9) exit 124;;\n\
@@ -819,14 +823,22 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
         ),
     )?;
     // The node calls `timeout --verbose --kill-after=G T <command...>`; the
-    // shim drops its own directory from PATH and keeps only the command.
+    // shim drops its own directory from PATH and keeps only the command. Only
+    // repetitions 5 and 6 are meant to outlive the bound, so only they get a
+    // short one; the rest get 30 s, so a loaded host cannot time out a
+    // repetition that should exit on its own (9's own 124 then read as
+    // timeout's, at load average 300 on 2026-10-07). Repetition 6 gets 3 s, so
+    // its bash has that long to reach its first line, where it ignores TERM,
+    // and it sleeps 10 s, longer than the bound and the 1 s grace together.
     let shim_dir = dir.join("bin");
     std::fs::create_dir_all(&shim_dir)
         .map_err(|error| format!("cannot create super stand-in shim dir: {error}"))?;
     write_executable(
         &shim_dir.join("timeout"),
         "#!/usr/bin/env bash\n\
-         PATH=${PATH#*:} exec timeout --verbose --kill-after=1 1 \"${@:4}\"\n",
+         rep=${!#}; rep=${rep##*-}\n\
+         case $rep in 5) bound=1;; 6) bound=3;; *) bound=30;; esac\n\
+         PATH=${PATH#*:} exec timeout --verbose --kill-after=1 \"$bound\" \"${@:4}\"\n",
     )?;
     let path = format!(
         "{}:{}",

@@ -1,6 +1,6 @@
 # hermit-test-workdir
 
-Filesystem workdir isolation helpers for Hermit tests and optional source-build DBT execution.
+Per-run filesystem and local-network isolation helpers for Hermit tests and DBT execution.
 
 This crate is part of [Hermit](https://hermetic-infra.org), an execution
 engine for reproducible Linux testing. For installation and run/record/replay

@@ -2,11 +2,11 @@
   "schema": 1,
   "asymmetric_manifest_tests": [
     "applications/kvm-python-examples",
-    "applications/kvm-shell-environment"
+    "applications/kvm-shell-environment",
+    "c-programs/child-subreaper-refusal"
   ],
   "backend_private_guest_files": [
     "tests/c/kvm_exact_child_waits.c",
-    "tests/c/liteinst_host_activation.c",
     "tests/c/liteinst_inert_runtime.c",
     "tests/c/mountinfo_device_identity.c",
     "tests/c/sabre_exit_group_parked.c",

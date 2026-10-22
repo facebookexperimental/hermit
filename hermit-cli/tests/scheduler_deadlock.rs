@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fs;
@@ -48,6 +51,14 @@ struct DescendantSnapshot {
     tasks: BTreeMap<libc::pid_t, ProcessIdentity>,
 }
 
+/// Whether a `/proc/<pid>` read failed because that task is gone. A task that
+/// exits between the directory listing and the read gives ENOENT, or ESRCH
+/// when it is released after its file was opened; either way it has no
+/// identity, parent or children any more. Every other error stays an error.
+fn vanished(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 fn proc_stat_parent_and_starttime(pid: libc::pid_t) -> io::Result<(libc::pid_t, u64)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let comm_end = stat
@@ -81,7 +92,7 @@ fn process_identity(pid: libc::pid_t) -> io::Result<ProcessIdentity> {
 fn same_process(identity: ProcessIdentity) -> io::Result<bool> {
     match proc_stat_starttime(identity.pid) {
         Ok(starttime) => Ok(starttime == identity.starttime),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if vanished(&error) => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -120,7 +131,7 @@ fn owned_processes(root: ProcessIdentity) -> io::Result<DescendantSnapshot> {
     while let Some((pid, depth)) = pending.pop() {
         let tids = match task_ids(pid) {
             Ok(tids) => tids,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if vanished(&error) => continue,
             Err(error) => return Err(error),
         };
 
@@ -130,7 +141,7 @@ fn owned_processes(root: ProcessIdentity) -> io::Result<DescendantSnapshot> {
                     Ok(identity) => {
                         snapshot.tasks.insert(*tid, identity);
                     }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) if vanished(&error) => {}
                     Err(error) => return Err(error),
                 }
             }
@@ -142,7 +153,7 @@ fn owned_processes(root: ProcessIdentity) -> io::Result<DescendantSnapshot> {
             }
             let (parent, starttime) = match proc_stat_parent_and_starttime(child) {
                 Ok(values) => values,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if vanished(&error) => continue,
                 Err(error) => return Err(error),
             };
             if parent != pid {
@@ -154,7 +165,7 @@ fn owned_processes(root: ProcessIdentity) -> io::Result<DescendantSnapshot> {
             };
             let after = match proc_stat_parent_and_starttime(child) {
                 Ok(values) => values,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if vanished(&error) => continue,
                 Err(error) => return Err(error),
             };
             if after != (pid, starttime) || !same_process(visited[&pid])? {
@@ -183,7 +194,7 @@ fn direct_children(pid: libc::pid_t) -> io::Result<BTreeMap<libc::pid_t, Process
                 );
             }
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if vanished(&error) => {}
             Err(error) => return Err(error),
         }
     }
@@ -781,7 +792,36 @@ fn wait_for_teardown(
     }
 }
 
+/// [`bounded_output_once`], run again only after a typed PMU skid-overshoot
+/// refusal ([`hermit_test::hermit_output_with`]). An I/O error or a timeout ends
+/// the loop at once and is returned.
 fn bounded_output(command: &mut Command, bound: Duration, description: &str) -> io::Result<Output> {
+    let (output, error) =
+        hermit_test::hermit_output_with(description, || {
+            match bounded_output_once(command, bound, description) {
+                Ok(output) => (output, None),
+                Err(error) => {
+                    use std::os::unix::process::ExitStatusExt;
+                    let unclassified = Output {
+                        status: std::process::ExitStatus::from_raw(libc::SIGKILL),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    };
+                    (unclassified, Some(error))
+                }
+            }
+        });
+    match error {
+        Some(error) => Err(error),
+        None => Ok(output),
+    }
+}
+
+fn bounded_output_once(
+    command: &mut Command,
+    bound: Duration,
+    description: &str,
+) -> io::Result<Output> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command
@@ -869,7 +909,8 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("scheduler-deadlock");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("scheduler-deadlock-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let guest = build_root.join("scheduler_deadlock");
 
@@ -923,7 +964,13 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     let mut stderr = tempfile::tempfile().expect("failed to create Hermit stderr capture");
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
-        .args(["--backend=ptrace", "run", "--strict", "--"])
+        .args([
+            "--backend=ptrace",
+            "run",
+            "--strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            "--",
+        ])
         .arg(&guest)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

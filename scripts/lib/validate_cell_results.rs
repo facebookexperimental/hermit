@@ -1,11 +1,5 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+//
 // Retain the per-cell result population carried by one full validate run.
 
 use std::collections::BTreeMap;
@@ -14,17 +8,12 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-#[cfg(test)]
-use hermit_manifest_plan::canonical_verdict::Verdict as VerificationVerdict;
-#[cfg(test)]
-use hermit_manifest_plan::canonical_verdict::VerificationReport;
 use hermit_manifest_plan::ledger::CellBindingContract;
 use hermit_manifest_plan::ledger::CellIdentity;
 use hermit_manifest_plan::ledger::CellResult as LedgerCellResult;
 use hermit_manifest_plan::ledger::CellResultsArtifact;
 use hermit_manifest_plan::ledger::CellResultsEvidence;
 use hermit_manifest_plan::ledger::CellVerdict;
-use hermit_manifest_plan::ledger::RequiredNullable;
 use hermit_manifest_plan::runner::outcome_after_retries;
 use serde_json::Value;
 use sha2::Digest;
@@ -375,6 +364,26 @@ impl CapturedResults {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         hermit_manifest_plan::ledger::RawResultInputCensusV1::from_inputs(run_id, commit, &inputs)
+    }
+
+    /// Every retried cell in the captured bytes. Call it only after
+    /// [`Self::census`] succeeded, which proves these bytes are still the
+    /// files on disk.
+    pub fn framework_retries(
+        &self,
+    ) -> Result<hermit_manifest_plan::ledger::FrameworkRetriesV1, String> {
+        let inputs = self
+            .inputs
+            .as_ref()
+            .map_err(Clone::clone)?
+            .iter()
+            .map(|(path, bytes)| {
+                path.to_str()
+                    .map(|path| (path.to_owned(), bytes.clone()))
+                    .ok_or_else(|| "raw result path is not UTF-8".to_owned())
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        hermit_manifest_plan::ledger::FrameworkRetriesV1::from_inputs(&inputs)
     }
 }
 
@@ -1026,42 +1035,11 @@ impl CommandProvenanceRoots {
         Ok(())
     }
 
-    fn render_attempt(
-        &self,
-        attempt: &mut hermit_manifest_plan::ledger::ParityAttempt,
-    ) -> Result<(), String> {
-        let attempt = &mut attempt.0;
-        let original = (
-            attempt.argv.clone(),
-            attempt.cwd.clone(),
-            attempt.env.clone(),
-        );
-        self.render_command(&mut attempt.argv, &mut attempt.cwd, &mut attempt.env)?;
-        for argument in &mut attempt.guest_argv {
-            *argument = self.render(argument)?;
-        }
-        if original
-            != (
-                attempt.argv.clone(),
-                attempt.cwd.clone(),
-                attempt.env.clone(),
-            )
-        {
-            attempt.shell_command = hermit_manifest_plan::runner::shell_command(
-                &attempt.cwd,
-                &attempt.env,
-                &attempt.argv,
-            );
-        }
-        Ok(())
-    }
-
     fn render_cell(
         &self,
         cell: &mut hermit_manifest_plan::ledger::CellArtifactResultV10,
     ) -> Result<(), String> {
         use hermit_manifest_plan::cpu_evidence::CpuAttemptHistory;
-        use hermit_manifest_plan::ledger::BackendParityCellAttempt;
         if let Some(history) = &mut cell.cpu_observation_history {
             for attempt in &mut history.attempts {
                 if let CpuAttemptHistory::Recorded { observations, .. } = attempt {
@@ -1076,37 +1054,13 @@ impl CommandProvenanceRoots {
                 }
             }
         }
-        if let RequiredNullable::Value(parity) = &mut cell.backend_parity {
-            for attempt in &mut parity.attempts {
-                match attempt {
-                    BackendParityCellAttempt::Completed {
-                        candidate_attempt,
-                        reference_attempt,
-                        ..
-                    } => {
-                        self.render_attempt(candidate_attempt)?;
-                        self.render_attempt(reference_attempt)?;
-                    }
-                    BackendParityCellAttempt::UnavailableWithReason {
-                        candidate_attempt,
-                        reference_attempt,
-                        ..
-                    } => {
-                        self.render_attempt(candidate_attempt)?;
-                        if let RequiredNullable::Value(reference) = reference_attempt {
-                            self.render_attempt(reference)?;
-                        }
-                    }
-                }
-            }
-        }
         Ok(())
     }
 }
 
-/// Retain full parity attempts in the immutable artifact and only derived,
-/// path-free summaries in schema 10. Ordinary and parity outcomes remain
-/// separate, and the selected population comes from the pre-execution plan.
+/// Retain each selected cell's full verdict in the immutable artifact and only
+/// derived, path-free summaries in schema 10. The selected population comes
+/// from the pre-execution plan.
 #[cfg(test)]
 pub fn retain_v10(
     parent: &Path,
@@ -1156,15 +1110,11 @@ fn retain_v10_with_contract(
     binding_contract: CellBindingContract,
 ) -> Result<RetainedCellResults, String> {
     use hermit_manifest_plan::ledger::CellArtifactResultV10;
-    use hermit_manifest_plan::ledger::CellBackendParity;
     use hermit_manifest_plan::ledger::CellResultsEvidenceV10;
+    use hermit_manifest_plan::ledger::RetiredBackendParity;
+    use hermit_manifest_plan::ledger::RetiredParityPopulation;
     let selected = plan.planned_cells()?;
     let selected_set = selected.iter().cloned().collect::<BTreeSet<_>>();
-    let selected_backend_parity = plan.planned_backend_parity_relations()?;
-    let parity_candidates = selected_backend_parity
-        .iter()
-        .map(|relation| relation.candidate.clone())
-        .collect::<BTreeSet<_>>();
     let mut rows = BTreeMap::<CellIdentity, Vec<(u64, Value)>>::new();
     let mut seen = BTreeSet::new();
     for (file, line, row) in snapshot.rows(true)? {
@@ -1193,48 +1143,41 @@ fn retain_v10_with_contract(
     let command_roots = CommandProvenanceRoots::new(measured_root, snapshot.root())?;
     for (id, mut rows) in rows {
         rows.sort_by_key(|(attempt, _)| *attempt);
-        let (cell_verdict, backend_parity, selected_attempt) = if parity_candidates.contains(&id) {
-            let parity = CellBackendParity::from_result_rows(&id, &rows)?;
-            let selected_attempt = parity.candidate_attempt_number(&id)?;
-            (
-                parity.candidate_verdict(&id)?,
-                RequiredNullable::Value(parity),
-                selected_attempt,
-            )
-        } else {
-            if rows.iter().any(|(_, row)| {
-                row.get("backend_parity")
-                    .is_some_and(|value| !value.is_null())
-                    || row
-                        .get("attempts")
-                        .and_then(Value::as_array)
-                        .is_some_and(|attempts| {
-                            attempts.iter().any(|attempt| {
-                                attempt.get("index").and_then(Value::as_str)
-                                    == Some("parity-reference")
-                            })
+        // The ptrace reference run was removed
+        // (https://github.com/rrnewton/hermit/issues/3301); a current row that
+        // still carries its report or attempt is refused, never read as an
+        // ordinary result.
+        if rows.iter().any(|(_, row)| {
+            row.get("backend_parity")
+                .is_some_and(|value| !value.is_null())
+                || row
+                    .get("attempts")
+                    .and_then(Value::as_array)
+                    .is_some_and(|attempts| {
+                        attempts.iter().any(|attempt| {
+                            attempt.get("index").and_then(Value::as_str) == Some("parity-reference")
                         })
-            }) {
-                return Err("ordinary selected cell emitted an unplanned parity comparison".into());
-            }
-            let outcome = outcome_after_retries(
-                rows.iter()
-                    .map(|(attempt, row)| Ok((*attempt, string(row, "outcome")?)))
-                    .collect::<Result<Vec<_>, String>>()?,
-            )?;
-            // The attempt comes from the SAME row the verdict does. Taking it
-            // from anywhere else -- the last attempt, the highest ordinal, the
-            // count -- would name a real published event that is not the one
-            // this verdict was computed from, which is the failure the binding
-            // exists to make impossible.
-            let (selected_attempt, row) = rows
-                .iter()
-                .rev()
-                .find(|(_, row)| row.get("outcome").and_then(Value::as_str) == Some(outcome))
-                .map(|(attempt, row)| (*attempt, row))
-                .ok_or("ordinary cell has no selected terminal result")?;
-            (cell_verdict(row)?, RequiredNullable::Null, selected_attempt)
-        };
+                    })
+        }) {
+            return Err("selected cell emitted the retired ptrace reference comparison".into());
+        }
+        let outcome = outcome_after_retries(
+            rows.iter()
+                .map(|(attempt, row)| Ok((*attempt, string(row, "outcome")?)))
+                .collect::<Result<Vec<_>, String>>()?,
+        )?;
+        // The attempt comes from the SAME row the verdict does. Taking it
+        // from anywhere else -- the last attempt, the highest ordinal, the
+        // count -- would name a real published event that is not the one
+        // this verdict was computed from, which is the failure the binding
+        // exists to make impossible.
+        let (selected_attempt, row) = rows
+            .iter()
+            .rev()
+            .find(|(_, row)| row.get("outcome").and_then(Value::as_str) == Some(outcome))
+            .map(|(attempt, row)| (*attempt, row))
+            .ok_or("ordinary cell has no selected terminal result")?;
+        let cell_verdict = cell_verdict(row)?;
         let cpu_observation_history =
             hermit_manifest_plan::cpu_evidence::CellCpuHistoryV1::from_source_rows(&rows)?;
         if binding_contract == CellBindingContract::LegacyUnbound
@@ -1249,7 +1192,7 @@ fn retain_v10_with_contract(
             mode: id.mode,
             backend: id.backend,
             cell_verdict,
-            backend_parity,
+            backend_parity: RetiredBackendParity,
             cpu_observation_history,
             selected_attempt: (binding_contract == CellBindingContract::SelectedAttemptV1)
                 .then_some(selected_attempt),
@@ -1301,7 +1244,7 @@ fn retain_v10_with_contract(
             row_count: cells.len() as u64,
         },
         selected,
-        selected_backend_parity,
+        selected_backend_parity: RetiredParityPopulation,
         cells,
     };
     if binding_contract == CellBindingContract::SelectedAttemptV1 {
@@ -1430,285 +1373,8 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_writer_preserves_reference_and_cross_failures_separately() {
+    fn ordinary_writer_binds_the_row_it_selected() {
         use hermit_manifest_plan::ledger::ConstructedValidationPlanV10;
-        let plan: ConstructedValidationPlanV10 =
-            serde_json::from_str(include_str!("fixtures/schema10-matched-plan.json")).unwrap();
-        let retained: Value =
-            serde_json::from_str(include_str!("fixtures/schema10-matched-cell.json")).unwrap();
-        let legacy_fixture: Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/ledger-schema10/legacy/ordinary-only-row.json"
-        ))
-        .unwrap();
-        let completed = &retained["backend_parity"]["attempts"][0];
-        let base = serde_json::json!({
-            "schema":4, "run_id":plan.run_id, "hermit_sha":plan.hermit_sha,
-            "source_tree_dirty":false, "attempt":1,
-            "test":retained["test"], "category":retained["category"],
-            "lane":retained["lane"], "mode":"verify", "backend":"kvm",
-            "classification":"deterministic", "outcome":"PASS", "result":"pass",
-            "failure_class":null, "error_kind":null, "timeout_seconds":57,
-            "execution_cpu_timeout_seconds":22, "execution_wall_timeout_seconds":57,
-            "argv":[], "guest_argv":[], "env":{}, "cwd":"/synthetic/fixture/work",
-            "shell_command":"synthetic retained writer input", "artifact_dir":"synthetic",
-            "attempts":[completed["candidate_attempt"],completed["reference_attempt"]],
-            "backend_parity":completed["report"]
-        });
-        let raw = serde_json::to_string(&base).unwrap();
-        for (needle, replacement) in [
-            ("\"status\":0", "\"status\":7,\"status\":0"),
-            ("\"status\":0", "\"status\":0,\"status\":0"),
-            ("\"compared\":2", "\"compared\":0,\"compared\":2"),
-            ("\"compared\":2", "\"compared\":2,\"compared\":2"),
-        ] {
-            assert!(raw.contains(needle), "duplicate control omitted {needle}");
-            let duplicate = raw.replacen(needle, replacement, 1);
-            assert_eq!(serde_json::from_str::<Value>(&duplicate).unwrap(), base);
-            let parent = tempfile::tempdir().unwrap();
-            let results = parent.path().join("input");
-            fs::create_dir(&results).unwrap();
-            fs::write(results.join("results.jsonl"), format!("{duplicate}\n")).unwrap();
-            let error = retain_v10(parent.path(), &results, &plan).unwrap_err();
-            assert!(error.contains("duplicate field"), "{error}");
-            let error = retain_v10_legacy(parent.path(), &results, &plan).unwrap_err();
-            assert!(error.contains("duplicate field"), "{error}");
-            assert!(!parent.path().join("ignored/validate/artifacts").exists());
-        }
-        for case in [
-            "matched",
-            "cross-diverged",
-            "reference-diverged",
-            "reference-no-report",
-            "pass-without-report",
-            "missing-digest",
-        ] {
-            let parent = tempfile::tempdir().unwrap();
-            let results = parent.path().join("input");
-            fs::create_dir(&results).unwrap();
-            let mut row = base.clone();
-            match case {
-                "matched" => {}
-                "cross-diverged" => {
-                    row["outcome"] = Value::String("FAIL".into());
-                    row["result"] = Value::String("parity-failure".into());
-                    row["failure_class"] = Value::String("product_failure".into());
-                    row["reason"] = Value::String("synthetic cross divergence".into());
-                    row["backend_parity"]["verdict"] = Value::String("diverged".into());
-                    row["backend_parity"]["comparison"]["verdict"] =
-                        Value::String("diverged".into());
-                    row["backend_parity"]["comparison"]["first_divergent_record"] = Value::from(2);
-                }
-                "reference-diverged" => {
-                    let mut report: VerificationReport = serde_json::from_str(
-                        row["attempts"][1]["verification_report"].as_str().unwrap(),
-                    )
-                    .unwrap();
-                    report.verdict = VerificationVerdict::Diverged;
-                    report.verified = false;
-                    report.bitwise_parity = false;
-                    report.first_divergent_record = Some(1);
-                    let raw = serde_json::to_string(&report).unwrap();
-                    row["attempts"][1]["verification_report_sha256"] =
-                        Value::String(hex_digest(raw.as_bytes()));
-                    row["attempts"][1]["verification_report"] = Value::String(raw);
-                    row["attempts"][1]["first_divergent_record"] = Value::from(1);
-                    row["attempts"][1]["outcome"] = Value::String("FAIL".into());
-                    row["attempts"][1]["status"] = Value::from(1);
-                    row["attempts"][1]["reason"] =
-                        Value::String("synthetic reference divergence".into());
-                }
-                "reference-no-report" | "pass-without-report" => {
-                    row["attempts"][1]["verification_report"] = Value::Null;
-                    row["attempts"][1]["verification_report_sha256"] = Value::Null;
-                    if case == "reference-no-report" {
-                        row["attempts"][1]["outcome"] = Value::String("ERROR".into());
-                        row["attempts"][1]["status"] = Value::from(7);
-                        row["attempts"][1]["error_kind"] =
-                            Value::String("incomplete-verification-evidence".into());
-                    }
-                }
-                "missing-digest" => row["attempts"][1]["verification_report_sha256"] = Value::Null,
-                _ => unreachable!(),
-            }
-            if matches!(
-                case,
-                "reference-diverged"
-                    | "reference-no-report"
-                    | "pass-without-report"
-                    | "missing-digest"
-            ) {
-                row["backend_parity"] = Value::Null;
-                row["outcome"] = Value::String("ERROR".into());
-                row["result"] = Value::Null;
-                row["failure_class"] = Value::String("no_result".into());
-                row["error_kind"] = Value::String("incomplete-parity-evidence".into());
-                row["reason"] = Value::String(
-                    "synthetic reference did not provide a matching strict comparison".into(),
-                );
-            }
-            fs::write(
-                results.join("results.jsonl"),
-                format!("{}\n", serde_json::to_string(&row).unwrap()),
-            )
-            .unwrap();
-            let legacy_parent = tempfile::tempdir().unwrap();
-            let legacy = retain_v10_legacy(legacy_parent.path(), &results, &plan);
-            let result = retain_v10(parent.path(), &results, &plan);
-            if matches!(case, "pass-without-report" | "missing-digest") {
-                assert!(legacy.is_err(), "legacy {case} was admitted");
-                assert!(result.is_err(), "{case} was admitted");
-                continue;
-            }
-            let result = result.unwrap_or_else(|error| panic!("{case}: {error}"));
-            let legacy = legacy.unwrap_or_else(|error| panic!("legacy {case}: {error}"));
-            assert_eq!(legacy.schema_version, 10);
-            assert!(legacy.evidence.get("binding_contract").is_none());
-            assert_eq!(
-                legacy
-                    .evidence
-                    .as_object()
-                    .unwrap()
-                    .keys()
-                    .collect::<Vec<_>>(),
-                legacy_fixture["cell_results"]
-                    .as_object()
-                    .unwrap()
-                    .keys()
-                    .collect::<Vec<_>>()
-            );
-            let legacy_cell = &legacy.evidence["cells"][0];
-            assert_eq!(
-                legacy_cell.as_object().unwrap().keys().collect::<Vec<_>>(),
-                legacy_fixture["cell_results"]["cells"][0]
-                    .as_object()
-                    .unwrap()
-                    .keys()
-                    .collect::<Vec<_>>()
-            );
-            assert!(legacy_cell.get("selected_attempt").is_none());
-            assert!(legacy_cell.get("evidence_binding").is_none());
-            assert_eq!(
-                legacy_cell["cell_verdict"],
-                result.evidence["cells"][0]["cell_verdict"]
-            );
-            assert_eq!(
-                legacy_cell["backend_parity"],
-                result.evidence["cells"][0]["backend_parity"]
-            );
-            let legacy_evidence: hermit_manifest_plan::ledger::CellResultsEvidenceV10 =
-                serde_json::from_value(legacy.evidence.clone()).unwrap();
-            assert_eq!(
-                legacy_evidence.binding_contract,
-                CellBindingContract::LegacyUnbound
-            );
-            assert!(
-                legacy_evidence
-                    .bound_attempts()
-                    .unwrap_err()
-                    .contains("legacy-unbound")
-            );
-            let legacy_bytes = fs::read(
-                legacy_parent
-                    .path()
-                    .join(legacy.evidence["artifact"]["path"].as_str().unwrap()),
-            )
-            .unwrap();
-            legacy_evidence
-                .verify_cell_artifact_bytes(&legacy_bytes)
-                .unwrap();
-            let legacy_artifact: Value = serde_json::from_slice(&legacy_bytes).unwrap();
-            assert_eq!(
-                legacy_artifact
-                    .as_object()
-                    .unwrap()
-                    .keys()
-                    .collect::<Vec<_>>(),
-                retained.as_object().unwrap().keys().collect::<Vec<_>>(),
-                "legacy control must retain the exact published artifact shape"
-            );
-            assert_eq!(result.schema_version, 10);
-            assert_eq!(result.evidence["binding_contract"], 1);
-            let cell = &result.evidence["cells"][0];
-            assert_eq!(
-                cell["cell_verdict"]["state"], "compared-and-matched",
-                "{case}"
-            );
-            // THE VERDICT NAMES THE ATTEMPT IT WAS COMPUTED FROM. Without this
-            // the row states a comparison and nothing records which of the
-            // run's events produced it, which is the whole defect: a verdict
-            // that can be counted and never resolved.
-            let binding = &cell["evidence_binding"];
-            assert!(!binding.is_null(), "{case}: compared verdict left unbound");
-            assert_eq!(
-                binding["run_id"],
-                Value::String(plan.run_id.clone()),
-                "{case}"
-            );
-            assert_eq!(
-                binding["tree"],
-                Value::String(plan.hermit_sha.clone()),
-                "{case}"
-            );
-            assert_eq!(binding["producer"], "validate", "{case}");
-            assert_eq!(
-                binding["series_cell"],
-                Value::String(format!("{}/verify/kvm", retained["test"].as_str().unwrap())),
-                "{case}"
-            );
-            // The bound ordinal, and the row's own independent copy of it.
-            // Recording it twice is what gives the decode-time guard a second
-            // operand; without it the guard compared the binding against
-            // itself and accepted every ordinal.
-            assert_eq!(binding["selected_attempt"], Value::from(1), "{case}");
-            assert_eq!(cell["selected_attempt"], Value::from(1), "{case}");
-            // It must NOT carry a predicted published identity. Predicting one
-            // is unsound for a compared verdict, which is always collapsible.
-            assert!(binding.get("event_id").is_none(), "{case}: {binding}");
-            let typed: hermit_manifest_plan::ledger::CellEvidenceBinding =
-                serde_json::from_value(binding.clone()).unwrap();
-            typed
-                .verify_against(
-                    &plan.run_id,
-                    &plan.hermit_sha,
-                    &CellIdentity {
-                        lane: cell["lane"].as_str().unwrap().into(),
-                        category: cell["category"].as_str().unwrap().into(),
-                        test: cell["test"].as_str().unwrap().into(),
-                        mode: cell["mode"].as_str().unwrap().into(),
-                        backend: cell["backend"].as_str().unwrap().into(),
-                    },
-                )
-                .unwrap_or_else(|error| panic!("{case}: {error}"));
-            let attempt = &cell["backend_parity"]["attempts"][0];
-            assert_eq!(attempt["candidate"]["state"], "compared-and-matched");
-            match case {
-                "matched" => assert_eq!(attempt["cross"]["state"], "matched"),
-                "cross-diverged" => assert_eq!(attempt["cross"]["state"], "diverged"),
-                "reference-diverged" => {
-                    assert_eq!(attempt["reference"]["state"], "compared-and-diverged");
-                    assert_eq!(attempt["cross"]["state"], "unavailable-with-reason");
-                }
-                "reference-no-report" => {
-                    assert_eq!(attempt["reference"]["state"], "unavailable-with-reason");
-                    assert!(attempt["reference_verification_report_sha256"].is_null());
-                }
-                _ => unreachable!(),
-            }
-            let artifact = result.evidence["artifact"]["path"].as_str().unwrap();
-            let bytes = fs::read(parent.path().join(artifact)).unwrap();
-            assert_eq!(result.evidence["artifact"]["sha256"], hex_digest(&bytes));
-            assert!(
-                String::from_utf8(bytes)
-                    .unwrap()
-                    .contains("/synthetic/fixture/")
-            );
-            assert!(
-                !serde_json::to_string(&result.evidence)
-                    .unwrap()
-                    .contains("/synthetic/fixture/")
-            );
-        }
-
         // The ordinary writer has its own selected-row branch. The schema-7
         // retry tests below do not prove that V1 binds the row it selected.
         let ordinary_plan: ConstructedValidationPlanV10 = serde_json::from_str(include_str!(
@@ -1717,12 +1383,6 @@ mod tests {
         .unwrap();
         let selected = ordinary_plan.planned_cells().unwrap();
         assert_eq!(selected.len(), 1);
-        assert!(
-            ordinary_plan
-                .planned_backend_parity_relations()
-                .unwrap()
-                .is_empty()
-        );
         let id = &selected[0];
         let unavailable = |row: &mut Value| {
             row["outcome"] = Value::String("ERROR".into());
@@ -1837,6 +1497,50 @@ mod tests {
             // A recovered match selects attempt 2, but the failed first row is
             // still retained; a later ERROR must not select over that failure.
             assert_eq!(all_result_rows(&results).unwrap(), written, "{case}");
+        }
+    }
+
+    /// A current row that still carries the removed ptrace reference run, as
+    /// its report or as an attempt, is refused rather than retained as an
+    /// ordinary result (https://github.com/rrnewton/hermit/issues/3301).
+    #[test]
+    fn writer_refuses_a_row_carrying_the_retired_reference_run() {
+        use hermit_manifest_plan::ledger::ConstructedValidationPlanV10;
+        let plan: ConstructedValidationPlanV10 = serde_json::from_str(include_str!(
+            "../../tests/fixtures/ledger-schema10/legacy/ordinary-only-plan.json"
+        ))
+        .unwrap();
+        let id = &plan.planned_cells().unwrap()[0];
+        let mut base = result_row(&plan.run_id, &plan.hermit_sha);
+        base["attempt"] = Value::from(1);
+        for (field, value) in [
+            ("lane", &id.lane),
+            ("category", &id.category),
+            ("test", &id.test),
+            ("mode", &id.mode),
+            ("backend", &id.backend),
+        ] {
+            base[field] = Value::String(value.clone());
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let results = parent.path().join("input");
+        append_result_row(&results, &base);
+        retain_v10(parent.path(), &results, &plan).unwrap();
+        let mut report = base.clone();
+        report["backend_parity"] = serde_json::json!({"verdict": "matched"});
+        let mut reference = base.clone();
+        let mut attempt = reference["attempts"][0].clone();
+        attempt["index"] = Value::String("parity-reference".into());
+        reference["attempts"].as_array_mut().unwrap().push(attempt);
+        for (case, row) in [("report", report), ("reference attempt", reference)] {
+            let parent = tempfile::tempdir().unwrap();
+            let results = parent.path().join("input");
+            append_result_row(&results, &row);
+            let error = retain_v10(parent.path(), &results, &plan).unwrap_err();
+            assert!(
+                error.contains("retired ptrace reference"),
+                "{case}: {error}"
+            );
         }
     }
 
@@ -2621,11 +2325,14 @@ mod tests {
     fn cpu_projection_renders_bound_commands_without_changing_typed_evidence() {
         use hermit_manifest_plan::ledger::CellResultsEvidenceV10;
         use hermit_manifest_plan::ledger::ConstructedValidationPlanV10;
-        let plan: ConstructedValidationPlanV10 =
-            serde_json::from_str(include_str!("fixtures/schema10-matched-plan.json")).unwrap();
+        let plan: ConstructedValidationPlanV10 = serde_json::from_str(include_str!(
+            "../../tests/fixtures/ledger-schema10/legacy/ordinary-only-plan.json"
+        ))
+        .unwrap();
         let template: Value =
             serde_json::from_str(include_str!("fixtures/schema10-matched-cell.json")).unwrap();
-        let completed = &template["backend_parity"]["attempts"][0];
+        // The candidate's own strict verification, as an ordinary attempt.
+        let candidate = &template["backend_parity"]["attempts"][0]["candidate_attempt"];
         let measured = tempfile::tempdir().unwrap();
         // Supported result roots need not be inside the source or state root.
         let results = tempfile::tempdir().unwrap();
@@ -2638,8 +2345,7 @@ mod tests {
             "execution_cpu_timeout_seconds":22,"execution_wall_timeout_seconds":57,
             "argv":[],"guest_argv":[],"env":{},"cwd":"/synthetic/fixture/work",
             "shell_command":"synthetic retained writer input","artifact_dir":"synthetic",
-            "attempts":[completed["candidate_attempt"],completed["reference_attempt"]],
-            "backend_parity":completed["report"]
+            "attempts":[candidate]
         });
         for attempt in row["attempts"].as_array_mut().unwrap() {
             for key in ["argv", "guest_argv"] {
@@ -2670,32 +2376,7 @@ mod tests {
         evidence.verify_cell_artifact_bytes(&bytes).unwrap();
         let artifact: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(artifact["selected_attempt"], 1);
-        let parity = &artifact["backend_parity"]["attempts"][0];
-        assert_eq!(parity["report"], row["backend_parity"]);
-        for (i, key) in ["candidate_attempt", "reference_attempt"]
-            .iter()
-            .enumerate()
-        {
-            let mapped = &parity[key];
-            assert_eq!(mapped["argv"][0], "/repo/hermit");
-            assert_eq!(mapped["cwd"], "/repo/work");
-            assert_eq!(mapped["guest_argv"][0], "/repo/guest");
-            assert_eq!(
-                mapped["env"]["E2E_FIXTURE_DIR"],
-                "$E2E_RESULT_ROOT/fixtures"
-            );
-            assert!(
-                mapped["shell_command"]
-                    .as_str()
-                    .unwrap()
-                    .contains("/repo/hermit")
-            );
-            let mut restored = mapped.clone();
-            for field in ["argv", "cwd", "env", "guest_argv", "shell_command"] {
-                restored[field] = row["attempts"][i][field].clone();
-            }
-            assert_eq!(restored, row["attempts"][i]);
-        }
+        assert_eq!(artifact["cell_verdict"]["state"], "compared-and-matched");
         let mut observations =
             artifact["cpu_observation_history"]["attempts"][0]["observations"].clone();
         for (i, invocation) in observations["invocations"]
@@ -2735,7 +2416,8 @@ mod tests {
                 .exists()
         );
 
-        // A literal alias in BOTH operands cannot collapse with another command.
+        // A literal alias in both the attempt and its CPU observation cannot
+        // collapse with another command.
         bad["attempts"][0]["argv"][0] = "/repo/hermit".into();
         let alias_results = tempfile::tempdir().unwrap();
         append_result_row(alias_results.path(), &bad);
@@ -2893,104 +2575,6 @@ mod tests {
                 .unwrap_err()
                 .contains("CPU observations")
         );
-    }
-
-    #[test]
-    fn cpu_projection_preserves_parity_invocations_and_validates_their_operands() {
-        use hermit_manifest_plan::ledger::ConstructedValidationPlanV10;
-        let plan: ConstructedValidationPlanV10 =
-            serde_json::from_str(include_str!("fixtures/schema10-matched-plan.json")).unwrap();
-        let retained: Value =
-            serde_json::from_str(include_str!("fixtures/schema10-matched-cell.json")).unwrap();
-        let completed = &retained["backend_parity"]["attempts"][0];
-        let base = serde_json::json!({
-            "schema":4,"run_id":plan.run_id,"hermit_sha":plan.hermit_sha,
-            "source_tree_dirty":false,"attempt":1,"test":retained["test"],
-            "category":retained["category"],"lane":retained["lane"],"mode":"verify","backend":"kvm",
-            "classification":"deterministic","outcome":"PASS","result":"pass",
-            "failure_class":null,"error_kind":null,"timeout_seconds":57,
-            "execution_cpu_timeout_seconds":22,"execution_wall_timeout_seconds":57,
-            "argv":[],"guest_argv":[],"env":{},"cwd":"/synthetic/fixture/work",
-            "shell_command":"synthetic retained writer input","artifact_dir":"synthetic",
-            "attempts":[completed["candidate_attempt"],completed["reference_attempt"]],
-            "backend_parity":completed["report"]
-        });
-        let mut supplied = base.clone();
-        supplied["cpu_observations"] = cpu_fixture_envelope(&supplied);
-        let mut normalization = supplied["cpu_observations"]["invocations"][1].clone();
-        normalization["ordinal"] = Value::from(3);
-        normalization["role"] =
-            serde_json::json!({"kind":"ptrace_normalization","execution_ordinal":2});
-        let mut comparison = normalization.clone();
-        comparison["ordinal"] = Value::from(4);
-        comparison["role"] = serde_json::json!({"kind":"parity_comparison","candidate_execution":1,"reference_execution":2});
-        supplied["cpu_observations"]["invocations"]
-            .as_array_mut()
-            .unwrap()
-            .extend([normalization, comparison]);
-        let mut historical = None;
-        for row in [&base, &supplied] {
-            let parent = tempfile::tempdir().unwrap();
-            let results = parent.path().join("results");
-            append_result_row(&results, row);
-            let retained = retain_v10(parent.path(), &results, &plan).unwrap();
-            let bytes = fs::read(
-                parent
-                    .path()
-                    .join(retained.evidence["artifact"]["path"].as_str().unwrap()),
-            )
-            .unwrap();
-            let evidence: hermit_manifest_plan::ledger::CellResultsEvidenceV10 =
-                serde_json::from_value(retained.evidence).unwrap();
-            evidence.verify_cell_artifact_bytes(&bytes).unwrap();
-            let mut artifact: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(artifact["selected_attempt"], 1);
-            assert_eq!(artifact["cell_verdict"]["state"], "compared-and-matched");
-            if row.get("cpu_observations").is_none() {
-                assert!(artifact.get("cpu_observation_history").is_none());
-                historical = Some(artifact);
-            } else {
-                assert_eq!(
-                    artifact["cpu_observation_history"]["attempts"][0]["observations"],
-                    supplied["cpu_observations"]
-                );
-                artifact
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("cpu_observation_history");
-                assert_eq!(Some(artifact), historical);
-            }
-        }
-        for (pointer, value) in [
-            (
-                "/cpu_observations/invocations/1/role/backend",
-                serde_json::json!("kvm"),
-            ),
-            (
-                "/cpu_observations/invocations/1/command/argv",
-                serde_json::json!(["foreign"]),
-            ),
-            (
-                "/cpu_observations/invocations/2/role/execution_ordinal",
-                serde_json::json!(1),
-            ),
-            (
-                "/cpu_observations/invocations/3/role/reference_execution",
-                serde_json::json!(1),
-            ),
-            ("/attempts/0/outcome", serde_json::json!("FAIL")),
-            ("/attempts/1/outcome", serde_json::json!("ERROR")),
-        ] {
-            let mut bad = supplied.clone();
-            *bad.pointer_mut(pointer).unwrap() = value;
-            let parent = tempfile::tempdir().unwrap();
-            let results = parent.path().join("results");
-            append_result_row(&results, &bad);
-            assert!(
-                retain_v10(parent.path(), &results, &plan).is_err(),
-                "{pointer}"
-            );
-        }
     }
 
     #[test]

@@ -1,0 +1,21 @@
+[package]
+name = "detcore-dbt-cdylib"
+description = "libdetcore_dbt.so, the Detcore runtime the DBT client loads, built from detcore-dbt."
+version = "0.5.1"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+publish = false
+
+# Only the shared object. detcore-dbt itself stays an rlib so its dependents
+# start from its metadata instead of waiting for this link (see src/lib.rs).
+[lib]
+name = "detcore_dbt"
+crate-type = ["cdylib"]
+# The library it re-exports is documented and tested under its own name.
+doc = false
+test = false
+doctest = false
+
+[dependencies]
+detcore-dbt-rlib = { package = "detcore-dbt", version = "0.5.1", path = "../detcore-dbt" }

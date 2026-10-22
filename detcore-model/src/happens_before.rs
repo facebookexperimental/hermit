@@ -47,8 +47,20 @@ use serde::Serialize;
 use crate::pid::DetTid;
 use crate::schedule::SyscallPhase;
 
-/// The schema version understood by this build.
-pub const HAPPENS_BEFORE_VERSION: u32 = 1;
+/// The newest schema version understood by this build. Version 2 adds
+/// relative anchors (`from`), the `futex_op` filter and the hold budget
+/// (`max_hold_ns`); version 1 files load unchanged, with their old semantics.
+/// A build that understands only version 1 refuses a version-2 file instead of
+/// silently dropping the fields it does not know.
+pub const HAPPENS_BEFORE_VERSION: u32 = 2;
+
+/// The original schema version, still accepted. It may not use any field that
+/// version 2 added ([`HappensBeforeError::NewFieldInVersion1`]).
+pub const HAPPENS_BEFORE_VERSION_1: u32 = 1;
+
+/// The hold budget of a version-2 spec that sets no `max_hold_ns`: 10 s of
+/// virtual time.
+pub const DEFAULT_MAX_HOLD_NS: u64 = 10_000_000_000;
 
 // ================================================================================
 // Declarative on-disk / on-wire format (serde)
@@ -59,8 +71,15 @@ pub const HAPPENS_BEFORE_VERSION: u32 = 1;
 /// verbatim so an authored file round-trips.
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct HappensBeforeSpec {
-    /// Schema version. Must equal [`HAPPENS_BEFORE_VERSION`].
+    /// Schema version: [`HAPPENS_BEFORE_VERSION_1`] or
+    /// [`HAPPENS_BEFORE_VERSION`].
     pub version: u32,
+
+    /// Version 2 only: how long a thread may stay held at a gate, in committed
+    /// virtual nanoseconds, before the run is refused
+    /// (`HERMIT_HB_HOLD_BUDGET_EXCEEDED`). Defaults to [`DEFAULT_MAX_HOLD_NS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hold_ns: Option<u64>,
 
     /// Symbolic thread labels mapped to a resolution rule, so authors need not
     /// hard-code raw `DetTid`s.
@@ -141,6 +160,32 @@ pub struct EventSpec {
     /// Which phase of the named `syscall` to anchor on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<PhaseSpec>,
+
+    /// Restrict the named `syscall` to calls whose first argument is this file
+    /// descriptor, for example `{"syscall": "writev", "fd": 9, "nth": 3}`: the
+    /// thread's third `writev` to fd 9. The descriptor is matched by number at
+    /// the time of the call: a write to a `dup` of fd 9 under another number
+    /// does not count, and after fd 9 is closed and the number reused, calls
+    /// on the new fd 9 do. Only valid with `syscall`, and only for
+    /// a syscall whose first argument is a file descriptor
+    /// ([`syscall_takes_fd_first`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd: Option<i32>,
+
+    /// Version 2 only: restrict `"syscall": "futex"` to calls whose operation
+    /// is this value. The kernel takes `int futex_op`, so the low 32 bits of
+    /// the second argument are compared, read as a signed `int`; the upper bits
+    /// of the register are ignored. The value must fit an `i32`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub futex_op: Option<i64>,
+
+    /// Version 2 only: count this event's syscall occurrences strictly after
+    /// the entry at which the named event is reached on the same thread, so
+    /// `nth` is 1-based from there. The base entry itself never counts, even
+    /// when it matches. The base must be a count or syscall-occurrence anchor
+    /// on the same thread and may not itself use `from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 
     /// A raw instruction pointer, as a hex string like `"0x401f3c"` or decimal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,7 +311,43 @@ pub enum Position {
     /// When the thread's RCB clock reaches this absolute value.
     Rcb(u64),
 
-    /// The `nth` occurrence of a specific syscall, optionally phase-qualified.
+    /// The `nth` occurrence of a specific syscall on the thread, optionally
+    /// phase-qualified and restricted to one file descriptor. The occurrence is
+    /// counted per thread, over that thread's calls that match `sysno` (and
+    /// `fd`), so an anchor needs no calibration run to find a syscall count.
+    ///
+    /// Two properties to know when writing one:
+    /// - What is counted is syscall *entries*, the same unit as
+    ///   [`Position::SyscallCount`]. A matching call that a signal interrupts
+    ///   and the kernel restarts is entered, and counted, again.
+    /// - The counters belong to the thread, like its syscall count: a new
+    ///   thread starts at zero, an exec keeps them, and after a non-leader exec
+    ///   the calling thread's counters continue under the leader's thread id.
+    /// - By default it fires at the prehook: an edge then orders the BEFORE
+    ///   thread *reaching* its syscall, not that syscall's effect. The held
+    ///   thread is re-admitted at the next drain, so a BEFORE syscall that
+    ///   takes more scheduler turns than the AFTER thread needs (a `write` to
+    ///   stdout takes a checkpoint turn and a resource turn) can let the AFTER
+    ///   thread's effect land first, even under the default scheduler.
+    /// - With `phase` posthook it fires when the syscall's result is final:
+    ///   a value or an errno, `EINTR` included, decided before the guest
+    ///   resumes (<https://github.com/rrnewton/hermit/issues/3929>). An entry
+    ///   that returns an internal restart code is refused
+    ///   (`HERMIT_HB_POSTHOOK_INTERRUPTED`), because the kernel decides after
+    ///   that point whether it returns at all. A call that only a signal
+    ///   handler ends (`pause`, `rt_sigsuspend`) always returns one, so a
+    ///   posthook anchor on it always refuses. Occurrences are counted at entry
+    ///   either way, and the five syscalls that do not return on success are
+    ///   refused at load ([`syscall_never_returns_on_success`]).
+    /// - What a hard edge orders depends on both ends. A posthook BEFORE and a
+    ///   prehook AFTER order the BEFORE syscall's completed effect before the
+    ///   AFTER syscall runs. A posthook AFTER holds its thread only after its
+    ///   own call, so that call's effect may come before the BEFORE one's.
+    ///   With a prehook BEFORE, effects may land in either order.
+    /// - A posthook BEFORE on a call that only a held thread can complete
+    ///   never fires. A child wait or futex wait on the held thread ends in
+    ///   `HERMIT_HB_ANCHOR_NEVER_FIRED`; a read whose only writer is held is
+    ///   external input to the scheduler, and the run ends at `--timeout`.
     Syscall {
         /// The syscall number.
         sysno: Sysno,
@@ -274,6 +355,11 @@ pub enum Position {
         phase: Option<SyscallPhase>,
         /// 1-based occurrence.
         nth: u64,
+        /// Restrict to calls whose first argument is this file descriptor.
+        fd: Option<i32>,
+        /// Restrict `futex` to calls whose operation (the low 32 bits of the
+        /// second argument, as an `int`) is this value.
+        futex_op: Option<i32>,
     },
 
     /// The `nth` execution of the instruction at an absolute address. The address
@@ -300,8 +386,20 @@ impl fmt::Display for Position {
         match self {
             Position::SyscallCount(n) => write!(f, "after {} syscalls", n),
             Position::Rcb(m) => write!(f, "at RCB {}", m),
-            Position::Syscall { sysno, phase, nth } => {
+            Position::Syscall {
+                sysno,
+                phase,
+                nth,
+                fd,
+                futex_op,
+            } => {
                 write!(f, "{}", sysno.name())?;
+                if let Some(fd) = fd {
+                    write!(f, "(fd={})", fd)?;
+                }
+                if let Some(op) = futex_op {
+                    write!(f, "(op={})", op)?;
+                }
                 if let Some(p) = phase {
                     write!(f, "@{:?}", p)?;
                 }
@@ -327,16 +425,178 @@ pub struct Anchor {
     pub position: Position,
     /// Optional human-legible / debug-info-resolved code location.
     pub location: CodeLocation,
+    /// For a relative anchor, the event on the same thread after which its
+    /// occurrences are counted (`from`).
+    pub from: Option<String>,
 }
 
 impl fmt::Display for Anchor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}[{}: {}", self.name, self.thread.label, self.position)?;
+        if let Some(base) = &self.from {
+            write!(f, " after {}", base)?;
+        }
         if !self.location.is_empty() {
             write!(f, " ({})", self.location)?;
         }
         write!(f, "]")
     }
+}
+
+impl Anchor {
+    /// True for an enforced syscall-occurrence anchor: a [`Position::Syscall`]
+    /// with no phase, the prehook phase or the posthook phase. Its
+    /// occurrences are counted at the prehook of each matching syscall entry.
+    /// It fires at the prehook of the thread's `nth` matching entry, or, for
+    /// the posthook phase ([`Anchor::fires_at_posthook`]), when that entry
+    /// completes. The polling phase is not enforced.
+    pub fn is_syscall_occurrence(&self) -> bool {
+        matches!(
+            self.position,
+            Position::Syscall {
+                phase: None | Some(SyscallPhase::Prehook) | Some(SyscallPhase::Posthook),
+                ..
+            }
+        )
+    }
+
+    /// True for a syscall-occurrence anchor that fires when its syscall
+    /// completes: after the call's effect and result, before the guest
+    /// resumes (<https://github.com/rrnewton/hermit/issues/3929>). An edge
+    /// whose BEFORE anchor fires at the posthook orders that syscall's
+    /// completed effect, not just its entry.
+    pub fn fires_at_posthook(&self) -> bool {
+        matches!(
+            self.position,
+            Position::Syscall {
+                phase: Some(SyscallPhase::Posthook),
+                ..
+            }
+        )
+    }
+
+    /// The per-thread counter this anchor's occurrences are counted in: its
+    /// syscall number, fd and futex operation, or `None` for any other kind of
+    /// anchor.
+    pub fn occurrence_key(&self) -> Option<OccurrenceKey> {
+        match &self.position {
+            Position::Syscall {
+                sysno,
+                fd,
+                futex_op,
+                ..
+            } if self.is_syscall_occurrence() => Some((*sysno as usize, *fd, *futex_op)),
+            _ => None,
+        }
+    }
+
+    /// True when this is an enforced syscall-occurrence anchor and a call to
+    /// `sysno` with first two arguments `args` is one of the calls it counts.
+    pub fn syscall_occurrence_matches(&self, sysno: Sysno, args: [usize; 2]) -> bool {
+        match &self.position {
+            Position::Syscall {
+                sysno: want,
+                fd,
+                futex_op,
+                ..
+            } if self.is_syscall_occurrence() && *want == sysno => {
+                // A file descriptor and a futex operation are each an `int`:
+                // the kernel reads the low 32 bits of the register.
+                fd.is_none_or(|fd| args[0] as u32 as i32 == fd)
+                    && futex_op.is_none_or(|op| args[1] as u32 as i32 == op)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// True for a syscall that does not return to its caller when it succeeds: the
+/// exec family replaces the image, and the exit family ends the thread. A
+/// posthook anchor on one is refused at load.
+pub fn syscall_never_returns_on_success(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::execve | Sysno::execveat | Sysno::exit | Sysno::exit_group | Sysno::rt_sigreturn
+    )
+}
+
+/// True for a syscall that never reaches Hermit's tracer on the ptrace
+/// backend, whatever Detcore subscribes to: Reverie lets `rt_sigreturn` run
+/// untraced from its private page so a signal frame is restored safely. A
+/// syscall anchor on one could never fire, so the run refuses it.
+pub fn syscall_never_reaches_tracer(sysno: Sysno) -> bool {
+    sysno == Sysno::rt_sigreturn
+}
+
+/// The key of one per-thread occurrence counter: a syscall number, an optional
+/// file descriptor and an optional futex operation ([`Anchor::occurrence_key`]).
+pub type OccurrenceKey = (usize, Option<i32>, Option<i32>);
+
+/// One thread's syscall-occurrence counters
+/// ([`HappensBeforeProgram::count_syscall_occurrences`]).
+pub type OccurrenceCounters = BTreeMap<OccurrenceKey, u64>;
+
+/// One thread's happens-before counting state: its occurrence counters, and for
+/// each relative anchor whose base this thread has reached, the origin: the
+/// count of the relative anchor's counter just after the base entry. Belongs to
+/// the thread, like its syscall count: empty for a new thread, kept across the
+/// thread's own exec.
+#[derive(PartialEq, Eq, Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HbThreadCounters {
+    /// Per occurrence key, how many of this thread's entries matched.
+    pub counts: OccurrenceCounters,
+    /// Per relative anchor whose base was reached, its origin. Each relative
+    /// anchor has its own origin, so the shared counters are never reset.
+    pub origins: BTreeMap<String, u64>,
+}
+
+/// True when `sysno`'s first argument is a file descriptor, so an anchor may
+/// restrict it with `fd`. The list is the fd-first syscalls a guest is likely to
+/// anchor on; an `fd` on any other syscall is refused when the spec is loaded
+/// rather than matched against an argument that is not a descriptor.
+pub fn syscall_takes_fd_first(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::read
+            | Sysno::write
+            | Sysno::readv
+            | Sysno::writev
+            | Sysno::pread64
+            | Sysno::pwrite64
+            | Sysno::preadv
+            | Sysno::pwritev
+            | Sysno::preadv2
+            | Sysno::pwritev2
+            | Sysno::close
+            | Sysno::fsync
+            | Sysno::fdatasync
+            | Sysno::ioctl
+            | Sysno::fcntl
+            | Sysno::lseek
+            | Sysno::fstat
+            | Sysno::ftruncate
+            | Sysno::fallocate
+            | Sysno::flock
+            | Sysno::getdents64
+            | Sysno::sendto
+            | Sysno::recvfrom
+            | Sysno::sendmsg
+            | Sysno::recvmsg
+            | Sysno::sendmmsg
+            | Sysno::recvmmsg
+            | Sysno::accept
+            | Sysno::accept4
+            | Sysno::connect
+            | Sysno::bind
+            | Sysno::listen
+            | Sysno::shutdown
+            | Sysno::epoll_wait
+            | Sysno::epoll_pwait
+            | Sysno::epoll_ctl
+            | Sysno::dup
+            | Sysno::dup2
+            | Sysno::dup3
+    )
 }
 
 /// A normalized happens-before edge between two anchors.
@@ -354,10 +614,16 @@ pub struct HappensBeforeEdge {
 /// the edge list, guaranteed acyclic with all references resolved.
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub struct HappensBeforeProgram {
+    /// The spec's schema version.
+    pub version: u32,
     /// Normalized anchors, keyed by event name.
     pub anchors: BTreeMap<String, Anchor>,
     /// The validated, acyclic edge list.
     pub edges: Vec<HappensBeforeEdge>,
+    /// The hold budget in committed virtual nanoseconds: `Some` for a
+    /// version-2 spec (its `max_hold_ns`, or [`DEFAULT_MAX_HOLD_NS`]), `None`
+    /// for version 1, which has no budget.
+    pub max_hold_ns: Option<u64>,
 }
 
 impl HappensBeforeProgram {
@@ -370,23 +636,144 @@ impl HappensBeforeProgram {
         })
     }
 
-    /// True when any anchor addresses a [`Position::SyscallCount`]. The scheduler
-    /// only issues per-syscall happens-before checkpoints when this holds, so a
-    /// program made entirely of not-yet-enforced positions adds no per-syscall
-    /// overhead.
-    pub fn has_syscall_count_anchors(&self) -> bool {
-        self.anchors
-            .values()
-            .any(|a| matches!(a.position, Position::SyscallCount(_)))
+    /// True when thread `dettid` must check in with the scheduler at its
+    /// syscall number `count`: some anchor sits at exactly
+    /// [`Position::SyscallCount`]`(count)` and names `dettid`, or names its
+    /// thread by spawn ordinal (which only the scheduler can resolve, so the
+    /// guest side must ask). For any other (thread, count) the scheduler's
+    /// checkpoint finds no anchor and does nothing, so skipping it changes no
+    /// gate. It costs one scheduler round trip per anchor its thread reaches,
+    /// not one per syscall (<https://github.com/rrnewton/hermit/issues/3877>),
+    /// and threads a spec does not name keep their schedule: a count another
+    /// thread passes early (QEMU's main loop makes about a million syscalls a
+    /// run) no longer adds a scheduler turn there.
+    pub fn may_have_syscall_count_anchor_at(&self, dettid: DetTid, count: u64) -> bool {
+        self.anchors.values().any(|a| {
+            matches!(a.position, Position::SyscallCount(n) if n == count)
+                && a.thread.dettid.is_none_or(|d| d == dettid)
+        })
     }
 
-    /// Anchors whose position kind the current scheduler does not yet enforce
-    /// (everything other than [`Position::SyscallCount`]). Reported so a run does
-    /// not silently ignore an authored ordering constraint it cannot honor.
-    pub fn unenforced_positions(&self) -> impl Iterator<Item = &Anchor> {
+    /// True when the program has any enforced syscall-occurrence anchor
+    /// ([`Anchor::is_syscall_occurrence`]), so the guest must count its calls.
+    pub fn has_syscall_occurrence_anchors(&self) -> bool {
+        self.anchors.values().any(Anchor::is_syscall_occurrence)
+    }
+
+    /// Count one syscall entry of thread `dettid` (`sysno`, first two
+    /// arguments `args`, the thread's `entry_count`th syscall) in that
+    /// thread's `counters`, and return the names of the syscall-occurrence
+    /// anchors this entry fires.
+    ///
+    /// `counters` belongs to one thread and is kept with its other per-thread
+    /// counts (the syscall count that count anchors use), so it starts empty
+    /// for every new thread. Per entry, in this order:
+    /// 1. Every distinct occurrence key (syscall, fd, futex operation) an
+    ///    anchor names that the entry matches is incremented once; an entry
+    ///    that matches both an fd-specific and an fd-agnostic anchor counts
+    ///    toward each.
+    /// 2. Each relative anchor whose base this entry reaches gets its origin:
+    ///    its own key's count after step 1, so the base entry is never counted
+    ///    in its window. A count base is reached when `entry_count` equals its
+    ///    count, whether or not the entry matches any key.
+    /// 3. An absolute anchor fires when its key's count equals `nth`; a
+    ///    relative anchor fires when its count minus its origin equals `nth`.
+    ///
+    /// An entry is counted exactly once, when the thread enters the syscall,
+    /// so a thread held at an anchor and re-admitted does not count again. The
+    /// result names anchors on `dettid` or on a spawn ordinal; the scheduler
+    /// resolves spawn ordinals and fires only the anchors on this thread.
+    pub fn count_syscall_occurrences(
+        &self,
+        counters: &mut HbThreadCounters,
+        dettid: DetTid,
+        sysno: Sysno,
+        args: [usize; 2],
+        entry_count: u64,
+    ) -> Vec<String> {
+        let on_thread = |a: &&Anchor| a.thread.dettid.is_none_or(|d| d == dettid);
+        let keys: BTreeSet<OccurrenceKey> = self
+            .anchors
+            .values()
+            .filter(|a| a.syscall_occurrence_matches(sysno, args))
+            .filter_map(Anchor::occurrence_key)
+            .collect();
+        for key in &keys {
+            *counters.counts.entry(*key).or_insert(0) += 1;
+        }
+        for relative in self.anchors.values().filter(on_thread) {
+            let Some(base) = relative.from.as_ref().and_then(|b| self.anchors.get(b)) else {
+                continue;
+            };
+            if counters.origins.contains_key(&relative.name) {
+                continue;
+            }
+            let reached = match &base.position {
+                Position::SyscallCount(n) => *n == entry_count,
+                Position::Syscall { nth, .. } => {
+                    base.syscall_occurrence_matches(sysno, args)
+                        && base
+                            .occurrence_key()
+                            .is_some_and(|key| counters.counts.get(&key) == Some(nth))
+                }
+                _ => false,
+            };
+            if reached {
+                let origin = relative
+                    .occurrence_key()
+                    .and_then(|key| counters.counts.get(&key).copied())
+                    .unwrap_or(0);
+                counters.origins.insert(relative.name.clone(), origin);
+            }
+        }
+        if keys.is_empty() {
+            return Vec::new();
+        }
         self.anchors
             .values()
-            .filter(|a| !matches!(a.position, Position::SyscallCount(_)))
+            .filter(on_thread)
+            .filter(|a| a.syscall_occurrence_matches(sysno, args))
+            .filter(|a| match (&a.position, a.occurrence_key()) {
+                (Position::Syscall { nth, .. }, Some(key)) => {
+                    let count = counters.counts.get(&key).copied().unwrap_or(0);
+                    match &a.from {
+                        None => count == *nth,
+                        Some(_) => counters
+                            .origins
+                            .get(&a.name)
+                            .is_some_and(|origin| count - origin == *nth),
+                    }
+                }
+                _ => false,
+            })
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    /// True for a version-2 program, which carries a hold budget and needs an
+    /// effective preemption timer to charge it.
+    pub fn is_version_2(&self) -> bool {
+        self.version == HAPPENS_BEFORE_VERSION
+    }
+
+    /// The relative anchors and their bases, in name order.
+    pub fn relative_anchors(&self) -> impl Iterator<Item = (&Anchor, &Anchor)> {
+        self.anchors.values().filter_map(|a| {
+            a.from
+                .as_ref()
+                .and_then(|b| self.anchors.get(b))
+                .map(|base| (a, base))
+        })
+    }
+
+    /// Anchors whose position kind the current scheduler does not yet enforce:
+    /// everything other than [`Position::SyscallCount`] and the syscall
+    /// occurrence anchors ([`Anchor::is_syscall_occurrence`]). Reported so a run
+    /// does not silently ignore an authored ordering constraint it cannot honor.
+    pub fn unenforced_positions(&self) -> impl Iterator<Item = &Anchor> {
+        self.anchors.values().filter(|a| {
+            !matches!(a.position, Position::SyscallCount(_)) && !a.is_syscall_occurrence()
+        })
     }
 }
 
@@ -413,6 +800,25 @@ pub enum HappensBeforeError {
         /// The unparseable name.
         name: String,
     },
+    /// An occurrence-counted event (`syscall`, `rip`, `mark` or a code
+    /// location) set `nth` to 0; occurrences are 1-based.
+    NthZero {
+        /// The offending event name.
+        event: String,
+    },
+    /// An event set `fd` without `syscall`.
+    FdWithoutSyscall {
+        /// The offending event name.
+        event: String,
+    },
+    /// An event set `fd` on a syscall whose first argument is not a file
+    /// descriptor ([`syscall_takes_fd_first`]).
+    FdNotFirstArgument {
+        /// The offending event name.
+        event: String,
+        /// The syscall name.
+        syscall: String,
+    },
     /// A RIP string could not be parsed as an address.
     BadRip {
         /// The offending event name.
@@ -437,6 +843,80 @@ pub enum HappensBeforeError {
     },
     /// The edge graph contains a cycle (listed in discovery order).
     Cycle(Vec<String>),
+    /// A version-1 spec used a field that version 2 added.
+    NewFieldInVersion1 {
+        /// The offending event name, or `None` for a spec-level field.
+        event: Option<String>,
+        /// The field.
+        field: String,
+    },
+    /// A version-2 spec carried a field this build does not know.
+    UnknownField {
+        /// Where: `spec`, `event 'x'`, `thread 'x'` or `edge N`.
+        place: String,
+        /// The field.
+        field: String,
+    },
+    /// An event set `futex_op` on a syscall other than `futex`, or without
+    /// `syscall`.
+    FutexOpWithoutFutex {
+        /// The offending event name.
+        event: String,
+    },
+    /// An event's `futex_op` does not fit the kernel's `int`.
+    FutexOpOutOfRange {
+        /// The offending event name.
+        event: String,
+        /// The value given.
+        value: i64,
+    },
+    /// An event's `from` names an event that does not exist.
+    FromUnknownEvent {
+        /// The relative event.
+        event: String,
+        /// The missing base.
+        base: String,
+    },
+    /// An event that is not a prehook syscall-occurrence anchor set `from`.
+    FromOnNonOccurrence {
+        /// The offending event name.
+        event: String,
+    },
+    /// A relative event's base cannot be shown to be on the same thread: it
+    /// names another dettid or spawn ordinal, or a dettid where the relative
+    /// event names a spawn ordinal (or the reverse).
+    FromOtherThread {
+        /// The relative event.
+        event: String,
+        /// Its base.
+        base: String,
+    },
+    /// A relative event's base is neither a count anchor nor an enforced
+    /// syscall-occurrence anchor, so it can never be reached.
+    FromUnenforcedPosition {
+        /// The relative event.
+        event: String,
+        /// Its base.
+        base: String,
+    },
+    /// A relative event's base is itself relative; chains are not supported.
+    FromRelativeBase {
+        /// The relative event.
+        event: String,
+        /// Its base.
+        base: String,
+    },
+    /// The relative bases and the hard edges together form a cycle, so some
+    /// event on it could only be reached after itself.
+    FromCycle(Vec<String>),
+    /// A posthook anchor names a syscall that does not return to its caller
+    /// when it succeeds ([`syscall_never_returns_on_success`]).
+    PosthookOnNoReturnSyscall {
+        /// The offending event name.
+        event: String,
+        /// The syscall name.
+        syscall: String,
+    },
     /// A DSL line could not be parsed.
     DslSyntax {
         /// 1-based line number.
@@ -451,8 +931,8 @@ impl fmt::Display for HappensBeforeError {
         match self {
             HappensBeforeError::UnsupportedVersion(v) => write!(
                 f,
-                "unsupported happens-before schema version {} (this build understands {})",
-                v, HAPPENS_BEFORE_VERSION
+                "unsupported happens-before schema version {} (this build understands {} and {})",
+                v, HAPPENS_BEFORE_VERSION_1, HAPPENS_BEFORE_VERSION
             ),
             HappensBeforeError::AmbiguousPosition { event, found } => {
                 if found.is_empty() {
@@ -474,6 +954,22 @@ impl fmt::Display for HappensBeforeError {
             HappensBeforeError::UnknownSyscall { event, name } => {
                 write!(f, "event '{}' names unknown syscall '{}'", event, name)
             }
+            HappensBeforeError::NthZero { event } => write!(
+                f,
+                "event '{}' sets 'nth' to 0; occurrences are counted from 1",
+                event
+            ),
+            HappensBeforeError::FdWithoutSyscall { event } => write!(
+                f,
+                "event '{}' sets 'fd' without 'syscall'; 'fd' restricts a named syscall",
+                event
+            ),
+            HappensBeforeError::FdNotFirstArgument { event, syscall } => write!(
+                f,
+                "event '{}' sets 'fd' on syscall '{}', whose first argument is not a file \
+                 descriptor",
+                event, syscall
+            ),
             HappensBeforeError::BadRip { event, text } => {
                 write!(f, "event '{}' has unparseable rip '{}'", event, text)
             }
@@ -495,6 +991,66 @@ impl fmt::Display for HappensBeforeError {
             HappensBeforeError::DslSyntax { line, message } => {
                 write!(f, "DSL parse error on line {}: {}", line, message)
             }
+            HappensBeforeError::NewFieldInVersion1 { event, field } => match event {
+                Some(event) => write!(
+                    f,
+                    "event '{}' sets '{}', which needs \"version\": 2",
+                    event, field
+                ),
+                None => write!(f, "the spec sets '{}', which needs \"version\": 2", field),
+            },
+            HappensBeforeError::UnknownField { place, field } => write!(
+                f,
+                "{} has unknown field '{}' (version 2 refuses unknown fields)",
+                place, field
+            ),
+            HappensBeforeError::FutexOpWithoutFutex { event } => write!(
+                f,
+                "event '{}' sets 'futex_op', which applies only to \"syscall\": \"futex\"",
+                event
+            ),
+            HappensBeforeError::FutexOpOutOfRange { event, value } => write!(
+                f,
+                "event '{}' sets 'futex_op' to {}, which does not fit the kernel's int",
+                event, value
+            ),
+            HappensBeforeError::FromUnknownEvent { event, base } => {
+                write!(f, "event '{}' counts from unknown event '{}'", event, base)
+            }
+            HappensBeforeError::FromOnNonOccurrence { event } => write!(
+                f,
+                "event '{}' sets 'from', which applies only to a syscall anchor at the prehook",
+                event
+            ),
+            HappensBeforeError::FromOtherThread { event, base } => write!(
+                f,
+                "event '{}' counts from '{}', which cannot be shown to be on the same thread; a \
+                 base must name the same dettid, or the same spawn ordinal",
+                event, base
+            ),
+            HappensBeforeError::FromUnenforcedPosition { event, base } => write!(
+                f,
+                "event '{}' counts from '{}', which is neither a count anchor nor a syscall anchor \
+                 at the prehook, so it is never reached",
+                event, base
+            ),
+            HappensBeforeError::FromRelativeBase { event, base } => write!(
+                f,
+                "event '{}' counts from '{}', which itself uses 'from'; relative chains are not \
+                 supported",
+                event, base
+            ),
+            HappensBeforeError::PosthookOnNoReturnSyscall { event, syscall } => write!(
+                f,
+                "event '{}' fires at the posthook of {}, which does not return to its caller when \
+                 it succeeds, so the anchor could only fire on a failed call",
+                event, syscall
+            ),
+            HappensBeforeError::FromCycle(names) => write!(
+                f,
+                "relative bases and hard edges together contain a cycle: {}",
+                names.join(" -> ")
+            ),
         }
     }
 }
@@ -506,8 +1062,22 @@ impl std::error::Error for HappensBeforeError {}
 // ================================================================================
 
 impl HappensBeforeSpec {
-    /// Parse a JSON specification.
+    /// Parse a JSON specification. A version-2 spec is also checked for
+    /// fields this build does not know ([`HappensBeforeError::UnknownField`]),
+    /// so a misspelled field is refused instead of silently ignored; version 1
+    /// keeps its old, lenient handling of unknown fields.
+    ///
+    /// The spec itself is deserialized from the original text, not from the
+    /// `Value` used for that check: a `Value` keeps only the last of two equal
+    /// keys, which would accept `"nth": 1, "nth": 2` as `nth` 2. Deserializing
+    /// the text refuses a duplicated field, in either version.
     pub fn from_json(s: &str) -> anyhow::Result<HappensBeforeSpec> {
+        let value: serde_json::Value = serde_json::from_str(s)?;
+        if value.get("version").and_then(serde_json::Value::as_u64)
+            == Some(u64::from(HAPPENS_BEFORE_VERSION))
+        {
+            check_known_fields(&value)?;
+        }
         Ok(serde_json::from_str(s)?)
     }
 
@@ -520,14 +1090,18 @@ impl HappensBeforeSpec {
     /// event references, require exactly one position per event, parse syscalls
     /// and RIPs, and confirm the edge graph is acyclic.
     pub fn normalize(&self) -> Result<HappensBeforeProgram, HappensBeforeError> {
-        if self.version != HAPPENS_BEFORE_VERSION {
+        if self.version != HAPPENS_BEFORE_VERSION && self.version != HAPPENS_BEFORE_VERSION_1 {
             return Err(HappensBeforeError::UnsupportedVersion(self.version));
+        }
+        if self.version == HAPPENS_BEFORE_VERSION_1 {
+            self.refuse_version_2_fields()?;
         }
 
         let mut anchors = BTreeMap::new();
         for (name, ev) in &self.events {
             anchors.insert(name.clone(), self.normalize_event(name, ev)?);
         }
+        check_relative_bases(&anchors)?;
 
         // Resolve edges against the anchor table.
         let mut edges = Vec::with_capacity(self.edges.len());
@@ -552,8 +1126,57 @@ impl HappensBeforeSpec {
         }
 
         detect_cycle(&anchors, &edges)?;
+        // A relative event is reached only after its base, on the same thread:
+        // an activation edge base -> relative. With the hard edges, a cycle
+        // means some event could only be reached after itself.
+        let mut with_activation = edges.clone();
+        with_activation.extend(
+            anchors
+                .values()
+                .filter_map(|a| a.from.as_ref().map(|base| (base, a)))
+                .map(|(base, a)| HappensBeforeEdge {
+                    before: base.clone(),
+                    after: a.name.clone(),
+                    strength: Strength::Hard,
+                }),
+        );
+        with_activation.retain(|e| e.strength == Strength::Hard);
+        if let Err(HappensBeforeError::Cycle(names)) = detect_cycle(&anchors, &with_activation) {
+            return Err(HappensBeforeError::FromCycle(names));
+        }
 
-        Ok(HappensBeforeProgram { anchors, edges })
+        let max_hold_ns = (self.version == HAPPENS_BEFORE_VERSION)
+            .then(|| self.max_hold_ns.unwrap_or(DEFAULT_MAX_HOLD_NS));
+        Ok(HappensBeforeProgram {
+            version: self.version,
+            anchors,
+            edges,
+            max_hold_ns,
+        })
+    }
+
+    /// Refuse, in a version-1 spec, every field that version 2 added.
+    fn refuse_version_2_fields(&self) -> Result<(), HappensBeforeError> {
+        if self.max_hold_ns.is_some() {
+            return Err(HappensBeforeError::NewFieldInVersion1 {
+                event: None,
+                field: "max_hold_ns".to_owned(),
+            });
+        }
+        for (name, ev) in &self.events {
+            for (field, set) in [
+                ("from", ev.from.is_some()),
+                ("futex_op", ev.futex_op.is_some()),
+            ] {
+                if set {
+                    return Err(HappensBeforeError::NewFieldInVersion1 {
+                        event: Some(name.clone()),
+                        field: field.to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve one event into a normalized [`Anchor`].
@@ -608,6 +1231,23 @@ impl HappensBeforeSpec {
             });
         }
 
+        if ev.fd.is_some() && ev.syscall.is_none() {
+            return Err(HappensBeforeError::FdWithoutSyscall {
+                event: name.to_string(),
+            });
+        }
+        if ev.futex_op.is_some() && ev.syscall.is_none() {
+            return Err(HappensBeforeError::FutexOpWithoutFutex {
+                event: name.to_string(),
+            });
+        }
+
+        if ev.nth == Some(0) && ev.syscalls.is_none() && ev.rcbs.is_none() {
+            return Err(HappensBeforeError::NthZero {
+                event: name.to_string(),
+            });
+        }
+
         let nth = ev.nth.unwrap_or(1);
         let position = if let Some(n) = ev.syscalls {
             Position::SyscallCount(n)
@@ -618,10 +1258,38 @@ impl HappensBeforeSpec {
                 event: name.to_string(),
                 name: sc.clone(),
             })?;
+            if ev.fd.is_some() && !syscall_takes_fd_first(sysno) {
+                return Err(HappensBeforeError::FdNotFirstArgument {
+                    event: name.to_string(),
+                    syscall: sc.clone(),
+                });
+            }
+            let futex_op = match ev.futex_op {
+                None => None,
+                Some(_) if sysno != Sysno::futex => {
+                    return Err(HappensBeforeError::FutexOpWithoutFutex {
+                        event: name.to_string(),
+                    });
+                }
+                Some(value) => Some(i32::try_from(value).map_err(|_| {
+                    HappensBeforeError::FutexOpOutOfRange {
+                        event: name.to_string(),
+                        value,
+                    }
+                })?),
+            };
+            if ev.phase == Some(PhaseSpec::Posthook) && syscall_never_returns_on_success(sysno) {
+                return Err(HappensBeforeError::PosthookOnNoReturnSyscall {
+                    event: name.to_string(),
+                    syscall: sc.clone(),
+                });
+            }
             Position::Syscall {
                 sysno,
                 phase: ev.phase.map(Into::into),
                 nth,
+                fd: ev.fd,
+                futex_op,
             }
         } else if let Some(rip) = &ev.rip {
             let addr = parse_rip(rip).ok_or_else(|| HappensBeforeError::BadRip {
@@ -648,6 +1316,7 @@ impl HappensBeforeSpec {
             thread,
             position,
             location,
+            from: ev.from.clone(),
         })
     }
 
@@ -673,6 +1342,103 @@ impl HappensBeforeSpec {
             })
         }
     }
+}
+
+/// Check every relative anchor's `from`: the base exists, is on the same
+/// thread, is a count or syscall-occurrence anchor and is not itself relative;
+/// the relative anchor is a syscall-occurrence anchor.
+fn check_relative_bases(anchors: &BTreeMap<String, Anchor>) -> Result<(), HappensBeforeError> {
+    for anchor in anchors.values() {
+        let Some(base_name) = &anchor.from else {
+            continue;
+        };
+        let event = anchor.name.clone();
+        let base = base_name.clone();
+        let Some(base_anchor) = anchors.get(base_name) else {
+            return Err(HappensBeforeError::FromUnknownEvent { event, base });
+        };
+        if !anchor.is_syscall_occurrence() {
+            return Err(HappensBeforeError::FromOnNonOccurrence { event });
+        }
+        if !same_thread(&base_anchor.thread, &anchor.thread) {
+            return Err(HappensBeforeError::FromOtherThread { event, base });
+        }
+        if base_anchor.from.is_some() {
+            return Err(HappensBeforeError::FromRelativeBase { event, base });
+        }
+        if !matches!(base_anchor.position, Position::SyscallCount(_))
+            && !base_anchor.is_syscall_occurrence()
+        {
+            return Err(HappensBeforeError::FromUnenforcedPosition { event, base });
+        }
+    }
+    Ok(())
+}
+
+/// True when two thread references resolve to the same thread whatever they
+/// are called: the same `dettid`, or, with no `dettid` on either, the same
+/// `spawn_ordinal`. A `dettid` and a `spawn_ordinal` cannot be shown equal
+/// before the run, so they are not.
+fn same_thread(a: &ThreadRef, b: &ThreadRef) -> bool {
+    match (a.dettid, b.dettid) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => a.spawn_ordinal.is_some() && a.spawn_ordinal == b.spawn_ordinal,
+        _ => false,
+    }
+}
+
+/// Refuse a field a version-2 spec does not define. The field lists mirror
+/// the serde structs above, including the `rcb` alias.
+fn check_known_fields(value: &serde_json::Value) -> Result<(), HappensBeforeError> {
+    const SPEC: &[&str] = &["version", "max_hold_ns", "threads", "events", "edges"];
+    const THREAD: &[&str] = &["label", "dettid", "spawn_ordinal"];
+    const EVENT: &[&str] = &[
+        "thread", "syscalls", "rcbs", "rcb", "func", "file", "line", "syscall", "phase", "fd",
+        "futex_op", "from", "rip", "mark", "nth",
+    ];
+    const EDGE: &[&str] = &["before", "after", "strength"];
+    fn check(
+        object: Option<&serde_json::Map<String, serde_json::Value>>,
+        known: &[&str],
+        place: impl Fn() -> String,
+    ) -> Result<(), HappensBeforeError> {
+        for field in object.into_iter().flat_map(|o| o.keys()) {
+            if !known.contains(&field.as_str()) {
+                return Err(HappensBeforeError::UnknownField {
+                    place: place(),
+                    field: field.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+    check(value.as_object(), SPEC, || "the spec".to_owned())?;
+    for (name, thread) in value
+        .get("threads")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        check(thread.as_object(), THREAD, || format!("thread '{name}'"))?;
+    }
+    for (name, event) in value
+        .get("events")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        check(event.as_object(), EVENT, || format!("event '{name}'"))?;
+    }
+    for (index, edge) in value
+        .get("edges")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        check(edge.as_object(), EDGE, || format!("edge {index}"))?;
+    }
+    Ok(())
 }
 
 /// Parse a RIP string: hex (`0x...`) or plain decimal.
@@ -774,8 +1540,10 @@ impl HappensBeforeSpec {
     /// Parse the terse line-oriented DSL into a specification. Symbolic threads
     /// mentioned by name become entries in the `threads` table.
     pub fn from_dsl(input: &str) -> Result<HappensBeforeSpec, HappensBeforeError> {
+        // The DSL has no version-2 syntax, so it builds a version-1 spec.
         let mut spec = HappensBeforeSpec {
-            version: HAPPENS_BEFORE_VERSION,
+            version: HAPPENS_BEFORE_VERSION_1,
+            max_hold_ns: None,
             threads: BTreeMap::new(),
             events: BTreeMap::new(),
             edges: Vec::new(),
@@ -984,6 +1752,177 @@ mod tests {
         }"#
     }
 
+    /// The guest-side checkpoint filter is exact per thread: true for the named
+    /// dettid at exactly its anchored count, false for another dettid or for
+    /// count +/- 1 or at count 0, true for every thread at a spawn-ordinal
+    /// anchor's count (the guest side cannot resolve ordinals), and false at
+    /// numbers that belong to other position kinds (an RCB value, a
+    /// syscall-by-name occurrence).
+    #[test]
+    fn may_have_syscall_count_anchor_at_is_exact_per_thread() {
+        let prog = HappensBeforeSpec::from_json(
+            r#"{"version": 1,
+                "threads": {"T7": {"dettid": 7}, "S2": {"spawn_ordinal": 2}},
+                "events": {"a": {"thread": "T7", "syscalls": 10},
+                           "b": {"thread": "S2", "syscalls": 20},
+                           "c": {"thread": "T7", "rcbs": 30},
+                           "d": {"thread": "T7", "syscall": "futex", "phase": "pre", "nth": 40}},
+                "edges": [{"before": "a", "after": "b"}]}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap();
+        assert!(prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 10));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(8), 10));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 9));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 11));
+        assert!(prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 20));
+        assert!(prog.may_have_syscall_count_anchor_at(DetTid::from_raw(8), 20));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(8), 21));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 30));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 0));
+        assert!(matches!(
+            prog.anchors["d"].position,
+            Position::Syscall { nth: 40, .. }
+        ));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 40));
+    }
+
+    /// `{"syscall": "writev", "fd": 9, "nth": 3}` is the thread's third
+    /// `writev` to fd 9: a syscall-occurrence anchor that needs no calibration.
+    #[test]
+    fn syscall_fd_anchor_normalizes_and_displays() {
+        let prog = HappensBeforeSpec::from_json(
+            r#"{"version": 1,
+                "events": {"m": {"thread": "7", "syscall": "writev", "fd": 9, "nth": 3}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap();
+        let anchor = &prog.anchors["m"];
+        assert_eq!(
+            anchor.position,
+            Position::Syscall {
+                sysno: Sysno::writev,
+                phase: None,
+                nth: 3,
+                fd: Some(9),
+                futex_op: None,
+            }
+        );
+        assert_eq!(anchor.position.to_string(), "writev(fd=9)#3");
+        assert!(anchor.is_syscall_occurrence());
+        assert_eq!(prog.unenforced_positions().count(), 0);
+    }
+
+    /// `fd` restricts a named syscall whose first argument is a descriptor; set
+    /// anywhere else it is refused by name when the spec is loaded, never
+    /// matched against an argument that is not a descriptor.
+    #[test]
+    fn syscall_fd_anchor_is_refused_where_it_cannot_apply() {
+        let err = HappensBeforeSpec::from_json(
+            r#"{"version": 1, "events": {"x": {"thread": "7", "syscalls": 5, "fd": 9}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            HappensBeforeError::FdWithoutSyscall {
+                event: "x".to_string()
+            }
+        );
+        let err = HappensBeforeSpec::from_json(
+            r#"{"version": 1, "events": {"y": {"thread": "7", "syscall": "getpid", "fd": 9}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            HappensBeforeError::FdNotFirstArgument {
+                event: "y".to_string(),
+                syscall: "getpid".to_string()
+            }
+        );
+        assert!(err.to_string().contains("'y'"), "{err}");
+        let err = HappensBeforeSpec::from_json(
+            r#"{"version": 1, "events": {"z": {"thread": "7", "syscall": "write", "fd": 1, "nth": 0}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            HappensBeforeError::NthZero {
+                event: "z".to_string()
+            }
+        );
+    }
+
+    /// Occurrences are counted per thread over the calls that match: the
+    /// anchor's syscall and, when it has one, its fd (the register's low 32
+    /// bits). The second matching `writev` to fd 9 reaches an `nth: 2` anchor
+    /// even with non-matching calls in between, an fd-agnostic anchor counts
+    /// every fd, a spawn-ordinal anchor is returned on any thread (the
+    /// scheduler resolves it), and a posthook anchor is never counted and is
+    /// reported as unenforced.
+    #[test]
+    fn count_syscall_occurrences_is_exact_per_thread() {
+        let prog = HappensBeforeSpec::from_json(
+            r#"{"version": 1,
+                "threads": {"S1": {"spawn_ordinal": 1}},
+                "events": {"fd9": {"thread": "7", "syscall": "writev", "fd": 9, "nth": 2},
+                           "anyfd": {"thread": "7", "syscall": "writev", "nth": 3},
+                           "spawned": {"thread": "S1", "syscall": "write", "fd": 1},
+                           "polling": {"thread": "7", "syscall": "close", "phase": "polling"}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap();
+        assert!(prog.has_syscall_occurrence_anchors());
+        let t7 = DetTid::from_raw(7);
+        let t8 = DetTid::from_raw(8);
+        let mut c7 = HbThreadCounters::default();
+        let count = |c: &mut HbThreadCounters, t, sysno, arg0: usize| {
+            prog.count_syscall_occurrences(c, t, sysno, [arg0, 0], 1)
+        };
+        assert!(count(&mut c7, t7, Sysno::writev, 9).is_empty());
+        // Another fd and another syscall do not count toward fd9.
+        assert!(count(&mut c7, t7, Sysno::writev, 8).is_empty());
+        assert!(count(&mut c7, t7, Sysno::write, 9).is_empty());
+        // Low 32 bits: this is fd 9, the second, and the third writev of any fd.
+        assert_eq!(
+            count(&mut c7, t7, Sysno::writev, 0x1_0000_0009),
+            ["anyfd", "fd9"]
+        );
+        assert!(count(&mut c7, t7, Sysno::writev, 9).is_empty());
+        // Thread 8 has its own counters; anchors on thread 7 are never its.
+        let mut c8 = HbThreadCounters::default();
+        assert!(count(&mut c8, t8, Sysno::writev, 9).is_empty());
+        assert!(count(&mut c8, t8, Sysno::writev, 9).is_empty());
+        // A spawn-ordinal anchor is returned on any thread at its nth.
+        assert_eq!(count(&mut c8, t8, Sysno::write, 1), ["spawned"]);
+        assert!(count(&mut c8, t8, Sysno::write, 2).is_empty());
+        // A polling anchor is not enforced, never counted.
+        assert!(count(&mut c7, t7, Sysno::close, 3).is_empty());
+        assert!(!c7.counts.contains_key(&(Sysno::close as usize, None, None)));
+        let unenforced: Vec<&str> = prog
+            .unenforced_positions()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(unenforced, ["polling"]);
+        // A count anchor is not a syscall-occurrence anchor and is unaffected.
+        assert!(!prog.may_have_syscall_count_anchor_at(t7, 2));
+        let count_only = HappensBeforeSpec::from_json(
+            r#"{"version": 1, "events": {"a": {"thread": "7", "syscalls": 2}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap();
+        assert!(!count_only.has_syscall_occurrence_anchors());
+    }
+
     #[test]
     fn parse_and_normalize_rfc_example() {
         let spec = HappensBeforeSpec::from_json(spec_json()).unwrap();
@@ -1008,7 +1947,13 @@ mod tests {
 
         // Syscall anchor parses the name and phase.
         match &prog.anchors["lockA"].position {
-            Position::Syscall { sysno, phase, nth } => {
+            Position::Syscall {
+                sysno,
+                phase,
+                nth,
+                fd: None,
+                futex_op: None,
+            } => {
                 assert_eq!(*sysno, Sysno::futex);
                 assert_eq!(*phase, Some(SyscallPhase::Posthook));
                 assert_eq!(*nth, 5);
@@ -1271,5 +2216,435 @@ mod tests {
         assert_eq!(parse_rip("0x401f3c"), Some(0x401f3c));
         assert_eq!(parse_rip("4201276"), Some(4201276));
         assert_eq!(parse_rip("nonsense"), None);
+    }
+
+    fn normalize_json(json: &str) -> Result<HappensBeforeProgram, HappensBeforeError> {
+        HappensBeforeSpec::from_json(json).unwrap().normalize()
+    }
+
+    /// Version 2 is a new schema: a version-1 spec loads with its old meaning
+    /// and no hold budget, but may not use a version-2 field; a version-2 spec
+    /// gets the default budget; any other version is refused. The DSL has no
+    /// version-2 syntax and builds version 1.
+    #[test]
+    fn version_2_fields_need_version_2() {
+        let v1 = normalize_json(
+            r#"{"version": 1, "events": {"w": {"thread": "7", "syscall": "write", "fd": 1}}}"#,
+        )
+        .unwrap();
+        assert_eq!((v1.version, v1.max_hold_ns), (1, None));
+        assert!(!v1.is_version_2());
+        let v2 = normalize_json(
+            r#"{"version": 2, "events": {"w": {"thread": "7", "syscall": "write", "fd": 1}}}"#,
+        )
+        .unwrap();
+        assert_eq!(v2.max_hold_ns, Some(DEFAULT_MAX_HOLD_NS));
+        assert!(v2.is_version_2());
+        let budget = normalize_json(
+            r#"{"version": 2, "max_hold_ns": 5000,
+                "events": {"w": {"thread": "7", "syscall": "write", "fd": 1}}}"#,
+        )
+        .unwrap();
+        assert_eq!(budget.max_hold_ns, Some(5000));
+
+        for (json, event, field) in [
+            (
+                r#"{"version": 1, "events": {
+                    "a": {"thread": "7", "syscall": "write", "fd": 1},
+                    "r": {"thread": "7", "syscall": "getppid", "from": "a"}}}"#,
+                Some("r"),
+                "from",
+            ),
+            (
+                r#"{"version": 1, "events": {
+                    "f": {"thread": "7", "syscall": "futex", "futex_op": 393}}}"#,
+                Some("f"),
+                "futex_op",
+            ),
+            (
+                r#"{"version": 1, "max_hold_ns": 5,
+                    "events": {"w": {"thread": "7", "syscall": "write"}}}"#,
+                None,
+                "max_hold_ns",
+            ),
+        ] {
+            assert_eq!(
+                normalize_json(json).unwrap_err(),
+                HappensBeforeError::NewFieldInVersion1 {
+                    event: event.map(str::to_owned),
+                    field: field.to_owned(),
+                }
+            );
+        }
+        assert_eq!(
+            normalize_json(r#"{"version": 3, "events": {}}"#).unwrap_err(),
+            HappensBeforeError::UnsupportedVersion(3)
+        );
+        let dsl = HappensBeforeSpec::from_dsl("A:sc=3 < B:sc=4").unwrap();
+        assert_eq!(dsl.version, HAPPENS_BEFORE_VERSION_1);
+    }
+
+    /// A version-2 spec refuses a field this build does not know, at every
+    /// level, so a misspelling is not silently ignored; version 1 keeps its
+    /// lenient parsing.
+    #[test]
+    fn version_2_refuses_unknown_fields() {
+        for (json, place, field) in [
+            (r#"{"version": 2, "evnets": {}}"#, "the spec", "evnets"),
+            (
+                r#"{"version": 2, "events": {"w": {"thread": "7", "syscal": "write"}}}"#,
+                "event 'w'",
+                "syscal",
+            ),
+            (
+                r#"{"version": 2, "threads": {"t": {"dettid": 7, "tid": 7}}}"#,
+                "thread 't'",
+                "tid",
+            ),
+            (
+                r#"{"version": 2, "events": {}, "edges": [{"before": "a", "after": "b", "kind": 1}]}"#,
+                "edge 0",
+                "kind",
+            ),
+        ] {
+            let error = HappensBeforeSpec::from_json(json).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<HappensBeforeError>(),
+                Some(&HappensBeforeError::UnknownField {
+                    place: place.to_owned(),
+                    field: field.to_owned(),
+                }),
+                "{json}"
+            );
+        }
+        // The `rcb` alias is a known field.
+        normalize_json(r#"{"version": 2, "events": {"r": {"thread": "7", "rcb": 5}}}"#).unwrap();
+        // Version 1 ignores an unknown field, as it always has.
+        normalize_json(r#"{"version": 1, "events": {}, "evnets": {}}"#).unwrap();
+    }
+
+    /// A field given twice is refused in both versions, rather than the last
+    /// value silently winning (the Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4004).
+    #[test]
+    fn a_duplicated_field_is_refused() {
+        for json in [
+            r#"{"version": 1, "events": {"w": {"thread": "7", "syscall": "write", "nth": 1, "nth": 2}}}"#,
+            r#"{"version": 2, "events": {"w": {"thread": "7", "syscall": "write", "nth": 1, "nth": 2}}}"#,
+            r#"{"version": 2, "max_hold_ns": 5, "max_hold_ns": 6, "events": {}}"#,
+        ] {
+            let error = HappensBeforeSpec::from_json(json).unwrap_err().to_string();
+            assert!(error.contains("duplicate field"), "{json}: {error}");
+        }
+    }
+
+    /// A posthook syscall anchor is enforced: it is counted at its entry like
+    /// any occurrence anchor and named at that entry, and only its firing
+    /// point differs (https://github.com/rrnewton/hermit/issues/3929). It is
+    /// refused at load on syscalls that do not return on success.
+    #[test]
+    fn a_posthook_anchor_is_counted_at_entry_and_refused_on_no_return_syscalls() {
+        let prog = normalize_json(
+            r#"{"version": 1, "events": {
+                "w": {"thread": "7", "syscall": "write", "fd": 1, "phase": "posthook", "nth": 2}}}"#,
+        )
+        .unwrap();
+        let w = &prog.anchors["w"];
+        assert!(w.is_syscall_occurrence() && w.fires_at_posthook());
+        assert_eq!(prog.unenforced_positions().count(), 0);
+        let t7 = DetTid::from_raw(7);
+        let mut c = HbThreadCounters::default();
+        assert!(
+            prog.count_syscall_occurrences(&mut c, t7, Sysno::write, [1, 0], 1)
+                .is_empty()
+        );
+        assert_eq!(
+            prog.count_syscall_occurrences(&mut c, t7, Sysno::write, [1, 0], 2),
+            ["w"]
+        );
+        for syscall in ["execve", "execveat", "exit", "exit_group", "rt_sigreturn"] {
+            assert_eq!(
+                normalize_json(&format!(
+                    r#"{{"version": 1, "events": {{"x": {{"thread": "7", "syscall": "{syscall}", "phase": "posthook"}}}}}}"#
+                ))
+                .unwrap_err(),
+                HappensBeforeError::PosthookOnNoReturnSyscall {
+                    event: "x".to_owned(),
+                    syscall: syscall.to_owned()
+                }
+            );
+        }
+        // At the prehook the same syscalls stay valid anchors.
+        normalize_json(r#"{"version": 1, "events": {"x": {"thread": "7", "syscall": "execve"}}}"#)
+            .unwrap();
+    }
+
+    /// `futex_op` restricts `futex` to one operation, compared on the low 32
+    /// bits of the second argument as the kernel's `int`; it is refused on any
+    /// other syscall and outside `i32`.
+    #[test]
+    fn futex_op_matches_the_low_32_bits_of_the_operation() {
+        let prog = normalize_json(
+            r#"{"version": 2, "events": {
+                "halt": {"thread": "7", "syscall": "futex", "futex_op": 393, "nth": 2},
+                "wait": {"thread": "7", "syscall": "futex", "futex_op": 0}}}"#,
+        )
+        .unwrap();
+        assert_eq!(prog.anchors["halt"].position.to_string(), "futex(op=393)#2");
+        let t7 = DetTid::from_raw(7);
+        let mut c = HbThreadCounters::default();
+        let mut entry = 0;
+        let mut call = |c: &mut HbThreadCounters, op: usize| {
+            entry += 1;
+            prog.count_syscall_occurrences(c, t7, Sysno::futex, [0x1000, op], entry)
+        };
+        assert_eq!(call(&mut c, 393), Vec::<String>::new());
+        // Operation 0 counts only toward its own matcher.
+        assert_eq!(call(&mut c, 0), ["wait"]);
+        // The same operation with other upper register bits is operation 393.
+        assert_eq!(call(&mut c, 0xdead_0000_0000_0189), ["halt"]);
+        assert_eq!(c.counts[&(Sysno::futex as usize, None, Some(393))], 2);
+        assert_eq!(c.counts[&(Sysno::futex as usize, None, Some(0))], 1);
+
+        assert_eq!(
+            normalize_json(
+                r#"{"version": 2, "events": {"w": {"thread": "7", "syscall": "write", "futex_op": 1}}}"#,
+            )
+            .unwrap_err(),
+            HappensBeforeError::FutexOpWithoutFutex {
+                event: "w".to_owned()
+            }
+        );
+        assert_eq!(
+            normalize_json(
+                r#"{"version": 2, "events": {"w": {"thread": "7", "futex_op": 1, "syscalls": 3}}}"#
+            )
+            .unwrap_err(),
+            HappensBeforeError::FutexOpWithoutFutex {
+                event: "w".to_owned()
+            }
+        );
+        assert_eq!(
+            normalize_json(
+                r#"{"version": 2, "events": {"f": {"thread": "7", "syscall": "futex", "futex_op": 2147483648}}}"#,
+            )
+            .unwrap_err(),
+            HappensBeforeError::FutexOpOutOfRange {
+                event: "f".to_owned(),
+                value: 2147483648
+            }
+        );
+    }
+
+    /// Each malformed `from` is refused by name when the spec is loaded.
+    #[test]
+    fn from_refusals_name_the_event() {
+        let refused = |events: &str, edges: &str| {
+            normalize_json(&format!(
+                r#"{{"version": 2, "events": {{{events}}}, "edges": [{edges}]}}"#
+            ))
+            .unwrap_err()
+        };
+        let names = |e: &str, b: &str| (e.to_owned(), b.to_owned());
+        let (event, base) = names("r", "nope");
+        assert_eq!(
+            refused(
+                r#""r": {"thread": "7", "syscall": "getppid", "from": "nope"}"#,
+                ""
+            ),
+            HappensBeforeError::FromUnknownEvent { event, base }
+        );
+        let (event, base) = names("r", "a");
+        assert_eq!(
+            refused(
+                r#""a": {"thread": "8", "syscall": "write", "fd": 1},
+                   "r": {"thread": "7", "syscall": "getppid", "from": "a"}"#,
+                ""
+            ),
+            HappensBeforeError::FromOtherThread { event, base }
+        );
+        let (event, base) = names("r", "a");
+        assert_eq!(
+            refused(
+                r#""a": {"thread": "7", "rcbs": 100},
+                   "r": {"thread": "7", "syscall": "getppid", "from": "a"}"#,
+                ""
+            ),
+            HappensBeforeError::FromUnenforcedPosition { event, base }
+        );
+        let (event, base) = names("r", "a");
+        assert_eq!(
+            refused(
+                r#""a": {"thread": "7", "syscall": "write", "phase": "polling"},
+                   "r": {"thread": "7", "syscall": "getppid", "from": "a"}"#,
+                ""
+            ),
+            HappensBeforeError::FromUnenforcedPosition { event, base }
+        );
+        let (event, base) = names("r2", "r1");
+        assert_eq!(
+            refused(
+                r#""a": {"thread": "7", "syscalls": 3},
+                   "r1": {"thread": "7", "syscall": "getppid", "from": "a"},
+                   "r2": {"thread": "7", "syscall": "getppid", "from": "r1"}"#,
+                ""
+            ),
+            HappensBeforeError::FromRelativeBase { event, base }
+        );
+        assert_eq!(
+            refused(
+                r#""a": {"thread": "7", "syscalls": 3},
+                   "r": {"thread": "7", "syscalls": 9, "from": "a"}"#,
+                ""
+            ),
+            HappensBeforeError::FromOnNonOccurrence {
+                event: "r".to_owned()
+            }
+        );
+        // R counts from A, so R comes after A on that thread; a hard edge
+        // R before A would need A after R.
+        assert_eq!(
+            refused(
+                r#""a": {"thread": "7", "syscalls": 3},
+                   "r": {"thread": "7", "syscall": "getppid", "from": "a"}"#,
+                r#"{"before": "r", "after": "a"}"#
+            ),
+            HappensBeforeError::FromCycle(vec!["a".to_owned(), "r".to_owned(), "a".to_owned()])
+        );
+        // One thread named two ways (a label for dettid 3, and "3") is the
+        // same thread; a dettid and a spawn ordinal cannot be shown equal.
+        normalize_json(
+            r#"{"version": 2, "threads": {"main": {"dettid": 3}, "s1": {"spawn_ordinal": 1}},
+                "events": {"a": {"thread": "main", "syscall": "write", "fd": 1},
+                           "r": {"thread": "3", "syscall": "getppid", "from": "a"},
+                           "b": {"thread": "s1", "syscalls": 4},
+                           "q": {"thread": "s1", "syscall": "getppid", "from": "b"}}}"#,
+        )
+        .unwrap();
+        let (event, base) = names("r", "a");
+        assert_eq!(
+            normalize_json(
+                r#"{"version": 2, "threads": {"s1": {"spawn_ordinal": 1}},
+                    "events": {"a": {"thread": "7", "syscall": "write", "fd": 1},
+                               "r": {"thread": "s1", "syscall": "getppid", "from": "a"}}}"#,
+            )
+            .unwrap_err(),
+            HappensBeforeError::FromOtherThread { event, base }
+        );
+        // A soft edge does not hold a thread, so it closes no cycle.
+        normalize_json(
+            r#"{"version": 2, "events": {
+                "a": {"thread": "7", "syscalls": 3},
+                "r": {"thread": "7", "syscall": "getppid", "from": "a"}},
+                "edges": [{"before": "r", "after": "a", "strength": "soft"}]}"#,
+        )
+        .unwrap();
+    }
+
+    /// The design's per-entry order: increment, then record origins, then
+    /// fire. Absolute and relative anchors on one matcher share its counter;
+    /// each relative anchor has its own origin; a base entry that matches the
+    /// relative matcher is not in the window; a count base resolves on an
+    /// entry that matches no key.
+    #[test]
+    fn relative_anchors_count_strictly_after_their_base() {
+        let prog = normalize_json(
+            r#"{"version": 2, "events": {
+                "m2": {"thread": "7", "syscall": "write", "fd": 1, "nth": 2},
+                "abs3": {"thread": "7", "syscall": "getppid", "nth": 3},
+                "after_m2": {"thread": "7", "syscall": "getppid", "from": "m2", "nth": 1},
+                "c4": {"thread": "7", "syscalls": 4},
+                "after_c4": {"thread": "7", "syscall": "getppid", "from": "c4", "nth": 2},
+                "gp1": {"thread": "7", "syscall": "getppid", "nth": 1},
+                "after_gp1": {"thread": "7", "syscall": "getppid", "from": "gp1", "nth": 1}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            prog.anchors["after_m2"].to_string(),
+            "after_m2[7: getppid#1 after m2]"
+        );
+        let relative: Vec<(&str, &str)> = prog
+            .relative_anchors()
+            .map(|(r, b)| (r.name.as_str(), b.name.as_str()))
+            .collect();
+        assert_eq!(
+            relative,
+            [("after_c4", "c4"), ("after_gp1", "gp1"), ("after_m2", "m2")]
+        );
+        let t7 = DetTid::from_raw(7);
+        let mut c = HbThreadCounters::default();
+        let mut entry = 0;
+        let mut call = |c: &mut HbThreadCounters, sysno: Sysno, arg0: usize| {
+            entry += 1;
+            prog.count_syscall_occurrences(c, t7, sysno, [arg0, 0], entry)
+        };
+        // Entry 1: getppid #1 fires gp1, which is after_gp1's base; that
+        // entry is not in after_gp1's window.
+        assert_eq!(call(&mut c, Sysno::getppid, 0), ["gp1"]);
+        assert_eq!(c.origins["after_gp1"], 1);
+        // Entry 2: write #1 to fd 1.
+        assert!(call(&mut c, Sysno::write, 1).is_empty());
+        // Entry 3: getppid #2, the first after gp1.
+        assert_eq!(call(&mut c, Sysno::getppid, 0), ["after_gp1"]);
+        // Entry 4: an unwatched syscall that matches no key is c4's base
+        // entry; after_c4's origin is getppid's count so far.
+        assert!(call(&mut c, Sysno::getpid, 0).is_empty());
+        assert_eq!(c.origins["after_c4"], 2);
+        // Entry 5: write #2 to fd 1 fires m2 and starts after_m2's window.
+        assert_eq!(call(&mut c, Sysno::write, 1), ["m2"]);
+        assert_eq!(c.origins["after_m2"], 2);
+        // Entry 6: getppid #3 is abs3, the first after m2, and the first
+        // after c4; one shared counter, independent origins.
+        assert_eq!(call(&mut c, Sysno::getppid, 0), ["abs3", "after_m2"]);
+        // Entry 7: getppid #4 is the second after c4.
+        assert_eq!(call(&mut c, Sysno::getppid, 0), ["after_c4"]);
+        assert!(call(&mut c, Sysno::getppid, 0).is_empty());
+        assert_eq!(c.counts[&(Sysno::getppid as usize, None, None)], 5);
+
+        // A new thread starts with no origins: the relative anchors on thread
+        // 7 are never counted for thread 8.
+        let mut c8 = HbThreadCounters::default();
+        assert!(
+            prog.count_syscall_occurrences(&mut c8, DetTid::from_raw(8), Sysno::getppid, [0, 0], 1)
+                .is_empty()
+        );
+        assert!(c8.origins.is_empty());
+    }
+
+    /// The phase is not part of an anchor's counting key: a prehook and a
+    /// posthook anchor on one matcher share one counter, and both are named at
+    /// the same entry; a posthook base starts its relative anchor's window at
+    /// its entry, as a prehook base does
+    /// (https://github.com/rrnewton/hermit/issues/3929).
+    #[test]
+    fn a_posthook_anchor_shares_its_counter_and_starts_windows_at_its_entry() {
+        let prog = normalize_json(
+            r#"{"version": 2, "events": {
+                "pre2": {"thread": "7", "syscall": "write", "fd": 1, "nth": 2},
+                "post2": {"thread": "7", "syscall": "write", "fd": 1, "nth": 2,
+                          "phase": "posthook"},
+                "post3": {"thread": "7", "syscall": "write", "fd": 1, "nth": 3,
+                          "phase": "posthook"},
+                "base": {"thread": "7", "syscall": "getpid", "phase": "posthook"},
+                "after_base": {"thread": "7", "syscall": "write", "fd": 1, "from": "base",
+                               "nth": 1}}}"#,
+        )
+        .unwrap();
+        let t7 = DetTid::from_raw(7);
+        let mut c = HbThreadCounters::default();
+        let mut entry = 0;
+        let mut call = |c: &mut HbThreadCounters, sysno: Sysno, arg0: usize| {
+            entry += 1;
+            prog.count_syscall_occurrences(c, t7, sysno, [arg0, 0], entry)
+        };
+        assert!(call(&mut c, Sysno::write, 1).is_empty());
+        assert_eq!(call(&mut c, Sysno::write, 1), ["post2", "pre2"]);
+        // Entry 3: the posthook base, named at its entry; its window starts
+        // at the write count so far.
+        assert_eq!(call(&mut c, Sysno::getpid, 0), ["base"]);
+        assert_eq!(c.origins["after_base"], 2);
+        // Entry 4: write #3 is post3 and the first write after the base.
+        assert_eq!(call(&mut c, Sysno::write, 1), ["after_base", "post3"]);
+        assert_eq!(c.counts[&(Sysno::write as usize, Some(1), None)], 3);
     }
 }

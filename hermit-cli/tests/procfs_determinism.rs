@@ -95,6 +95,24 @@ fn read_procfs_at_epoch(path: &str, epoch: Option<&str>) -> Vec<u8> {
     read_procfs_with(path, epoch, |_| {})
 }
 
+/// The files these tests read that only the `standard` /proc level has
+/// (https://github.com/rrnewton/hermit/issues/4266); every other file is
+/// read at the default level.
+const STANDARD_LEVEL_FILES: &[&str] = &[
+    "/proc/1/io",
+    "/proc/diskstats",
+    "/proc/driver/rtc",
+    "/proc/interrupts",
+    "/proc/pressure/cpu",
+    "/proc/pressure/io",
+    "/proc/pressure/memory",
+    "/proc/schedstat",
+    "/proc/softirqs",
+    "/proc/sys/kernel/random/entropy_avail",
+    "/proc/vmstat",
+    "/proc/zoneinfo",
+];
+
 fn read_procfs_with(
     path: &str,
     epoch: Option<&str>,
@@ -108,6 +126,9 @@ fn read_procfs_with(
         "--no-virtualize-cpuid",
         "--max-timeslice=disabled",
     ]);
+    if STANDARD_LEVEL_FILES.contains(&path) {
+        command.arg("--proc=standard");
+    }
     if let Some(epoch) = epoch {
         command.arg(format!("--epoch={epoch}"));
     }
@@ -115,9 +136,7 @@ fn read_procfs_with(
     command.args(["--", "/bin/cat", path]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "procfs read failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -285,9 +304,248 @@ fn proc_self_status_is_deterministic() {
         assert!(pid > 0);
         assert!(text.contains("Cpus_allowed:\t00000000,00000000,00000000,00000001\n"));
         assert!(text.contains("Cpus_allowed_list:\t0\n"));
+        assert!(text.contains("Mems_allowed:\t00000000,00000001\n"));
+        assert!(text.contains("Mems_allowed_list:\t0\n"));
         assert!(text.contains("voluntary_ctxt_switches:\t0\n"));
         assert!(text.contains("nonvoluntary_ctxt_switches:\t0\n"));
     });
+}
+
+/// The host cgroup path (a launcher's unit name, a CI job's slice) changed the
+/// branch counts of Go's GOMAXPROCS probe and so every virtual timestamp after
+/// it (https://github.com/rrnewton/hermit/issues/4378). When the test itself
+/// already runs in the root cgroup the host path is `/` too, and only the
+/// Detcore unit test can tell the rule is missing.
+#[test]
+fn proc_self_cgroup_reads_as_the_root_cgroup() {
+    assert_deterministic("/proc/self/cgroup", |contents| {
+        let text = std::str::from_utf8(contents).expect("cgroup should be UTF-8");
+        assert!(!text.is_empty(), "cgroup has no hierarchy");
+        for line in text.lines() {
+            assert!(
+                line.ends_with(":/"),
+                "cgroup line keeps a host path: {line}"
+            );
+        }
+    });
+}
+
+/// `tests/c/process_cgroup.c`, built into a fresh directory under the test
+/// target's scratch space.
+fn process_cgroup_guest() -> (tempfile::TempDir, PathBuf) {
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create guest directory");
+    let guest = build.path().join("process-cgroup");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli must be inside the repository")
+            .join("tests/c/process_cgroup.c"),
+        &guest,
+    );
+    (build, guest)
+}
+
+/// Asserts that every cgroup line in `text` has the path `/`.
+fn assert_root_cgroup_lines(text: &str) {
+    assert!(!text.is_empty(), "cgroup has no hierarchy");
+    for line in text.lines() {
+        assert!(
+            line.ends_with(":/"),
+            "cgroup line keeps a host path: {line}"
+        );
+    }
+}
+
+/// The cgroup file seeks as Linux's `seq_lseek` does, before and after its
+/// first read: SEEK_END, SEEK_DATA and SEEK_HOLE are EINVAL. Once Detcore
+/// served it from a snapshot, they returned the snapshot's length, 0 and the
+/// length (Codex review of https://github.com/rrnewton/hermit/pull/4386).
+#[test]
+fn proc_self_cgroup_seeks_as_a_seq_file() {
+    let _guard = hermit_run_lock();
+    let (_build, guest) = process_cgroup_guest();
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("seek");
+    hermit_test::configure_guest_execution(&mut command);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "status {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rest = stdout
+        .strip_prefix(
+            "cold: end EINVAL data EINVAL hole EINVAL\n\
+             read: end EINVAL data EINVAL hole EINVAL\n\
+             again: ",
+        )
+        .unwrap_or_else(|| panic!("unexpected seeks:\n{stdout}"));
+    assert_root_cgroup_lines(rest);
+}
+
+/// The real cgroup file bind-mounted at an ordinary path is the cgroup file:
+/// its spelling and its descriptor's link both name the bind's mount point,
+/// and it read as the launcher's path (Codex review of
+/// https://github.com/rrnewton/hermit/pull/4386). The bound process, the
+/// shell that made the bind, stays alive through the run. As for
+/// [`proc_self_cgroup_reads_as_the_root_cgroup`], a test that already runs in
+/// the root cgroup cannot tell.
+#[test]
+fn a_bind_mounted_cgroup_file_reads_as_the_root_cgroup() {
+    let _guard = hermit_run_lock();
+    let (build, guest) = process_cgroup_guest();
+    let alias = build.path().join("alias");
+    fs::write(&alias, b"").expect("create the bind target");
+    let mut command = Command::new("unshare");
+    command
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "sh",
+            "-c",
+            r#"mount --bind "/proc/$$/cgroup" "$1" || exit 3; alias=$1; shift; "$@" read "$alias""#,
+            "sh",
+        ])
+        .arg(&alias)
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(&guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "status {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rest = stdout
+        .strip_prefix("procfs 1\n")
+        .unwrap_or_else(|| panic!("the alias is not the procfs file:\n{stdout}"));
+    assert_root_cgroup_lines(rest);
+}
+
+/// Through a bind of the whole of `/proc` at another path, a process's
+/// cgroup file reads as the root cgroup too, and a mountinfo file, which
+/// Detcore leaves unclassified there, runs to completion: classifying it as
+/// the guest's own mountinfo failed its identity check, and Hermit killed the
+/// guest (exit 125; Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4386).
+#[test]
+fn a_bind_of_proc_reads_cgroup_as_root_and_leaves_mountinfo_alone() {
+    let _guard = hermit_run_lock();
+    let (build, guest) = process_cgroup_guest();
+    let copy = build.path().join("proc-copy");
+    fs::create_dir(&copy).expect("create the bind target");
+    let mut command = Command::new("unshare");
+    command
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "sh",
+            "-c",
+            r#"mount --rbind /proc "$1" || exit 3; copy=$1; shift
+               "$@" read "$copy/1/mountinfo" > /dev/null || exit 4
+               "$@" read "$copy/self/cgroup""#,
+            "sh",
+        ])
+        .arg(&copy)
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(&guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "status {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rest = stdout
+        .strip_prefix("procfs 1\n")
+        .unwrap_or_else(|| panic!("the copy's cgroup file is not procfs:\n{stdout}"));
+    assert_root_cgroup_lines(rest);
+}
+
+/// A process's status file bind-mounted at an ordinary path keeps Linux's
+/// `seq_lseek` answers before and after a read: Detcore leaves it to the
+/// kernel, as before. Classifying it by the entry it reaches served it from a
+/// snapshot that answered SEEK_END, SEEK_DATA and SEEK_HOLE once read (Codex
+/// re-check of https://github.com/rrnewton/hermit/pull/4386).
+#[test]
+fn a_bind_mounted_status_file_keeps_its_seeks() {
+    let _guard = hermit_run_lock();
+    let (build, guest) = process_cgroup_guest();
+    let alias = build.path().join("alias");
+    fs::write(&alias, b"").expect("create the bind target");
+    let mut command = Command::new("unshare");
+    command
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "sh",
+            "-c",
+            r#"mount --bind "/proc/$$/status" "$1" || exit 3; alias=$1; shift; "$@" seek "$alias""#,
+            "sh",
+        ])
+        .arg(&alias)
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(&guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "status {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.starts_with(
+            "cold: end EINVAL data EINVAL hole EINVAL\n\
+             read: end EINVAL data EINVAL hole EINVAL\n\
+             again: Name:"
+        ),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -306,13 +564,29 @@ fn proc_self_cmdline_is_deterministic() {
 // TODO-HUMAN-REVIEW(PR-843): Review process and system accounting coverage.
 #[test]
 fn proc_system_cpu_accounting_is_deterministic() {
+    // Linux's layout (`show_stat`), with nothing of the host's: one CPU,
+    // which spent the whole uptime (120 s) in its first column, in USER_HZ
+    // ticks; a count per interrupt number below 16, not one per host
+    // interrupt number; the ten softirqs; every count 0
+    // (https://github.com/rrnewton/hermit/issues/4213).
+    let expected = |ticks: u64| {
+        format!(
+            "cpu  {ticks} 0 0 0 0 0 0 0 0 0\ncpu0 {ticks} 0 0 0 0 0 0 0 0 0\nintr 0{}\n\
+             ctxt 0\nbtime 1767225480\nprocesses 0\nprocs_running 0\nprocs_blocked 0\n\
+             softirq 0{}\n",
+            " 0".repeat(16),
+            " 0".repeat(10),
+        )
+    };
     assert_deterministic_at_epoch("/proc/stat", Some(ACCOUNTING_EPOCH), |contents| {
+        assert_eq!(String::from_utf8_lossy(contents), expected(12_000));
         let text = std::str::from_utf8(contents).expect("stat should be UTF-8");
         let cpu_lines = text
             .lines()
             .filter(|line| line.starts_with("cpu"))
             .collect::<Vec<_>>();
         let cpu_count = cpu_lines.len() - 1;
+        assert_eq!(cpu_count, 1, "/proc/stat should list one virtual CPU");
         for line in &cpu_lines {
             let mut fields = line.split_whitespace();
             let name = fields.next().expect("CPU line has no name");
@@ -336,6 +610,13 @@ fn proc_system_cpu_accounting_is_deterministic() {
         }
         assert!(text.contains("btime 1767225480\n"));
     });
+    // Opened, then read 5 seconds later: the snapshot is the read's, as
+    // Linux renders the file when it is read.
+    assert_eq!(
+        read_procfs_at_first_read("/proc/stat"),
+        expected(12_500),
+        "/proc/stat read 5 seconds after the open"
+    );
 }
 
 #[test]
@@ -411,6 +692,15 @@ fn proc_cpuinfo_is_deterministic() {
     assert_deterministic("/proc/cpuinfo", |contents| {
         let text = std::str::from_utf8(contents).expect("cpuinfo should be UTF-8");
         assert!(text.contains("processor\t:"));
+        let processors = text
+            .lines()
+            .filter(|line| line.starts_with("processor"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            processors,
+            ["processor\t: 0"],
+            "cpuinfo should describe Hermit's one virtual CPU"
+        );
         let frequencies = text
             .lines()
             .filter(|line| line.starts_with("cpu MHz"))
@@ -425,17 +715,407 @@ fn proc_cpuinfo_is_deterministic() {
 }
 
 #[test]
+fn sys_cpu_lists_report_one_virtual_cpu() {
+    for path in [
+        "/sys/devices/system/cpu/online",
+        "/sys/devices/system/cpu/possible",
+        "/sys/devices/system/cpu/present",
+        "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
+        "/sys/devices/system/cpu/cpu0/topology/package_cpus_list",
+        "/sys/devices/system/node/node0/cpulist",
+        "/sys/devices/system/cpu/cpu0/cache/index0/shared_cpu_list",
+    ] {
+        assert_deterministic(path, |contents| assert_eq!(contents, b"0\n", "{path}"));
+    }
+    for path in [
+        "/sys/devices/system/cpu/cpu0/topology/thread_siblings",
+        "/sys/devices/system/node/node0/cpumap",
+    ] {
+        assert_deterministic(path, |contents| assert_eq!(contents, b"1\n", "{path}"));
+    }
+    for path in ["/proc/interrupts", "/proc/softirqs"] {
+        assert_deterministic(path, |contents| {
+            let text = std::str::from_utf8(contents).expect("interrupt table should be UTF-8");
+            let header = text.lines().next().expect("interrupt table has a header");
+            assert_eq!(
+                header.split_whitespace().collect::<Vec<_>>(),
+                ["CPU0"],
+                "{path}"
+            );
+            // One counter per row, at the kernel's `" %10u"` width.
+            for row in text.lines().skip(1) {
+                let (_, counters) = row.split_once(':').expect("interrupt row has a label");
+                assert!(counters.starts_with("          0"), "{path}: {row}");
+                assert!(
+                    !counters[11..].starts_with(char::is_numeric),
+                    "{path}: {row}"
+                );
+            }
+        });
+    }
+}
+
+/// The CPU and node files that are numbers, flags or node lists describe one
+/// CPU on one node, as on such a machine: the highest supported CPU number
+/// sizes the 128-bit mask `sched_getaffinity` answers with, no SMT sibling is
+/// active or supported, cpu0's topology IDs are 0, the node lists name node 0
+/// and node 0's distances list only its own
+/// (https://github.com/rrnewton/hermit/issues/4160). A file the host kernel
+/// does not have (no SMT control, no NUMA, no cluster ID) is skipped, as the
+/// guest cannot open it either.
+#[test]
+fn sys_cpu_numbers_and_node_files_describe_one_cpu_and_node() {
+    for (path, expected) in [
+        ("/sys/devices/system/cpu/kernel_max", &b"127\n"[..]),
+        ("/sys/devices/system/cpu/enabled", b"0\n"),
+        ("/sys/devices/system/cpu/smt/active", b"0\n"),
+        ("/sys/devices/system/cpu/smt/control", b"notsupported\n"),
+        ("/sys/devices/system/cpu/cpu0/topology/cluster_id", b"0\n"),
+        ("/sys/devices/system/cpu/cpu0/topology/core_id", b"0\n"),
+        ("/sys/devices/system/cpu/cpu0/topology/die_id", b"0\n"),
+        (
+            "/sys/devices/system/cpu/cpu0/topology/physical_package_id",
+            b"0\n",
+        ),
+        ("/sys/devices/system/node/online", b"0\n"),
+        ("/sys/devices/system/node/possible", b"0\n"),
+        ("/sys/devices/system/node/has_cpu", b"0\n"),
+        ("/sys/devices/system/node/has_memory", b"0\n"),
+        ("/sys/devices/system/node/has_normal_memory", b"0\n"),
+        ("/sys/devices/system/node/has_generic_initiator", b"\n"),
+        ("/sys/devices/system/node/node0/distance", b"10\n"),
+    ] {
+        if !Path::new(path).exists() {
+            eprintln!("skipping {path}: the host kernel does not have it");
+            continue;
+        }
+        assert_deterministic(path, |contents| assert_eq!(contents, expected, "{path}"));
+    }
+}
+
+/// `nproc` asks `sched_getaffinity`; `getconf _NPROCESSORS_ONLN` asks glibc's
+/// `get_nprocs`, which reads `/sys/devices/system/cpu/online`. A build that
+/// sizes its parallelism from either must see the same single CPU, or its
+/// behaviour follows the host it ran on.
+#[test]
+fn cpu_count_queries_agree_on_one_virtual_cpu() {
+    let _guard = hermit_run_lock();
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--",
+        "/bin/sh",
+        "-c",
+        "nproc; getconf _NPROCESSORS_ONLN",
+    ]);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = hermit_test::hermit_output(&rendered, &mut command);
+    assert!(
+        output.status.success(),
+        "CPU-count probe failed: {rendered}\nstatus: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n1\n");
+}
+
+/// `nproc --all` and `getconf _NPROCESSORS_CONF` ask glibc's
+/// `get_nprocs_conf`, which counts the `cpuN` entries of
+/// `/sys/devices/system/cpu`; libnuma counts those and the `nodeN` entries of
+/// `/sys/devices/system/node`. They must list Hermit's one CPU and one node,
+/// as `online` does (https://github.com/rrnewton/hermit/issues/4160).
+#[test]
+fn cpu_and_node_directories_list_one_cpu_and_node() {
+    let _guard = hermit_run_lock();
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--",
+        "/bin/sh",
+        "-c",
+        "nproc --all; getconf _NPROCESSORS_CONF; \
+         ls /sys/devices/system/cpu | grep -c '^cpu[0-9]'; \
+         ls /sys/devices/system/node | grep -c '^node[0-9]'; \
+         cd /sys/devices/system && ls cpu | grep '^cpu[0-9]'; \
+         ls /sys/bus/cpu/devices",
+    ]);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = hermit_test::hermit_output(&rendered, &mut command);
+    assert!(
+        output.status.success(),
+        "CPU-listing probe failed: {rendered}\nstatus: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "1\n1\n1\n1\ncpu0\ncpu0\n"
+    );
+}
+
+/// /proc/loadavg is a fixed file Detcore renders
+/// (https://github.com/rrnewton/hermit/issues/4213): its bytes are the same
+/// in every run, and a recording of a read of it replays with the same output
+/// and log at the strict comparison. Under record/replay Detcore opens the
+/// kernel's file and takes the bytes from its fixed table, with no recorded
+/// kernel read.
+#[test]
 fn proc_loadavg_uses_virtual_values() {
     assert_deterministic("/proc/loadavg", |contents| {
         assert_eq!(contents, b"0.00 0.00 0.00 1/1 1\n");
     });
+
+    let _guard = hermit_run_lock();
+    let data_dir =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create recording directory");
+    let verdict = data_dir.path().join("verify.json");
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--verify-json={}", verdict.display()))
+        .arg(format!(
+            "--data-dir={}",
+            data_dir.path().join("recording").display()
+        ))
+        .args(["--", "/bin/cat", "/proc/loadavg"])
+        .stdin(Stdio::null());
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "recording a read of /proc/loadavg did not replay: {rendered}\nstatus: {}\n\
+         stdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("0.00 0.00 0.00 1/1 1\n"),
+        "the recorded read of /proc/loadavg printed something else: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("record/replay wrote no verify JSON"))
+            .expect("record/replay verify JSON is not JSON");
+    assert_eq!(report["verdict"], serde_json::json!("matched"), "{report}");
+    assert_eq!(
+        report["bitwise_parity"],
+        serde_json::json!(true),
+        "{report}"
+    );
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "no INFO messages compared on the {side}: {report}"
+        );
+    }
 }
 
+/// A /proc name outside the run's level, reached relative to a /proc
+/// descriptor that was itself opened through a descriptor link
+/// (`openat(open("/proc/self/fd/<a /proc descriptor>"), "kallsyms")`, and the
+/// `/dev/fd/N` spelling), is refused under record and replay as the procfs
+/// name it is: ENOENT at `--proc=minimal`, before the open takes a scheduler
+/// turn or reaches the kernel, and the recording replays bit for bit. Before
+/// Detcore recorded such a descriptor as the path of the descriptor it
+/// reopens, the name was looked up below the link's spelling, which names no
+/// procfs file, so the open took a turn and reached the kernel before it was
+/// refused; that is why RECORD_VERSION moved to 0x167
+/// (https://github.com/rrnewton/hermit/issues/4213).
+///
+/// The opens are made by the root process, by a thread of a process created
+/// with `CLONE_FILES` and without `CLONE_THREAD` (which leads its own group
+/// and holds a table made for its creator), and by a thread of an image a
+/// thread that did not lead its process executed (whose table exec made
+/// before that thread took over as leader). Each of those threads holds the
+/// table its process holds, so `/proc/self/fd/N` is its own descriptor.
+/// The log check's pattern is shown to appear where an open must take a
+/// turn: the guest's `--control`, an existing file named `kallsyms` below a
+/// directory outside `/proc`.
+#[test]
+fn a_name_outside_the_level_through_a_directory_alias_is_refused_before_its_turn() {
+    let _guard = hermit_run_lock();
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create guest directory");
+    let guest = build.path().join("proc-directory-alias-level");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli must be inside the repository")
+            .join("tests/c/proc_directory_alias_level.c"),
+        &guest,
+    );
+    let expected = "openat(/proc/self/fd/3, \"kallsyms\"): No such file or directory\n\
+                    openat(/dev/fd/3, \"kallsyms\"): No such file or directory\n\
+                    thread of a CLONE_FILES process: \
+                    openat(/proc/self/fd/3, \"kallsyms\"): No such file or directory\n\
+                    thread of a CLONE_FILES process: \
+                    openat(/dev/fd/3, \"kallsyms\"): No such file or directory\n\
+                    thread after a non-leader exec: \
+                    openat(/proc/self/fd/3, \"kallsyms\"): No such file or directory\n\
+                    thread after a non-leader exec: \
+                    openat(/dev/fd/3, \"kallsyms\"): No such file or directory\n";
+    let record = |data_dir: &Path, verify_json: Option<&Path>, control: bool| {
+        let mut command = Command::new(hermit_test::hermit_binary());
+        command.args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--proc=minimal",
+            "--record-timeout=30",
+        ]);
+        if let Some(verdict) = verify_json {
+            command
+                .args(["--verify", "--verify-strict"])
+                .arg(format!("--verify-json={}", verdict.display()));
+        }
+        command
+            .arg(format!("--data-dir={}", data_dir.display()))
+            .arg("--")
+            .arg(&guest)
+            .args(control.then_some("--control"))
+            .stdin(Stdio::null());
+        let rendered = format!("{command:?}");
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+        assert!(
+            output.status.success(),
+            "{rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            if control {
+                "openat(<directory>, \"kallsyms\"): opened\n"
+            } else {
+                expected
+            },
+            "{rendered}"
+        );
+        output
+    };
+
+    let data_dir =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create recording directory");
+    let verdict = data_dir.path().join("verify.json");
+    record(&data_dir.path().join("verified"), Some(&verdict), false);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("record/replay wrote no verify JSON"))
+            .expect("record/replay verify JSON is not JSON");
+    assert_eq!(report["verdict"], serde_json::json!("matched"), "{report}");
+    assert_eq!(
+        report["bitwise_parity"],
+        serde_json::json!(true),
+        "{report}"
+    );
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "no INFO messages compared on the {side}: {report}"
+        );
+    }
+
+    // The recording's own log: every open is answered, and none takes a
+    // scheduler turn for the name.
+    let turn = "Path(\"kallsyms\")";
+    let output = record(&data_dir.path().join("logged"), None, false);
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        log.matches("\"kallsyms\", OFlag(O_CLOEXEC)) = Err(Errno(ENOENT))")
+            .count(),
+        6,
+        "the recording's log does not show all six refusals:\n{log}"
+    );
+    assert!(
+        !log.contains(turn),
+        "an alias-reached name outside the level took a scheduler turn:\n{log}"
+    );
+    // The pattern is the one an open of the name that takes its turn logs.
+    let output = record(&data_dir.path().join("control"), None, true);
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        log.contains(turn),
+        "an open of an existing file named kallsyms logged no {turn} turn, so the check \
+         above could not see one:\n{log}"
+    );
+}
+
+/// /proc/uptime shows the virtual uptime, and the one of the read: opened,
+/// then read 5 seconds later, it shows the later uptime, as Linux renders it
+/// when it is read (https://github.com/rrnewton/hermit/issues/4213).
 #[test]
 fn proc_uptime_uses_virtual_time() {
     assert_deterministic_at_epoch("/proc/uptime", Some(ACCOUNTING_EPOCH), |contents| {
         assert_eq!(contents, b"120.00 0.00\n");
     });
+    assert_eq!(
+        read_procfs_at_first_read("/proc/uptime"),
+        "125.00 0.00\n",
+        "the uptime read 5 seconds after the open"
+    );
+}
+
+/// What the guest reads from `path` opened at the accounting epoch and read
+/// 5 seconds later (`tests/fixtures/procfs_at_first_read.c`).
+fn read_procfs_at_first_read(path: &str) -> String {
+    let _guard = hermit_run_lock();
+    let build =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create guest build directory");
+    let guest = build.path().join("procfs-at-first-read");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/procfs_at_first_read.c"),
+        &guest,
+    );
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+        ])
+        .arg(format!("--epoch={ACCOUNTING_EPOCH}"))
+        .arg("--")
+        .arg(&guest)
+        .arg(path);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "{path} probe failed: {rendered}\nstatus: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("procfs contents are UTF-8")
 }
 
 #[test]
@@ -497,11 +1177,13 @@ fn proc_interrupt_accounting_is_deterministic() {
 
 #[test]
 fn proc_schedstat_uses_virtual_zero_values() {
+    // The machine has one CPU (https://github.com/rrnewton/hermit/issues/4266):
+    // one zeroed `cpu0` line and, as Linux shows for one CPU, no scheduling
+    // domains.
     assert_deterministic("/proc/schedstat", |contents| {
         let text = std::str::from_utf8(contents).expect("schedstat should be UTF-8");
         let mut saw_timestamp = false;
-        let mut saw_cpu = false;
-        let mut saw_domain = false;
+        let mut cpus = Vec::new();
 
         for line in text.lines() {
             let fields = line.split_whitespace().collect::<Vec<_>>();
@@ -516,12 +1198,7 @@ fn proc_schedstat_uses_virtual_zero_values() {
                 }
                 Some(label) if is_numbered_label(label, "cpu") => {
                     assert!(fields[1..].iter().all(|field| *field == "0"));
-                    saw_cpu = true;
-                }
-                Some(label) if is_numbered_label(label, "domain") => {
-                    assert!(fields.len() >= 3);
-                    assert!(fields[3..].iter().all(|field| *field == "0"));
-                    saw_domain = true;
+                    cpus.push(label.to_owned());
                 }
                 Some(label) => panic!("unexpected schedstat row {label}: {line}"),
                 None => {}
@@ -529,8 +1206,7 @@ fn proc_schedstat_uses_virtual_zero_values() {
         }
 
         assert!(saw_timestamp);
-        assert!(saw_cpu);
-        assert!(saw_domain);
+        assert_eq!(cpus, ["cpu0"], "{text}");
     });
 }
 
@@ -591,6 +1267,7 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
         "--base-env=minimal",
         "--no-virtualize-cpuid",
         "--max-timeslice=disabled",
+        "--proc=standard",
         "--epoch=2000-12-31T23:59:59+00:00",
         "--",
         "/usr/bin/python3",
@@ -599,9 +1276,7 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
     ]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "RTC virtual-time probe failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -635,12 +1310,22 @@ fn proc_self_mountinfo_is_deterministic() {
             command.env("TMPDIR", host_tmpdir.path());
         })
     };
-    let first = read();
-    for run in 2..=RUNS {
-        assert_eq!(first, read(), "mountinfo differed on run {run}");
+    // Each guest starts from a copy of this process's mount table, and host
+    // mounts stay visible by design. Linux detaches a bind in every namespace
+    // when something renames over its mountpoint, as a `git config` write does
+    // to a bind-mounted `.git/config`, so a host change between runs is a
+    // changed input. Compare only batches read while the host table held
+    // still; within them every run must still match byte for byte.
+    let runs = assert_runs_equal_while_host_mountinfo_stable(
+        || (0..RUNS).map(|_| read()).collect::<Vec<_>>(),
+        "mountinfo changed across runs",
+    );
+    let first = &runs[0];
+    for (index, contents) in runs.iter().enumerate().skip(1) {
+        assert_eq!(first, contents, "mountinfo differed on run {}", index + 1);
     }
     {
-        let contents = &first;
+        let contents = first;
         let text = std::str::from_utf8(contents).expect("mountinfo should be UTF-8");
         assert!(!text.contains("/tmpvol/.tmp"));
         assert!(text.lines().all(|line| line.contains(" - ")));
@@ -648,8 +1333,13 @@ fn proc_self_mountinfo_is_deterministic() {
     }
 }
 
+/// A user's bind mount shows its target as its root, not the host source path
+/// (owner rule of Oct 13: Detcore is the only /proc authority and the guest
+/// never sees host paths, https://github.com/rrnewton/hermit/issues/4266).
+/// Before, this test required the source's name in the root; it still
+/// requires that the mount not be shown as one of Hermit's own.
 #[test]
-fn proc_self_mountinfo_preserves_user_mount_with_tempfile_shape() {
+fn proc_self_mountinfo_shows_a_user_mount_at_its_target_not_as_hermit_owned() {
     let _guard = hermit_run_lock();
     let mut user_group = tempfile::Builder::new()
         .prefix(".tmp")
@@ -675,12 +1365,135 @@ fn proc_self_mountinfo_preserves_user_mount_with_tempfile_shape() {
             .all(|row| !row.contains("/tmpvol/.hermit/etc/group")),
         "a user-supplied mount must not be represented as Hermit-owned: {group_rows:?}"
     );
+    let source_name = user_group.path().file_name().unwrap().to_str().unwrap();
     assert!(
-        group_rows
-            .iter()
-            .any(|row| row.contains(user_group.path().file_name().unwrap().to_str().unwrap())),
-        "the user-supplied tempfile-shaped root must be preserved: {group_rows:?}"
+        group_rows.iter().all(|row| !row.contains(source_name)),
+        "the user mount's host source path reached the guest: {group_rows:?}"
     );
+    let top = group_rows.last().unwrap();
+    assert_eq!(
+        top.split(' ').nth(3),
+        Some("/etc/group"),
+        "the user mount's root is not its target: {top}"
+    );
+}
+
+/// After the guest's own `chroot`, its `mountinfo` is the kernel's view,
+/// sanitized: there a staged bind (a `--bind` below `/tmp`, as DBT's
+/// statistics bind is) still shows its target as its root, at every layer,
+/// and its host source never reaches the guest
+/// (https://github.com/rrnewton/hermit/issues/4213, K3a). The container mount
+/// table, which the guest reads before any `chroot`, leaves a backend's own
+/// bind out; this checks the root rewrite that still serves the kernel path.
+#[test]
+fn a_staged_binds_root_rewrite_holds_on_the_kernel_path_after_chroot() {
+    let _guard = hermit_run_lock();
+    let chroot = [
+        "/usr/sbin/chroot",
+        "/usr/bin/chroot",
+        "/sbin/chroot",
+        "/bin/chroot",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).exists())
+    .expect("a chroot command");
+    let source = tempfile::tempdir().expect("create the bind source");
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args(["--log=error", "run", "--base-env=minimal"])
+        .arg(format!(
+            "--bind={}:/tmp/k3-staged-bind",
+            source.path().display()
+        ))
+        .args(["--", chroot, "/", "/bin/cat", "/proc/self/mountinfo"]);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = hermit_test::hermit_output(&rendered, &mut command);
+    assert!(
+        output.status.success(),
+        "{rendered}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let text = String::from_utf8(output.stdout).expect("mountinfo should be UTF-8");
+    let rows = text
+        .lines()
+        .filter(|line| line.split(' ').nth(4) == Some("/tmp/k3-staged-bind"))
+        .collect::<Vec<_>>();
+    assert!(
+        !rows.is_empty(),
+        "the kernel view has no row for the bind:\n{text}"
+    );
+    for row in &rows {
+        assert_eq!(row.split(' ').nth(3), Some("/tmp/k3-staged-bind"), "{row}");
+    }
+    let source_name = source.path().file_name().unwrap().to_str().unwrap();
+    assert!(
+        !text.contains(source_name),
+        "the bind's host source leaked:\n{text}"
+    );
+}
+
+/// A bind recorded where the kernel put it when the container's setup
+/// installed it stays the plan's, through the real setup path (`--mount`, as
+/// `--bind` takes only targets below /tmp): the second of three binds names
+/// opt/x, which crosses the symbolic link x -> foo in the
+/// first bind at opt, so the kernel mounts it at foo; the third bind replaces
+/// opt with a directory whose x links to bar. The row at foo is still shown,
+/// and the run is not refused (round 2 of
+/// https://github.com/rrnewton/hermit/issues/4213, K3a: provenance by
+/// install-time resolution, not by how a target resolves at the end).
+#[test]
+fn a_bind_through_a_symbolic_link_stays_shown_after_a_later_bind_replaces_it() {
+    let _guard = hermit_run_lock();
+    let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create scratch");
+    let root = fs::canonicalize(scratch.path()).expect("resolve scratch");
+    for dir in ["a", "c", "item", "foo", "bar", "opt"] {
+        fs::create_dir(root.join(dir)).expect("create a bind directory");
+    }
+    std::os::unix::fs::symlink(root.join("foo"), root.join("a/x")).expect("link a/x");
+    std::os::unix::fs::symlink(root.join("bar"), root.join("c/x")).expect("link c/x");
+    let path = |name: &str| root.join(name).to_str().expect("UTF-8 path").to_owned();
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args(["--log=error", "run", "--base-env=minimal"])
+        .arg(format!(
+            "--mount=type=bind,source={},target={}",
+            path("a"),
+            path("opt")
+        ))
+        .arg(format!(
+            "--mount=type=bind,source={},target={}",
+            path("item"),
+            path("opt/x")
+        ))
+        .arg(format!(
+            "--mount=type=bind,source={},target={}",
+            path("c"),
+            path("opt")
+        ))
+        .args(["--", "/bin/cat", "/proc/self/mountinfo"]);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = hermit_test::hermit_output(&rendered, &mut command);
+    assert!(
+        output.status.success(),
+        "{rendered}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let text = String::from_utf8(output.stdout).expect("mountinfo should be UTF-8");
+    let at = |mountpoint: &str| {
+        text.lines()
+            .filter(|line| line.split(' ').nth(4) == Some(mountpoint))
+            .count()
+    };
+    assert_eq!(
+        at(&path("foo")),
+        1,
+        "the bind through the link is gone:\n{text}"
+    );
+    assert_eq!(at(&path("opt")), 2, "both binds at opt are shown:\n{text}");
 }
 
 fn mountinfo_and_stat_proc_device(no_virtualize_metadata: bool, stat_first: bool) -> (u64, u64) {
@@ -703,9 +1516,7 @@ fn mountinfo_and_stat_proc_device(no_virtualize_metadata: bool, stat_first: bool
     command.args(["--", "/bin/sh", "-c", script]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "mountinfo/stat probe failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -761,8 +1572,10 @@ fn mountinfo_device_agrees_with_stat_with_and_without_metadata_virtualization() 
     }
 }
 
+/// A user mount over /tmp replaces the private /tmp and shows /tmp as its
+/// root, not the host source path (https://github.com/rrnewton/hermit/issues/4266).
 #[test]
-fn proc_self_mountinfo_preserves_user_mount_over_private_tmp() {
+fn proc_self_mountinfo_shows_a_user_mount_over_private_tmp_at_its_target() {
     let _guard = hermit_run_lock();
     let user_tmp = tempfile::Builder::new()
         .prefix(".tmp")
@@ -796,14 +1609,22 @@ fn proc_self_mountinfo_preserves_user_mount_over_private_tmp() {
     let effective_tmp = tmp_rows
         .last()
         .expect("nonempty /tmp mount rows should have a top mount");
+    let source_name = user_tmp.path().file_name().unwrap().to_str().unwrap();
     assert!(
-        effective_tmp.contains(user_tmp.path().file_name().unwrap().to_str().unwrap()),
-        "the user-provided /tmp root must remain visible: {tmp_rows:?}"
+        tmp_rows.iter().all(|row| !row.contains(source_name)),
+        "the user mount's host source path reached the guest: {tmp_rows:?}"
+    );
+    assert_eq!(
+        effective_tmp.split(' ').nth(3),
+        Some("/tmp"),
+        "the user mount over /tmp does not show its target as its root: {effective_tmp}"
     );
 }
 
+/// A `--bind` over /tmp shows /tmp as its root and mountpoint, not the host
+/// source path or Hermit's staging path (https://github.com/rrnewton/hermit/issues/4266).
 #[test]
-fn proc_self_mountinfo_preserves_user_bind_over_private_tmp() {
+fn proc_self_mountinfo_shows_a_user_bind_over_private_tmp_at_its_target() {
     let _guard = hermit_run_lock();
     let user_tmp = tempfile::Builder::new()
         .prefix(".tmp")
@@ -822,15 +1643,263 @@ fn proc_self_mountinfo_preserves_user_bind_over_private_tmp() {
         .lines()
         .rfind(|line| line.split(' ').nth(4) == Some("/tmp"))
         .expect("mountinfo must expose /tmp");
+    let source_name = user_tmp.path().file_name().unwrap().to_str().unwrap();
     assert!(
-        effective_tmp.contains(user_tmp.path().file_name().unwrap().to_str().unwrap()),
-        "the exact /tmp bind root was not preserved: {effective_tmp}"
+        !text.contains(source_name),
+        "the bind's host source path reached the guest:\n{text}"
+    );
+    assert_eq!(
+        effective_tmp.split(' ').nth(3),
+        Some("/tmp"),
+        "the exact /tmp bind does not show its target as its root: {effective_tmp}"
     );
     assert_eq!(
         effective_tmp.split(' ').nth(4),
         Some("/tmp"),
         "the exact /tmp bind exposed Hermit's random staging mountpoint"
     );
+}
+
+/// A directory the test makes outside /tmp for a `--mount` target: Hermit
+/// creates a missing target only under /tmp, and a host directory such as
+/// /mnt need not exist where the test runs (the validation's pinned root has
+/// none).
+fn mount_target_outside_tmp() -> tempfile::TempDir {
+    let target = tempfile::Builder::new()
+        .prefix("mountinfo-target-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create a mount target");
+    assert!(
+        !target.path().starts_with("/tmp"),
+        "{} is under /tmp, where Hermit stages binds",
+        target.path().display()
+    );
+    target
+}
+
+/// Two runs whose user binds have different host sources see the same
+/// mountinfo, byte for byte: every row of each bind, including a layer a
+/// later bind covers and a copy staged under Hermit's private /tmp, shows the
+/// bind's target as its root (https://github.com/rrnewton/hermit/issues/4266).
+/// The binds: a `--bind` under /tmp, a `--bind` of a subdirectory of its
+/// source, the same source bound again elsewhere, two binds stacked at one
+/// target, a `--mount` of type bind under /tmp and one outside it, at a
+/// directory the test makes.
+#[test]
+fn user_binds_with_different_sources_show_identical_mountinfo() {
+    let _guard = hermit_run_lock();
+    let outside = mount_target_outside_tmp();
+    let outside = outside.path().display().to_string();
+    let first = tempfile::tempdir().expect("create the first run's sources");
+    let second = tempfile::tempdir().expect("create the second run's sources");
+    for sources in [&first, &second] {
+        for name in ["home/sub", "lower", "upper", "data", "staged"] {
+            fs::create_dir_all(sources.path().join(name)).expect("create a bind source");
+        }
+    }
+    let targets = [
+        "/tmp/e2e/home",
+        "/tmp/e2e/sub",
+        "/tmp/e2e/again",
+        "/tmp/e2e/layer",
+        "/tmp/e2e/mounted",
+        &outside,
+    ];
+    let read = |sources: &tempfile::TempDir| {
+        let source = |name: &str| sources.path().join(name).display().to_string();
+        read_procfs_with("/proc/self/mountinfo", None, |command| {
+            command
+                .arg(format!("--bind={}:/tmp/e2e/home", source("home")))
+                .arg(format!("--bind={}:/tmp/e2e/sub", source("home/sub")))
+                .arg(format!("--bind={}:/tmp/e2e/again", source("home")))
+                .arg(format!("--bind={}:/tmp/e2e/layer", source("lower")))
+                .arg(format!("--bind={}:/tmp/e2e/layer", source("upper")))
+                .arg(format!(
+                    "--mount=type=bind,source={},target=/tmp/e2e/mounted",
+                    source("staged")
+                ))
+                .arg(format!(
+                    "--mount=type=bind,source={},target={outside}",
+                    source("data")
+                ));
+        })
+    };
+    let (one, two) = assert_runs_equal_while_host_mountinfo_stable(
+        || (read(&first), read(&second)),
+        "paired bind runs changed with the host mount table",
+    );
+    let one_text = std::str::from_utf8(&one).expect("mountinfo should be UTF-8");
+    let two_text = std::str::from_utf8(&two).expect("mountinfo should be UTF-8");
+    for (text, sources) in [(one_text, &first), (two_text, &second)] {
+        // The sources' unique directory name, which any spelling of a source
+        // path contains, whatever subvolume or mount it is reached through.
+        let source = sources.path().file_name().unwrap().to_str().unwrap();
+        assert!(
+            !text.contains(source),
+            "a bind's host source {source} reached the guest:\n{text}"
+        );
+        for target in targets {
+            let rows = text
+                .lines()
+                .filter(|line| line.split(' ').nth(4) == Some(target))
+                .collect::<Vec<_>>();
+            assert!(
+                !rows.is_empty(),
+                "mountinfo has no row at {target}:\n{text}"
+            );
+            // No target is a host mountpoint (Hermit's private /tmp holds
+            // only these binds, and the test made the other target), so every
+            // row at a target is one of the binds.
+            for row in &rows {
+                assert_eq!(row.split(' ').nth(3), Some(target), "{row}");
+            }
+        }
+        let layers = text
+            .lines()
+            .filter(|line| line.split(' ').nth(4) == Some("/tmp/e2e/layer"))
+            .count();
+        assert!(layers >= 2, "the covered bind's layer is missing:\n{text}");
+    }
+    assert_eq!(
+        one_text, two_text,
+        "mountinfo depends on the binds' host sources"
+    );
+}
+
+/// A user bind rewrites only its own rows. Host /tmp may be the root of a
+/// btrfs subvolume (`/tmpvol` on the development hosts), as other host mounts are;
+/// binding it at a directory the test makes must not change the root of any
+/// other row. The bind may add rows, but only the host mounts above its
+/// target, which the guest's container mount table shows because they hold a
+/// mount Hermit installed (https://github.com/rrnewton/hermit/issues/4213,
+/// K3a); every row the guest sees without the bind keeps its root.
+#[test]
+fn a_user_bind_changes_no_other_rows_root() {
+    let _guard = hermit_run_lock();
+    let target = mount_target_outside_tmp();
+    let target = target.path().display().to_string();
+    let below = format!("{target}/");
+    // Every row's root, in order, per mountpoint, covered layers included,
+    // outside the target (where the bind and the submounts it copies sit).
+    let roots = |text: &str| {
+        let mut roots = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for line in text.lines() {
+            let fields = line.split(' ').collect::<Vec<_>>();
+            if fields[4] != target && !fields[4].starts_with(&below) {
+                roots
+                    .entry(fields[4].to_owned())
+                    .or_default()
+                    .push(fields[3].to_owned());
+            }
+        }
+        roots
+    };
+    let (plain, bound) = assert_runs_equal_while_host_mountinfo_stable(
+        || {
+            let plain = read_procfs_with("/proc/self/mountinfo", None, |_| {});
+            let bound = read_procfs_with("/proc/self/mountinfo", None, |command| {
+                command.arg(format!("--mount=type=bind,source=/tmp,target={target}"));
+            });
+            (plain, bound)
+        },
+        "the bind comparison changed with the host mount table",
+    );
+    let plain = std::str::from_utf8(&plain).expect("mountinfo should be UTF-8");
+    let bound = std::str::from_utf8(&bound).expect("mountinfo should be UTF-8");
+    let (plain_roots, mut bound_roots) = (roots(plain), roots(bound));
+    bound_roots.retain(|mountpoint, _| {
+        plain_roots.contains_key(mountpoint) || {
+            let above = format!("{}/", mountpoint.trim_end_matches('/'));
+            assert!(
+                target.starts_with(&above),
+                "binding /tmp at {target} added a row at {mountpoint}, which is not above it:\n{bound}"
+            );
+            false
+        }
+    });
+    assert_eq!(
+        bound_roots, plain_roots,
+        "binding /tmp at {target} changed another row:\n{bound}"
+    );
+    let row = bound
+        .lines()
+        .rfind(|line| line.split(' ').nth(4) == Some(target.as_str()))
+        .unwrap_or_else(|| panic!("mountinfo has no row at {target}:\n{bound}"));
+    assert_eq!(row.split(' ').nth(3), Some(target.as_str()), "{row}");
+}
+
+/// User mounts are installed in order, so an earlier one can change what a
+/// later one's source names (review of the mountinfo bind change,
+/// https://github.com/rrnewton/hermit/issues/4266). The first bind, whose
+/// source is a symbolic link, covers a directory the test makes (`covered`);
+/// the second binds `covered` at another (`copy`), which then mounts the
+/// first bind's source, not the host's `covered`. Both show their targets as
+/// roots and never the host source. A tmpfs then mounted at `covered` keeps
+/// its own root, `/`, above the bind it covers.
+#[test]
+fn user_binds_show_their_targets_whatever_earlier_mounts_did() {
+    let _guard = hermit_run_lock();
+    let covered = mount_target_outside_tmp();
+    let copy = mount_target_outside_tmp();
+    let covered = covered.path().display().to_string();
+    let copy = copy.path().display().to_string();
+    let sources = tempfile::tempdir().expect("create bind sources");
+    fs::create_dir_all(sources.path().join("real")).expect("create a link target");
+    std::os::unix::fs::symlink("real", sources.path().join("link")).expect("create a link");
+    let (plain, text) = assert_runs_equal_while_host_mountinfo_stable(
+        || {
+            let plain = read_procfs_with("/proc/self/mountinfo", None, |_| {});
+            let bound = read_procfs_with("/proc/self/mountinfo", None, |command| {
+                command
+                    .arg(format!(
+                        "--mount=type=bind,source={},target={covered}",
+                        sources.path().join("link").display()
+                    ))
+                    .arg(format!("--mount=type=bind,source={covered},target={copy}"))
+                    .arg(format!("--mount=type=tmpfs,target={covered}"));
+            });
+            (plain, bound)
+        },
+        "the ordered binds changed with the host mount table",
+    );
+    let plain = std::str::from_utf8(&plain).expect("mountinfo should be UTF-8");
+    let text = std::str::from_utf8(&text).expect("mountinfo should be UTF-8");
+    // The host's own rows at those mountpoints, if any, keep their roots:
+    // the binds only add layers above them.
+    for target in [covered.as_str(), copy.as_str()] {
+        let roots = |text: &str| {
+            text.lines()
+                .filter(|line| line.split(' ').nth(4) == Some(target))
+                .map(|line| line.split(' ').nth(3).unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let (before, after) = (roots(plain), roots(text));
+        assert!(
+            after.starts_with(&before) && after.len() > before.len(),
+            "the binds changed the host's rows at {target}: {before:?} became {after:?}"
+        );
+    }
+    let name = sources.path().file_name().unwrap().to_str().unwrap();
+    assert!(
+        !text.contains(name),
+        "a host source reached the guest:\n{text}"
+    );
+    // Above the host's rows: at `copy` the bind; at `covered` the bind,
+    // then the tmpfs over it.
+    for (target, added) in [
+        (copy.as_str(), &[copy.as_str()][..]),
+        (covered.as_str(), &[covered.as_str(), "/"][..]),
+    ] {
+        let roots = text
+            .lines()
+            .filter(|line| line.split(' ').nth(4) == Some(target))
+            .map(|line| line.split(' ').nth(3).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            roots.ends_with(added),
+            "the mounts at {target} show roots {roots:?}, not ending {added:?}:\n{text}"
+        );
+    }
 }
 
 #[test]
@@ -857,6 +1926,15 @@ fn ordered_nested_user_mounts_preserve_linux_stacking() {
         "ordered nested mounts changed across runs",
     );
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
+    // Each mount, the covered child included, shows its target as its root,
+    // not its host source (https://github.com/rrnewton/hermit/issues/4266).
+    for source in [&parent_source, &child_source] {
+        let name = source.path().file_name().unwrap().to_str().unwrap();
+        assert!(
+            !text.contains(name),
+            "a host source reached the guest:\n{text}"
+        );
+    }
     for target in ["/tmp/stack/child", "/tmp/stack"] {
         assert!(
             text.lines()
@@ -967,9 +2045,7 @@ fn ordered_var_then_nscd_mount_keeps_the_run_nscd_hardening_mount() {
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut command);
         let rendered = format!("{command:?}");
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+        let output = hermit_test::hermit_output(&rendered, &mut command);
         assert!(
             output.status.success(),
             "ordered mount run failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -1127,9 +2203,7 @@ fn fdinfo_and_mountinfo_ids() -> (u64, u64, u64, u64) {
     ]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "fdinfo/mountinfo probe failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -1290,23 +2364,38 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
 
     let captured_mount_ids =
         hermit::capture_mountinfo_identity_order().expect("capture producer mount identity order");
-    let raw_proc_mount_id = fs::read_to_string("/proc/self/mountinfo")
+    let producer_rows = fs::read_to_string("/proc/self/mountinfo")
         .expect("read producer mountinfo")
         .lines()
-        .find_map(|row| {
-            let mut fields = row.split(' ');
-            let raw_mount_id = fields.next()?.parse::<u64>().ok()?;
-            let _parent = fields.next()?;
-            let _device = fields.next()?;
-            let _root = fields.next()?;
-            (fields.next()? == proc_target.to_str()?).then_some(raw_mount_id)
+        .map(|row| {
+            let fields = row.split(' ').collect::<Vec<_>>();
+            let id = |index: usize| -> u64 {
+                fields[index]
+                    .parse()
+                    .expect("producer mountinfo ID should be decimal")
+            };
+            (id(0), id(1), fields[4].to_owned())
+        })
+        .collect::<Vec<_>>();
+    let raw_proc_mount_id = producer_rows
+        .iter()
+        .find_map(|(raw, _, mountpoint)| {
+            (Some(mountpoint.as_str()) == proc_target.to_str()).then_some(*raw)
         })
         .expect("find chroot proc mount in producer mountinfo");
-    let expected_proc_mount_id = captured_mount_ids
+    // Detcore numbers mount IDs in the order the guest first observes them.
+    // The guest reads mountinfo before fdinfo, and its chroot view lists only
+    // the mounts under the chroot, so that first view numbers its rows in row
+    // order and then their outside parents. This oracle deliberately ignores
+    // the captured namespace order: the guest cannot see it, so it must not
+    // decide any number. Rows outside the chroot get no number.
+    let chroot_prefix = format!("{}/", root.path().to_str().expect("UTF-8 chroot path"));
+    let expected_proc_mount_id = producer_rows
         .iter()
-        .position(|raw| *raw == raw_proc_mount_id)
+        .filter(|(_, _, mountpoint)| mountpoint.starts_with(&chroot_prefix))
+        .position(|(raw, _, _)| *raw == raw_proc_mount_id)
         .map(|index| index as u64 + 1)
-        .expect("proc mount must be present in captured identity order");
+        .expect("proc mount must be a row of the chroot view");
 
     // The subject is mount identity, not preemption: the guest is a single
     // sequential reader of mountinfo and fdinfo. Request no PMU timeslice
@@ -1319,6 +2408,9 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
         max_timeslice: None,
         ..Default::default()
     };
+    // Launched from the test's own thread: on ptrace the launch functions run
+    // the session on their tracer thread
+    // (https://github.com/rrnewton/hermit/issues/4389).
     let mut command = ReverieCommand::new(&controller_program);
     command.chroot(root.path()).current_dir("/");
     let output = hermit::run_with_output(command, config, false, &None);
@@ -1352,6 +2444,37 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
         .expect("fdinfo must contain one numeric mnt_id");
     assert_eq!(visible_proc_mount_id, expected_proc_mount_id);
     assert_eq!(fdinfo_mount_id, expected_proc_mount_id);
+    // The whole first view is numbered from its own text: rows 1..=n in row
+    // order, then each outside parent in first-appearance order.
+    let visible_rows = mountinfo
+        .lines()
+        .map(|row| {
+            let mut fields = row.split(' ').map(|field| {
+                field
+                    .parse::<u64>()
+                    .expect("mountinfo ID should be decimal")
+            });
+            (fields.next().unwrap(), fields.next().unwrap())
+        })
+        .collect::<Vec<_>>();
+    let row_ids = visible_rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    assert_eq!(
+        row_ids,
+        (1..=visible_rows.len() as u64).collect::<Vec<_>>(),
+        "chroot mountinfo rows must be numbered in row order:\n{mountinfo}"
+    );
+    let mut outside_parents = Vec::new();
+    for (_, parent) in &visible_rows {
+        if !row_ids.contains(parent) && !outside_parents.contains(parent) {
+            outside_parents.push(*parent);
+        }
+    }
+    assert_eq!(
+        outside_parents,
+        (visible_rows.len() as u64 + 1..=(visible_rows.len() + outside_parents.len()) as u64)
+            .collect::<Vec<_>>(),
+        "outside parents must be numbered after the rows, in first-appearance order:\n{mountinfo}"
+    );
     assert!(
         !mountinfo.contains(root.path().to_str().expect("UTF-8 chroot path")),
         "chroot mountinfo leaked the host-side chroot path:\n{mountinfo}"
@@ -1384,9 +2507,7 @@ fn redirected_regular_stdio_fdinfo() -> Vec<u8> {
             output.reopen().expect("reopen redirected stdout"),
         ));
     let rendered = format!("{command:?}");
-    let result = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let result = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         result.status.success(),
         "redirected stdio fdinfo failed: {rendered}\nstatus: {}\nstderr:\n{}",
@@ -1410,7 +2531,8 @@ fn compile_fdinfo_mount_classes_guest() -> PathBuf {
         .parent()
         .expect("hermit-cli should be inside the repository")
         .to_path_buf();
-    let output = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("proc-fdinfo-mount-classes");
+    let output = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("proc-fdinfo-mount-classes-{}", std::process::id()));
     let compile = Command::new("cc")
         .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
         .arg(repository.join("tests/c/proc_fdinfo_mount_classes.c"))
@@ -1447,7 +2569,7 @@ fn fdinfo_mount_classes_with_stdio(guest: &PathBuf, regular_stdin_and_stderr: bo
             stderr_file.reopen().expect("reopen regular stderr"),
         ));
     }
-    let output = command.output().expect("run fdinfo mount-class guest");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(
         output.status.success(),
         "fdinfo mount-class guest failed: {}",
@@ -1539,9 +2661,7 @@ fn mount_namespace_fdinfo(no_namespace: bool) -> Vec<u8> {
     ]);
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "mount namespace fdinfo failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -1587,9 +2707,7 @@ fn no_namespace_mountinfo_and_fdinfo_share_one_mount_identity_map() {
         ]);
         hermit_test::configure_guest_execution(&mut command);
         let rendered = format!("{command:?}");
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+        let output = hermit_test::hermit_output(&rendered, &mut command);
         assert!(
             output.status.success(),
             "no-namespace mountinfo/fdinfo read failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -1648,24 +2766,20 @@ fn proc_random_uuid_is_deterministic() {
     });
 }
 
+/// The guest sees an empty module table, whatever the host has loaded
+/// (https://github.com/rrnewton/hermit/issues/3815). `assert_deterministic`
+/// refuses empty output, so this reads the file itself.
 #[test]
 fn proc_modules_are_deterministic() {
-    assert_deterministic("/proc/modules", |contents| {
-        let text = std::str::from_utf8(contents).expect("modules should be UTF-8");
-        for line in text.lines() {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            assert!(fields.len() >= 4, "malformed module row: {line}");
-            let expected = if fields[3] == "-" {
-                0
-            } else {
-                fields[3]
-                    .split(',')
-                    .filter(|holder| !holder.is_empty())
-                    .count()
-            };
-            assert_eq!(fields[2].parse::<usize>().unwrap(), expected);
-        }
-    });
+    let _guard = hermit_run_lock();
+    for run in 1..=RUNS {
+        let contents = read_procfs_at_epoch("/proc/modules", None);
+        assert!(
+            contents.is_empty(),
+            "run {run}: /proc/modules published host modules:\n{}",
+            String::from_utf8_lossy(&contents)
+        );
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1690,4 +2804,124 @@ fn sysfs_hwmon_input_is_deterministic_when_available() {
     };
     let path = path.to_str().expect("hwmon path should be UTF-8");
     assert_deterministic(path, |contents| assert_eq!(contents, b"0\n"));
+}
+
+#[cfg(feature = "dbt")]
+#[test]
+fn runtime_private_maps_keep_the_opened_targets_guest_mapping() {
+    let _run_lock = hermit_run_lock();
+    let build = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("runtime-private-maps")
+        .join(std::process::id().to_string());
+    fs::create_dir_all(&build).unwrap();
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runtime_private_maps.c");
+    let program = build.join("runtime_private_maps");
+    compile_c(&source, &program);
+    let expected = b"maps aliases retain the target's guest mapping\n";
+    let native = Command::new(&program).output().unwrap();
+    assert!(native.status.success(), "native target control: {native:?}");
+    assert_eq!(native.stdout, expected);
+    let mut observations = Vec::new();
+    for backend in ["ptrace", "dbt"] {
+        let report = build.join(format!("{backend}.json"));
+        let mut command = Command::new(hermit_test::hermit_binary());
+        command
+            .args([
+                "--log=debug",
+                "--backend",
+                backend,
+                "run",
+                "--base-env=minimal",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+            ])
+            .arg(&report)
+            .arg("--keep-logs")
+            .arg("--verify-log-dir")
+            .arg(build.join(format!("{backend}-logs")))
+            .arg("--")
+            .arg(&program);
+        hermit_test::configure_guest_execution(&mut command);
+        let output = hermit_test::hermit_output_attempts(
+            &format!("runtime-private maps target binding ({backend})"),
+            1,
+            &mut command,
+        );
+        eprintln!(
+            "{backend} target binding: {output:?}; report={}",
+            report.display()
+        );
+        observations.push((backend, output, report));
+    }
+    for (backend, output, report) in observations {
+        assert!(output.status.success(), "{backend}: {output:?}");
+        assert_eq!(output.stdout, expected, "{backend}");
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+        assert_eq!(value["verdict"], "matched", "{backend}: {value}");
+        assert_eq!(value["bitwise_parity"], true, "{backend}: {value}");
+        assert_eq!(value["comparison"]["strictness"], "canonical");
+        assert_eq!(value["comparison"]["compare_io_buffers"], true);
+        for side in ["left", "right"] {
+            assert!(value["compared_log_messages"][side].as_u64().unwrap() > 0);
+            assert_eq!(value["compared_outputs"][side]["exit_code"], 0);
+            assert_eq!(
+                value["compared_outputs"][side]["stdout_bytes"],
+                expected.len()
+            );
+        }
+    }
+    let old_expected = b"old maps descriptor has no replacement image\n";
+    let native_old = Command::new(&program).arg("old-exec").output().unwrap();
+    assert!(
+        native_old.status.success(),
+        "native old-mm control: {native_old:?}"
+    );
+    assert_eq!(native_old.stdout, old_expected);
+    let mut old_observations = Vec::new();
+    for backend in ["ptrace", "dbt"] {
+        let mut command = Command::new(hermit_test::hermit_binary());
+        command
+            .args([
+                "--log=info",
+                "--backend",
+                backend,
+                "run",
+                "--base-env=minimal",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+            ])
+            .arg(&program)
+            .arg("old-exec");
+        hermit_test::configure_guest_execution(&mut command);
+        let output = hermit_test::hermit_output_attempts(
+            &format!("runtime-private maps old image ({backend})"),
+            1,
+            &mut command,
+        );
+        eprintln!("{backend} old maps binding: {output:?}");
+        old_observations.push((backend, output));
+    }
+    for (backend, output) in old_observations {
+        if backend == "ptrace" {
+            assert!(output.status.success(), "ptrace old-mm control: {output:?}");
+            assert_eq!(output.stdout, old_expected);
+        } else {
+            assert!(
+                !output.status.success(),
+                "retired DBT view must refuse: {output:?}"
+            );
+            assert!(output.status.code().is_some(), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("runtime-private maps view unavailable: target ownership retired"),
+                "{output:?}"
+            );
+        }
+    }
 }

@@ -29,12 +29,15 @@ run_strict() {
   local stderr_file=$4
   shift 4
 
-  if ! "$hermit_bin" --log off run --strict \
+  local status=0
+  "$hermit_bin" --log off run --strict \
     --base-env=minimal --env=LC_ALL=C --workdir="$workdir" -- \
-    "$@" >"$stdout_file" 2>"$stderr_file"; then
+    "$@" >"$stdout_file" 2>"$stderr_file" || status=$?
+  if ((status != 0)); then
     printf '%s failed under strict Hermit:\n' "$label" >&2
     cat "$stderr_file" >&2
-    return 1
+    # Hermit's own status, so a caller can tell a typed refusal (122) apart.
+    return "$status"
   fi
 }
 

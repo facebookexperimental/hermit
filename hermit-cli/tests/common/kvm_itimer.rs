@@ -1,10 +1,6 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+// Licensed under the BSD-style license in the LICENSE file.
 
 //! Positive ITIMER_REAL delivery while sleeping, including worker arm/exit.
 //! One selected declaration runs eight modes, each with two actual guests and

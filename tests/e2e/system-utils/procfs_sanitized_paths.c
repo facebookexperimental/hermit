@@ -462,8 +462,12 @@ static bool check_numa_maps(const char* root) {
 
 static bool check_arch_status(const char* root) {
   size_t length = 0;
-  char* contents = read_required(
-      root, "self-arch-status", "/proc/self/arch_status", &length);
+  // Linux prints the AVX512_elapsed_ms line only on a CPU with AVX-512F
+  // (arch/x86/kernel/fpu/xstate.c avx512_status), so on any other x86 host the
+  // file exists and is empty. An empty file leaks no host timing, so it is a
+  // valid result; a present line must still be normalized.
+  char* contents = read_path(
+      root, "self-arch-status", "/proc/self/arch_status", &length, true);
   if (contents == NULL) {
     return false;
   }

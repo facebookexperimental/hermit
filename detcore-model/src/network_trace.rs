@@ -9,11 +9,15 @@
 //! Versioned data model for schedule-independent external network input.
 //!
 //! This module deliberately contains no recorder, replayer, or scheduler hook.
-//! It defines the fail-closed v1 envelope and its framing so a future runtime
+//! It defines the fail-closed trace envelopes and their framing so the runtime
 //! integration cannot accidentally reuse the schedule-coupled syscall event
-//! stream. Merely constructing a [`NetworkTraceConfig`] does not enable any
-//! behavior today.
+//! stream. [`NetworkTraceV1`] is the original single-channel envelope;
+//! [`NetworkTraceV2`] is the multi-channel form the recorder writes, and its
+//! reader upgrades v1 traces. The v3 and v4 framings extend the v2 payload
+//! with refused sends and with send waits respectively. Merely constructing a [`NetworkTraceConfig`]
+//! does not enable any behavior.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -33,10 +37,8 @@ use crate::time::LogicalTime;
 
 /// The on-disk format magic. The version is stored in the following four bytes.
 pub const NETWORK_TRACE_MAGIC: [u8; 16] = *b"HERMIT-NET-TRACE";
-/// The only network trace format this build accepts.
+/// The first network trace format; still accepted and upgraded on read.
 pub const NETWORK_TRACE_VERSION_V1: u32 = 1;
-/// Refuse hostile or corrupt length headers before allocating memory.
-pub const MAX_NETWORK_TRACE_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 const FRAME_HEADER_LEN: usize = NETWORK_TRACE_MAGIC.len() + 4 + 8;
 
@@ -160,6 +162,40 @@ impl NetworkAddressV1 {
         }
     }
 
+    /// The port in host byte order.
+    pub fn port(&self) -> u16 {
+        match self {
+            Self::Inet4 { port, .. } | Self::Inet6 { port, .. } => *port,
+        }
+    }
+
+    /// An address no connection can have as its peer.
+    /// Whether a v2 trace can hold a connection to this peer: a nonzero port
+    /// and an address that names one host. The unspecified address, which
+    /// Linux connects to loopback, is excluded.
+    pub fn is_traceable_peer(&self) -> bool {
+        self.port() != 0 && !self.is_unroutable()
+    }
+
+    fn is_unroutable(&self) -> bool {
+        match self {
+            Self::Inet4 { address, .. } => {
+                let address = Ipv4Addr::from(*address);
+                address.is_unspecified() || address.is_multicast() || address.is_broadcast()
+            }
+            Self::Inet6 { address, .. } => {
+                let address = Ipv6Addr::from(*address);
+                // Linux connects an IPv4-mapped address over IPv4.
+                if let Some(mapped) = address.to_ipv4_mapped() {
+                    return mapped.is_unspecified()
+                        || mapped.is_multicast()
+                        || mapped.is_broadcast();
+                }
+                address.is_unspecified() || address.is_multicast()
+            }
+        }
+    }
+
     fn same_family(&self, other: &Self) -> bool {
         matches!(
             (self, other),
@@ -257,12 +293,55 @@ pub struct NetworkInputEventV1 {
 }
 
 /// One contiguous recorded fragment of the expected outbound TCP byte stream.
+///
+/// From v3 on, a fragment with no bytes records a nonblocking send that
+/// Linux refused with `EAGAIN` when the stream had reached `stream_offset`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkOutputV1 {
     pub channel: OpenFileId,
     pub stream_offset: u64,
     pub bytes: Vec<u8>,
+}
+
+/// How long a blocking send waited for buffer space before Linux accepted
+/// one fragment of it.
+///
+/// Replay hands the fragment to the guest only after the same send has
+/// waited `waits` times and global time has reached `not_before_global_time`,
+/// so the send returns at the same point of the guest's execution as it did
+/// in the recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSendWaitV4 {
+    /// Waits for buffer space since the send started or since its previous
+    /// accepted fragment, whichever came later; never zero.
+    pub waits: u64,
+    /// The global time at which the recording accepted the fragment.
+    pub not_before_global_time: LogicalTime,
+}
+
+/// One recorded outbound fragment, as a v4 trace holds it: a v1 fragment
+/// and, when a blocking send waited before Linux accepted it, that wait.
+/// Fragments of earlier versions have no wait.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkOutputV4 {
+    pub channel: OpenFileId,
+    pub stream_offset: u64,
+    pub bytes: Vec<u8>,
+    pub wait: Option<NetworkSendWaitV4>,
+}
+
+impl From<NetworkOutputV1> for NetworkOutputV4 {
+    fn from(output: NetworkOutputV1) -> Self {
+        Self {
+            channel: output.channel,
+            stream_offset: output.stream_offset,
+            bytes: output.bytes,
+            wait: None,
+        }
+    }
 }
 
 /// Version-one schedule-independent network input trace.
@@ -281,18 +360,7 @@ impl NetworkTraceV1 {
     /// domain. `GlobalTime` truncates the epoch to microseconds, so this does
     /// the same conversion without an unchecked signed cast or multiplication.
     pub fn epoch_global_time(&self) -> Result<LogicalTime, NetworkTraceValidationError> {
-        let seconds = u64::try_from(self.epoch.timestamp())
-            .map_err(|_| NetworkTraceValidationError::EpochOutOfRange)?;
-        let whole_seconds = seconds
-            .checked_mul(1_000_000_000)
-            .ok_or(NetworkTraceValidationError::EpochOutOfRange)?;
-        let fractional_micros = u64::from(self.epoch.timestamp_subsec_micros())
-            .checked_mul(1_000)
-            .ok_or(NetworkTraceValidationError::EpochOutOfRange)?;
-        whole_seconds
-            .checked_add(fractional_micros)
-            .map(LogicalTime::from_nanos)
-            .ok_or(NetworkTraceValidationError::EpochOutOfRange)
+        epoch_global_time(&self.epoch)
     }
 
     /// Enforce the narrow v1 envelope before either writing or consuming a trace.
@@ -392,65 +460,430 @@ impl NetworkTraceV1 {
     }
 
     /// Write one complete, length-delimited v1 trace.
-    pub fn write_framed<W: Write>(&self, mut writer: W) -> Result<(), NetworkTraceCodecError> {
+    pub fn write_framed<W: Write>(&self, writer: W) -> Result<(), NetworkTraceCodecError> {
         self.validate()?;
-        let payload = bincode::serde::encode_to_vec(self, bincode::config::standard())
-            .map_err(NetworkTraceCodecError::Encode)?;
-        let payload_len =
-            u64::try_from(payload.len()).map_err(|_| NetworkTraceCodecError::TooLarge)?;
-        if payload_len > MAX_NETWORK_TRACE_PAYLOAD_BYTES {
-            return Err(NetworkTraceCodecError::TooLarge);
-        }
-        writer.write_all(&NETWORK_TRACE_MAGIC)?;
-        writer.write_all(&NETWORK_TRACE_VERSION_V1.to_le_bytes())?;
-        writer.write_all(&payload_len.to_le_bytes())?;
-        writer.write_all(&payload)?;
-        Ok(())
+        write_frame(writer, NETWORK_TRACE_VERSION_V1, self)
     }
 
     /// Read exactly one complete trace, rejecting truncation, trailing bytes,
     /// unknown versions, malformed payloads, and invalid v1 semantics.
-    pub fn read_framed<R: Read>(mut reader: R) -> Result<Self, NetworkTraceCodecError> {
-        let mut header = [0u8; FRAME_HEADER_LEN];
-        read_exact_or_truncated(&mut reader, &mut header)?;
-        if header[..NETWORK_TRACE_MAGIC.len()] != NETWORK_TRACE_MAGIC {
-            return Err(NetworkTraceCodecError::BadMagic);
-        }
-        let version_start = NETWORK_TRACE_MAGIC.len();
-        let version = u32::from_le_bytes(
-            header[version_start..version_start + 4]
-                .try_into()
-                .expect("fixed-size version field"),
-        );
+    pub fn read_framed<R: Read>(reader: R) -> Result<Self, NetworkTraceCodecError> {
+        let (version, payload) = read_frame(reader)?;
         if version != NETWORK_TRACE_VERSION_V1 {
             return Err(NetworkTraceCodecError::UnsupportedVersion(version));
         }
-        let len_start = version_start + 4;
-        let payload_len = u64::from_le_bytes(
-            header[len_start..len_start + 8]
-                .try_into()
-                .expect("fixed-size length field"),
-        );
-        if payload_len > MAX_NETWORK_TRACE_PAYLOAD_BYTES {
-            return Err(NetworkTraceCodecError::TooLarge);
+        let trace: Self = decode_payload(&payload)?;
+        trace.validate()?;
+        Ok(trace)
+    }
+}
+
+/// Read one frame header and its payload, rejecting truncation and trailing bytes.
+fn read_frame<R: Read>(mut reader: R) -> Result<(u32, Vec<u8>), NetworkTraceCodecError> {
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    read_exact_or_truncated(&mut reader, &mut header)?;
+    if header[..NETWORK_TRACE_MAGIC.len()] != NETWORK_TRACE_MAGIC {
+        return Err(NetworkTraceCodecError::BadMagic);
+    }
+    let version_start = NETWORK_TRACE_MAGIC.len();
+    let version = u32::from_le_bytes(
+        header[version_start..version_start + 4]
+            .try_into()
+            .expect("fixed-size version field"),
+    );
+    if ![
+        NETWORK_TRACE_VERSION_V1,
+        NETWORK_TRACE_VERSION_V2,
+        NETWORK_TRACE_VERSION_V3,
+        NETWORK_TRACE_VERSION_V4,
+    ]
+    .contains(&version)
+    {
+        return Err(NetworkTraceCodecError::UnsupportedVersion(version));
+    }
+    let len_start = version_start + 4;
+    let payload_len = u64::from_le_bytes(
+        header[len_start..len_start + 8]
+            .try_into()
+            .expect("fixed-size length field"),
+    );
+    // Grow the payload only as its bytes arrive, so a corrupt or hostile
+    // length header cannot make the reader allocate more than the input holds.
+    let mut payload = Vec::new();
+    let read = reader
+        .by_ref()
+        .take(payload_len)
+        .read_to_end(&mut payload)?;
+    if read as u64 != payload_len {
+        return Err(NetworkTraceCodecError::Truncated);
+    }
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(NetworkTraceCodecError::TrailingData);
+    }
+    Ok((version, payload))
+}
+
+fn decode_payload<T: serde::de::DeserializeOwned>(
+    payload: &[u8],
+) -> Result<T, NetworkTraceCodecError> {
+    let (value, consumed): (T, usize) =
+        bincode::serde::decode_from_slice(payload, bincode::config::standard())
+            .map_err(NetworkTraceCodecError::Decode)?;
+    if consumed != payload.len() {
+        return Err(NetworkTraceCodecError::TrailingPayloadData);
+    }
+    Ok(value)
+}
+
+/// Encode one complete frame: the header, then the payload, in one buffer.
+fn encode_frame<T: Serialize>(version: u32, value: &T) -> Result<Vec<u8>, NetworkTraceCodecError> {
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN);
+    frame.extend_from_slice(&NETWORK_TRACE_MAGIC);
+    frame.extend_from_slice(&version.to_le_bytes());
+    frame.extend_from_slice(&[0; 8]);
+    bincode::serde::encode_into_std_write(value, &mut frame, bincode::config::standard())
+        .map_err(NetworkTraceCodecError::Encode)?;
+    let payload_len = (frame.len() - FRAME_HEADER_LEN) as u64;
+    frame[FRAME_HEADER_LEN - 8..FRAME_HEADER_LEN].copy_from_slice(&payload_len.to_le_bytes());
+    Ok(frame)
+}
+
+fn write_frame<W: Write, T: Serialize>(
+    mut writer: W,
+    version: u32,
+    value: &T,
+) -> Result<(), NetworkTraceCodecError> {
+    writer.write_all(&encode_frame(version, value)?)?;
+    Ok(())
+}
+
+/// The trace format written by the runtime recorder when no nonblocking send
+/// was refused.
+pub const NETWORK_TRACE_VERSION_V2: u32 = 2;
+/// The v2 format, extended with empty outbound fragments that record a
+/// nonblocking send refused with `EAGAIN`. The recorder writes it only for a
+/// trace that holds one, so a reader that predates it rejects only those.
+pub const NETWORK_TRACE_VERSION_V3: u32 = 3;
+/// The v3 format, extended with the wait of each outbound fragment that a
+/// blocking send waited for. The recorder writes it only for a trace that
+/// holds one.
+pub const NETWORK_TRACE_VERSION_V4: u32 = 4;
+
+/// One outbound TCP client connection in a v2 trace.
+///
+/// Unlike v1, a v2 trace may hold several channels, may name a loopback peer
+/// (the recording ran with explicit host networking, so a host-loopback
+/// server is as external as any other), and records the connect outcome so a
+/// replay can reproduce a refused connection without touching the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkChannelV2 {
+    /// Stable Detcore open-file-description identity, never a raw fd.
+    pub id: OpenFileId,
+    pub transport: NetworkTransportV1,
+    pub role: NetworkEndpointRoleV1,
+    /// The local address the host assigned, or `None` when connect failed.
+    pub local_address: Option<NetworkAddressV1>,
+    pub peer_address: NetworkAddressV1,
+    /// `0` when the connection was established, otherwise the positive errno
+    /// the guest observed for it.
+    pub connect_errno: i32,
+}
+
+/// Version-two schedule-independent network trace: v1's release model over
+/// several channels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkTraceV2 {
+    pub epoch: DateTime<Utc>,
+    pub channels: Vec<NetworkChannelV2>,
+    /// Inputs of every channel, in the global order they were observed.
+    pub inputs: Vec<NetworkInputEventV1>,
+    /// Outbound fragments of every channel, in the order they were sent.
+    pub outputs: Vec<NetworkOutputV4>,
+}
+
+/// The v2 and v3 payload: [`NetworkTraceV2`] before fragments could carry a
+/// wait. Decoding through it is what keeps a wait out of a v2 or v3 trace.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkTraceV2Wire {
+    epoch: DateTime<Utc>,
+    channels: Vec<NetworkChannelV2>,
+    inputs: Vec<NetworkInputEventV1>,
+    outputs: Vec<NetworkOutputV1>,
+}
+
+impl From<NetworkTraceV2Wire> for NetworkTraceV2 {
+    fn from(trace: NetworkTraceV2Wire) -> Self {
+        Self {
+            epoch: trace.epoch,
+            channels: trace.channels,
+            inputs: trace.inputs,
+            outputs: trace.outputs.into_iter().map(Into::into).collect(),
         }
-        let payload_len =
-            usize::try_from(payload_len).map_err(|_| NetworkTraceCodecError::TooLarge)?;
-        let mut payload = vec![0; payload_len];
-        read_exact_or_truncated(&mut reader, &mut payload)?;
-        let mut trailing = [0u8; 1];
-        if reader.read(&mut trailing)? != 0 {
-            return Err(NetworkTraceCodecError::TrailingData);
+    }
+}
+
+impl From<NetworkTraceV1> for NetworkTraceV2 {
+    fn from(trace: NetworkTraceV1) -> Self {
+        Self {
+            epoch: trace.epoch,
+            channels: trace
+                .channels
+                .into_iter()
+                .map(|channel| NetworkChannelV2 {
+                    id: channel.id,
+                    transport: channel.transport,
+                    role: channel.role,
+                    local_address: Some(channel.local_address),
+                    peer_address: channel.peer_address,
+                    connect_errno: 0,
+                })
+                .collect(),
+            inputs: trace.inputs,
+            outputs: trace.outputs.into_iter().map(Into::into).collect(),
         }
-        let (trace, consumed): (Self, usize) =
-            bincode::serde::decode_from_slice(&payload, bincode::config::standard())
-                .map_err(NetworkTraceCodecError::Decode)?;
-        if consumed != payload.len() {
-            return Err(NetworkTraceCodecError::TrailingPayloadData);
+    }
+}
+
+impl NetworkTraceV2 {
+    /// Enforce the v2 envelope before either writing or consuming a trace.
+    pub fn validate(&self) -> Result<(), NetworkTraceValidationError> {
+        let epoch_start = epoch_global_time(&self.epoch)?;
+        let mut channels = BTreeMap::new();
+        for channel in &self.channels {
+            if !channel.id.is_socket() {
+                return Err(NetworkTraceValidationError::NonSocketChannelIdentity);
+            }
+            if !channel.peer_address.is_traceable_peer() {
+                return Err(NetworkTraceValidationError::UnsupportedPeerAddress);
+            }
+            if let Some(local) = &channel.local_address
+                && !local.same_family(&channel.peer_address)
+            {
+                return Err(NetworkTraceValidationError::AddressFamilyMismatch);
+            }
+            if !(0..=4095).contains(&channel.connect_errno)
+                || (channel.connect_errno == 0) != channel.local_address.is_some()
+            {
+                return Err(NetworkTraceValidationError::InvalidErrno);
+            }
+            if channels.insert(channel.id, channel).is_some() {
+                return Err(NetworkTraceValidationError::DuplicateChannel);
+            }
+        }
+
+        let mut total_output: BTreeMap<OpenFileId, u64> = BTreeMap::new();
+        let mut last_wait: BTreeMap<OpenFileId, LogicalTime> = BTreeMap::new();
+        for output in &self.outputs {
+            let channel = channels
+                .get(&output.channel)
+                .ok_or(NetworkTraceValidationError::UnknownChannel)?;
+            if channel.connect_errno != 0 {
+                return Err(NetworkTraceValidationError::TrafficOnFailedChannel);
+            }
+            let offset = total_output.entry(output.channel).or_default();
+            if output.stream_offset != *offset {
+                return Err(NetworkTraceValidationError::NonContiguousOutput);
+            }
+            *offset = offset
+                .checked_add(output.bytes.len() as u64)
+                .ok_or(NetworkTraceValidationError::StreamOffsetOverflow)?;
+            if let Some(wait) = &output.wait {
+                // A refused send returned without waiting, so it has no wait.
+                if output.bytes.is_empty() {
+                    return Err(NetworkTraceValidationError::WaitOnRefusedSend);
+                }
+                if wait.waits == 0 {
+                    return Err(NetworkTraceValidationError::ZeroSendWaits);
+                }
+                if wait.not_before_global_time < epoch_start {
+                    return Err(NetworkTraceValidationError::SendWaitBeforeEpoch);
+                }
+                let previous = last_wait.entry(output.channel).or_insert(epoch_start);
+                if wait.not_before_global_time < *previous {
+                    return Err(NetworkTraceValidationError::NonMonotonicSendWait);
+                }
+                *previous = wait.not_before_global_time;
+            }
+        }
+
+        #[derive(Default)]
+        struct InboundCursor {
+            offset: u64,
+            tx_watermark: u64,
+            terminal: bool,
+        }
+        let mut cursors: BTreeMap<OpenFileId, InboundCursor> = BTreeMap::new();
+        let mut previous_time = epoch_start;
+        for (index, input) in self.inputs.iter().enumerate() {
+            if input.ordinal != index as u64 {
+                return Err(NetworkTraceValidationError::NonCanonicalOrdinal);
+            }
+            let channel = channels
+                .get(&input.channel)
+                .ok_or(NetworkTraceValidationError::UnknownChannel)?;
+            if channel.connect_errno != 0 {
+                return Err(NetworkTraceValidationError::TrafficOnFailedChannel);
+            }
+            if input.release.not_before_global_time < epoch_start {
+                return Err(NetworkTraceValidationError::ReleaseBeforeEpoch);
+            }
+            let cursor = cursors.entry(input.channel).or_default();
+            if input.release.not_before_global_time < previous_time
+                || input.release.after_transmitted_offset < cursor.tx_watermark
+            {
+                return Err(NetworkTraceValidationError::NonMonotonicRelease);
+            }
+            if input.release.after_transmitted_offset
+                > total_output.get(&input.channel).copied().unwrap_or(0)
+            {
+                return Err(NetworkTraceValidationError::UnreachableTransmitWatermark);
+            }
+            if cursor.terminal {
+                return Err(NetworkTraceValidationError::EventAfterTerminal);
+            }
+            cursor.offset = validate_input_kind(&input.event, cursor.offset)?;
+            cursor.terminal = !matches!(input.event, NetworkInputKindV1::InboundBytes { .. });
+            cursor.tx_watermark = input.release.after_transmitted_offset;
+            previous_time = input.release.not_before_global_time;
+        }
+        Ok(())
+    }
+
+    /// Whether the trace records a nonblocking send refused with `EAGAIN`,
+    /// which only v3 and v4 can hold.
+    pub fn records_refused_sends(&self) -> bool {
+        self.outputs.iter().any(|output| output.bytes.is_empty())
+    }
+
+    /// Whether any outbound fragment records a wait, which only v4 can hold.
+    pub fn records_send_waits(&self) -> bool {
+        self.outputs.iter().any(|output| output.wait.is_some())
+    }
+
+    /// Write one complete, length-delimited trace: v4 when it records a send
+    /// wait, otherwise v3 when it records a refused send, otherwise v2.
+    pub fn write_framed<W: Write>(&self, mut writer: W) -> Result<(), NetworkTraceCodecError> {
+        writer.write_all(&self.encode_framed()?)?;
+        Ok(())
+    }
+
+    /// The bytes [`Self::write_framed`] writes, encoded without touching any
+    /// output, so a caller can refuse an invalid trace before it truncates a file.
+    pub fn encode_framed(&self) -> Result<Vec<u8>, NetworkTraceCodecError> {
+        self.validate()?;
+        if self.records_send_waits() {
+            return encode_frame(NETWORK_TRACE_VERSION_V4, self);
+        }
+        let version = if self.records_refused_sends() {
+            NETWORK_TRACE_VERSION_V3
+        } else {
+            NETWORK_TRACE_VERSION_V2
+        };
+        let wire = NetworkTraceV2Wire {
+            epoch: self.epoch,
+            channels: self.channels.clone(),
+            inputs: self.inputs.clone(),
+            outputs: self
+                .outputs
+                .iter()
+                .map(|output| NetworkOutputV1 {
+                    channel: output.channel,
+                    stream_offset: output.stream_offset,
+                    bytes: output.bytes.clone(),
+                })
+                .collect(),
+        };
+        encode_frame(version, &wire)
+    }
+
+    /// Read exactly one complete v1, v2, v3 or v4 trace. A v1 trace is
+    /// upgraded to the equivalent v2 trace after passing v1 validation; a v2
+    /// trace may not hold the refused sends that v3 added, and only a v4
+    /// trace can hold a send wait.
+    pub fn read_framed<R: Read>(reader: R) -> Result<Self, NetworkTraceCodecError> {
+        let (version, payload) = read_frame(reader)?;
+        let trace = match version {
+            NETWORK_TRACE_VERSION_V1 => {
+                let trace: NetworkTraceV1 = decode_payload(&payload)?;
+                trace.validate()?;
+                Self::from(trace)
+            }
+            NETWORK_TRACE_VERSION_V4 => decode_payload(&payload)?,
+            _ => Self::from(decode_payload::<NetworkTraceV2Wire>(&payload)?),
+        };
+        if version < NETWORK_TRACE_VERSION_V3 && trace.records_refused_sends() {
+            return Err(NetworkTraceValidationError::EmptyByteChunk.into());
         }
         trace.validate()?;
         Ok(trace)
     }
+}
+
+/// Check one input against its channel's inbound cursor and return the next offset.
+fn validate_input_kind(
+    event: &NetworkInputKindV1,
+    offset: u64,
+) -> Result<u64, NetworkTraceValidationError> {
+    match event {
+        NetworkInputKindV1::InboundBytes {
+            stream_offset,
+            bytes,
+        } => {
+            if bytes.is_empty() {
+                return Err(NetworkTraceValidationError::EmptyByteChunk);
+            }
+            if *stream_offset != offset {
+                return Err(NetworkTraceValidationError::NonContiguousInput);
+            }
+            offset
+                .checked_add(bytes.len() as u64)
+                .ok_or(NetworkTraceValidationError::StreamOffsetOverflow)
+        }
+        NetworkInputKindV1::PeerWriteClosed { stream_offset } => {
+            if *stream_offset != offset {
+                return Err(NetworkTraceValidationError::NonContiguousInput);
+            }
+            Ok(offset)
+        }
+        NetworkInputKindV1::SocketError {
+            stream_offset,
+            errno,
+        } => {
+            if *stream_offset != offset {
+                return Err(NetworkTraceValidationError::NonContiguousInput);
+            }
+            if !(1..=4095).contains(errno) {
+                return Err(NetworkTraceValidationError::InvalidErrno);
+            }
+            if matches!(*errno, libc::EAGAIN | libc::EINTR) {
+                return Err(NetworkTraceValidationError::NonTerminalSocketError);
+            }
+            Ok(offset)
+        }
+    }
+}
+
+/// The absolute `GlobalTime` starting point for `epoch`; see
+/// [`NetworkTraceV1::epoch_global_time`].
+pub fn epoch_global_time(
+    epoch: &DateTime<Utc>,
+) -> Result<LogicalTime, NetworkTraceValidationError> {
+    let seconds = u64::try_from(epoch.timestamp())
+        .map_err(|_| NetworkTraceValidationError::EpochOutOfRange)?;
+    let whole_seconds = seconds
+        .checked_mul(1_000_000_000)
+        .ok_or(NetworkTraceValidationError::EpochOutOfRange)?;
+    let fractional_micros = u64::from(epoch.timestamp_subsec_micros())
+        .checked_mul(1_000)
+        .ok_or(NetworkTraceValidationError::EpochOutOfRange)?;
+    whole_seconds
+        .checked_add(fractional_micros)
+        .map(LogicalTime::from_nanos)
+        .ok_or(NetworkTraceValidationError::EpochOutOfRange)
 }
 
 fn validate_outputs(
@@ -488,8 +921,8 @@ fn read_exact_or_truncated<R: Read>(
     })
 }
 
-/// Semantically invalid v1 trace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Semantically invalid trace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkTraceValidationError {
     ChannelCount(usize),
     EpochOutOfRange,
@@ -509,6 +942,12 @@ pub enum NetworkTraceValidationError {
     InvalidErrno,
     NonTerminalSocketError,
     EventAfterTerminal,
+    DuplicateChannel,
+    TrafficOnFailedChannel,
+    WaitOnRefusedSend,
+    ZeroSendWaits,
+    SendWaitBeforeEpoch,
+    NonMonotonicSendWait,
 }
 
 impl fmt::Display for NetworkTraceValidationError {
@@ -526,7 +965,6 @@ pub enum NetworkTraceCodecError {
     Truncated,
     BadMagic,
     UnsupportedVersion(u32),
-    TooLarge,
     TrailingData,
     TrailingPayloadData,
     Encode(bincode::error::EncodeError),
@@ -646,6 +1084,27 @@ mod tests {
         bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&payload);
         bytes
+    }
+
+    #[test]
+    fn traceable_peer_names_one_host_including_ipv4_mapped_addresses() {
+        let inet6 = |address: Ipv6Addr| NetworkAddressV1::Inet6 {
+            port: 80,
+            flowinfo: 0,
+            address: address.octets(),
+            scope_id: 0,
+        };
+        let mapped = |v4: Ipv4Addr| inet6(v4.to_ipv6_mapped());
+        assert!(mapped(Ipv4Addr::LOCALHOST).is_traceable_peer());
+        assert!(inet6(Ipv6Addr::LOCALHOST).is_traceable_peer());
+        for v4 in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(224, 0, 0, 1),
+        ] {
+            assert!(!mapped(v4).is_traceable_peer(), "{v4} names no single host");
+        }
+        assert!(!inet6(Ipv6Addr::UNSPECIFIED).is_traceable_peer());
     }
 
     #[test]
@@ -773,14 +1232,16 @@ mod tests {
     }
 
     #[test]
-    fn oversized_length_is_rejected_before_allocation() {
+    fn hostile_length_is_truncation_without_allocating_it() {
+        // Allocating the claimed length before reading it panics here.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&NETWORK_TRACE_MAGIC);
         bytes.extend_from_slice(&NETWORK_TRACE_VERSION_V1.to_le_bytes());
-        bytes.extend_from_slice(&(MAX_NETWORK_TRACE_PAYLOAD_BYTES + 1).to_le_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        bytes.extend_from_slice(b"short");
         assert!(matches!(
             NetworkTraceV1::read_framed(Cursor::new(bytes)),
-            Err(NetworkTraceCodecError::TooLarge)
+            Err(NetworkTraceCodecError::Truncated)
         ));
     }
 
@@ -1030,5 +1491,458 @@ mod tests {
             trace.validate(),
             Err(NetworkTraceValidationError::EventAfterTerminal)
         );
+    }
+
+    fn second_channel_id() -> OpenFileId {
+        OpenFileId::new_socket(DetTid::from_raw(1), 1)
+    }
+
+    fn loopback(port: u16) -> NetworkAddressV1 {
+        NetworkAddressV1::Inet4 {
+            address: [127, 0, 0, 1],
+            port,
+        }
+    }
+
+    /// Two loopback channels whose events interleave, plus one refused connect.
+    fn valid_trace_v2() -> NetworkTraceV2 {
+        let first = channel_id();
+        let second = second_channel_id();
+        let refused = OpenFileId::new_socket(DetTid::from_raw(2), 0);
+        let channel = |id, local: Option<u16>, errno| NetworkChannelV2 {
+            id,
+            transport: NetworkTransportV1::Tcp,
+            role: NetworkEndpointRoleV1::OutboundClient,
+            local_address: local.map(loopback),
+            peer_address: loopback(8080),
+            connect_errno: errno,
+        };
+        let input = |ordinal, channel, time, tx, event| NetworkInputEventV1 {
+            ordinal,
+            channel,
+            release: NetworkReleaseV1 {
+                not_before_global_time: global_time_after_epoch(time),
+                after_transmitted_offset: tx,
+            },
+            event,
+        };
+        NetworkTraceV2 {
+            epoch: trace_epoch(),
+            channels: vec![
+                channel(first, Some(40_000), 0),
+                channel(second, Some(40_001), 0),
+                channel(refused, None, libc::ECONNREFUSED),
+            ],
+            inputs: vec![
+                input(
+                    0,
+                    second,
+                    10,
+                    2,
+                    NetworkInputKindV1::InboundBytes {
+                        stream_offset: 0,
+                        bytes: b"xy".to_vec(),
+                    },
+                ),
+                input(
+                    1,
+                    first,
+                    10,
+                    3,
+                    NetworkInputKindV1::InboundBytes {
+                        stream_offset: 0,
+                        bytes: b"abc".to_vec(),
+                    },
+                ),
+                input(
+                    2,
+                    first,
+                    30,
+                    3,
+                    NetworkInputKindV1::PeerWriteClosed { stream_offset: 3 },
+                ),
+            ],
+            outputs: vec![
+                NetworkOutputV4 {
+                    channel: first,
+                    stream_offset: 0,
+                    bytes: b"req".to_vec(),
+                    wait: None,
+                },
+                NetworkOutputV4 {
+                    channel: second,
+                    stream_offset: 0,
+                    bytes: b"hi".to_vec(),
+                    wait: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn network_trace_v2_round_trips_exactly() {
+        let trace = valid_trace_v2();
+        let mut bytes = Vec::new();
+        trace.write_framed(&mut bytes).unwrap();
+        let start = NETWORK_TRACE_MAGIC.len();
+        assert_eq!(
+            bytes[start..start + 4],
+            NETWORK_TRACE_VERSION_V2.to_le_bytes()
+        );
+        assert_eq!(
+            NetworkTraceV2::read_framed(Cursor::new(bytes)).unwrap(),
+            trace
+        );
+    }
+
+    #[test]
+    fn frames_are_the_header_then_the_bincode_payload() {
+        // The layout every earlier writer produced: magic, version, payload
+        // length, then the payload encoded on its own.
+        let v1 = valid_trace();
+        assert_eq!(framed(&v1), framed_without_validation(&v1));
+        let trace = valid_trace_v2();
+        let wire = NetworkTraceV2Wire {
+            epoch: trace.epoch,
+            channels: trace.channels.clone(),
+            inputs: trace.inputs.clone(),
+            outputs: trace
+                .outputs
+                .iter()
+                .map(|output| NetworkOutputV1 {
+                    channel: output.channel,
+                    stream_offset: output.stream_offset,
+                    bytes: output.bytes.clone(),
+                })
+                .collect(),
+        };
+        let payload = bincode::serde::encode_to_vec(&wire, bincode::config::standard()).unwrap();
+        // Literal bytes, so a changed magic or version number fails here too.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"HERMIT-NET-TRACE");
+        expected.extend_from_slice(&[2, 0, 0, 0]);
+        expected.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        expected.extend_from_slice(&payload);
+        assert_eq!(trace.encode_framed().unwrap(), expected);
+    }
+
+    #[test]
+    fn network_trace_above_64_mib_round_trips() {
+        // 64 MiB was the old limit on a whole trace; a download of that size
+        // recorded completely and then lost its trace at exit.
+        let mut trace = valid_trace_v2();
+        let len = 64 * 1024 * 1024 + 1;
+        trace.inputs[1].event = NetworkInputKindV1::InboundBytes {
+            stream_offset: 0,
+            bytes: vec![0xa5; len],
+        };
+        trace.inputs[2].event = NetworkInputKindV1::PeerWriteClosed {
+            stream_offset: len as u64,
+        };
+        let mut framed = Vec::new();
+        trace.write_framed(&mut framed).unwrap();
+        assert!(framed.len() > len);
+        assert!(NetworkTraceV2::read_framed(Cursor::new(framed)).unwrap() == trace);
+    }
+
+    #[test]
+    fn network_trace_v2_reader_upgrades_v1() {
+        let v1 = valid_trace();
+        let upgraded = NetworkTraceV2::read_framed(Cursor::new(framed(&v1))).unwrap();
+        assert_eq!(upgraded, NetworkTraceV2::from(v1.clone()));
+        assert_eq!(upgraded.channels.len(), 1);
+        assert_eq!(upgraded.channels[0].connect_errno, 0);
+        assert_eq!(
+            upgraded.channels[0].local_address,
+            Some(v1.channels[0].local_address.clone())
+        );
+        assert_eq!(upgraded.inputs, v1.inputs);
+        let v1_outputs: Vec<NetworkOutputV4> = v1.outputs.into_iter().map(Into::into).collect();
+        assert_eq!(upgraded.outputs, v1_outputs);
+    }
+
+    #[test]
+    fn network_trace_v2_reader_keeps_v1_validation() {
+        let mut v1 = valid_trace();
+        v1.channels[0].created_before_competing_threads = false;
+        assert!(matches!(
+            NetworkTraceV2::read_framed(Cursor::new(framed_without_validation(&v1))),
+            Err(NetworkTraceCodecError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn network_trace_v2_reader_rejects_unknown_versions() {
+        let mut bytes = Vec::new();
+        valid_trace_v2().write_framed(&mut bytes).unwrap();
+        let start = NETWORK_TRACE_MAGIC.len();
+        bytes[start..start + 4].copy_from_slice(&5u32.to_le_bytes());
+        assert!(matches!(
+            NetworkTraceV2::read_framed(Cursor::new(bytes)),
+            Err(NetworkTraceCodecError::UnsupportedVersion(5))
+        ));
+    }
+
+    /// `valid_trace_v2` with one more fragment on the first channel, accepted
+    /// after its send waited twice.
+    fn waited_trace_v4() -> NetworkTraceV2 {
+        let mut trace = valid_trace_v2();
+        trace.outputs.push(NetworkOutputV4 {
+            channel: trace.channels[0].id,
+            stream_offset: 3,
+            bytes: b"more".to_vec(),
+            wait: Some(NetworkSendWaitV4 {
+                waits: 2,
+                not_before_global_time: global_time_after_epoch(20),
+            }),
+        });
+        trace
+    }
+
+    #[test]
+    fn network_trace_v4_holds_send_waits_that_v2_and_v3_cannot() {
+        let trace = waited_trace_v4();
+        let mut bytes = Vec::new();
+        trace.write_framed(&mut bytes).unwrap();
+        let start = NETWORK_TRACE_MAGIC.len();
+        assert_eq!(
+            bytes[start..start + 4],
+            NETWORK_TRACE_VERSION_V4.to_le_bytes()
+        );
+        assert_eq!(
+            NetworkTraceV2::read_framed(Cursor::new(bytes.clone())).unwrap(),
+            trace
+        );
+        // The older payloads have no field for a wait, so the same payload
+        // labelled v2 or v3 does not decode.
+        for older in [NETWORK_TRACE_VERSION_V2, NETWORK_TRACE_VERSION_V3] {
+            let mut relabelled = bytes.clone();
+            relabelled[start..start + 4].copy_from_slice(&older.to_le_bytes());
+            assert!(
+                NetworkTraceV2::read_framed(Cursor::new(relabelled)).is_err(),
+                "a v4 payload labelled v{older} decoded"
+            );
+        }
+        // A trace without a wait keeps its older version byte for byte.
+        let mut unwaited = Vec::new();
+        valid_trace_v2().write_framed(&mut unwaited).unwrap();
+        assert_eq!(
+            unwaited[start..start + 4],
+            NETWORK_TRACE_VERSION_V2.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn network_trace_v4_validation_rejects_each_malformed_wait() {
+        let check = |mutate: &dyn Fn(&mut NetworkTraceV2), expected| {
+            let mut trace = waited_trace_v4();
+            mutate(&mut trace);
+            assert_eq!(trace.validate(), Err(expected));
+        };
+        use NetworkTraceValidationError as E;
+        let wait_at = |nanos| {
+            Some(NetworkSendWaitV4 {
+                waits: 1,
+                not_before_global_time: global_time_after_epoch(nanos),
+            })
+        };
+        check(
+            &|t| {
+                t.outputs.push(NetworkOutputV4 {
+                    channel: t.channels[0].id,
+                    stream_offset: 7,
+                    bytes: Vec::new(),
+                    wait: wait_at(30),
+                })
+            },
+            E::WaitOnRefusedSend,
+        );
+        check(
+            &|t| t.outputs[2].wait.as_mut().unwrap().waits = 0,
+            E::ZeroSendWaits,
+        );
+        check(
+            &|t| {
+                let epoch = epoch_global_time(&t.epoch).unwrap().as_nanos();
+                t.outputs[2].wait.as_mut().unwrap().not_before_global_time =
+                    LogicalTime::from_nanos(epoch - 1);
+            },
+            E::SendWaitBeforeEpoch,
+        );
+        check(
+            &|t| {
+                t.outputs.push(NetworkOutputV4 {
+                    channel: t.channels[0].id,
+                    stream_offset: 7,
+                    bytes: b"x".to_vec(),
+                    wait: wait_at(19),
+                })
+            },
+            E::NonMonotonicSendWait,
+        );
+        // Monotonicity is per channel: an earlier wait on another channel
+        // after a later one on the first is valid.
+        let mut trace = waited_trace_v4();
+        trace.outputs.push(NetworkOutputV4 {
+            channel: trace.channels[1].id,
+            stream_offset: 2,
+            bytes: b"x".to_vec(),
+            wait: wait_at(5),
+        });
+        assert_eq!(trace.validate(), Ok(()));
+    }
+
+    #[test]
+    fn network_trace_v3_holds_refused_sends_that_v2_rejects() {
+        let mut trace = valid_trace_v2();
+        let first = trace.channels[0].id;
+        trace.outputs.insert(
+            0,
+            NetworkOutputV4 {
+                channel: first,
+                stream_offset: 0,
+                bytes: Vec::new(),
+                wait: None,
+            },
+        );
+        let mut bytes = Vec::new();
+        trace.write_framed(&mut bytes).unwrap();
+        let start = NETWORK_TRACE_MAGIC.len();
+        assert_eq!(
+            bytes[start..start + 4],
+            NETWORK_TRACE_VERSION_V3.to_le_bytes()
+        );
+        assert_eq!(
+            NetworkTraceV2::read_framed(Cursor::new(bytes.clone())).unwrap(),
+            trace
+        );
+        bytes[start..start + 4].copy_from_slice(&NETWORK_TRACE_VERSION_V2.to_le_bytes());
+        assert!(matches!(
+            NetworkTraceV2::read_framed(Cursor::new(bytes)),
+            Err(NetworkTraceCodecError::Validation(
+                NetworkTraceValidationError::EmptyByteChunk
+            ))
+        ));
+    }
+
+    #[test]
+    fn network_trace_v2_validation_rejects_each_malformation() {
+        let check = |mutate: &dyn Fn(&mut NetworkTraceV2), expected| {
+            let mut trace = valid_trace_v2();
+            mutate(&mut trace);
+            assert_eq!(trace.validate(), Err(expected));
+        };
+        use NetworkTraceValidationError as E;
+        check(&|t| t.channels[1].id = channel_id(), E::DuplicateChannel);
+        check(
+            &|t| t.channels[0].id = OpenFileId::new(DetTid::from_raw(1), 9),
+            E::NonSocketChannelIdentity,
+        );
+        check(
+            &|t| t.channels[0].peer_address = loopback(0),
+            E::UnsupportedPeerAddress,
+        );
+        check(
+            &|t| {
+                t.channels[0].peer_address = NetworkAddressV1::Inet4 {
+                    address: [0, 0, 0, 0],
+                    port: 80,
+                }
+            },
+            E::UnsupportedPeerAddress,
+        );
+        check(
+            &|t| {
+                t.channels[0].peer_address = NetworkAddressV1::Inet6 {
+                    address: [0; 16],
+                    port: 80,
+                    flowinfo: 0,
+                    scope_id: 0,
+                }
+            },
+            E::UnsupportedPeerAddress,
+        );
+        check(
+            &|t| {
+                t.channels[0].peer_address = NetworkAddressV1::Inet6 {
+                    address: Ipv6Addr::LOCALHOST.octets(),
+                    port: 80,
+                    flowinfo: 0,
+                    scope_id: 0,
+                }
+            },
+            E::AddressFamilyMismatch,
+        );
+        check(&|t| t.channels[0].connect_errno = -1, E::InvalidErrno);
+        check(&|t| t.channels[0].local_address = None, E::InvalidErrno);
+        check(
+            &|t| t.channels[2].local_address = Some(loopback(1)),
+            E::InvalidErrno,
+        );
+        check(
+            &|t| t.outputs[1].channel = t.channels[2].id,
+            E::TrafficOnFailedChannel,
+        );
+        check(
+            &|t| t.inputs[0].channel = t.channels[2].id,
+            E::TrafficOnFailedChannel,
+        );
+        check(
+            &|t| t.inputs[0].channel = OpenFileId::new_socket(DetTid::from_raw(9), 0),
+            E::UnknownChannel,
+        );
+        check(&|t| t.outputs[1].stream_offset = 1, E::NonContiguousOutput);
+        check(&|t| t.inputs[2].ordinal = 7, E::NonCanonicalOrdinal);
+        check(
+            &|t| t.inputs[1].release.not_before_global_time = global_time_after_epoch(5),
+            E::NonMonotonicRelease,
+        );
+        check(
+            &|t| t.inputs[2].release.after_transmitted_offset = 2,
+            E::NonMonotonicRelease,
+        );
+        check(
+            &|t| t.inputs[0].release.after_transmitted_offset = 3,
+            E::UnreachableTransmitWatermark,
+        );
+        check(
+            &|t| {
+                t.inputs[2].event = NetworkInputKindV1::PeerWriteClosed { stream_offset: 2 };
+            },
+            E::NonContiguousInput,
+        );
+        check(
+            &|t| {
+                let mut late = t.inputs[2].clone();
+                late.ordinal = 3;
+                late.release.not_before_global_time = global_time_after_epoch(40);
+                late.event = NetworkInputKindV1::InboundBytes {
+                    stream_offset: 3,
+                    bytes: b"z".to_vec(),
+                };
+                t.inputs.push(late);
+            },
+            E::EventAfterTerminal,
+        );
+    }
+
+    #[test]
+    fn network_trace_v2_offsets_are_per_channel() {
+        // The second channel's bytes start at offset 0 even though the first
+        // channel already delivered bytes: a shared cursor would reject this.
+        let mut trace = valid_trace_v2();
+        trace.inputs.push(NetworkInputEventV1 {
+            ordinal: 3,
+            channel: second_channel_id(),
+            release: NetworkReleaseV1 {
+                not_before_global_time: global_time_after_epoch(30),
+                after_transmitted_offset: 2,
+            },
+            event: NetworkInputKindV1::InboundBytes {
+                stream_offset: 2,
+                bytes: b"z".to_vec(),
+            },
+        });
+        assert_eq!(trace.validate(), Ok(()));
     }
 }

@@ -43,7 +43,7 @@ claim that different backends expose byte-identical hardware descriptions.
 
 Native observations are diagnostic. `/proc/uptime` is required to change
 between two uncontained probes, directly demonstrating the host nondeterminism
-that Hermit replaces with a backend-local deterministic value: `120.00 0.00`
-through ptrace and `0.00 0.00` through the KVM personality. Other utilities
+that Hermit replaces with a deterministic value: `120.00 0.00`
+on every backend, rendered by Detcore at the first read. Other utilities
 report a native-output digest because identity, hardware topology, and
 filesystem geometry are host-specific even when stable during one short run.

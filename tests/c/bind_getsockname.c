@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Cross-backend parity contract: bind(2) an AF_UNIX socket to an
 // abstract-namespace name and read it back with getsockname(2). NO data
 // transfer, NO listen/connect.

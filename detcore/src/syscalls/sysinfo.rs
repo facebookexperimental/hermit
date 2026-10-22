@@ -12,6 +12,7 @@ use reverie::Guest;
 use reverie::syscalls;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Sysno;
 
 use crate::Detcore;
 use crate::RecordOrReplay;
@@ -144,9 +145,9 @@ fn validate_resource_limit_mutation(
     }
     // CORE is virtual compatibility state too: changing it cannot enable host
     // core dumps, while Linux sanitizers routinely lower its soft limit.
-    if resource != libc::RLIMIT_STACK
-        && resource != libc::RLIMIT_NOFILE
-        && resource != libc::RLIMIT_CORE
+    if resource != reverie::syscalls::linux_abi::RLIMIT_STACK
+        && resource != reverie::syscalls::linux_abi::RLIMIT_NOFILE
+        && resource != reverie::syscalls::linux_abi::RLIMIT_CORE
     {
         return Err(Errno::EPERM);
     }
@@ -154,6 +155,23 @@ fn validate_resource_limit_mutation(
         return Err(Errno::EPERM);
     }
     Ok(())
+}
+
+/// The record of a resource-limit read that a loader served before post-exec
+/// ([`crate::random::EarlyRequest::LimitRead`]), emitted by post-exec. It is
+/// the record [`Detcore::handle_prlimit64`] emits for the same read, from the
+/// same module; a `getrlimit` read records nothing, as in `handle_getrlimit`.
+pub(crate) fn record_early_limit_read(
+    call: crate::random::LimitReadCall,
+    resource: u32,
+    current: u64,
+    maximum: u64,
+) {
+    if let crate::random::LimitReadCall::Prlimit64 { pid } = call {
+        crate::detlog!(
+            "prlimit64: pid={pid}, resource={resource}, mutation=false, old={current}:{maximum}"
+        );
+    }
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -245,7 +263,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             None
         };
 
-        let pid = call.pid();
+        // A nested caller names its process by its own namespace's pid
+        // (https://github.com/rrnewton/hermit/issues/4155); a pid no task of
+        // that namespace has is ESRCH, as Linux's `find_task_by_vpid` answers.
+        let pid = if call.pid() > 0 && guest.thread_state().nested_pid_namespace {
+            match crate::tool_global::guest_pid(guest, call.pid()).await {
+                crate::scheduler::pid_namespaces::GuestPidAnswer::Task { task, .. } => {
+                    task.as_raw()
+                }
+                crate::scheduler::pid_namespaces::GuestPidAnswer::NoSuchPid => {
+                    return Err(Errno::ESRCH.into());
+                }
+                crate::scheduler::pid_namespaces::GuestPidAnswer::Untranslatable(reason) => {
+                    tracing::error!(
+                        "[detcore, dtid {}] prlimit64 from a nested PID namespace is not supported: {} (https://github.com/rrnewton/hermit/issues/4155)",
+                        guest.thread_state().dettid,
+                        reason,
+                    );
+                    return self
+                        .refuse_unserviceable_operation(guest, Sysno::prlimit64, Errno::ENOSYS)
+                        .await;
+                }
+            }
+        } else {
+            call.pid()
+        };
         let deterministic_pid = guest.thread_state().detpid.map(|detpid| detpid.as_raw());
         if !prlimit_targets_current_process(pid, deterministic_pid, guest.pid().as_raw()) {
             return Err(Errno::EPERM.into());
@@ -406,7 +448,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let sys_info = self.collect_sysinfo(guest).await?;
         let mut memory = guest.memory();
 
-        memory.write_value(info_addr, &sys_info.into())?;
+        // Typed moves do not guarantee initialized repr(C) padding. Serialize
+        // directly into initialized bytes for every target libc.
+        let bytes = sys_info.to_kernel_bytes();
+        memory.write_exact(info_addr.cast::<u8>(), &bytes)?;
         Ok(0)
     }
 
@@ -440,7 +485,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
     ) -> Result<syscalls::SysInfo, Error> {
-        let memory = configured_memory(self.cfg.memory);
+        let memory = configured_memory(crate::machine::MachineDescription::of(&self.cfg).memory);
         let now = thread_observe_time(guest).await;
         let epoch = crate::types::DetTime::new(&self.cfg).as_nanos();
         Ok(syscalls::SysInfo {
@@ -612,7 +657,7 @@ mod tests {
         ] {
             let uptime =
                 sysinfo_uptime_seconds(LogicalTime::from_nanos(elapsed_ns), epoch, offset).unwrap();
-            let info: libc::sysinfo = syscalls::SysInfo {
+            let info: reverie::syscalls::linux_abi::Sysinfo = syscalls::SysInfo {
                 uptime,
                 loads_1: 0,
                 loads_5: 0,
@@ -791,7 +836,11 @@ mod tests {
             maximum: 0,
         };
         assert_eq!(
-            validate_resource_limit_mutation(libc::RLIMIT_CPU, limit, limit),
+            validate_resource_limit_mutation(
+                reverie::syscalls::linux_abi::RLIMIT_CPU,
+                limit,
+                limit
+            ),
             Ok(())
         );
     }
@@ -807,7 +856,11 @@ mod tests {
             maximum: 1,
         };
         assert_eq!(
-            validate_resource_limit_mutation(libc::RLIMIT_CORE, previous, requested),
+            validate_resource_limit_mutation(
+                reverie::syscalls::linux_abi::RLIMIT_CORE,
+                previous,
+                requested
+            ),
             Ok(())
         );
     }
@@ -823,7 +876,11 @@ mod tests {
             maximum: 1,
         };
         assert_eq!(
-            validate_resource_limit_mutation(libc::RLIMIT_CPU, previous, requested),
+            validate_resource_limit_mutation(
+                reverie::syscalls::linux_abi::RLIMIT_CPU,
+                previous,
+                requested
+            ),
             Err(Errno::EPERM)
         );
     }
@@ -839,7 +896,11 @@ mod tests {
             maximum: 1,
         };
         assert_eq!(
-            validate_resource_limit_mutation(libc::RLIMIT_CORE, previous, requested),
+            validate_resource_limit_mutation(
+                reverie::syscalls::linux_abi::RLIMIT_CORE,
+                previous,
+                requested
+            ),
             Err(Errno::EINVAL)
         );
     }
@@ -855,7 +916,11 @@ mod tests {
             maximum: 2,
         };
         assert_eq!(
-            validate_resource_limit_mutation(libc::RLIMIT_CORE, previous, requested),
+            validate_resource_limit_mutation(
+                reverie::syscalls::linux_abi::RLIMIT_CORE,
+                previous,
+                requested
+            ),
             Err(Errno::EPERM)
         );
     }

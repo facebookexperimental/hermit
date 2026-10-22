@@ -1,0 +1,953 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+// Caught signal deliveries that Hermit's Detcore checks against the kernel
+// before its signal-state copy records them (A5 step 3.2,
+// https://github.com/rrnewton/hermit/issues/4485). Each mode makes one
+// delivery of a known shape, most from a single thread and the mt-* modes
+// with a sibling thread (step 3.2b), and checks what Linux
+// guarantees about it: that the handler ran once, the mask it ran under, the
+// interrupted call's result or restart, and the action afterwards. It prints
+// "OK <mode>" and exits 0, or prints what differed and exits 1.
+//
+// Signals come from the thread itself (raise, sigqueue), from a sibling
+// thread of the guest's own (the mt-* modes, A5 step 3.2b), or from the
+// scheduler (an ITIMER_REAL expiry), never from outside, so every run is
+// deterministic.
+
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/futex.h>
+#include <poll.h>
+#include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/select.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t handled;
+// Written by the handler: a lock-free atomic and sig_atomic_t objects.
+static _Atomic uint64_t handler_mask;
+_Static_assert(ATOMIC_LONG_LOCK_FREE == 2, "the handler's atomic must be lock-free");
+static volatile sig_atomic_t handler_value;
+static volatile sig_atomic_t handler_values[2];
+static volatile sig_atomic_t write_end = -1;
+// The thread a handler ran on, and the mask its frame restores
+// (uc_sigmask).
+static volatile sig_atomic_t handler_tid;
+static _Atomic uint64_t handler_frame_mask;
+static sigjmp_buf recovery;
+// A null pointer the compiler cannot see through, for a deliberate fault.
+static int* volatile nowhere;
+
+static uint64_t current_mask(void) {
+  sigset_t now;
+  uint64_t bits = 0;
+  if (sigprocmask(SIG_BLOCK, NULL, &now) != 0) {
+    _exit(2);
+  }
+  for (int sig = 1; sig <= 64; sig++) {
+    if (sigismember(&now, sig) == 1) {
+      bits |= 1ull << (sig - 1);
+    }
+  }
+  return bits;
+}
+
+static uint64_t bit(int sig) {
+  return 1ull << (sig - 1);
+}
+
+static uint64_t sigset_bits(const sigset_t* set) {
+  uint64_t bits = 0;
+  for (int sig = 1; sig <= 64; sig++) {
+    if (sigismember(set, sig) == 1) {
+      bits |= 1ull << (sig - 1);
+    }
+  }
+  return bits;
+}
+
+static void on_signal(int sig, siginfo_t* info, void* context) {
+  (void)sig;
+  handler_tid = (sig_atomic_t)syscall(SYS_gettid);
+  handler_frame_mask = sigset_bits(&((ucontext_t*)context)->uc_sigmask);
+  if (handled < 2) {
+    handler_values[handled] = info->si_value.sival_int;
+  }
+  handled++;
+  handler_mask = current_mask();
+  handler_value = info->si_value.sival_int;
+  if (write_end >= 0) {
+    char byte = 'x';
+    if (write(write_end, &byte, 1) != 1) {
+      _exit(3);
+    }
+  }
+}
+
+// Catches `sig`, with SIGUSR2 in its sa_mask unless `empty_mask`.
+static void catch_signal_with(int sig, int flags, int empty_mask) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_sigaction = on_signal;
+  action.sa_flags = SA_SIGINFO | flags;
+  sigemptyset(&action.sa_mask);
+  if (!empty_mask) {
+    sigaddset(&action.sa_mask, SIGUSR2);
+  }
+  if (sigaction(sig, &action, NULL) != 0) {
+    perror("sigaction");
+    exit(2);
+  }
+}
+
+// Catches `sig` with SIGUSR2 in its sa_mask.
+static void catch_signal(int sig, int flags) {
+  catch_signal_with(sig, flags, 0);
+}
+
+static void on_fault(int sig) {
+  (void)sig;
+  siglongjmp(recovery, 1);
+}
+
+static void set_mask(uint64_t bits) {
+  sigset_t set;
+  sigemptyset(&set);
+  for (int sig = 1; sig <= 64; sig++) {
+    if (bits & bit(sig)) {
+      sigaddset(&set, sig);
+    }
+  }
+  if (sigprocmask(SIG_SETMASK, &set, NULL) != 0) {
+    perror("sigprocmask");
+    exit(2);
+  }
+}
+
+static void arm_alarm(void) {
+  struct itimerval timer = {{0, 0}, {0, 20000}};
+  if (setitimer(ITIMER_REAL, &timer, NULL) != 0) {
+    perror("setitimer");
+    exit(2);
+  }
+}
+
+static int failures;
+
+// What a sibling thread does (mt-* modes): set its mask to `blocks` (0, the
+// default, admits every signal: a new thread inherits its creator's mask,
+// which here blocks the signal under test), sleep `delay_ms`, then send each
+// of `signals` in turn, to `target` with tgkill, or to the process with kill
+// when `target` is 0. A process-directed signal is sent only by its sole
+// eligible receiver: Hermit refuses one whose sender blocks it, or that more
+// than one thread could take (https://github.com/rrnewton/hermit/issues/4034).
+struct sibling {
+  pid_t target;
+  uint64_t blocks;
+  long delay_ms;
+  int signals[2];
+  // Set by the sibling to its thread ID before it sends.
+  volatile pid_t tid;
+};
+
+static void* sibling_main(void* arg) {
+  struct sibling* job = arg;
+  sigset_t set;
+  sigemptyset(&set);
+  for (int sig = 1; sig <= 64; sig++) {
+    if (job->blocks & (1ull << (sig - 1))) {
+      sigaddset(&set, sig);
+    }
+  }
+  if (pthread_sigmask(SIG_SETMASK, &set, NULL) != 0) {
+    _exit(2);
+  }
+  job->tid = (pid_t)syscall(SYS_gettid);
+  if (job->delay_ms) {
+    struct timespec delay = {0, job->delay_ms * 1000000};
+    nanosleep(&delay, NULL);
+  }
+  for (int i = 0; i < 2 && job->signals[i]; i++) {
+    long r = job->target ? syscall(SYS_tgkill, getpid(), job->target, job->signals[i])
+                         : kill(getpid(), job->signals[i]);
+    if (r != 0) {
+      _exit(2);
+    }
+  }
+  return NULL;
+}
+
+// The mt-arrived-first-* sibling: it announces that it runs
+// (`arrived_first_ready`, with a futex wake), sleeps 1 ms, sends SIGUSR1 to
+// `job->target`, sleeps 100 ms, then sends SIGUSR2.
+static _Atomic int arrived_first_ready;
+static volatile sig_atomic_t late_handled;
+
+static void on_late(int sig) {
+  (void)sig;
+  late_handled++;
+}
+
+static void* arrived_first_main(void* arg) {
+  struct sibling* job = arg;
+  job->tid = (pid_t)syscall(SYS_gettid);
+  atomic_store(&arrived_first_ready, 1);
+  syscall(SYS_futex, &arrived_first_ready, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+  struct timespec first = {0, 1000000};
+  nanosleep(&first, NULL);
+  if (syscall(SYS_tgkill, getpid(), job->target, SIGUSR1) != 0) {
+    _exit(2);
+  }
+  struct timespec second = {0, 100000000};
+  nanosleep(&second, NULL);
+  if (syscall(SYS_tgkill, getpid(), job->target, SIGUSR2) != 0) {
+    _exit(2);
+  }
+  return NULL;
+}
+
+static pthread_t start_sibling(struct sibling* job) {
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, sibling_main, job) != 0) {
+    perror("pthread_create");
+    exit(2);
+  }
+  return thread;
+}
+
+static void expect(const char* what, long long actual, long long expected) {
+  if (actual != expected) {
+    printf("FAIL %s: %lld, expected %lld\n", what, actual, expected);
+    failures++;
+  }
+}
+
+// The reenter-fault mode's SIGUSR1 handler, in assembly so that its
+// registers are known. Its first instruction loads through r12; it then
+// clears r12 and jumps back to that instruction, which now faults: a SIGSEGV
+// at the handler's first instruction, with rdi, rsi, rdx and rsp still as
+// Linux left them for the SIGUSR1 frame. No conditional branch runs between
+// the frame and the fault, so no timer preemption comes between them under
+// Hermit. The SIGSEGV handler resumes at reenter_done, whose `ret` returns
+// through the SIGUSR1 frame's restorer.
+void reenter_handler(int);
+extern char reenter_done[];
+__asm__(
+    ".text\n"
+    ".globl reenter_handler\n"
+    ".type reenter_handler, @function\n"
+    "reenter_handler:\n"
+    "  movq (%r12), %rax\n"
+    "  xorl %r12d, %r12d\n"
+    "  jmp reenter_handler\n"
+    ".globl reenter_done\n"
+    "reenter_done:\n"
+    "  ret\n"
+    ".size reenter_handler, .-reenter_handler\n");
+
+// The sigreturn-chained-* modes' SIGUSR1 handler. With SIGILL and SIGFPE
+// blocked by its sa_mask, it sends itself both, then takes them out of the
+// frame's saved mask. rt_sigreturn installs that mask, and at its exit Linux
+// delivers one, then the other chained right after the first one's frame
+// (A5 step 3.2b part 4). Both are queued with rt_tgsigqueueinfo and a
+// positive si_code, which only a thread sending to itself may use, unless
+// sigreturn_chained_tkill: then SIGILL is sent by tgkill (SI_TKILL). Measured
+// natively and under Hermit alike: queued, SIGILL is delivered first and
+// SIGFPE chained; with tgkill, SIGFPE (the one with a positive code) first
+// and SIGILL chained.
+static volatile sig_atomic_t sigreturn_chained_tkill;
+
+static void on_usr1_queue_two(int sig, siginfo_t* info, void* context) {
+  (void)sig;
+  (void)info;
+  ucontext_t* uc = context;
+  pid_t pid = getpid();
+  pid_t tid = (pid_t)syscall(SYS_gettid);
+  siginfo_t queued;
+  memset(&queued, 0, sizeof queued);
+  queued.si_pid = pid;
+  if (sigreturn_chained_tkill) {
+    syscall(SYS_tgkill, pid, tid, SIGILL);
+  } else {
+    queued.si_signo = SIGILL;
+    queued.si_code = ILL_ILLOPN;
+    syscall(SYS_rt_tgsigqueueinfo, pid, tid, SIGILL, &queued);
+  }
+  queued.si_signo = SIGFPE;
+  queued.si_code = FPE_INTDIV;
+  syscall(SYS_rt_tgsigqueueinfo, pid, tid, SIGFPE, &queued);
+  sigdelset(&uc->uc_sigmask, SIGILL);
+  sigdelset(&uc->uc_sigmask, SIGFPE);
+}
+
+static volatile sig_atomic_t fault_at_handler_entry;
+
+static void on_reenter_fault(int sig, siginfo_t* info, void* context) {
+  (void)sig;
+  ucontext_t* uc = context;
+  fault_at_handler_entry = uc->uc_mcontext.gregs[REG_RIP] == (greg_t)reenter_handler &&
+      uc->uc_mcontext.gregs[REG_RDI] == SIGUSR1 && info->si_code == SEGV_MAPERR &&
+      info->si_addr == NULL;
+  handled++;
+  uc->uc_mcontext.gregs[REG_RIP] = (greg_t)reenter_done;
+}
+
+int main(int argc, char** argv) {
+  const char* mode = argc > 1 ? argv[1] : "";
+  const uint64_t own = bit(SIGINT);
+  const uint64_t sa_mask = bit(SIGUSR2);
+  set_mask(own);
+  long result = 0;
+  int error = 0;
+
+  if (!strcmp(mode, "raise")) {
+    catch_signal(SIGUSR1, 0);
+    result = raise(SIGUSR1);
+    expect("raise", result, 0);
+    expect("handler mask", (long long)handler_mask, (long long)(own | sa_mask | bit(SIGUSR1)));
+  } else if (!strcmp(mode, "pause")) {
+    catch_signal(SIGALRM, 0);
+    arm_alarm();
+    result = pause();
+    error = errno;
+    expect("pause", result, -1);
+    expect("pause errno", error, EINTR);
+  } else if (!strcmp(mode, "nanosleep")) {
+    catch_signal(SIGALRM, 0);
+    arm_alarm();
+    struct timespec duration = {5, 0};
+    result = nanosleep(&duration, NULL);
+    error = errno;
+    expect("nanosleep", result, -1);
+    expect("nanosleep errno", error, EINTR);
+  } else if (!strcmp(mode, "read") || !strcmp(mode, "read-restart")) {
+    int restart = !strcmp(mode, "read-restart");
+    catch_signal(SIGALRM, restart ? SA_RESTART : 0);
+    int pipe_ends[2];
+    if (pipe(pipe_ends) != 0) {
+      perror("pipe");
+      return 2;
+    }
+    // With SA_RESTART the read restarts, and the handler's byte ends it.
+    if (restart) {
+      write_end = pipe_ends[1];
+    }
+    arm_alarm();
+    char byte;
+    result = read(pipe_ends[0], &byte, 1);
+    error = errno;
+    if (restart) {
+      expect("restarted read", result, 1);
+    } else {
+      expect("read", result, -1);
+      expect("read errno", error, EINTR);
+    }
+  } else if (!strcmp(mode, "spin")) {
+    catch_signal(SIGALRM, 0);
+    arm_alarm();
+    volatile unsigned long spins = 0;
+    while (!handled) {
+      spins++;
+    }
+  } else if (!strcmp(mode, "suspend")) {
+    catch_signal(SIGALRM, 0);
+    set_mask(own | bit(SIGALRM));
+    arm_alarm();
+    sigset_t temporary;
+    sigemptyset(&temporary);
+    result = sigsuspend(&temporary);
+    error = errno;
+    expect("sigsuspend", result, -1);
+    expect("sigsuspend errno", error, EINTR);
+    expect("handler mask", (long long)handler_mask, (long long)(sa_mask | bit(SIGALRM)));
+    expect("mask after sigsuspend", (long long)current_mask(), (long long)(own | bit(SIGALRM)));
+  } else if (!strcmp(mode, "suspend-forced-frame") || !strcmp(mode, "suspend-forced-current")) {
+    // As suspend, with SIGSEGV, which Linux can force-deliver and the
+    // delivery check therefore leaves unchecked where Detcore's copy blocks
+    // it, in only one of the two masks: the thread's own (the mask the
+    // frame saves), or the temporary one (the mask in effect during the
+    // wait) (A5 step 3.2b).
+    int in_frame = !strcmp(mode, "suspend-forced-frame");
+    catch_signal(SIGALRM, 0);
+    uint64_t saved = own | bit(SIGALRM) | (in_frame ? bit(SIGSEGV) : 0);
+    set_mask(saved);
+    arm_alarm();
+    sigset_t temporary;
+    sigemptyset(&temporary);
+    if (!in_frame) {
+      sigaddset(&temporary, SIGSEGV);
+    }
+    result = sigsuspend(&temporary);
+    error = errno;
+    expect("sigsuspend", result, -1);
+    expect("sigsuspend errno", error, EINTR);
+    expect(
+        "handler mask",
+        (long long)handler_mask,
+        (long long)(sa_mask | bit(SIGALRM) | (in_frame ? 0 : bit(SIGSEGV))));
+    expect("frame mask", (long long)handler_frame_mask, (long long)saved);
+    expect("mask after sigsuspend", (long long)current_mask(), (long long)saved);
+  } else if (!strcmp(mode, "suspend-forced-only-difference")) {
+    // As suspend, with a temporary mask that differs from the thread's own
+    // only in SIGSEGV, a signal Linux can force-deliver: own {SIGINT,
+    // SIGSEGV}, temporary {SIGINT}. Detcore's copy took the kernel's mask for
+    // a forced delivery's clear and gave itself up, leaving the delivery and
+    // every later one unchecked (A5 step 3.2b follow-up).
+    catch_signal(SIGALRM, 0);
+    uint64_t saved = own | bit(SIGSEGV);
+    set_mask(saved);
+    arm_alarm();
+    sigset_t temporary;
+    sigemptyset(&temporary);
+    sigaddset(&temporary, SIGINT);
+    result = sigsuspend(&temporary);
+    error = errno;
+    expect("sigsuspend", result, -1);
+    expect("sigsuspend errno", error, EINTR);
+    expect(
+        "handler mask",
+        (long long)handler_mask,
+        (long long)(own | sa_mask | bit(SIGALRM)));
+    expect("frame mask", (long long)handler_frame_mask, (long long)saved);
+    expect("mask after sigsuspend", (long long)current_mask(), (long long)saved);
+  } else if (!strcmp(mode, "realtime")) {
+    catch_signal(SIGRTMIN + 3, 0);
+    union sigval value = {.sival_int = 7};
+    result = sigqueue(getpid(), SIGRTMIN + 3, value);
+    expect("sigqueue", result, 0);
+    expect("handler value", handler_value, 7);
+    expect(
+        "handler mask",
+        (long long)handler_mask,
+        (long long)(own | sa_mask | bit(SIGRTMIN + 3)));
+  } else if (!strcmp(mode, "resethand")) {
+    // The first delivery runs the handler and resets the action; the second
+    // takes SIGWINCH's default action, which ignores it.
+    catch_signal(SIGWINCH, SA_RESETHAND);
+    raise(SIGWINCH);
+    struct sigaction now;
+    sigaction(SIGWINCH, NULL, &now);
+    expect("action after SA_RESETHAND", now.sa_handler == SIG_DFL, 1);
+    raise(SIGWINCH);
+  } else if (!strcmp(mode, "nodefer")) {
+    catch_signal(SIGUSR1, SA_NODEFER);
+    raise(SIGUSR1);
+    expect("handler mask", (long long)handler_mask, (long long)(own | sa_mask));
+  } else if (!strcmp(mode, "two-pending")) {
+    // Two caught signals pending at one exit: the kernel delivers the second
+    // right after building the first one's frame.
+    catch_signal_with(SIGUSR1, 0, 1);
+    catch_signal_with(SIGWINCH, 0, 1);
+    set_mask(own | bit(SIGUSR1) | bit(SIGWINCH));
+    raise(SIGUSR1);
+    raise(SIGWINCH);
+    sigset_t temporary;
+    sigemptyset(&temporary);
+    result = sigsuspend(&temporary);
+    error = errno;
+    expect("sigsuspend", result, -1);
+    expect("sigsuspend errno", error, EINTR);
+    expect("handled twice", handled, 2);
+    handled = 1;
+  } else if (!strcmp(mode, "blocked-sleep")) {
+    // A blocked signal does not end a sleep; it is delivered at the unblock.
+    catch_signal(SIGALRM, 0);
+    set_mask(own | bit(SIGALRM));
+    arm_alarm();
+    struct timespec duration = {0, 50000000};
+    result = nanosleep(&duration, NULL);
+    expect("blocked nanosleep", result, 0);
+    expect("handled while blocked", handled, 0);
+    sigset_t pending;
+    sigpending(&pending);
+    expect("pending after the sleep", sigismember(&pending, SIGALRM), 1);
+    set_mask(own);
+  } else if (!strcmp(mode, "default-ignored")) {
+    // SIGWINCH's default action is to ignore it.
+    raise(SIGWINCH);
+    expect("handled", handled, 0);
+    handled = 1;
+  } else if (!strcmp(mode, "default-fatal")) {
+    pid_t child = fork();
+    if (child == 0) {
+      raise(SIGTERM);
+      _exit(9);
+    }
+    int status = 0;
+    expect("waitpid", waitpid(child, &status, 0), child);
+    expect("killed by SIGTERM", WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM, 1);
+    handled = 1;
+  } else if (!strcmp(mode, "coalesce")) {
+    // Two sends of one standard signal while it is blocked are one pending
+    // signal, delivered once at the unblock.
+    catch_signal(SIGUSR1, 0);
+    set_mask(own | bit(SIGUSR1));
+    raise(SIGUSR1);
+    raise(SIGUSR1);
+    set_mask(own);
+  } else if (!strcmp(mode, "realtime-direct")) {
+    // Two queued sends of one realtime signal, unblocked: each is delivered
+    // as its send returns, in order.
+    catch_signal(SIGRTMIN + 3, 0);
+    union sigval first = {.sival_int = 1};
+    union sigval second = {.sival_int = 2};
+    sigqueue(getpid(), SIGRTMIN + 3, first);
+    sigqueue(getpid(), SIGRTMIN + 3, second);
+    expect("handled twice", handled, 2);
+    expect("first value", handler_values[0], 1);
+    expect("second value", handler_values[1], 2);
+    handled = 1;
+  } else if (!strcmp(mode, "partial-write")) {
+    // A write that has moved bytes when a caught signal arrives returns the
+    // count, with no EINTR: the pipe takes what fits, and nobody reads.
+    catch_signal(SIGALRM, 0);
+    int pipe_ends[2];
+    if (pipe(pipe_ends) != 0) {
+      perror("pipe");
+      return 2;
+    }
+    long capacity = fcntl(pipe_ends[1], F_GETPIPE_SZ);
+    static char buffer[1 << 20];
+    arm_alarm();
+    result = write(pipe_ends[1], buffer, sizeof buffer);
+    expect("partial write", result, capacity);
+  } else if (!strcmp(mode, "realtime-two")) {
+    // Two queued instances of one realtime signal, delivered in order.
+    catch_signal(SIGRTMIN + 3, 0);
+    set_mask(own | bit(SIGRTMIN + 3));
+    union sigval first = {.sival_int = 1};
+    union sigval second = {.sival_int = 2};
+    sigqueue(getpid(), SIGRTMIN + 3, first);
+    sigqueue(getpid(), SIGRTMIN + 3, second);
+    set_mask(own);
+    expect("handled twice", handled, 2);
+    expect("first value", handler_values[0], 1);
+    expect("second value", handler_values[1], 2);
+    handled = 1;
+  } else if (!strcmp(mode, "child-wait-restart")) {
+    // The child's SIGUSR1 interrupts the parent's wait, which SA_RESTART
+    // restarts until the child exits.
+    catch_signal(SIGUSR1, SA_RESTART);
+    pid_t child = fork();
+    if (child == 0) {
+      // Long enough for the parent to be waiting when the signal comes.
+      struct timespec pause = {0, 10000000};
+      nanosleep(&pause, NULL);
+      kill(getppid(), SIGUSR1);
+      // Still alive, so the signal interrupts the wait, which restarts.
+      nanosleep(&pause, NULL);
+      _exit(3);
+    }
+    int status = 0;
+    result = waitpid(child, &status, 0);
+    expect("waitpid", result, child);
+    expect("child exit status", WIFEXITED(status) ? WEXITSTATUS(status) : -1, 3);
+  } else if (!strcmp(mode, "frame-fault") || !strcmp(mode, "frame-fault-nodefer")) {
+    // SIGUSR1's frame goes on an alternate stack that cannot be written: the
+    // kernel raises SIGSEGV, and SA_RESETHAND still resets the action. With
+    // SA_NODEFER and an empty sa_mask, the handler's mask equals the frame's.
+    int nodefer = !strcmp(mode, "frame-fault-nodefer");
+    void* stack = mmap(NULL, 65536, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stack == MAP_FAILED) {
+      perror("mmap");
+      return 2;
+    }
+    stack_t alternate = {.ss_sp = stack, .ss_size = 65536, .ss_flags = 0};
+    if (sigaltstack(&alternate, NULL) != 0) {
+      perror("sigaltstack");
+      return 2;
+    }
+    struct sigaction fault;
+    memset(&fault, 0, sizeof fault);
+    fault.sa_handler = on_fault;
+    fault.sa_flags = SA_NODEFER;
+    sigemptyset(&fault.sa_mask);
+    sigaction(SIGSEGV, &fault, NULL);
+    catch_signal_with(SIGUSR1, SA_ONSTACK | SA_RESETHAND | (nodefer ? SA_NODEFER : 0), nodefer);
+    if (sigsetjmp(recovery, 1) == 0) {
+      raise(SIGUSR1);
+      expect("reached after the fault", 0, 1);
+    }
+    struct sigaction now;
+    sigaction(SIGUSR1, NULL, &now);
+    expect("action after the frame fault", now.sa_handler == SIG_DFL, 1);
+    expect("handled", handled, 0);
+    handled = 1;
+  } else if (!strcmp(mode, "forced-ignored") || !strcmp(mode, "forced-blocked")) {
+    // A fault forces SIGSEGV: Linux resets an ignored action, or a caught one
+    // the thread blocks, to the default, and unblocks it, which kills the
+    // child.
+    int blocked = !strcmp(mode, "forced-blocked");
+    pid_t child = fork();
+    if (child == 0) {
+      struct rlimit no_core = {0, 0};
+      setrlimit(RLIMIT_CORE, &no_core);
+      if (blocked) {
+        catch_signal(SIGSEGV, 0);
+        set_mask(own | bit(SIGSEGV));
+      } else {
+        signal(SIGSEGV, SIG_IGN);
+      }
+      *nowhere = 1;
+      _exit(9);
+    }
+    int status = 0;
+    expect("waitpid", waitpid(child, &status, 0), child);
+    expect("killed by SIGSEGV", WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV, 1);
+    handled = 1;
+  } else if (!strcmp(mode, "mt-suspend") || !strcmp(mode, "mt-suspend-late")) {
+    // Must deliver: the main thread blocks a caught SIGUSR1 and waits in
+    // sigsuspend with a temporary mask that admits it; a sibling sends it to
+    // the main thread, at once (it arrives before the wait starts) or after a
+    // 20 ms sleep (it arrives during the wait). One handler, on the main
+    // thread, under the temporary mask (SIGQUIT, which the thread's own mask
+    // does not hold) plus sa_mask plus SIGUSR1; its frame restores the main
+    // thread's own mask; sigsuspend fails with EINTR.
+    catch_signal(SIGUSR1, 0);
+    set_mask(own | bit(SIGUSR1));
+    struct sibling job = {
+        .target = (pid_t)syscall(SYS_gettid),
+        .delay_ms = !strcmp(mode, "mt-suspend-late") ? 20 : 0,
+        .signals = {SIGUSR1}};
+    pthread_t thread = start_sibling(&job);
+    sigset_t temporary;
+    sigemptyset(&temporary);
+    sigaddset(&temporary, SIGQUIT);
+    result = sigsuspend(&temporary);
+    error = errno;
+    pthread_join(thread, NULL);
+    expect("sigsuspend", result, -1);
+    expect("sigsuspend errno", error, EINTR);
+    expect("handler thread", handler_tid, job.target);
+    expect(
+        "handler mask",
+        (long long)handler_mask,
+        (long long)(bit(SIGQUIT) | sa_mask | bit(SIGUSR1)));
+    expect("frame mask", (long long)handler_frame_mask, (long long)(own | bit(SIGUSR1)));
+    expect("mask after sigsuspend", (long long)current_mask(), (long long)(own | bit(SIGUSR1)));
+  } else if (!strncmp(mode, "mt-arrived-first-", strlen("mt-arrived-first-"))) {
+    // A sibling's SIGUSR1, caught and admitted by the thread's own mask,
+    // arrives after the main thread enters a call and before the call has
+    // any effect (A5 step 3.2b). The sibling announces itself and sleeps
+    // 1 ms; the main thread, released by that announcement, spins 6 million
+    // iterations in user code (no syscall, so no scheduling point, and
+    // under the preemption timeslice), then makes the call named by the
+    // mode's suffix. Under sequentialized threads the sibling's 1 ms wake
+    // falls inside the spin, so its send comes at the call's entry, before
+    // Hermit's first injection for it. A SIGUSR2 follows 100 ms later.
+    //
+    // Linux allows two outcomes, which the guest tells apart by the
+    // handler's mask:
+    // - the signal came before the call: the handler runs under the thread's
+    //   own mask, then the call runs (a wait then waits for SIGUSR2);
+    // - it came during a wait: the handler runs under the wait's temporary
+    //   mask (SIGQUIT), and the wait fails with EINTR before SIGUSR2.
+    // Neither returns EINTR from a wait whose temporary mask the handler
+    // did not see, nor from rt_sigprocmask or rt_sigaction.
+    const char* call = mode + strlen("mt-arrived-first-");
+    int waits = !strcmp(call, "suspend") || !strcmp(call, "ppoll") || !strcmp(call, "pselect")
+        || !strcmp(call, "epoll_pwait2");
+    // A zero-timeout ppoll returns at once: 0 if the signal came before it,
+    // EINTR with the handler under the temporary mask if it came during it.
+    int probes = !strcmp(call, "ppoll0");
+    if (!waits && !probes && strcmp(call, "sigprocmask") && strcmp(call, "sigaction")) {
+      printf("unknown call %s\n", call);
+      return 2;
+    }
+    catch_signal(SIGUSR1, 0);
+    struct sigaction late;
+    memset(&late, 0, sizeof late);
+    late.sa_handler = on_late;
+    sigemptyset(&late.sa_mask);
+    if (sigaction(SIGUSR2, &late, NULL) != 0) {
+      perror("sigaction");
+      return 2;
+    }
+    // Anything the call needs is made before the sibling starts, so the call
+    // is the spin's next syscall.
+    int epfd = -1;
+    if (!strcmp(call, "epoll_pwait2")) {
+      epfd = epoll_create1(0);
+      if (epfd < 0) {
+        perror("epoll_create1");
+        return 2;
+      }
+    }
+    struct sibling job = {.target = (pid_t)syscall(SYS_gettid)};
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, arrived_first_main, &job) != 0) {
+      perror("pthread_create");
+      return 2;
+    }
+    while (!atomic_load(&arrived_first_ready)) {
+      syscall(SYS_futex, &arrived_first_ready, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+    }
+    for (volatile long spin = 0; spin < 6000000; spin++) {
+    }
+    sigset_t temporary;
+    sigemptyset(&temporary);
+    sigaddset(&temporary, SIGQUIT);
+    if (!strcmp(call, "suspend")) {
+      result = sigsuspend(&temporary);
+    } else if (!strcmp(call, "ppoll")) {
+      struct timespec timeout = {5, 0};
+      result = ppoll(NULL, 0, &timeout, &temporary);
+    } else if (!strcmp(call, "pselect")) {
+      struct timespec timeout = {5, 0};
+      result = pselect(0, NULL, NULL, NULL, &timeout, &temporary);
+    } else if (!strcmp(call, "epoll_pwait2")) {
+      struct epoll_event event;
+      struct timespec timeout = {5, 0};
+      result = syscall(SYS_epoll_pwait2, epfd, &event, 1, &timeout, &temporary, 8);
+    } else if (!strcmp(call, "ppoll0")) {
+      struct timespec timeout = {0, 0};
+      result = ppoll(NULL, 0, &timeout, &temporary);
+    } else if (!strcmp(call, "sigprocmask")) {
+      // Sets the mask to the thread's own plus SIGQUIT, which no one sends;
+      // the call cannot fail. SIG_SETMASK, not SIG_BLOCK, so that Hermit
+      // also runs its handling of a mask that may unblock signals.
+      sigset_t set;
+      sigemptyset(&set);
+      sigaddset(&set, SIGINT);
+      sigaddset(&set, SIGQUIT);
+      result = syscall(SYS_rt_sigprocmask, SIG_SETMASK, &set, NULL, 8);
+    } else {
+      struct sigaction quit;
+      memset(&quit, 0, sizeof quit);
+      quit.sa_handler = SIG_IGN;
+      sigemptyset(&quit.sa_mask);
+      result = syscall(SYS_rt_sigaction, SIGQUIT, &quit, NULL, 8);
+      struct sigaction installed;
+      if (sigaction(SIGQUIT, NULL, &installed) != 0) {
+        perror("sigaction");
+        return 2;
+      }
+      expect("SIGQUIT ignored after rt_sigaction", installed.sa_handler == SIG_IGN, 1);
+    }
+    error = errno;
+    int late_at_return = late_handled;
+    pthread_join(thread, NULL);
+    expect("handler thread", handler_tid, job.target);
+    expect("late SIGUSR2 handled", late_handled, 1);
+    long long own_shape = (long long)(own | sa_mask | bit(SIGUSR1));
+    long long wait_shape = (long long)(bit(SIGQUIT) | sa_mask | bit(SIGUSR1));
+    if (waits) {
+      expect("frame mask", (long long)handler_frame_mask, (long long)own);
+      expect("wait", result, -1);
+      expect("wait errno", error, EINTR);
+      if ((long long)handler_mask == own_shape) {
+        expect("SIGUSR2 handled before the wait returned (signal before the call)", late_at_return, 1);
+      } else {
+        expect("handler mask (signal during the wait)", (long long)handler_mask, wait_shape);
+        expect("SIGUSR2 handled before the wait returned (signal during the wait)", late_at_return, 0);
+      }
+      expect("mask after the wait", (long long)current_mask(), (long long)own);
+    } else if (probes) {
+      expect("frame mask", (long long)handler_frame_mask, (long long)own);
+      if ((long long)handler_mask == own_shape) {
+        expect("probe (signal before the call)", result, 0);
+      } else {
+        expect("handler mask (signal during the probe)", (long long)handler_mask, wait_shape);
+        expect("probe (signal during the probe)", result, -1);
+        expect("probe errno (signal during the probe)", error, EINTR);
+      }
+      expect("mask after the probe", (long long)current_mask(), (long long)own);
+    } else {
+      // The signal came before or after the call: the frame restores the
+      // mask then in force, and the handler runs under it.
+      uint64_t after = own | (!strcmp(call, "sigprocmask") ? bit(SIGQUIT) : 0);
+      expect(call, result, 0);
+      if (handler_frame_mask != own) {
+        expect("frame mask (signal after the call)", (long long)handler_frame_mask, (long long)after);
+      }
+      expect(
+          "handler mask",
+          (long long)handler_mask,
+          (long long)(handler_frame_mask | sa_mask | bit(SIGUSR1)));
+      expect("mask after the call", (long long)current_mask(), (long long)after);
+    }
+  } else if (!strcmp(mode, "mt-suspend-blocked")) {
+    // Must not deliver: the temporary mask blocks SIGUSR1 too, so the
+    // sibling's SIGUSR1 stays pending through the wait, which a second,
+    // admitted signal (SIGWINCH) ends. SIGUSR1 is delivered at the unblock.
+    // The temporary mask holds SIGQUIT, which the thread's own mask does not.
+    catch_signal(SIGUSR1, 0);
+    catch_signal(SIGWINCH, 0);
+    set_mask(own | bit(SIGUSR1) | bit(SIGWINCH));
+    struct sibling job = {
+        .target = (pid_t)syscall(SYS_gettid), .signals = {SIGUSR1, SIGWINCH}};
+    pthread_t thread = start_sibling(&job);
+    sigset_t temporary;
+    sigemptyset(&temporary);
+    sigaddset(&temporary, SIGQUIT);
+    sigaddset(&temporary, SIGUSR1);
+    result = sigsuspend(&temporary);
+    error = errno;
+    pthread_join(thread, NULL);
+    expect("sigsuspend", result, -1);
+    expect("sigsuspend errno", error, EINTR);
+    expect("handled in the wait", handled, 1);
+    expect(
+        "SIGWINCH handler mask",
+        (long long)handler_mask,
+        (long long)(bit(SIGQUIT) | bit(SIGUSR1) | sa_mask | bit(SIGWINCH)));
+    expect(
+        "SIGWINCH frame mask",
+        (long long)handler_frame_mask,
+        (long long)(own | bit(SIGUSR1) | bit(SIGWINCH)));
+    sigset_t pending;
+    sigpending(&pending);
+    expect("SIGUSR1 pending after the wait", sigismember(&pending, SIGUSR1), 1);
+    expect("SIGWINCH handler thread", handler_tid, job.target);
+    set_mask(own);
+    expect("handled after the unblock", handled, 2);
+    expect("SIGUSR1 handler thread", handler_tid, job.target);
+    expect(
+        "SIGUSR1 handler mask", (long long)handler_mask, (long long)(own | sa_mask | bit(SIGUSR1)));
+    expect("SIGUSR1 frame mask", (long long)handler_frame_mask, (long long)own);
+    handled = 1;
+  } else if (!strcmp(mode, "mt-process-to-sibling")) {
+    // A process-directed SIGUSR1 goes to a thread that does not block it
+    // (complete_signal): the sibling that sends it, while the main thread
+    // blocks it and waits for the sibling in pthread_join (the sibling first
+    // sleeps 20 ms, meant to let the main thread return from pthread_create,
+    // whose block-everything mask would otherwise decide alone; nothing here
+    // checks that it did, and either way the main thread blocks SIGUSR1). The
+    // handler runs on the sibling under the sibling's mask (empty) plus
+    // sa_mask plus SIGUSR1, and its frame restores the sibling's mask.
+    catch_signal(SIGUSR1, 0);
+    set_mask(own | bit(SIGUSR1));
+    struct sibling job = {.target = 0, .delay_ms = 20, .signals = {SIGUSR1}};
+    pthread_t thread = start_sibling(&job);
+    pthread_join(thread, NULL);
+    expect("handler thread is the sibling", handler_tid, job.tid);
+    expect("handler mask", (long long)handler_mask, (long long)(sa_mask | bit(SIGUSR1)));
+    expect("frame mask", (long long)handler_frame_mask, 0);
+    set_mask(own);
+  } else if (!strcmp(mode, "mt-thread-to-masked")) {
+    // A thread-directed SIGUSR1 to a thread that blocks it stays pending on
+    // that thread, though another thread admits it, and is delivered there
+    // at the unblock.
+    catch_signal(SIGUSR1, 0);
+    set_mask(own | bit(SIGUSR1));
+    struct sibling job = {.target = (pid_t)syscall(SYS_gettid), .signals = {SIGUSR1}};
+    pthread_t thread = start_sibling(&job);
+    pthread_join(thread, NULL);
+    expect("handled while blocked", handled, 0);
+    sigset_t pending;
+    sigpending(&pending);
+    expect("SIGUSR1 pending on the main thread", sigismember(&pending, SIGUSR1), 1);
+    set_mask(own);
+    expect("handler thread is the main thread", handler_tid, job.target);
+    expect("handler mask", (long long)handler_mask, (long long)(own | sa_mask | bit(SIGUSR1)));
+    expect("frame mask", (long long)handler_frame_mask, (long long)own);
+  } else if (!strcmp(mode, "skip-bypass")) {
+    // A caught SIGSYS that the thread blocks, queued to itself with a
+    // kernel si_code (1, SYS_SECCOMP) so that Linux treats it as
+    // synchronous, stays pending through a sched_yield, and its handler runs
+    // once, at the unblock. Under ptrace, Hermit emulates sched_yield and
+    // the backend skips the guest's call; the skip's step takes the queued
+    // SIGSYS, which the backend passes back to the guest unreported, so no
+    // delivery check sees it (A5 step 3.2b).
+    catch_signal(SIGSYS, 0);
+    set_mask(own | bit(SIGSYS));
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    info.si_signo = SIGSYS;
+    info.si_code = 1;
+    info.si_pid = getpid();
+    result = syscall(SYS_rt_tgsigqueueinfo, getpid(), syscall(SYS_gettid), SIGSYS, &info);
+    expect("rt_tgsigqueueinfo", result, 0);
+    expect("sched_yield", syscall(SYS_sched_yield), 0);
+    sigset_t pending;
+    sigpending(&pending);
+    expect("pending after sched_yield", sigismember(&pending, SIGSYS), 1);
+    expect("handled before the unblock", handled, 0);
+    set_mask(own);
+    expect("handler mask", (long long)handler_mask, (long long)(own | sa_mask | bit(SIGSYS)));
+  } else if (!strcmp(mode, "sigreturn-chained-queued") ||
+             !strcmp(mode, "sigreturn-chained-tkill")) {
+    // Two synchronous signals Linux delivers at rt_sigreturn's exit, the
+    // second chained after the first one's frame (on_usr1_queue_two).
+    sigreturn_chained_tkill = !strcmp(mode, "sigreturn-chained-tkill");
+    catch_signal_with(SIGILL, 0, 1);
+    catch_signal_with(SIGFPE, 0, 1);
+    struct sigaction usr1;
+    memset(&usr1, 0, sizeof usr1);
+    usr1.sa_sigaction = on_usr1_queue_two;
+    usr1.sa_flags = SA_SIGINFO;
+    sigemptyset(&usr1.sa_mask);
+    sigaddset(&usr1.sa_mask, SIGILL);
+    sigaddset(&usr1.sa_mask, SIGFPE);
+    expect("sigaction SIGUSR1", sigaction(SIGUSR1, &usr1, NULL), 0);
+    raise(SIGUSR1);
+    expect("handled twice", handled, 2);
+    handled = 1;
+  } else if (!strcmp(mode, "reenter-fault")) {
+    // A SIGUSR1 handler that comes back to its own first instruction, which
+    // faults there: the SIGSEGV stop shows the SIGUSR1 frame's registers,
+    // but the thread ran user code since that frame, so the SIGSEGV is not a
+    // delivery chained at the same exit (A5 step 3.2b part 4).
+    struct sigaction usr1;
+    memset(&usr1, 0, sizeof usr1);
+    usr1.sa_handler = reenter_handler;
+    sigemptyset(&usr1.sa_mask);
+    expect("sigaction SIGUSR1", sigaction(SIGUSR1, &usr1, NULL), 0);
+    struct sigaction segv;
+    memset(&segv, 0, sizeof segv);
+    segv.sa_sigaction = on_reenter_fault;
+    segv.sa_flags = SA_SIGINFO;
+    sigemptyset(&segv.sa_mask);
+    expect("sigaction SIGSEGV", sigaction(SIGSEGV, &segv, NULL), 0);
+    // tgkill by hand, so that r12 holds a readable address at the syscall's
+    // exit, where the kernel delivers SIGUSR1; rt_sigreturn puts r12 back.
+    static long readable;
+    register long r12 __asm__("r12") = (long)&readable;
+    long ret;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "0"((long)SYS_tgkill),
+                       "D"((long)getpid()),
+                       "S"((long)syscall(SYS_gettid)),
+                       "d"((long)SIGUSR1),
+                       "r"(r12)
+                     : "rcx", "r11", "memory");
+    expect("tgkill", ret, 0);
+    expect("fault at the handler's first instruction", fault_at_handler_entry, 1);
+  } else if (!strcmp(mode, "ignored")) {
+    signal(SIGUSR1, SIG_IGN);
+    raise(SIGUSR1);
+    expect("handled", handled, 0);
+  } else {
+    printf("unknown mode %s\n", mode);
+    return 2;
+  }
+  if (strcmp(mode, "ignored")) {
+    expect("handled", handled, 1);
+  }
+  if (failures) {
+    return 1;
+  }
+  printf("OK %s\n", mode);
+  return 0;
+}

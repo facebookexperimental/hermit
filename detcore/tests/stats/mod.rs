@@ -30,7 +30,19 @@ mod non_sanitized_tests {
     use nix::sys::stat::FileStat;
     use nix::unistd;
     use reverie::Errno;
-    use reverie_ptrace::testing::check_fn;
+    // Keep Reverie's original default-config launch, with the real ptrace timer fact.
+    fn check_fn<T, F>(f: F) -> T::GlobalState
+    where
+        T: reverie::Tool + 'static,
+        T::GlobalState: reverie::GlobalTool<Config = detcore::Config>,
+        F: FnOnce(),
+    {
+        reverie_ptrace::testing::check_fn_with_config::<T, F>(
+            f,
+            detcore_testutils::prepare_ptrace_timer_config(Default::default()),
+            true,
+        )
+    }
 
     const FILE_NON_EXIST: *const libc::c_char =
         "/this_file_definitely_dost_not_exist!#\0".as_ptr() as _;

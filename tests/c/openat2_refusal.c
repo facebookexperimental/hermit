@@ -1,12 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/*
  * Backend-parity fixture: deterministic refusal of openat2(2).
  *
  * openat2(2) (Linux 5.6+) is a newer path-resolution syscall that extends

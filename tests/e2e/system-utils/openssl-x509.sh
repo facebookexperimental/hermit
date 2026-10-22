@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # `openssl req -x509 -newkey ec` issues a self-signed X.509 certificate in one
 # shot. That single artifact folds together several native entropy/time channels:
 # the fresh EC private key and the ECDSA signature nonce both come from

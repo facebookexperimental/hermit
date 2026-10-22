@@ -1,10 +1,8 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
 
 //! Receipt publication and the `locally-validated` label
 //! (`publish_receipt_backed_label`, validate.sh:1645).
@@ -137,16 +135,59 @@ fn ci_hub_path() -> Option<std::path::PathBuf> {
     )
 }
 
-/// Resolve the PR: `$PR_NUMBER`, else ask `gh` (through `with-proxy` when
-/// available, because networked `gh` requires it here).
-fn resolve_pr() -> Option<String> {
-    if let Ok(p) = std::env::var("PR_NUMBER") {
-        if !p.is_empty() {
-            return Some(p);
-        }
+/// Where the PR to label comes from, decided without the network.
+#[derive(Debug, PartialEq, Eq)]
+enum PrLookup {
+    /// `$PR_NUMBER` names it.
+    Env(String),
+    /// Ask `gh` for the PR of the checked-out branch.
+    AskGh,
+    /// There can be no PR to label, for this reason.
+    NoPr(&'static str),
+}
+
+/// Decide how to find the PR from `$PR_NUMBER` (PR_ENV), the checked-out branch
+/// (BRANCH, `None` when HEAD is detached) and whether HEAD is already on
+/// `origin/main` (ON_MAIN). `gh pr view --json` is a GraphQL call, and on a
+/// detached HEAD, on `main`, or for a commit already on `origin/main` it can
+/// find no PR, so those cases make no call. Before this, every validate of
+/// main spent one GraphQL request (10-15 a day) that could only fail.
+fn pr_lookup(pr_env: Option<&str>, branch: Option<&str>, on_main: bool) -> PrLookup {
+    if let Some(pr) = pr_env.filter(|pr| !pr.is_empty()) {
+        return PrLookup::Env(pr.to_string());
+    }
+    match branch {
+        None => PrLookup::NoPr("HEAD is detached, so it has no branch PR"),
+        Some("main") => PrLookup::NoPr("main has no PR"),
+        Some(_) if on_main => PrLookup::NoPr("HEAD is already on origin/main"),
+        Some(_) => PrLookup::AskGh,
+    }
+}
+
+fn git_output(args: &[&str]) -> Option<String> {
+    let out = Command::new("git").args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Resolve the PR: `$PR_NUMBER`, else, for a named branch not yet on
+/// `origin/main`, ask `gh` (through `with-proxy` when available, because
+/// networked `gh` requires it here). Err carries why there is no PR.
+fn resolve_pr() -> Result<String, String> {
+    let pr_env = std::env::var("PR_NUMBER").ok();
+    let branch = git_output(&["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    let on_main = Command::new("git")
+        .args(["merge-base", "--is-ancestor", "HEAD", "origin/main"])
+        .status()
+        .is_ok_and(|status| status.success());
+    match pr_lookup(pr_env.as_deref(), branch.as_deref(), on_main) {
+        PrLookup::Env(pr) => return Ok(pr),
+        PrLookup::NoPr(reason) => return Err(reason.into()),
+        PrLookup::AskGh => {}
     }
     if !has_cmd("gh") {
-        return None;
+        return Err("gh is not installed".into());
     }
     let (prog, pre): (&str, &[&str]) = if has_cmd("with-proxy") {
         ("with-proxy", &["gh"])
@@ -159,12 +200,16 @@ fn resolve_pr() -> Option<String> {
             "pr", "view", "--repo", LABEL_REPO, "--json", "number", "-q", ".number",
         ])
         .output()
-        .ok()?;
+        .map_err(|error| format!("gh could not run: {error}"))?;
     if !out.status.success() {
-        return None;
+        return Err("gh found no PR for this branch".into());
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        Err("gh found no PR for this branch".into())
+    } else {
+        Ok(s)
+    }
 }
 
 fn apply_local_label_args(pr: &str) -> [&str; 5] {
@@ -194,11 +239,14 @@ pub fn publish() -> Publication {
         eprintln!("⚠️  counted validation recorded, but {msg}; not applying locally-validated");
         return Publication::Unavailable(msg);
     }
-    let Some(pr) = resolve_pr() else {
-        eprintln!(
-            "⚠️  counted validation recorded, but no PR was found; not applying locally-validated"
-        );
-        return Publication::Unavailable("no PR was found".into());
+    let pr = match resolve_pr() {
+        Ok(pr) => pr,
+        Err(reason) => {
+            eprintln!(
+                "⚠️  counted validation recorded, but no PR was found ({reason}); not applying locally-validated"
+            );
+            return Publication::Unavailable(format!("no PR was found: {reason}"));
+        }
     };
     let status = Command::new(&ci_hub)
         .args(apply_local_label_args(&pr))
@@ -296,7 +344,7 @@ pub fn self_test() -> Result<String, String> {
         ),
         (
             "focused compat profile",
-            eligible(0, 0, true, true, false, "strict-compat-only", "cargo"),
+            eligible(0, 0, true, true, false, "sabre-compat-only", "cargo"),
         ),
         (
             "cell requalification profile",
@@ -339,6 +387,33 @@ pub fn self_test() -> Result<String, String> {
         return Err(format!(
             "receipt: a Buck green must be refused BY THE BUILDER gate, got: {buck_error}"
         ));
+    }
+    // The PR lookup makes no network call where no PR can exist.
+    for (pr_env, branch, on_main, want) in [
+        (Some("42"), None, true, PrLookup::Env("42".into())),
+        (Some(""), Some("feature"), false, PrLookup::AskGh),
+        (None, Some("feature"), false, PrLookup::AskGh),
+        (
+            None,
+            None,
+            false,
+            PrLookup::NoPr("HEAD is detached, so it has no branch PR"),
+        ),
+        (None, Some("main"), true, PrLookup::NoPr("main has no PR")),
+        (None, Some("main"), false, PrLookup::NoPr("main has no PR")),
+        (
+            None,
+            Some("landed"),
+            true,
+            PrLookup::NoPr("HEAD is already on origin/main"),
+        ),
+    ] {
+        let got = pr_lookup(pr_env, branch, on_main);
+        if got != want {
+            return Err(format!(
+                "receipt: pr_lookup({pr_env:?}, {branch:?}, {on_main}) gave {got:?}, want {want:?}"
+            ));
+        }
     }
     accepted += 0;
     Ok(format!(

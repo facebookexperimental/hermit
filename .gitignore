@@ -44,6 +44,8 @@ ci/validate-ledger/
 buck-out/
 /shim/third-party/rust/.cargo/
 /shim/third-party/rust/BUCK
+# scripts/patch-reverie-dbt-buck.rs's atomic write of that BUCK, renamed over it.
+/shim/third-party/rust/.BUCK.*.tmp
 /shim/third-party/rust/vendor/
 /shim/rust-sysroot/
 /.buck2

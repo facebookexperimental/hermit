@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Contract tests for host-visible, checkout-scoped QEMU demo paths."""
 
 import os
@@ -89,10 +83,9 @@ class DefaultQemuAssetsTest(unittest.TestCase):
                 run.assert_not_called()
 
     def test_tmp_checkouts_are_host_visible_and_checkout_scoped(self):
-        with (
-            tempfile.TemporaryDirectory(dir="/tmp") as first,
-            tempfile.TemporaryDirectory(dir="/tmp") as second,
-        ):
+        with tempfile.TemporaryDirectory(dir="/tmp") as first, tempfile.TemporaryDirectory(
+            dir="/tmp"
+        ) as second:
             first_root = Path(first)
             second_root = Path(second)
             first_assets = dc.default_qemu_assets(first_root)
@@ -103,7 +96,9 @@ class DefaultQemuAssetsTest(unittest.TestCase):
             self.assertNotEqual(first_assets, second_assets)
             self.assertEqual(first_assets.parent, Path("/var/tmp"))
             self.assertTrue(
-                first_assets.name.startswith("hermit-demo-qemu-{}-".format(os.getuid()))
+                first_assets.name.startswith(
+                    "hermit-demo-qemu-{}-".format(os.getuid())
+                )
             )
 
     def test_non_tmp_checkout_keeps_repo_local_ignored_directory(self):
@@ -113,10 +108,9 @@ class DefaultQemuAssetsTest(unittest.TestCase):
         self.assertEqual(_shell_default(root_path), expected)
 
     def test_symlinked_tmp_checkout_matches_python_canonicalization(self):
-        with (
-            tempfile.TemporaryDirectory(dir="/tmp") as physical,
-            tempfile.TemporaryDirectory(dir="/tmp") as links,
-        ):
+        with tempfile.TemporaryDirectory(dir="/tmp") as physical, tempfile.TemporaryDirectory(
+            dir="/tmp"
+        ) as links:
             linked_root = Path(links) / "checkout"
             linked_root.symlink_to(physical, target_is_directory=True)
             self.assertEqual(
@@ -228,9 +222,7 @@ class GuestControllerStagingTest(unittest.TestCase):
             with self.subTest(relative=relative):
                 text = (DEMO_DIR / relative).read_text()
                 self.assertIn('stage_guest_controller(run_dir / "controller")', text)
-                self.assertIn(
-                    '"{}:{}".format(controller_dir, GUEST_CONTROLLER_DIR)', text
-                )
+                self.assertIn('"{}:{}".format(controller_dir, GUEST_CONTROLLER_DIR)', text)
                 self.assertIn('str(GUEST_CONTROLLER_DIR / "qemu_controller.py")', text)
                 self.assertNotIn('DEMOS_DIR / "lib", GUEST', text)
 
@@ -243,9 +235,7 @@ class SocketPathBoundTest(unittest.TestCase):
     """
 
     def test_a_path_that_fits_is_returned_unchanged(self):
-        fits = Path(
-            "/runner-state/_work/hermit/hermit/ignored/q/.work/boot-ab/qmp.sock"
-        )
+        fits = Path("/runner-state/_work/hermit/hermit/ignored/q/.work/boot-ab/qmp.sock")
         self.assertLessEqual(len(str(fits).encode()), dc.AF_UNIX_PATH_MAX)
         self.assertEqual(dc.make_socket_path(fits, "boot"), fits)
 
@@ -261,7 +251,9 @@ class SocketPathBoundTest(unittest.TestCase):
             got = dc.make_socket_path(too_long, "boot")
         self.assertNotEqual(got, too_long)
         self.assertLessEqual(len(str(got).encode()), dc.AF_UNIX_PATH_MAX)
-        self.assertEqual(got.parent, Path("/var/tmp/hermit-qmp-{}".format(os.getuid())))
+        self.assertEqual(
+            got.parent, Path("/var/tmp/hermit-qmp-{}".format(os.getuid()))
+        )
         self.assertTrue(got.name.startswith("boot-"))
         self.assertTrue(got.name.endswith(".sock"))
 
@@ -272,7 +264,9 @@ class SocketPathBoundTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("QEMU_SOCKET_DIR", None)
             first = dc.make_socket_path(first_run / "qmp.sock", "boot")
-            self.assertEqual(dc.make_socket_path(first_run / "qmp.sock", "boot"), first)
+            self.assertEqual(
+                dc.make_socket_path(first_run / "qmp.sock", "boot"), first
+            )
             second = dc.make_socket_path(second_run / "qmp.sock", "boot")
         self.assertNotEqual(first, second)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:

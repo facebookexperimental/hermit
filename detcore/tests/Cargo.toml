@@ -1,0 +1,43 @@
+[package]
+name = "hermit-detcore-tests"
+description = "Detcore's integration tests, which drive Detcore under a real tracer; a separate package so hermit-detcore's own unit-test binary does not wait for, and link a second copy of, the hermit-detcore library."
+version = "0.5.1"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+publish = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[[test]]
+name = "tests_misc"
+path = "misc/mod.rs"
+
+[[test]]
+name = "tests_parallelism"
+path = "parallelism/mod.rs"
+
+[[test]]
+name = "tests_time"
+path = "time/mod.rs"
+
+# Every dependency is test-only: this package has no library or binary. The
+# backend crate reverie-ptrace stays in a dev-dependency table, as
+# scripts/check-detcore-backend-abstraction.sh expects of detcore's tests.
+[dev-dependencies]
+chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
+detcore = { package = "hermit-detcore", version = "0.5.1", path = ".." }
+detcore-model = { version = "0.5.1", path = "../../detcore-model" }
+detcore-testutils = { version = "0.5.1", path = "testutils" }
+libc = "0.2.186"
+nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
+pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
+raw-cpuid = "10.7.0"
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "9b1ba3cfbea21152a11b190112757c2274d9bca3" }
+reverie-ptrace = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "9b1ba3cfbea21152a11b190112757c2274d9bca3" }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+tempfile = "3.27.0"
+test-allocator = { version = "0.5.1", path = "../../common/test-allocator" }
+tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }

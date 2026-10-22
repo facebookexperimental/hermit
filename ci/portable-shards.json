@@ -145,13 +145,6 @@
       "nodes": [
         "test.sabre_examples"
       ]
-    },
-    {
-      "slug": "liteinst",
-      "needs": "aux",
-      "nodes": [
-        "test.liteinst_strict"
-      ]
     }
   ]
 }

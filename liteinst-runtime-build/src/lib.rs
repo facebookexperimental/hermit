@@ -1,20 +1,11 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-//! Build-only root that enables the LiteInst preload constructor.
+//! Build-only root that stages the owned LiteInst preload.
 //!
-//! `reverie-liteinst` is outside Hermit's Cargo workspace, so Hermit's normal
-//! dependency edge cannot select features when Cargo builds that package as a
-//! cdylib. This standalone locked graph makes the constructor-bearing runtime
-//! an explicit artifact without linking its constructor into the Hermit host.
+//! The published `reverie-liteinst-preload` leaf owns its allocator and
+//! constructor. This standalone locked graph builds that leaf explicitly
+//! without linking its constructor into the Hermit host.
 
-//! The build script compiles the runtime member in an isolated target directory
-//! and stages the exact cdylib reported by that Cargo invocation.
+//! The build script uses an isolated target directory and stages the exact
+//! current leaf cdylib reported by that Cargo invocation.
 
 #[cfg(test)]
 #[path = "../artifact.rs"]

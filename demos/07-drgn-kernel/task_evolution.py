@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Show how the guest kernel's task list changes across a fixed command.
 
 run.sh passes this file to drgn, which reads the task list from the paused
@@ -11,8 +5,9 @@ guest's memory without running any code inside the guest.
 """
 
 import os
-import sys
 from pathlib import Path
+import subprocess
+import sys
 
 from drgn.helpers.linux.list import list_for_each_entry
 
@@ -22,7 +17,11 @@ ROOT = DEMOS_DIR.parent
 sys.path.insert(0, str(DEMOS_DIR / "lib"))
 
 from demo_common import hermit_binary  # noqa: E402
-from drgn_hermit import GuestConfig, program_from_hermit  # noqa: E402
+from drgn_hermit import (  # noqa: E402
+    GuestConfig,
+    ensure_boot_snapshot,
+    program_from_hermit,
+)
 
 
 ADVANCE_MARKER = b"__HERMIT_DEMO07_ADVANCE_DONE__"
@@ -43,15 +42,33 @@ DEFAULT_ADVANCE_COMMAND = (
 def _required_path(variable: str) -> Path:
     value = os.environ.get(variable)
     if not value:
-        raise RuntimeError(
-            "{} is not set; run demos/07-drgn-kernel/run.sh".format(variable)
-        )
+        raise RuntimeError("{} is not set; run demos/07-drgn-kernel/run.sh".format(variable))
     return Path(value).resolve()
 
 
 def _optional_path(variable: str):
     value = os.environ.get(variable)
     return Path(value).resolve() if value else None
+
+
+def _boot_snapshot_disk() -> Path:
+    """DEMO07_SNAPSHOT_DISK exactly as run.sh gave it, with no symlink resolved.
+
+    Demo 5 writes its record of a boot snapshot next to the name it was given,
+    as <name>.producer.json, and verify_boot_snapshot reads the record next to
+    the name it is given. The check before the first pass
+    (_ensure_boot_snapshot) and the check of each pass's copy
+    (HermitGuestProgram.start, through _config) are both given this one name,
+    so they read the same record, the one demo 6 reads for the same name.
+    Resolving a symlinked name, as _required_path does, would send the check of
+    each copy to a record next to the symlink's target instead.
+    """
+    value = os.environ.get("DEMO07_SNAPSHOT_DISK")
+    if not value:
+        raise RuntimeError(
+            "DEMO07_SNAPSHOT_DISK is not set; run demos/07-drgn-kernel/run.sh"
+        )
+    return Path(value)
 
 
 def _config() -> GuestConfig:
@@ -62,13 +79,46 @@ def _config() -> GuestConfig:
         kernel=_required_path("DEMO07_KERNEL"),
         initrd=_required_path("DEMO07_INITRD"),
         vmlinux=_required_path("DEMO07_VMLINUX"),
-        snapshot_disk=_required_path("DEMO07_SNAPSHOT_DISK"),
+        snapshot_disk=_boot_snapshot_disk(),
         snapshot_name=os.environ.get("DEMO07_SNAPSHOT_NAME", "hermit-boot"),
         advance_command=DEFAULT_ADVANCE_COMMAND,
         artifact_dir=_required_path("DEMO07_ARTIFACTS"),
+        assets=_required_path("DEMO07_ASSETS"),
         qemu_bios=_optional_path("DEMO07_QEMU_BIOS"),
         qemu_library_path=_optional_path("DEMO07_QEMU_LIBRARY_PATH"),
         timeout=float(os.environ.get("DEMO07_TIMEOUT", "240")),
+    )
+
+
+def _rebuild_boot_snapshot() -> None:
+    """Run demo 5, which saves the default boot snapshot and its record."""
+    environment = dict(os.environ, QEMU_ASSETS=os.environ["DEMO07_ASSETS"])
+    subprocess.run(
+        ["make", "--no-print-directory", "-C", str(DEMOS_DIR), "demo5"],
+        cwd=str(ROOT),
+        env=environment,
+        check=True,
+    )
+
+
+def _ensure_boot_snapshot() -> None:
+    """Check demo 5's boot snapshot before any pass restores it.
+
+    The paths are compared as run.sh gave them, so the default snapshot,
+    $DEMO07_ASSETS/hermit-boot.qcow2, is rebuilt and any other is refused. The
+    snapshot is named by _boot_snapshot_disk, the name every pass's check of its
+    copy uses too.
+    """
+    for variable in ("DEMO07_SNAPSHOT_DISK", "DEMO07_ASSETS"):
+        if not os.environ.get(variable):
+            raise RuntimeError(
+                "{} is not set; run demos/07-drgn-kernel/run.sh".format(variable)
+            )
+    ensure_boot_snapshot(
+        _boot_snapshot_disk(),
+        ROOT,
+        Path(os.environ["DEMO07_ASSETS"]),
+        _rebuild_boot_snapshot,
     )
 
 
@@ -129,7 +179,8 @@ def _print_tasks(label, rows, limit):
     for pid, comm in shown:
         print("  {:5d} {}".format(pid, comm))
     if len(rows) > limit:
-        print("  ... {} unchanged rows omitted from display".format(len(rows) - limit))
+        # Only counted: a row not shown can be in the task-list diff.
+        print("  ... {} rows omitted from display".format(len(rows) - limit))
 
 
 def _print_diff(removed, added):
@@ -149,6 +200,8 @@ def main() -> int:
         raise ValueError("DEMO07_RUNS must be at least 2 to prove reproducibility")
     if task_limit < 1:
         raise ValueError("DEMO07_TASK_LIMIT must be positive")
+    # Every pass restores a copy of this snapshot; start() checks each copy.
+    _ensure_boot_snapshot()
 
     baseline = None
     all_metrics = []

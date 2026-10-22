@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Regression fixture for `rust_script_prelude::init` SIGPIPE handling.
 //!
 //! Compiled by `scripts/check-script-sigpipe.sh` with a plain `rustc` (no

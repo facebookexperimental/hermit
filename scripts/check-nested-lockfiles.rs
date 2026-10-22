@@ -6,7 +6,6 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-
 //! Fail fast when a *nested* Cargo workspace's `Cargo.lock` is stale relative to
 //! its own manifest, before the opaque `--locked` build failure downstream.
 //!
@@ -428,6 +427,11 @@ mod tests {
             .expect("read production fetch retry helper");
         write_executable(&root.join("ci/hermetic/retry-fetch.sh"), &retry);
         write_executable(&root.join("ci/prepare-rust-scripts.sh"), &prepare);
+        // The producer runs its cargo builds through this wrapper, which execs
+        // or, on a compiler crash, reruns them once.
+        let crash_retry = fs::read_to_string(source_root.join("ci/retry-on-compiler-crash.sh"))
+            .expect("read production compiler-crash retry wrapper");
+        write_executable(&root.join("ci/retry-on-compiler-crash.sh"), &crash_retry);
 
         fs::write(
             root.join("ci/portable-shards.json"),

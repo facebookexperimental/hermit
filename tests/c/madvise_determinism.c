@@ -54,10 +54,8 @@ static int check_shared_coherence(int fd, size_t page_size) {
   unsigned char* shared = mmap(NULL, page_size, PROT_READ, MAP_SHARED, fd, 0);
   if (shared == MAP_FAILED || pwrite(fd, "B", 1, 0) != 1 ||
       madvise(shared, page_size, MADV_DONTNEED) != 0 || shared[0] != 'B') {
-    fprintf(
-        stderr,
-        "shared MADV_DONTNEED read %c, not B\n",
-        shared == MAP_FAILED ? '?' : shared[0]);
+    fprintf(stderr, "shared MADV_DONTNEED read %c, not B\n",
+            shared == MAP_FAILED ? '?' : shared[0]);
     return 2;
   }
   if (munmap(shared, page_size) != 0 || close(fd) != 0) {
@@ -95,17 +93,13 @@ static int check_semantic_advice(
   file_mapping[1] = original ^ 0xff;
   if (madvise(file_mapping, page_size, MADV_DONTNEED) != 0 ||
       file_mapping[1] != original) {
-    fprintf(
-        stderr,
-        "file MADV_DONTNEED read %d, not %d\n",
-        file_mapping[1],
-        original);
+    fprintf(stderr, "file MADV_DONTNEED read %d, not %d\n", file_mapping[1],
+            original);
     return 4;
   }
 
   /* The same for a read-only file mapping. */
-  unsigned char* read_only =
-      mmap(NULL, page_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  unsigned char* read_only = mmap(NULL, page_size, PROT_READ, MAP_PRIVATE, fd, 0);
   if (read_only == MAP_FAILED) {
     return 5;
   }
@@ -123,8 +117,7 @@ static int check_semantic_advice(
 
   /* The same after a write through the descriptor, for a memfd and for a
    * regular file. */
-  if (check_shared_coherence(
-          memfd_create("madvise_determinism", 0), page_size)) {
+  if (check_shared_coherence(memfd_create("madvise_determinism", 0), page_size)) {
     return 14;
   }
   char temp_path[] = "/tmp/madvise_determinism.XXXXXX";
@@ -146,20 +139,11 @@ static int check_semantic_advice(
    * page that follows it. A child sees the wiped anonymous page and the
    * file page's contents. */
   unsigned char* mixed = mmap(
-      NULL,
-      2 * page_size,
-      PROT_READ | PROT_WRITE,
-      MAP_PRIVATE | MAP_ANONYMOUS,
-      -1,
-      0);
+      NULL, 2 * page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+      -1, 0);
   if (mixed == MAP_FAILED ||
-      mmap(
-          mixed + page_size,
-          page_size,
-          PROT_READ | PROT_WRITE,
-          MAP_PRIVATE | MAP_FIXED,
-          fd,
-          0) == MAP_FAILED) {
+      mmap(mixed + page_size, page_size, PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) {
     return 7;
   }
   mixed[0] = 0x33;
@@ -180,9 +164,63 @@ static int check_semantic_advice(
     return 10;
   }
 
-  if (munmap(mixed, 2 * page_size) != 0 || munmap(read_only, page_size) != 0 ||
+  if (munmap(mixed, 2 * page_size) != 0 ||
+      munmap(read_only, page_size) != 0 ||
       munmap(file_mapping, page_size) != 0 || close(fd) != 0) {
     return 11;
+  }
+  return 0;
+}
+
+/* KVM implements MADV_DONTNEED for anonymous memory: private pages read back
+ * as zeros and shared ones keep their contents. It refuses the advice with
+ * ENOSYS, changing nothing, for a private file copy it cannot read again, and
+ * still refuses the other guest-visible advice. */
+static int check_kvm_advice(
+    const char* path,
+    unsigned char* anonymous,
+    size_t page_size) {
+  anonymous[0] = 0x5a;
+  if (madvise(anonymous, page_size, MADV_DONTNEED) != 0 || anonymous[0] != 0) {
+    fprintf(stderr, "KVM anonymous MADV_DONTNEED kept %d\n", anonymous[0]);
+    return 1;
+  }
+  unsigned char* shared = mmap(
+      NULL,
+      page_size,
+      PROT_READ | PROT_WRITE,
+      MAP_SHARED | MAP_ANONYMOUS,
+      -1,
+      0);
+  if (shared == MAP_FAILED) {
+    return 2;
+  }
+  shared[0] = 0x6b;
+  if (madvise(shared, page_size, MADV_DONTNEED) != 0 || shared[0] != 0x6b) {
+    fprintf(stderr, "KVM shared anonymous MADV_DONTNEED read %d\n", shared[0]);
+    return 3;
+  }
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    return 4;
+  }
+  unsigned char* file_mapping =
+      mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+  if (file_mapping == MAP_FAILED) {
+    return 5;
+  }
+  const unsigned char changed = file_mapping[1] ^ 0xff;
+  file_mapping[1] = changed;
+  if (expect_errno(file_mapping, page_size, MADV_DONTNEED, ENOSYS) ||
+      file_mapping[1] != changed) {
+    return 6;
+  }
+  if (expect_errno(anonymous, page_size, MADV_DONTFORK, ENOSYS)) {
+    return 7;
+  }
+  if (munmap(file_mapping, page_size) != 0 || munmap(shared, page_size) != 0 ||
+      close(fd) != 0) {
+    return 8;
   }
   return 0;
 }
@@ -218,7 +256,7 @@ int main(int argc, char** argv) {
   }
 
   if (kvm) {
-    if (expect_errno(anonymous, page_size, MADV_DONTNEED, ENOSYS)) {
+    if (check_kvm_advice(argv[0], anonymous, page_size)) {
       return 14;
     }
   } else if (check_semantic_advice(argv[0], anonymous, page_size)) {

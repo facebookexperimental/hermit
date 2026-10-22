@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /* fd-hygiene: the first guest-opened descriptor is the lowest free number (3,
  * after stdin/stdout/stderr). Regresses that e9patch preprocessing does not
  * leak an extra open descriptor (the e9loader closes its self-fd). */

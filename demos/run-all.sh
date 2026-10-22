@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Run the selected Hermit demos, with one log and one summary row per demo.
 # Exits 1 if any selected demo fails; a demo that exits 0 without printing its
 # own SUCCESS line has failed. Otherwise it exits 4 if it could not

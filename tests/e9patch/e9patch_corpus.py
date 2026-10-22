@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Ratchet e9patch preprocessing parity against the golden ptrace backend.
 
 e9patch is binary-rewriting *preprocessing* for the ptrace backend, not a

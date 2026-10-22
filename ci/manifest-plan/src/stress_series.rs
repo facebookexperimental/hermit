@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Shared serialized type for `stress-series` rows.
 //!
 //! Hermit owns the artifact consumed by the compatibility scorecard. The
@@ -185,6 +177,11 @@ pub enum SeriesNoVerdictKind {
     NotRun,
     FirstRunRejected,
     ContainerFailed,
+    /// Hermit started a verification run and a typed failure of it stopped the
+    /// run (`run_failed`: a backend failure, a recorded determinism loss or a
+    /// policy refusal of the guest). The runner types the attempt FAIL, a
+    /// crash-error red, exactly as for `first_run_rejected`.
+    RunFailed,
     InfrastructureError,
     MissingReportTimeout,
     NoncanonicalMatch,
@@ -198,6 +195,25 @@ pub enum SeriesNoVerdictKind {
     /// crash-error red, retained beside its siblings instead of refusing the
     /// whole run.
     FailedMatch,
+    /// A matched comparison report from an attempt the runner timed out. The
+    /// guest process ran to completion and its two runs agreed, but its CPU
+    /// charge reached the cell's remaining budget at the final wait, or the
+    /// wall deadline killed it after the report was written, so the runner
+    /// typed the attempt as a timeout. The timeout is the result, or the row
+    /// has none when a non-product cell error kind decides it. The match is
+    /// retained by its report digest and earns no credit; without this kind
+    /// the row, and every sibling attempt with it, would be refused.
+    TimedOutMatch,
+    /// A canonical match from a SaBRe verify attempt whose run did not stay
+    /// on SaBRe's own path: its execution-path evidence is incomplete, or the
+    /// run used ptrace fallback or trusted native sites. The attempt passed,
+    /// but the runner then fails the passed cell
+    /// (`runner::execution_path_ineligible`) and types it a crash-error,
+    /// although nothing crashed. Hermit's readers give such a row no verdict,
+    /// so the match is retained by its report digest, earns no credit and
+    /// projects without a result; without this kind the row would be
+    /// refused.
+    IneligibleExecutionPath,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -306,10 +322,40 @@ pub struct SeriesPressureComparison {
 }
 
 impl SeriesPressureAttempt {
+    /// A timed-out attempt never passes and never decides a product verdict.
+    /// Hermit's runner types a CellResult that retains one as a timeout, or
+    /// leaves it without a result when a non-product error kind decides the
+    /// cell (`runner::observed_result_from_typed_evidence`), and refines
+    /// either to sandbox-denied or infrastructure-error when an attempt's
+    /// output shows an environmental block (`runner::observed_result`).
+    /// `validate_pressure_evidence`, `validate_declared_guest_exit` and
+    /// pressure-test.rs's `checked_inner_pressure_history` hold the attempts
+    /// they judge to this one rule, whatever a timed-out attempt's report says
+    /// and whether it wrote one. Other readers of retained attempts do not
+    /// apply it yet.
+    pub fn require_result_supported_by_timeouts(
+        attempts: &[SeriesPressureAttempt],
+        result: Option<ObservedResult>,
+    ) -> Result<(), String> {
+        require_result_supported_by_timeout(
+            attempts.iter().any(|attempt| attempt.timed_out),
+            result,
+        )
+    }
+
     /// Validate one retained invocation without changing its framework outcome.
     /// Callers that have original report bytes must additionally validate their
     /// digest and report semantics before constructing these compact facts.
-    pub fn validate_for_mode(&self, mode: &str) -> Result<(), String> {
+    ///
+    /// `declared` is the cell's `expected_guest_exit`, if it has one. A matched
+    /// verify invocation may then also end with exactly that disposition as
+    /// Hermit reports it ([`ExpectedGuestExit::hermit_status_matches`]). A
+    /// declaration the runner itself would refuse accepts nothing more.
+    pub fn validate_for_mode(
+        &self,
+        mode: &str,
+        declared: Option<&ExpectedGuestExit>,
+    ) -> Result<(), String> {
         let comparison_mode = matches!(mode, "verify" | "replay" | "chaos");
         if !matches!(self.outcome.as_str(), "PASS" | "FAIL" | "ERROR") {
             return Err("pressure_evidence has an unsupported inner outcome".into());
@@ -375,13 +421,38 @@ impl SeriesPressureAttempt {
         if comparison.verdict != Verdict::NoResult && comparison.no_result_kind.is_some() {
             return Err("pressure_evidence comparison carries an unrelated no_result_kind".into());
         }
+        // A match from an attempt the runner timed out is that timeout, never
+        // a canonical pass: see `SeriesNoVerdictKind::TimedOutMatch`.
+        let timed_out_match = !comparison.canonical
+            && self.timed_out
+            && matches!(self.outcome.as_str(), "FAIL" | "ERROR")
+            && matches!(
+                self.error_kind.as_deref(),
+                Some("cpu-timeout" | "wall-timeout")
+            )
+            && self.status.is_some() != self.signal.is_some();
         let valid = match comparison.verdict {
             Verdict::Matched => {
-                completed_pass
-                    && self.signal.is_none()
+                let ordinary_exit = self.signal.is_none()
                     && self
                         .status
-                        .is_some_and(|status| mode == "chaos" || status == 0)
+                        .is_some_and(|status| mode == "chaos" || status == 0);
+                let declared_exit = declared.is_some_and(|declared| {
+                    validate_expected_guest_exit("declared_guest_exit", mode, Some(declared))
+                        .is_ok()
+                        && declared.hermit_status_matches(self.status, self.signal)
+                });
+                // A match the runner failed by its declared exit or stdout
+                // (`SeriesNoVerdictKind::FailedMatch`): the crash-error red,
+                // retained as a non-canonical match, never a pass.
+                let failed_match = !comparison.canonical
+                    && self.outcome == "FAIL"
+                    && !self.timed_out
+                    && self.error_kind.is_none()
+                    && self.status.is_some() != self.signal.is_some();
+                timed_out_match
+                    || failed_match
+                    || (completed_pass && (ordinary_exit || declared_exit))
             }
             Verdict::Diverged => {
                 self.outcome == "FAIL"
@@ -433,6 +504,13 @@ impl SeriesPressureAttempt {
                         && self.status == Some(125)
                         && self.signal.is_none()
                 }
+                Some(SeriesNoVerdictKind::RunFailed) => {
+                    self.outcome == "FAIL"
+                        && !self.timed_out
+                        && self.error_kind.is_none()
+                        && self.status.is_some_and(|status| status > 0)
+                        && self.signal.is_none()
+                }
                 _ => false,
             },
         };
@@ -444,6 +522,30 @@ impl SeriesPressureAttempt {
         }
         Ok(())
     }
+}
+
+/// The rule behind [`SeriesPressureAttempt::require_result_supported_by_timeouts`],
+/// shared by every retained attempt list a row carries. It needs only
+/// whether any retained attempt timed out, so a reader can apply it before
+/// it has read the rest of those attempts.
+pub fn require_result_supported_by_timeout(
+    any_timed_out: bool,
+    result: Option<ObservedResult>,
+) -> Result<(), String> {
+    let supported = matches!(
+        result,
+        None | Some(
+            ObservedResult::Timeout
+                | ObservedResult::SandboxDenied
+                | ObservedResult::InfrastructureError
+        )
+    );
+    if any_timed_out && !supported {
+        return Err(format!(
+            "retains a timed-out attempt, which contradicts result {result:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn is_prelaunch_timeout_disposition(disposition: &SeriesAttemptDisposition) -> bool {
@@ -527,6 +629,11 @@ pub struct SeriesPayload {
     /// derivable from the machine name or kernel version.
     #[serde(default)]
     pub host_capabilities: Option<HostCapabilities>,
+    /// How the observed cell ran: its strictness level and Hermit settings
+    /// (`runner::CellResult::strictness`). Absent means not recorded, never
+    /// "strict": a reader must not infer it from the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strictness: Option<crate::runner::CellStrictness>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -888,7 +995,13 @@ impl SeriesRow {
                     .into(),
             );
         }
-        Ok(())
+        // A timed-out sibling of a declared pass is still a timed-out attempt
+        // of this cell, whatever its outcome label says.
+        require_result_supported_by_timeout(
+            declared.attempts.iter().any(|attempt| attempt.timed_out),
+            self.series.result,
+        )
+        .map_err(|error| format!("declared_guest_exit {error}"))
     }
 
     fn validate_pressure_evidence(&self, evidence: &SeriesPressureEvidence) -> Result<(), String> {
@@ -921,13 +1034,29 @@ impl SeriesRow {
             return Err("pressure_evidence.attempts must retain a nonempty inner history".into());
         }
         let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        let declared = self
+            .series
+            .declared_guest_exit
+            .as_ref()
+            .map(|declared| ExpectedGuestExit {
+                code: declared.code,
+                signal: declared.signal,
+                reason: declared.reason.clone(),
+            });
         let mut indices = std::collections::BTreeSet::new();
         for attempt in &evidence.attempts {
             if attempt.index.trim().is_empty() || !indices.insert(&attempt.index) {
                 return Err("pressure_evidence attempt indices must be nonempty and unique".into());
             }
-            attempt.validate_for_mode(mode)?;
+            attempt.validate_for_mode(mode, declared.as_ref())?;
         }
+        // The same rule as the no-verdict timeout dispositions below, also
+        // when the row carries no no_verdict_evidence to cross-check.
+        SeriesPressureAttempt::require_result_supported_by_timeouts(
+            &evidence.attempts,
+            self.series.result,
+        )
+        .map_err(|error| format!("pressure_evidence {error}"))?;
         if let Some(other) = &self.series.no_verdict_evidence {
             for disposition in &other.attempts {
                 let retained = evidence
@@ -941,11 +1070,14 @@ impl SeriesRow {
                         let (verdict, no_result_kind) = match kind {
                             SeriesNoVerdictKind::Unspecified | SeriesNoVerdictKind::ComparisonRefused
                             | SeriesNoVerdictKind::NotRun | SeriesNoVerdictKind::FirstRunRejected
-                            | SeriesNoVerdictKind::ContainerFailed =>
+                            | SeriesNoVerdictKind::ContainerFailed
+                            | SeriesNoVerdictKind::RunFailed =>
                                 (Verdict::NoResult, Some(kind)),
                             SeriesNoVerdictKind::InfrastructureError => (Verdict::InfrastructureError, None),
                             SeriesNoVerdictKind::NoncanonicalMatch
-                            | SeriesNoVerdictKind::FailedMatch => (Verdict::Matched, None),
+                            | SeriesNoVerdictKind::FailedMatch
+                            | SeriesNoVerdictKind::TimedOutMatch
+                            | SeriesNoVerdictKind::IneligibleExecutionPath => (Verdict::Matched, None),
                             SeriesNoVerdictKind::NoncanonicalDivergence => (Verdict::Diverged, None),
                             SeriesNoVerdictKind::MissingReportTimeout =>
                                 return Err("pressure_evidence supplied a report for a missing-report disposition".into()),
@@ -974,6 +1106,8 @@ impl SeriesRow {
         }
         // Inner history explains qualification; it never rewrites the exact
         // framework result, including a retained PASS with an adverse subrun.
+        // The timed-out-attempt rule above rewrites nothing: it refuses a result
+        // the runner cannot type for the CellResult it retains.
         Ok(())
     }
 
@@ -1148,6 +1282,21 @@ impl SeriesRow {
                         );
                     }
                 }
+                SeriesNoVerdictKind::RunFailed => {
+                    if disposition.attempt_outcome != "FAIL"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || disposition.status.is_none_or(|status| status <= 0)
+                        || disposition.signal.is_some()
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "run_failed evidence must carry attempt outcome FAIL, no error_kind, a nonzero status without signal, timed_out=false, a verification report, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
                 SeriesNoVerdictKind::ContainerFailed => {
                     if disposition.attempt_outcome != "FAIL"
                         || disposition.disposition != SeriesOutcome::NoResult
@@ -1288,6 +1437,76 @@ impl SeriesRow {
                         );
                     }
                     saw_timeout = true;
+                }
+                SeriesNoVerdictKind::TimedOutMatch => {
+                    // A timeout never lets the runner pass an attempt, so a
+                    // timed-out match is a FAIL, or an ERROR when the runner
+                    // also refused the report's comparison policy; the
+                    // timeout then replaces the error kind. The process ended
+                    // and was reaped, so exactly one status or signal is
+                    // known, and a status of 0 is the ordinary case.
+                    if !matches!(disposition.attempt_outcome.as_str(), "FAIL" | "ERROR")
+                        || disposition.disposition != SeriesOutcome::Timeout
+                        || !disposition.timed_out
+                        || !matches!(
+                            disposition.error_kind.as_deref(),
+                            Some("cpu-timeout" | "wall-timeout")
+                        )
+                        || disposition.status.is_some() == disposition.signal.is_some()
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "timed_out_match evidence must carry attempt outcome FAIL or ERROR, error_kind cpu-timeout or wall-timeout, exactly one status or signal, timed_out=true, a verification report, and timeout disposition"
+                                .into(),
+                        );
+                    }
+                    saw_timeout = true;
+                }
+                SeriesNoVerdictKind::IneligibleExecutionPath => {
+                    // The runner judges the execution path only after a cell
+                    // passed, so the attempt is a completed pass: exit 0, or
+                    // the declared guest exit as Hermit reports it. Only a
+                    // SaBRe run writes path evidence, and these rows are
+                    // verify cells, which a crash-error result then records.
+                    let backend = self.series.cell.rsplit('/').next().unwrap_or_default();
+                    let passed_exit = match &self.series.declared_guest_exit {
+                        None => disposition.status == Some(0) && disposition.signal.is_none(),
+                        Some(declared) => {
+                            // This runs before validate_declared_guest_exit,
+                            // so check the declaration before matching: a
+                            // declaration the runner itself would refuse
+                            // accepts nothing, and an out-of-range signal
+                            // would overflow the match's `128 + signal`.
+                            let expected = ExpectedGuestExit {
+                                code: declared.code,
+                                signal: declared.signal,
+                                reason: declared.reason.clone(),
+                            };
+                            validate_expected_guest_exit(
+                                "declared_guest_exit",
+                                mode,
+                                Some(&expected),
+                            )
+                            .is_ok()
+                                && expected
+                                    .hermit_status_matches(disposition.status, disposition.signal)
+                        }
+                    };
+                    if disposition.attempt_outcome != "PASS"
+                        || disposition.disposition != SeriesOutcome::Errored
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || !passed_exit
+                        || disposition.verification_report_sha256.is_none()
+                        || mode != "verify"
+                        || backend != "sabre"
+                        || self.series.result != Some(ObservedResult::CrashError)
+                    {
+                        return Err(
+                            "ineligible_execution_path evidence must carry attempt outcome PASS, no error_kind, exit 0 or the declared guest exit, timed_out=false, a verification report, errored disposition, a SaBRe verify cell, and a crash-error result"
+                                .into(),
+                        );
+                    }
                 }
             }
         }
@@ -1511,6 +1730,7 @@ mod tests {
                         },
                     ),
                 ])),
+                strictness: None,
             },
         }
     }
@@ -1716,6 +1936,82 @@ mod tests {
         let mut encoded = serde_json::to_value(base()).unwrap();
         encoded["series"]["declared_guest_exit"]["note"] = "x".into();
         assert!(serde_json::from_value::<SeriesRow>(encoded).is_err());
+    }
+
+    #[test]
+    fn declared_guest_exit_holds_a_timed_out_sibling_to_the_timeout_rule() {
+        // The runner never passes a timed-out attempt and types the cell as a
+        // timeout, so a declared pass beside a timed-out sibling cannot make
+        // the row a pass or a red, whichever order the attempts ran in.
+        for sibling_outcome in ["FAIL", "ERROR"] {
+            for sibling_first in [false, true] {
+                let with_sibling = |mut fixture: SeriesRow| {
+                    let sibling = SeriesDeclaredGuestExitAttempt {
+                        index: "2".into(),
+                        outcome: sibling_outcome.into(),
+                        status: None,
+                        signal: Some(9),
+                        timed_out: true,
+                        verification_report_sha256: Some("e".repeat(64)),
+                    };
+                    let attempts = &mut declared(&mut fixture).attempts;
+                    if sibling_first {
+                        attempts.insert(0, sibling);
+                    } else {
+                        attempts.push(sibling);
+                    }
+                    fixture
+                };
+                let label = format!("{sibling_outcome} sibling, first={sibling_first}");
+
+                let passed = with_sibling(declared_exit_row(Some(7), None, Some(7), None));
+                let mut diverged = with_sibling(declared_exit_row(Some(7), None, Some(7), None));
+                diverged.series.outcome = SeriesOutcome::Diverged;
+                diverged.series.result = Some(ObservedResult::DeterminismFailure);
+                diverged.series.failure_class = Some(FailureClass::ProductFailure);
+                for (fixture, result) in [
+                    (&passed, "Some(Pass)"),
+                    (&diverged, "Some(DeterminismFailure)"),
+                ] {
+                    let message = format!(
+                        "declared_guest_exit retains a timed-out attempt, which contradicts result {result}"
+                    );
+                    for error in [
+                        fixture.validate_for_write(),
+                        fixture.validate_for_read(),
+                        fixture.validate_for_projection(),
+                    ] {
+                        let error = error.expect_err(&format!("{label}, {result} was admitted"));
+                        assert!(error.contains(&message), "{label}: {error}");
+                    }
+                }
+
+                // The same attempts under the runner's timeout are admitted.
+                let mut timeout = with_sibling(declared_exit_row(Some(7), None, Some(7), None));
+                timeout.series.outcome = SeriesOutcome::Timeout;
+                timeout.series.result = Some(ObservedResult::Timeout);
+                timeout.series.failure_class = Some(FailureClass::NoResult);
+                let mut evidence = no_verdict_row().series.no_verdict_evidence.unwrap();
+                let disposition = &mut evidence.attempts[0];
+                disposition.index = "2".into();
+                disposition.kind = SeriesNoVerdictKind::TimedOutMatch;
+                disposition.attempt_outcome = sibling_outcome.into();
+                disposition.disposition = SeriesOutcome::Timeout;
+                disposition.error_kind = Some("wall-timeout".into());
+                disposition.status = None;
+                disposition.signal = Some(9);
+                disposition.timed_out = true;
+                disposition.verification_report_sha256 = Some("e".repeat(64));
+                timeout.series.no_verdict_evidence = Some(evidence);
+                for admitted in [
+                    timeout.validate_for_write(),
+                    timeout.validate_for_read(),
+                    timeout.validate_for_projection(),
+                ] {
+                    admitted.unwrap_or_else(|error| panic!("{label}: {error}"));
+                }
+            }
+        }
     }
 
     #[test]
@@ -2337,6 +2633,590 @@ mod tests {
         }
     }
 
+    /// A matched report from an attempt the runner failed by its declared
+    /// exit or stdout (a failed match) is retained in pressure evidence as a
+    /// match that is not canonical, from a FAIL attempt with no error kind and
+    /// one process disposition; it never stands for a pass.
+    #[test]
+    fn failed_match_pressure_evidence_is_a_non_canonical_failed_attempt() {
+        let failed = SeriesPressureAttempt {
+            index: "1".into(),
+            outcome: "FAIL".into(),
+            error_kind: None,
+            status: Some(0),
+            signal: None,
+            timed_out: false,
+            comparison: Some(SeriesPressureComparison {
+                verdict: Verdict::Matched,
+                canonical: false,
+                report_sha256: "c".repeat(64),
+                no_result_kind: None,
+            }),
+        };
+        for mode in ["verify", "replay", "chaos"] {
+            failed.validate_for_mode(mode, None).unwrap();
+        }
+        let mut nonzero = failed.clone();
+        nonzero.status = Some(3);
+        nonzero.validate_for_mode("verify", None).unwrap();
+        type InnerEdit = fn(&mut SeriesPressureAttempt);
+        let refused: [(&str, InnerEdit); 5] = [
+            ("canonical", |a| {
+                a.comparison.as_mut().unwrap().canonical = true
+            }),
+            ("error kind", |a| {
+                a.error_kind = Some("infrastructure".into())
+            }),
+            ("no process disposition", |a| a.status = None),
+            ("status and signal", |a| a.signal = Some(9)),
+            ("attempt ERROR", |a| a.outcome = "ERROR".into()),
+        ];
+        for (label, edit) in refused {
+            let mut bad = failed.clone();
+            edit(&mut bad);
+            assert!(
+                bad.validate_for_mode("verify", None).is_err(),
+                "{label}: admitted"
+            );
+        }
+    }
+
+    /// A matched report from an attempt the runner timed out, as in a chaos
+    /// cell whose last seed exited 0 just as the cell's CPU budget ran out:
+    /// admitted as the timeout in exactly the runner's shape, refused in
+    /// every other.
+    #[test]
+    fn timed_out_match_evidence_is_the_timeout_and_nothing_else() {
+        let timed_out_match = || {
+            let mut fixture = no_verdict_row();
+            fixture.series.cell = "fixture/test/chaos/ptrace".into();
+            fixture.series.outcome = SeriesOutcome::Timeout;
+            fixture.series.result = Some(ObservedResult::Timeout);
+            let disposition = attempt(&mut fixture);
+            disposition.kind = SeriesNoVerdictKind::TimedOutMatch;
+            disposition.attempt_outcome = "FAIL".into();
+            disposition.disposition = SeriesOutcome::Timeout;
+            disposition.error_kind = Some("cpu-timeout".into());
+            disposition.status = Some(0);
+            disposition.timed_out = true;
+            fixture
+        };
+        fn attempt(row: &mut SeriesRow) -> &mut SeriesAttemptDisposition {
+            &mut row.series.no_verdict_evidence.as_mut().unwrap().attempts[0]
+        }
+        type Edit = fn(&mut SeriesRow);
+        fn no_result(row: &mut SeriesRow) {
+            row.series.outcome = SeriesOutcome::NoResult;
+            row.series.result = None;
+            row.series.failure_class = Some(FailureClass::NoResult);
+        }
+        let admitted: [(&str, Edit); 8] = [
+            ("chaos, exit 0, cpu-timeout", |_| {}),
+            // The runner leaves a cell without a result when a non-product
+            // error kind decides it, timed-out attempts or not.
+            ("no-result row", no_result),
+            ("verify cell", |row| {
+                row.series.cell = "fixture/test/verify/ptrace".into()
+            }),
+            ("replay cell", |row| {
+                row.series.cell = "fixture/test/replay/ptrace".into()
+            }),
+            ("wall-timeout", |row| {
+                attempt(row).error_kind = Some("wall-timeout".into())
+            }),
+            ("killed after the report", |row| {
+                let disposition = attempt(row);
+                disposition.error_kind = Some("wall-timeout".into());
+                disposition.status = None;
+                disposition.signal = Some(9);
+            }),
+            ("refused comparison policy", |row| {
+                attempt(row).attempt_outcome = "ERROR".into()
+            }),
+            ("nonzero chaos status", |row| attempt(row).status = Some(3)),
+        ];
+        for (label, edit) in admitted {
+            let mut row = timed_out_match();
+            edit(&mut row);
+            row.validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            let raw = serde_json::to_value(&row).unwrap();
+            assert_eq!(
+                raw["series"]["no_verdict_evidence"]["attempts"][0]["kind"], "timed_out_match",
+                "{label}"
+            );
+            let decoded: SeriesRow = serde_json::from_value(raw).unwrap();
+            decoded
+                .validate_for_read()
+                .unwrap_or_else(|error| panic!("{label}: read: {error}"));
+        }
+
+        const SHAPE: &str = "timed_out_match evidence must carry";
+        let refused: [(&str, Edit, &str); 12] = [
+            (
+                "attempt PASS",
+                |row| attempt(row).attempt_outcome = "PASS".into(),
+                SHAPE,
+            ),
+            ("not timed out", |row| attempt(row).timed_out = false, SHAPE),
+            ("no error kind", |row| attempt(row).error_kind = None, SHAPE),
+            (
+                "infrastructure error kind",
+                |row| attempt(row).error_kind = Some("infrastructure".into()),
+                SHAPE,
+            ),
+            (
+                "refused-evidence error kind",
+                |row| attempt(row).error_kind = Some("incomplete-verification-evidence".into()),
+                SHAPE,
+            ),
+            (
+                "no process disposition",
+                |row| attempt(row).status = None,
+                SHAPE,
+            ),
+            (
+                "no verification report",
+                |row| attempt(row).verification_report_sha256 = None,
+                SHAPE,
+            ),
+            (
+                "no_result disposition",
+                |row| attempt(row).disposition = SeriesOutcome::NoResult,
+                SHAPE,
+            ),
+            (
+                "errored disposition",
+                |row| attempt(row).disposition = SeriesOutcome::Errored,
+                SHAPE,
+            ),
+            (
+                "status and signal",
+                |row| attempt(row).signal = Some(9),
+                "status/signal disposition is invalid",
+            ),
+            (
+                "detail",
+                |row| attempt(row).detail = Some("cell exceeded 46 CPU s".into()),
+                "only comparison_refused and failed_match evidence may carry detail",
+            ),
+            (
+                "crash-error row",
+                |row| {
+                    row.series.outcome = SeriesOutcome::Errored;
+                    row.series.result = Some(ObservedResult::CrashError);
+                    row.series.failure_class = Some(FailureClass::ProductFailure);
+                },
+                "timed-out attempt disposition contradicts result",
+            ),
+        ];
+        for (label, edit, expected) in refused {
+            let mut row = timed_out_match();
+            edit(&mut row);
+            let error = row
+                .validate_for_write()
+                .expect_err(&format!("{label}: admitted"));
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+
+        // The same attempt in a pressure row's inner history is a match that
+        // is not canonical, and nothing else.
+        let mut pressure = timed_out_match();
+        pressure.producer = SeriesProducer::PressureTest;
+        let inner = SeriesPressureAttempt {
+            index: "1".into(),
+            outcome: "FAIL".into(),
+            error_kind: Some("cpu-timeout".into()),
+            status: Some(0),
+            signal: None,
+            timed_out: true,
+            comparison: Some(SeriesPressureComparison {
+                verdict: Verdict::Matched,
+                canonical: false,
+                report_sha256: "c".repeat(64),
+                no_result_kind: None,
+            }),
+        };
+        pressure.series.pressure_evidence = Some(SeriesPressureEvidence {
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![inner.clone()],
+        });
+        pressure.validate_for_write().unwrap();
+        pressure.validate_for_read().unwrap();
+        let mut no_result_pressure = pressure.clone();
+        no_result(&mut no_result_pressure);
+        no_result_pressure.validate_for_write().unwrap();
+        // A timed-out attempt never passes, so no CellResult that retains one
+        // is a pass, and a pressure row cannot claim one even when it carries
+        // no no_verdict_evidence to cross-check.
+        let mut passed = pressure_row();
+        passed.series.cell = "fixture/test/chaos/ptrace".into();
+        passed.validate_for_write().unwrap();
+        let mut timed_out_second = inner.clone();
+        timed_out_second.index = "2".into();
+        passed
+            .series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .push(timed_out_second);
+        assert_eq!(passed.series.result, Some(ObservedResult::Pass));
+        assert!(passed.series.no_verdict_evidence.is_none());
+        for error in [passed.validate_for_write(), passed.validate_for_read()] {
+            assert!(
+                error
+                    .unwrap_err()
+                    .contains("pressure_evidence retains a timed-out attempt"),
+                "pass row admitted"
+            );
+        }
+        // The same holds for a timed-out attempt that wrote no report: the
+        // runner killed it, and its matched sibling cannot make the row a
+        // pass. The inner attempt alone is well formed.
+        let mut killed_second = pressure_row();
+        killed_second.series.cell = "fixture/test/chaos/ptrace".into();
+        let killed = SeriesPressureAttempt {
+            index: "2".into(),
+            outcome: "ERROR".into(),
+            error_kind: Some("cpu-timeout".into()),
+            status: None,
+            signal: Some(9),
+            timed_out: true,
+            comparison: None,
+        };
+        killed.validate_for_mode("chaos", None).unwrap();
+        killed_second
+            .series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .push(killed);
+        assert!(killed_second.series.no_verdict_evidence.is_none());
+        for error in [
+            killed_second.validate_for_write(),
+            killed_second.validate_for_read(),
+        ] {
+            assert!(
+                error
+                    .unwrap_err()
+                    .contains("pressure_evidence retains a timed-out attempt"),
+                "pass row with a killed attempt admitted"
+            );
+        }
+        for mode in ["verify", "replay", "chaos"] {
+            inner.validate_for_mode(mode, None).unwrap();
+        }
+        type InnerEdit = fn(&mut SeriesPressureAttempt);
+        let refused_inner: [(&str, InnerEdit); 6] = [
+            ("canonical", |a| {
+                a.comparison.as_mut().unwrap().canonical = true
+            }),
+            ("not timed out", |a| a.timed_out = false),
+            ("no error kind", |a| a.error_kind = None),
+            ("infrastructure error kind", |a| {
+                a.error_kind = Some("infrastructure".into())
+            }),
+            ("attempt PASS", |a| a.outcome = "PASS".into()),
+            ("no process disposition", |a| a.status = None),
+        ];
+        for (label, edit) in refused_inner {
+            let mut bad = inner.clone();
+            edit(&mut bad);
+            assert!(
+                bad.validate_for_mode("chaos", None).is_err(),
+                "{label}: admitted"
+            );
+            let mut row = pressure.clone();
+            row.series.pressure_evidence.as_mut().unwrap().attempts[0] = bad;
+            assert!(row.validate_for_write().is_err(), "{label}: row admitted");
+        }
+        let mut other_report = pressure.clone();
+        other_report
+            .series
+            .pressure_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .comparison
+            .as_mut()
+            .unwrap()
+            .report_sha256 = "d".repeat(64);
+        assert!(
+            other_report
+                .validate_for_write()
+                .unwrap_err()
+                .contains("contradicts the same no_verdict_evidence invocation")
+        );
+    }
+
+    /// A SaBRe verify attempt that passed, in a cell the runner then failed
+    /// because the run left SaBRe's own path: admitted in exactly the
+    /// runner's shape, refused in every other, and in a pressure row's inner
+    /// history a match that is not canonical.
+    #[test]
+    fn ineligible_execution_path_evidence_is_the_passed_sabre_attempt_and_nothing_else() {
+        let ineligible = || {
+            let mut fixture = no_verdict_row();
+            fixture.series.cell = "fixture/test/verify/sabre".into();
+            fixture.series.outcome = SeriesOutcome::Errored;
+            fixture.series.result = Some(ObservedResult::CrashError);
+            fixture.series.failure_class = Some(FailureClass::ProductFailure);
+            let disposition = attempt(&mut fixture);
+            disposition.kind = SeriesNoVerdictKind::IneligibleExecutionPath;
+            disposition.attempt_outcome = "PASS".into();
+            disposition.disposition = SeriesOutcome::Errored;
+            disposition.error_kind = None;
+            disposition.status = Some(0);
+            fixture
+        };
+        fn attempt(row: &mut SeriesRow) -> &mut SeriesAttemptDisposition {
+            &mut row.series.no_verdict_evidence.as_mut().unwrap().attempts[0]
+        }
+        let row = ineligible();
+        row.validate_for_write().unwrap();
+        let raw = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            raw["series"]["no_verdict_evidence"]["attempts"][0]["kind"],
+            "ineligible_execution_path"
+        );
+        let decoded: SeriesRow = serde_json::from_value(raw).unwrap();
+        decoded.validate_for_read().unwrap();
+        decoded.validate_for_projection().unwrap();
+
+        // A declared cell passes only with its declared exit, as Hermit
+        // reports it, and never with exit 0. Both fixtures name the same
+        // source evidence.
+        let declared_cell = |code: Option<i32>, signal: Option<i32>, status, observed| {
+            let mut row = ineligible();
+            row.series.declared_guest_exit = declared_exit_row(code, signal, status, observed)
+                .series
+                .declared_guest_exit;
+            let disposition = attempt(&mut row);
+            disposition.status = status;
+            disposition.signal = observed;
+            row
+        };
+        for (label, row) in [
+            (
+                "declared 7, exit 7",
+                declared_cell(Some(7), None, Some(7), None),
+            ),
+            (
+                "declared signal 11, signal 11",
+                declared_cell(None, Some(11), None, Some(11)),
+            ),
+            (
+                "declared signal 11, exit 139",
+                declared_cell(None, Some(11), Some(139), None),
+            ),
+        ] {
+            row.validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            row.validate_for_read()
+                .unwrap_or_else(|error| panic!("{label}: read: {error}"));
+        }
+
+        const SHAPE: &str = "ineligible_execution_path evidence must carry";
+        for (label, row) in [
+            (
+                "declared 7, exit 0",
+                declared_cell(Some(7), None, Some(0), None),
+            ),
+            (
+                "declared 7, exit 3",
+                declared_cell(Some(7), None, Some(3), None),
+            ),
+            (
+                "declared signal 11, signal 6",
+                declared_cell(None, Some(11), None, Some(6)),
+            ),
+            // A declaration the runner would refuse admits nothing. This
+            // check runs before the declaration's own, so it must refuse
+            // rather than panic: matching exit 0 against this signal would
+            // overflow `128 + signal`.
+            (
+                "declared signal i32::MAX, exit 0",
+                declared_cell(None, Some(i32::MAX), Some(0), None),
+            ),
+        ] {
+            for (path, error) in [
+                ("write", row.validate_for_write()),
+                ("read", row.validate_for_read()),
+                ("projection", row.validate_for_projection()),
+            ] {
+                let error = error.expect_err(&format!("{label}: admitted on {path}"));
+                assert!(error.contains(SHAPE), "{label}: {path}: {error}");
+            }
+        }
+        type Edit = fn(&mut SeriesRow);
+        let refused: [(&str, Edit, &str); 16] = [
+            (
+                "attempt FAIL",
+                |row| attempt(row).attempt_outcome = "FAIL".into(),
+                SHAPE,
+            ),
+            (
+                "attempt ERROR",
+                |row| attempt(row).attempt_outcome = "ERROR".into(),
+                SHAPE,
+            ),
+            (
+                "no_result disposition",
+                |row| attempt(row).disposition = SeriesOutcome::NoResult,
+                SHAPE,
+            ),
+            ("timed out", |row| attempt(row).timed_out = true, SHAPE),
+            (
+                "error kind",
+                |row| attempt(row).error_kind = Some("invalid-backend-evidence".into()),
+                SHAPE,
+            ),
+            (
+                "undeclared nonzero exit",
+                |row| attempt(row).status = Some(3),
+                SHAPE,
+            ),
+            (
+                "undeclared signal",
+                |row| {
+                    let disposition = attempt(row);
+                    disposition.status = None;
+                    disposition.signal = Some(11);
+                },
+                SHAPE,
+            ),
+            (
+                "no process disposition",
+                |row| attempt(row).status = None,
+                SHAPE,
+            ),
+            (
+                "no verification report",
+                |row| attempt(row).verification_report_sha256 = None,
+                SHAPE,
+            ),
+            (
+                "replay cell",
+                |row| row.series.cell = "fixture/test/replay/sabre".into(),
+                SHAPE,
+            ),
+            (
+                "chaos cell",
+                |row| row.series.cell = "fixture/test/chaos/sabre".into(),
+                SHAPE,
+            ),
+            (
+                "ptrace cell",
+                |row| row.series.cell = "fixture/test/verify/ptrace".into(),
+                SHAPE,
+            ),
+            (
+                "liteinst cell",
+                |row| row.series.cell = "fixture/test/verify/liteinst".into(),
+                SHAPE,
+            ),
+            (
+                "no-result row",
+                |row| {
+                    row.series.outcome = SeriesOutcome::NoResult;
+                    row.series.result = None;
+                    row.series.failure_class = Some(FailureClass::NoResult);
+                },
+                SHAPE,
+            ),
+            (
+                "detail",
+                |row| {
+                    attempt(row).detail = Some(
+                        "SaBRe execution path is incomplete or used fallback/native sites".into(),
+                    )
+                },
+                "only comparison_refused and failed_match evidence may carry detail",
+            ),
+            (
+                "status and signal",
+                |row| attempt(row).signal = Some(11),
+                "status/signal disposition is invalid",
+            ),
+        ];
+        for (label, edit, expected) in refused {
+            let mut row = ineligible();
+            edit(&mut row);
+            for (path, error) in [
+                ("write", row.validate_for_write()),
+                ("read", row.validate_for_read()),
+                ("projection", row.validate_for_projection()),
+            ] {
+                let error = error.expect_err(&format!("{label}: admitted on {path}"));
+                assert!(error.contains(expected), "{label}: {path}: {error}");
+            }
+        }
+
+        // The same attempt in a pressure row's inner history is a match that
+        // is not canonical, and nothing else.
+        let mut pressure = ineligible();
+        pressure.producer = SeriesProducer::PressureTest;
+        let inner = SeriesPressureAttempt {
+            index: "1".into(),
+            outcome: "PASS".into(),
+            error_kind: None,
+            status: Some(0),
+            signal: None,
+            timed_out: false,
+            comparison: Some(SeriesPressureComparison {
+                verdict: Verdict::Matched,
+                canonical: false,
+                report_sha256: "c".repeat(64),
+                no_result_kind: None,
+            }),
+        };
+        pressure.series.pressure_evidence = Some(SeriesPressureEvidence {
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![inner],
+        });
+        pressure.validate_for_write().unwrap();
+        pressure.validate_for_read().unwrap();
+        const CONTRADICTS: &str = "contradicts the same no_verdict_evidence invocation";
+        type InnerEdit = fn(&mut SeriesPressureAttempt);
+        let refused_inner: [(&str, InnerEdit, &str); 4] = [
+            (
+                "canonical",
+                |a| a.comparison.as_mut().unwrap().canonical = true,
+                CONTRADICTS,
+            ),
+            (
+                "other report",
+                |a| a.comparison.as_mut().unwrap().report_sha256 = "d".repeat(64),
+                CONTRADICTS,
+            ),
+            (
+                "noncanonical divergence",
+                |a| {
+                    a.outcome = "FAIL".into();
+                    a.status = Some(1);
+                    a.comparison.as_mut().unwrap().verdict = Verdict::Diverged;
+                },
+                CONTRADICTS,
+            ),
+            // An undeclared verify match exits 0, inner history included.
+            (
+                "nonzero exit",
+                |a| a.status = Some(2),
+                "matched report contradicts its inner process disposition",
+            ),
+        ];
+        for (label, edit, expected) in refused_inner {
+            let mut row = pressure.clone();
+            edit(&mut row.series.pressure_evidence.as_mut().unwrap().attempts[0]);
+            let error = row
+                .validate_for_write()
+                .expect_err(&format!("{label}: admitted"));
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+    }
+
     #[test]
     fn no_verdict_timeout_disposition_is_typed_and_contradictions_refuse() {
         let mut timeout = no_verdict_row();
@@ -2746,10 +3626,194 @@ mod tests {
         inner.status = None;
         inner.timed_out = true;
         inner.error_kind = Some("cpu-timeout".into());
+        inner.validate_for_mode("naked", None).unwrap();
+        // The prelaunch timeout is a well-formed attempt, but the runner
+        // never types a cell that retains a timed-out attempt as a pass, so
+        // the row is admitted only as the timeout it is.
+        assert!(
+            native
+                .validate_for_read()
+                .unwrap_err()
+                .contains("pressure_evidence retains a timed-out attempt")
+        );
+        native.series.outcome = SeriesOutcome::Timeout;
+        native.series.result = Some(ObservedResult::Timeout);
+        native.series.failure_class = Some(FailureClass::NoResult);
         native.validate_for_read().unwrap();
+        // `runner::observed_result` refines that timeout to sandbox-denied or
+        // infrastructure-error when an attempt's output shows an environmental
+        // block. Neither claims a product verdict, so both are admitted; a
+        // crash-error or an OOM over the same timeout is not.
+        for (outcome, result, failure_class, admitted) in [
+            (
+                SeriesOutcome::Errored,
+                ObservedResult::SandboxDenied,
+                FailureClass::UnderstoodInfrastructureFailure,
+                true,
+            ),
+            (
+                SeriesOutcome::Errored,
+                ObservedResult::InfrastructureError,
+                FailureClass::UnderstoodInfrastructureFailure,
+                true,
+            ),
+            (
+                SeriesOutcome::Errored,
+                ObservedResult::CrashError,
+                FailureClass::ProductFailure,
+                false,
+            ),
+            (
+                SeriesOutcome::NoResult,
+                ObservedResult::Oom,
+                FailureClass::NoResult,
+                false,
+            ),
+        ] {
+            let mut refined = native.clone();
+            refined.series.outcome = outcome;
+            refined.series.result = Some(result);
+            refined.series.failure_class = Some(failure_class);
+            let checked = refined.validate_for_read();
+            if admitted {
+                checked.unwrap_or_else(|error| panic!("{result:?}: {error}"));
+            } else {
+                assert!(
+                    checked
+                        .unwrap_err()
+                        .contains("pressure_evidence retains a timed-out attempt"),
+                    "{result:?} admitted"
+                );
+            }
+        }
         let mut raw = serde_json::to_value(&good).unwrap();
         raw["series"]["pressure_evidence"]["attempts"][0]["timed_out"] = serde_json::json!("false");
         assert!(serde_json::from_value::<SeriesRow>(raw).is_err());
+    }
+
+    /// `pressure_row` for a cell that declares exit `code` or `signal`, whose
+    /// one inner invocation Hermit ended with `status` or `observed_signal`.
+    /// The declaration's own audit shows the declared disposition, so the
+    /// inner invocation is the only thing that varies.
+    fn declared_pressure_row(
+        code: Option<i32>,
+        signal: Option<i32>,
+        status: Option<i32>,
+        observed_signal: Option<i32>,
+    ) -> SeriesRow {
+        let mut value = pressure_row();
+        value.series.declared_guest_exit = declared_exit_row(code, signal, code, signal)
+            .series
+            .declared_guest_exit;
+        let inner = &mut value.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.status = status;
+        inner.signal = observed_signal;
+        value
+    }
+
+    #[test]
+    fn pressure_history_admits_a_nonzero_match_only_as_declared() {
+        for (label, value) in [
+            ("status 0 without a declaration", pressure_row()),
+            (
+                "status 0 with a declaration",
+                declared_pressure_row(Some(23), None, Some(0), None),
+            ),
+            (
+                "the declared code",
+                declared_pressure_row(Some(23), None, Some(23), None),
+            ),
+            (
+                "the declared signal",
+                declared_pressure_row(None, Some(11), None, Some(11)),
+            ),
+            (
+                "the declared signal as 128 + 11",
+                declared_pressure_row(None, Some(11), Some(139), None),
+            ),
+        ] {
+            value
+                .validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+        }
+        let mut undeclared = declared_pressure_row(Some(23), None, Some(23), None);
+        undeclared.series.declared_guest_exit = None;
+        let mut blank_reason = declared_pressure_row(Some(23), None, Some(23), None);
+        declared(&mut blank_reason).reason = " ".into();
+        let mut replay = declared_pressure_row(Some(23), None, Some(23), None);
+        replay.series.cell = "fixture/test/replay/ptrace".into();
+        let mut failed = declared_pressure_row(Some(23), None, Some(23), None);
+        let inner = &mut failed.series.pressure_evidence.as_mut().unwrap().attempts[0];
+        inner.outcome = "FAIL".into();
+        for (label, value) in [
+            ("status 23 without a declaration", undeclared),
+            (
+                "another code",
+                declared_pressure_row(Some(23), None, Some(22), None),
+            ),
+            (
+                "a signal for a declared code",
+                declared_pressure_row(Some(23), None, None, Some(23)),
+            ),
+            (
+                "128 + the declared code",
+                declared_pressure_row(Some(23), None, Some(151), None),
+            ),
+            (
+                "the declared signal's number as a code",
+                declared_pressure_row(None, Some(11), Some(11), None),
+            ),
+            (
+                "another signal",
+                declared_pressure_row(None, Some(11), None, Some(9)),
+            ),
+            (
+                "128 + another signal",
+                declared_pressure_row(None, Some(11), Some(137), None),
+            ),
+            // A declaration the runner itself refuses accepts nothing more.
+            ("a blank reason", blank_reason),
+            (
+                "a code out of range",
+                declared_pressure_row(Some(300), None, Some(300), None),
+            ),
+            (
+                "both a code and a signal",
+                declared_pressure_row(Some(23), Some(23), Some(23), None),
+            ),
+            ("a replay cell", replay),
+            ("an invocation that did not pass", failed),
+        ] {
+            let error = value.validate_for_read().unwrap_err();
+            assert!(
+                error.contains(
+                    "pressure_evidence matched report contradicts its inner process disposition"
+                ),
+                "{label}: {error}"
+            );
+        }
+        // The declaration admits an exit, never a verdict: every other verdict
+        // keeps its own rule for an invocation that ended as declared.
+        for verdict in [
+            Verdict::Diverged,
+            Verdict::InfrastructureError,
+            Verdict::NoResult,
+        ] {
+            let mut value = declared_pressure_row(Some(23), None, Some(23), None);
+            let comparison = value.series.pressure_evidence.as_mut().unwrap().attempts[0]
+                .comparison
+                .as_mut()
+                .unwrap();
+            comparison.verdict = verdict;
+            comparison.canonical = verdict == Verdict::Diverged;
+            let error = value.validate_for_read().unwrap_err();
+            assert!(
+                error.contains(&format!(
+                    "pressure_evidence {verdict} report contradicts its inner process disposition"
+                )),
+                "{verdict}: {error}"
+            );
+        }
     }
 
     #[test]

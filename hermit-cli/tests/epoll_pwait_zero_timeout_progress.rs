@@ -44,8 +44,10 @@ fn guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root =
-                Path::new(env!("CARGO_TARGET_TMPDIR")).join("epoll-pwait-zero-timeout-progress");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+                "epoll-pwait-zero-timeout-progress-{}",
+                std::process::id()
+            ));
             fs::create_dir_all(&build_root).expect("failed to create build directory");
             let output = build_root.join("epoll_pwait_zero_timeout_progress");
             let mut command = Command::new("cc");
@@ -102,9 +104,7 @@ fn run_guest(extra: &[&str], guest_args: &[&str], marker: &str) {
 
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start guest: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
 
     // `timeout` exits 124 when it has to kill the child. That is precisely the
     // starvation this test guards: the poller monopolized the CPU and the

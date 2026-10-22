@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 #
 # pr-dag-health.sh -- health assessment for the floating PR DAG.
 #
@@ -62,7 +56,7 @@ while [ $# -gt 0 ]; do
         --out) OUT="$2"; shift 2 ;;
         --no-commute) DO_COMMUTE=0; shift ;;
         --limit) LIMIT="$2"; shift 2 ;;
-        -h|--help) sed -n '8,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done

@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -13,9 +16,7 @@ use std::process::Output;
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -56,7 +57,8 @@ fn meminfo_fields_and_free_use_guest_memory() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("meminfo-determinism");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("meminfo-determinism-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     for name in ["meminfo_free", "meminfo_available", "meminfo_cached"] {
@@ -71,10 +73,12 @@ fn meminfo_fields_and_free_use_guest_memory() {
         verify_guest(&guest, &format!("{name} strict verification"));
     }
 
-    let free = Path::new("/usr/bin/free");
-    assert!(
-        free.is_file(),
-        "free(1) is required by the compatibility corpus"
-    );
+    // The pinned root has procps at /bin only
+    // (https://github.com/rrnewton/hermit/issues/4355).
+    let free = ["/usr/bin/free", "/bin/free"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .expect("free(1) is required by the compatibility corpus: neither /usr/bin/free nor /bin/free exists");
     verify_guest(free, "free strict verification");
 }

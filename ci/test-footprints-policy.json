@@ -53,6 +53,7 @@
         "detcore-model",
         "detcore-testutils",
         "hermit",
+        "hermit-cdylib",
         "hermit-test-workdir",
         "hermit-resources",
         "test-allocator"
@@ -103,7 +104,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit",
         "test.ignored_syscall_regressions",
-        "test.liteinst_strict",
         "test.rr_suite_contract",
         "test.sabre_examples"
       ],
@@ -140,7 +140,7 @@
     },
     {
       "_why": "The DBT plugin has a runtime-callback ABI check and DBT cells. The retired test.dbt_parity matrix's 28 cases are DBT cells of the c-programs and system-utils manifests since slice S13 of https://github.com/rrnewton/hermit/issues/3301, and check.dbt_runtime_abi lost the test.dbt_parity dependent that used to pull it in.",
-      "packages": ["detcore-dbt"],
+      "packages": ["detcore-dbt", "detcore-dbt-cdylib"],
       "nodes": ["check.dbt_runtime_abi", "e2e.manifest_c_programs_on_host", "e2e.manifest_system_utils_on_host"],
       "e2e_backends": ["dbt"]
     },
@@ -149,6 +149,12 @@
       "packages": ["detcore-sabre"],
       "nodes": ["test.sabre_examples"],
       "e2e_backends": ["sabre"]
+    },
+    {
+      "_why": "The in-guest LiteInst runtime (the detcore-liteinst cdylib) is preloaded at run time by the cli binary's in-guest LiteInst tests and by every liteinst and in-guest-trap guest, a dependency Cargo's graph does not show.",
+      "packages": ["detcore-liteinst"],
+      "nodes": ["test.cli_on_host"],
+      "e2e_backends": ["liteinst", "in-guest-trap"]
     },
     {
       "_why": "Flaky guest binaries feed the chaos and determinism-stress manifest buckets.",
@@ -219,12 +225,6 @@
         "test.rr_suite_contract"
       ],
       "e2e_all": true
-    },
-    {
-      "_why": "LiteInst runtime staging is outside Cargo's workspace graph.",
-      "paths": ["scripts/stage-liteinst-runtime.sh"],
-      "nodes": ["test.liteinst_strict"],
-      "e2e_backends": ["liteinst"]
     },
     {
       "_why": "Standalone checks map to their own portable DAG node.",

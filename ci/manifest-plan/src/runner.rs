@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -13,6 +5,10 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::{self};
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
+use std::os::fd::RawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
@@ -36,7 +32,9 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 
-use crate::backend_parity::BackendParityReport;
+use crate::bundle_record::binary_digest;
+#[cfg(test)]
+use crate::bundle_record::file_digest;
 use crate::canonical_verdict::InfrastructureError;
 use crate::canonical_verdict::Verdict;
 pub use crate::canonical_verdict::VerificationReport;
@@ -56,6 +54,7 @@ use crate::cpu_evidence::InvocationCpuObservation;
 use crate::cpu_evidence::InvocationRole;
 use crate::cpu_evidence::LaunchObservation;
 use crate::cpu_evidence::LiveCpuObservation;
+use crate::cpu_evidence::LiveCpuSource;
 use crate::cpu_evidence::NotStartedReason;
 use crate::cpu_evidence::RegistrationObservation;
 use crate::cpu_evidence::ReturnedCpuCharge;
@@ -65,20 +64,23 @@ use crate::cpu_evidence::WaitCpuObservation;
 use crate::cpu_evidence::WaitOperation;
 use crate::environmental_block::EnvBlockClass;
 use crate::environmental_block::environmental_block_observation;
+use crate::host_capability::CapabilityVerdict;
+use crate::host_capability::HostCapabilitiesReport;
 use crate::host_capability::probe_host_capabilities;
+use crate::invocation_cgroup::ALLOW_PROCESS_GROUP_CPU_SCAN_ENV;
+use crate::invocation_cgroup::InvocationCgroup;
+use crate::invocation_cgroup::process_group_scan_allowed;
 use crate::ledger::RequiredNullable;
 use crate::stress_series::HostCapabilities;
 use crate::stress_series::HostCapability;
 #[cfg(test)]
 use crate::stress_series::HostCapabilityVerdict;
 #[cfg(test)]
-use crate::timeouts::CALIBRATED_CI_CELL_COUNT;
+use crate::timeouts::COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS;
 #[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS;
-#[cfg(test)]
-use crate::timeouts::DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
 #[cfg(test)]
@@ -87,39 +89,15 @@ use crate::timeouts::DEFAULTS_FILE;
 #[cfg(test)]
 use crate::timeouts::EXPLICIT_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
-use crate::timeouts::IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::KVM_2026_09_08_SELECTED_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::KVM_NEXT40_QUALIFIED_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::KVM_PINNED_IMAGE_QUALIFIED_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::KVM_RATCHET_CI_CELL_COUNT;
-#[cfg(test)]
 use crate::timeouts::KVM_RATCHET_TIMEOUT_CALIBRATIONS;
-#[cfg(test)]
-use crate::timeouts::KVM_RUN_1709_CI_REMOVAL_COUNT;
-#[cfg(test)]
-use crate::timeouts::LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
-use crate::timeouts::LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT;
-#[cfg(test)]
 use crate::timeouts::LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS;
 use crate::timeouts::MANIFEST_SCHEMA;
-#[cfg(test)]
-use crate::timeouts::NON_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
 #[cfg(test)]
 use crate::timeouts::SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS;
-#[cfg(test)]
-use crate::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::SELECT_REPLAY_2026_10_03_TESTS;
 #[cfg(test)]
@@ -130,7 +108,7 @@ use crate::timeouts::resolve_timeout_seconds;
 use crate::timeouts::timeout_multipliers_from_env;
 use crate::timeouts::validate_timeout_seconds;
 
-const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const BACKENDS: [&str; 6] = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const CELL_CPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CELL_CPU_ACCOUNTING_GRACE: Duration = Duration::from_secs(1);
@@ -182,7 +160,18 @@ pub fn validate_source_sha(sha: &str) -> Result<(), String> {
 /// (a corrupt index, an unusable `.git`, no git to run) is refused: the files
 /// might be tracked. The search for `.git` starts from the resolved root, so
 /// a symlink to tracked files is looked up where the files are.
+///
+/// The SHA cannot stand in for this check: it is the claim being checked, and
+/// nothing in it says whether an enclosing checkout tracks the root.
+/// [`SNAPSHOT_GIT_ENV`] may name the git to ask.
 pub fn validate_source_snapshot(root: &Path, sha: &str) -> Result<(), String> {
+    let git = std::env::var_os(SNAPSHOT_GIT_ENV)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from("git"), PathBuf::from);
+    validate_source_snapshot_with(root, sha, &git)
+}
+
+fn validate_source_snapshot_with(root: &Path, sha: &str, git: &Path) -> Result<(), String> {
     validate_source_sha(sha)?;
     let resolved = std::fs::canonicalize(root).map_err(|error| {
         format!(
@@ -196,7 +185,7 @@ pub fn validate_source_snapshot(root: &Path, sha: &str) -> Result<(), String> {
     {
         return Ok(());
     }
-    let tracked = crate::git_environment::git_command()
+    let tracked = crate::git_environment::git_command_at(git)
         .arg("-C")
         .arg(root)
         .args(["ls-files", "--error-unmatch", "--", "."])
@@ -228,6 +217,12 @@ pub fn validate_source_snapshot(root: &Path, sha: &str) -> Result<(), String> {
         )),
     }
 }
+
+/// The git that [`validate_source_snapshot`] asks whether a snapshot's files
+/// are tracked, when set. ci/buck-e2e/cell.sh names the host's git behind its
+/// telemetry wrapper there: the wrapper runs four more git commands and a
+/// logger for each call, about 0.04 CPU-s against 0.015 for the one command.
+pub const SNAPSHOT_GIT_ENV: &str = "HERMIT_E2E_SNAPSHOT_GIT";
 
 fn first_attempt() -> u64 {
     1
@@ -315,9 +310,103 @@ pub fn validate_golden_kernel_floor(
 }
 
 /// The host capability a backend itself needs, independent of any `requires`
-/// token: a kvm cell cannot run where KVM is proven absent.
+/// token: a kvm cell cannot run where KVM is proven absent, and a cell of
+/// either in-guest LiteInst backend (`liteinst`, and `in-guest-trap`, the same
+/// runtime with syscall site patching off) cannot run where CPUID faulting is
+/// proven absent, because that runtime arms CPUID faulting before the guest's
+/// first instruction and refuses to start without it
+/// (`detcore-liteinst: initialization failed: CPUID faulting is unavailable`).
+///
+/// Each required plan row carries this capability in
+/// `requires_host_capabilities`, so the harness withholds the cell on such a
+/// host, the validation planner counts it, and the Buck cell generator
+/// (`ci/buck-e2e/defs.bzl`) runs it locally rather than on a remote execution
+/// worker, which may lack the capability.
 pub fn backend_capability(backend: &str) -> Option<HostCapability> {
-    (backend == "kvm").then_some(HostCapability::Kvm)
+    match backend {
+        "kvm" => Some(HostCapability::Kvm),
+        "liteinst" | "in-guest-trap" => Some(HostCapability::CpuidFaulting),
+        _ => None,
+    }
+}
+
+/// CPUID faulting needed by a cell's ptrace execution, beyond its backend's
+/// unconditional requirements. Plan routing and runtime admission share this
+/// decision. Verify retains its existing host-dependent relaxed form; replay
+/// always subscribes to CPUID through the recorder/replayer subscription list.
+pub fn ptrace_cell_capability(cell: &SelectedCell) -> Option<HostCapability> {
+    if !matches!(cell.id.backend.as_deref(), Some("ptrace" | "e9patch")) {
+        return None;
+    }
+    let needs_cpuid = match cell.id.mode.as_str() {
+        "replay" | "chaos" => true,
+        "custom" => {
+            // Only Hermit options count: a guest argument after `--` cannot
+            // change the tracer's subscriptions or bypass its execution.
+            !cell.test.modes["custom"]
+                .args
+                .iter()
+                .take_while(|arg| arg.as_str() != "--")
+                .any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--no-virtualize-cpuid" | "--namespace-only" | "--lite" | "--strace-only"
+                    )
+                })
+        }
+        _ => false,
+    };
+    needs_cpuid.then_some(HostCapability::CpuidFaulting)
+}
+
+/// Whether `hermit run --strict` on `backend` reads its virtual clock from the
+/// host's retired-conditional-branch counter, and so refuses where the hermit
+/// binary reports no `exact_branch_counter`.
+///
+/// Unlike [`backend_capability`], this is decided on the machine that runs the
+/// cell and never enters a plan row: a plan row that names a host capability
+/// routes the cell off remote execution, and remote workers differ in CPU
+/// model, so the plan cannot say which of them count exactly.
+pub fn pmu_clock_backend(backend: &str) -> bool {
+    matches!(backend, "ptrace" | "e9patch")
+}
+
+/// Whether the hermit binary refuses `cell` where it reports no
+/// `exact_branch_counter`: the cell runs `hermit run --strict` or `hermit
+/// record start --strict` on a [`pmu_clock_backend`]. Verify and chaos cells
+/// always pass `--strict` to `run`, and replay cells to `record start`, which
+/// refuses in the same way
+/// (<https://github.com/rrnewton/hermit/issues/3810>). A custom cell passes it
+/// when its arguments say so, unless they also select `--namespace-only`
+/// (alias `--lite`), which arms no branch counter. A naked cell runs no
+/// hermit. A run with `--max-timeslice=disabled` uses no branch count in
+/// Detcore (Reverie still sets the counters up), so Hermit does not refuse it
+/// (<https://github.com/rrnewton/hermit/issues/4291>):
+/// not a custom cell that passes it, and not a verify cell at the relaxed
+/// strictness level, which adds it ([`RELAXED_LEVEL_ARGS`]) — unless the
+/// cell's recipe declares its own numeric `--max-timeslice`, which the
+/// relaxed level then leaves in place, so the run still arms the counter.
+pub fn refused_on_an_inexact_branch_counter(cell: &SelectedCell) -> bool {
+    let strict_run = match cell.id.mode.as_str() {
+        "verify" | "chaos" | "replay" => true,
+        "custom" => {
+            let args = &cell.test.modes["custom"].args;
+            let has = |flag: &str| args.iter().any(|arg| arg == flag);
+            has("--strict")
+                && !has("--namespace-only")
+                && !has("--lite")
+                && !has("--max-timeslice=disabled")
+        }
+        _ => false,
+    };
+    strict_run
+        && cell.id.backend.as_deref().is_some_and(pmu_clock_backend)
+        && match cell.strictness_level() {
+            Some(StrictnessLevel::Relaxed) => cell
+                .strictness()
+                .is_some_and(|strictness| strictness.max_timeslice != MaxTimeslice::Disabled),
+            _ => true,
+        }
 }
 
 pub fn requires_capability(token: &str) -> Result<Option<HostCapability>, String> {
@@ -383,6 +472,28 @@ pub struct TestRecipe {
     /// type keeps only its own tests.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// The `/proc` level every Hermit cell runs the guest at (`--proc`),
+    /// when it is not Hermit's default, `minimal`. A level decides which
+    /// system-wide `/proc` names exist; it is not a relaxation.
+    pub proc: Option<ProcLevel>,
+}
+
+/// A `/proc` level, as Hermit's `--proc` spells it.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcLevel {
+    Minimal,
+    Standard,
+}
+
+impl ProcLevel {
+    /// The Hermit flag that selects this level.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Minimal => "--proc=minimal",
+            Self::Standard => "--proc=standard",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -409,6 +520,38 @@ pub struct Observation {
     pub stderr: bool,
     #[serde(default)]
     pub artifacts: Vec<String>,
+}
+
+/// Why a verify mode's `hermit_args` relax determinism: one reason for every
+/// backend's flags, or a mapping with one reason for each backend that has
+/// flags, so each cell's relaxation records only its own.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum HermitArgsReason {
+    Shared(String),
+    PerBackend(BTreeMap<String, String>),
+}
+
+impl HermitArgsReason {
+    /// The reason for `backend`'s flags.
+    pub fn for_backend(&self, backend: &str) -> Option<&str> {
+        match self {
+            Self::Shared(reason) => Some(reason),
+            Self::PerBackend(reasons) => reasons.get(backend).map(String::as_str),
+        }
+    }
+}
+
+impl From<&str> for HermitArgsReason {
+    fn from(reason: &str) -> Self {
+        Self::Shared(reason.to_string())
+    }
+}
+
+impl From<String> for HermitArgsReason {
+    fn from(reason: String) -> Self {
+        Self::Shared(reason)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -464,12 +607,20 @@ pub struct ModeRecipe {
     /// required and both are recorded as relaxations.
     #[serde(default)]
     pub hermit_args: BTreeMap<String, Vec<String>>,
-    pub hermit_args_reason: Option<String>,
+    pub hermit_args_reason: Option<HermitArgsReason>,
     /// Guest environment variables a verify cell adds, as `--env NAME=VALUE`,
     /// after the runner's fixed guest environment. A name the runner sets is
-    /// refused rather than silently overridden.
+    /// refused rather than silently overridden. A replay cell inherits its
+    /// verify recipe's unless it declares its own; an empty mapping there
+    /// declares that it adds none. This module's private `cell_mode_env`
+    /// applies that rule.
     #[serde(default)]
-    pub env: BTreeMap<String, String>,
+    pub env: Option<BTreeMap<String, String>>,
+    /// Verify-only guest additions on the named enabled backend, merged with
+    /// `env` without replacing any common or runner-owned name. Replay inherits
+    /// the effective verify environment unless it declares its own `env`.
+    #[serde(default)]
+    pub env_by_backend: BTreeMap<String, BTreeMap<String, String>>,
     /// The comparison a verify cell's two runs must pass. `strict` (the
     /// default) is the canonical full-observation comparison that can
     /// establish L2. `stripped` is Hermit's default `--verify` comparison:
@@ -488,14 +639,24 @@ pub struct ModeRecipe {
     #[serde(default)]
     pub diagnostic: BTreeMap<String, String>,
     /// Why a product failure of this verify cell is final. Every other cell
-    /// is retried once after a product failure; this one gets one attempt,
-    /// for a corpus whose recorded verdict was a single run (the strict
-    /// compatibility corpus), so a first-attempt failure stays a failure.
+    /// except a replay cell is retried once after a product failure (see
+    /// [`retries_product_failures`]); this one gets one attempt, for a corpus
+    /// whose recorded verdict was a single run (the strict compatibility
+    /// corpus), so a first-attempt failure stays a failure.
     pub no_retry_reason: Option<String>,
     /// Run-type labels of this mode's cell on an enabled backend, added to the
     /// test's own `labels` for that cell only. See [`cell_labels`].
     #[serde(default)]
     pub labels: BTreeMap<String, Vec<String>>,
+    /// The deepest strictness level this verify cell runs at. `relaxed` caps a
+    /// test whose result does not depend on preemption or CPUID
+    /// virtualization at the relaxed level on every host, so it never has a
+    /// second, strict form ([`SelectedCell::strictness_level`]). Only
+    /// `relaxed` may be written, with `max_level_reason`, and only on a verify
+    /// mode with a ptrace or e9patch cell, the backends that have a relaxed
+    /// form.
+    pub max_level: Option<StrictnessLevel>,
+    pub max_level_reason: Option<String>,
 }
 
 /// The run type of a cell that names none: the full validation, whose
@@ -549,6 +710,18 @@ pub fn cell_hermit_args<'a>(recipe: &'a ModeRecipe, backend: &str) -> &'a [Strin
         .unwrap_or_default()
 }
 
+/// The Hermit an import run (`E2E_IMPORT_RESULTS`) compares logs with: `HERMIT_BIN`, else
+/// the Hermit ci/buck-e2e/stage staged for the imported Buck cells
+/// (`ci/buck-e2e/staged/hermit`, which `-c hermit_e2e.hermit=staged` cells run). An import
+/// runs no cell, but its parity post-pass runs `hermit log-diff`, and a Buck run builds no
+/// target/debug/hermit for it to fall back on.
+pub fn resolve_import_hermit_bin(root: &Path, hermit_bin: Option<std::ffi::OsString>) -> PathBuf {
+    resolve_hermit_bin(
+        root,
+        Some(hermit_bin.unwrap_or_else(|| "ci/buck-e2e/staged/hermit".into())),
+    )
+}
+
 /// The Hermit the harness runs: `HERMIT_BIN`, else target/debug/hermit. A
 /// relative path names a checkout path, like the default, because cells start
 /// Hermit from their own working directories; an absolute path is kept.
@@ -561,12 +734,21 @@ pub fn resolve_hermit_bin(root: &Path, hermit_bin: Option<std::ffi::OsString>) -
 }
 
 /// Whether a product failure of `cell` earns the runner's one retry: false
-/// for a verify cell that declares `no_retry_reason`.
+/// for a replay cell and for a verify cell that declares `no_retry_reason`.
+///
+/// A replay cell records the program and replays that recording, and its
+/// product failure is a replay that diverged from the recording or a
+/// recording that did not complete. A second, fresh recording that happens to
+/// replay cleanly does not answer whether the first one did, so a replay
+/// failure is final, as it was on the retired rr lane, which ran each program
+/// once.
 pub fn retries_product_failures(cell: &SelectedCell) -> bool {
-    cell.test
-        .modes
-        .get(&cell.id.mode)
-        .is_none_or(|mode| mode.no_retry_reason.is_none())
+    cell.id.mode != "replay"
+        && cell
+            .test
+            .modes
+            .get(&cell.id.mode)
+            .is_none_or(|mode| mode.no_retry_reason.is_none())
 }
 
 /// A stripped cell's report must hold the comparison it declared: Hermit's
@@ -735,15 +917,31 @@ pub(crate) fn cell_workdir(cell: &SelectedCell) -> Option<String> {
 }
 
 /// The guest environment variables a selected cell adds after the runner's own.
+///
+/// Verify merges common `env` with only this backend's additions. A replay
+/// recipe's declared `env`, even an empty one, replaces the effective verify
+/// environment rather than inheriting variables it was never meant to carry.
 fn cell_mode_env(cell: &SelectedCell) -> BTreeMap<String, String> {
     inherited(cell, |recipe| {
-        (!recipe.env.is_empty()).then(|| recipe.env.clone())
+        let backend_env = cell
+            .id
+            .backend
+            .as_ref()
+            .and_then(|backend| recipe.env_by_backend.get(backend));
+        if recipe.env.is_none() && backend_env.is_none() {
+            return None;
+        }
+        let mut env = recipe.env.clone().unwrap_or_default();
+        if let Some(additions) = backend_env {
+            env.extend(additions.clone());
+        }
+        Some(env)
     })
     .unwrap_or_default()
 }
 
 /// The declared guest disposition for a selected verify or replay cell.
-fn cell_expected_guest_exit(cell: &SelectedCell) -> Option<ExpectedGuestExit> {
+pub fn cell_expected_guest_exit(cell: &SelectedCell) -> Option<ExpectedGuestExit> {
     expectation_recipe(cell)?.expected_guest_exit.clone()
 }
 
@@ -763,6 +961,15 @@ fn cell_expected_stdout_contains(cell: &SelectedCell) -> Option<String> {
         .expected_stdout_contains
         .get(backend)
         .cloned()
+}
+
+/// Both stdout assertions a selected verify or replay cell declares for its
+/// backend, in the form a skid attempt records them ([`DeclaredStdout`]).
+pub fn cell_declared_stdout(cell: &SelectedCell) -> DeclaredStdout {
+    DeclaredStdout {
+        exact: cell_expected_stdout(cell),
+        contains: cell_expected_stdout_contains(cell),
+    }
 }
 
 /// A per-backend stdout assertion is verify-only and keyed by enabled backends.
@@ -1095,6 +1302,35 @@ fn check_expected_stdout_contains(
     }
 }
 
+/// The first declared stdout assertion of `spec` that the compared runs of
+/// `report` do not satisfy: the exact `expected_stdout`
+/// ([`check_expected_stdout`]), then the `expected_stdout_contains` text
+/// searched in the verify stdout captured at `stdout_path`
+/// ([`check_expected_stdout_contains`]). `None` when the cell declares
+/// neither or every declared assertion holds.
+fn declared_stdout_error(
+    spec: &CellRunSpec,
+    report: &VerificationReport,
+    stdout_path: &Path,
+) -> Option<ExpectedStdoutError> {
+    if let Some(Err(error)) = spec
+        .expected_stdout
+        .as_deref()
+        .map(|expected| check_expected_stdout(expected, report))
+    {
+        return Some(error);
+    }
+    spec.expected_stdout_contains
+        .as_deref()
+        .and_then(|text| match fs::read(stdout_path) {
+            Ok(captured) => check_expected_stdout_contains(text, &captured, report).err(),
+            Err(error) => Some(ExpectedStdoutError::Unevidenced(format!(
+                "cannot read captured verify stdout {}: {error}, so the declared expected_stdout_contains cannot be checked",
+                stdout_path.display()
+            ))),
+        })
+}
+
 pub fn validate_expected_guest_exit(
     id: &str,
     mode: &str,
@@ -1186,9 +1422,10 @@ pub struct EqualizedInput {
 /// alone make ptrace diverge from ptrace: 16 of 18 pairs in the S0 control
 /// (<https://github.com/rrnewton/hermit/issues/3301#issuecomment-5874842696>).
 /// Binding each directory to the same guest path, and naming only guest paths
-/// in the guest's environment and argv, gives every backend that honours
-/// `--bind` the same guest-visible inputs. The dbt backend refuses `--bind`,
-/// so its cells keep the host paths (see [`equalizes_guest_inputs`]).
+/// in the guest's environment and argv, gives every backend the same
+/// guest-visible inputs. The dbt backend applies `--bind` in its own per-run
+/// mount namespace (`common/test-workdir`), which needs CAP_SYS_ADMIN, so a
+/// dbt cell runs in the pinned root.
 ///
 /// It is below guest `/tmp` because `--bind` accepts only targets there;
 /// every such guest gets a private tmpfs `/tmp`, in which the bind targets
@@ -1216,13 +1453,11 @@ pub const EQUALIZED_INPUTS: [EqualizedInput; 3] = [
 
 /// Whether a cell's guest is given the equalized inputs.
 ///
-/// Only `verify` cells are, because only they are compared across backends
-/// (the parity post-pass). Other modes keep the host paths they always had.
-/// The dbt backend refuses `--bind` (`hermit-cli/src/bin/hermit/run.rs`: "the
-/// dbt backend cannot apply --mount or --bind"), so a dbt cell cannot be given
-/// them and its parity rows say `inputs-not-equalized`.
-pub fn equalizes_guest_inputs(mode: &str, backend: &str) -> bool {
-    mode == "verify" && backend != "dbt"
+/// Only `verify` cells are, on every backend, because only they are compared
+/// across backends (the parity post-pass). Other modes keep the host paths
+/// they always had.
+pub fn equalizes_guest_inputs(mode: &str) -> bool {
+    mode == "verify"
 }
 
 /// The guest path of a host path at or below one of `cell_dir`'s equalized
@@ -1242,17 +1477,137 @@ fn equalized_guest_path(cell_dir: &Path, value: &str) -> Option<String> {
     })
 }
 
-/// `guest_argv` with each whole argument that names a path in one of the
-/// cell's equalized input directories rewritten to its guest path, so the
-/// program is launched as `/tmp/e2e/fixtures/program`. A path embedded in a
-/// longer argument is left alone; it still names a host file the guest can
-/// read, and the parity post-pass then sees unequal argv and reports the
-/// comparison as not equalized.
-fn equalized_guest_argv(cell_dir: &Path, guest_argv: Vec<String>) -> Vec<String> {
-    guest_argv
+/// Where a verify guest sees the validation's compatibility fixtures,
+/// `{{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures` on the host.
+pub const COMPAT_FIXTURES_GUEST_PATH: &str = "/tmp/e2e/compat-fixtures";
+
+/// Where a verify guest sees the repository checkout, `{{ROOT_DIR}}` on the
+/// host.
+pub const REPOSITORY_GUEST_PATH: &str = "/tmp/e2e/repo";
+
+/// The compatibility fixtures, below the validation's run-state directory.
+const COMPAT_FIXTURES_RUN_STATE_SUBDIR: &str = "strict-compat/real-compat-fixtures";
+
+/// A host directory outside the cell directory that a verify cell's argv may
+/// name, and the guest path it is bound at when it does.
+///
+/// The ptrace reference and each candidate backend run as separate cells.
+/// Under Buck each cell has its own run-state directory and its own bundle
+/// checkout, so a fixture or repository file named by its host path is a
+/// different string in every cell, and the parity post-pass diverged on the
+/// path alone: 22 cells in the f406d84f validation
+/// (<https://github.com/rrnewton/hermit/issues/4337>). Naming the guest path
+/// instead gives every run of the test the same arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EqualizedRoot {
+    host: String,
+    guest: &'static str,
+    /// Host directories below `host` that it does not cover: the harness's
+    /// own per-run trees, whose paths would still differ from cell to cell.
+    except: Vec<String>,
+}
+
+/// The equalized roots of `context` with run-state directory `run_state`,
+/// the most specific first: the fixtures are below the run state, which is
+/// commonly below the checkout. The checkout root does not cover the
+/// harness's result, build and run-state trees.
+fn equalized_roots(context: &RunContext, run_state: Option<&OsStr>) -> Vec<EqualizedRoot> {
+    let text = |path: &Path| path.to_string_lossy().into_owned();
+    let run_state = run_state.filter(|state| !state.is_empty()).map(Path::new);
+    let mut roots = Vec::new();
+    if let Some(state) = run_state {
+        roots.push(EqualizedRoot {
+            host: text(&state.join(COMPAT_FIXTURES_RUN_STATE_SUBDIR)),
+            guest: COMPAT_FIXTURES_GUEST_PATH,
+            except: Vec::new(),
+        });
+    }
+    roots.push(EqualizedRoot {
+        host: text(&context.root),
+        guest: REPOSITORY_GUEST_PATH,
+        except: [
+            Some(context.result_root.as_path()),
+            Some(context.build_root.as_path()),
+            run_state,
+        ]
         .into_iter()
-        .map(|arg| equalized_guest_path(cell_dir, &arg).unwrap_or(arg))
-        .collect()
+        .flatten()
+        .map(text)
+        .collect(),
+    });
+    roots
+}
+
+/// `value` with the host directory `host` replaced by `guest`, when `value`
+/// is that directory or a path below it.
+fn rebased(host: &str, guest: &str, value: &str) -> Option<String> {
+    if value == host {
+        Some(guest.to_string())
+    } else {
+        value
+            .strip_prefix(host)
+            .filter(|rest| rest.starts_with('/'))
+            .map(|rest| format!("{guest}{rest}"))
+    }
+}
+
+/// `guest_argv` with each argument that names a path in one of the cell's
+/// equalized input directories, or below one of `roots`, rewritten to its
+/// guest path, so the program is launched as `/tmp/e2e/fixtures/program`. An
+/// environment assignment (`env NAME=PATH`) has its value rewritten the same
+/// way. A path embedded in any other longer argument is left alone; it still
+/// names a host file the guest can read, and the parity post-pass then sees
+/// unequal argv and reports the comparison as not equalized. Also returns the
+/// roots some argument named, which the run must bind.
+fn equalized_guest_argv(
+    cell_dir: &Path,
+    roots: &[EqualizedRoot],
+    guest_argv: Vec<String>,
+) -> (Vec<String>, Vec<EqualizedRoot>) {
+    let mut named = Vec::new();
+    let mut rewrite = |value: &str| -> Option<String> {
+        equalized_guest_path(cell_dir, value).or_else(|| {
+            roots.iter().find_map(|root| {
+                if root
+                    .except
+                    .iter()
+                    .any(|except| rebased(except, "", value).is_some())
+                {
+                    return None;
+                }
+                let rewritten = rebased(&root.host, root.guest, value)?;
+                if !named.contains(root) {
+                    named.push(root.clone());
+                }
+                Some(rewritten)
+            })
+        })
+    };
+    let argv = guest_argv
+        .into_iter()
+        .map(|arg| {
+            if let Some(rewritten) = rewrite(&arg) {
+                return rewritten;
+            }
+            match arg.split_once('=') {
+                Some((name, value)) if is_environment_name(name) => rewrite(value)
+                    .map(|value| format!("{name}={value}"))
+                    .unwrap_or(arg),
+                _ => arg,
+            }
+        })
+        .collect();
+    (argv, named)
+}
+
+/// Whether `name` can be an environment variable's name, as `env NAME=VALUE`
+/// takes it.
+fn is_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// The cell environment as the guest of an equalized cell sees it: each
@@ -1266,14 +1621,18 @@ fn equalized_guest_env(env: &BTreeMap<String, String>) -> BTreeMap<String, Strin
     env
 }
 
-/// Bind each equalized input directory of `cell_dir` to its guest path.
-fn append_equalized_input_binds(argv: &mut Vec<String>, cell_dir: &Path) {
+/// Bind each equalized input directory of `cell_dir` to its guest path, and
+/// each equalized root the cell's argv names.
+fn append_equalized_input_binds(argv: &mut Vec<String>, cell_dir: &Path, roots: &[EqualizedRoot]) {
     for input in EQUALIZED_INPUTS {
         argv.push(format!(
             "--bind={}:{}",
             cell_dir.join(input.cell_subdir).to_string_lossy(),
             input.guest_path
         ));
+    }
+    for root in roots {
+        argv.push(format!("--bind={}:{}", root.host, root.guest));
     }
 }
 
@@ -1327,6 +1686,75 @@ pub struct Selection {
     /// Every run type's cells, ignoring `labels`: a census of the cells in
     /// the manifest (the metadata export), not a run of one run type.
     pub all_run_types: bool,
+    /// A disabled verify cell probed for parity runs on ptrace's inputs
+    /// (`with_parity_inputs`), so its log can be compared with ptrace's.
+    pub parity_inputs: bool,
+}
+
+/// The in-guest backends refuse a preemption timer: every verify cell of
+/// theirs that the manifests enable runs with this flag.
+const IN_GUEST_PARITY_HERMIT_ARGS: &[&str] = &["--max-timeslice=disabled"];
+/// The recorded reason for the in-guest parity probe flag (`--max-timeslice=disabled`).
+pub const PARITY_PROBE_HERMIT_ARGS_REASON: &str = "Parity probe of a disabled cell: in-guest \
+     LiteInst refuses a preemption timer, so the probe runs this backend with the maximum \
+     timeslice disabled, as every enabled cell of it runs";
+
+/// `test` with its disabled verify cell on `backend` given ptrace's inputs, for
+/// a parity probe (`test-harness run --probe-disabled --parity-inputs`, which
+/// `ci/compat-envelope/pressure-test.rs run --parity-all` uses): ptrace's
+/// guest arguments where the manifest names none for `backend`, and on
+/// liteinst and in-guest-trap the `--max-timeslice=disabled` every enabled
+/// cell of theirs carries, with its own reason. A parity comparison needs the
+/// same guest arguments on both sides, and an in-guest probe without the flag
+/// is only a refusal. The probe keeps the cell's own wall and CPU budget, the
+/// one the pressure test sizes its enclosing allowance from. Nothing the
+/// manifest declares for `backend` is replaced, and an enabled cell is never
+/// touched.
+fn with_parity_inputs(test: &TestRecipe, backend: &str) -> TestRecipe {
+    let mut test = test.clone();
+    let Some(verify) = test.modes.get_mut("verify") else {
+        return test;
+    };
+    if verify
+        .backends_enabled
+        .iter()
+        .any(|enabled| enabled == backend)
+        || !verify
+            .backends_enabled
+            .iter()
+            .any(|enabled| enabled == "ptrace")
+    {
+        return test;
+    }
+    if let Some(args) = verify.guest_args.get("ptrace").cloned() {
+        verify.guest_args.entry(backend.to_string()).or_insert(args);
+    }
+    if matches!(backend, "liteinst" | "in-guest-trap") && !verify.hermit_args.contains_key(backend)
+    {
+        verify.hermit_args.insert(
+            backend.to_string(),
+            IN_GUEST_PARITY_HERMIT_ARGS
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect(),
+        );
+        // The probe's flag carries its own reason. A shared reason written
+        // for the other backends' flags is kept for exactly those backends.
+        let reason = PARITY_PROBE_HERMIT_ARGS_REASON.to_string();
+        let mut reasons = match verify.hermit_args_reason.take() {
+            None => BTreeMap::new(),
+            Some(HermitArgsReason::PerBackend(reasons)) => reasons,
+            Some(HermitArgsReason::Shared(shared)) => verify
+                .hermit_args
+                .keys()
+                .filter(|flagged| flagged.as_str() != backend)
+                .map(|flagged| (flagged.clone(), shared.clone()))
+                .collect(),
+        };
+        reasons.insert(backend.to_string(), reason);
+        verify.hermit_args_reason = Some(HermitArgsReason::PerBackend(reasons));
+    }
+    test
 }
 
 #[derive(Clone, Debug)]
@@ -1337,6 +1765,297 @@ pub struct SelectedCell {
     pub enabled: bool,
     pub timeout_seconds: u64,
     pub cpu_timeout_seconds: u64,
+    /// The strictness level of the host that runs this cell
+    /// ([`host_strictness`]). Selection leaves it at the strict default, which
+    /// describes no host; the harness that runs the cells sets it from the
+    /// host it runs on, so a plan or an inventory never depends on a host. An
+    /// import leaves it too: its rows ran at their producer's level.
+    pub host_level: HostLevel,
+}
+
+/// How deep a cell's run goes. A host with a PMU and CPUID faulting runs every
+/// test at the strict level; a host without them runs it at the relaxed level,
+/// which adds [`RELAXED_LEVEL_ARGS`]; a verify cell may cap itself at the
+/// relaxed level ([`ModeRecipe::max_level`]). One run per test, at the deepest
+/// level the host and the cell allow, and the row records which
+/// ([`CellResult::strictness`]).
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Deserialize,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize
+)]
+#[serde(rename_all = "lowercase")]
+pub enum StrictnessLevel {
+    /// CPUID virtualization and the preemption timer off.
+    Relaxed,
+    /// No relaxation: CPUID virtualization and the preemption timer on.
+    #[default]
+    Strict,
+}
+
+impl StrictnessLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Relaxed => "relaxed",
+            Self::Strict => "strict",
+        }
+    }
+}
+
+/// How one cell ran: its strictness level and the Hermit settings it ran
+/// with, recorded on its result row ([`CellResult::strictness`]) and its
+/// series observation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellStrictness {
+    pub level: StrictnessLevel,
+    /// Whether Hermit virtualized CPUID (no `--no-virtualize-cpuid`).
+    pub virtualize_cpuid: bool,
+    /// The preemption timeslice Hermit ran with: its `--max-timeslice`, or
+    /// Hermit's default when the cell passed none.
+    pub max_timeslice: MaxTimeslice,
+    /// Whether the cell's recipe caps it at the relaxed level
+    /// ([`ModeRecipe::max_level`]).
+    pub capped: bool,
+}
+
+/// A `--max-timeslice` value: `"disabled"` in JSON, or the timeslice in
+/// virtual nanoseconds as a number.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaxTimeslice {
+    Disabled,
+    Nanoseconds(u64),
+}
+
+impl MaxTimeslice {
+    /// The value of a `--max-timeslice=<value>` flag, or `None` when Hermit
+    /// would not accept it.
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "disabled" => Some(Self::Disabled),
+            value => value
+                .parse::<u64>()
+                .ok()
+                .filter(|nanoseconds| *nanoseconds > 0)
+                .map(Self::Nanoseconds),
+        }
+    }
+
+    /// The timeslice Hermit runs with when it is given no `--max-timeslice`.
+    fn hermit_default() -> Self {
+        detcore_model::config::Config::default()
+            .max_timeslice
+            .map_or(Self::Disabled, |nanoseconds| {
+                Self::Nanoseconds(nanoseconds.get())
+            })
+    }
+}
+
+impl Serialize for MaxTimeslice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Disabled => serializer.serialize_str("disabled"),
+            Self::Nanoseconds(nanoseconds) => serializer.serialize_u64(*nanoseconds),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MaxTimeslice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Word(String),
+            Nanoseconds(u64),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Word(word) if word == "disabled" => Ok(Self::Disabled),
+            Repr::Word(word) => Err(serde::de::Error::custom(format!(
+                "max_timeslice must be \"disabled\" or a positive number, got {word:?}"
+            ))),
+            Repr::Nanoseconds(0) => Err(serde::de::Error::custom(
+                "max_timeslice must be \"disabled\" or a positive number, got 0",
+            )),
+            Repr::Nanoseconds(nanoseconds) => Ok(Self::Nanoseconds(nanoseconds)),
+        }
+    }
+}
+
+/// The strictness level a host runs, and why when it is not strict.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostLevel {
+    pub level: StrictnessLevel,
+    /// Why the host runs the relaxed level; `None` at the strict level.
+    pub reason: Option<String>,
+}
+
+/// The environment variable that makes a host run the relaxed level although
+/// it could run the strict one. Its only accepted value is `relaxed`: nothing
+/// can make a host without the capabilities run the strict level.
+pub const STRICTNESS_LEVEL_ENV: &str = "E2E_STRICTNESS_LEVEL";
+
+/// The Hermit `run` flags a verify cell adds at the relaxed level: CPUID
+/// virtualization off, which needs CPUID faulting, and the preemption timer
+/// off, which needs an exact retired-branch counter. Without the timer
+/// `hermit run --strict` does not refuse an inexact counter.
+pub const RELAXED_LEVEL_ARGS: [&str; 2] = ["--no-virtualize-cpuid", "--max-timeslice=disabled"];
+
+/// The strictness level of this host: relaxed when it lacks CPUID faulting,
+/// when the hermit binary reports its retired-branch counter inexact, or when
+/// `forced` (the value of [`STRICTNESS_LEVEL_ENV`]) is `relaxed`; strict
+/// otherwise. A binary that gives no counter verdict does not relax the host,
+/// as it does not make a cell HOST-INAPPLICABLE. Any other forced value is
+/// refused.
+pub fn host_strictness(
+    host_capabilities: &HostCapabilities,
+    exact_branch_counter: Option<&CapabilityVerdict>,
+    forced: Option<&str>,
+) -> Result<HostLevel, String> {
+    let relaxed = |reason: String| HostLevel {
+        level: StrictnessLevel::Relaxed,
+        reason: Some(reason),
+    };
+    match forced {
+        None | Some("") => {}
+        Some("relaxed") => return Ok(relaxed(format!("{STRICTNESS_LEVEL_ENV}=relaxed"))),
+        Some(other) => {
+            return Err(format!(
+                "{STRICTNESS_LEVEL_ENV} must be `relaxed` or unset, got {other:?}; a host runs the \
+                 strict level whenever it can, and nothing can make it run the strict level when \
+                 it cannot"
+            ));
+        }
+    }
+    let mut missing = Vec::new();
+    match host_capabilities.get(&HostCapability::CpuidFaulting) {
+        Some(verdict) if verdict.present => {}
+        Some(verdict) => missing.push(format!("no CPUID faulting ({})", verdict.evidence)),
+        None => missing.push("no CPUID faulting verdict".to_string()),
+    }
+    // No verdict is not a verdict of absence: like the HOST-INAPPLICABLE
+    // rule ([`refused_on_an_inexact_branch_counter`]'s caller), the level
+    // relaxes only where the binary reported the counter inexact.
+    if let Some(verdict) = exact_branch_counter.filter(|verdict| !verdict.present) {
+        missing.push(format!("no exact branch counter ({})", verdict.evidence));
+    }
+    Ok(if missing.is_empty() {
+        HostLevel::default()
+    } else {
+        relaxed(format!("this host has {}", missing.join(" and ")))
+    })
+}
+
+impl SelectedCell {
+    /// The strictness level this cell runs at, or `None` for a naked cell,
+    /// which runs no Hermit.
+    ///
+    /// Only a verify cell on a backend that reads its virtual clock from the
+    /// host's branch counter ([`pmu_clock_backend`]) has a relaxed form, so
+    /// only it runs relaxed: on a relaxed host, or when its recipe caps it.
+    /// Every other cell runs as declared, at the strict level; a chaos or
+    /// replay cell that needs the counter is not run on a host without it.
+    pub fn strictness_level(&self) -> Option<StrictnessLevel> {
+        (self.id.mode != "naked").then(|| {
+            if self.relaxed_level_reason().is_some() {
+                StrictnessLevel::Relaxed
+            } else {
+                StrictnessLevel::Strict
+            }
+        })
+    }
+
+    /// How this cell runs ([`CellStrictness`]), or `None` for a naked cell.
+    /// The settings are read from the Hermit flags the cell passes: a verify
+    /// cell's recipe flags, level flags and probe flag, or a custom cell's
+    /// arguments. Chaos and replay cells pass none.
+    pub fn strictness(&self) -> Option<CellStrictness> {
+        let level = self.strictness_level()?;
+        let recipe = &self.test.modes[&self.id.mode];
+        let flags: Vec<String> = match (self.id.mode.as_str(), self.id.backend.as_deref()) {
+            ("verify", Some(backend)) => cell_hermit_args(recipe, backend)
+                .iter()
+                .cloned()
+                .chain(
+                    self.level_relaxations()
+                        .into_iter()
+                        .map(|(arg, _)| arg.to_string()),
+                )
+                .chain(probe_relaxation(self, backend).map(str::to_string))
+                .collect(),
+            ("custom", _) => recipe.args.clone(),
+            _ => Vec::new(),
+        };
+        let max_timeslice = flags
+            .iter()
+            .rev()
+            .find_map(|flag| flag.strip_prefix("--max-timeslice="))
+            .and_then(MaxTimeslice::parse)
+            .unwrap_or_else(MaxTimeslice::hermit_default);
+        Some(CellStrictness {
+            level,
+            virtualize_cpuid: !flags.iter().any(|flag| flag == "--no-virtualize-cpuid"),
+            max_timeslice,
+            capped: self.id.mode == "verify" && recipe.max_level == Some(StrictnessLevel::Relaxed),
+        })
+    }
+
+    /// Why this cell runs at the relaxed level, or `None` when it does not.
+    /// The cell's own cap is named first: it holds on every host.
+    fn relaxed_level_reason(&self) -> Option<String> {
+        if self.id.mode != "verify" || !self.id.backend.as_deref().is_some_and(pmu_clock_backend) {
+            return None;
+        }
+        let recipe = &self.test.modes[&self.id.mode];
+        if recipe.max_level == Some(StrictnessLevel::Relaxed) {
+            return Some(format!(
+                "the cell caps itself at the relaxed level: {}",
+                recipe
+                    .max_level_reason
+                    .as_deref()
+                    .unwrap_or("reason missing")
+            ));
+        }
+        (self.host_level.level == StrictnessLevel::Relaxed).then(|| {
+            format!(
+                "the host runs the relaxed level: {}",
+                self.host_level
+                    .reason
+                    .as_deref()
+                    .unwrap_or("reason missing")
+            )
+        })
+    }
+
+    /// The [`RELAXED_LEVEL_ARGS`] this cell adds at the relaxed level, each
+    /// with the reason, leaving out a flag its recipe already declares.
+    pub fn level_relaxations(&self) -> Vec<(&'static str, String)> {
+        let Some(reason) = self.relaxed_level_reason() else {
+            return Vec::new();
+        };
+        let declared = self
+            .id
+            .backend
+            .as_deref()
+            .map(|backend| cell_hermit_args(&self.test.modes[&self.id.mode], backend))
+            .unwrap_or_default();
+        let flag_name = |arg: &str| arg.split_once('=').map_or(arg, |(flag, _)| flag).to_owned();
+        RELAXED_LEVEL_ARGS
+            .into_iter()
+            .filter(|arg| {
+                !declared
+                    .iter()
+                    .any(|declared| flag_name(declared) == flag_name(arg))
+            })
+            .map(|arg| (arg, reason.clone()))
+            .collect()
+    }
 }
 
 /// Named manifest bytes captured once for shared parsing and provenance.
@@ -1593,6 +2312,7 @@ impl ManifestSet {
                             .get("native")
                             .copied()
                             .unwrap_or(*default_cpu_timeout_seconds),
+                        host_level: HostLevel::default(),
                     });
                     continue;
                 }
@@ -1621,6 +2341,13 @@ impl ManifestSet {
                     if !population_accepts(population, ci.selected(&backend), enabled) {
                         continue;
                     }
+                    let probed = (selection.parity_inputs && !enabled && mode == "verify")
+                        .then(|| with_parity_inputs(test, &backend));
+                    let cell_test = probed.as_ref().unwrap_or(test);
+                    let recipe = probed
+                        .as_ref()
+                        .and_then(|probed| probed.modes.get(mode.as_str()))
+                        .unwrap_or(recipe);
                     let timeout_seconds = resolve_timeout_seconds(
                         *bucket_timeout_seconds,
                         None,
@@ -1633,7 +2360,7 @@ impl ManifestSet {
                         .unwrap_or(*default_cpu_timeout_seconds);
                     cells.push(SelectedCell {
                         category: category.clone(),
-                        test: test.clone(),
+                        test: cell_test.clone(),
                         id: CellId {
                             test: id.clone(),
                             mode: mode.clone(),
@@ -1642,6 +2369,7 @@ impl ManifestSet {
                         enabled,
                         timeout_seconds,
                         cpu_timeout_seconds,
+                        host_level: HostLevel::default(),
                     });
                 }
             }
@@ -1909,15 +2637,22 @@ fn validate_mode_with_cpu(
             ));
         }
     }
+    // `compare_io_buffers=false` is refused with or without a reason: the
+    // runner would pass `--no-detlog-io-buffers`, under which Hermit never
+    // reports `bitwise_parity` (`is_bitwise_parity` in
+    // hermit-cli/src/bin/hermit/verify.rs), so the cell could never reach a
+    // canonical match. Every reason is therefore refused as well.
     match (
         mode,
         recipe.compare_io_buffers,
         recipe.compare_io_buffers_disabled_reason.as_deref(),
     ) {
-        ("verify", None | Some(true), None) | ("verify", Some(false), Some(_)) => {}
-        ("verify", Some(false), None) => {
+        ("verify", None | Some(true), None) => {}
+        ("verify", Some(false), _) => {
             return Err(format!(
-                "{id}: verify compare_io_buffers=false requires compare_io_buffers_disabled_reason"
+                "{id}: verify compare_io_buffers=false is refused, with or without a reason: \
+                 under --no-detlog-io-buffers Hermit never reports bitwise_parity, so the cell \
+                 could never reach a canonical match"
             ));
         }
         ("verify", None | Some(true), Some(_)) => {
@@ -1931,15 +2666,6 @@ fn validate_mode_with_cpu(
                 "{id}: compare_io_buffers is supported only by verify mode"
             ));
         }
-    }
-    if recipe
-        .compare_io_buffers_disabled_reason
-        .as_deref()
-        .is_some_and(|reason| reason.trim().is_empty())
-    {
-        return Err(format!(
-            "{id}: compare_io_buffers_disabled_reason must be substantive"
-        ));
     }
     match (
         mode,
@@ -2001,7 +2727,46 @@ fn supports_test_workdir(mode: &str, _backend: &str) -> bool {
     matches!(mode, "verify" | "replay" | "chaos" | "custom")
 }
 
-fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
+/// Whether `result` records the relaxations `cell` runs with on the host that
+/// produced it: [`cell_relaxations`] with that host's strictness level.
+///
+/// A level relaxation names its host's level ([`host_strictness`]), and a row
+/// imported from another host does not share the importing host's: a Buck RE
+/// worker without CPUID faulting runs `--no-virtualize-cpuid` where this host
+/// does not (on 2026-10-19 that refused the skid-overshoot retry of
+/// c-programs/sigreturn-preemption whose retry had passed). The producing
+/// host's level is the one the row's own capability verdicts give, or, when
+/// the row records an uncapped relaxed level, the forced relaxed level
+/// ([`STRICTNESS_LEVEL_ENV`]). Every relaxation the manifest declares is still
+/// the cell's own, and a row this host produced is held to this host's level.
+pub fn row_records_cell_relaxations(cell: &SelectedCell, result: &CellResult) -> bool {
+    let at_level = |forced: Option<&str>| {
+        host_strictness(
+            &result.host_capabilities,
+            result.exact_branch_counter.as_ref(),
+            forced,
+        )
+        .ok()
+        .map(|host_level| {
+            let mut producer = cell.clone();
+            producer.host_level = host_level;
+            cell_relaxations(&producer)
+        })
+    };
+    let recorded_relaxed = result.strictness.as_ref().is_some_and(|strictness| {
+        strictness.level == StrictnessLevel::Relaxed && !strictness.capped
+    });
+    result.relaxations == cell_relaxations(cell)
+        || at_level(None).as_ref() == Some(&result.relaxations)
+        || (recorded_relaxed && at_level(Some("relaxed")).as_ref() == Some(&result.relaxations))
+}
+
+/// The relaxations a row of `cell` records ([`CellResult::relaxations`]): each
+/// weaker-than-default setting its manifest recipe selects, with its reason.
+/// A retained row whose relaxations differ was recorded under another recipe,
+/// so its evidence does not decide this cell. The recipe of the cell's own
+/// mode must exist, as it does for every planned cell.
+pub fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
     let recipe = &cell.test.modes[&cell.id.mode];
     let mut relaxations = Vec::new();
     if recipe.compare_io_buffers == Some(false) {
@@ -2024,14 +2789,21 @@ fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
     }
     let reason =
         |reason: &Option<String>| reason.as_deref().unwrap_or("reason missing").to_string();
-    for arg in cell
-        .id
-        .backend
-        .as_deref()
-        .map(|backend| cell_hermit_args(recipe, backend))
-        .unwrap_or_default()
-    {
-        relaxations.push(format!("{arg}: {}", reason(&recipe.hermit_args_reason)));
+    if let Some(backend) = cell.id.backend.as_deref() {
+        let args_reason = recipe
+            .hermit_args_reason
+            .as_ref()
+            .and_then(|reason| reason.for_backend(backend))
+            .unwrap_or("reason missing");
+        for arg in cell_hermit_args(recipe, backend) {
+            relaxations.push(format!("{arg}: {args_reason}"));
+        }
+        for (arg, reason) in cell.level_relaxations() {
+            relaxations.push(format!("{arg}: {LEVEL_RELAXATION_PREFIX}{reason}"));
+        }
+        if let Some(arg) = probe_relaxation(cell, backend) {
+            relaxations.push(format!("{arg}: {PROBE_RELAXATION_REASON}"));
+        }
     }
     if recipe.comparator == Some(Comparator::Stripped) {
         relaxations.push(format!(
@@ -2044,6 +2816,10 @@ fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
     }
     relaxations
 }
+
+/// What follows the flag in the relaxation that records a flag the relaxed
+/// strictness level added ([`SelectedCell::level_relaxations`]).
+pub const LEVEL_RELAXATION_PREFIX: &str = "strictness level relaxed: ";
 
 /// The relaxation that records a stripped-comparator cell and its reason. The
 /// ledger reads it back to judge the cell by the comparison it declared.
@@ -2129,6 +2905,18 @@ pub fn records_stripped_comparator(relaxations: &[String]) -> bool {
     recorded_relaxation_reason(relaxations, STRIPPED_COMPARATOR_RELAXATION_PREFIX).is_some()
 }
 
+/// The comparator a verify row was judged by, as its relaxations record it:
+/// `stripped` when they record the stripped comparator with a reason
+/// ([`records_stripped_comparator`]), the runner's default `strict`
+/// otherwise. A row that records it malformed is therefore held to `strict`.
+pub fn row_comparator(result: &CellResult) -> Comparator {
+    if records_stripped_comparator(&result.relaxations) {
+        Comparator::Stripped
+    } else {
+        Comparator::Strict
+    }
+}
+
 /// The reason of the one non-blank relaxation with `prefix`; `None` when there
 /// is none, or more than one, since the runner records each at most once.
 fn recorded_relaxation_reason<'a>(relaxations: &'a [String], prefix: &str) -> Option<&'a str> {
@@ -2161,6 +2949,10 @@ pub struct CellRunSpec {
     pub timeout_seconds: u64,
     pub verdict_path: Option<PathBuf>,
     pub verification_log_dir: Option<PathBuf>,
+    /// The `verify-runs/<attempt>` directory holding a verify or chaos
+    /// attempt's two `--verify-run` directories (see `VERIFY_PAIR_SCRIPT`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_runs: Option<PathBuf>,
     pub sabre_path_evidence: Option<PathBuf>,
     pub cell_dir: PathBuf,
     /// The exact nonzero guest disposition this attempt requires, if any.
@@ -2314,15 +3106,17 @@ pub struct AttemptResult {
     pub timed_out: bool,
     #[serde(default)]
     pub duration_ms: u128,
-    /// CPU consumed by the launched process group. Rows written before the
+    /// CPU consumed by the launched command. Rows written before the
     /// ptrace golden-log normalization was removed
     /// (<https://github.com/rrnewton/hermit/issues/3301>) also include that
     /// normalization process for `E2E_KEEP_VERIFY_LOGS=1` ptrace verify cells.
     ///
     /// Completed commands use `wait4`; a CPU timeout retains the last live
-    /// process-group observation when that is larger. It is not inferred from
-    /// wall time and remains attributable when cells execute concurrently or
-    /// move their work outside the enclosing DAG cgroup.
+    /// observation when that is larger. The live observation is the CPU of the
+    /// command's own invocation cgroup or, in a run that declared it has no
+    /// cgroups, of the leader's live process group; `cpu_observations` names
+    /// which. It is not inferred from wall time, so it stays attributable when
+    /// cells execute concurrently.
     #[serde(default)]
     pub cpu_usage_usec: Option<u64>,
     pub observation_sha256: Option<String>,
@@ -2367,6 +3161,33 @@ pub struct AttemptResult {
     pub reason: Option<String>,
 }
 
+/// The stdout assertions a verify cell declares for its backend: the exact
+/// `expected_stdout` and the `expected_stdout_contains` text, each `null`
+/// when the cell declares none.
+///
+/// Both members must be present when a row is read. Serde would otherwise
+/// read an omitted member as `None`, so a row that dropped `exact` would read
+/// as a cell that declares no exact stdout, and the skid checks would
+/// re-decide the attempts against an empty declaration instead of the one
+/// the runner recorded. The runner always writes both members.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredStdout {
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub exact: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub contains: Option<String>,
+}
+
+/// Reads a member that must be present but may be `null`. A field with a
+/// `deserialize_with` and no `default` is a missing-field error when omitted.
+fn deserialize_required_nullable<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
+
 /// One test-harness cell observation written to `results.jsonl`.
 ///
 /// This is not [`crate::ledger::CellResult`]. That type is the validation
@@ -2389,6 +3210,16 @@ pub struct CellResult {
     /// cells could execute on this host.
     #[serde(default)]
     pub host_capabilities: HostCapabilities,
+    /// The run's hermit binary's own `exact_branch_counter` verdict (whether
+    /// the retired-branch counter that ptrace and e9patch runs read their
+    /// virtual clock from is exact here; see
+    /// [`refused_on_an_inexact_branch_counter`]), recorded in every row so
+    /// that a cell which ran is known to have run on an exact counter or not.
+    /// It is outside the closed `host_capabilities` record, whose set the
+    /// stress series froze. `None` when the binary was not probed or did not
+    /// answer, and in a row written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_branch_counter: Option<CapabilityVerdict>,
     /// The cell attempt that produced this observation. A retry is a second
     /// observation, so it receives the next positive ordinal instead of
     /// replacing the earlier row.
@@ -2487,14 +3318,16 @@ pub struct CellResult {
     pub shell_command: String,
     #[serde(default)]
     pub relaxations: Vec<String>,
+    /// How the cell ran ([`SelectedCell::strictness`]): its strictness level
+    /// and the Hermit settings that level and the recipe selected. `None` for
+    /// a naked cell, which runs no Hermit, and in a row written before this
+    /// field; a reader must treat that as not recorded and never infer it from
+    /// the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strictness: Option<CellStrictness>,
     pub execution_path: Option<JsonValue>,
     pub diversity: Option<JsonValue>,
     pub attempts: Vec<AttemptResult>,
-    /// Strict ptrace-reference comparison produced in this cell, when
-    /// explicitly requested by the runner. Same-backend verification evidence
-    /// remains in `attempts`; this field is the separate cross-backend fact.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend_parity: Option<BackendParityReport>,
     /// Cell-level divergence position: the FIRST attempt that located one.
     ///
     /// This mirrors `reason` exactly, which is also
@@ -2539,6 +3372,18 @@ pub struct CellResult {
     /// so rows for ordinary cells are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_guest_exit: Option<ExpectedGuestExit>,
+    /// The stdout assertions this verify cell declares, recorded on every row
+    /// with at least one attempt whose retained verification report has the
+    /// verdict `infrastructure_error`, and absent from every other row, so
+    /// rows for ordinary cells are unchanged.
+    ///
+    /// [`skid_overshoot_only_reports`] re-decides these assertions from each
+    /// attempt's own report and captured stdout instead of trusting how the
+    /// attempt was classified, and a row without this record (one written
+    /// before it existed) never has a skid-only history
+    /// (<https://github.com/rrnewton/hermit/issues/1845>).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_stdout: Option<DeclaredStdout>,
 }
 
 impl CellResult {
@@ -2573,16 +3418,11 @@ impl CellResult {
                 &attempt.env,
             )?;
         }
-        observations.require_passing_prerequisites(self.attempts.iter().map(|attempt| {
-            (
-                attempt.index.as_str(),
-                attempt.outcome == "PASS"
-                    && attempt.status == Some(0)
-                    && attempt.signal.is_none()
-                    && !attempt.timed_out,
-                Some(attempt.timed_out),
-            )
-        }))?;
+        observations.require_timeout_prerequisites(
+            self.attempts
+                .iter()
+                .map(|attempt| (attempt.index.as_str(), Some(attempt.timed_out))),
+        )?;
         Ok(())
     }
 
@@ -2744,6 +3584,12 @@ pub struct RunContext {
     pub machine_shortname: String,
     pub kernel_version: String,
     pub host_capabilities: HostCapabilities,
+    /// The hermit binary's own `exact_branch_counter` verdict, from
+    /// `hermit host-capabilities --json`; `None` when the binary was not
+    /// probed or did not answer. Where it is absent, the cells that the binary
+    /// then refuses are HOST-INAPPLICABLE (see
+    /// [`refused_on_an_inexact_branch_counter`]).
+    pub exact_branch_counter: Option<CapabilityVerdict>,
     pub attempt: u64,
     pub run_index: Option<u64>,
     /// One concrete CLI input shared by comparison operands and outer retries.
@@ -2773,26 +3619,31 @@ pub struct RunContext {
     pub isolated_workdir: Option<PathBuf>,
 }
 
-fn resolve_run_epoch(
-    explicit: Option<std::ffi::OsString>,
-    capture_now: impl FnOnce() -> SystemTime,
-) -> Result<String, String> {
+/// The epoch a cell gets when `HERMIT_EPOCH` is unset, re-exported for the
+/// scripts that build on this crate.
+pub use detcore_model::config::CANONICAL_TEST_EPOCH;
+
+/// The epoch every cell gives its guests: `HERMIT_EPOCH` verbatim, or the
+/// canonical test epoch. Never the host clock: a run whose epoch came from the
+/// host could be reproduced only from a recording, and `hermit run --strict`
+/// refuses it.
+fn resolve_run_epoch(explicit: Option<std::ffi::OsString>) -> Result<String, String> {
     match explicit {
         // Preserve the supported input exactly, including invalid values that
-        // the CLI must reject. Never replace an override with a new sample.
+        // the CLI must reject.
         Some(epoch) => epoch
             .into_string()
             .map_err(|_| "HERMIT_EPOCH must be valid Unicode".to_owned()),
-        None => Ok(detcore_model::config::epoch_from_host_time(capture_now()).to_rfc3339()),
+        None => Ok(CANONICAL_TEST_EPOCH.to_owned()),
     }
 }
 
 /// The `HERMIT_EPOCH` a harness process started now would give every guest:
-/// the environment's value verbatim, or one sampled from host time. A caller
+/// the environment's value verbatim, or the canonical test epoch. A caller
 /// that launches several harness processes whose logs are compared (the
-/// pressure test's parity post-pass) samples this once and passes it to each.
+/// pressure test's parity post-pass) resolves this once and passes it to each.
 pub fn run_epoch_from_env() -> Result<String, String> {
-    resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now)
+    resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"))
 }
 
 impl RunContext {
@@ -2816,9 +3667,13 @@ impl RunContext {
     }
 
     /// The context of a run that executes no cell: `E2E_IMPORT_RESULTS`
-    /// re-publishes rows another harness process wrote. Nothing launches the
-    /// Hermit binary, so it is neither required nor probed; the binary-derived
-    /// fields stay empty and every other field is read as `from_env` reads it.
+    /// re-publishes rows another harness process wrote. No cell launches the
+    /// Hermit binary, so it is [`resolve_import_hermit_bin`]'s choice and the
+    /// fields that describe the binary stay empty; the parity post-pass runs
+    /// it for `hermit log-diff`. It is still asked for `exact_branch_counter`,
+    /// which describes this machine: a producer's claim that a strict ptrace
+    /// or e9patch cell is inapplicable counts only when this machine confirms
+    /// it. Every other field is read as `from_env` reads it.
     pub fn for_import(root: PathBuf, source_sha: Option<&str>) -> Result<Self, String> {
         Self::from_env_probing(root, true, source_sha, false)
     }
@@ -2876,13 +3731,23 @@ impl RunContext {
         let build_root = std::env::var_os("E2E_BUILD_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| result_root.join("build").join(&source_sha));
-        let hermit_bin = resolve_hermit_bin(&root, std::env::var_os("HERMIT_BIN"));
+        let hermit_bin = if probe_hermit {
+            resolve_hermit_bin(&root, std::env::var_os("HERMIT_BIN"))
+        } else {
+            resolve_import_hermit_bin(&root, std::env::var_os("HERMIT_BIN"))
+        };
         // Ask the binary where it came from, the same way this function already
         // asks it what flags it supports. `source_sha` above describes the
         // checkout; only the binary can describe the binary.
         let binary_build_sha = probe_hermit
             .then(|| probe_binary_build_sha(&hermit_bin))
             .flatten();
+        // Only the binary can run Reverie's counter validation, and it is the
+        // binary that refuses `--strict` when the validation fails. An import
+        // asks too: the verdict describes this machine, not the binary, and it
+        // is what confirms a producer's claim that a strict ptrace or e9patch
+        // cell is inapplicable here.
+        let exact_branch_counter = probe_exact_branch_counter(&hermit_bin);
         // Published main still exposes the legacy `--verify-strict` spelling;
         // the canonical-only cutover removes it and makes bare `--verify`
         // canonical.  Detect the running binary rather than keying behavior to
@@ -2917,9 +3782,10 @@ impl RunContext {
             machine_shortname,
             kernel_version,
             host_capabilities,
+            exact_branch_counter,
             attempt: 1,
             run_index,
-            epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now)?,
+            epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"))?,
             source_sha,
             source_dirty,
             binary_build_sha,
@@ -3058,6 +3924,1075 @@ pub fn cell_result_and_attempts_after_retries(
         .map(|result| result.attempt)
         .ok_or_else(|| "cell result has no attempts".to_string())?;
     Ok((selected, attempts))
+}
+
+/// The reason the runner records for a verify attempt whose verification
+/// report is Hermit's typed `skid_overshoot` infrastructure error.
+///
+/// The classifier writes this reason and [`skid_overshoot_only_reports`] reads
+/// it back, so the retry gate keys on exactly the text the classifier
+/// produced and on nothing a guest could print.
+pub fn skid_overshoot_reason(count: u64) -> String {
+    format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)")
+}
+
+/// The reason the runner records for a verify attempt whose verification
+/// report is Hermit's typed `host_input_changed` infrastructure error
+/// (`change`). [`host_input_change_only`] reads it back, as
+/// [`skid_overshoot_only_reports`] reads back [`skid_overshoot_reason`].
+pub fn host_input_changed_reason(change: &InfrastructureError) -> String {
+    format!("verification diverged and Hermit found the cause outside the guest: {change}")
+}
+
+/// Whether `result` is a verify attempt whose only failure is a divergence
+/// that a host file changing during one run explains: Hermit's typed
+/// `host_input_changed` report (see `detcore_model::host_input`).
+///
+/// Such an attempt measured a change of the host's files, not the guest's
+/// determinism, so the runner gives the cell one fresh attempt, even a cell
+/// that declares `no_retry_reason`: that declaration keeps a PRODUCT
+/// failure final, and this is not one. The fresh attempt decides the cell by
+/// the ordinary rules: a second divergence fails it, and a divergence for
+/// any other reason was never this. Nothing here turns a divergence green.
+///
+/// Every condition must hold, from the row and from each inner attempt's own
+/// retained evidence, so that a label alone cannot claim it: the row is a
+/// verify `ERROR` of failure class `understood_infrastructure_failure` and
+/// error kind `infrastructure` whose reason is its first attempt's, and whose
+/// retained SaBRe path evidence is the evidence the executor summarized into
+/// its recorded execution path (`retained_path_evidence_error`; the executor
+/// makes a row whose evidence does not summarize an
+/// `invalid-backend-evidence` `ERROR`, and judges the path's eligibility only
+/// on a `PASS`, so an ineligible path does not disqualify); each inner
+/// attempt is an `ERROR` of error kind `infrastructure` that did not time
+/// out, whose retained exit status, stdout and stderr carry no failure its
+/// producer classified (`producer_failure`, which the executor decides
+/// before it reads any report), whose retained verification report is the
+/// bytes its recorded
+/// `verification_report_sha256` names and parses as a current report with
+/// verdict `infrastructure_error`, a `host_input_changed` error, a comparison
+/// that is complete under the comparator the row records ([`row_comparator`];
+/// the check the classifier makes before it labels a host-input attempt, so a
+/// row it did not classify, such as an imported one, cannot skip it) and no
+/// `no_result_reason`, whose reason is [`host_input_changed_reason`]
+/// of that error, and whose report and captured stdout meet the cell's
+/// declared stdout assertions, which the row records
+/// ([`CellResult::declared_stdout`]; a row without that record never
+/// qualifies). A host change explains the divergence, not a declared output
+/// either run got wrong.
+pub fn host_input_change_only(result: &CellResult) -> bool {
+    let Some(declared) = result.declared_stdout.as_ref() else {
+        return false;
+    };
+    if result.mode != "verify"
+        || result.outcome != "ERROR"
+        || result.failure_class != Some(FailureClass::UnderstoodInfrastructureFailure)
+        || result.error_kind.as_deref() != Some("infrastructure")
+        || result.attempts.is_empty()
+        || result
+            .attempts
+            .first()
+            .is_none_or(|first| result.reason != first.reason)
+        || retained_path_evidence_error(result).is_some()
+    {
+        return false;
+    }
+    result.attempts.iter().all(|attempt| {
+        if attempt.outcome != "ERROR"
+            || attempt.timed_out
+            || attempt.error_kind.as_deref() != Some("infrastructure")
+        {
+            return false;
+        }
+        // The executor reads no report over a failure its producer classified
+        // on stderr, so an attempt whose retained process evidence carries one
+        // never reached this label.
+        if producer_failure(
+            &result.mode,
+            result.backend.as_deref(),
+            attempt.status == Some(0),
+            attempt.timed_out,
+            &attempt.stdout,
+            &attempt.stderr,
+        )
+        .is_some()
+        {
+            return false;
+        }
+        let Some(raw) = attempt.verification_report.as_deref() else {
+            return false;
+        };
+        if attempt.verification_report_sha256.as_deref()
+            != Some(hex_digest(raw.as_bytes()).as_str())
+        {
+            return false;
+        }
+        let Ok(report) = current_verification_report(raw.as_bytes()) else {
+            return false;
+        };
+        // The comparison must be the complete one the row's comparator
+        // requires, the check the classifier makes before it labels a
+        // host-input attempt as one: an incomplete comparison is incomplete
+        // verification evidence instead.
+        let complete = || match row_comparator(result) {
+            Comparator::Strict => report.require_canonical_comparison(),
+            Comparator::Stripped => require_stripped_comparison(&report),
+        };
+        match &report.infrastructure_error {
+            Some(change @ InfrastructureError::HostInputChanged { .. }) => {
+                report.verdict == Verdict::InfrastructureError
+                    && report.no_result_reason.is_none()
+                    && report.comparison.is_some()
+                    && complete().is_ok()
+                    && attempt.reason.as_deref() == Some(host_input_changed_reason(change).as_str())
+                    && declared
+                        .exact
+                        .as_deref()
+                        .is_none_or(|expected| check_expected_stdout(expected, &report).is_ok())
+                    && declared.contains.as_deref().is_none_or(|text| {
+                        check_expected_stdout_contains(text, attempt.stdout.as_bytes(), &report)
+                            .is_ok()
+                    })
+            }
+            _ => false,
+        }
+    })
+}
+
+/// The number of `HERMIT_SKID_OVERSHOOT` reports behind `result`, when, and
+/// only when, the cell is a verify cell and its failure is a precise-timer
+/// overshoot and nothing else
+/// (<https://github.com/rrnewton/hermit/issues/1845>).
+///
+/// A precise timer is armed `skid_margin` retired conditional branches before
+/// its target and then single-stepped to it. When the counter's overflow
+/// interrupt lands more than `skid_margin` branches late, the guest has
+/// already run past the target and the preemption point cannot be moved back.
+/// Hermit then refuses the comparison with the typed verdict
+/// `infrastructure_error` / `skid_overshoot` and exit status 122, taking the
+/// count from its own in-process counter rather than from guest-visible text.
+/// Such an attempt measured the host's interrupt latency, not the guest's
+/// determinism, so a fresh attempt of the same cell is a new measurement.
+///
+/// Every condition below must hold; a single unmet one returns `None`, which
+/// leaves the attempt to the ordinary rules:
+///
+/// - the cell is a `verify` cell whose row is an `ERROR` with no typed
+///   product result, failure class `understood_infrastructure_failure`, error
+///   kind `infrastructure`, and the reason of its first attempt (so a later
+///   cell-level override, such as the Hermit binary changing during the cell,
+///   is not mistaken for a skid);
+/// - it has at least one inner attempt, the inner attempts' indices are
+///   nonempty and distinct (as the runner writes them, and as the pressure
+///   test's and the stress series' history readers require), and every inner
+///   attempt is a skid
+///   attempt: an `ERROR` with error kind `infrastructure` that did not time
+///   out, exited with Hermit's policy-refusal status
+///   (`HERMIT_POLICY_REFUSAL_EXIT`, 122) and no signal, whose retained
+///   verification report is the exact bytes its recorded
+///   `verification_report_sha256` names and parses as a current report with verdict
+///   `infrastructure_error` and `skid_overshoot` count greater than zero and
+///   no `no_result_reason`, whose reason is [`skid_overshoot_reason`] of that
+///   count, and whose stderr carries at least one `HERMIT_SKID_OVERSHOOT `
+///   line and the line `HERMIT_POLICY_REFUSAL class=policy-refusal
+///   cause=skid-overshoot count=<that count>`, no other Hermit classification
+///   line ([`HERMIT_CLASSIFICATION_PREFIXES`]), and no comparator refusal line
+///   (`REFUSING to compare:`);
+/// - every such report records a completed comparison of both runs (its
+///   `comparison` and `compared_outputs` are present) that meets the
+///   requirements of the comparator the row records ([`row_comparator`]),
+///   the same requirements the classifier applies before it accepts a skid
+///   report: for `strict`, a canonical comparison
+///   ([`VerificationReport::require_canonical_comparison`]); for `stripped`,
+///   the stripped comparison ([`require_stripped_comparison`]); and its guest
+///   disposition and both compared runs' dispositions are the one the cell
+///   accepts ([`accepted_guest_disposition`] of the row's
+///   `expected_guest_exit`);
+/// - every such report satisfies the backend evidence a passing attempt of
+///   the row's backend must carry (`dispatch_record_error` finds nothing in
+///   its `runtime`), and the row's execution-path evidence is the one its own
+///   retained attempts decide ([`retained_execution_path_error`] finds
+///   nothing: SaBRe evidence bytes that match their digests, summarized to
+///   the row's recorded `execution_path`, eligible). Both are checked only on
+///   a `PASS` elsewhere, so an `ERROR` attempt would otherwise reach a retry
+///   without them.
+/// - every inner attempt's retained runtime and divergence coordinates are
+///   the ones the runner copies onto it from its report, and the row's are
+///   the ones the runner gives a row from its attempts
+///   (`attempt_copies_its_report`, `row_copies_its_attempts`), so no retained
+///   copy carries evidence, such as another backend's dispatch record, that
+///   the report the checks above read does not;
+/// - every inner attempt's command line, and the row's copies of the first
+///   attempt's, are the verify invocation the executor writes for the row's
+///   backend, relaxations, expected guest exit and comparator
+///   ([`retained_verify_invocation_error`] finds nothing), so a row whose
+///   command line selects another backend, carries a run flag its
+///   relaxations do not record, or ran another guest is not judged by labels
+///   that do not describe it;
+///
+/// - the row records the stdout assertions its cell declares
+///   ([`CellResult::declared_stdout`]), and every attempt's own evidence
+///   satisfies them: the exact `expected_stdout` is checked against both
+///   compared runs' stdout digests in the attempt's report
+///   (`check_expected_stdout`), and the `expected_stdout_contains` text is
+///   searched in the attempt's captured stdout, which must be the bytes of
+///   both compared runs (`check_expected_stdout_contains`). An assertion
+///   that fails or cannot be decided, or a row that records no declaration
+///   (one written before the record existed), disqualifies the row.
+///
+/// The classifier decides the same assertions first: a skid attempt whose
+/// compared runs violate one, or whose assertion cannot be checked, keeps the
+/// plain skid attempt's infrastructure classification, but its reason names
+/// the assertion as well as the overshoot count, so it is not
+/// [`skid_overshoot_reason`] of the count. The re-decision above is what
+/// makes a row the classifier did not produce (an imported row, or one from
+/// an older producer) unable to claim a skid-only history by its labels
+/// alone, and the report digest is what ties the re-decided report to the
+/// bytes the runner read.
+///
+/// The last condition is positive evidence that both guests ran to an
+/// accepted end. Hermit also writes a `skid_overshoot` report, exits 122 and
+/// prints only the skid refusal line when the overshoot sits beside a second
+/// failure:
+///
+/// - run 1 ended with a status the verify policy rejects (a crash, a signal,
+///   an unexpected exit code): no second run or comparison happened, and the
+///   report carries that rejected disposition;
+/// - run 1 or run 2 failed for another reason (a tracer error, a run timeout,
+///   a container death) while also overshooting: Hermit attaches the
+///   overshoot to that error, and the report has no comparison;
+/// - both runs completed but one ended differently (run 2 crashed): the
+///   comparison's divergence becomes the skid verdict, and
+///   `compared_outputs` carries the crash.
+///
+/// None of these is skid-only, and a passing fresh attempt must not replace
+/// them.
+///
+/// A `diverged` or `no_result` report, a timeout, a missing or unreadable
+/// report, an environmental block, any other exit status, a stderr marker
+/// without the typed report, or a typed report without the stderr markers
+/// never qualifies. Neither does an overshoot whose comparison the comparator
+/// refused (a log cut at its size bound): Hermit then writes the refusal as
+/// the report (verdict `no_result`, reason `comparison_refused`) and prints
+/// the `REFUSING to compare:` line, and that refusal is a second failure a
+/// fresh attempt must not hide. The `no_result_reason` guard below repeats
+/// the report parser's own refusal of a reason beside any other verdict, so
+/// the predicate does not depend on that parser alone. The
+/// skid report's own first-divergence fields are not a second class: Hermit
+/// decides the verdict's precedence, and an overshoot moves the preemption
+/// point, so its two runs are expected to differ there.
+pub fn skid_overshoot_only_reports(result: &CellResult) -> Option<u64> {
+    if result.mode != "verify"
+        || result.outcome != "ERROR"
+        || result.result.is_some()
+        || result.failure_class != Some(FailureClass::UnderstoodInfrastructureFailure)
+        || result.error_kind.as_deref() != Some("infrastructure")
+        || retained_execution_path_error(result).is_some()
+        || !row_copies_its_attempts(result)
+        || retained_verify_invocation_error(result).is_some()
+    {
+        return None;
+    }
+    let first = result.attempts.first()?;
+    if result.reason != first.reason {
+        return None;
+    }
+    let mut indices = BTreeSet::new();
+    if result
+        .attempts
+        .iter()
+        .any(|attempt| attempt.index.trim().is_empty() || !indices.insert(attempt.index.as_str()))
+    {
+        return None;
+    }
+    let declared = result.declared_stdout.as_ref()?;
+    let accepted = accepted_guest_disposition(result.expected_guest_exit.as_ref());
+    let backend = result.backend.as_deref();
+    let comparator = row_comparator(result);
+    result.attempts.iter().try_fold(0u64, |reports, attempt| {
+        reports.checked_add(attempt_skid_overshoot_reports(
+            attempt, declared, accepted, backend, comparator,
+        )?)
+    })
+}
+
+/// Whether `attempt` retains a verification report whose verdict is
+/// `infrastructure_error`, the attempts whose rows record the cell's declared
+/// stdout assertions ([`CellResult::declared_stdout`]).
+fn attempt_has_infrastructure_report(attempt: &AttemptResult) -> bool {
+    attempt
+        .verification_report
+        .as_deref()
+        .and_then(|report| current_verification_report(report.as_bytes()).ok())
+        .is_some_and(|report| report.verdict == Verdict::InfrastructureError)
+}
+
+/// The guest disposition, as `(exit code, signal)`, that a verify cell
+/// accepts from each run: the one its manifest declares in
+/// `expected_guest_exit`, or a clean exit 0 when it declares none. These are
+/// the dispositions Hermit's `--verify` admits to a comparison for the cell,
+/// in the representation the verification report records.
+pub fn accepted_guest_disposition(
+    expected: Option<&ExpectedGuestExit>,
+) -> (Option<i32>, Option<i32>) {
+    expected.map_or((Some(0), None), |expected| (expected.code, expected.signal))
+}
+
+/// The prefixes of the one-line classifications Hermit prints when it stops
+/// for a reason of its own: a policy refusal, an internal failure, a signal
+/// death or a run timeout. A skid attempt's stderr may carry exactly one kind
+/// of these, its own skid refusal; any other is a second failure.
+pub const HERMIT_CLASSIFICATION_PREFIXES: [&str; 4] = [
+    "HERMIT_POLICY_REFUSAL",
+    "HERMIT_INTERNAL_FAILURE",
+    "HERMIT_SIGNAL_DEATH",
+    "HERMIT_RUN_TIMEOUT",
+];
+
+/// The line Hermit's log comparator prints when it declines to compare two
+/// logs, a no-result rather than a match or a difference.
+const COMPARISON_REFUSAL_PREFIX: &str = "REFUSING to compare:";
+
+/// The overshoot count of one inner attempt that is a typed skid attempt of a
+/// cell on `backend` declaring the stdout assertions `declared`, accepting
+/// the guest disposition `accepted` and judged by `comparator`, as defined by
+/// [`skid_overshoot_only_reports`].
+fn attempt_skid_overshoot_reports(
+    attempt: &AttemptResult,
+    declared: &DeclaredStdout,
+    accepted: (Option<i32>, Option<i32>),
+    backend: Option<&str>,
+    comparator: Comparator,
+) -> Option<u64> {
+    if attempt.outcome != "ERROR"
+        || attempt.timed_out
+        || attempt.error_kind.as_deref() != Some("infrastructure")
+        || attempt.status != Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+        || attempt.signal.is_some()
+    {
+        return None;
+    }
+    // The retained report must be the bytes the runner read and hashed: every
+    // decision below is made from it.
+    let raw = attempt.verification_report.as_deref()?;
+    if attempt.verification_report_sha256.as_deref() != Some(hex_digest(raw.as_bytes()).as_str()) {
+        return None;
+    }
+    let report = current_verification_report(raw.as_bytes()).ok()?;
+    if report.verdict != Verdict::InfrastructureError
+        || report.no_result_reason.is_some()
+        || !attempt_copies_its_report(attempt, &report)
+    {
+        return None;
+    }
+    // The backend evidence a passing attempt must carry.
+    if backend
+        .and_then(|backend| dispatch_record_error(backend, report.runtime.as_ref()))
+        .is_some()
+    {
+        return None;
+    }
+    // Both runs completed, were compared, and ended as the cell accepts.
+    let outputs = report.compared_outputs.as_ref()?;
+    if report.comparison.is_none()
+        || (report.guest_exit_code, report.guest_signal) != accepted
+        || [&outputs.left, &outputs.right]
+            .into_iter()
+            .any(|output| (output.exit_code, output.signal) != accepted)
+    {
+        return None;
+    }
+    // The comparison is the complete one the comparator requires, the check
+    // the classifier makes before it reports a skid attempt as one: an
+    // incomplete comparison is incomplete verification evidence instead.
+    let complete = match comparator {
+        Comparator::Strict => report.require_canonical_comparison(),
+        Comparator::Stripped => require_stripped_comparison(&report),
+    };
+    if complete.is_err() {
+        return None;
+    }
+    // The cell's declared stdout assertions, re-decided from this attempt's
+    // own report and captured stdout rather than read from its labels.
+    if declared
+        .exact
+        .as_deref()
+        .is_some_and(|expected| check_expected_stdout(expected, &report).is_err())
+        || declared.contains.as_deref().is_some_and(|text| {
+            check_expected_stdout_contains(text, attempt.stdout.as_bytes(), &report).is_err()
+        })
+    {
+        return None;
+    }
+    let Some(InfrastructureError::SkidOvershoot { count }) = report.infrastructure_error else {
+        return None;
+    };
+    let refusal =
+        format!("HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count={count}");
+    let mut overshoot_marked = false;
+    let mut refusal_marked = false;
+    for line in attempt.stderr.lines() {
+        let line = line.trim_end();
+        if line.starts_with("HERMIT_SKID_OVERSHOOT ") {
+            overshoot_marked = true;
+        } else if line == refusal {
+            refusal_marked = true;
+        } else if line.starts_with(COMPARISON_REFUSAL_PREFIX)
+            || HERMIT_CLASSIFICATION_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        {
+            return None;
+        }
+    }
+    (count > 0
+        && overshoot_marked
+        && refusal_marked
+        && attempt.reason.as_deref() == Some(skid_overshoot_reason(count).as_str()))
+    .then_some(count)
+}
+
+/// The first-line prefix of every producer failure class the executor keeps
+/// as an `ERROR` whatever report is present (a refused guest launch, an
+/// unavailable backend, backend evidence for another backend, Hermit's
+/// generic command-line error).
+const HERMIT_INTERNAL_FAILURE_CLASS_PREFIX: &str = "HERMIT_INTERNAL_FAILURE class=";
+
+/// Why a retained verify `PASS` row is not one the executor would have
+/// written from its own retained evidence, or `None` when it is.
+///
+/// A reader that has the row but not the cell (the pressure test re-reading a
+/// result history) re-decides the pass from what the row itself retains,
+/// with the checks the executor applies before it writes `PASS`:
+///
+/// - the row is a verify `PASS` labelled as the executor labels one (typed
+///   result `pass`, and no failure class, error kind or reason), and its
+///   execution path is the eligible one its own retained attempts decide
+///   ([`retained_execution_path_error`]);
+/// - every inner attempt's command line, and the row's copies of the first
+///   attempt's, are the verify invocation the executor writes for the row's
+///   backend, relaxations, expected guest exit and comparator
+///   ([`retained_verify_invocation_error`]);
+/// - it has at least one inner attempt, and every inner attempt has a
+///   nonblank index no other attempt shares and is a `PASS` with no error
+///   kind, reason or timeout, whose first stderr line carries no Hermit
+///   internal-failure class (the executor keeps four such classes as an
+///   `ERROR` after a failed exit; this refuses every one of them, after any
+///   exit, so it never admits a row the executor would not);
+/// - every inner attempt's retained verification report is the exact bytes
+///   its `verification_report_sha256` names and parses as a current report
+///   that passes the comparator the row's relaxations record
+///   ([`row_comparator`]): for `strict`, a canonical comparison with a
+///   canonical match; for `stripped`, the stripped comparison
+///   ([`require_stripped_comparison`]), a verified `matched` verdict and
+///   matching exact outputs;
+/// - every inner attempt's retained runtime and divergence coordinates are
+///   its report's, which the runner copies onto it, and the row's are the
+///   first runtime and the divergence position its attempts give, so no
+///   retained copy carries evidence that only a copy, not the report, holds;
+/// - the report satisfies the stdout assertions `declared` (the exact bytes
+///   against both compared runs' digests, and the contained text in the
+///   attempt's captured stdout, which must be both runs' stdout);
+/// - the attempt ended as the row's recorded `expected_guest_exit` requires
+///   (that guest disposition and the Hermit status reporting it), or with
+///   Hermit exit status 0 when the row records none;
+/// - the report carries the dispatch record a passing attempt of the row's
+///   backend must carry (`dispatch_record_error`).
+///
+/// The row records its comparator, backend and expected exit. It records its
+/// declared stdout only on an infrastructure row, so the caller passes the
+/// declaration an earlier skid row of the same cell recorded
+/// (<https://github.com/rrnewton/hermit/issues/1845>).
+pub fn retained_verify_pass_error(
+    result: &CellResult,
+    declared: &DeclaredStdout,
+) -> Option<String> {
+    if result.mode != "verify" || result.outcome != "PASS" {
+        return Some(format!(
+            "the row is a {} {} row, not a verify PASS",
+            result.mode, result.outcome
+        ));
+    }
+    if result.result != Some(ObservedResult::Pass)
+        || result.failure_class.is_some()
+        || result.error_kind.is_some()
+        || result.reason.is_some()
+    {
+        return Some(
+            "the row is not labelled as a verify PASS is: typed result pass, and no failure class, error kind or reason"
+                .into(),
+        );
+    }
+    if let Some(error) = retained_execution_path_error(result) {
+        return Some(format!(
+            "the row's execution-path evidence does not decide a pass: {error}"
+        ));
+    }
+    if result.attempts.is_empty() {
+        return Some("the row retains no inner attempt".into());
+    }
+    if let Some(error) = retained_verify_invocation_error(result) {
+        return Some(format!(
+            "the row's command lines are not a verify invocation the executor writes: {error}"
+        ));
+    }
+    let comparator = row_comparator(result);
+    let mut indices = BTreeSet::new();
+    for attempt in &result.attempts {
+        let index = attempt.index.as_str();
+        if index.trim().is_empty() || !indices.insert(index) {
+            return Some(format!(
+                "inner attempt index {index:?} is blank or repeated"
+            ));
+        }
+        if attempt.outcome != "PASS"
+            || attempt.error_kind.is_some()
+            || attempt.reason.is_some()
+            || attempt.timed_out
+        {
+            return Some(format!(
+                "inner attempt {index} is not a PASS without an error kind, reason or timeout"
+            ));
+        }
+        let first_line = attempt.stderr.lines().next().unwrap_or_default();
+        if first_line.starts_with(HERMIT_INTERNAL_FAILURE_CLASS_PREFIX) {
+            return Some(format!(
+                "inner attempt {index}'s first stderr line is a Hermit internal-failure class ({first_line}), which is never a pass"
+            ));
+        }
+        let Some(raw) = attempt.verification_report.as_deref() else {
+            return Some(format!(
+                "inner attempt {index} retains no verification report"
+            ));
+        };
+        if attempt.verification_report_sha256.as_deref()
+            != Some(hex_digest(raw.as_bytes()).as_str())
+        {
+            return Some(format!(
+                "inner attempt {index}'s retained verification report is not the bytes its verification_report_sha256 names"
+            ));
+        }
+        let report = match current_verification_report(raw.as_bytes()) {
+            Ok(report) => report,
+            Err(error) => {
+                return Some(format!(
+                    "inner attempt {index}'s verification report is not a current report: {error}"
+                ));
+            }
+        };
+        // The runner copies a passing attempt's runtime and divergence
+        // coordinates from its report, so a retained copy that differs is not
+        // one the runner wrote, and the checks below, which read the report,
+        // would never decide what the copy carries.
+        if !attempt_copies_its_report(attempt, &report) {
+            return Some(format!(
+                "inner attempt {index}'s retained runtime or divergence coordinates differ from its verification report's"
+            ));
+        }
+        let comparison = match comparator {
+            Comparator::Strict => report
+                .require_canonical_comparison()
+                .and_then(|()| report.require_canonical_match()),
+            Comparator::Stripped => require_stripped_comparison(&report)
+                .and_then(|()| {
+                    (report.verified && report.verdict == Verdict::Matched)
+                        .then_some(())
+                        .ok_or_else(|| {
+                            format!(
+                                "stripped verification did not match: verified={} verdict={}",
+                                report.verified, report.verdict
+                            )
+                        })
+                })
+                .and_then(|()| report.require_exact_output_match()),
+        };
+        if let Err(error) = comparison {
+            return Some(format!(
+                "inner attempt {index}'s verification report does not pass the row's {comparator:?} comparator: {error}"
+            ));
+        }
+        let stdout = declared
+            .exact
+            .as_deref()
+            .map(|expected| check_expected_stdout(expected, &report))
+            .transpose()
+            .and_then(|_| {
+                declared
+                    .contains
+                    .as_deref()
+                    .map(|text| {
+                        check_expected_stdout_contains(text, attempt.stdout.as_bytes(), &report)
+                    })
+                    .transpose()
+            });
+        if let Err(error) = stdout {
+            let error = match error {
+                ExpectedStdoutError::Unevidenced(error) | ExpectedStdoutError::Mismatch(error) => {
+                    error
+                }
+            };
+            return Some(format!(
+                "inner attempt {index} does not satisfy a declared stdout assertion: {error}"
+            ));
+        }
+        let disposition = match &result.expected_guest_exit {
+            Some(expected) => expected.check(
+                report.guest_exit_code,
+                report.guest_signal,
+                attempt.status,
+                attempt.signal,
+            ),
+            None if attempt.status == Some(0) && attempt.signal.is_none() => Ok(()),
+            None => Err(format!(
+                "Hermit ended with status {:?} and signal {:?}, not exit status 0",
+                attempt.status, attempt.signal
+            )),
+        };
+        if let Err(error) = disposition {
+            return Some(format!(
+                "inner attempt {index} did not end as the row requires: {error}"
+            ));
+        }
+        if let Some(error) = result
+            .backend
+            .as_deref()
+            .and_then(|backend| dispatch_record_error(backend, report.runtime.as_ref()))
+        {
+            return Some(format!(
+                "inner attempt {index} lacks its backend's dispatch evidence: {error}"
+            ));
+        }
+    }
+    // The runner gives the row the first runtime its attempts carry and the
+    // divergence position its attempts give (`cell_divergence_position`).
+    if !row_copies_its_attempts(result) {
+        return Some(
+            "the row's runtime or divergence coordinates are not the ones its inner attempts retain"
+                .into(),
+        );
+    }
+    None
+}
+
+/// Whether `attempt`'s retained runtime and divergence coordinates are the
+/// ones the executor copies onto it from `report`, the attempt's own parsed
+/// verification report.
+///
+/// The executor copies the runtime from every report it parses, and the
+/// divergence coordinates from every one except a refused guest launch's or
+/// an unavailable backend's. Those two attempts are an `ERROR` whose first
+/// stderr line is a Hermit internal-failure class, which neither a verify
+/// `PASS` ([`retained_verify_pass_error`]) nor a skid attempt
+/// ([`skid_overshoot_only_reports`]) may carry, so for those readers a copy
+/// that differs from the report is one the executor did not write.
+fn attempt_copies_its_report(attempt: &AttemptResult, report: &VerificationReport) -> bool {
+    attempt.runtime == report.runtime
+        && attempt.first_divergent_scheduler_turn == report.first_divergent_scheduler_turn
+        && attempt.first_divergent_virtual_nanoseconds == report.first_divergent_virtual_nanoseconds
+        && attempt.first_divergent_record == report.first_divergent_record
+        && attempt.first_divergent_syscall == report.first_divergent_syscall
+        && attempt.first_divergent_left_message == report.first_divergent_left_message
+        && attempt.first_divergent_right_message == report.first_divergent_right_message
+}
+
+/// Whether `result`'s runtime and divergence coordinates are the ones the
+/// executor gives a row from its inner attempts: the first runtime an
+/// attempt carries, and the divergence position the attempts give
+/// (`cell_divergence_position`).
+fn row_copies_its_attempts(result: &CellResult) -> bool {
+    let position = cell_divergence_position(&result.attempts);
+    result.runtime
+        == result
+            .attempts
+            .iter()
+            .find_map(|attempt| attempt.runtime.clone())
+        && result.first_divergent_scheduler_turn == position.scheduler_turn
+        && result.first_divergent_virtual_nanoseconds == position.virtual_nanoseconds
+        && result.first_divergent_record == position.record
+        && result.first_divergent_syscall == position.syscall
+        && result.first_divergent_left_message == position.left_message
+        && result.first_divergent_right_message == position.right_message
+}
+
+/// Why `row`'s Hermit commands do not run its guest at the `/proc` level
+/// `cell`'s test declares, if they do not. The row's command line and every
+/// attempt's must each end with `--` and its guest argv, and carry before that
+/// exactly the flag the runner writes for that test ([`ProcLevel::flag`]), or
+/// no `--proc` option when the test declares no level. A naked row runs no
+/// Hermit. A row with no command line and no attempt has none to check (an
+/// infrastructure ERROR); one with attempts but no command line is refused.
+pub fn proc_level_mismatch(row: &CellResult, cell: &SelectedCell) -> Option<String> {
+    if row.mode == "naked" {
+        return None;
+    }
+    if row.argv.is_empty() {
+        return (!row.attempts.is_empty())
+            .then(|| "the row records attempts but no command line".into());
+    }
+    let declared: Vec<&str> = cell.test.proc.map(ProcLevel::flag).into_iter().collect();
+    let commands = std::iter::once(("the row".to_owned(), &row.argv, &row.guest_argv)).chain(
+        row.attempts.iter().map(|attempt| {
+            (
+                format!("attempt {}", attempt.index),
+                &attempt.argv,
+                &attempt.guest_argv,
+            )
+        }),
+    );
+    for (whose, argv, guest_argv) in commands {
+        let Some(end) = argv
+            .len()
+            .checked_sub(guest_argv.len() + 1)
+            .filter(|&end| argv[end] == "--" && argv[end + 1..] == guest_argv[..])
+        else {
+            return Some(format!(
+                "{whose}'s argv does not end with `--` and its guest argv"
+            ));
+        };
+        let levels: Vec<&str> = argv[..end]
+            .iter()
+            .map(String::as_str)
+            .filter(|arg| arg.starts_with("--proc"))
+            .collect();
+        if levels != declared {
+            return Some(format!(
+                "{whose} runs with the /proc options {levels:?}, and the cell's test declares {declared:?}"
+            ));
+        }
+    }
+    None
+}
+
+/// Why `result`'s retained command lines are not the verify invocation the
+/// executor writes for a row with its recorded backend, relaxations, expected
+/// guest exit and comparator, or `None` when they are.
+///
+/// The executor builds every verify attempt's argv in one place
+/// (`verified_invocation_argv`) from the cell the row records: `<hermit> --log
+/// info --backend <backend> run`, the runner's own flags, the run flags the
+/// row's relaxations record, `--verify` with the expected-exit allowance
+/// exactly when the row records an expected guest exit, the report path, the
+/// optional retained-log directory, the guest's execution root and
+/// environment, and `--` before the attempt's guest argv. It records that argv
+/// on the attempt beside the shell command rendered from it
+/// ([`shell_command`]), and copies the first attempt's command fields onto the
+/// row, with the argv after the Hermit path as `effective_args` and log level
+/// `info`. A reader re-deciding a retained row from what it retains
+/// ([`skid_overshoot_only_reports`], [`retained_verify_pass_error`]) judges it
+/// by its recorded backend, relaxations and expected exit, so those must
+/// describe the command that ran
+/// (<https://github.com/rrnewton/hermit/issues/1845>):
+///
+/// - each attempt's argv selects the row's backend (`native` when the row
+///   records none, as the executor does) once, before `run`, and no token
+///   before `--` selects a backend again;
+/// - every token between `run` and `--` is one the executor writes, in the
+///   order it writes them, and every valued flag carries a value that does
+///   not start with `-` (a token Hermit's parser would not take as the value);
+/// - the run flags in the argv are exactly the ones the row's relaxations
+///   record, `--verify-allow=failure` is present exactly when the row records
+///   an expected guest exit, and `--verify-strict` is absent under the
+///   stripped comparator ([`row_comparator`]);
+/// - the tokens after `--` are the attempt's guest argv, and its shell command
+///   is the one rendered from its cwd, env and argv;
+/// - the row's argv, guest argv, env, cwd and shell command are its first
+///   attempt's, its effective args are that argv after the Hermit path, and
+///   its log level is `info`.
+pub fn retained_verify_invocation_error(result: &CellResult) -> Option<String> {
+    let Some(first) = result.attempts.first() else {
+        return Some("the row retains no inner attempt".into());
+    };
+    if result.argv != first.argv
+        || result.guest_argv != first.guest_argv
+        || result.env != first.env
+        || result.cwd != first.cwd
+        || result.shell_command != first.shell_command
+    {
+        return Some(
+            "the row's argv, guest argv, env, cwd or shell command is not its first inner attempt's"
+                .into(),
+        );
+    }
+    if result.effective_args.as_slice() != result.argv.get(1..).unwrap_or_default()
+        || result.log_level.as_deref() != Some("info")
+    {
+        return Some(
+            "the row's effective args or log level are not the ones the executor records with its argv"
+                .into(),
+        );
+    }
+    let backend = result.backend.as_deref().unwrap_or("native");
+    let mut relaxation_flags: Vec<&str> = result
+        .relaxations
+        .iter()
+        .filter_map(|relaxation| relaxation.split_once(": "))
+        .map(|(flag, _)| flag)
+        .filter(|flag| flag.starts_with("--"))
+        .collect();
+    relaxation_flags.sort_unstable();
+    let expects_exit = result.expected_guest_exit.is_some();
+    let comparator = row_comparator(result);
+    let mut first_level = None;
+    for attempt in &result.attempts {
+        let index = attempt.index.as_str();
+        let level = match verify_attempt_invocation_error(
+            attempt,
+            backend,
+            &relaxation_flags,
+            expects_exit,
+            comparator,
+        ) {
+            Ok(level) => level,
+            Err(error) => return Some(format!("inner attempt {index}'s command line {error}")),
+        };
+        // Every attempt of one row runs at the one `/proc` level its test
+        // declares.
+        let first = *first_level.get_or_insert(level);
+        if first != level {
+            return Some(format!(
+                "inner attempt {index} runs at the /proc level {level:?}, not the first attempt's {first:?}"
+            ));
+        }
+        if attempt.shell_command != shell_command(&attempt.cwd, &attempt.env, &attempt.argv) {
+            return Some(format!(
+                "inner attempt {index}'s shell command is not the one rendered from its cwd, env and argv"
+            ));
+        }
+    }
+    None
+}
+
+/// Why `attempt`'s argv is not one `verified_invocation_argv` writes for a
+/// verify attempt on `backend` whose row's relaxations record the run flags
+/// `relaxation_flags` (sorted), that expects a guest exit when `expects_exit`
+/// and that is judged by `comparator`, as [`retained_verify_invocation_error`]
+/// defines it. When it is one, its `/proc` level, if it names one.
+fn verify_attempt_invocation_error<'a>(
+    attempt: &'a AttemptResult,
+    backend: &str,
+    relaxation_flags: &[&str],
+    expects_exit: bool,
+    comparator: Comparator,
+) -> Result<Option<&'a str>, String> {
+    // The paired program ([`VERIFY_PAIR_SCRIPT`]): the comparison, then the
+    // run command.
+    let paired = &attempt.argv;
+    let program = ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME];
+    if paired
+        .get(..program.len())
+        .is_none_or(|words| words.iter().map(String::as_str).ne(program))
+    {
+        return Err("is not the paired verification program the executor runs".into());
+    }
+    // Both commands start with the Hermit binary; the run starts at its
+    // second appearance, as the script finds it.
+    let commands = &paired[program.len()..];
+    let run_start = commands
+        .iter()
+        .skip(1)
+        .position(|word| Some(word) == commands.first())
+        .map(|offset| offset + 1)
+        .ok_or("has no run command after its comparison")?;
+    let (comparison, argv) = commands.split_at(run_start);
+    let head = ["--log", "info", "--backend", backend, "run"];
+    if argv
+        .get(1..=head.len())
+        .is_none_or(|words| words.iter().map(String::as_str).ne(head))
+    {
+        return Err(format!(
+            "does not start `<hermit> --log info --backend {backend} run`"
+        ));
+    }
+    let options_start = 1 + head.len();
+    let separator = argv[options_start..]
+        .iter()
+        .position(|arg| arg == "--")
+        .map(|offset| options_start + offset)
+        .ok_or("has no `--` before the guest command")?;
+    if argv[separator + 1..] != attempt.guest_argv[..] {
+        return Err("does not end with the attempt's guest argv".into());
+    }
+    let options = &argv[options_start..separator];
+    if let Some(selector) = options
+        .iter()
+        .find(|arg| *arg == "--backend" || arg.starts_with("--backend="))
+    {
+        return Err(format!("selects a backend again after `run` ({selector})"));
+    }
+    let mut tokens = InvocationTokens(options);
+    tokens.require("--base-env=minimal")?;
+    tokens.require("--strict")?;
+    let level = tokens.prefixed("--proc=");
+    if let Some(level) = level {
+        if !matches!(level, "minimal" | "standard") {
+            return Err(format!(
+                "selects the /proc level {level:?}, which Hermit lacks"
+            ));
+        }
+    }
+    if tokens.flag("--verify-strict") && comparator == Comparator::Stripped {
+        return Err(
+            "asks for the canonical comparison (`--verify-strict`) under the stripped comparator"
+                .into(),
+        );
+    }
+    let mut run_flags = Vec::new();
+    while let Some(arg) = tokens.next_if(allowed_hermit_arg) {
+        run_flags.push(arg);
+    }
+    for flag in ["--no-detlog-io-buffers", "--no-rcb-time"] {
+        if tokens.flag(flag) {
+            run_flags.push(flag);
+        }
+    }
+    run_flags.sort_unstable();
+    if run_flags != relaxation_flags {
+        return Err(format!(
+            "carries the run flags {run_flags:?}, not the ones the row's relaxations record ({relaxation_flags:?})"
+        ));
+    }
+    if tokens.value("--verify-run")? != Some(VERIFY_RUN_DIR_PLACEHOLDER) {
+        return Err(format!(
+            "lacks `--verify-run {VERIFY_RUN_DIR_PLACEHOLDER}` where the executor writes it"
+        ));
+    }
+    paired_comparison_error(comparison, &argv[0], expects_exit)
+        .map_err(|error| format!("compares with a command that {error}"))?;
+    // The execution root (`append_execution_root_args`): a tmpfs mounted at
+    // the workdir, a workdir alone, a per-attempt directory bound at the fixed
+    // guest workdir, or none.
+    let mount = tokens.prefixed("--mount=type=tmpfs,target=");
+    let fixed_bind = format!(":{FIXED_GUEST_WORKDIR}");
+    let fixed = mount.is_none()
+        && matches!(tokens.0, [bind, workdir, ..]
+            if bind.starts_with("--bind=") && bind.ends_with(&fixed_bind) && workdir == "--workdir");
+    if fixed {
+        tokens.0 = &tokens.0[1..];
+    }
+    let workdir = tokens.value("--workdir")?;
+    if mount.is_some_and(|target| workdir != Some(target))
+        || (fixed && workdir != Some(FIXED_GUEST_WORKDIR))
+    {
+        return Err("mounts or binds an execution root that is not its workdir".into());
+    }
+    // The equalized inputs' binds, then the guest environment.
+    while tokens.prefixed("--bind=").is_some() {}
+    while let Some(assignment) = tokens.value("--env")? {
+        if !assignment.contains('=') {
+            return Err(format!(
+                "gives `--env` the value {assignment:?}, which assigns nothing"
+            ));
+        }
+    }
+    match tokens.0.first() {
+        Some(token) => Err(format!(
+            "carries `{token}` where the executor writes nothing of the kind"
+        )),
+        None => Ok(level),
+    }
+}
+
+/// Why `comparison` is not the `hermit log-diff --verify-json` command
+/// [`verified_invocation_argv`] writes for a paired verify attempt run with
+/// the Hermit binary `hermit`, which expects a guest exit when
+/// `expects_exit`.
+fn paired_comparison_error(
+    comparison: &[String],
+    hermit: &str,
+    expects_exit: bool,
+) -> Result<(), String> {
+    if comparison.first().map(String::as_str) != Some(hermit)
+        || comparison.get(1).map(String::as_str) != Some("log-diff")
+    {
+        return Err("does not start `<hermit> log-diff` with the run's Hermit".into());
+    }
+    let mut tokens = InvocationTokens(&comparison[2..]);
+    tokens
+        .value("--verify-json")?
+        .ok_or("lacks `--verify-json <path>` where the executor writes it")?;
+    if tokens.flag("--verify-allow=failure") != expects_exit {
+        return Err(format!(
+            "{} `--verify-allow=failure`, but the row {} an expected guest exit",
+            if expects_exit { "lacks" } else { "carries" },
+            if expects_exit {
+                "records"
+            } else {
+                "records no"
+            },
+        ));
+    }
+    tokens.value("--verify-log-dir")?;
+    let [first, second] = tokens.0 else {
+        return Err(format!(
+            "does not end with exactly the two run directories ({:?})",
+            tokens.0
+        ));
+    };
+    let first = Path::new(first);
+    if !first.ends_with("run1")
+        || first.parent().map(|parent| parent.join("run2")).as_deref() != Some(Path::new(second))
+    {
+        return Err("does not compare the attempt's run1 and run2 directories".into());
+    }
+    Ok(())
+}
+
+/// The Hermit options of a retained command line, read front to back by
+/// [`verify_attempt_invocation_error`]. Each method consumes the next token
+/// only when it is the one asked for.
+struct InvocationTokens<'a>(&'a [String]);
+
+impl<'a> InvocationTokens<'a> {
+    /// Consume the next token if `accept` takes it.
+    fn next_if(&mut self, accept: impl FnOnce(&str) -> bool) -> Option<&'a str> {
+        let (first, rest) = self.0.split_first()?;
+        accept(first).then(|| {
+            self.0 = rest;
+            first.as_str()
+        })
+    }
+
+    /// Consume `flag` if it is next.
+    fn flag(&mut self, flag: &str) -> bool {
+        self.next_if(|token| token == flag).is_some()
+    }
+
+    /// Consume `flag`, which the executor always writes next.
+    fn require(&mut self, flag: &str) -> Result<(), String> {
+        self.flag(flag)
+            .then_some(())
+            .ok_or_else(|| format!("lacks `{flag}` where the executor writes it"))
+    }
+
+    /// Consume the next token if it is `prefix` followed by a nonempty value,
+    /// and return the value.
+    fn prefixed(&mut self, prefix: &str) -> Option<&'a str> {
+        let value = self
+            .0
+            .first()?
+            .strip_prefix(prefix)
+            .filter(|value| !value.is_empty())?;
+        self.0 = &self.0[1..];
+        Some(value)
+    }
+
+    /// Consume `flag` and its value if `flag` is next: `Ok(None)` when it is
+    /// not, and an error when its value is missing, empty or starts with `-`.
+    fn value(&mut self, flag: &str) -> Result<Option<&'a str>, String> {
+        let [first, rest @ ..] = self.0 else {
+            return Ok(None);
+        };
+        if first != flag {
+            return Ok(None);
+        }
+        match rest {
+            [value, rest @ ..] if !value.is_empty() && !value.starts_with('-') => {
+                self.0 = rest;
+                Ok(Some(value.as_str()))
+            }
+            _ => Err(format!("gives `{flag}` no value Hermit would take")),
+        }
+    }
 }
 
 fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
@@ -3211,19 +5146,21 @@ fn prepare_test_until(
             argv
         }
         (None, Some(DirectCommand::Argv(argv))) => {
+            // The cell's XDG configuration copy is named by its host path
+            // here; an equalized (verify) cell's argv then names it at its
+            // guest path, /tmp/e2e/xdg-config ([`equalized_guest_argv`]).
             crate::manifest_corpus::resolve_direct_placeholders(
                 &cell.test.id,
                 argv,
                 &context.root,
                 crate::manifest_corpus::validate_run_state().as_deref(),
+                Some(&dir.join("xdg-config")),
             )?
         }
         _ => return Err(format!("{} has unsupported program kind", cell.test.id)),
     };
     guest.extend(guest_args);
-    if context.isolated_workdir.is_some()
-        || (backend != "dbt" && supports_test_workdir(&cell.id.mode, backend))
-    {
+    if context.isolated_workdir.is_some() || supports_test_workdir(&cell.id.mode, backend) {
         resolve_repo_guest_args(&context.root, &mut guest);
     }
     Ok((guest, cpu_usage_usec))
@@ -3235,7 +5172,15 @@ fn resolve_repo_guest_args(root: &Path, argv: &mut [String]) {
         if path.is_absolute() || arg == "." || arg == ".." {
             continue;
         }
-        let resolved = root.join(path);
+        // `./examples/x` names the same file as `examples/x`. Joining it
+        // verbatim leaves `<root>/./examples/x` in the recorded command, and
+        // the retained-evidence renderer rightly refuses a `.` component after
+        // a provenance root (validate_cell_results.rs), so drop it here.
+        let resolved = root.join(
+            path.components()
+                .filter(|component| !matches!(component, Component::CurDir))
+                .collect::<PathBuf>(),
+        );
         let looks_like_repo_path = arg.starts_with("./") || arg.contains('/') || resolved.is_file();
         if looks_like_repo_path && resolved.exists() {
             *arg = resolved.to_string_lossy().into_owned();
@@ -3413,13 +5358,17 @@ pub fn build_spec(
     // hermetic tmpfs path does not remove this path-safety property.
     let fixed_workdir_source = fixed_workdir_source_for_attempt(&dir, attempt)?;
     let backend = cell.id.backend.as_deref().unwrap_or("native");
-    let equalized_inputs = equalizes_guest_inputs(&cell.id.mode, backend);
+    let equalized_inputs = equalizes_guest_inputs(&cell.id.mode);
     // The recorded guest argv is the argv after `--`, so both carry the guest
     // paths of an equalized cell.
-    let guest_argv = if equalized_inputs {
-        equalized_guest_argv(&dir, guest_argv)
+    let (guest_argv, named_roots) = if equalized_inputs {
+        let roots = equalized_roots(
+            context,
+            crate::manifest_corpus::validate_run_state().as_deref(),
+        );
+        equalized_guest_argv(&dir, &roots, guest_argv)
     } else {
-        guest_argv
+        (guest_argv, Vec::new())
     };
     let mode_recipe = &cell.test.modes[&cell.id.mode];
     let mut env = execution_cell_env(context, &dir, cell.id.mode != "naked");
@@ -3453,19 +5402,19 @@ pub fn build_spec(
     }
     // `record start` has no `--bind`, so outside the hermetic path a replay cell
     // runs in its manifest workdir or the runner's working directory.
-    let bound_workdir_source = (matches!(cell.id.mode.as_str(), "verify" | "chaos" | "custom")
-        && backend != "dbt")
+    let bound_workdir_source = matches!(cell.id.mode.as_str(), "verify" | "chaos" | "custom")
         .then_some(fixed_workdir_source.as_path());
     let isolated = context.isolated_workdir.is_some();
     let verdict = dir.join(format!("verify-{attempt}.json"));
     let mut verification_log_dir = None;
+    let verify_runs = matches!(cell.id.mode.as_str(), "verify" | "chaos" | "replay")
+        .then(|| dir.join("verify-runs").join(attempt));
     let (argv, verdict_path) = match cell.id.mode.as_str() {
         "naked" => (guest_argv.clone(), None),
         mode @ ("verify" | "replay" | "chaos") => {
             let invocation = match mode {
                 "verify" => VerifiedInvocation::Verify,
                 "replay" => VerifiedInvocation::Replay {
-                    data_dir: dir.join("recording"),
                     record_timeout_seconds: timeout_seconds,
                 },
                 _ => VerifiedInvocation::Chaos {
@@ -3486,8 +5435,10 @@ pub fn build_spec(
                 invocation,
                 verdict: &verdict,
                 verification_log_dir: verification_log_dir.as_deref(),
+                verify_runs: verify_runs.as_deref(),
                 bound_workdir_source,
                 equalized_inputs_dir: equalized_inputs.then_some(dir.as_path()),
+                equalized_roots: &named_roots,
                 env: &env,
                 guest_argv: &guest_argv,
             });
@@ -3502,6 +5453,7 @@ pub fn build_spec(
                 backend.into(),
                 "run".into(),
             ];
+            argv.extend(cell.test.proc.map(|level| level.flag().to_string()));
             argv.extend(cell.test.modes["custom"].args.clone());
             if isolated {
                 require_minimal_base_env(&mut argv)?;
@@ -3533,6 +5485,7 @@ pub fn build_spec(
         timeout_seconds,
         verdict_path,
         verification_log_dir,
+        verify_runs,
         sabre_path_evidence,
         cell_dir: dir,
         expected_guest_exit: cell_expected_guest_exit(cell),
@@ -3550,14 +5503,14 @@ pub fn build_spec(
 
 /// The Hermit subcommand a verified cell runs and the arguments only it takes.
 enum VerifiedInvocation {
-    /// `hermit run --verify`: two runs compared.
+    /// Two `hermit run --verify-run` runs, compared by `hermit log-diff
+    /// --verify-json` ([`VERIFY_PAIR_SCRIPT`]).
     Verify,
-    /// `hermit record start --verify`: a recording and its replay compared.
-    Replay {
-        data_dir: PathBuf,
-        record_timeout_seconds: u64,
-    },
-    /// `hermit run --verify --chaos`: two runs under one random schedule.
+    /// `hermit record start --verify-run`, then the same command replaying
+    /// that recording (`--verify-replay-of`), compared by `hermit log-diff
+    /// --verify-json`.
+    Replay { record_timeout_seconds: u64 },
+    /// The same pair, each run under one random schedule (`--chaos`).
     Chaos { seed: i64 },
 }
 
@@ -3568,12 +5521,161 @@ struct VerifiedInvocationArgs<'a> {
     invocation: VerifiedInvocation,
     verdict: &'a Path,
     verification_log_dir: Option<&'a Path>,
+    /// The attempt's `verify-runs/<attempt>` directory, for a verify or chaos
+    /// attempt ([`VERIFY_PAIR_SCRIPT`]).
+    verify_runs: Option<&'a Path>,
     bound_workdir_source: Option<&'a Path>,
     /// The cell directory whose inputs are bound at their guest paths, for an
     /// equalized cell.
     equalized_inputs_dir: Option<&'a Path>,
+    /// The equalized roots the cell's argv names, bound beside its inputs.
+    equalized_roots: &'a [EqualizedRoot],
     env: &'a BTreeMap<String, String>,
     guest_argv: &'a [String],
+}
+
+/// The backends that run Detcore inside the guest process with in-guest
+/// LiteInst. Hermit refuses to run them with a preemption timer, which their
+/// in-guest Tool host cannot deliver yet, so every enabled cell of theirs
+/// declares `--max-timeslice=disabled`
+/// (https://github.com/rrnewton/hermit/issues/3745).
+const IN_GUEST_LITEINST_BACKENDS: [&str; 2] = ["liteinst", "in-guest-trap"];
+
+/// Why a probe of a disabled in-guest LiteInst cell runs with
+/// `--max-timeslice=disabled` (see [`probe_relaxation`]).
+const PROBE_RELAXATION_REASON: &str = "a probe of a disabled in-guest LiteInst cell runs without a preemption timer, which Hermit refuses to start that backend with (https://github.com/rrnewton/hermit/issues/3745)";
+
+/// The relaxation a probe of a disabled verify cell (`test-harness run
+/// --probe-disabled`) adds to the cell's own flags: `--max-timeslice=disabled`
+/// for an in-guest LiteInst backend when the cell names no `--max-timeslice`
+/// of its own. A disabled cell usually declares no flags for its backend, and
+/// without that one Hermit refuses every in-guest LiteInst run before the
+/// guest starts, so the probe would measure the refusal instead of the
+/// program. The flag stays in the recorded argv, which is where an enabled
+/// cell's declared relaxation is recorded too.
+fn probe_relaxation(cell: &SelectedCell, backend: &str) -> Option<&'static str> {
+    let declared = cell_hermit_args(&cell.test.modes[&cell.id.mode], backend);
+    (!cell.enabled
+        && cell.id.mode == "verify"
+        && IN_GUEST_LITEINST_BACKENDS.contains(&backend)
+        && !declared
+            .iter()
+            .any(|arg| arg.starts_with("--max-timeslice")))
+    .then_some("--max-timeslice=disabled")
+}
+
+/// The program every verify, chaos and replay attempt runs: two executions of
+/// the guest, each writing its evidence to a `--verify-run` directory, then
+/// `hermit log-diff --verify-json` over the two directories
+/// (https://github.com/rrnewton/hermit/issues/4275). For a verify or chaos
+/// cell both are `hermit run`s; for a replay cell the first is `hermit record
+/// start` and the second replays its recording, the run command's
+/// [`VERIFY_REPLAY_OF_PLACEHOLDER`] becoming `--verify-replay-of <run1>` there
+/// and nothing in the first.
+///
+/// It is run as `bash -c VERIFY_PAIR_SCRIPT VERIFY_PAIR_NAME COMPARISON...
+/// RUN...`, so the attempt is one process tree: the executor's CPU budget,
+/// timeout and CPU evidence cover all three commands, as they covered the
+/// single `run --verify` or `record start --verify` they replace. COMPARISON
+/// is the `log-diff` command, whose last two words are the run directories;
+/// RUN is the guest command,
+/// with [`VERIFY_RUN_DIR_PLACEHOLDER`] where each execution's directory goes.
+/// Both start with the Hermit binary, which no other word of COMPARISON is,
+/// so its second appearance is where RUN starts.
+///
+/// It follows `run --verify`: run 2 starts only when run 1 left a record and
+/// its exit status is one `--verify-allow` admits (a replay cell admits
+/// every status, as `record start --verify` replays every recording), and
+/// when a run leaves no
+/// record (Hermit refused it before it started) the attempt ends with that
+/// run's status and output, after the comparison has stamped its report. Each
+/// run's own stderr is passed on, run 1's first. Each run reads stdin through
+/// its own open file description, a reopening of `/proc/self/fd/0`, so a
+/// frozen stdin (`hermit verify-inputs`) reaches both from its start rather
+/// than through one shared offset. The two runs execute one
+/// after the other, on the same workdir and inputs, as `run --verify`'s do: a
+/// bind source's host path is visible to the guest in /proc/self/mountinfo,
+/// so two concurrent runs could not each have their own without the guest
+/// seeing the difference.
+///
+/// Each run also writes to the same path, `run` beside the two directories,
+/// which is moved to its own directory once the run has ended. Hermit is
+/// the guest's PID 1, so its command line and its open files are the
+/// guest's to read (`ps aux` prints `/proc/1/cmdline`): a run told
+/// `--verify-run .../run1` and one told `.../run2` were two different
+/// guests, and compat/ps, compat/pgrep and compat/pkill diverged on exactly
+/// that. `run --verify` gave its two runs one command line; this gives them
+/// one too.
+const VERIFY_PAIR_SCRIPT: &str = r#"set -u
+for ((start = 2; start <= $#; start++)); do
+  [[ ${!start} == "$1" ]] && break
+done
+comparison=("${@:1:start-1}")
+run=("${@:start}")
+directories=("${comparison[@]: -2}")
+allow=success
+for word in "${comparison[@]}"; do
+  case $word in --verify-allow=*) allow=${word#--verify-allow=} ;; esac
+done
+staging=${directories[0]%/*}/run
+verify_run() {
+  local directory=$1 status word words=()
+  for word in "${run[@]}"; do
+    if [[ $word == @VERIFY_REPLAY_OF@ ]]; then
+      [[ $directory == "${directories[1]}" ]] && words+=(--verify-replay-of "${directories[0]}")
+      continue
+    fi
+    [[ $word == @VERIFY_RUN_DIR@ ]] && word=$staging
+    words+=("$word")
+  done
+  "${words[@]}" </proc/self/fd/0 >"$staging.stdout" 2>"$staging.stderr"
+  status=$?
+  mv "$staging.stdout" "$directory.stdout"
+  mv "$staging.stderr" "$directory.stderr"
+  if [[ -e $staging ]]; then
+    mv "$staging" "$directory"
+  fi
+  return "$status"
+}
+end_without_comparison() {
+  cat "$1.stdout"
+  "${comparison[@]}" >/dev/null 2>&1
+  exit "$2"
+}
+verify_run "${directories[0]}"
+status=$?
+cat "${directories[0]}.stderr" >&2
+[[ -e ${directories[0]}/verify-run.json ]] || end_without_comparison "${directories[0]}" "$status"
+case $allow in
+  success) admitted=$((status == 0)) ;;
+  failure) admitted=$((status != 0)) ;;
+  *) admitted=1 ;;
+esac
+if ((admitted)); then
+  verify_run "${directories[1]}"
+  status=$?
+  cat "${directories[1]}.stderr" >&2
+  [[ -e ${directories[1]}/verify-run.json ]] || end_without_comparison "${directories[1]}" "$status"
+fi
+exec "${comparison[@]}"
+"#;
+
+/// `$0` of [`VERIFY_PAIR_SCRIPT`], which names it in the shell's own messages.
+const VERIFY_PAIR_NAME: &str = "hermit-verify-pair";
+
+/// The word of a paired run command that `VERIFY_PAIR_SCRIPT` replaces with
+/// the one path both executions write their `--verify-run` directory at.
+pub const VERIFY_RUN_DIR_PLACEHOLDER: &str = "@VERIFY_RUN_DIR@";
+
+/// The word of a paired `record start` command that [`VERIFY_PAIR_SCRIPT`]
+/// drops from the recording's command and replaces with `--verify-replay-of
+/// <run1>` in the replay's.
+const VERIFY_REPLAY_OF_PLACEHOLDER: &str = "@VERIFY_REPLAY_OF@";
+
+/// The `--verify-run` directories of a paired attempt, below its
+/// `verify-runs/<attempt>` directory.
+fn verify_run_directories(verify_runs: &Path) -> [PathBuf; 2] {
+    [verify_runs.join("run1"), verify_runs.join("run2")]
 }
 
 /// The one argv builder for verify, replay and chaos cells.
@@ -3582,7 +5684,8 @@ struct VerifiedInvocationArgs<'a> {
 /// strictness, execution root and guest environment; only the subcommand and
 /// the arguments in [`VerifiedInvocation`] differ. Building them in one place is
 /// what keeps a replay cell from silently running a different guest than the
-/// verify cell it records.
+/// verify cell it records. Every one runs its guest command under
+/// [`VERIFY_PAIR_SCRIPT`].
 fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     let VerifiedInvocationArgs {
         context,
@@ -3591,14 +5694,17 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         invocation,
         verdict,
         verification_log_dir,
+        verify_runs,
         bound_workdir_source,
         equalized_inputs_dir,
+        equalized_roots,
         env,
         guest_argv,
     } = args;
     let mode_recipe = &cell.test.modes[&cell.id.mode];
+    let hermit = context.hermit_bin.to_string_lossy().into_owned();
     let mut argv = vec![
-        context.hermit_bin.to_string_lossy().into_owned(),
+        hermit.clone(),
         "--log".into(),
         "info".into(),
         "--backend".into(),
@@ -3615,58 +5721,88 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         }
     };
     argv.extend(["--base-env=minimal".into(), "--strict".into()]);
+    argv.extend(cell.test.proc.map(|level| level.flag().to_string()));
     if verify_strict && mode_recipe.comparator != Some(Comparator::Stripped) {
         argv.push("--verify-strict".into());
     }
     // Validation admits these relaxations only on a verify recipe, and a
     // replay cell does not inherit them: `record start` has no such flags.
+    // Validation refuses `compare_io_buffers=false` outright; the flag is
+    // still rendered for a recipe built without validation, such as one that
+    // reproduces a retained row recorded before the refusal.
     argv.extend(cell_hermit_args(mode_recipe, backend).iter().cloned());
+    argv.extend(
+        cell.level_relaxations()
+            .into_iter()
+            .map(|(arg, _)| arg.to_string()),
+    );
+    argv.extend(probe_relaxation(cell, backend).map(str::to_string));
     if mode_recipe.compare_io_buffers == Some(false) {
         argv.push("--no-detlog-io-buffers".into());
     }
     if mode_recipe.rcb_time == Some(false) {
         argv.push("--no-rcb-time".into());
     }
-    argv.push("--verify".into());
-    match &invocation {
-        VerifiedInvocation::Chaos { .. } => argv.push("--verify-allow=both".into()),
+    // The allowance `run --verify` would take, which the paired comparison
+    // takes in its place.
+    let verify_allow = match &invocation {
+        // `record start --verify` replays and compares every recording,
+        // whatever its status; `both` has the paired program do the same,
+        // and a recording's comparison applies no allowance.
+        VerifiedInvocation::Chaos { .. } | VerifiedInvocation::Replay { .. } => {
+            Some("--verify-allow=both")
+        }
         // The exact disposition is enforced on the report after the
         // comparison; this only lets a failing first run be compared.
-        // `record start --verify` always compares and returns the guest's
-        // status on a match, so it needs no allowance.
         VerifiedInvocation::Verify if cell_expected_guest_exit(cell).is_some() => {
-            argv.push("--verify-allow=failure".into());
+            Some("--verify-allow=failure")
         }
-        VerifiedInvocation::Verify | VerifiedInvocation::Replay { .. } => {}
+        VerifiedInvocation::Verify => None,
+    };
+    match invocation {
+        VerifiedInvocation::Replay {
+            record_timeout_seconds,
+        } => {
+            argv.extend([
+                "--verify-run".into(),
+                VERIFY_RUN_DIR_PLACEHOLDER.into(),
+                VERIFY_REPLAY_OF_PLACEHOLDER.into(),
+                "--record-timeout".into(),
+                record_timeout_seconds.to_string(),
+            ]);
+        }
+        VerifiedInvocation::Verify => {
+            argv.extend(["--verify-run".into(), VERIFY_RUN_DIR_PLACEHOLDER.into()]);
+        }
+        VerifiedInvocation::Chaos { seed } => {
+            argv.extend([
+                "--verify-run".into(),
+                VERIFY_RUN_DIR_PLACEHOLDER.into(),
+                "--chaos".into(),
+                "--sched-heuristic=random".into(),
+                format!("--seed={seed}"),
+            ]);
+        }
     }
-    argv.extend([
+    let mut comparison = vec![
+        hermit,
+        "log-diff".into(),
         "--verify-json".into(),
         verdict.to_string_lossy().into_owned(),
-    ]);
+    ];
+    comparison.extend(verify_allow.map(str::to_string));
     if let Some(logs) = verification_log_dir {
-        argv.extend([
-            "--keep-logs".into(),
+        comparison.extend([
             "--verify-log-dir".into(),
             logs.to_string_lossy().into_owned(),
         ]);
     }
-    match invocation {
-        VerifiedInvocation::Verify => {}
-        VerifiedInvocation::Replay {
-            data_dir,
-            record_timeout_seconds,
-        } => argv.extend([
-            "--data-dir".into(),
-            data_dir.to_string_lossy().into_owned(),
-            "--record-timeout".into(),
-            record_timeout_seconds.to_string(),
-        ]),
-        VerifiedInvocation::Chaos { seed } => argv.extend([
-            "--chaos".into(),
-            "--sched-heuristic=random".into(),
-            format!("--seed={seed}"),
-        ]),
-    }
+    let verify_runs = verify_runs.expect("a verified attempt has its verify-run directories");
+    comparison.extend(
+        verify_run_directories(verify_runs)
+            .iter()
+            .map(|directory| directory.to_string_lossy().into_owned()),
+    );
     append_execution_root_args(
         &mut argv,
         backend,
@@ -3676,7 +5812,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     );
     let isolated = context.isolated_workdir.is_some();
     if let Some(cell_dir) = equalized_inputs_dir {
-        append_equalized_input_binds(&mut argv, cell_dir);
+        append_equalized_input_binds(&mut argv, cell_dir, equalized_roots);
         append_guest_env_args(&mut argv, &equalized_guest_env(env), isolated);
     } else {
         append_guest_env_args(&mut argv, env, isolated);
@@ -3686,7 +5822,23 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     }
     argv.push("--".into());
     argv.extend(guest_argv.iter().cloned());
-    argv
+    paired_verification_argv(comparison, argv)
+}
+
+/// The argv of `VERIFY_PAIR_SCRIPT` comparing two executions of the `run`
+/// command with the `comparison` command, as the executor runs every
+/// verified attempt. `run` carries `--verify-run @VERIFY_RUN_DIR@`; the last
+/// two words of `comparison` are the attempt's run1 and run2 directories.
+pub fn paired_verification_argv(comparison: Vec<String>, run: Vec<String>) -> Vec<String> {
+    let mut paired = vec![
+        "bash".into(),
+        "-c".into(),
+        VERIFY_PAIR_SCRIPT.into(),
+        VERIFY_PAIR_NAME.into(),
+    ];
+    paired.extend(comparison);
+    paired.extend(run);
+    paired
 }
 
 fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, String> {
@@ -3694,7 +5846,7 @@ fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, Strin
 }
 
 /// Backends whose every completed run must carry a dispatch record.
-const DISPATCH_RECORD_BACKENDS: [&str; 3] = ["ptrace", "liteinst", "sabre"];
+const DISPATCH_RECORD_BACKENDS: [&str; 4] = ["ptrace", "liteinst", "in-guest-trap", "sabre"];
 
 /// Why a passing verify report's runtime does not carry each run's dispatch
 /// record for `backend`, or `None` when it does.
@@ -3702,18 +5854,43 @@ const DISPATCH_RECORD_BACKENDS: [&str; 3] = ["ptrace", "liteinst", "sabre"];
 /// Only a run whose summary was read is checked: a report without runtime has
 /// nothing to carry the record in. KVM and DBT have no record, and native runs
 /// no backend, so they are not checked.
+///
+/// `in-guest-trap` is held to more. Its pass claims that both executions ran
+/// with syscall site patching off, and only the dispatch records show that, so
+/// the report must carry the runtime, both runs' summaries and both records,
+/// and each record must report no syscall site patched and none considered
+/// for patching, and must have measured something: every syscall of a run
+/// with patching off reaches the Tool as an in-guest `SIGSYS`, so a record
+/// with no signal trap is the empty record of a run whose guests collected no
+/// statistics, whose zeros are not measurements. And otherwise: a patched site (a guest that turned patching back on, or a
+/// Hermit that stopped forcing it off) makes the cell's result a liteinst
+/// result under the wrong name, and missing evidence cannot rule that out.
 fn dispatch_record_error(backend: &str, runtime: Option<&VerificationRuntime>) -> Option<String> {
     if !DISPATCH_RECORD_BACKENDS.contains(&backend) {
         return None;
     }
-    let runtime = runtime?;
+    let requires_every_run = backend == "in-guest-trap";
+    let Some(runtime) = runtime else {
+        return requires_every_run.then(|| {
+            "verification report carries no runtime, so it cannot show that both in-guest-trap \
+             runs patched no syscall site"
+                .to_owned()
+        });
+    };
     [
         ("run1", runtime.run1.as_ref()),
         ("run2", runtime.run2.as_ref()),
     ]
     .into_iter()
-    .filter_map(|(run, stats)| Some((run, stats?)))
     .find_map(|(run, stats)| {
+        let Some(stats) = stats else {
+            return requires_every_run.then(|| {
+                format!(
+                    "verification runtime.{run} is missing, so it cannot show that this \
+                     in-guest-trap run patched no syscall site"
+                )
+            });
+        };
         let Some(record) = &stats.dispatch else {
             return Some(format!(
                 "verification runtime.{run} carries no {backend} dispatch record"
@@ -3726,10 +5903,31 @@ fn dispatch_record_error(backend: &str, runtime: Option<&VerificationRuntime>) -
             ));
         }
         let inconsistencies = record.inconsistencies();
-        (!inconsistencies.is_empty()).then(|| {
-            format!(
+        if !inconsistencies.is_empty() {
+            return Some(format!(
                 "verification runtime.{run} dispatch record is inconsistent: {}",
                 inconsistencies.join("; ")
+            ));
+        }
+        let shown = |count: Option<u64>| {
+            count.map_or_else(|| "unmeasured".to_owned(), |count| count.to_string())
+        };
+        if requires_every_run && record.counters.signal_traps.is_none_or(|traps| traps == 0) {
+            return Some(format!(
+                "verification runtime.{run} in-guest-trap dispatch record counts {} signal \
+                 traps, so its guests measured nothing and its zero patched sites are not a \
+                 measurement",
+                shown(record.counters.signal_traps)
+            ));
+        }
+        (requires_every_run
+            && (record.sites.patched != Some(0) || record.sites.candidates != Some(0)))
+        .then(|| {
+            format!(
+                "verification runtime.{run} in-guest-trap dispatch record reports {} patched \
+                 and {} candidate syscall sites, expected 0 and 0",
+                shown(record.sites.patched),
+                shown(record.sites.candidates)
             )
         })
     })
@@ -3743,6 +5941,76 @@ pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
         None,
         &mut Vec::new(),
     )
+}
+
+/// The failure an attempt's producer classified on the first line of its
+/// stderr, before any verification report is read. The executor gives each
+/// its own ERROR kind, and no report read afterwards may supersede it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProducerFailure {
+    /// The guest program was not found or not executable, so no guest was
+    /// created.
+    LaunchRefused,
+    /// The runner cannot start the requested backend. The first line is the
+    /// producer-owned class emitted before human prose; matching a broader
+    /// nonzero exit would hide real regressions. KVM currently bypasses
+    /// ensure_available, so its availability failures do not enter this class.
+    BackendUnavailable,
+    /// A backend-unavailable class for another backend or execution shape: it
+    /// is unavailable evidence, not a product crash, and the human error line
+    /// must never override the mismatched class into FAIL.
+    InvalidBackendEvidence,
+    /// The producer wrote a class that does not establish a more specific
+    /// result. That absence stays a no-result instead of letting the following
+    /// English line manufacture a product failure.
+    UnclassifiedInternal,
+}
+
+/// Which [`ProducerFailure`] the executor finds for an attempt of a `mode`
+/// cell on `backend` whose Hermit process `succeeded` (exit status 0) or not,
+/// `timed_out` or not, and wrote `stdout` and `stderr`; `None` when it finds
+/// none. The executor classifies its own attempt with this, and
+/// [`host_input_change_only`] re-decides a retained attempt with it.
+fn producer_failure(
+    mode: &str,
+    backend: Option<&str>,
+    succeeded: bool,
+    timed_out: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Option<ProducerFailure> {
+    if succeeded {
+        return None;
+    }
+    let line = stderr.lines().next().unwrap_or_default();
+    if mode != "naked"
+        && stdout.is_empty()
+        && matches!(
+            line,
+            "HERMIT_INTERNAL_FAILURE class=guest-program-not-found"
+                | "HERMIT_INTERNAL_FAILURE class=guest-program-not-executable"
+        )
+    {
+        return Some(ProducerFailure::LaunchRefused);
+    }
+    if timed_out {
+        return None;
+    }
+    if mode != "naked"
+        && stdout.is_empty()
+        && backend.is_some_and(|backend| {
+            line == format!("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend={backend}")
+        })
+    {
+        return Some(ProducerFailure::BackendUnavailable);
+    }
+    if line.starts_with("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=") {
+        return Some(ProducerFailure::InvalidBackendEvidence);
+    }
+    if line == "HERMIT_INTERNAL_FAILURE class=cli-error" {
+        return Some(ProducerFailure::UnclassifiedInternal);
+    }
+    None
 }
 
 fn execute_spec_until(
@@ -3779,6 +6047,16 @@ fn execute_spec_until(
             .map_err(|e| format!("cannot reset {}: {e}", workdir.display()))?;
     }
     fs::create_dir_all(workdir).map_err(|e| format!("cannot create {}: {e}", workdir.display()))?;
+    // Each `--verify-run` directory must be new, so no earlier attempt's
+    // evidence can be read as this one's.
+    if let Some(verify_runs) = &spec.verify_runs {
+        if verify_runs.exists() {
+            fs::remove_dir_all(verify_runs)
+                .map_err(|e| format!("cannot reset {}: {e}", verify_runs.display()))?;
+        }
+        fs::create_dir_all(verify_runs)
+            .map_err(|e| format!("cannot create {}: {e}", verify_runs.display()))?;
+    }
     let captures = spec.cell_dir.join("captures");
     fs::create_dir_all(&captures).map_err(|e| e.to_string())?;
     let stdout_path = captures.join(format!("{}-{index}.stdout", spec.id.mode));
@@ -3842,14 +6120,15 @@ fn execute_spec_until(
         .map(|kind| kind.reason(cpu_timeout_seconds, wall_timeout_seconds));
     let mut error_kind = None;
     let failure_class_line = stderr.lines().next().unwrap_or_default();
-    let launch_refusal = spec.id.mode != "naked"
-        && !output.status.success()
-        && stdout.is_empty()
-        && matches!(
-            failure_class_line,
-            "HERMIT_INTERNAL_FAILURE class=guest-program-not-found"
-                | "HERMIT_INTERNAL_FAILURE class=guest-program-not-executable"
-        );
+    let producer_class = producer_failure(
+        &spec.id.mode,
+        spec.id.backend.as_deref(),
+        output.status.success(),
+        output.timeout.is_some(),
+        &stdout,
+        &stderr,
+    );
+    let launch_refusal = producer_class == Some(ProducerFailure::LaunchRefused);
     if launch_refusal {
         outcome = "ERROR".into();
         error_kind = Some("guest-launch-refused".into());
@@ -3862,24 +6141,9 @@ fn execute_spec_until(
         ));
     }
     // A runner that cannot start the requested backend and a backend that ran
-    // but produced no canonical comparison are different failures. Keep both
-    // visible as ERROR, but give the pre-guest availability refusal its own
-    // machine-readable kind so sweeps cannot count it as a product failure.
-    // The first line is the producer-owned class emitted before human prose.
-    // Matching a broader nonzero exit would hide real regressions.
-    // KVM currently bypasses ensure_available, so its availability failures do
-    // not enter this class.
-    let unavailable_class = spec.id.backend.as_deref().map(|backend| {
-        format!("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend={backend}")
-    });
-    let backend_unavailable = spec.id.mode != "naked"
-        && !launch_refusal
-        && output.timeout.is_none()
-        && !output.status.success()
-        && stdout.is_empty()
-        && unavailable_class
-            .as_deref()
-            .is_some_and(|class| failure_class_line == class);
+    // but produced no canonical comparison are different failures
+    // ([`ProducerFailure::BackendUnavailable`]).
+    let backend_unavailable = producer_class == Some(ProducerFailure::BackendUnavailable);
     if backend_unavailable {
         outcome = "ERROR".into();
         error_kind = Some("backend-unavailable".into());
@@ -3892,13 +6156,8 @@ fn execute_spec_until(
         ));
     }
     // A producer class that cannot satisfy the requested backend or execution
-    // shape is unavailable evidence, not a product crash. In particular, the
-    // human error line must never override a mismatched class into FAIL.
-    let invalid_backend_evidence = output.timeout.is_none()
-        && !output.status.success()
-        && !backend_unavailable
-        && failure_class_line
-            .starts_with("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=");
+    // shape ([`ProducerFailure::InvalidBackendEvidence`]).
+    let invalid_backend_evidence = producer_class == Some(ProducerFailure::InvalidBackendEvidence);
     if invalid_backend_evidence {
         outcome = "ERROR".into();
         error_kind = Some("invalid-backend-evidence".into());
@@ -3907,14 +6166,9 @@ fn execute_spec_until(
         ));
     }
     // The producer did write a class, but it did not establish a more specific
-    // result. Keep that absence as no-result instead of letting the following
-    // English line manufacture a product failure.
-    let unclassified_internal_failure = output.timeout.is_none()
-        && !output.status.success()
-        && !launch_refusal
-        && !backend_unavailable
-        && !invalid_backend_evidence
-        && failure_class_line == "HERMIT_INTERNAL_FAILURE class=cli-error";
+    // result ([`ProducerFailure::UnclassifiedInternal`]).
+    let unclassified_internal_failure =
+        producer_class == Some(ProducerFailure::UnclassifiedInternal);
     if unclassified_internal_failure {
         outcome = "ERROR".into();
         error_kind = Some("incomplete-verification-evidence".into());
@@ -3924,10 +6178,7 @@ fn execute_spec_until(
             .filter(|detail| !detail.trim().is_empty())
             .map(str::to_owned);
     }
-    let producer_failure_classified = launch_refusal
-        || backend_unavailable
-        || invalid_backend_evidence
-        || unclassified_internal_failure;
+    let producer_failure_classified = producer_class.is_some();
     let mut report_json = None;
     let mut report_sha = None;
     let mut runtime = None;
@@ -3977,10 +6228,18 @@ fn execute_spec_until(
                             first_divergent_right_message =
                                 report.first_divergent_right_message.clone();
                         }
-                        if producer_failure_classified {
+                        let typed_run_failure = matches!(
+                            report.no_result_reason,
+                            Some(crate::canonical_verdict::NoResultReason::RunFailed { .. })
+                        );
+                        if producer_failure_classified
+                            && !(unclassified_internal_failure && typed_run_failure)
+                        {
                             // The producer's classified failure, or a
                             // contradiction in that evidence, cannot be
                             // superseded by a pre-stamped or unrelated report.
+                            // A `run_failed` report is neither: it is the
+                            // class an unclassified `cli-error` line lacks.
                         } else if let Some(
                             crate::canonical_verdict::NoResultReason::ContainerFailed(failure),
                         ) = &report.no_result_reason
@@ -4004,6 +6263,37 @@ fn execute_spec_until(
                                     reason = Some(error);
                                 }
                             }
+                        } else if let Some(crate::canonical_verdict::NoResultReason::RunFailed {
+                            run,
+                            failure,
+                            detail,
+                        }) = &report.no_result_reason
+                        {
+                            // Hermit started the run and a typed failure of it
+                            // stopped the run: a backend failure, a recorded
+                            // determinism loss or a policy refusal of this
+                            // guest. That is this cell's result on this
+                            // backend, a crash-error red with Hermit's reason,
+                            // not a run that never happened. Hermit exits
+                            // nonzero for each; anything else contradicts it.
+                            if output.timeout.is_none()
+                                && output.status.code().is_some_and(|code| code != 0)
+                            {
+                                outcome = "FAIL".into();
+                                error_kind = None;
+                                reason = Some(format!(
+                                    "{run:?} failed ({}): {detail}",
+                                    failure.as_str()
+                                ));
+                            } else {
+                                outcome = "ERROR".into();
+                                error_kind = Some("incomplete-verification-evidence".into());
+                                reason = Some(format!(
+                                    "run_failed contradicts the Hermit process disposition: status={:?} timed_out={}",
+                                    output.status.code(),
+                                    output.timeout.is_some()
+                                ));
+                            }
                         } else if report.verdict == Verdict::InfrastructureError {
                             let comparison_error = report.comparison.as_ref().and_then(|_| {
                                 match spec.comparator {
@@ -4012,21 +6302,66 @@ fn execute_spec_until(
                                 }
                                 .err()
                             });
+                            let skid_reason = match report.infrastructure_error.as_ref() {
+                                Some(InfrastructureError::SkidOvershoot { count }) => {
+                                    skid_overshoot_reason(*count)
+                                }
+                                Some(change @ InfrastructureError::HostInputChanged { .. }) => {
+                                    host_input_changed_reason(change)
+                                }
+                                None => unreachable!(
+                                    "typed report parser requires an infrastructure error"
+                                ),
+                            };
+                            // When both runs completed and were compared, the
+                            // cell's declared stdout assertions are decided
+                            // before the refusal is accepted as the attempt's
+                            // only failure. An overshoot moves a preemption
+                            // point and nothing else, so compared runs that
+                            // agree on the wrong bytes, or omit the declared
+                            // marker, carry the same product defect they carry
+                            // without one. Such an attempt, and one whose
+                            // assertion the evidence cannot decide, keeps the
+                            // skid infrastructure ERROR it always had, because
+                            // every reader of a result row (the validation
+                            // series writer, the pressure test and the stress
+                            // series) accepts an `infrastructure_error` report
+                            // only on that classification. Its reason names
+                            // both the overshoot and the assertion, and it is
+                            // never retried, never a pass and never a
+                            // skid-only attempt: the skid predicate requires
+                            // the plain skid reason and re-decides the row's
+                            // recorded declaration from the attempt's own
+                            // evidence (https://github.com/rrnewton/hermit/issues/1845).
+                            // A host input change is decided the same way: it
+                            // explains the divergence, not a declared output
+                            // that either run got wrong, so a violated or
+                            // undecidable assertion keeps the attempt out of
+                            // the host-input retry as well.
+                            let stdout_error = report
+                                .compared_outputs
+                                .as_ref()
+                                .filter(|_| comparison_error.is_none() && output.timeout.is_none())
+                                .and_then(|_| declared_stdout_error(spec, &report, &stdout_path));
                             if let Some(error) = comparison_error {
                                 outcome = "ERROR".into();
                                 error_kind = Some("incomplete-verification-evidence".into());
                                 reason = Some(error);
+                            } else if let Some(error) = stdout_error {
+                                outcome = "ERROR".into();
+                                error_kind = Some("infrastructure".into());
+                                reason = Some(match error {
+                                    ExpectedStdoutError::Unevidenced(error) => format!(
+                                        "{skid_reason}, and a declared stdout assertion cannot be checked: {error}"
+                                    ),
+                                    ExpectedStdoutError::Mismatch(error) => format!(
+                                        "{skid_reason}, and its compared runs violate a declared stdout assertion: {error}"
+                                    ),
+                                });
                             } else {
                                 outcome = "ERROR".into();
                                 error_kind = Some("infrastructure".into());
-                                reason = Some(match report.infrastructure_error.as_ref() {
-                                    Some(InfrastructureError::SkidOvershoot { count }) => format!(
-                                        "verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)"
-                                    ),
-                                    None => unreachable!(
-                                        "typed report parser requires an infrastructure error"
-                                    ),
-                                });
+                                reason = Some(skid_reason);
                             }
                         } else if report.verdict == Verdict::NoResult
                             && matches!(
@@ -4105,47 +6440,20 @@ fn execute_spec_until(
                         {
                             outcome = "FAIL".into();
                             reason = Some(error);
-                        } else if let Some(Err(error)) = spec
-                            .expected_stdout
-                            .as_deref()
-                            .filter(|_| output.timeout.is_none())
-                            .map(|expected| check_expected_stdout(expected, &report))
+                        } else if let Some(error) = output
+                            .timeout
+                            .is_none()
+                            .then(|| declared_stdout_error(spec, &report, &stdout_path))
+                            .flatten()
                         {
                             // Two runs agreeing on the wrong bytes is still a
-                            // failure when the cell names the exact bytes.
+                            // failure when the cell names the exact bytes, and
+                            // so are agreeing runs that omit the guest's
+                            // success marker.
                             match error {
                                 ExpectedStdoutError::Unevidenced(error) => {
                                     outcome = "ERROR".into();
-                                    error_kind =
-                                        Some("incomplete-verification-evidence".into());
-                                    reason = Some(error);
-                                }
-                                ExpectedStdoutError::Mismatch(error) => {
-                                    outcome = "FAIL".into();
-                                    reason = Some(error);
-                                }
-                            }
-                        } else if let Some(Err(error)) = spec
-                            .expected_stdout_contains
-                            .as_deref()
-                            .filter(|_| output.timeout.is_none())
-                            .map(|text| match fs::read(&stdout_path) {
-                                Ok(captured) => {
-                                    check_expected_stdout_contains(text, &captured, &report)
-                                }
-                                Err(error) => Err(ExpectedStdoutError::Unevidenced(format!(
-                                    "cannot read captured verify stdout {}: {error}, so the declared expected_stdout_contains cannot be checked",
-                                    stdout_path.display()
-                                ))),
-                            })
-                        {
-                            // Agreeing runs that omit the guest's success
-                            // marker are still a failure.
-                            match error {
-                                ExpectedStdoutError::Unevidenced(error) => {
-                                    outcome = "ERROR".into();
-                                    error_kind =
-                                        Some("incomplete-verification-evidence".into());
+                                    error_kind = Some("incomplete-verification-evidence".into());
                                     reason = Some(error);
                                 }
                                 ExpectedStdoutError::Mismatch(error) => {
@@ -4224,6 +6532,18 @@ fn execute_spec_until(
     if let Some(timeout) = output.timeout {
         error_kind = Some(timeout.error_kind().into());
         reason = Some(timeout.reason(cpu_timeout_seconds, wall_timeout_seconds));
+    }
+    // After a match the two `--verify-run` directories hold nothing the
+    // report and any retained golden log do not, so they go, as `run
+    // --verify` deletes its logs after a match; otherwise they stay beside
+    // the report as its evidence.
+    let matched = report_json.as_deref().is_some_and(|json| {
+        current_verification_report(json.as_bytes())
+            .is_ok_and(|report| report.verdict == Verdict::Matched)
+    });
+    if let Some(verify_runs) = spec.verify_runs.as_ref().filter(|_| matched) {
+        fs::remove_dir_all(verify_runs)
+            .map_err(|e| format!("cannot remove {}: {e}", verify_runs.display()))?;
     }
     Ok(AttemptResult {
         index: index.into(),
@@ -4306,11 +6626,13 @@ fn record_not_started(
     reason: NotStartedReason,
     observations: &mut Vec<InvocationCpuObservation>,
 ) {
+    // No process starts, so no cgroup is created and no CPU is measured. The
+    // row names the source a started invocation would try first.
     let mut observation = InvocationCpuObservation::pending(
         observations.len() as u64 + 1,
         request.role,
         request.command,
-        cpu_enabled,
+        cpu_enabled.then_some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
     );
     observation.launch = LaunchObservation::NotStarted { reason };
     observations.push(observation);
@@ -4388,8 +6710,56 @@ fn live_cpu_usage_usec(pgid: u32, seconds: f64) -> Result<u64, String> {
     Ok(usec as u64)
 }
 
+/// A pidfd for the invocation's leader, opened while the leader is this
+/// runner's unreaped child, so it names exactly that process wherever its
+/// process group goes.
+struct LeaderPidFd {
+    pid: u32,
+    fd: Option<OwnedFd>,
+}
+
+impl LeaderPidFd {
+    fn open(pid: u32) -> Self {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        Self {
+            pid,
+            // SAFETY: a nonnegative pidfd_open result is a new descriptor
+            // that nothing else owns.
+            fd: (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as RawFd) }),
+        }
+    }
+
+    /// SIGKILL the leader itself. Without a pidfd (a kernel older than 5.3),
+    /// or if the pidfd signal fails, the PID still names the leader: it is
+    /// this runner's unreaped child, so the kernel cannot reuse it.
+    fn kill(&self) {
+        let sent = self.fd.as_ref().is_some_and(|fd| {
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        });
+        if !sent {
+            unsafe {
+                libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Stop the invocation: SIGTERM its process group, wait out the 10 s grace for
+/// the leader, then SIGKILL the group, the invocation cgroup when there is one,
+/// and the leader through its pidfd, and reap the leader.
 fn stop_process_group(
     pid: u32,
+    leader: &LeaderPidFd,
+    cgroup: Option<&InvocationCgroup>,
     started: Instant,
     final_wait: &mut FinalWaitObservation,
 ) -> Result<(ExitStatus, u64), String> {
@@ -4415,6 +6785,17 @@ fn stop_process_group(
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
+    // A leader that moved to another process group, and anything that left
+    // the group, are beyond the group SIGKILL. The invocation cgroup still
+    // holds them all, and the pidfd still names the leader, so the blocking
+    // wait below ends with this kill rather than whenever the leader chooses.
+    // A cgroup.kill failure is not reported here: the pidfd kill still ends
+    // the wait, and the cgroup's finish() fails the invocation if anything
+    // survives.
+    if let Some(cgroup) = cgroup {
+        let _ = cgroup.kill();
+    }
+    leader.kill();
     wait4_process(pid, 0, WaitOperation::BlockingStop, started, final_wait)?.ok_or_else(|| {
         let reason = format!("blocking wait4({pid}) returned no child");
         *final_wait = FinalWaitObservation::Unavailable {
@@ -4476,44 +6857,807 @@ fn execute_process(
     )
 }
 
+/// Where a budgeted invocation's live CPU may come from. Production reads the
+/// fallback marker from the environment and creates invocation cgroups under
+/// the runner's own cgroup; a test may substitute both for its own thread.
+#[derive(Clone, Debug)]
+struct LiveCpuPlan {
+    allow_process_group_scan: Result<bool, String>,
+    cgroup_parent: Option<PathBuf>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LIVE_CPU_PLAN_OVERRIDE: std::cell::RefCell<Option<LiveCpuPlan>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl LiveCpuPlan {
+    fn current() -> Self {
+        Self::test_override().unwrap_or_else(|| Self {
+            allow_process_group_scan: process_group_scan_allowed(
+                std::env::var_os(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV).as_deref(),
+            ),
+            cgroup_parent: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn test_override() -> Option<Self> {
+        LIVE_CPU_PLAN_OVERRIDE.with(|plan| plan.borrow().clone())
+    }
+
+    #[cfg(not(test))]
+    fn test_override() -> Option<Self> {
+        None
+    }
+}
+
+/// How one invocation's live CPU is measured.
+enum LiveCpuMeter {
+    /// The invocation has no CPU budget, so nothing is measured live.
+    Disabled,
+    /// The invocation runs in a cgroup of its own and is charged from that
+    /// cgroup's `cpu.stat`.
+    Cgroup(InvocationCgroup),
+    /// The launcher declared a run without cgroups and none can be created
+    /// here, so the agent-utils process-group scan measures the invocation and
+    /// its rows name that source.
+    ProcessGroupScan,
+}
+
+/// Why a budgeted invocation was refused before anything started, and at
+/// which launch stage its observation records that refusal.
+struct MeterRefusal {
+    stage: SpawnStage,
+    reason: String,
+}
+
+impl LiveCpuMeter {
+    /// Choose the meter for a budgeted invocation, or refuse the invocation.
+    ///
+    /// A command whose CPU no source can measure is never launched. Started,
+    /// it would run unmeasured until the unavailable grace stopped it, and a
+    /// command quicker than that grace would complete and could pass. The
+    /// grace is for a meter that was established and then failed.
+    fn choose(plan: &LiveCpuPlan) -> Result<Self, MeterRefusal> {
+        let allow_process_group_scan =
+            plan.allow_process_group_scan
+                .clone()
+                .map_err(|reason| MeterRefusal {
+                    stage: SpawnStage::Spawn,
+                    reason,
+                })?;
+        let created = match &plan.cgroup_parent {
+            Some(parent) => InvocationCgroup::create_in(parent),
+            None => InvocationCgroup::create(),
+        };
+        match created {
+            Ok(cgroup) => Ok(Self::Cgroup(cgroup)),
+            Err(error) if error.fallback_eligible && allow_process_group_scan => {
+                Ok(Self::ProcessGroupScan)
+            }
+            Err(error) => {
+                let fallback = if error.fallback_eligible {
+                    format!(
+                        "; only a run given no cgroups on purpose may set {ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}=1 to measure with the process-group scan instead"
+                    )
+                } else {
+                    String::new()
+                };
+                Err(MeterRefusal {
+                    stage: SpawnStage::LiveCpuMeter,
+                    reason: format!(
+                        "cannot measure live CPU: {}{fallback}; the budgeted command was refused before launch rather than run unmeasured",
+                        error.message
+                    ),
+                })
+            }
+        }
+    }
+
+    fn source(&self) -> Option<LiveCpuSource> {
+        match self {
+            Self::Disabled => None,
+            Self::Cgroup(_) => Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+            Self::ProcessGroupScan => Some(LiveCpuSource::AgentUtilsPairedPidfdStatV1),
+        }
+    }
+}
+
 fn execute_process_with_cpu_poll_interval(
     request: ProcessRequest,
     limits: ProcessLimits,
     observations: &mut Vec<InvocationCpuObservation>,
 ) -> Result<ProcessOutput, String> {
     let started = Instant::now();
-    let mut observation = InvocationCpuObservation::pending(
-        observations.len() as u64 + 1,
-        request.role,
-        request.command,
-        limits.cpu_budget_usec.is_some(),
-    );
+    let ordinal = observations.len() as u64 + 1;
+    let meter = if limits.cpu_budget_usec.is_some() {
+        LiveCpuMeter::choose(&LiveCpuPlan::current())
+    } else {
+        Ok(LiveCpuMeter::Disabled)
+    };
+    let mut meter = match meter {
+        Ok(meter) => meter,
+        Err(MeterRefusal { stage, reason }) => {
+            // A malformed fallback marker, or a budgeted command no source can
+            // measure, is refused before anything starts. The observation
+            // names the cgroup source the boxed run required.
+            let mut observation = InvocationCpuObservation::pending(
+                ordinal,
+                request.role,
+                request.command,
+                Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+            );
+            observation.launch = LaunchObservation::SpawnFailed {
+                stage,
+                reason: reason.clone(),
+            };
+            observation.termination = TerminationPath::SpawnFailed;
+            observations.push(observation);
+            return Err(reason);
+        }
+    };
+    let mut observation =
+        InvocationCpuObservation::pending(ordinal, request.role, request.command, meter.source());
+    let enrollment = match &meter {
+        LiveCpuMeter::Cgroup(cgroup) => Some((cgroup.enrollment_fd(), cgroup.path())),
+        _ => None,
+    };
     let result = spawn_process(
         &request.cwd,
         &request.stdout,
         &request.stderr,
+        enrollment,
         &mut observation,
     )
-    .and_then(|child| {
-        monitor_process(
+    .and_then(|child| match &meter {
+        LiveCpuMeter::Cgroup(cgroup) => monitor_live_cpu_in(
+            child,
+            limits,
+            started,
+            &mut observation,
+            Some(cgroup),
+            |pid, leader_unreaped| match cgroup.kernel_path() {
+                Some(invocation) => check_cgroup_membership(
+                    pid,
+                    leader_unreaped,
+                    &invocation,
+                    process_group_members,
+                    process_cgroup,
+                ),
+                None => Err(format!(
+                    "invocation cgroup {} is not under /sys/fs/cgroup, so its members cannot be checked",
+                    cgroup.path().display()
+                )),
+            },
+            |_| Ok(()),
+            monotonic_cpu_sampler(|| cgroup.cpu_usage_usec()),
+        ),
+        LiveCpuMeter::Disabled | LiveCpuMeter::ProcessGroupScan => monitor_process(
             child,
             limits,
             started,
             &mut observation,
             |pid| dagrun::proccpu::ProcessGroupCpu::new(pid).map_err(|error| error.to_string()),
             |reader| reader.seconds().map_err(|error| error.to_string()),
-        )
+        ),
     });
+    // The leader has been reaped (or could not be). Whatever it left in its
+    // cgroup is killed there, and the cgroup is removed; a failure to do so
+    // fails the invocation rather than leaving processes behind unnoticed.
+    let result = match &mut meter {
+        LiveCpuMeter::Cgroup(cgroup) => match (result, cgroup.finish()) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+        },
+        _ => result,
+    };
     // Retain the same observation on every error path, including successful
     // reap after accounting became unavailable. An error never fabricates zero.
     observations.push(observation);
     result
 }
 
+/// Wrap a cgroup counter read so that a value below the highest one already
+/// returned is a failed sample. The kernel never lowers `usage_usec`, so a
+/// decrease means the read is not of this invocation's counter; the monitor
+/// then treats it like any other failed sample, timed from when it returned.
+fn monotonic_cpu_sampler(
+    mut read: impl FnMut() -> Result<u64, String>,
+) -> impl FnMut(u32, &()) -> Result<u64, CpuError> {
+    let mut highest: Option<u64> = None;
+    move |_, _| {
+        let usage = read().map_err(|error| CpuError {
+            stage: CpuErrorStage::Sampling,
+            reason: format!("sampling: {error}"),
+        })?;
+        if let Some(highest) = highest.filter(|highest| usage < *highest) {
+            return Err(CpuError {
+                stage: CpuErrorStage::Sampling,
+                reason: format!(
+                    "sampling: cgroup CPU counter decreased from {highest} to {usage} usec"
+                ),
+            });
+        }
+        highest = Some(usage);
+        Ok(usage)
+    }
+}
+
+/// Whether `path`, a cgroup path as the `0::` line of `/proc/<pid>/cgroup`
+/// gives it, is `invocation` or a cgroup below it.
+fn within_cgroup(path: &str, invocation: &str) -> bool {
+    path == invocation
+        || path
+            .strip_prefix(invocation)
+            .is_some_and(|below| below.starts_with('/'))
+}
+
+/// The cgroup v2 path of `pid` from the `0::` line of `/proc/<pid>/cgroup`,
+/// or `None` when the process no longer exists.
+fn process_cgroup(pid: u32) -> Result<Option<String>, String> {
+    let text = match fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+        Ok(text) => text,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("/proc/{pid}/cgroup: {error}")),
+    };
+    let path = text
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| format!("/proc/{pid}/cgroup has no cgroup v2 line"))?;
+    // An exited process in a removed cgroup still names it, so marked.
+    Ok(Some(
+        path.strip_suffix(" (deleted)").unwrap_or(path).to_owned(),
+    ))
+}
+
+/// The live members of process group `pgid`, found as the agent-utils
+/// process-group scan finds them: every numeric `/proc` entry whose `stat`
+/// names `pgid` as its process group. A process that exits during the scan
+/// is skipped.
+///
+/// Linux cannot list a process group's members, so every scan walks every
+/// PID on the host; reading every PID's `stat` each time made one scan cost
+/// as much as the host has processes, and an invocation is checked at every
+/// CPU poll and at its exit ([`check_cgroup_membership`]). Under a loaded host
+/// that turned a 15 s test into a 57 s timeout. So, as `dagrun::proccpu`
+/// does, the scan remembers each PID's session ([`SESSION_CENSUS`]) and skips
+/// a PID that cannot be a member: a process joins a group only within its own
+/// session, and changes session only through `setsid`, which makes its session
+/// its own PID. A PID is read when its cached session or the PID itself is the
+/// group's session, when its session is unknown, or when the kernel may have
+/// handed its number to a new task since it was cached. The group's session
+/// comes from its leader's `stat`, or, once the leader is gone, from an earlier
+/// scan or from [`spawn_process`], which records each group it creates; without
+/// it every PID is read.
+///
+/// A Buck validation runs each e2e cell as a harness process of its own, so the
+/// first scan of every cell read every PID on the host (about 5,300 `stat`
+/// files, 0.12 CPU-s). With [`SESSION_CENSUS_ENV`] naming a file, the census
+/// starts from the one the last cell on this host left there and is written
+/// back after this process's first scan ([`SessionCensus::load`]), under the
+/// same reuse rule: an entry is kept only while the allocator cannot have
+/// handed its PID out again since the writer's scan began.
+fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
+    let mut census = SESSION_CENSUS
+        .get_or_init(session_census_from_env)
+        .lock()
+        .map_err(|_| "session census lock poisoned".to_string())?;
+    let scan = scan_process_group(&mut census, pgid)?;
+    if !census.saved || scan.read >= SESSION_CENSUS_SAVE_READS {
+        if let Some(path) = std::env::var_os(SESSION_CENSUS_ENV).filter(|v| !v.is_empty()) {
+            census.save(Path::new(&path));
+        }
+        census.saved = true;
+    }
+    Ok(scan.members)
+}
+
+/// What one [`scan_process_group`] found and did.
+struct GroupScan {
+    members: Vec<u32>,
+    /// How many PIDs' `stat` it read.
+    read: usize,
+    /// The PIDs it saw in /proc and did not read, because the census placed
+    /// them in another session. Kept for the tests, which assert on the set.
+    #[cfg(test)]
+    skipped: Vec<u32>,
+}
+
+/// [`process_group_members`] with `census`.
+fn scan_process_group(census: &mut SessionCensus, pgid: u32) -> Result<GroupScan, String> {
+    let now = PidAllocator::read();
+    census.begin(now, read_pid_max());
+    let group_session = match read_process_stat(pgid)? {
+        StatRead::Bytes(stat) if stat_process_group(&stat) == Some(pgid) => {
+            let session = stat_session(&stat);
+            census.remember_group(pgid, session, now);
+            session
+        }
+        _ => census
+            .group_sessions
+            .get(&pgid)
+            .map(|(session, _)| *session),
+    };
+    let mut members = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut read = 0;
+    #[cfg(test)]
+    let mut skipped = Vec::new();
+    for entry in fs::read_dir("/proc").map_err(|error| format!("/proc: {error}"))? {
+        let entry = entry.map_err(|error| format!("/proc: {error}"))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .filter(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        seen.insert(pid);
+        if group_session.is_some_and(|session| census.skip(pid, session)) {
+            #[cfg(test)]
+            skipped.push(pid);
+            continue;
+        }
+        read += 1;
+        let mut session = None;
+        let group = member_process_group(
+            pid,
+            |pid| {
+                let read = read_process_stat(pid)?;
+                if let StatRead::Bytes(stat) = &read {
+                    session = stat_session(stat);
+                }
+                Ok(read)
+            },
+            process_exists,
+        )?;
+        if let Some(session) = session {
+            census.sessions.insert(pid, session);
+        }
+        if group == Some(pgid) {
+            members.push(pid);
+        }
+    }
+    census.sessions.retain(|pid, _| seen.contains(pid));
+    Ok(GroupScan {
+        members,
+        read,
+        #[cfg(test)]
+        skipped,
+    })
+}
+
+/// Records the session of the process group a child of this process created
+/// with `setpgid(0, 0)` ([`spawn_process`]), so a scan made after the leader
+/// exited, when its `stat` is gone, can still skip by session. The group was
+/// created in this process's session, which the child inherited, and it never
+/// changes: a group's leader cannot call `setsid`, and a member that does
+/// leaves the group.
+fn remember_spawned_group(pgid: u32) {
+    let session = u32::try_from(unsafe { libc::getsid(0) }).ok();
+    if let Ok(mut census) = SESSION_CENSUS.get_or_init(session_census_from_env).lock() {
+        census.remember_group(pgid, session, PidAllocator::read());
+    }
+}
+
+/// The session of each host PID an earlier [`process_group_members`] scan
+/// read, and the session of each process group it scanned for or this
+/// process created, valid while the kernel cannot have reused those PIDs
+/// (judged by [`PidAllocator`]).
+static SESSION_CENSUS: std::sync::OnceLock<std::sync::Mutex<SessionCensus>> =
+    std::sync::OnceLock::new();
+
+/// A file the session census starts from and is written back to, shared by
+/// the harness processes on one host (set by ci/buck-e2e/cell.sh).
+pub const SESSION_CENSUS_ENV: &str = "HERMIT_E2E_SESSION_CENSUS";
+const SESSION_CENSUS_SCHEMA: &str = "hermit-session-census/v1";
+/// After its first scan, a process writes the census back only after a scan
+/// that read at least this many `stat` files: later scans read little, and
+/// writing after every CPU poll would cost more than it saves.
+const SESSION_CENSUS_SAVE_READS: usize = 1024;
+
+fn session_census_from_env() -> std::sync::Mutex<SessionCensus> {
+    let census = std::env::var_os(SESSION_CENSUS_ENV)
+        .filter(|v| !v.is_empty())
+        .and_then(|path| SessionCensus::load(Path::new(&path)))
+        .unwrap_or_default();
+    std::sync::Mutex::new(census)
+}
+
+/// The kernel instance and PID namespace a census describes: PIDs and
+/// allocator positions mean nothing outside them.
+fn census_scope() -> Option<String> {
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let pidns = fs::read_link("/proc/self/ns/pid").ok()?;
+    Some(format!("{} {}", boot.trim(), pidns.to_str()?))
+}
+
+#[derive(Default)]
+struct SessionCensus {
+    sessions: std::collections::HashMap<u32, u32>,
+    /// Each group's session, with where the allocator stood when the group
+    /// was known to exist with that session.
+    group_sessions: std::collections::HashMap<u32, (u32, PidAllocator)>,
+    at: Option<PidAllocator>,
+    /// Whether this process has written the census back since it started.
+    saved: bool,
+}
+
+impl SessionCensus {
+    /// The census a previous process saved at `path`, or `None` when there is
+    /// none, it is unreadable, or it describes another boot or PID namespace;
+    /// every PID is then read, as without a file. Only the PID sessions and the
+    /// allocator position come across: [`Self::begin`] then drops each PID the
+    /// allocator may have handed out since the writer's scan began, exactly as
+    /// for this process's own previous scan. Group sessions stay per process.
+    fn load(path: &Path) -> Option<Self> {
+        Self::parse(&fs::read_to_string(path).ok()?, &census_scope()?)
+    }
+
+    fn parse(text: &str, scope: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        if lines.next()? != SESSION_CENSUS_SCHEMA || lines.next()?.strip_prefix("scope ")? != scope
+        {
+            return None;
+        }
+        let at: Vec<_> = lines.next()?.strip_prefix("at ")?.split(' ').collect();
+        let [last_pid, tasks, forks] = at.as_slice() else {
+            return None;
+        };
+        let at = PidAllocator {
+            last_pid: last_pid.parse().ok()?,
+            tasks: tasks.parse().ok()?,
+            forks: forks.parse().ok()?,
+        };
+        let mut sessions = std::collections::HashMap::new();
+        for line in lines {
+            let (pid, session) = line.split_once(' ')?;
+            sessions.insert(pid.parse().ok()?, session.parse().ok()?);
+        }
+        Some(Self {
+            sessions,
+            at: Some(at),
+            ..Self::default()
+        })
+    }
+
+    fn render(&self, scope: &str) -> Option<String> {
+        let at = self.at?;
+        let mut text = format!(
+            "{SESSION_CENSUS_SCHEMA}\nscope {scope}\nat {} {} {}\n",
+            at.last_pid, at.tasks, at.forks
+        );
+        for (pid, session) in &self.sessions {
+            text.push_str(&format!("{pid} {session}\n"));
+        }
+        Some(text)
+    }
+
+    /// Best effort, replacing the file whole: a process that cannot write it
+    /// leaves the next one to read every PID, as without a file.
+    fn save(&self, path: &Path) {
+        let Some(text) = census_scope().and_then(|scope| self.render(&scope)) else {
+            return;
+        };
+        let partial = path.with_extension(format!("{}.partial", std::process::id()));
+        if fs::write(&partial, text).is_err() || fs::rename(&partial, path).is_err() {
+            let _ = fs::remove_file(&partial);
+        }
+    }
+
+    /// Starts a scan at allocator position `now`, dropping each entry whose
+    /// PID the allocator may have handed out since the previous scan began.
+    fn begin(&mut self, now: Option<PidAllocator>, pid_max: Option<u32>) {
+        match (self.at, now, pid_max) {
+            (Some(previous), Some(now), Some(pid_max)) => {
+                self.sessions
+                    .retain(|pid, _| !previous.may_have_reused(now, pid_max, *pid));
+            }
+            _ => self.sessions.clear(),
+        }
+        match (now, pid_max) {
+            (Some(now), Some(pid_max)) => self
+                .group_sessions
+                .retain(|pgid, (_, since)| !since.may_have_reused(now, pid_max, *pgid)),
+            _ => self.group_sessions.clear(),
+        }
+        self.at = now;
+    }
+
+    /// Records that group `pgid` existed in `session` when the allocator
+    /// stood at `since`.
+    fn remember_group(&mut self, pgid: u32, session: Option<u32>, since: Option<PidAllocator>) {
+        if let (Some(session), Some(since)) = (session, since) {
+            self.group_sessions.insert(pgid, (session, since));
+        }
+    }
+
+    /// Whether `pid` cannot be in a process group of session `session`.
+    fn skip(&self, pid: u32, session: u32) -> bool {
+        pid != session
+            && self
+                .sessions
+                .get(&pid)
+                .is_some_and(|cached| *cached != session)
+    }
+}
+
+/// Where the kernel's PID allocator stands: the last PID it handed out and the
+/// number of live tasks (`/proc/loadavg`), and the tasks created since boot
+/// (`processes` in `/proc/stat`). Threads take their IDs from the same space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PidAllocator {
+    last_pid: u32,
+    tasks: u64,
+    forks: u64,
+}
+
+/// PIDs below this are never handed out again after the allocator wraps
+/// (Linux `RESERVED_PIDS`).
+const RESERVED_PIDS: u64 = 300;
+
+impl PidAllocator {
+    fn read() -> Option<Self> {
+        let loadavg = fs::read_to_string("/proc/loadavg").ok()?;
+        let fields: Vec<_> = loadavg.split_whitespace().collect();
+        let (_, tasks) = fields.get(3)?.split_once('/')?;
+        let stat = fs::read_to_string("/proc/stat").ok()?;
+        let forks = stat
+            .lines()
+            .find_map(|line| line.strip_prefix("processes "))?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(Self {
+            last_pid: fields.get(4)?.parse().ok()?,
+            tasks: tasks.parse().ok()?,
+            forks,
+        })
+    }
+
+    /// Whether the allocator may have handed out `pid` again on its way from
+    /// `self` to `to`. It walks the PID space in a circle, so every PID it
+    /// handed out lies on the arc after `self.last_pid` up to `to.last_pid`,
+    /// unless it may have gone the whole way round.
+    fn may_have_reused(self, to: PidAllocator, pid_max: u32, pid: u32) -> bool {
+        let Some(created) = to.forks.checked_sub(self.forks) else {
+            return true;
+        };
+        let lap = u64::from(pid_max).saturating_sub(RESERVED_PIDS);
+        if created.saturating_add(self.tasks.max(to.tasks)) >= lap {
+            return true;
+        }
+        if created == 0 {
+            return false;
+        }
+        // `created` counts tasks created on the whole host (/proc/stat), while
+        // `last_pid` is this PID namespace's allocator (/proc/loadavg). In a
+        // namespace other than the host's (the pinned root's), the host can
+        // create tasks while this namespace creates none, so the cursor stays
+        // put. With a full lap ruled out above, a cursor that did not move
+        // handed out no PID.
+        let (start, end) = (self.last_pid, to.last_pid);
+        if start == end {
+            return false;
+        }
+        if start < end {
+            start < pid && pid <= end
+        } else {
+            pid > start || pid <= end
+        }
+    }
+}
+
+fn read_pid_max() -> Option<u32> {
+    fs::read_to_string("/proc/sys/kernel/pid_max")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The session in the bytes of a `/proc/<pid>/stat` file: the field after the
+/// process group (see [`stat_process_group`]).
+fn stat_session(stat: &[u8]) -> Option<u32> {
+    let close = stat.iter().rposition(|&byte| byte == b')')?;
+    std::str::from_utf8(&stat[close + 1..])
+        .ok()?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()
+}
+
+/// One read of a `/proc/<pid>/stat` file: its bytes, or that the process
+/// no longer exists.
+#[derive(Debug)]
+enum StatRead {
+    Bytes(Vec<u8>),
+    Gone,
+}
+
+/// Read `/proc/<pid>/stat` as bytes, not text: any process on the host may
+/// name itself with bytes that are not UTF-8, and one such name must not fail
+/// the scan.
+fn read_process_stat(pid: u32) -> Result<StatRead, String> {
+    match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => Ok(StatRead::Bytes(stat)),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            Ok(StatRead::Gone)
+        }
+        Err(error) => Err(format!("/proc/{pid}/stat: {error}")),
+    }
+}
+
+/// Whether `/proc/<pid>` still exists.
+fn process_exists(pid: u32) -> Result<bool, String> {
+    match fs::symlink_metadata(format!("/proc/{pid}")) {
+        Ok(_) => Ok(true),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Ok(false),
+        Err(error) => Err(format!("/proc/{pid}: {error}")),
+    }
+}
+
+/// The process group of `pid` from its `stat`, or `None` when the process no
+/// longer exists. A read whose bytes do not parse is not trusted at once: in
+/// the validation of hermit 9e698b862c8e, two such reads refused liteinst
+/// cells. If `/proc/<pid>` is gone the
+/// process has exited and is skipped, as an exited process cannot be outside
+/// the cgroup; otherwise the file is read once more. A live process whose
+/// stat still does not parse fails the check, with both reads' lengths and
+/// leading bytes in the error so the next occurrence shows what it read.
+fn member_process_group(
+    pid: u32,
+    mut read: impl FnMut(u32) -> Result<StatRead, String>,
+    exists: impl FnOnce(u32) -> Result<bool, String>,
+) -> Result<Option<u32>, String> {
+    let first = match read(pid)? {
+        StatRead::Gone => return Ok(None),
+        StatRead::Bytes(stat) => stat,
+    };
+    if let Some(group) = stat_process_group(&first) {
+        return Ok(Some(group));
+    }
+    if !exists(pid)? {
+        return Ok(None);
+    }
+    let reread = match read(pid)? {
+        StatRead::Gone => return Ok(None),
+        StatRead::Bytes(stat) => stat,
+    };
+    match stat_process_group(&reread) {
+        Some(group) => Ok(Some(group)),
+        None => Err(format!(
+            "/proc/{pid}/stat is malformed in two reads of a live process: first {}; re-read {}",
+            describe_stat_bytes(&first),
+            describe_stat_bytes(&reread)
+        )),
+    }
+}
+
+/// The length of `stat` and its first 64 bytes, escaped, for an error.
+fn describe_stat_bytes(stat: &[u8]) -> String {
+    let shown: String = stat
+        .iter()
+        .take(64)
+        .flat_map(|&byte| std::ascii::escape_default(byte))
+        .map(char::from)
+        .collect();
+    format!("{} bytes \"{shown}\"", stat.len())
+}
+
+/// The process group in the bytes of a `/proc/<pid>/stat` file, or `None`
+/// when they are malformed. The command name may hold any bytes, including
+/// spaces, parentheses and bytes that are not UTF-8; after its last ')' come
+/// the state, the parent PID and the process group, all ASCII.
+fn stat_process_group(stat: &[u8]) -> Option<u32> {
+    let close = stat.iter().rposition(|&byte| byte == b')')?;
+    std::str::from_utf8(&stat[close + 1..])
+        .ok()?
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
+}
+
+/// How many times [`check_cgroup_membership`] reads again, [`FORK_WINDOW_PAUSE`]
+/// apart, a process whose cgroup reads as the root cgroup `/`, or as an
+/// ancestor-only path through a nested cgroup namespace.
+///
+/// A child that `fork` is still creating is in the root cgroup for a moment:
+/// `cgroup_fork` points it at `init_css_set`, `copy_process` makes it visible
+/// in `/proc` and in its parent's process group, and only then does
+/// `cgroup_post_fork` move it into its parent's cgroup (Linux v6.19
+/// kernel/fork.c and kernel/cgroup/cgroup.c). A forking guest's child read
+/// in that window is not outside: c-programs/wait-on-child (verify/sabre) was
+/// refused that way in a box validation of hermit 6b31e9ae, and a probe that
+/// reads each child of a forking loop as soon as it appears saw 2 of 108171
+/// children in `/`. A reader in a nested cgroup namespace can see the same
+/// host root as `/../../..` instead. An ancestor-only spelling does not prove
+/// membership or even that this is the fork window: it gets the same bounded
+/// recheck, and a process that stays outside is still refused.
+const FORK_WINDOW_REREADS: u32 = 50;
+const FORK_WINDOW_PAUSE: Duration = Duration::from_millis(2);
+
+fn possible_fork_root_cgroup(path: &str) -> bool {
+    path == "/"
+        || path
+            .strip_prefix('/')
+            .is_some_and(|relative| relative.split('/').all(|part| part == ".."))
+}
+
+/// Check that every process the process-group scan could see for this
+/// invocation is in its cgroup `invocation` or a cgroup below it: the leader
+/// `pid` while it is unreaped (`leader_unreaped`), wherever its process group
+/// went, and the live members of its process group `pid`. Returns why the
+/// invocation must be refused: a process outside, or a failed check.
+///
+/// What this cannot see: a process other than the leader that leaves both
+/// the process group and the invocation cgroup, and one that leaves the
+/// cgroup and exits between two checks. The process-group scan this cgroup
+/// replaced could not charge either of them. One evasion is weaker than that
+/// scan and is not refused here: a command that empties its invocation
+/// cgroup, makes it threaded through `cgroup.type` and moves back only its
+/// thread-group leader through `cgroup.threads` passes this check while its
+/// other threads are charged to the parent cgroup. The scan read the whole
+/// thread group's CPU from `/proc/<pid>/stat`.
+fn check_cgroup_membership(
+    pid: u32,
+    leader_unreaped: bool,
+    invocation: &str,
+    group_members: impl FnOnce(u32) -> Result<Vec<u32>, String>,
+    mut cgroup_of: impl FnMut(u32) -> Result<Option<String>, String>,
+) -> Result<(), String> {
+    let unchecked = |error: String| {
+        format!(
+            "cannot check that process group {pid} stays inside its invocation cgroup {invocation}: {error}"
+        )
+    };
+    let members = group_members(pid).map_err(unchecked)?;
+    let leader = leader_unreaped.then_some(pid);
+    for member in leader
+        .into_iter()
+        .chain(members.into_iter().filter(|member| Some(*member) != leader))
+    {
+        let mut cgroup = cgroup_of(member).map_err(unchecked)?;
+        let mut rereads = 0;
+        while cgroup
+            .as_deref()
+            .is_some_and(|path| possible_fork_root_cgroup(path) && !within_cgroup(path, invocation))
+            && rereads < FORK_WINDOW_REREADS
+        {
+            std::thread::sleep(FORK_WINDOW_PAUSE);
+            cgroup = cgroup_of(member).map_err(unchecked)?;
+            rereads += 1;
+        }
+        match cgroup {
+            Some(cgroup) if !within_cgroup(&cgroup, invocation) => {
+                let role = if Some(member) == leader {
+                    "the leader"
+                } else {
+                    "a member of the leader's process group"
+                };
+                return Err(format!(
+                    "process {member} ({role}) is in cgroup {cgroup}, outside its invocation cgroup {invocation}, so that cgroup's CPU counter does not hold its CPU"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn spawn_process(
     cwd: &Path,
     stdout: &Path,
     stderr: &Path,
+    enrollment: Option<(RawFd, &Path)>,
     observation: &mut InvocationCpuObservation,
 ) -> Result<Child, String> {
     let mut open_capture = |path: &Path, stage| {
@@ -4529,6 +7673,25 @@ fn spawn_process(
     };
     let stdout_file = open_capture(stdout, SpawnStage::StdoutCapture)?;
     let stderr_file = open_capture(stderr, SpawnStage::StderrCapture)?;
+    // A failed cgroup join and a failed exec reach this process as the same
+    // bare error code, so the child writes one byte to this pipe when the join
+    // is what failed.
+    let join_report = match enrollment {
+        Some(_) => match join_failure_pipe() {
+            Ok(pipe) => Some(pipe),
+            Err(error) => {
+                let reason =
+                    format!("cannot open the pipe that reports a failed cgroup join: {error}");
+                observation.launch = LaunchObservation::SpawnFailed {
+                    stage: SpawnStage::Spawn,
+                    reason: reason.clone(),
+                };
+                observation.termination = TerminationPath::SpawnFailed;
+                return Err(reason);
+            }
+        },
+        None => None,
+    };
     let identity = &observation.command;
     let program = &identity.argv[0];
     let mut command = Command::new(program);
@@ -4539,21 +7702,66 @@ fn spawn_process(
         .stdout(stdout_file)
         .stderr(stderr_file);
     command.envs(identity.env_overrides.iter());
+    let enrollment_fd = enrollment.map(|(fd, _)| fd);
+    let join_report_fd = join_report.as_ref().map(|(_, write)| write.as_raw_fd());
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setpgid(0, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
+            }
+            // Join the invocation cgroup before exec, so every CPU cycle of the
+            // program and of anything it starts is charged to that cgroup. The
+            // descriptor is close-on-exec, so the program never sees it.
+            if let Some(fd) = enrollment_fd {
+                let joined = loop {
+                    let written = libc::write(fd, b"0\n".as_ptr().cast(), 2);
+                    if written == 2 {
+                        break Ok(());
+                    }
+                    if written < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        break Err(error);
+                    }
+                    break Err(std::io::Error::from_raw_os_error(libc::EIO));
+                };
+                if let Err(error) = joined {
+                    if let Some(report) = join_report_fd {
+                        libc::write(report, b"j".as_ptr().cast(), 1);
+                    }
+                    return Err(error);
+                }
             }
             Ok(())
         });
     }
-    match command.spawn() {
+    let spawned = command.spawn();
+    // The child wrote its report, if any, before it sent the error that ends
+    // the spawn, so a failed spawn finds the byte already in the pipe.
+    let join_failed = match (&spawned, join_report) {
+        (Err(_), Some((read, _write))) => {
+            let mut byte = [0u8; 1];
+            let read = unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+            read == 1
+        }
+        _ => false,
+    };
+    match spawned {
         Ok(child) => {
             observation.launch = LaunchObservation::Spawned { pid: child.id() };
+            remember_spawned_group(child.id());
             Ok(child)
         }
         Err(error) => {
-            let reason = format!("cannot execute {program}: {error}");
+            let reason = match enrollment {
+                Some((_, cgroup)) if join_failed => format!(
+                    "cannot join invocation cgroup {} before exec, so {program} was not started: {error}",
+                    cgroup.display()
+                ),
+                _ => format!("cannot execute {program}: {error}"),
+            };
             observation.launch = LaunchObservation::SpawnFailed {
                 stage: SpawnStage::Spawn,
                 reason: reason.clone(),
@@ -4564,6 +7772,20 @@ fn spawn_process(
     }
 }
 
+/// A close-on-exec, nonblocking pipe, read end first, through which a child
+/// reports that its cgroup join failed before exec.
+fn join_failure_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 returned two new descriptors that nothing else owns.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// Monitor with a reader that reports live CPU in seconds, as agent-utils
+/// `proccpu` does. The seconds are converted to microseconds here, and a
+/// conversion failure is a failed sample like any other.
 fn monitor_process<R>(
     child: Child,
     limits: ProcessLimits,
@@ -4572,12 +7794,78 @@ fn monitor_process<R>(
     register: impl FnOnce(u32) -> Result<R, String>,
     mut sample: impl FnMut(&R) -> Result<f64, String>,
 ) -> Result<ProcessOutput, String> {
+    monitor_live_cpu(
+        child,
+        limits,
+        started,
+        observation,
+        register,
+        |pid, reader| {
+            sample(reader)
+                .map_err(|error| CpuError {
+                    stage: CpuErrorStage::Sampling,
+                    reason: format!("sampling: {error}"),
+                })
+                .and_then(|seconds| {
+                    live_cpu_usage_usec(pid, seconds).map_err(|reason| CpuError {
+                        stage: CpuErrorStage::Conversion,
+                        reason,
+                    })
+                })
+        },
+    )
+}
+
+/// Wait for the invocation's leader while polling its live CPU, and stop its
+/// process group when a budget runs out or when its CPU cannot be measured for
+/// `CELL_CPU_ACCOUNTING_GRACE`. `register` binds the reader once at spawn;
+/// `sample` returns the invocation's CPU in microseconds.
+fn monitor_live_cpu<R>(
+    child: Child,
+    limits: ProcessLimits,
+    started: Instant,
+    observation: &mut InvocationCpuObservation,
+    register: impl FnOnce(u32) -> Result<R, String>,
+    sample: impl FnMut(u32, &R) -> Result<u64, CpuError>,
+) -> Result<ProcessOutput, String> {
+    monitor_live_cpu_in(
+        child,
+        limits,
+        started,
+        observation,
+        None,
+        |_, _| Ok(()),
+        register,
+        sample,
+    )
+}
+
+/// `monitor_live_cpu` for an invocation that runs in `cgroup`, when it has one.
+///
+/// `membership(pid, leader_unreaped)` refuses the invocation when a process
+/// that should be charged to the cgroup is outside it. It runs before every
+/// live CPU sample, before a wall-clock stop, and once the leader has been
+/// waited for. A CPU-budget stop is preceded by the check at its triggering
+/// poll, which runs before that poll's sample so that a refusal never follows
+/// a recorded trigger.
+#[allow(clippy::too_many_arguments)]
+fn monitor_live_cpu_in<R>(
+    child: Child,
+    limits: ProcessLimits,
+    started: Instant,
+    observation: &mut InvocationCpuObservation,
+    cgroup: Option<&InvocationCgroup>,
+    mut membership: impl FnMut(u32, bool) -> Result<(), String>,
+    register: impl FnOnce(u32) -> Result<R, String>,
+    mut sample: impl FnMut(u32, &R) -> Result<u64, CpuError>,
+) -> Result<ProcessOutput, String> {
     let ProcessLimits {
         deadline,
         cpu_budget_usec,
         cpu_poll_interval,
     } = limits;
     let pid = child.id();
+    let leader = LeaderPidFd::open(pid);
     // Authenticate once at spawn and retain this generation's owner through
     // final wait/stop. Disabled accounting never registers or samples a reader.
     let cpu_reader = cpu_budget_usec.map(|_| register(pid));
@@ -4601,6 +7889,37 @@ fn monitor_process<R>(
             started,
             &mut observation.final_wait,
         )? {
+            let leader_unreaped =
+                !matches!(observation.final_wait, FinalWaitObservation::Reaped { .. });
+            if let Err(reason) = membership(pid, leader_unreaped) {
+                observation.termination = TerminationPath::CgroupMembershipStop;
+                if leader_unreaped {
+                    return match stop_process_group(
+                        pid,
+                        &leader,
+                        cgroup,
+                        started,
+                        &mut observation.final_wait,
+                    ) {
+                        Ok(_) => Err(format!(
+                            "{reason}; stopped and reaped its leader rather than charge an incomplete CPU measurement"
+                        )),
+                        Err(error) => Err(format!(
+                            "{reason}; could not confirm leader stop/reap: {error}"
+                        )),
+                    };
+                }
+                // The leader is gone, so no grace can be waited out for it.
+                // Its PID stays reserved while it names a live process group,
+                // so this kill reaches only that group; what remains in the
+                // invocation cgroup is killed when the cgroup is finished.
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+                return Err(format!(
+                    "{reason}; killed its process group after the leader exited rather than charge an incomplete CPU measurement"
+                ));
+            }
             let timeout = cpu_budget_usec
                 .filter(|limit| cpu_usage_usec >= *limit)
                 .map(|_| ProcessTimeout::Cpu);
@@ -4622,22 +7941,33 @@ fn monitor_process<R>(
             });
         }
         let now = Instant::now();
-        let (timeout, observed_cpu_usec) = if now >= deadline {
+        let wall_due = now >= deadline;
+        let poll_due = cpu_budget_usec.is_some() && now >= next_cpu_poll;
+        if wall_due || poll_due {
+            if let Err(reason) = membership(pid, true) {
+                observation.termination = TerminationPath::CgroupMembershipStop;
+                return match stop_process_group(
+                    pid,
+                    &leader,
+                    cgroup,
+                    started,
+                    &mut observation.final_wait,
+                ) {
+                    Ok(_) => Err(format!(
+                        "{reason}; stopped and reaped its leader rather than charge an incomplete CPU measurement"
+                    )),
+                    Err(error) => Err(format!(
+                        "{reason}; could not confirm leader stop/reap: {error}"
+                    )),
+                };
+            }
+        }
+        let (timeout, observed_cpu_usec) = if wall_due {
             (Some(ProcessTimeout::Wall), None)
-        } else if let Some(limit) = cpu_budget_usec.filter(|_| now >= next_cpu_poll) {
+        } else if let Some(limit) = cpu_budget_usec.filter(|_| poll_due) {
             next_cpu_poll = now + cpu_poll_interval;
             let sample_result = match &cpu_reader {
-                Some(Ok(reader)) => sample(reader)
-                    .map_err(|error| CpuError {
-                        stage: CpuErrorStage::Sampling,
-                        reason: format!("sampling: {error}"),
-                    })
-                    .and_then(|seconds| {
-                        live_cpu_usage_usec(pid, seconds).map_err(|reason| CpuError {
-                            stage: CpuErrorStage::Conversion,
-                            reason,
-                        })
-                    }),
+                Some(Ok(reader)) => sample(pid, reader),
                 Some(Err(error)) => Err(CpuError {
                     stage: CpuErrorStage::Registration,
                     reason: format!("registration: {error}"),
@@ -4664,14 +7994,20 @@ fn monitor_process<R>(
                     // from `now`, which was taken before it ran. One host-wide
                     // /proc census can itself outlast the grace, and proccpu
                     // then serves its refusal again for 500 ms
-                    // (https://github.com/rrnewton/hermit/issues/3377). Timed
+                    // (https://github.com/rrnewton/hermit/issues/3822). Timed
                     // from `now`, that census alone would stop the command at
                     // the next poll, with no fresh sample in between.
                     let failed_at = Instant::now();
                     let missing_since = cpu_accounting_missing_since.get_or_insert(failed_at);
                     if failed_at.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
                         observation.termination = TerminationPath::AccountingUnavailableStop;
-                        return match stop_process_group(pid, started, &mut observation.final_wait) {
+                        return match stop_process_group(
+                            pid,
+                            &leader,
+                            cgroup,
+                            started,
+                            &mut observation.final_wait,
+                        ) {
                             Ok(_) => Err(format!(
                                 "cannot measure live CPU for process group {pid}: {reason}; stopped and reaped its leader rather than silently disabling its CPU budget"
                             )),
@@ -4692,7 +8028,7 @@ fn monitor_process<R>(
                 ProcessTimeout::Wall => TerminationPath::WallBudgetStop,
             };
             let (status, final_cpu_usage_usec) =
-                stop_process_group(pid, started, &mut observation.final_wait)?;
+                stop_process_group(pid, &leader, cgroup, started, &mut observation.final_wait)?;
             let cpu_usage_usec = observed_cpu_usec.map_or(final_cpu_usage_usec, |observed| {
                 observed.max(final_cpu_usage_usec)
             });
@@ -4807,7 +8143,7 @@ pub fn cell_artifact_path(
 
 /// The verdict of `attempt`'s retained verification report, or `None` when it
 /// retains none or one that is not a current report. A `diverged` verdict
-/// here is what [`observed_result`] types a verify row
+/// here is what [`observed_result`] types a verify or chaos row
 /// `determinism-failure` from; the parity post-pass reads the same verdict
 /// from every attempt (`parity::records_mismatch`).
 pub(crate) fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
@@ -4831,6 +8167,27 @@ pub(crate) fn verification_matched_canonically(attempt: &AttemptResult) -> bool 
         .is_some_and(|report| report.require_canonical_match().is_ok())
 }
 
+/// Whether `attempt` retains a current verification report in which Hermit
+/// rejected the guest's first verify run (`first_run_rejected`): the guest ran
+/// and failed, so no comparison was made. A typed failure of a run Hermit had
+/// started (`run_failed`) is the same kind of evidence: Hermit named what
+/// stopped the run, so its output is Hermit's report of it, not a host block.
+fn first_run_rejected(attempt: &AttemptResult) -> bool {
+    attempt
+        .verification_report
+        .as_deref()
+        .and_then(|report| current_verification_report(report.as_bytes()).ok())
+        .is_some_and(|report| {
+            matches!(
+                report.no_result_reason,
+                Some(
+                    crate::canonical_verdict::NoResultReason::FirstRunRejected { .. }
+                        | crate::canonical_verdict::NoResultReason::RunFailed { .. }
+                )
+            )
+        })
+}
+
 fn observed_result(
     mode: &str,
     outcome: &str,
@@ -4850,6 +8207,15 @@ fn observed_result(
                 | ObservedResult::ReplayFailure
         )
     ) {
+        return typed;
+    }
+    // A crash whose terminal attempt retains Hermit's typed rejection of the
+    // guest's first verify run is the guest's own failure, and that attempt's
+    // output is the guest's own output: a guest line such as "lsirq: cannot
+    // open /proc/interrupts: Permission denied" is product behaviour, not the
+    // host blocking a tool (https://github.com/rrnewton/hermit/issues/4029).
+    if typed == Some(ObservedResult::CrashError) && attempts.last().is_some_and(first_run_rejected)
+    {
         return typed;
     }
     if let Some(class) = attempts.iter().find_map(|attempt| {
@@ -4884,7 +8250,11 @@ fn observed_result_from_typed_evidence(
     if attempts.iter().any(|attempt| attempt.timed_out) {
         return Some(ObservedResult::Timeout);
     }
-    if mode == "verify"
+    // A chaos attempt is a verify run under a perturbed schedule, so a
+    // diverged chaos attempt is the same product failure as a diverged verify
+    // attempt. Without the chaos arm it fell through to crash-error, and the
+    // stress series refused the row because a crash cannot carry a divergence.
+    if (mode == "verify" || mode == "chaos")
         && attempts
             .iter()
             .any(|attempt| verification_verdict(attempt) == Some(Verdict::Diverged))
@@ -5165,7 +8535,19 @@ fn run_cell_inner(
     let timeouts = cell_timeouts(context, cell)?;
     let preparation_deadline =
         execution_deadline_after_preparation(started, timeouts.wall_seconds)?;
-    let binary_before = file_digest(&context.hermit_bin);
+    // Hashed once per process while the file is unchanged (bundle_record.rs);
+    // a write or replacement is hashed afresh, here and after the cell.
+    let binary_before = binary_digest(&context.hermit_bin);
+    if let Some(recorded) = crate::bundle_record::recorded_hermit_sha256()? {
+        if binary_before.as_deref() != Some(recorded.as_str()) {
+            return Err(format!(
+                "Hermit binary {} has sha256 {}, but the bundle records {recorded}; \
+                 refusing to run a binary that is not the bundle's",
+                context.hermit_bin.display(),
+                binary_before.as_deref().unwrap_or("(unreadable)")
+            ));
+        }
+    }
     let (guest, preparation_cpu_usage_usec) = prepare_test_until(
         context,
         cell,
@@ -5470,7 +8852,7 @@ fn run_cell_inner(
         .map(|attempt| attempt.shell_command.clone())
         .unwrap_or_default();
     let test_sha = test_digest(&context.root, &cell.test)?;
-    let binary_sha = file_digest(&context.hermit_bin);
+    let binary_sha = binary_digest(&context.hermit_bin);
     if binary_before.is_some() && binary_before != binary_sha {
         outcome = "ERROR".into();
         error_kind = Some("infrastructure".into());
@@ -5483,15 +8865,21 @@ fn run_cell_inner(
         .try_fold(preparation_cpu_usage_usec, |total, attempt| {
             checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
         });
+    let declared_stdout = attempts
+        .iter()
+        .any(attempt_has_infrastructure_report)
+        .then(|| cell_declared_stdout(cell));
     Ok(CellResult {
         cpu_observations: None,
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
+        declared_stdout,
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
+        exact_branch_counter: context.exact_branch_counter.clone(),
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
@@ -5527,6 +8915,7 @@ fn run_cell_inner(
         cwd: literal_cwd,
         shell_command: literal_shell_command,
         relaxations: cell_relaxations(cell),
+        strictness: cell.strictness(),
         execution_path,
         diversity: (cell.id.mode == "chaos").then(|| {
             diversity_evidence(
@@ -5542,7 +8931,6 @@ fn run_cell_inner(
             )
         }),
         attempts: std::mem::take(attempts),
-        backend_parity: None,
         first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
@@ -5570,17 +8958,19 @@ pub fn infrastructure_error_result(
         cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
+        declared_stdout: None,
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
+        exact_branch_counter: context.exact_branch_counter.clone(),
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
-        binary_sha256: file_digest(&context.hermit_bin),
+        binary_sha256: binary_digest(&context.hermit_bin),
         test_sha256: test_digest(&context.root, &cell.test).unwrap_or_default(),
         test: cell.id.test.clone(),
         category: cell.category.clone(),
@@ -5608,10 +8998,10 @@ pub fn infrastructure_error_result(
         cwd: context.root.to_string_lossy().into_owned(),
         shell_command: String::new(),
         relaxations: cell_relaxations(cell),
+        strictness: cell.strictness(),
         execution_path: None,
         diversity: None,
         attempts: Vec::new(),
-        backend_parity: None,
         // No attempt ran, so there is no divergence position to report. `None`
         // here means "never measured", which is the same value a clean run
         // produces -- see the note in the observation fold about those two
@@ -5645,11 +9035,13 @@ pub fn host_inapplicable_result(
         cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
         expected_guest_exit: cell_expected_guest_exit(cell),
+        declared_stdout: None,
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
+        exact_branch_counter: context.exact_branch_counter.clone(),
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
@@ -5683,10 +9075,10 @@ pub fn host_inapplicable_result(
         cwd: context.root.to_string_lossy().into_owned(),
         shell_command: String::new(),
         relaxations: cell_relaxations(cell),
+        strictness: cell.strictness(),
         execution_path: None,
         diversity: None,
         attempts: Vec::new(),
-        backend_parity: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
@@ -5761,15 +9153,94 @@ pub(crate) fn execution_path_ineligible(execution_path: Option<&JsonValue>) -> b
     execution_path.is_some_and(|evidence| evidence["eligible"] != true)
 }
 
+/// Whether a Hermit command line selects the SaBRe backend, the executions
+/// that write SaBRe execution-path evidence.
+///
+/// Only Hermit's own arguments select a backend. The executor writes the
+/// guest command after the first `--` (`verified_invocation_argv`, the
+/// `custom` mode), so a `--backend sabre` pair there is an argument of the
+/// guest, not a backend selection, and a ptrace run whose guest takes it
+/// writes no SaBRe evidence.
+fn argv_selects_sabre(argv: &[String]) -> bool {
+    let hermit_args = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .map_or(argv, |separator| &argv[..separator]);
+    hermit_args
+        .windows(2)
+        .any(|window| window[0] == "--backend" && window[1] == "sabre")
+}
+
+/// Why `result`'s recorded execution path is not the eligible one its own
+/// retained attempts decide, if it is not.
+///
+/// The runner summarizes a row's SaBRe execution-path evidence from the
+/// evidence files its attempts wrote (`summarize_sabre_path_evidence`) and
+/// fails a `PASS` whose summary is ineligible. A retained row carries the
+/// summary as a label beside each attempt's retained evidence text and the
+/// digest of the bytes the runner read, so a reader admitting such a row
+/// re-decides the summary instead of trusting the label: every attempt
+/// selects SaBRe exactly when the row's backend is `sabre`, every attempt's
+/// retained evidence text is the bytes its `sabre_path_evidence_sha256`
+/// names (both absent for an attempt that wrote none), and the summary of
+/// those retained attempts is valid, equals the row's `execution_path`, and
+/// is eligible (`execution_path_ineligible` is false). A row of another
+/// backend therefore has no evidence and no `execution_path`.
+pub fn retained_execution_path_error(result: &CellResult) -> Option<String> {
+    if let Some(error) = retained_path_evidence_error(result) {
+        return Some(error);
+    }
+    execution_path_ineligible(result.execution_path.as_ref()).then(|| {
+        "the row's SaBRe execution path is incomplete or used fallback/native sites".into()
+    })
+}
+
+/// Why `result`'s retained SaBRe path evidence is not the evidence the
+/// executor summarized into its recorded `execution_path`, if it is not:
+/// [`retained_execution_path_error`] without its eligibility check.
+///
+/// The executor summarizes every row's evidence
+/// (`summarize_sabre_path_evidence`), whatever its outcome, makes a row whose
+/// evidence does not summarize an `invalid-backend-evidence` `ERROR`, and
+/// records the summary as the row's execution path; it judges the path's
+/// eligibility only on a `PASS`. So a non-`PASS` row this finds an error in
+/// is not one the executor wrote, while one with an ineligible path may be.
+fn retained_path_evidence_error(result: &CellResult) -> Option<String> {
+    let sabre = result.backend.as_deref() == Some("sabre");
+    for attempt in &result.attempts {
+        let index = attempt.index.as_str();
+        if argv_selects_sabre(&attempt.argv) != sabre {
+            return Some(format!(
+                "inner attempt {index}'s command line does not select the row's backend {:?}",
+                result.backend
+            ));
+        }
+        if attempt.sabre_path_evidence_sha256
+            != attempt
+                .sabre_path_evidence
+                .as_deref()
+                .map(|text| hex_digest(text.as_bytes()))
+        {
+            return Some(format!(
+                "inner attempt {index}'s retained SaBRe path evidence is not the bytes its sabre_path_evidence_sha256 names"
+            ));
+        }
+    }
+    let summary = match summarize_sabre_path_evidence(&result.attempts) {
+        Ok(summary) => summary,
+        Err(error) => return Some(error),
+    };
+    (summary != result.execution_path).then(|| {
+        "the row's execution_path is not the summary of its retained SaBRe path evidence".into()
+    })
+}
+
 pub(crate) fn summarize_sabre_path_evidence(
     attempts: &[AttemptResult],
 ) -> Result<Option<JsonValue>, String> {
-    let is_sabre = attempts.iter().any(|attempt| {
-        attempt
-            .argv
-            .windows(2)
-            .any(|window| window[0] == "--backend" && window[1] == "sabre")
-    });
+    let is_sabre = attempts
+        .iter()
+        .any(|attempt| argv_selects_sabre(&attempt.argv));
     if !is_sabre {
         return Ok(None);
     }
@@ -5798,14 +9269,13 @@ pub(crate) fn summarize_sabre_path_evidence(
         // candidate. Only executions which actually selected SaBRe can emit
         // SaBRe path evidence; counting the ptrace operand would turn every
         // otherwise-valid SaBRe parity measurement into an incomplete path.
-        .filter(|attempt| {
-            attempt
-                .argv
-                .windows(2)
-                .any(|window| window[0] == "--backend" && window[1] == "sabre")
-        })
+        .filter(|attempt| argv_selects_sabre(&attempt.argv))
         .map(|attempt| {
-            if attempt.argv.iter().any(|arg| arg == "--verify") {
+            if attempt
+                .argv
+                .iter()
+                .any(|arg| arg == "--verify" || arg == "--verify-run")
+            {
                 2
             } else {
                 1
@@ -5999,14 +9469,7 @@ pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
 }
 
 fn prepare_dirs(root: &Path, dir: &Path) -> Result<(), String> {
-    for child in [
-        "home",
-        "xdg-config",
-        "tmp",
-        "fixtures",
-        "recording",
-        "captures",
-    ] {
+    for child in ["home", "xdg-config", "tmp", "fixtures", "captures"] {
         fs::create_dir_all(dir.join(child)).map_err(|e| e.to_string())?;
     }
     let xdg = root.join("tests/e2e/xdg-config");
@@ -6147,18 +9610,72 @@ const RUNNER_GUEST_ENV: [&str; 7] = [
 /// takes a value.
 const ALLOWED_HERMIT_ARGS: &[&str] = &["--no-virtualize-cpuid", "--max-timeslice="];
 
+/// Whether `arg` is one of [`ALLOWED_HERMIT_ARGS`]: one of its exact flags,
+/// or one of its valued flags with a nonempty value.
+fn allowed_hermit_arg(arg: &str) -> bool {
+    ALLOWED_HERMIT_ARGS
+        .iter()
+        .any(|flag| match flag.strip_suffix('=') {
+            Some(_) => arg
+                .strip_prefix(flag)
+                .is_some_and(|value| !value.is_empty()),
+            None => arg == *flag,
+        })
+}
+
 /// Validate a mode's `hermit_args`, `env` and `comparator`.
 fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String> {
     let extends = !recipe.hermit_args.is_empty()
         || recipe.hermit_args_reason.is_some()
-        || !recipe.env.is_empty()
         || recipe.comparator.is_some()
         || recipe.comparator_reason.is_some()
         || !recipe.diagnostic.is_empty()
-        || recipe.no_retry_reason.is_some();
+        || recipe.no_retry_reason.is_some()
+        || recipe.max_level.is_some()
+        || recipe.max_level_reason.is_some();
     if extends && mode != "verify" {
         return Err(format!(
-            "{id}: {mode} declares hermit_args, env, comparator, diagnostic or no_retry_reason, which only a verify mode accepts"
+            "{id}: {mode} declares hermit_args, comparator, diagnostic, no_retry_reason or max_level, which only a verify mode accepts"
+        ));
+    }
+    match (recipe.max_level, recipe.max_level_reason.as_deref()) {
+        (None, None) => {}
+        (Some(StrictnessLevel::Relaxed), Some(reason)) if !reason.trim().is_empty() => {
+            if !recipe
+                .backends_enabled
+                .iter()
+                .any(|backend| pmu_clock_backend(backend))
+            {
+                return Err(format!(
+                    "{id}: max_level caps a ptrace or e9patch cell, and this verify mode enables neither"
+                ));
+            }
+        }
+        (Some(StrictnessLevel::Strict), _) => {
+            return Err(format!(
+                "{id}: max_level: strict is every cell's default; only `relaxed` caps a cell"
+            ));
+        }
+        (Some(StrictnessLevel::Relaxed), _) => {
+            return Err(format!(
+                "{id}: max_level: relaxed requires a substantive max_level_reason"
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(format!("{id}: max_level_reason without max_level"));
+        }
+    }
+    // A replay cell records and replays the program its verify cell checks,
+    // so it may restate that program's environment (see [`cell_mode_env`]);
+    // no other mode passes a declared environment to its guest.
+    if recipe.env.is_some() && !matches!(mode, "verify" | "replay") {
+        return Err(format!(
+            "{id}: {mode} declares env, which only a verify or replay mode accepts"
+        ));
+    }
+    if !recipe.env_by_backend.is_empty() && mode != "verify" {
+        return Err(format!(
+            "{id}: {mode} declares env_by_backend, which only a verify mode accepts"
         ));
     }
     if recipe
@@ -6189,26 +9706,28 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
         }
     }
     for arg in recipe.hermit_args.values().flatten() {
-        let allowed = ALLOWED_HERMIT_ARGS
-            .iter()
-            .any(|flag| match flag.strip_suffix('=') {
-                Some(_) => arg
-                    .strip_prefix(flag)
-                    .is_some_and(|value| !value.is_empty()),
-                None => arg == flag,
-            });
-        if !allowed {
+        if !allowed_hermit_arg(arg) {
             return Err(format!(
                 "{id}: hermit_args entry `{arg}` is not one of {ALLOWED_HERMIT_ARGS:?}"
             ));
         }
     }
-    match (
-        recipe.hermit_args.is_empty(),
-        recipe.hermit_args_reason.as_deref().map(str::trim),
-    ) {
+    match (recipe.hermit_args.is_empty(), &recipe.hermit_args_reason) {
         (true, None) => {}
-        (false, Some(reason)) if !reason.is_empty() => {}
+        (false, Some(HermitArgsReason::Shared(reason))) if !reason.trim().is_empty() => {}
+        // One reason per backend with flags, and none for a backend without.
+        (false, Some(HermitArgsReason::PerBackend(reasons))) => {
+            if !reasons.keys().eq(recipe.hermit_args.keys()) {
+                return Err(format!(
+                    "{id}: a per-backend hermit_args_reason must name exactly the backends of hermit_args"
+                ));
+            }
+            if reasons.values().any(|reason| reason.trim().is_empty()) {
+                return Err(format!(
+                    "{id}: hermit_args relax determinism and require a substantive hermit_args_reason"
+                ));
+            }
+        }
         (false, _) => {
             return Err(format!(
                 "{id}: hermit_args relax determinism and require a substantive hermit_args_reason"
@@ -6218,7 +9737,32 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
             return Err(format!("{id}: hermit_args_reason without hermit_args"));
         }
     }
-    for (name, value) in &recipe.env {
+    for (backend, env) in &recipe.env_by_backend {
+        if !recipe.backends_enabled.contains(backend) {
+            return Err(format!(
+                "{id}: env_by_backend names backend `{backend}`, which is not in backends_enabled"
+            ));
+        }
+        if env.is_empty() {
+            return Err(format!("{id}: env_by_backend for `{backend}` is empty"));
+        }
+        if let Some(name) = env.keys().find(|name| {
+            recipe
+                .env
+                .as_ref()
+                .is_some_and(|common| common.contains_key(*name))
+        }) {
+            return Err(format!(
+                "{id}: env_by_backend for `{backend}` repeats common env name `{name}`"
+            ));
+        }
+    }
+    for (name, value) in recipe
+        .env
+        .iter()
+        .flatten()
+        .chain(recipe.env_by_backend.values().flatten())
+    {
         let well_formed = name
             .chars()
             .next()
@@ -6447,16 +9991,6 @@ fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// The SHA-256 of the file at `path`, or `None` when it cannot be read.
-/// It streams the file rather than reading it whole: every cell hashes the
-/// Hermit binary three times, and a debug Hermit is about 450 MB, so
-/// `fs::read` held that much per concurrently running cell.
-fn file_digest(path: &Path) -> Option<String> {
-    let mut digest = Sha256::new();
-    std::io::copy(&mut fs::File::open(path).ok()?, &mut digest).ok()?;
-    Some(format!("{:x}", digest.finalize()))
-}
-
 fn xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -6475,6 +10009,39 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The binary's `exact_branch_counter` verdict, or `None` (with a note on
+/// stderr) when it cannot be read. `None` withholds no cell: a binary that
+/// then refuses `--strict` fails its cells loudly instead. An import
+/// confirms no producer's inexact-counter claim without a verdict.
+fn probe_exact_branch_counter(program: &Path) -> Option<CapabilityVerdict> {
+    let read = || -> Result<CapabilityVerdict, String> {
+        let output = Command::new(program)
+            .args(["host-capabilities", "--json"])
+            .output()
+            .map_err(|error| format!("cannot run it: {error}"))?;
+        if !output.status.success() {
+            return Err(format!("it exited {}", output.status));
+        }
+        parse_exact_branch_counter(&output.stdout)
+    };
+    read()
+        .map_err(|error| {
+            eprintln!(
+                "test-harness: no exact_branch_counter verdict from `{} host-capabilities --json` \
+                 ({error}); this machine is not taken to lack an exact branch counter",
+                program.display()
+            )
+        })
+        .ok()
+}
+
+fn parse_exact_branch_counter(bytes: &[u8]) -> Result<CapabilityVerdict, String> {
+    let report = serde_json::from_slice::<HostCapabilitiesReport>(bytes)
+        .map_err(|error| format!("unreadable report: {error}"))?;
+    report.validate()?;
+    Ok(report.exact_branch_counter)
 }
 
 /// Ask the hermit binary which commit it was built from.
@@ -6578,6 +10145,245 @@ fn execute_observed_until(
 
 #[cfg(test)]
 mod tests {
+    /// The session is the field after the process group, whatever bytes the
+    /// command name holds.
+    #[test]
+    fn stat_session_reads_past_any_command_name() {
+        assert_eq!(stat_session(b"42 (a) b) S 1 40 41 0"), Some(41));
+        assert_eq!(stat_process_group(b"42 (a) b) S 1 40 41 0"), Some(40));
+        assert_eq!(stat_session(b"42 (x"), None);
+    }
+
+    /// A PID is suspect when the allocator passed it since the census was
+    /// taken, including across a wrap, and every PID is once a lap may have
+    /// been completed.
+    #[test]
+    fn the_census_drops_only_pids_the_allocator_may_have_reused() {
+        let at = |last_pid, forks| PidAllocator {
+            last_pid,
+            tasks: 1000,
+            forks,
+        };
+        let pid_max = 100_000;
+        assert!(!at(500, 10).may_have_reused(at(500, 10), pid_max, 400));
+        assert!(at(500, 10).may_have_reused(at(510, 20), pid_max, 505));
+        assert!(!at(500, 10).may_have_reused(at(510, 20), pid_max, 400));
+        assert!(!at(500, 10).may_have_reused(at(510, 20), pid_max, 511));
+        // Wrapped from 99_990 to 310: both ends of the arc are suspect.
+        assert!(at(99_990, 10).may_have_reused(at(310, 40), pid_max, 99_995));
+        assert!(at(99_990, 10).may_have_reused(at(310, 40), pid_max, 305));
+        assert!(!at(99_990, 10).may_have_reused(at(310, 40), pid_max, 5_000));
+        // Enough new tasks to go round the whole space: everything is suspect.
+        assert!(at(500, 10).may_have_reused(at(400, 200_000), pid_max, 450));
+        // A counter that went backwards proves nothing.
+        assert!(at(500, 10).may_have_reused(at(510, 5), pid_max, 400));
+        // Host-wide tasks were created but this namespace's cursor did not
+        // move: no PID here was handed out, on either side of the cursor.
+        assert!(!at(500, 10).may_have_reused(at(500, 40), pid_max, 400));
+        assert!(!at(500, 10).may_have_reused(at(500, 40), pid_max, 500));
+        assert!(!at(500, 10).may_have_reused(at(500, 40), pid_max, 600));
+        // A lap is still a lap, cursor moved or not.
+        assert!(at(500, 10).may_have_reused(at(500, 200_000), pid_max, 400));
+    }
+
+    /// A group recorded after the previous scan began keeps its session at
+    /// the next scan, though its PID lies on the allocator's arc since then,
+    /// until the allocator passes its PID again.
+    #[test]
+    fn a_group_recorded_between_scans_keeps_its_session() {
+        let at = |last_pid, forks| PidAllocator {
+            last_pid,
+            tasks: 1000,
+            forks,
+        };
+        let pid_max = Some(100_000);
+        let mut census = SessionCensus::default();
+        census.begin(Some(at(500, 10)), pid_max);
+        census.remember_group(505, Some(9), Some(at(505, 15)));
+        census.remember_group(506, None, Some(at(506, 16)));
+        census.begin(Some(at(520, 30)), pid_max);
+        assert_eq!(
+            census.group_sessions.get(&505).map(|entry| entry.0),
+            Some(9)
+        );
+        assert!(
+            !census.group_sessions.contains_key(&506),
+            "no session, no entry"
+        );
+        // The allocator wraps and passes 505 again: the entry is dropped.
+        census.begin(Some(at(510, 99_990)), pid_max);
+        assert!(census.group_sessions.is_empty());
+    }
+
+    /// A PID is skipped only when its cached session can no longer be the
+    /// group's: not the group's session, and not the PID itself (setsid).
+    #[test]
+    fn the_census_skips_only_pids_that_cannot_join_the_group() {
+        let mut census = SessionCensus::default();
+        census.sessions.insert(10, 7);
+        census.sessions.insert(11, 9);
+        assert!(census.skip(10, 9));
+        assert!(!census.skip(11, 9));
+        assert!(!census.skip(12, 9), "an unknown PID is read");
+        assert!(!census.skip(9, 9), "the session leader is read");
+    }
+
+    /// The census-backed scan still finds a real process group's members,
+    /// on a first scan and on a later one that skips what it cached.
+    #[test]
+    fn the_process_group_scan_finds_members_with_and_without_the_census() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id();
+        let first = process_group_members(pgid).unwrap();
+        let second = process_group_members(pgid).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(first, vec![pgid]);
+        assert_eq!(second, vec![pgid]);
+    }
+
+    /// A census saved by one process and loaded by another finds the same
+    /// members as a scan with none, and skips exactly what it may: the PIDs it
+    /// knows to be in another session. A census can save reads only where such
+    /// PIDs exist. In a PID namespace where every process shares the test's
+    /// session (the pinned root has about 26 PIDs) there is nothing to skip, so
+    /// the test makes that shape itself: three processes in a session of their
+    /// own, which no scan without a census may skip and the carried census must.
+    /// A census for another boot or PID namespace is not loaded at all.
+    #[test]
+    fn a_census_carried_to_another_process_finds_the_same_members() {
+        use std::os::unix::process::CommandExt;
+        assert!(
+            PidAllocator::read().is_some() && read_pid_max().is_some(),
+            "the census needs /proc/loadavg, /proc/stat and /proc/sys/kernel/pid_max"
+        );
+        // Three processes in a new session; each stays until the session is killed.
+        let mut other = std::process::Command::new("sh");
+        other.args(["-c", "sleep 60 & sleep 60 & exec sleep 60"]);
+        // SAFETY: setsid is async-signal-safe; the child is not a group leader.
+        unsafe {
+            other.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut other = other.spawn().unwrap();
+        let other_session = other.id();
+        let in_other_session = || -> BTreeSet<u32> {
+            fs::read_dir("/proc")
+                .unwrap()
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+                .filter(|pid| {
+                    matches!(read_process_stat(*pid), Ok(StatRead::Bytes(stat))
+                        if stat_session(&stat) == Some(other_session))
+                })
+                .collect()
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut skippable = in_other_session();
+        while skippable.len() < 3 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            skippable = in_other_session();
+        }
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id();
+        let group_session = u32::try_from(unsafe { libc::getsid(0) }).unwrap();
+        let mut writer = SessionCensus::default();
+        let cold = scan_process_group(&mut writer, pgid).unwrap();
+        let scope = census_scope().unwrap();
+        let text = writer.render(&scope).unwrap();
+        let mut reader = SessionCensus::parse(&text, &scope).unwrap();
+        assert_eq!(reader.sessions, writer.sessions);
+        let warm = scan_process_group(&mut reader, pgid).unwrap();
+        // With no census at all the scan reads every PID.
+        let none = scan_process_group(&mut SessionCensus::default(), pgid).unwrap();
+        let still_there = in_other_session();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        unsafe { libc::kill(-(other_session as i32), libc::SIGKILL) };
+        other.wait().unwrap();
+        assert_eq!(
+            skippable.len(),
+            3,
+            "the other session never had its 3 processes"
+        );
+        assert_eq!(
+            still_there, skippable,
+            "a process of the other session left early"
+        );
+        assert_eq!(cold.members, vec![pgid]);
+        assert_eq!(warm.members, cold.members);
+        assert_eq!(none.members, cold.members);
+        // Without a census nothing may be skipped, so the other session's PIDs
+        // are read; the carried census skips every one of them.
+        assert_eq!(cold.skipped, Vec::<u32>::new());
+        assert_eq!(none.skipped, Vec::<u32>::new());
+        let skipped: BTreeSet<u32> = warm.skipped.iter().copied().collect();
+        assert!(
+            skippable.is_subset(&skipped),
+            "the census skipped {skipped:?}, not all of {skippable:?}"
+        );
+        // And it skipped nothing it may not: each skipped PID was cached in a
+        // session other than the group's, and is not the group's session leader.
+        // (A count comparison of the two scans is no property of the census:
+        // other tests create and reap processes in this session between them.)
+        for pid in &skipped {
+            assert_ne!(
+                *pid, group_session,
+                "the group's session leader was skipped"
+            );
+            let cached = writer.sessions.get(pid);
+            assert!(
+                cached.is_some_and(|session| *session != group_session),
+                "PID {pid} was skipped with cached session {cached:?}, group session {group_session}"
+            );
+        }
+        assert!(SessionCensus::parse(&text, "another-boot pid:[1]").is_none());
+        assert!(SessionCensus::parse(&text.replace("/v1", "/v0"), &scope).is_none());
+        assert!(SessionCensus::parse(&format!("{text}12 x\n"), &scope).is_none());
+        assert!(
+            SessionCensus::default().render(&scope).is_none(),
+            "no position, no file"
+        );
+    }
+
+    /// A loaded census keeps only what the allocator cannot have reused since
+    /// the writer's scan began.
+    #[test]
+    fn a_loaded_census_drops_pids_the_allocator_may_have_reused() {
+        let at = PidAllocator {
+            last_pid: 1000,
+            tasks: 10,
+            forks: 5000,
+        };
+        let text = format!("{SESSION_CENSUS_SCHEMA}\nscope s\nat 1000 10 5000\n900 1\n1500 2\n");
+        let mut census = SessionCensus::parse(&text, "s").unwrap();
+        assert_eq!(census.at, Some(at));
+        let now = PidAllocator {
+            last_pid: 2000,
+            tasks: 10,
+            forks: 6000,
+        };
+        census.begin(Some(now), Some(4_194_304));
+        assert_eq!(
+            census.sessions.get(&900),
+            Some(&1),
+            "900 lies behind the allocator"
+        );
+        assert_eq!(census.sessions.get(&1500), None, "1500 may be a new task");
+    }
+
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
 
@@ -6659,6 +10465,33 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// The git asked is the one named, and a named git that cannot run
+    /// refuses the snapshot as an absent one does.
+    #[test]
+    fn a_snapshot_is_checked_with_the_named_git() {
+        let base = std::env::temp_dir().join(format!("runner-named-git-{}", std::process::id()));
+        let checkout = base.join("checkout");
+        let snapshot = checkout.join("snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        let says = |name: &str, status: i32| {
+            let path = base.join(name);
+            fs::write(&path, format!("#!/bin/sh\nexit {status}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let untracked = says("untracked-git", 1);
+        let tracked = says("tracked-git", 0);
+        let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+        let accepted = validate_source_snapshot_with(&snapshot, sha, &untracked);
+        let refused = validate_source_snapshot_with(&snapshot, sha, &tracked);
+        let absent = validate_source_snapshot_with(&snapshot, sha, &base.join("no-git"));
+        fs::remove_dir_all(&base).unwrap();
+        assert_eq!(accepted, Ok(()));
+        assert!(refused.unwrap_err().contains("Git tracks files under"));
+        assert!(absent.unwrap_err().contains("git cannot run"));
     }
 
     #[test]
@@ -6996,6 +10829,7 @@ mod tests {
             ("kvm".into(), "not qualified".into()),
             ("sabre".into(), "not qualified".into()),
             ("liteinst".into(), "not qualified".into()),
+            ("in-guest-trap".into(), "not qualified".into()),
         ]);
         let mode = ModeRecipe {
             ci: CiSelectionSpec::Uniform(ci),
@@ -7030,7 +10864,178 @@ mod tests {
             modes: BTreeMap::from([("verify".into(), mode)]),
             preprocessors: Vec::new(),
             labels: Vec::new(),
+            proc: None,
         }
+    }
+
+    /// A corpus's additional-backend flags reach the expanded verify mode's
+    /// per-backend `hermit_args`, so the manifest validator holds them to the
+    /// same allowlist and once-per-flag rule as any hand-written cell's, and
+    /// the relaxation each cell records names its own flags.
+    #[test]
+    fn corpus_additional_backend_flags_meet_the_manifest_validator() {
+        let corpus = r#"schema: 3
+bucket: fixture
+corpus:
+  description: Fixture program
+  lane: portable
+  requires: [linux]
+  backend: ptrace
+  verify:
+    hermit_args: [--no-virtualize-cpuid]
+    hermit_args_reason: fixture configuration
+    timeout_seconds: 60
+    cpu_timeout_seconds: 59
+    slow_reason: fixture budget
+  additional:
+    - backend: liteinst
+      hermit_args: [--max-timeslice=disabled]
+      hermit_args_reason: fixture in-guest reason
+      rows: [echo]
+      disabled_reason: not measured on liteinst
+  rows:
+    - {label: "echo", argv: ["/bin/echo", "x"]}
+    - {label: "true", argv: ["/bin/true"]}
+"#;
+        let load = |text: &str| -> Result<ManifestDocument, String> {
+            let value = crate::manifest_corpus::expand_corpus(
+                serde_yaml::from_str(text).map_err(|error| error.to_string())?,
+            )?;
+            let document: ManifestDocument =
+                serde_yaml::from_value(value).map_err(|error| error.to_string())?;
+            validate_document(&document, "fixture", Path::new("/"), 15)?;
+            Ok(document)
+        };
+        let document = load(corpus).unwrap();
+        let verify = &document.test[0].modes["verify"];
+        assert_eq!(verify.backends_enabled, ["ptrace", "liteinst"]);
+        assert_eq!(
+            cell_hermit_args(verify, "liteinst"),
+            ["--max-timeslice=disabled"]
+        );
+        assert_eq!(
+            cell_hermit_args(verify, "ptrace"),
+            ["--no-virtualize-cpuid"]
+        );
+        // Each cell's relaxation names its own flags with its own reason.
+        let relaxations = |backend: &str| {
+            cell_relaxations(&SelectedCell {
+                category: "fixture".into(),
+                test: document.test[0].clone(),
+                id: CellId {
+                    test: "fixture/echo".into(),
+                    mode: "verify".into(),
+                    backend: Some(backend.into()),
+                },
+                enabled: true,
+                timeout_seconds: 15,
+                cpu_timeout_seconds: 15,
+                host_level: HostLevel::default(),
+            })
+        };
+        assert_eq!(
+            relaxations("ptrace"),
+            ["--no-virtualize-cpuid: fixture configuration"]
+        );
+        assert_eq!(
+            relaxations("liteinst"),
+            ["--max-timeslice=disabled: fixture in-guest reason"]
+        );
+        // A row without the additional cell keeps the lane's one reason.
+        assert_eq!(
+            document.test[1].modes["verify"].hermit_args_reason,
+            Some(HermitArgsReason::from("fixture configuration"))
+        );
+        for refused_flag in ["--no-strict", "--chaos", "--max-timeslice=", "--epoch=1"] {
+            let error = load(&corpus.replace(
+                "hermit_args: [--max-timeslice=disabled]",
+                &format!("hermit_args: [\"{refused_flag}\"]"),
+            ))
+            .unwrap_err();
+            assert!(error.contains("is not one of"), "{refused_flag}: {error}");
+        }
+        let error = load(&corpus.replace(
+            "hermit_args: [--max-timeslice=disabled]",
+            "hermit_args: [--max-timeslice=1, --max-timeslice=disabled]",
+        ))
+        .unwrap_err();
+        assert!(error.contains("repeats `--max-timeslice`"), "{error}");
+        let error =
+            load(&corpus.replace("      hermit_args_reason: fixture in-guest reason\n", ""))
+                .unwrap_err();
+        assert!(error.contains("require a hermit_args_reason"), "{error}");
+    }
+
+    /// A per-backend `hermit_args_reason` names exactly the backends with
+    /// flags, each with a substantive reason, and each cell records its own.
+    #[test]
+    fn a_per_backend_hermit_args_reason_covers_exactly_the_flagged_backends() {
+        let accepted = ModeRecipe {
+            backends_enabled: vec!["ptrace".into(), "liteinst".into(), "sabre".into()],
+            hermit_args: BTreeMap::from([
+                ("ptrace".into(), vec!["--no-virtualize-cpuid".into()]),
+                ("liteinst".into(), vec!["--max-timeslice=disabled".into()]),
+            ]),
+            hermit_args_reason: Some(HermitArgsReason::PerBackend(BTreeMap::from([
+                (
+                    "ptrace".into(),
+                    "the corpus records this configuration".into(),
+                ),
+                (
+                    "liteinst".into(),
+                    "in-guest LiteInst refuses a preemption timer".into(),
+                ),
+            ]))),
+            ..ModeRecipe::default()
+        };
+        validate_mode_extensions("fixture/test", "verify", &accepted).unwrap();
+        let reason = accepted.hermit_args_reason.as_ref().unwrap();
+        assert_eq!(
+            reason.for_backend("liteinst"),
+            Some("in-guest LiteInst refuses a preemption timer")
+        );
+        assert_eq!(reason.for_backend("sabre"), None);
+        let refused = |reasons: &[(&str, &str)], needle: &str| {
+            let mut recipe = accepted.clone();
+            recipe.hermit_args_reason = Some(HermitArgsReason::PerBackend(
+                reasons
+                    .iter()
+                    .map(|(backend, reason)| (backend.to_string(), reason.to_string()))
+                    .collect(),
+            ));
+            let error = validate_mode_extensions("fixture/test", "verify", &recipe).unwrap_err();
+            assert!(error.contains(needle), "{reasons:?}: {error}");
+        };
+        let exactly = "must name exactly the backends of hermit_args";
+        refused(&[("ptrace", "configuration")], exactly);
+        refused(
+            &[
+                ("ptrace", "configuration"),
+                ("liteinst", "timer"),
+                ("sabre", "no flags"),
+            ],
+            exactly,
+        );
+        refused(&[], exactly);
+        refused(
+            &[("ptrace", "configuration"), ("liteinst", " ")],
+            "require a substantive hermit_args_reason",
+        );
+        // A per-backend reason without flags is a reason without flags.
+        let mut bare = accepted.clone();
+        bare.hermit_args.clear();
+        assert!(
+            validate_mode_extensions("fixture/test", "verify", &bare)
+                .unwrap_err()
+                .contains("hermit_args_reason without hermit_args")
+        );
+        // Both spellings read from YAML.
+        let shared: HermitArgsReason = serde_yaml::from_str("one reason").unwrap();
+        assert_eq!(shared, HermitArgsReason::from("one reason"));
+        let per_backend: HermitArgsReason =
+            serde_yaml::from_str("{ptrace: a, liteinst: b}").unwrap();
+        assert_eq!(per_backend.for_backend("ptrace"), Some("a"));
+        assert!(serde_yaml::from_str::<HermitArgsReason>("[a, b]").is_err());
     }
 
     #[test]
@@ -7045,7 +11050,7 @@ mod tests {
                 ],
             )]),
             hermit_args_reason: Some("the corpus records this configuration".into()),
-            env: BTreeMap::from([("TMPDIR".into(), "/tmp".into())]),
+            env: Some(BTreeMap::from([("TMPDIR".into(), "/tmp".into())])),
             comparator: Some(Comparator::Stripped),
             comparator_reason: Some("the corpus verdict policy is the stripped comparison".into()),
             ..ModeRecipe::default()
@@ -7182,16 +11187,43 @@ mod tests {
         );
         for owned in RUNNER_GUEST_ENV {
             refused(
-                &|r| r.env = BTreeMap::from([(owned.into(), "x".into())]),
+                &|r| r.env = Some(BTreeMap::from([(owned.into(), "x".into())])),
                 "verify",
                 "a variable the runner sets itself",
             );
         }
         refused(
-            &|r| r.env = BTreeMap::from([("lower".into(), "x".into())]),
+            &|r| r.env = Some(BTreeMap::from([("lower".into(), "x".into())])),
             "verify",
             "not a valid NAME=VALUE",
         );
+        // A replay recipe may restate its environment, an empty mapping
+        // included, under the same name checks; no other mode may declare one.
+        let with_env = |env: BTreeMap<String, String>| ModeRecipe {
+            env: Some(env),
+            ..ModeRecipe::default()
+        };
+        for env in [
+            BTreeMap::new(),
+            BTreeMap::from([("MODE".into(), "x".into())]),
+        ] {
+            validate_mode_extensions("fixture/test", "replay", &with_env(env)).unwrap();
+        }
+        let error = validate_mode_extensions(
+            "fixture/test",
+            "replay",
+            &with_env(BTreeMap::from([("lower".into(), "x".into())])),
+        )
+        .unwrap_err();
+        assert!(error.contains("not a valid NAME=VALUE"), "{error}");
+        for mode in ["naked", "chaos", "custom"] {
+            let error = validate_mode_extensions("fixture/test", mode, &with_env(BTreeMap::new()))
+                .unwrap_err();
+            assert!(
+                error.contains("declares env, which only a verify or replay mode accepts"),
+                "{error}"
+            );
+        }
         // A diagnostic is accepted only on an enabled backend of a stripped
         // cell, with a substantive reason, and only in verify.
         let diagnostic = || BTreeMap::from([("ptrace".into(), "bounded probe".into())]);
@@ -7231,7 +11263,7 @@ mod tests {
                 let backends: &[&str] = if mode == "naked" {
                     &["native"]
                 } else {
-                    &["ptrace", "dbt", "kvm", "sabre", "liteinst"]
+                    &["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"]
                 };
                 test.modes.insert(
                     mode.into(),
@@ -7320,6 +11352,7 @@ mod tests {
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         assert_eq!(
             cell_relaxations(&cell),
@@ -7463,27 +11496,441 @@ mod tests {
         assert_eq!(error, "--label super names no test in any manifest");
     }
 
+    fn relaxed_host() -> HostLevel {
+        HostLevel {
+            level: StrictnessLevel::Relaxed,
+            reason: Some("this host has no exact branch counter (fixture)".into()),
+        }
+    }
+
+    /// The run flags of a verify spec: the tokens after `--strict` that its
+    /// recipe, level or probe added.
+    fn verify_run_flags(spec: &CellRunSpec) -> Vec<String> {
+        spec.argv
+            .iter()
+            .filter(|arg| allowed_hermit_arg(arg))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn host_strictness_is_strict_only_with_cpuid_faulting_and_an_exact_counter() {
+        let exact = CapabilityVerdict {
+            present: true,
+            evidence: "fixture counter".into(),
+        };
+        let inexact = CapabilityVerdict {
+            present: false,
+            evidence: "SpecLockMap is enabled".into(),
+        };
+        let capable = fixture_host_capabilities();
+        assert_eq!(
+            host_strictness(&capable, Some(&exact), None).unwrap(),
+            HostLevel::default()
+        );
+        let level = host_strictness(&capable, Some(&inexact), None).unwrap();
+        assert_eq!(level.level, StrictnessLevel::Relaxed);
+        assert_eq!(
+            level.reason.as_deref(),
+            Some("this host has no exact branch counter (SpecLockMap is enabled)")
+        );
+        // No verdict is not a verdict of absence.
+        assert_eq!(
+            host_strictness(&capable, None, None).unwrap(),
+            HostLevel::default()
+        );
+        let mut no_faulting = capable.clone();
+        no_faulting
+            .get_mut(&HostCapability::CpuidFaulting)
+            .unwrap()
+            .present = false;
+        let level = host_strictness(&no_faulting, Some(&inexact), None).unwrap();
+        assert_eq!(
+            level.reason.as_deref(),
+            Some(
+                "this host has no CPUID faulting (fixture cpuid probe) and no exact branch \
+                 counter (SpecLockMap is enabled)"
+            )
+        );
+        // Forcing relaxed works on a capable host; nothing forces strict.
+        let level = host_strictness(&capable, Some(&exact), Some("relaxed")).unwrap();
+        assert_eq!(level.level, StrictnessLevel::Relaxed);
+        assert_eq!(
+            level.reason.as_deref(),
+            Some("E2E_STRICTNESS_LEVEL=relaxed")
+        );
+        for refused in ["strict", "Relaxed", "both"] {
+            assert!(host_strictness(&capable, Some(&exact), Some(refused)).is_err());
+        }
+    }
+
+    #[test]
+    fn a_relaxed_host_runs_a_ptrace_verify_cell_once_at_the_relaxed_level() {
+        let mut cell = verify_cell("ptrace", true, BTreeMap::new(), None);
+        assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Strict));
+        assert!(verify_run_flags(&verify_spec_of(cell.clone())).is_empty());
+        assert!(refused_on_an_inexact_branch_counter(&cell));
+        assert_eq!(
+            cell.strictness(),
+            Some(CellStrictness {
+                level: StrictnessLevel::Strict,
+                virtualize_cpuid: true,
+                max_timeslice: MaxTimeslice::Nanoseconds(200_000_000),
+                capped: false,
+            })
+        );
+
+        cell.host_level = relaxed_host();
+        assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Relaxed));
+        assert_eq!(
+            verify_run_flags(&verify_spec_of(cell.clone())),
+            RELAXED_LEVEL_ARGS
+        );
+        // Without the preemption timer Hermit does not refuse the counter.
+        assert!(!refused_on_an_inexact_branch_counter(&cell));
+        assert_eq!(
+            cell_relaxations(&cell),
+            [
+                "--no-virtualize-cpuid: strictness level relaxed: the host runs the relaxed \
+                 level: this host has no exact branch counter (fixture)",
+                "--max-timeslice=disabled: strictness level relaxed: the host runs the relaxed \
+                 level: this host has no exact branch counter (fixture)",
+            ]
+        );
+        assert_eq!(
+            cell.strictness(),
+            Some(CellStrictness {
+                level: StrictnessLevel::Relaxed,
+                virtualize_cpuid: false,
+                max_timeslice: MaxTimeslice::Disabled,
+                capped: false,
+            })
+        );
+    }
+
+    /// A test's declared `/proc` level reaches the Hermit command of each of
+    /// its cells once, right after `--strict`, and records no relaxation; a
+    /// test that declares none runs at Hermit's default.
+    #[test]
+    fn a_declared_proc_level_reaches_every_hermit_cell_and_relaxes_nothing() {
+        for mut cell in [
+            verify_cell("ptrace", true, BTreeMap::new(), None),
+            ptrace_cell("replay"),
+            ptrace_cell("custom"),
+        ] {
+            let mode = cell.id.mode.clone();
+            let argv = verify_spec_of(cell.clone()).argv;
+            assert!(
+                !argv.iter().any(|arg| arg.starts_with("--proc")),
+                "{mode}: {argv:?}"
+            );
+            let relaxations = cell_relaxations(&cell);
+            cell.test.proc = Some(ProcLevel::Standard);
+            let argv = verify_spec_of(cell.clone()).argv;
+            let levels: Vec<usize> = (0..argv.len())
+                .filter(|&index| argv[index].starts_with("--proc"))
+                .collect();
+            assert_eq!(levels.len(), 1, "{mode}: {argv:?}");
+            assert_eq!(argv[levels[0]], "--proc=standard", "{mode}");
+            if mode != "custom" {
+                assert_eq!(argv[levels[0] - 1], "--strict", "{mode}: {argv:?}");
+            }
+            assert_eq!(cell_relaxations(&cell), relaxations, "{mode}");
+        }
+    }
+
+    /// A row is held to its producing host's level: one from a host without
+    /// CPUID faulting (a Buck RE worker) records the relaxed level's flag,
+    /// which this strict host's cell does not, and still records its cell, as
+    /// does one from a producer forced to the relaxed level. The same
+    /// relaxations from a row whose own verdicts give the strict level, a
+    /// forced reason without a recorded relaxed level, and a relaxation the
+    /// manifest does not declare are refused.
+    #[test]
+    fn a_row_records_its_cells_relaxations_at_its_producers_level() {
+        let cell = verify_cell("ptrace", true, BTreeMap::new(), None);
+        assert_eq!(cell.host_level.level, StrictnessLevel::Strict);
+        let mut row = cell_result_that_located_nothing();
+        row.relaxations = cell_relaxations(&cell);
+        row.strictness = cell.strictness();
+        assert!(row_records_cell_relaxations(&cell, &row));
+
+        let mut remote = row.clone();
+        remote.host_capabilities.insert(
+            HostCapability::CpuidFaulting,
+            HostCapabilityVerdict {
+                present: false,
+                evidence: "fixture: no CPUID faulting".into(),
+            },
+        );
+        let mut producer = cell.clone();
+        producer.host_level = host_strictness(&remote.host_capabilities, None, None).unwrap();
+        assert_eq!(producer.host_level.level, StrictnessLevel::Relaxed);
+        remote.relaxations = cell_relaxations(&producer);
+        remote.strictness = producer.strictness();
+        assert_ne!(remote.relaxations, cell_relaxations(&cell));
+        assert!(row_records_cell_relaxations(&cell, &remote));
+
+        let mut claimed = remote.clone();
+        claimed.host_capabilities = row.host_capabilities.clone();
+        assert!(!row_records_cell_relaxations(&cell, &claimed));
+
+        let mut forced_cell = cell.clone();
+        forced_cell.host_level =
+            host_strictness(&row.host_capabilities, None, Some("relaxed")).unwrap();
+        let mut forced = row.clone();
+        forced.relaxations = cell_relaxations(&forced_cell);
+        forced.strictness = forced_cell.strictness();
+        assert!(row_records_cell_relaxations(&cell, &forced));
+        forced.strictness = cell.strictness();
+        assert!(!row_records_cell_relaxations(&cell, &forced));
+
+        let mut undeclared = remote.clone();
+        undeclared
+            .relaxations
+            .push("--no-rcb-time: fixture reason".into());
+        assert!(!row_records_cell_relaxations(&cell, &undeclared));
+    }
+
+    #[test]
+    fn a_capped_cell_runs_relaxed_on_every_host_and_records_its_cap() {
+        let mut cell = verify_cell("ptrace", true, BTreeMap::new(), None);
+        let mode = cell.test.modes.get_mut("verify").unwrap();
+        mode.max_level = Some(StrictnessLevel::Relaxed);
+        mode.max_level_reason = Some("prints a constant; preemption cannot change it".into());
+        assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Relaxed));
+        assert_eq!(
+            verify_run_flags(&verify_spec_of(cell.clone())),
+            RELAXED_LEVEL_ARGS
+        );
+        assert!(
+            cell_relaxations(&cell)
+                .iter()
+                .all(|relaxation| relaxation.ends_with(
+                    "strictness level relaxed: the cell caps itself at the relaxed level: prints a \
+             constant; preemption cannot change it"
+                ))
+        );
+        assert!(cell.strictness().unwrap().capped);
+        // The cap names itself first on a relaxed host too, so the row's
+        // relaxations do not depend on the host.
+        let strict_host_relaxations = cell_relaxations(&cell);
+        cell.host_level = relaxed_host();
+        assert_eq!(cell_relaxations(&cell), strict_host_relaxations);
+    }
+
+    #[test]
+    fn the_relaxed_level_adds_no_flag_a_recipe_already_declares() {
+        let hermit_args =
+            BTreeMap::from([("ptrace".into(), vec!["--max-timeslice=400000".into()])]);
+        let mut cell = verify_cell("ptrace", true, hermit_args, None);
+        assert_eq!(
+            cell.strictness().unwrap().max_timeslice,
+            MaxTimeslice::Nanoseconds(400_000)
+        );
+        cell.host_level = relaxed_host();
+        assert_eq!(
+            verify_run_flags(&verify_spec_of(cell.clone())),
+            ["--max-timeslice=400000", "--no-virtualize-cpuid"]
+        );
+    }
+
+    #[test]
+    fn only_a_pmu_clock_verify_cell_has_a_relaxed_form() {
+        for backend in ["kvm", "dbt", "sabre", "liteinst", "in-guest-trap"] {
+            let mut cell = verify_cell(backend, true, BTreeMap::new(), None);
+            cell.host_level = relaxed_host();
+            assert_eq!(
+                cell.strictness_level(),
+                Some(StrictnessLevel::Strict),
+                "{backend}"
+            );
+            assert!(cell.level_relaxations().is_empty(), "{backend}");
+        }
+        for mode in ["chaos", "replay"] {
+            let mut cell = ptrace_cell(mode);
+            cell.host_level = relaxed_host();
+            assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Strict));
+            // Still refused where the host lacks the counter.
+            assert!(refused_on_an_inexact_branch_counter(&cell), "{mode}");
+        }
+        let mut naked = ptrace_cell("naked");
+        naked.id.backend = None;
+        assert_eq!(naked.strictness_level(), None);
+        assert_eq!(naked.strictness(), None);
+    }
+
+    /// A verify cell that declares its own numeric `--max-timeslice` keeps it
+    /// at the relaxed level (the level adds `--max-timeslice=disabled` only
+    /// where the recipe names no timeslice), so it still arms the counter and
+    /// is withheld where the counter is inexact. c-programs/sigreturn-preemption
+    /// needs the preemption timer to finish at all.
+    #[test]
+    fn a_relaxed_verify_cell_with_its_own_timeslice_is_refused_on_an_inexact_counter() {
+        let mut cell = verify_cell(
+            "ptrace",
+            true,
+            BTreeMap::from([("ptrace".into(), vec!["--max-timeslice=100000".into()])]),
+            None,
+        );
+        cell.host_level = relaxed_host();
+        assert_eq!(cell.strictness_level(), Some(StrictnessLevel::Relaxed));
+        assert_eq!(
+            cell.strictness().unwrap().max_timeslice,
+            MaxTimeslice::Nanoseconds(100_000)
+        );
+        assert!(refused_on_an_inexact_branch_counter(&cell));
+        // Without its own timeslice the relaxed cell is not refused.
+        let mut plain = verify_cell("ptrace", true, BTreeMap::new(), None);
+        plain.host_level = relaxed_host();
+        assert!(!refused_on_an_inexact_branch_counter(&plain));
+    }
+
+    /// A run with `--max-timeslice=disabled` uses no branch count, so
+    /// Hermit does not refuse it on a host whose counter miscounts, and the
+    /// harness does not withhold it there
+    /// (https://github.com/rrnewton/hermit/issues/4291).
+    #[test]
+    fn a_strict_custom_cell_without_a_timeslice_is_not_refused_on_an_inexact_counter() {
+        let mut cell = ptrace_cell("custom");
+        cell.test.modes.get_mut("custom").unwrap().args = vec!["--strict".into()];
+        assert!(refused_on_an_inexact_branch_counter(&cell));
+        cell.test.modes.get_mut("custom").unwrap().args =
+            vec!["--strict".into(), "--max-timeslice=disabled".into()];
+        assert!(!refused_on_an_inexact_branch_counter(&cell));
+        assert_eq!(
+            cell.strictness().unwrap().max_timeslice,
+            MaxTimeslice::Disabled
+        );
+    }
+
+    #[test]
+    fn max_level_is_validated() {
+        let check = |mode: &str, edit: &dyn Fn(&mut ModeRecipe)| {
+            let mut recipe = recipe(true).modes.remove("verify").unwrap();
+            edit(&mut recipe);
+            validate_mode_extensions("fixture/test", mode, &recipe)
+        };
+        let capped = |recipe: &mut ModeRecipe| {
+            recipe.max_level = Some(StrictnessLevel::Relaxed);
+            recipe.max_level_reason = Some("constant output".into());
+        };
+        check("verify", &capped).unwrap();
+        assert!(
+            check("chaos", &capped)
+                .unwrap_err()
+                .contains("which only a verify mode accepts")
+        );
+        assert!(
+            check("verify", &|recipe| {
+                capped(recipe);
+                recipe.max_level = Some(StrictnessLevel::Strict);
+            })
+            .unwrap_err()
+            .contains("only `relaxed` caps a cell")
+        );
+        assert!(
+            check("verify", &|recipe| {
+                capped(recipe);
+                recipe.max_level_reason = Some(" ".into());
+            })
+            .unwrap_err()
+            .contains("substantive max_level_reason")
+        );
+        assert!(
+            check("verify", &|recipe| recipe.max_level_reason =
+                Some("why".into()))
+            .unwrap_err()
+            .contains("max_level_reason without max_level")
+        );
+        assert!(
+            check("verify", &|recipe| {
+                capped(recipe);
+                recipe.backends_enabled = vec!["kvm".into()];
+            })
+            .unwrap_err()
+            .contains("enables neither")
+        );
+    }
+
+    #[test]
+    fn max_timeslice_reads_and_writes_disabled_or_a_number() {
+        let strictness = CellStrictness {
+            level: StrictnessLevel::Relaxed,
+            virtualize_cpuid: false,
+            max_timeslice: MaxTimeslice::Disabled,
+            capped: true,
+        };
+        let json = serde_json::to_value(strictness).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "level": "relaxed",
+                "virtualize_cpuid": false,
+                "max_timeslice": "disabled",
+                "capped": true,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CellStrictness>(json).unwrap(),
+            strictness
+        );
+        assert_eq!(
+            serde_json::from_value::<MaxTimeslice>(serde_json::json!(5000)).unwrap(),
+            MaxTimeslice::Nanoseconds(5000)
+        );
+        for refused in [serde_json::json!(0), serde_json::json!("off")] {
+            assert!(serde_json::from_value::<MaxTimeslice>(refused).is_err());
+        }
+    }
+
     fn extended_verify_spec(comparator: Option<Comparator>) -> CellRunSpec {
+        let hermit_args = BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
+        verify_spec("ptrace", true, hermit_args, comparator)
+    }
+
+    /// The run spec of a fixture verify cell on `backend`, enabled or not,
+    /// with these per-backend flags.
+    fn verify_spec(
+        backend: &str,
+        enabled: bool,
+        hermit_args: BTreeMap<String, Vec<String>>,
+        comparator: Option<Comparator>,
+    ) -> CellRunSpec {
+        verify_spec_of(verify_cell(backend, enabled, hermit_args, comparator))
+    }
+
+    /// A fixture verify cell on `backend`, enabled or not, with these
+    /// per-backend flags.
+    fn verify_cell(
+        backend: &str,
+        enabled: bool,
+        hermit_args: BTreeMap<String, Vec<String>>,
+        comparator: Option<Comparator>,
+    ) -> SelectedCell {
         let mut test = recipe(true);
         let mode = test.modes.get_mut("verify").unwrap();
-        mode.hermit_args =
-            BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
+        mode.hermit_args = hermit_args;
         mode.hermit_args_reason = Some("fixture configuration".into());
-        mode.env = BTreeMap::from([("TMPDIR".into(), "/tmp".into())]);
+        mode.env = Some(BTreeMap::from([("TMPDIR".into(), "/tmp".into())]));
         mode.comparator = comparator;
         mode.comparator_reason = comparator.map(|_| "fixture policy".into());
-        let cell = SelectedCell {
+        SelectedCell {
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
                 mode: "verify".into(),
-                backend: Some("ptrace".into()),
+                backend: Some(backend.into()),
             },
             test,
-            enabled: true,
+            enabled,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
-        };
+            host_level: HostLevel::default(),
+        }
+    }
+
+    fn verify_spec_of(cell: SelectedCell) -> CellRunSpec {
         let context = RunContext {
             root: PathBuf::from("/repo"),
             hermit_bin: PathBuf::from("/repo/hermit"),
@@ -7507,6 +11954,7 @@ mod tests {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         build_spec(
             &context,
@@ -7520,6 +11968,211 @@ mod tests {
         .unwrap()
     }
 
+    /// A probe of a disabled in-guest LiteInst cell runs it with the maximum
+    /// timeslice disabled, as Hermit requires of that backend; an enabled
+    /// cell, another backend, or a cell that names its own `--max-timeslice`
+    /// runs with exactly its declared flags.
+    #[test]
+    fn a_probed_in_guest_cell_runs_without_a_preemption_timer() {
+        let timeslices = |spec: &CellRunSpec| {
+            let separator = spec.argv.iter().position(|a| a == "--").unwrap();
+            spec.argv[..separator]
+                .iter()
+                .filter(|a| a.starts_with("--max-timeslice"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for backend in ["liteinst", "in-guest-trap"] {
+            let probed = verify_spec(backend, false, BTreeMap::new(), None);
+            assert_eq!(
+                timeslices(&probed),
+                ["--max-timeslice=disabled"],
+                "{backend}"
+            );
+            assert_eq!(
+                cell_relaxations(&verify_cell(backend, false, BTreeMap::new(), None)),
+                [format!(
+                    "--max-timeslice=disabled: {PROBE_RELAXATION_REASON}"
+                )]
+            );
+            let verify = probed
+                .argv
+                .iter()
+                .position(|a| a == "--verify-run")
+                .unwrap();
+            let flag = probed
+                .argv
+                .iter()
+                .position(|a| a == "--max-timeslice=disabled")
+                .unwrap();
+            assert!(flag < verify, "{:?}", probed.argv);
+            assert!(timeslices(&verify_spec(backend, true, BTreeMap::new(), None)).is_empty());
+            let declared = BTreeMap::from([(backend.into(), vec!["--max-timeslice=1".into()])]);
+            assert_eq!(
+                timeslices(&verify_spec(backend, false, declared, None)),
+                ["--max-timeslice=1"]
+            );
+        }
+        for backend in ["ptrace", "dbt", "kvm"] {
+            assert!(
+                timeslices(&verify_spec(backend, false, BTreeMap::new(), None)).is_empty(),
+                "{backend}"
+            );
+        }
+        // A SaBRe spec writes its path evidence under the cell directory, so
+        // that backend is checked on the relaxation alone.
+        let sabre = verify_cell("sabre", false, BTreeMap::new(), None);
+        assert_eq!(probe_relaxation(&sabre, "sabre"), None);
+    }
+
+    /// [`VERIFY_PAIR_SCRIPT`] follows `run --verify`: run 2 starts only when
+    /// run 1 left a record with a status `--verify-allow` admits; a run that
+    /// leaves no record ends the attempt with its own status and output, its
+    /// stderr first, after the comparison has stamped its report; otherwise
+    /// the comparison's status, stdout and stderr end it, after each run's
+    /// stderr.
+    #[test]
+    fn the_paired_program_runs_and_compares_as_run_verify_does() {
+        let root_dir = std::env::temp_dir().join(format!(
+            "hermit-runner-paired-program-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root_dir);
+        fs::create_dir_all(&root_dir).unwrap();
+        struct Root(PathBuf);
+        impl Root {
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Root(root_dir);
+        let hermit = root.path().join("hermit");
+        // A run's behaviour is `$FAKE_RUN<n>`: `record:<status>` commits a
+        // record and exits with the status, `refuse` exits 122 with a class
+        // line and no record. Each call is logged.
+        fs::write(
+            &hermit,
+            r#"#!/bin/sh
+log="$(dirname "$0")/calls"
+if [ "$1" = log-diff ]; then
+  printf 'compare %s\n' "$*" >> "$log"
+  echo "comparison stdout"
+  echo "comparison stderr" >&2
+  exit 9
+fi
+while [ "$#" -gt 0 ]; do
+  [ "$1" = --verify-run ] && directory=$2
+  shift
+done
+n=$(grep -c '^run' "$log" 2>/dev/null)
+n=$((n + 1))
+printf 'run%s %s\n' "$n" "$directory" >> "$log"
+eval "behaviour=\$FAKE_RUN$n"
+echo "run $n stderr" >&2
+case $behaviour in
+  refuse) echo "HERMIT_POLICY_REFUSAL class=policy-refusal" >&2; exit 122 ;;
+  record:*) mkdir "$directory"; : > "$directory/verify-run.json"; exit "${behaviour#record:}" ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+        let hermit = hermit.to_string_lossy().into_owned();
+        let pair = |label: &str, allow: Option<&str>, runs: [&str; 2]| {
+            let runs_dir = root.path().join(label);
+            fs::create_dir(&runs_dir).unwrap();
+            let [first, second] = verify_run_directories(&runs_dir);
+            let mut argv = vec![
+                "-c".to_string(),
+                VERIFY_PAIR_SCRIPT.into(),
+                VERIFY_PAIR_NAME.into(),
+                hermit.clone(),
+                "log-diff".into(),
+                "--verify-json".into(),
+                "report.json".into(),
+            ];
+            argv.extend(allow.map(str::to_string));
+            argv.extend([
+                first.to_string_lossy().into_owned(),
+                second.to_string_lossy().into_owned(),
+                hermit.clone(),
+                "run".into(),
+                "--verify-run".into(),
+                VERIFY_RUN_DIR_PLACEHOLDER.into(),
+                "--".into(),
+                "guest".into(),
+            ]);
+            let _ = fs::remove_file(root.path().join("calls"));
+            let output = Command::new("bash")
+                .args(&argv)
+                .env("FAKE_RUN1", runs[0])
+                .env("FAKE_RUN2", runs[1])
+                .output()
+                .unwrap();
+            let calls = fs::read_to_string(root.path().join("calls")).unwrap();
+            (output, calls, first, second)
+        };
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+
+        // Both runs complete: the comparison ends the attempt.
+        let (output, calls, first, second) = pair("both", None, ["record:0", "record:0"]);
+        assert_eq!(output.status.code(), Some(9));
+        assert_eq!(text(&output.stdout), "comparison stdout\n");
+        assert_eq!(
+            text(&output.stderr),
+            "run 1 stderr\nrun 2 stderr\ncomparison stderr\n"
+        );
+        // Both runs are given one path, so they are one guest command line,
+        // and each run's evidence then moves to its own directory.
+        let staging = first.parent().unwrap().join("run");
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines[0], format!("run1 {}", staging.display()));
+        assert_eq!(lines[1], format!("run2 {}", staging.display()));
+        assert!(lines[2].ends_with(&format!("{} {}", first.display(), second.display())));
+        assert_eq!(lines.len(), 3);
+        assert!(first.join("verify-run.json").exists() && second.join("verify-run.json").exists());
+        assert!(!staging.exists());
+
+        // A status the allowance refuses: no run 2, as `run --verify`.
+        let (output, calls, ..) = pair("rejected", None, ["record:3", "record:0"]);
+        assert_eq!(output.status.code(), Some(9));
+        assert_eq!(
+            calls.lines().filter(|line| line.starts_with("run")).count(),
+            1
+        );
+        // ... which `--verify-allow=failure` admits, and `both` too.
+        for allow in ["--verify-allow=failure", "--verify-allow=both"] {
+            let (_, calls, ..) = pair(allow, Some(allow), ["record:3", "record:3"]);
+            assert_eq!(
+                calls.lines().filter(|line| line.starts_with("run")).count(),
+                2
+            );
+        }
+
+        // A refused run 1: its status and stderr, first line first, and the
+        // comparison still stamps its report but says nothing.
+        let (output, calls, ..) = pair("refused", None, ["refuse", "record:0"]);
+        assert_eq!(output.status.code(), Some(122));
+        assert_eq!(
+            text(&output.stderr),
+            "run 1 stderr\nHERMIT_POLICY_REFUSAL class=policy-refusal\n"
+        );
+        assert_eq!(text(&output.stdout), "");
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with("compare "));
+
+        // A run 2 that leaves no record ends the attempt likewise.
+        let (output, ..) = pair("refused-second", None, ["record:0", "refuse"]);
+        assert_eq!(output.status.code(), Some(122));
+    }
+
     #[test]
     fn a_verify_cell_carries_its_hermit_args_env_and_comparator() {
         let strict = extended_verify_spec(None);
@@ -7528,7 +12181,7 @@ mod tests {
         let flag = at(&strict.argv, "--no-virtualize-cpuid").unwrap();
         assert!(
             at(&strict.argv, "--strict").unwrap() < flag
-                && flag < at(&strict.argv, "--verify").unwrap()
+                && flag < at(&strict.argv, "--verify-run").unwrap()
         );
         let env = strict
             .argv
@@ -7550,7 +12203,7 @@ mod tests {
             "{:?}",
             stripped.argv
         );
-        assert!(at(&stripped.argv, "--verify").is_some());
+        assert!(at(&stripped.argv, "--verify-run").is_some());
         assert_eq!(stripped.comparator, Comparator::Stripped);
     }
 
@@ -7572,6 +12225,16 @@ mod tests {
             resolve_hermit_bin(root, Some("/opt/hermit".into())),
             Path::new("/opt/hermit")
         );
+        // An import compares the imported Buck cells' logs with the Hermit they ran, unless
+        // HERMIT_BIN names another; it never falls back to target/debug/hermit.
+        assert_eq!(
+            resolve_import_hermit_bin(root, None),
+            Path::new("/repo/ci/buck-e2e/staged/hermit")
+        );
+        assert_eq!(
+            resolve_import_hermit_bin(root, Some("/opt/hermit".into())),
+            Path::new("/opt/hermit")
+        );
     }
 
     /// The strict compatibility corpus ran each program as its own validation
@@ -7582,21 +12245,37 @@ mod tests {
     /// https://github.com/rrnewton/hermit/issues/3448 moved it into
     /// compat.yaml; the shipped row, built the way the runner builds it under
     /// e2e.manifest_compat's HERMIT_E2E_EMPTY_WORKDIR=/test, still carries
-    /// every one of those flags, the stripped comparator, and the guest argv
-    /// with its run-owned fixture path.
+    /// every one of those flags on a host at the relaxed strictness level,
+    /// now with the strict comparator (--verify-strict, since 2026-10-07),
+    /// and the guest argv with its run-owned fixture path. On a host at the
+    /// strict level it carries neither relaxation: since 2026-10-13 the
+    /// level, not the row, owns them
+    /// (https://github.com/rrnewton/hermit/issues/4276).
+    /// manifest_corpus spells the default run type itself, for the
+    /// rust-scripts that include it without this module.
     #[test]
-    fn a_shipped_compat_row_keeps_the_strict_compatibility_probe_flags() {
+    fn the_corpus_full_run_type_is_the_default_run_type() {
+        assert_eq!(crate::manifest_corpus::FULL_RUN_TYPE, DEFAULT_RUN_TYPE);
+    }
+
+    #[test]
+    fn a_shipped_compat_row_runs_at_the_hosts_strictness_level() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let cells = ManifestSet::load(&root)
             .unwrap()
             .select(&Selection {
                 test: Some("compat/cat".into()),
+                // The lane's cell; the row's in-guest cells (the corpus's
+                // `additional` backends) carry their own flags, and its replay
+                // cell none of the verify settings.
+                mode: Some("verify".into()),
+                backend: Some("ptrace".into()),
                 population: Some(Population::Required),
                 ..Selection::default()
             })
             .unwrap();
         let [cell] = cells.as_slice() else {
-            panic!("compat/cat must have exactly one CI cell: {cells:?}");
+            panic!("compat/cat must have exactly one ptrace CI cell: {cells:?}");
         };
         assert_eq!(
             (cell.id.mode.as_str(), cell.id.backend.as_deref()),
@@ -7610,6 +12289,7 @@ mod tests {
             argv,
             &root,
             Some(std::ffi::OsStr::new("/run-state")),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -7642,17 +12322,34 @@ mod tests {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: Some(PathBuf::from("/test")),
+            exact_branch_counter: None,
         };
-        let spec = build_spec(
-            &context,
-            cell,
-            PathBuf::from("/repo/results/cell"),
-            guest.clone(),
-            "1",
-            None,
-            cell.timeout_seconds,
-        )
-        .unwrap();
+        let spec_on = |cell: &SelectedCell| {
+            build_spec(
+                &context,
+                cell,
+                PathBuf::from("/repo/results/cell"),
+                guest.clone(),
+                "1",
+                None,
+                cell.timeout_seconds,
+            )
+            .unwrap()
+        };
+        let strict_spec = spec_on(cell);
+        for flag in RELAXED_LEVEL_ARGS {
+            assert!(
+                !strict_spec.argv.iter().any(|arg| arg == flag),
+                "{flag} in {:?}",
+                strict_spec.argv
+            );
+        }
+        let mut relaxed_cell = cell.clone();
+        relaxed_cell.host_level = HostLevel {
+            level: StrictnessLevel::Relaxed,
+            reason: Some("this host has no CPUID faulting (fixture)".into()),
+        };
+        let spec = spec_on(&relaxed_cell);
         let argv = &spec.argv;
         let at = |want: &[&str]| {
             argv.windows(want.len())
@@ -7664,18 +12361,20 @@ mod tests {
             at(&["run"]),
             at(&["--base-env=minimal"]),
             at(&["--strict"]),
+            at(&["--verify-strict"]),
             at(&["--no-virtualize-cpuid"]),
             at(&["--max-timeslice=disabled"]),
-            at(&["--verify"]),
+            at(&["--verify-run", VERIFY_RUN_DIR_PLACEHOLDER]),
             at(&["--mount=type=tmpfs,target=/test"]),
             at(&["--workdir", "/test"]),
             at(&["--env", "TMPDIR=/tmp"]),
             separator,
         ];
         assert!(ordered.is_sorted(), "{ordered:?} in {argv:?}");
-        assert!(!argv.iter().any(|arg| arg == "--verify-strict"), "{argv:?}");
         assert_eq!(argv[separator + 1..], guest[..]);
-        assert_eq!(spec.comparator, Comparator::Stripped);
+        // The corpus is strict (2026-10-07), so a compat row is an L2
+        // reference for the parity post-pass.
+        assert_eq!(spec.comparator, Comparator::Strict);
         assert_eq!((cell.timeout_seconds, cell.cpu_timeout_seconds), (60, 59));
         // One attempt, as the generated node had; an ordinary cell retries.
         assert!(!retries_product_failures(cell));
@@ -7690,6 +12389,37 @@ mod tests {
             })
             .unwrap();
         assert!(retries_product_failures(&ordinary[0]));
+    }
+
+    /// A replay cell's product failure is a divergence between a recording
+    /// and its replay, or a recording that did not complete; a fresh
+    /// recording on a retry does not answer for the first, so the cell gets
+    /// one attempt, as the retired rr lane gave each program. The same test's
+    /// verify cell keeps its retry.
+    #[test]
+    fn a_replay_cell_is_not_retried_after_a_product_failure() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifests = ManifestSet::load(&root).unwrap();
+        let cell = |mode: &str| {
+            let mut cells = manifests
+                .select(&Selection {
+                    test: Some("c-programs/random-readv-stream".into()),
+                    mode: Some(mode.into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(Population::Required),
+                    ..Selection::default()
+                })
+                .unwrap();
+            assert_eq!(cells.len(), 1, "{mode}: {cells:?}");
+            cells.remove(0)
+        };
+        let replay = cell("replay");
+        assert_eq!(replay.id.mode, "replay");
+        // The replay cell declares no no_retry_reason (a replay mode may not),
+        // so only its mode makes it final.
+        assert!(replay.test.modes["replay"].no_retry_reason.is_none());
+        assert!(!retries_product_failures(&replay));
+        assert!(retries_product_failures(&cell("verify")));
     }
 
     use super::PRODUCER_STRIPPED_REPORT;
@@ -7822,6 +12552,136 @@ mod tests {
         );
         assert_eq!(dispatch_record_error("ptrace", None), None);
         assert!(dispatch_record_error("sabre", historical.runtime.as_ref()).is_some());
+    }
+
+    /// An in-guest-trap run must patch no syscall site: a passing report whose
+    /// dispatch record names in-guest-trap and reports a patched site is
+    /// refused, and the same record under liteinst, which patches by design,
+    /// is not.
+    #[test]
+    fn an_in_guest_trap_dispatch_record_must_report_no_patched_site() {
+        let record = |backend: &str, patched: u64| {
+            let mut record = ptrace_dispatch_record();
+            record.backend = backend.into();
+            record.counters.ptrace_seccomp_stops = Some(0);
+            record.counters.signal_traps = Some(40);
+            record.sites.candidates = Some(patched);
+            record.sites.patched = Some(patched);
+            record
+        };
+        let report = |backend: &str, run2_patched: u64| {
+            let mut report: VerificationReport =
+                serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap();
+            let runtime = report.runtime.as_mut().unwrap();
+            runtime.run1.as_mut().unwrap().dispatch = Some(record(backend, 0));
+            runtime.run2.as_mut().unwrap().dispatch = Some(record(backend, run2_patched));
+            report
+        };
+        assert_eq!(
+            dispatch_record_error("in-guest-trap", report("in-guest-trap", 0).runtime.as_ref()),
+            None
+        );
+        let error =
+            dispatch_record_error("in-guest-trap", report("in-guest-trap", 3).runtime.as_ref())
+                .expect("a patched site under in-guest-trap is refused");
+        assert!(
+            error.contains("runtime.run2 in-guest-trap dispatch record reports 3 patched"),
+            "{error}"
+        );
+        // Missing or partial evidence cannot show zero patched sites.
+        assert!(
+            dispatch_record_error("in-guest-trap", None)
+                .is_some_and(|error| error.contains("carries no runtime"))
+        );
+        for missing in ["run1", "run2"] {
+            let mut partial = report("in-guest-trap", 0);
+            let runtime = partial.runtime.as_mut().unwrap();
+            if missing == "run1" {
+                runtime.run1 = None;
+            } else {
+                runtime.run2 = None;
+            }
+            let error = dispatch_record_error("in-guest-trap", partial.runtime.as_ref())
+                .unwrap_or_else(|| panic!("a report without {missing} was accepted"));
+            assert!(
+                error.contains(&format!("runtime.{missing} is missing")),
+                "{error}"
+            );
+            let mut no_record = report("in-guest-trap", 0);
+            let runtime = no_record.runtime.as_mut().unwrap();
+            let stats = if missing == "run1" {
+                runtime.run1.as_mut()
+            } else {
+                runtime.run2.as_mut()
+            };
+            stats.unwrap().dispatch = None;
+            let error = dispatch_record_error("in-guest-trap", no_record.runtime.as_ref())
+                .unwrap_or_else(|| panic!("a {missing} without a dispatch record was accepted"));
+            assert!(
+                error.contains(&format!(
+                    "runtime.{missing} carries no in-guest-trap dispatch record"
+                )),
+                "{error}"
+            );
+        }
+        // A candidate without a patch is evidence of patching too.
+        let mut candidate = report("in-guest-trap", 0);
+        let record = candidate
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap();
+        record.sites.candidates = Some(1);
+        record.sites.fell_back = Some(1);
+        assert!(
+            dispatch_record_error("in-guest-trap", candidate.runtime.as_ref())
+                .is_some_and(|error| error.contains("0 patched and 1 candidate"))
+        );
+        // An empty record, as from guests whose statistics were suppressed,
+        // measured nothing.
+        let mut empty = report("in-guest-trap", 0);
+        empty
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run2
+            .as_mut()
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap()
+            .counters
+            .signal_traps = Some(0);
+        assert!(
+            dispatch_record_error("in-guest-trap", empty.runtime.as_ref()).is_some_and(|error| {
+                error.contains(
+                    "runtime.run2 in-guest-trap dispatch record \
+                     counts 0 signal traps",
+                )
+            })
+        );
+        // The other backends keep their leniency for absent evidence.
+        assert_eq!(dispatch_record_error("liteinst", None), None);
+        let mut liteinst_partial = report("liteinst", 0);
+        liteinst_partial.runtime.as_mut().unwrap().run2 = None;
+        assert_eq!(
+            dispatch_record_error("liteinst", liteinst_partial.runtime.as_ref()),
+            None
+        );
+        // A liteinst record under the in-guest-trap name is refused by name.
+        assert!(
+            dispatch_record_error("in-guest-trap", report("liteinst", 0).runtime.as_ref())
+                .is_some_and(|error| error.contains("names backend liteinst"))
+        );
+        assert_eq!(
+            dispatch_record_error("liteinst", report("liteinst", 3).runtime.as_ref()),
+            None
+        );
     }
 
     #[test]
@@ -8046,6 +12906,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ptrace_cpuid_requirement_follows_the_execution_mode() {
+        for backend in ["ptrace", "e9patch"] {
+            for mode in ["replay", "chaos", "custom"] {
+                let mut cell = ptrace_cell(mode);
+                cell.id.backend = Some(backend.into());
+                assert_eq!(
+                    ptrace_cell_capability(&cell),
+                    Some(HostCapability::CpuidFaulting),
+                    "{backend}/{mode}"
+                );
+            }
+            for mode in ["verify", "naked"] {
+                let mut cell = ptrace_cell(mode);
+                cell.id.backend = Some(backend.into());
+                assert_eq!(ptrace_cell_capability(&cell), None, "{backend}/{mode}");
+                cell.host_level = relaxed_host();
+                assert_eq!(ptrace_cell_capability(&cell), None, "{backend}/{mode}");
+            }
+        }
+        for backend in ["kvm", "dbt", "sabre", "liteinst", "in-guest-trap"] {
+            let mut cell = ptrace_cell("replay");
+            cell.id.backend = Some(backend.into());
+            assert_eq!(ptrace_cell_capability(&cell), None, "{backend}");
+        }
+    }
+
+    #[test]
+    fn custom_cpuid_requirement_respects_only_hermit_subscription_options() {
+        for backend in ["ptrace", "e9patch"] {
+            let mut cell = ptrace_cell("custom");
+            cell.id.backend = Some(backend.into());
+            for flag in [
+                "--no-virtualize-cpuid",
+                "--namespace-only",
+                "--lite",
+                "--strace-only",
+            ] {
+                cell.test.modes.get_mut("custom").unwrap().args = vec![flag.into()];
+                assert_eq!(ptrace_cell_capability(&cell), None, "{backend}: {flag}");
+                cell.test.modes.get_mut("custom").unwrap().args = vec!["--".into(), flag.into()];
+                assert_eq!(
+                    ptrace_cell_capability(&cell),
+                    Some(HostCapability::CpuidFaulting),
+                    "guest argument {flag} must not disable {backend} interception"
+                );
+            }
+            cell.test.modes.get_mut("custom").unwrap().args = vec![
+                "--strict".into(),
+                "--base-env=minimal".into(),
+                "--max-timeslice=disabled".into(),
+            ];
+            assert_eq!(
+                ptrace_cell_capability(&cell),
+                Some(HostCapability::CpuidFaulting),
+                "disabling preemption must not disable CPUID interception"
+            );
+        }
+    }
+
     fn ptrace_cell(mode: &str) -> SelectedCell {
         let mut test = recipe(true);
         if mode != "verify" {
@@ -8063,6 +12983,7 @@ mod tests {
             enabled: true,
             timeout_seconds: 600,
             cpu_timeout_seconds: 22,
+            host_level: HostLevel::default(),
         }
     }
 
@@ -8109,27 +13030,15 @@ mod tests {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         }
     }
 
     #[test]
-    fn comparison_epoch_is_captured_once_and_explicit_input_never_reads_clock() {
-        let calls = std::cell::Cell::new(0);
-        let epoch = resolve_run_epoch(None, || {
-            calls.set(calls.get() + 1);
-            UNIX_EPOCH + Duration::new(978_307_199, 123_456_789)
-        })
-        .unwrap();
-        assert_eq!(calls.get(), 1);
-        assert_eq!(epoch, "2000-12-31T23:59:59.123456789+00:00");
+    fn comparison_epoch_is_the_canonical_one_unless_given_explicitly() {
+        assert_eq!(resolve_run_epoch(None).unwrap(), CANONICAL_TEST_EPOCH);
         let explicit = "2026-01-01T00:00:00.987654321Z";
-        assert_eq!(
-            resolve_run_epoch(Some(explicit.into()), || {
-                panic!("an explicit environment epoch must not sample the clock")
-            })
-            .unwrap(),
-            explicit
-        );
+        assert_eq!(resolve_run_epoch(Some(explicit.into())).unwrap(), explicit);
     }
 
     #[test]
@@ -8143,10 +13052,8 @@ mod tests {
                 .as_nanos(),
         ));
         let mut context = run_context(&root);
-        context.epoch = resolve_run_epoch(None, || {
-            UNIX_EPOCH + Duration::new(978_307_199, 123_456_789)
-        })
-        .unwrap();
+        context.epoch =
+            resolve_run_epoch(Some("2000-12-31T23:59:59.123456789+00:00".into())).unwrap();
         for outer_attempt in [1, 2] {
             let context = context.with_attempt(outer_attempt);
             for backend in ["sabre", "ptrace"] {
@@ -8305,6 +13212,7 @@ mod tests {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         assert_eq!(
             infrastructure_error_result(&context, &cell, "fixture".into()).classification,
@@ -8356,6 +13264,105 @@ mod tests {
             "an unselected backend must not inherit a selected sibling's arguments"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_parity_probe_runs_a_disabled_verify_cell_on_ptraces_inputs() {
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.guest_args
+            .insert("ptrace".into(), vec!["53".into(), "5".into()]);
+        mode.guest_args.insert("kvm".into(), vec!["kvm-own".into()]);
+        mode.timeout_seconds.insert("ptrace".into(), 91);
+        mode.cpu_timeout_seconds.insert("ptrace".into(), 32);
+        mode.slow_reason
+            .insert("ptrace".into(), "the ptrace workload is slow".into());
+        validate_mode("fixture/test", "verify", mode, 60).unwrap();
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: BTreeMap::from([(
+                test.id.clone(),
+                ("fixture".into(), 60, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+            )]),
+        };
+        let probe = |backend: &str, parity_inputs: bool| {
+            let cells = set
+                .select(&Selection {
+                    population: Some(Population::Disabled),
+                    test: Some("fixture/test".into()),
+                    mode: Some("verify".into()),
+                    backend: Some(backend.into()),
+                    parity_inputs,
+                    ..Selection::default()
+                })
+                .unwrap();
+            assert_eq!(cells.len(), 1);
+            cells.into_iter().next().unwrap()
+        };
+        let liteinst = probe("liteinst", true);
+        assert!(!liteinst.enabled);
+        assert_eq!(cell_guest_args(&liteinst, "liteinst"), ["53", "5"]);
+        // The probe keeps its own budget, the one the pressure test sizes its
+        // enclosing allowance from, not ptrace's.
+        assert_eq!(
+            (liteinst.timeout_seconds, liteinst.cpu_timeout_seconds),
+            (60, DEFAULT_TEST_CPU_TIMEOUT_SECONDS)
+        );
+        let verify = &liteinst.test.modes["verify"];
+        assert_eq!(
+            cell_hermit_args(verify, "liteinst"),
+            ["--max-timeslice=disabled"]
+        );
+        assert_eq!(
+            verify
+                .hermit_args_reason
+                .as_ref()
+                .and_then(|reason| reason.for_backend("liteinst")),
+            Some(PARITY_PROBE_HERMIT_ARGS_REASON)
+        );
+        validate_mode("fixture/test", "verify", verify, 60).unwrap();
+        // A backend's own declared arguments are kept, and only the in-guest
+        // backends get the timeslice flag.
+        let kvm = probe("kvm", true);
+        assert_eq!(cell_guest_args(&kvm, "kvm"), ["kvm-own"]);
+        assert!(cell_hermit_args(&kvm.test.modes["verify"], "kvm").is_empty());
+        // Without --parity-inputs a probe is exactly the manifest's.
+        let plain = probe("liteinst", false);
+        assert!(cell_guest_args(&plain, "liteinst").is_empty());
+        assert!(cell_hermit_args(&plain.test.modes["verify"], "liteinst").is_empty());
+        assert_eq!(plain.timeout_seconds, 60);
+    }
+
+    #[test]
+    fn a_parity_probe_does_not_borrow_another_backends_shared_flag_reason() {
+        // c-programs/sigreturn-preemption's shape: ptrace carries a flag with a
+        // shared reason written for it alone.
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.hermit_args
+            .insert("ptrace".into(), vec!["--no-virtualize-cpuid".into()]);
+        mode.hermit_args_reason = Some(HermitArgsReason::Shared(
+            "ptrace reads the host CPUID for this probe of the signal path".into(),
+        ));
+        validate_mode("fixture/test", "verify", mode, 60).unwrap();
+        let probed = with_parity_inputs(&test, "in-guest-trap");
+        let verify = &probed.modes["verify"];
+        let reason = verify.hermit_args_reason.as_ref().unwrap();
+        assert_eq!(
+            reason.for_backend("in-guest-trap"),
+            Some(PARITY_PROBE_HERMIT_ARGS_REASON)
+        );
+        assert_eq!(
+            reason.for_backend("ptrace"),
+            Some("ptrace reads the host CPUID for this probe of the signal path")
+        );
+        validate_mode("fixture/test", "verify", verify, 60).unwrap();
+        // An enabled backend is never probed: its recipe is untouched.
+        let untouched = with_parity_inputs(&test, "ptrace");
+        assert!(matches!(
+            untouched.modes["verify"].hermit_args_reason,
+            Some(HermitArgsReason::Shared(_))
+        ));
     }
 
     #[test]
@@ -8450,6 +13457,78 @@ mod tests {
     }
 
     #[test]
+    fn every_row_records_the_binarys_exact_branch_counter_verdict() {
+        // The cell whose remote failures came from an inexact counter
+        // (https://github.com/rrnewton/hermit/issues/3794): a row that ran must
+        // say whether the counter was exact, not only a withheld row's reason.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cells = ManifestSet::load(&root)
+            .unwrap()
+            .select(&Selection {
+                population: Some(Population::Required),
+                test: Some("language-runtimes/python-hashseed".into()),
+                mode: Some("verify".into()),
+                backend: Some("ptrace".into()),
+                ..Selection::default()
+            })
+            .unwrap();
+        assert_eq!(cells.len(), 1);
+        let cell = &cells[0];
+        let scratch = std::env::temp_dir().join(format!(
+            "hermit-runner-exact-branch-counter-row-{}",
+            std::process::id()
+        ));
+        let mut context = run_context(&scratch);
+        let verdict = CapabilityVerdict {
+            present: false,
+            evidence: "fixture CPU: Reverie performance-counter validation failed \
+                       (AmdSpecLockMapShouldBeDisabled)"
+                .into(),
+        };
+        context.exact_branch_counter = Some(verdict.clone());
+        for (builder, row) in [
+            (
+                "infrastructure_error_result",
+                infrastructure_error_result(&context, cell, "fixture".into()),
+            ),
+            (
+                "host_inapplicable_result",
+                host_inapplicable_result(&context, cell, "fixture".into()),
+            ),
+        ] {
+            assert_eq!(
+                row.exact_branch_counter.as_ref(),
+                Some(&verdict),
+                "{builder}"
+            );
+            let rendered = serde_json::to_value(&row).unwrap();
+            assert_eq!(
+                rendered["exact_branch_counter"]["present"], false,
+                "{builder}"
+            );
+            assert_eq!(
+                rendered["exact_branch_counter"]["evidence"],
+                verdict.evidence.as_str(),
+                "{builder}"
+            );
+            // The closed record keeps its frozen set.
+            assert!(
+                rendered["host_capabilities"]
+                    .get("exact_branch_counter")
+                    .is_none(),
+                "{builder}"
+            );
+        }
+        // A binary that gave no verdict leaves the key out, as a row written
+        // before the field does.
+        context.exact_branch_counter = None;
+        let row = infrastructure_error_result(&context, cell, "fixture".into());
+        let rendered = serde_json::to_value(&row).unwrap();
+        assert!(rendered.get("exact_branch_counter").is_none());
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
     fn shipped_readdir_order_identity_retains_its_resolved_timeouts() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let cells = ManifestSet::load(&root)
@@ -8512,24 +13591,43 @@ mod tests {
             .filter(|cell| cell.id.test == "c-programs/record-replay-file-state-regular-sink")
             .map(|cell| (cell.id.mode.as_str(), cell.id.backend.as_deref()))
             .collect::<BTreeSet<_>>();
+        // Its KVM verify cell joins on 2026-10-08 (the KVM zero-class
+        // qualification: three non-vacuous canonical passes on the validation
+        // host), also with the default timeouts and no calibration change.
+        // Its DBT verify cell joins the same day on the same evidence (the DBT
+        // zero-class qualification), again with the default timeouts.
+        // Its liteinst and in-guest-trap verify cells join the same day too,
+        // from ten clean in-guest verify runs each with the maximum timeslice
+        // disabled (https://github.com/rrnewton/hermit/issues/3745), again with
+        // the default timeouts.
         assert_eq!(
             regular_sink,
-            BTreeSet::from([("verify", Some("ptrace")), ("verify", Some("sabre"))])
+            BTreeSet::from([
+                ("verify", Some("dbt")),
+                ("verify", Some("in-guest-trap")),
+                ("verify", Some("kvm")),
+                ("verify", Some("liteinst")),
+                ("verify", Some("ptrace")),
+                ("verify", Some("sabre"))
+            ])
         );
         // https://github.com/rrnewton/hermit/pull/3231 qualifies three new
         // cells without revising the frozen calibration or any timeout override.
+        // DBT verification now joins after whole-fixture qualification, with
+        // the same default bounds and no calibration change.
         for population in [&required, &enabled] {
             let rng = population
                 .iter()
                 .filter(|cell| cell.id.test == "c-programs/random-readv-stream")
                 .collect::<Vec<_>>();
-            assert_eq!(rng.len(), 3);
+            assert_eq!(rng.len(), 4);
             assert_eq!(
                 rng.iter()
                     .map(|cell| (cell.id.mode.as_str(), cell.id.backend.as_deref()))
                     .collect::<BTreeSet<_>>(),
                 BTreeSet::from([
                     ("verify", Some("ptrace")),
+                    ("verify", Some("dbt")),
                     ("verify", Some("kvm")),
                     ("replay", Some("ptrace")),
                 ])
@@ -8556,39 +13654,11 @@ mod tests {
                 assert_eq!(replay[0].timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
             }
         }
-        assert_eq!(
-            required.len(),
-            CALIBRATED_CI_CELL_COUNT + KVM_RATCHET_CI_CELL_COUNT - KVM_RUN_1709_CI_REMOVAL_COUNT
-                + KVM_PINNED_IMAGE_QUALIFIED_CI_CELL_COUNT
-                + KVM_NEXT40_QUALIFIED_CI_CELL_COUNT
-                + 2
-                + KVM_2026_09_08_SELECTED_CI_CELL_COUNT
-                + IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT
-                + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
-                + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
-                + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
-                + 3 // the exact RNG identities asserted above
-                + DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT
-                + STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
-                + SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT
-                // Six KVM verify selections; the frozen calibration stays unchanged.
-                // https://github.com/rrnewton/reverie/issues/891
-                + 6
-                // Three socket KVM verify selections from the same issue; assertions stay exact.
-                // https://github.com/rrnewton/reverie/issues/891
-                + 3
-                // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
-                + 1
-                // One zero-time epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
-                + 1
-                // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-                + 1
-                // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-                + 1
-                // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-                + 1
-                + SABRE_2026_10_03_SELECTED_CI_CELL_COUNT
-        );
+        // How many cells are required is not pinned: the committed plan
+        // records it, the manifest gate holds the plan to the manifests, and
+        // a cell flip shows up as a diff of that plan
+        // (https://github.com/rrnewton/hermit/issues/3606). The checks here
+        // are of the named batches' bounds.
         // The SaBRe verify selections of 2026-10-03 have the ordinary bounds,
         // and the ones that were enabled with ci:false are now required.
         fn sabre_verify<'a>(
@@ -8628,39 +13698,79 @@ mod tests {
                 dbt_verify(&enabled, test),
                 "{test} verify/dbt is not enabled"
             );
+            // The whole io-uring fallback verify/DBT cell is now required after
+            // 20 independent strict canonical pairs passed at ed4a5dd90da2.
             assert!(
-                !dbt_verify(&required, test),
-                "{test} verify/dbt is required"
+                dbt_verify(&required, test),
+                "{test} verify/dbt is not required"
             );
         }
-        assert_eq!(
-            enabled.len() - required.len(),
-            NON_CI_CELL_COUNT
-                - LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
-                - DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS.len()
-                + DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS.len()
-                - SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS.len(),
-            "the current manifest census records every enabled ci:false cell"
-        );
 
-        // The earlier group was already enabled; the later disabled group adds
-        // equally to enabled and required, preserving enabled-minus-required.
-        // Both groups retain their separate evidence and ordinary bounds.
-        for calibration in LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS
+        // The two dated LiteInst groups were qualified on the ptrace-owned
+        // hybrid. The owner reset of 2026-10-04 switched every LiteInst cell
+        // off while in-guest Detcore replaces it
+        // (https://github.com/rrnewton/hermit/issues/3745, step 1 of
+        // https://github.com/rrnewton/hermit/issues/3520), and the groups are
+        // history: they qualify nothing. LiteInst cells came back on
+        // 2026-10-08 only on the new architecture, with fresh evidence: verify
+        // cells of in-guest LiteInst (liteinst, and in-guest-trap with site
+        // patching off) that passed ten clean verify runs each with the
+        // maximum timeslice disabled, which in-guest LiteInst requires. So
+        // every enabled LiteInst or in-guest-trap cell, a hybrid-group member
+        // included, must be a verify cell that carries exactly that
+        // relaxation and the default bounds, never a hybrid-era calibration.
+        // The census covers every run type and the occasional tests, so a
+        // cell that full validation would skip is caught too.
+        let enabled_anywhere = manifests
+            .select(&Selection {
+                population: Some(Population::Enabled),
+                all_run_types: true,
+                include_occasional: true,
+                ..Selection::default()
+            })
+            .unwrap();
+        let in_guest = enabled_anywhere
+            .iter()
+            .filter(|cell| {
+                matches!(
+                    cell.id.backend.as_deref(),
+                    Some("liteinst" | "in-guest-trap")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!in_guest.is_empty());
+        for cell in &in_guest {
+            let backend = cell.id.backend.as_deref().unwrap();
+            let name = format!("{} {}/{backend}", cell.id.test, cell.id.mode);
+            assert_eq!(cell.id.mode, "verify", "{name}");
+            assert_eq!(
+                cell_hermit_args(&cell.test.modes[&cell.id.mode], backend),
+                ["--max-timeslice=disabled"],
+                "{name}"
+            );
+            assert_eq!(
+                (cell.cpu_timeout_seconds, cell.timeout_seconds),
+                (
+                    DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+                    DEFAULT_TEST_WALL_TIMEOUT_SECONDS
+                ),
+                "{name}"
+            );
+        }
+        let hybrid_group_cells = LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS)
-        {
-            let cell = required
-                .iter()
-                .find(|cell| {
+            .filter(|calibration| {
+                in_guest.iter().any(|cell| {
                     cell.id.test == calibration.test
                         && cell.id.mode == calibration.mode
                         && cell.id.backend.as_deref() == Some(calibration.backend)
                 })
-                .expect("a newly qualified LiteInst cell is missing from required selection");
-            assert_eq!(cell.cpu_timeout_seconds, calibration.configured_cpu_seconds);
-            assert_eq!(cell.timeout_seconds, calibration.configured_wall_seconds);
-        }
+            })
+            .count();
+        // Hybrid-group cells do come back, on the in-guest evidence above, so
+        // the checks above are not vacuous for them.
+        assert!(hybrid_group_cells > 0);
 
         let observed = enabled
             .iter()
@@ -8680,33 +13790,35 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         // The strict compatibility corpus (fold 1 of
-        // https://github.com/rrnewton/hermit/issues/3448) keeps the wall bounds
-        // its generated validation nodes carried, 60 s and 20 s for its five
-        // bounded diagnostics, with CPU one second below each (a cell's CPU
-        // budget must stay below its wall). These literals are the check; they
-        // are not read back from compat.yaml.
+        // https://github.com/rrnewton/hermit/issues/3448) keeps the 60 s wall
+        // bound its generated validation nodes carried, with CPU one second
+        // below it (a cell's CPU budget must stay below its wall). Its five
+        // former 20-second diagnostics are ordinary cells since the corpus
+        // became strict (2026-10-07). These literals are the check; they are
+        // not read back from compat.yaml.
         let (compat, observed): (BTreeMap<_, _>, BTreeMap<_, _>) = observed
             .into_iter()
             .partition(|((test, _, _), _)| test.starts_with("compat/"));
+        // Its replay cells, the full run's since 2026-10-20, keep the rr run
+        // type's identical bounds.
+        let (compat_replay, compat): (BTreeMap<_, _>, BTreeMap<_, _>) = compat
+            .into_iter()
+            .partition(|((_, mode, _), _)| *mode == "replay");
+        assert_eq!(
+            compat_replay.len(),
+            COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT
+        );
+        for ((test, _, backend), bounds) in &compat_replay {
+            assert_eq!(*backend, "ptrace", "{test}");
+            assert_eq!(*bounds, (59, 60), "{test}");
+        }
         assert_eq!(
             compat.len(),
             STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
         );
         for ((test, mode, backend), bounds) in &compat {
             assert_eq!((*mode, *backend), ("verify", "ptrace"), "{test}");
-            let diagnostic = matches!(
-                *test,
-                "compat/df"
-                    | "compat/ranlib"
-                    | "compat/top"
-                    | "compat/zstd"
-                    | "compat/zstd-roundtrip"
-            );
-            assert_eq!(
-                *bounds,
-                if diagnostic { (19, 20) } else { (59, 60) },
-                "{test}"
-            );
+            assert_eq!(*bounds, (59, 60), "{test}");
         }
         let expected = EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
@@ -8809,6 +13921,7 @@ mod tests {
             timeout_seconds: 15,
             verdict_path: Some(root.join("verdict.json")),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: root.clone(),
             expected_guest_exit: None,
@@ -9040,6 +14153,8 @@ mod tests {
         );
         stop_process_group(
             pid,
+            &LeaderPidFd::open(pid),
+            None,
             Instant::now(),
             &mut FinalWaitObservation::NotApplicable,
         )
@@ -9060,11 +14175,50 @@ mod tests {
         root
     }
 
+    /// Substitute the live-CPU plan for the current test thread until dropped,
+    /// in place of the fallback marker and the runner's own cgroup.
+    struct LiveCpuPlanOverride;
+
+    impl LiveCpuPlanOverride {
+        fn set(
+            allow_process_group_scan: Result<bool, String>,
+            cgroup_parent: Option<PathBuf>,
+        ) -> Self {
+            LIVE_CPU_PLAN_OVERRIDE.with(|plan| {
+                *plan.borrow_mut() = Some(LiveCpuPlan {
+                    allow_process_group_scan,
+                    cgroup_parent,
+                });
+            });
+            Self
+        }
+    }
+
+    impl Drop for LiveCpuPlanOverride {
+        fn drop(&mut self) {
+            LIVE_CPU_PLAN_OVERRIDE.with(|plan| *plan.borrow_mut() = None);
+        }
+    }
+
     fn spawn_cpu_reader_fixture(
         root: &Path,
         label: &str,
         script: &str,
         cpu_enabled: bool,
+    ) -> (Child, Instant, InvocationCpuObservation) {
+        spawn_fixture_with_source(
+            root,
+            label,
+            script,
+            cpu_enabled.then_some(LiveCpuSource::AgentUtilsPairedPidfdStatV1),
+        )
+    }
+
+    fn spawn_fixture_with_source(
+        root: &Path,
+        label: &str,
+        script: &str,
+        cpu_source: Option<LiveCpuSource>,
     ) -> (Child, Instant, InvocationCpuObservation) {
         let started = Instant::now();
         let request = ProcessRequest::new(
@@ -9080,15 +14234,96 @@ mod tests {
             &root.join(format!("{label}.stderr")),
         );
         let mut observation =
-            InvocationCpuObservation::pending(1, request.role, request.command, cpu_enabled);
+            InvocationCpuObservation::pending(1, request.role, request.command, cpu_source);
         let child = spawn_process(
             &request.cwd,
             &request.stdout,
             &request.stderr,
+            None,
             &mut observation,
         )
         .unwrap();
         (child, started, observation)
+    }
+
+    /// Spawn `program` with `enrollment` standing in for an invocation
+    /// cgroup's `cgroup.procs` descriptor, and return the spawn error.
+    fn spawn_error_with_enrollment(
+        root: &Path,
+        label: &str,
+        program: &str,
+        enrollment: &File,
+    ) -> (String, InvocationCpuObservation) {
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: label.into(),
+                backend: RequiredNullable::Null,
+            },
+            root,
+            program,
+            &[],
+            &BTreeMap::new(),
+            &root.join(format!("{label}.stdout")),
+            &root.join(format!("{label}.stderr")),
+        );
+        let mut observation = InvocationCpuObservation::pending(
+            1,
+            request.role,
+            request.command,
+            Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+        );
+        let error = spawn_process(
+            &request.cwd,
+            &request.stdout,
+            &request.stderr,
+            Some((
+                enrollment.as_raw_fd(),
+                Path::new("/sys/fs/cgroup/stand-in-invocation"),
+            )),
+            &mut observation,
+        )
+        .expect_err("the spawn must fail");
+        (error, observation)
+    }
+
+    #[test]
+    fn a_failed_spawn_names_the_exec_or_the_cgroup_join_whichever_failed() {
+        let root = cpu_reader_test_root("spawn-failure-step");
+        // The join's write succeeds on /dev/null, so only the exec can fail,
+        // and its reason reads exactly as it does without a cgroup.
+        let accepting = OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let missing = root.join("missing-program");
+        let (error, observation) =
+            spawn_error_with_enrollment(&root, "exec", missing.to_str().unwrap(), &accepting);
+        let exec_failure = format!(
+            "cannot execute {}: No such file or directory (os error 2)",
+            missing.display()
+        );
+        assert_eq!(error, exec_failure);
+        assert_eq!(
+            observation.launch,
+            LaunchObservation::SpawnFailed {
+                stage: SpawnStage::Spawn,
+                reason: exec_failure,
+            }
+        );
+        assert_eq!(observation.termination, TerminationPath::SpawnFailed);
+        // A descriptor opened read-only refuses the join's write, so the join
+        // fails before an existing program could be started.
+        let refusing = File::open("/dev/null").unwrap();
+        let (error, observation) =
+            spawn_error_with_enrollment(&root, "join", "/bin/true", &refusing);
+        let join_failure = "cannot join invocation cgroup /sys/fs/cgroup/stand-in-invocation before exec, so /bin/true was not started: Bad file descriptor (os error 9)";
+        assert_eq!(error, join_failure);
+        assert_eq!(
+            observation.launch,
+            LaunchObservation::SpawnFailed {
+                stage: SpawnStage::Spawn,
+                reason: join_failure.into(),
+            }
+        );
+        assert_eq!(observation.termination, TerminationPath::SpawnFailed);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn owned_child_is_reaped(pid: u32) -> bool {
@@ -9218,7 +14453,7 @@ mod tests {
         // census pairs its pidfd with its stat file ("pidfd/stat generation
         // mismatch"); either failure is then served to every call for 500 ms
         // by proccpu's shared snapshot
-        // (https://github.com/rrnewton/hermit/issues/3377). Real samples
+        // (https://github.com/rrnewton/hermit/issues/3822). Real samples
         // through the monitor, with the monitor's one-second grace for
         // unavailable samples, are checked by
         // native_zombie_then_reaped_child_has_no_double_cpu_charge (every
@@ -9458,22 +14693,39 @@ mod tests {
         let mut first_missing = None;
         let mut valid_samples = 0;
         let mut missing_after_valid = 0;
+        // The one valid sample comes one poll interval before the original grace
+        // ends, and it is synthetic, so the sequence does not depend on host
+        // load. A failed poll before it is less than the grace after the first
+        // failure, and any later poll is itself the valid one, so the original
+        // grace cannot stop the command first. The grace then restarts at the next
+        // failure, about one grace after the first one, and `done` is written 200 ms
+        // past the original grace, which leaves about 0.8 s for the child to exit
+        // and be reaped before the restarted grace ends.
+        //
+        // This test used to take the valid sample at 500 ms from a real host-wide
+        // /proc census (`ProcessGroupCpu::seconds`), which under load can be slow
+        // or refused (https://github.com/rrnewton/hermit/issues/3822), and it left
+        // the child about 0.4 s to exit (measured: done written at 1.32 s, the
+        // restarted grace due at 1.72 s). It failed under host load 155-173.
         let output = monitor_process(
             child,
             ProcessLimits {
+                // A hang guard only: the run ends about 1.4 s in (measured 1.34 to
+                // 1.37 s with the earlier timeline, free or pinned to one CPU).
                 deadline: Instant::now() + Duration::from_secs(5),
                 cpu_budget_usec: Some(5_000_000),
                 cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
             },
             started,
             &mut observation,
-            |pid| dagrun::proccpu::ProcessGroupCpu::new(pid).map_err(|error| error.to_string()),
-            |reader| {
+            |_| Ok(()),
+            |_| {
                 let first = *first_missing.get_or_insert_with(Instant::now);
-                if valid_samples == 0 && first.elapsed() >= Duration::from_millis(500) {
-                    let seconds = reader.seconds().map_err(|error| error.to_string())?;
+                if valid_samples == 0
+                    && first.elapsed() >= CELL_CPU_ACCOUNTING_GRACE - CELL_CPU_POLL_INTERVAL
+                {
                     valid_samples += 1;
-                    return Ok(seconds);
+                    return Ok(0.0);
                 }
                 if valid_samples > 0 {
                     missing_after_valid += 1;
@@ -9506,7 +14758,7 @@ mod tests {
     fn a_slow_failed_sample_does_not_use_up_the_unavailable_grace() {
         // One host-wide /proc census can outlast the whole grace. proccpu then
         // refuses it ("scan deadline") and serves that refusal again for 500 ms
-        // (https://github.com/rrnewton/hermit/issues/3377). The grace is timed
+        // (https://github.com/rrnewton/hermit/issues/3822). The grace is timed
         // from when the failed sample returned, so the refusal served right
         // after a slow census cannot stop the command before a fresh sample
         // runs. The samples are synthetic so the sequence is exact on any host.
@@ -9563,7 +14815,7 @@ mod tests {
     fn a_slow_census_that_keeps_failing_still_stops_the_command() {
         // The refusal above never clears here: every fresh census takes 1 s and
         // fails, and its refusal is served again for 500 ms, as proccpu does
-        // (https://github.com/rrnewton/hermit/issues/3377). The command must
+        // (https://github.com/rrnewton/hermit/issues/3822). The command must
         // still be stopped and reaped through the accounting stop, at least
         // the grace after the first failed census returned. The grace is only
         // checked when a sample returns, so the census running when it expires
@@ -9619,6 +14871,192 @@ mod tests {
     }
 
     #[test]
+    fn monotonic_cpu_sampler_refuses_a_decrease_and_keeps_the_high_value() {
+        let mut reads = vec![
+            Ok(5),
+            Ok(5),
+            Ok(7),
+            Ok(6),
+            Err("fixture read failure".to_string()),
+            Ok(6),
+            Ok(7),
+            Ok(9),
+        ]
+        .into_iter();
+        let mut sample = monotonic_cpu_sampler(move || reads.next().unwrap());
+        let decreased = Err(CpuError {
+            stage: CpuErrorStage::Sampling,
+            reason: "sampling: cgroup CPU counter decreased from 7 to 6 usec".into(),
+        });
+        assert_eq!(sample(1, &()), Ok(5));
+        assert_eq!(
+            sample(1, &()),
+            Ok(5),
+            "an unchanged counter is a valid sample"
+        );
+        assert_eq!(sample(1, &()), Ok(7));
+        assert_eq!(sample(1, &()), decreased);
+        assert_eq!(
+            sample(1, &()),
+            Err(CpuError {
+                stage: CpuErrorStage::Sampling,
+                reason: "sampling: fixture read failure".into(),
+            })
+        );
+        // The refused values never lower the bar: 6 is still below 7.
+        assert_eq!(sample(1, &()), decreased);
+        assert_eq!(sample(1, &()), Ok(7));
+        assert_eq!(sample(1, &()), Ok(9));
+    }
+
+    #[test]
+    fn a_decreasing_cgroup_sample_is_refused_after_the_unavailable_grace() {
+        use std::cell::Cell;
+
+        // The kernel never lowers a cgroup's usage_usec, so a lower reading is
+        // not this invocation's counter. It is a failed sample, timed from when
+        // it returned, and a counter that stays low stops the command once the
+        // unavailable grace has passed, exactly as a failed proccpu census does.
+        let root = cpu_reader_test_root("cgroup-decrease");
+        let (child, started, mut observation) = spawn_fixture_with_source(
+            &root,
+            "decrease",
+            "exec sleep 30",
+            Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+        );
+        let pid = child.id();
+        let reads = Cell::new(0u64);
+        let first_decrease_returned = Cell::new(None::<Instant>);
+        let error = monitor_live_cpu(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(15),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            monotonic_cpu_sampler(|| {
+                reads.set(reads.get() + 1);
+                Ok(match reads.get() {
+                    1 => 100,
+                    2 => 200,
+                    _ => {
+                        if first_decrease_returned.get().is_none() {
+                            first_decrease_returned.set(Some(Instant::now()));
+                        }
+                        150
+                    }
+                })
+            }),
+        )
+        .map(|_| ())
+        .expect_err("a cgroup counter that stays below its high value must stop the command");
+        assert!(
+            error.contains("sampling: cgroup CPU counter decreased from 200 to 150 usec"),
+            "{error}"
+        );
+        assert!(error.contains("stopped and reaped its leader"), "{error}");
+        assert_eq!(
+            observation.termination,
+            TerminationPath::AccountingUnavailableStop
+        );
+        assert!(
+            first_decrease_returned.get().unwrap().elapsed() >= CELL_CPU_ACCOUNTING_GRACE,
+            "stopped before the grace had passed since the first decrease"
+        );
+        assert!(owned_child_is_reaped(pid));
+        measured_final_cpu(&observation);
+        assert_eq!(
+            observation.returned_cpu_charge,
+            ReturnedCpuCharge::Unavailable
+        );
+        let live = enabled_cpu(&observation);
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        assert_eq!(live.registration, RegistrationObservation::BoundOnce);
+        assert_eq!(live.valid_polls, 2);
+        assert!(live.unavailable_polls >= 2);
+        assert_eq!(live.source_sample_calls, live.polls);
+        let (RequiredNullable::Value(high), RequiredNullable::Value(last)) =
+            (&live.high_water, &live.last)
+        else {
+            panic!("two valid samples must leave points: {live:?}");
+        };
+        assert_eq!((high.cpu_usec, last.cpu_usec), (200, 200));
+        let RequiredNullable::Value(last_error) = &live.last_error else {
+            panic!("a refused decrease must retain its typed error");
+        };
+        assert_eq!(last_error.stage, CpuErrorStage::Sampling);
+        validate_native_observation(&observation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_transient_cgroup_decrease_is_graced_until_the_counter_recovers() {
+        use std::cell::Cell;
+
+        let root = cpu_reader_test_root("cgroup-decrease-recovers");
+        let done = root.join("done");
+        let (child, started, mut observation) = spawn_fixture_with_source(
+            &root,
+            "recovers",
+            "while [ ! -f done ]; do sleep 0.02; done",
+            Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+        );
+        let pid = child.id();
+        let reads = Cell::new(0u64);
+        let first_decrease_returned = Cell::new(None::<Instant>);
+        let output = monitor_live_cpu(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(10),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            monotonic_cpu_sampler(|| {
+                reads.set(reads.get() + 1);
+                match reads.get() {
+                    1 => return Ok(100),
+                    2 => return Ok(200),
+                    _ => {}
+                }
+                let first = first_decrease_returned.get().unwrap_or_else(|| {
+                    let now = Instant::now();
+                    first_decrease_returned.set(Some(now));
+                    now
+                });
+                if first.elapsed() < Duration::from_millis(500) {
+                    return Ok(150);
+                }
+                fs::write(&done, b"complete").map_err(|error| error.to_string())?;
+                Ok(250 + reads.get())
+            }),
+        )
+        .expect("a decrease shorter than the grace must not stop the command");
+        assert!(output.status.success());
+        assert_eq!(output.timeout, None);
+        assert!(done.is_file());
+        assert!(owned_child_is_reaped(pid));
+        assert_process_observation(&observation, &output);
+        let live = enabled_cpu(&observation);
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        assert!(live.unavailable_polls >= 1);
+        assert!(live.valid_polls >= 3);
+        let (RequiredNullable::Value(high), RequiredNullable::Value(last)) =
+            (&live.high_water, &live.last)
+        else {
+            panic!("valid samples must leave points: {live:?}");
+        };
+        assert_eq!(high.cpu_usec, last.cpu_usec);
+        assert!(last.cpu_usec >= 250, "{last:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn live_cpu_conversion_refuses_unrepresentable_values() {
         assert_eq!(live_cpu_usage_usec(42, 0.0), Ok(0));
         assert_eq!(live_cpu_usage_usec(42, 0.125), Ok(125_000));
@@ -9655,6 +15093,7 @@ mod tests {
             timeout_seconds: 1,
             verdict_path: None,
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: root.join(label),
             expected_guest_exit: None,
@@ -9703,6 +15142,10 @@ mod tests {
             return;
         }
         let root = cpu_reader_test_root("actual-fd-reserve");
+        // The descriptor reserve is the agent-utils reader's own refusal, and
+        // the runner uses that reader only for a run without cgroups. Run as
+        // one: the fallback marker is set and no cgroup can be created.
+        let _plan = LiveCpuPlanOverride::set(Ok(true), Some(root.join("missing-cgroup-parent")));
         let context = run_context(&root);
         let cell = native_cpu_cell("exec sleep 20", 1);
         let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
@@ -9741,6 +15184,7 @@ mod tests {
         );
         measured_final_cpu(invocation);
         let live = enabled_cpu(invocation);
+        assert_eq!(live.source, LiveCpuSource::AgentUtilsPairedPidfdStatV1);
         assert_eq!(
             live.registration,
             RegistrationObservation::Unavailable {
@@ -9764,6 +15208,1497 @@ mod tests {
             String::from_utf8(bytes).unwrap().trim()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The cgroup v2 directory named by the unified line of a saved copy of
+    /// `/proc/<pid>/cgroup`.
+    fn saved_cgroup_directory(saved: &Path) -> PathBuf {
+        let text = fs::read_to_string(saved).unwrap();
+        let relative = text
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap_or_else(|| panic!("no unified cgroup line in {text:?}"));
+        Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'))
+    }
+
+    #[test]
+    fn a_boxed_run_whose_invocation_cgroup_cannot_be_created_still_stops_the_cell() {
+        // A boxed run carries no fallback marker. When it cannot create the
+        // invocation cgroup, it has no CPU source, so the command is refused
+        // before it starts and the cell is an ERROR. It is never measured some
+        // other way, its budget is never dropped, and it never runs unmeasured,
+        // not even for the unavailable grace.
+        let root = cpu_reader_test_root("boxed-without-cgroup");
+        let plain = root.join("plain-directory");
+        fs::create_dir(&plain).unwrap();
+        for (label, parent) in [
+            ("missing", root.join("missing-cgroup-parent")),
+            ("plain", plain.clone()),
+        ] {
+            let _plan = LiveCpuPlanOverride::set(Ok(false), Some(parent.clone()));
+            let case = root.join(label);
+            fs::create_dir(&case).unwrap();
+            let ran = case.join("command-started");
+            let context = run_context(&case);
+            let cell = native_cpu_cell(
+                &format!("printf started > '{}'; exec sleep 20", ran.display()),
+                1,
+            );
+            let failure = run_cell(&context, &cell)
+                .expect_err("a budgeted command with no CPU source must not complete");
+            assert!(!ran.exists(), "{label}: a refused command ran: {failure}");
+            let message = failure.to_string();
+            for expected in [
+                parent.to_str().unwrap(),
+                "only a run given no cgroups on purpose may set HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1",
+                "refused before launch",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "{label}: {expected:?} in {message}"
+                );
+            }
+            let row = failure.into_result(&context, &cell);
+            assert_eq!(row.outcome, "ERROR", "{label}");
+            assert_eq!(row.cpu_usage_usec, None, "{label}");
+            assert!(row.attempts.is_empty(), "{label}");
+            row.require_cpu_observations().unwrap();
+            let observations = row.cpu_observations.as_ref().unwrap();
+            assert_eq!(observations.invocations.len(), 1, "{label}");
+            let invocation = &observations.invocations[0];
+            assert_eq!(
+                invocation.termination,
+                TerminationPath::SpawnFailed,
+                "{label}"
+            );
+            assert_eq!(
+                invocation.returned_cpu_charge,
+                ReturnedCpuCharge::Unavailable,
+                "{label}"
+            );
+            assert_eq!(
+                invocation.final_wait,
+                FinalWaitObservation::NotApplicable,
+                "{label}"
+            );
+            let launch = serde_json::to_value(&invocation.launch).unwrap();
+            assert_eq!(launch["state"], "spawn_failed", "{label}: {launch}");
+            assert_eq!(launch["stage"], "live_cpu_meter", "{label}: {launch}");
+            assert!(
+                launch["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains(parent.to_str().unwrap())),
+                "{label}: {launch}"
+            );
+            let live = enabled_cpu(invocation);
+            assert_eq!(
+                live.source,
+                LiveCpuSource::CgroupV2InvocationCpuStatV1,
+                "{label}"
+            );
+            assert_eq!(
+                live.registration,
+                RegistrationObservation::NotAttempted,
+                "{label}"
+            );
+            assert_eq!(live.polls, 0, "{label}");
+            assert_eq!(live.source_sample_calls, 0, "{label}");
+            assert_eq!(live.valid_polls, 0, "{label}");
+            assert_eq!(live.last_error, RequiredNullable::Null, "{label}");
+            assert_cpu_source_roundtrip(&row);
+        }
+        assert_eq!(fs::read_dir(&plain).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_boxed_run_without_an_invocation_cgroup_refuses_quick_commands_before_any_runs() {
+        // Two commands that would each finish well inside the one-second
+        // unavailable grace. A meter that was never established is not a live
+        // meter that failed: the first command is refused before it starts,
+        // so neither runs unmeasured and the cell can never pass.
+        let root = cpu_reader_test_root("boxed-quick-without-cgroup");
+        let parent = root.join("missing-cgroup-parent");
+        let _plan = LiveCpuPlanOverride::set(Ok(false), Some(parent.clone()));
+        let ran = root.join("commands-that-ran");
+        let context = run_context(&root);
+        // Each run prints its own leader PID, so the naked cell's rule that
+        // its two runs differ is met and nothing but the refusal can fail it.
+        let cell = native_cpu_cell(
+            &format!("printf ran >> '{}'; printf '%s\\n' \"$$\"", ran.display()),
+            2,
+        );
+        let failure = match run_cell(&context, &cell) {
+            Ok(row) => panic!(
+                "a budgeted command with no CPU source completed as {} with CPU {:?}; \
+                 commands that ran: {:?}",
+                row.outcome,
+                row.cpu_usage_usec,
+                fs::read_to_string(&ran)
+            ),
+            Err(failure) => failure,
+        };
+        assert!(
+            !ran.exists(),
+            "refused commands ran: {:?}: {failure}",
+            fs::read_to_string(&ran)
+        );
+        let message = failure.to_string();
+        assert!(message.contains(parent.to_str().unwrap()), "{message}");
+        assert!(message.contains("refused before launch"), "{message}");
+        let row = failure.into_result(&context, &cell);
+        assert_eq!(row.outcome, "ERROR");
+        assert_eq!(row.cpu_usage_usec, None);
+        assert!(row.attempts.is_empty());
+        row.require_cpu_observations().unwrap();
+        let observations = row.cpu_observations.as_ref().unwrap();
+        assert_eq!(observations.invocations.len(), 1);
+        let invocation = &observations.invocations[0];
+        assert_eq!(invocation.termination, TerminationPath::SpawnFailed);
+        assert_eq!(invocation.final_wait, FinalWaitObservation::NotApplicable);
+        let launch = serde_json::to_value(&invocation.launch).unwrap();
+        assert_eq!(launch["stage"], "live_cpu_meter", "{launch}");
+        assert_eq!(enabled_cpu(invocation).polls, 0);
+        assert_cpu_source_roundtrip(&row);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_fallback_marker_does_not_hide_an_ineligible_cgroup_failure() {
+        // The marker allows the process-group scan only when no cgroup can be
+        // made here at all. A parent that is not a directory is a broken setup,
+        // not a run without cgroups, so the command is still refused, before
+        // even its capture files are created.
+        let root = cpu_reader_test_root("marker-ineligible");
+        let parent = root.join("regular-file");
+        fs::write(&parent, b"").unwrap();
+        let _plan = LiveCpuPlanOverride::set(Ok(true), Some(parent.clone()));
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: "1".into(),
+                backend: RequiredNullable::Null,
+            },
+            &root,
+            "/bin/sh",
+            &["-c".into(), "exec sleep 20".into()],
+            &BTreeMap::new(),
+            &root.join("ineligible.stdout"),
+            &root.join("ineligible.stderr"),
+        );
+        let mut observations = Vec::new();
+        let started = Instant::now();
+        let error = execute_process_with_cpu_poll_interval(
+            request,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(10),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            &mut observations,
+        )
+        .map(|_| ())
+        .expect_err("an ineligible cgroup failure must refuse the command");
+        assert!(error.contains("refused before launch"), "{error}");
+        assert!(error.contains("Not a directory"), "{error}");
+        assert!(!error.contains("only a run given no cgroups"), "{error}");
+        assert!(!root.join("ineligible.stdout").exists(), "{error}");
+        assert!(!root.join("ineligible.stderr").exists(), "{error}");
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        assert_eq!(observation.termination, TerminationPath::SpawnFailed);
+        assert_eq!(observation.final_wait, FinalWaitObservation::NotApplicable);
+        assert_eq!(
+            observation.returned_cpu_charge,
+            ReturnedCpuCharge::Unavailable
+        );
+        let launch = serde_json::to_value(&observation.launch).unwrap();
+        assert_eq!(launch["stage"], "live_cpu_meter", "{launch}");
+        let live = enabled_cpu(observation);
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        assert_eq!(live.registration, RegistrationObservation::NotAttempted);
+        assert_eq!(live.polls, 0);
+        assert_eq!(live.source_sample_calls, 0);
+        validate_native_observation(observation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_run_without_cgroups_measures_with_the_process_group_scan_under_its_own_source_name() {
+        // With the marker set and no cgroup available, the agent-utils scan
+        // measures the command, and every row says so: no row of such a run
+        // carries the cgroup source, so no reader can count it as one.
+        let root = cpu_reader_test_root("declared-without-cgroup");
+        let plain = root.join("plain-directory");
+        fs::create_dir(&plain).unwrap();
+        for (label, parent) in [
+            ("missing", root.join("missing-cgroup-parent")),
+            ("plain", plain.clone()),
+        ] {
+            let _plan = LiveCpuPlanOverride::set(Ok(true), Some(parent));
+            let case = root.join(label);
+            fs::create_dir(&case).unwrap();
+            let context = run_context(&case);
+            // Long enough for a poll after the scan's registration, which can
+            // take most of its 1 s deadline on a loaded host.
+            let cell = native_cpu_cell("exec sleep 1.5", 1);
+            let row = run_cell(&context, &cell).unwrap();
+            // A naked cell needs two distinct outcomes to pass, so this single
+            // run is judged by its attempt: the command ran to a normal exit.
+            assert_eq!(row.error_kind, None, "{label}: {row:?}");
+            assert_eq!(row.attempts.len(), 1, "{label}: {row:?}");
+            assert_eq!(row.attempts[0].outcome, "PASS", "{label}: {row:?}");
+            assert_eq!(row.attempts[0].status, Some(0), "{label}");
+            row.require_cpu_observations().unwrap();
+            let observations = row.cpu_observations.as_ref().unwrap();
+            assert_eq!(observations.invocations.len(), 1, "{label}");
+            let invocation = &observations.invocations[0];
+            assert_eq!(
+                invocation.termination,
+                TerminationPath::CompletedWait4,
+                "{label}"
+            );
+            let live = enabled_cpu(invocation);
+            assert_eq!(
+                live.source,
+                LiveCpuSource::AgentUtilsPairedPidfdStatV1,
+                "{label}"
+            );
+            assert_eq!(
+                live.registration,
+                RegistrationObservation::BoundOnce,
+                "{label}"
+            );
+            assert!(live.polls >= 1, "{label}: {live:?}");
+            assert_eq!(live.source_sample_calls, live.polls, "{label}");
+            let json = serde_json::to_string(&row).unwrap();
+            assert!(
+                json.contains(r#""source":"agent_utils_paired_pidfd_stat_v1""#),
+                "{label}: {json}"
+            );
+            assert!(
+                !json.contains("cgroup_v2_invocation_cpu_stat_v1"),
+                "{label}: {json}"
+            );
+            assert_cpu_source_roundtrip(&row);
+        }
+        assert_eq!(fs::read_dir(&plain).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source() {
+        let test = "a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source";
+        let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        drop(probe);
+        // The production plan, minus the marker: the cgroup is created under
+        // the test process's own cgroup.
+        let _plan = LiveCpuPlanOverride::set(Ok(false), None);
+        let root = cpu_reader_test_root("invocation-cgroup-row");
+        let saved = root.join("leader.cgroup");
+        let context = run_context(&root);
+        let cell = native_cpu_cell(
+            &format!(
+                "cat /proc/self/cgroup > {}; i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done",
+                saved.display()
+            ),
+            1,
+        );
+        let row = run_cell(&context, &cell).unwrap();
+        // Judged by its attempt, as a naked cell needs two distinct outcomes.
+        assert_eq!(row.error_kind, None, "{row:?}");
+        assert_eq!(row.attempts.len(), 1, "{row:?}");
+        assert_eq!(row.attempts[0].outcome, "PASS", "{row:?}");
+        assert_eq!(row.attempts[0].status, Some(0));
+        row.require_cpu_observations().unwrap();
+        let invocation = &row.cpu_observations.as_ref().unwrap().invocations[0];
+        assert_eq!(invocation.termination, TerminationPath::CompletedWait4);
+        let live = enabled_cpu(invocation);
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        assert_eq!(live.registration, RegistrationObservation::BoundOnce);
+        assert!(live.valid_polls >= 1, "{live:?}");
+        let (RequiredNullable::Value(high), RequiredNullable::Value(last)) =
+            (&live.high_water, &live.last)
+        else {
+            panic!("valid samples must leave points: {live:?}");
+        };
+        assert_eq!(high.cpu_usec, last.cpu_usec);
+        assert!(last.cpu_usec > 0, "{last:?}");
+        let directory = saved_cgroup_directory(&saved);
+        assert!(
+            directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("hermit-e2e-invocation-"),
+            "{}",
+            directory.display()
+        );
+        assert!(!directory.exists(), "{}", directory.display());
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains(r#""source":"cgroup_v2_invocation_cpu_stat_v1""#));
+        assert_cpu_source_roundtrip(&row);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_malformed_fallback_marker_refuses_the_budgeted_command_before_launch() {
+        let root = cpu_reader_test_root("malformed-marker");
+        for value in ["0", "yes", ""] {
+            let allow = process_group_scan_allowed(Some(OsStr::new(value)));
+            assert!(allow.is_err(), "{value:?}");
+            let _plan = LiveCpuPlanOverride::set(allow, None);
+            let label = format!("marker-{}", value.len());
+            let request = |label: &str| {
+                ProcessRequest::new(
+                    InvocationRole::Execution {
+                        attempt_index: "1".into(),
+                        backend: RequiredNullable::Null,
+                    },
+                    &root,
+                    "/bin/sh",
+                    &["-c".into(), "exit 0".into()],
+                    &BTreeMap::new(),
+                    &root.join(format!("{label}.stdout")),
+                    &root.join(format!("{label}.stderr")),
+                )
+            };
+            let mut observations = Vec::new();
+            let error = execute_process_with_cpu_poll_interval(
+                request(&label),
+                ProcessLimits {
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    cpu_budget_usec: Some(1_000_000),
+                    cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+                },
+                &mut observations,
+            )
+            .map(|_| ())
+            .expect_err("a malformed marker must refuse a budgeted command");
+            assert!(error.contains(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV), "{error}");
+            assert!(error.contains(&format!("{value:?}")), "{error}");
+            assert!(!root.join(format!("{label}.stdout")).exists());
+            assert!(!root.join(format!("{label}.stderr")).exists());
+            assert_eq!(observations.len(), 1);
+            let observation = &observations[0];
+            assert_eq!(
+                observation.launch,
+                LaunchObservation::SpawnFailed {
+                    stage: SpawnStage::Spawn,
+                    reason: error.clone(),
+                }
+            );
+            assert_eq!(observation.termination, TerminationPath::SpawnFailed);
+            assert_eq!(observation.final_wait, FinalWaitObservation::NotApplicable);
+            validate_native_observation(observation);
+
+            // An invocation without a CPU budget measures nothing live, so the
+            // marker plays no part in it.
+            let mut observations = Vec::new();
+            let output = execute_process_with_cpu_poll_interval(
+                request(&format!("{label}-unbudgeted")),
+                ProcessLimits {
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    cpu_budget_usec: None,
+                    cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+                },
+                &mut observations,
+            )
+            .unwrap();
+            assert!(output.status.success());
+            assert_eq!(observations[0].live, LiveCpuObservation::Disabled);
+            assert_process_observation(&observations[0], &output);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_escaped_setsid_burner_is_charged_and_killed_through_the_invocation_cgroup() {
+        let test = "an_escaped_setsid_burner_is_charged_and_killed_through_the_invocation_cgroup";
+        let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        drop(probe);
+        let _plan = LiveCpuPlanOverride::set(Ok(false), None);
+        let root = cpu_reader_test_root("escaped-burner");
+        let pid_file = root.join("burner.pid");
+        let saved = root.join("burner.cgroup");
+        // If an assertion fails before the cgroup kills it, the burner must not
+        // outlive the test.
+        struct KillBurner(PathBuf);
+        impl Drop for KillBurner {
+            fn drop(&mut self) {
+                if let Some(pid) = fs::read_to_string(&self.0)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+                {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        let _burner_guard = KillBurner(pid_file.clone());
+        // The burner starts a session of its own, so it is outside the leader's
+        // process group: the process-group scan would not count it and the
+        // group stop would not reach it. It is still in the invocation cgroup.
+        let script = format!(
+            "setsid /bin/sh -c 'echo $$ > {}; cat /proc/self/cgroup > {}; while :; do :; done' & exec sleep 60",
+            pid_file.display(),
+            saved.display()
+        );
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: "1".into(),
+                backend: RequiredNullable::Null,
+            },
+            &root,
+            "/bin/sh",
+            &["-c".into(), script],
+            &BTreeMap::new(),
+            &root.join("burner.stdout"),
+            &root.join("burner.stderr"),
+        );
+        let mut observations = Vec::new();
+        let started = Instant::now();
+        let output = execute_process_with_cpu_poll_interval(
+            request,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(30),
+                cpu_budget_usec: Some(150_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            &mut observations,
+        )
+        .expect("the CPU budget stop must return the charge");
+        assert_eq!(
+            output.timeout,
+            Some(ProcessTimeout::Cpu),
+            "{observations:?}"
+        );
+        let observation = &observations[0];
+        assert_eq!(observation.termination, TerminationPath::CpuBudgetStop);
+        assert_process_observation(observation, &output);
+        let live = enabled_cpu(observation);
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        let RequiredNullable::Value(trigger) = &live.timeout_trigger else {
+            panic!("a CPU stop must retain its trigger: {live:?}");
+        };
+        let leader_cpu = measured_final_cpu(observation);
+        assert!(trigger.cpu_usec >= 150_000, "{trigger:?}");
+        assert!(
+            trigger.cpu_usec > leader_cpu,
+            "the leader's wait4 ({leader_cpu} usec) must not include the escaped burner ({trigger:?})"
+        );
+        assert_eq!(output.cpu_usage_usec, trigger.cpu_usec);
+        // The cgroup killed the burner after the leader was reaped, and was
+        // then removed.
+        let directory = saved_cgroup_directory(&saved);
+        let name = directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("hermit-e2e-invocation-"), "{name}");
+        assert!(!directory.exists(), "{}", directory.display());
+        let burner: libc::pid_t = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{burner}/stat")) {
+            let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+            // A zombie waiting for its new parent is dead; any other process
+            // with this PID must be a later one outside the invocation cgroup.
+            if state != Some(Some('Z')) {
+                let cgroup =
+                    fs::read_to_string(format!("/proc/{burner}/cgroup")).unwrap_or_default();
+                assert!(!cgroup.contains(&name), "burner {burner} survived: {stat}");
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    const GROUP_LEAVING_LEADER_ENV: &str = "HERMIT_RUNNER_TEST_GROUP_LEAVING_LEADER";
+    const GROUP_LEAVING_CHILD_ENV: &str = "HERMIT_RUNNER_TEST_GROUP_LEAVING_CHILD";
+
+    /// A shell script that execs this test binary as
+    /// `group_leaving_leader_helper`, so the leader is a process whose every
+    /// step is known: no interpreter or wrapper stands between it and the
+    /// runner.
+    fn group_leaving_leader_script(moved: &Path, escaped_child: bool) -> String {
+        let exe = std::env::current_exe().unwrap();
+        format!(
+            "export {GROUP_LEAVING_LEADER_ENV}='{}'; {}exec '{}' --exact runner::tests::group_leaving_leader_helper --nocapture --test-threads=1",
+            moved.display(),
+            if escaped_child {
+                format!("export {GROUP_LEAVING_CHILD_ENV}=1; ")
+            } else {
+                String::new()
+            },
+            exe.display()
+        )
+    }
+
+    /// Does nothing unless `group_leaving_leader_script` started it. Then it
+    /// moves into its parent's process group (the runner's), optionally starts
+    /// a child in a session of its own that sleeps for 60 s, writes the file
+    /// named by its environment, and sleeps for 25 s before exiting 0.
+    #[test]
+    fn group_leaving_leader_helper() {
+        let Some(moved) = std::env::var_os(GROUP_LEAVING_LEADER_ENV) else {
+            return;
+        };
+        if unsafe { libc::setpgid(0, libc::getpgid(libc::getppid())) } != 0 {
+            std::process::exit(3);
+        }
+        if std::env::var_os(GROUP_LEAVING_CHILD_ENV).is_some() {
+            match unsafe { libc::fork() } {
+                0 => unsafe {
+                    libc::setsid();
+                    libc::sleep(60);
+                    libc::_exit(0);
+                },
+                -1 => std::process::exit(4),
+                _ => {}
+            }
+        }
+        fs::write(moved, b"").unwrap();
+        thread::sleep(Duration::from_secs(25));
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn a_leader_that_joins_the_runners_process_group_is_killed_when_the_stop_grace_ends() {
+        let root = cpu_reader_test_root("leader-left-its-group");
+        let moved = root.join("moved");
+        // The leader moves into the runner's own process group, so neither the
+        // SIGTERM nor the SIGKILL sent to its original group reaches it. Left
+        // alone it sleeps for 25 s and then exits 0.
+        let script = group_leaving_leader_script(&moved, false);
+        let (child, started, mut observation) = spawn_fixture_with_source(
+            &root,
+            "left-group",
+            &script,
+            Some(LiveCpuSource::AgentUtilsPairedPidfdStatV1),
+        );
+        let pid = child.id();
+        let mut triggered_at = None;
+        let output = monitor_live_cpu(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(60),
+                cpu_budget_usec: Some(100_000),
+                cpu_poll_interval: Duration::from_millis(100),
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            |_, _| {
+                if !moved.exists() {
+                    return Ok(0);
+                }
+                triggered_at.get_or_insert_with(Instant::now);
+                Ok(200_000)
+            },
+        )
+        .expect("the CPU stop must reap the leader");
+        let stopped_at = Instant::now();
+        let triggered_at = triggered_at.expect("the leader must have left its process group");
+        assert_eq!(output.timeout, Some(ProcessTimeout::Cpu), "{observation:?}");
+        assert_eq!(observation.termination, TerminationPath::CpuBudgetStop);
+        let FinalWaitObservation::Reaped { raw_status, .. } = observation.final_wait else {
+            panic!("the stop must reap the leader: {observation:?}");
+        };
+        assert!(
+            libc::WIFSIGNALED(raw_status) && libc::WTERMSIG(raw_status) == libc::SIGKILL,
+            "the leader must be killed, not exit by itself: raw wait status {raw_status:#x}, {:?} after the trigger",
+            stopped_at.duration_since(triggered_at)
+        );
+        // The whole 10 s TERM grace is waited out; the kill that follows reaps
+        // the leader at once, long before its 25 s sleep would end.
+        let stop = stopped_at.duration_since(triggered_at);
+        assert!(
+            stop >= Duration::from_secs(10) && stop < Duration::from_secs(12),
+            "stopped {stop:?} after the trigger"
+        );
+        assert!(owned_child_is_reaped(pid));
+        assert_process_observation(&observation, &output);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_stop_kills_the_invocation_cgroup_before_it_waits_for_a_leader_that_left_its_group() {
+        let test =
+            "the_stop_kills_the_invocation_cgroup_before_it_waits_for_a_leader_that_left_its_group";
+        let Some(mut cgroup) =
+            crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        let root = cpu_reader_test_root("stop-kills-cgroup");
+        let moved = root.join("moved");
+        // The leader moves into the runner's process group and starts a child
+        // in a session of its own; both stay in the invocation cgroup. Left
+        // alone, the leader exits after 25 s and its child after 60 s.
+        let script = group_leaving_leader_script(&moved, true);
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: "1".into(),
+                backend: RequiredNullable::Null,
+            },
+            &root,
+            "/bin/sh",
+            &["-c".into(), script],
+            &BTreeMap::new(),
+            &root.join("leader.stdout"),
+            &root.join("leader.stderr"),
+        );
+        let mut observation = InvocationCpuObservation::pending(
+            1,
+            request.role,
+            request.command,
+            Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+        );
+        let started = Instant::now();
+        let child = spawn_process(
+            &request.cwd,
+            &request.stdout,
+            &request.stderr,
+            Some((cgroup.enrollment_fd(), cgroup.path())),
+            &mut observation,
+        )
+        .unwrap();
+        let output = monitor_live_cpu_in(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(60),
+                cpu_budget_usec: Some(100_000),
+                cpu_poll_interval: Duration::from_millis(100),
+            },
+            started,
+            &mut observation,
+            Some(&cgroup),
+            |_, _| Ok(()),
+            |_| Ok(()),
+            |_, _| Ok(if moved.exists() { 200_000 } else { 0 }),
+        )
+        .expect("the CPU stop must reap the leader");
+        assert_eq!(output.timeout, Some(ProcessTimeout::Cpu), "{observation:?}");
+        assert_eq!(observation.termination, TerminationPath::CpuBudgetStop);
+        // The stop itself killed everything in the cgroup, the escaped child
+        // included, before finish() had a chance to.
+        let emptied_by = Instant::now() + Duration::from_secs(2);
+        while cgroup.populated().unwrap() {
+            assert!(
+                Instant::now() < emptied_by,
+                "the stop left a live process in the invocation cgroup, {:?} after launch",
+                started.elapsed()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        cgroup.finish().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_cell_whose_command_leaves_empty_nested_cgroups_passes_and_leaves_nothing_behind() {
+        use crate::invocation_cgroup::tests::OWN_CGROUP_SH;
+        use crate::invocation_cgroup::tests::RemoveLeftoverCgroup;
+        let test =
+            "a_cell_whose_command_leaves_empty_nested_cgroups_passes_and_leaves_nothing_behind";
+        let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        drop(probe);
+        let _plan = LiveCpuPlanOverride::set(Ok(false), None);
+        let root = cpu_reader_test_root("nested-empty-cgroups");
+        let saved = root.join("leader.cgroup");
+        let _leftovers = RemoveLeftoverCgroup(saved.clone());
+        let context = run_context(&root);
+        // A nested runner makes cgroups of its own below the one it runs in;
+        // this command does the same and leaves them empty when it succeeds.
+        let cell = native_cpu_cell(
+            &format!(
+                r#"cat /proc/self/cgroup > '{}'; {OWN_CGROUP_SH}mkdir "$cg/nested" "$cg/nested/deeper""#,
+                saved.display()
+            ),
+            1,
+        );
+        let row = run_cell(&context, &cell)
+            .unwrap_or_else(|failure| panic!("the successful command's cell failed: {failure}"));
+        assert_eq!(row.error_kind, None, "{row:?}");
+        assert_eq!(row.attempts.len(), 1, "{row:?}");
+        assert_eq!(row.attempts[0].outcome, "PASS", "{row:?}");
+        row.require_cpu_observations().unwrap();
+        let invocation = &row.cpu_observations.as_ref().unwrap().invocations[0];
+        assert_eq!(invocation.termination, TerminationPath::CompletedWait4);
+        assert_eq!(
+            enabled_cpu(invocation).source,
+            LiveCpuSource::CgroupV2InvocationCpuStatV1
+        );
+        let directory = saved_cgroup_directory(&saved);
+        assert!(
+            directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("hermit-e2e-invocation-"),
+            "{}",
+            directory.display()
+        );
+        assert!(
+            !directory.exists(),
+            "{} is left behind",
+            directory.display()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_populated_nested_cgroup_is_killed_and_removed_when_the_wall_budget_stops_the_command() {
+        use crate::invocation_cgroup::tests::KillPidFile;
+        use crate::invocation_cgroup::tests::OWN_CGROUP_SH;
+        use crate::invocation_cgroup::tests::RemoveLeftoverCgroup;
+        let test = "a_populated_nested_cgroup_is_killed_and_removed_when_the_wall_budget_stops_the_command";
+        let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        drop(probe);
+        let _plan = LiveCpuPlanOverride::set(Ok(false), None);
+        let root = cpu_reader_test_root("nested-populated-cgroup");
+        let saved = root.join("leader.cgroup");
+        let pid_file = root.join("nested.pid");
+        let _leftovers = RemoveLeftoverCgroup(saved.clone());
+        let _sleeper = KillPidFile(pid_file.clone());
+        // The leader starts a child in a session of its own, beyond the stop's
+        // process-group signals, which moves into a nested cgroup and sleeps.
+        // The leader then sleeps past its wall budget.
+        let script = format!(
+            r#"cat /proc/self/cgroup > '{saved}'; {OWN_CGROUP_SH}mkdir "$cg/nested" && setsid /bin/sh -c 'echo $$ > "$1/cgroup.procs" && echo $$ > "$2" && exec sleep 60' sh "$cg/nested" '{pid}' & while [ ! -s '{pid}' ]; do sleep 0.05; done; exec sleep 60"#,
+            saved = saved.display(),
+            pid = pid_file.display()
+        );
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: "1".into(),
+                backend: RequiredNullable::Null,
+            },
+            &root,
+            "/bin/sh",
+            &["-c".into(), script],
+            &BTreeMap::new(),
+            &root.join("leader.stdout"),
+            &root.join("leader.stderr"),
+        );
+        let mut observations = Vec::new();
+        let output = execute_process_with_cpu_poll_interval(
+            request,
+            ProcessLimits {
+                deadline: Instant::now() + Duration::from_secs(3),
+                cpu_budget_usec: Some(60_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            &mut observations,
+        )
+        .unwrap_or_else(|error| panic!("the wall stop must return its outcome: {error}"));
+        assert_eq!(
+            output.timeout,
+            Some(ProcessTimeout::Wall),
+            "{observations:?}"
+        );
+        let observation = &observations[0];
+        assert_eq!(observation.termination, TerminationPath::WallBudgetStop);
+        assert_eq!(
+            enabled_cpu(observation).source,
+            LiveCpuSource::CgroupV2InvocationCpuStatV1
+        );
+        let directory = saved_cgroup_directory(&saved);
+        let name = directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("hermit-e2e-invocation-"), "{name}");
+        assert!(
+            !directory.exists(),
+            "{} is left behind",
+            directory.display()
+        );
+        let sleeper: libc::pid_t = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{sleeper}/stat")) {
+            let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+            // A zombie waiting for its new parent is dead; a live process with
+            // this PID must be a later one outside the removed cgroup.
+            if state != Some(Some('Z')) {
+                let membership =
+                    fs::read_to_string(format!("/proc/{sleeper}/cgroup")).unwrap_or_default();
+                assert!(
+                    !membership.contains(&name),
+                    "sleeper {sleeper} survived: {stat}"
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_child_still_in_the_root_cgroup_while_forked_is_read_again() {
+        let invocation = "/runner/hermit-e2e-invocation-1";
+        // Process 8's cgroup reads as each entry of `reads` in turn, then as
+        // the last one; 7, the leader, is inside.
+        let check = |reads: &[Option<&str>]| {
+            let reads: Vec<Option<String>> =
+                reads.iter().map(|read| read.map(str::to_owned)).collect();
+            let seen = std::cell::Cell::new(0);
+            let result = check_cgroup_membership(
+                7,
+                true,
+                invocation,
+                |_| Ok(vec![7, 8]),
+                |pid| match pid {
+                    7 => Ok(Some(invocation.to_owned())),
+                    8 => {
+                        let read = reads[seen.get().min(reads.len() - 1)].clone();
+                        seen.set(seen.get() + 1);
+                        Ok(read)
+                    }
+                    other => panic!("process {other} was not expected to be checked"),
+                },
+            );
+            (result, seen.get())
+        };
+        // In the root cgroup while fork creates it, then in the invocation.
+        assert_eq!(check(&[Some("/"), Some(invocation)]), (Ok(()), 2));
+        assert_eq!(
+            check(&[
+                Some("/"),
+                Some("/"),
+                Some("/runner/hermit-e2e-invocation-1/x")
+            ]),
+            (Ok(()), 3)
+        );
+        // Gone before a re-read: not outside.
+        assert_eq!(check(&[Some("/"), None]), (Ok(()), 2));
+        // A reader in a nested cgroup namespace sees the host root through
+        // parent components. It is still outside until a later read proves
+        // the child joined this invocation (or the child has exited).
+        for root in ["/..", "/../..", "/../../../../../.."] {
+            assert_eq!(check(&[Some(root), Some(invocation)]), (Ok(()), 2));
+            assert_eq!(
+                check(&[Some(root), Some("/runner/hermit-e2e-invocation-1/x")]),
+                (Ok(()), 2)
+            );
+            assert_eq!(check(&[Some(root), None]), (Ok(()), 2));
+            let (stays, reads) = check(&[Some(root)]);
+            assert!(stays.unwrap_err().contains("outside its invocation cgroup"));
+            assert_eq!(reads, 1 + FORK_WINDOW_REREADS as usize);
+        }
+        // Only the ancestor-only spelling receives the bounded fork check;
+        // neither a sibling nor a malformed path is a transient root claim.
+        for outside in [
+            "/../other",
+            "/../../other",
+            "/./..",
+            "/..//..",
+            "../..",
+            "/../",
+        ] {
+            let (result, reads) = check(&[Some(outside), Some(invocation)]);
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("outside its invocation cgroup")
+            );
+            assert_eq!(reads, 1, "{outside}");
+        }
+        // Read again only for the root cgroup: a parent cgroup is refused at once.
+        let (parent, reads) = check(&[Some("/runner"), Some(invocation)]);
+        assert!(parent.unwrap_err().contains("process 8 (a member"));
+        assert_eq!(reads, 1);
+        // Still in the root cgroup after every re-read: refused.
+        let (stays, reads) = check(&[Some("/")]);
+        let refusal = stays.unwrap_err();
+        assert!(
+            refusal.contains("process 8 (a member of the leader's process group) is in cgroup /,"),
+            "{refusal}"
+        );
+        assert_eq!(reads, 1 + FORK_WINDOW_REREADS as usize);
+    }
+
+    #[test]
+    fn the_cgroup_membership_check_refuses_every_process_it_sees_outside_the_cgroup() {
+        let invocation = "/runner/hermit-e2e-invocation-1";
+        let check = |leader_unreaped: bool,
+                     members: Result<Vec<u32>, String>,
+                     cgroups: &[(u32, Result<Option<&str>, &str>)]| {
+            check_cgroup_membership(
+                7,
+                leader_unreaped,
+                invocation,
+                |pgid| {
+                    assert_eq!(pgid, 7, "the leader's PID names its process group");
+                    members
+                },
+                |pid| match cgroups.iter().find(|(member, _)| *member == pid) {
+                    Some((_, Ok(cgroup))) => Ok(cgroup.map(str::to_owned)),
+                    Some((_, Err(error))) => Err((*error).to_owned()),
+                    None => panic!("process {pid} was not expected to be checked"),
+                },
+            )
+        };
+        let inside = Ok(Some(invocation));
+        let nested = Ok(Some("/runner/hermit-e2e-invocation-1/nested"));
+        let parent = Ok(Some("/runner"));
+        // Shares the invocation's name as a prefix but is a sibling cgroup.
+        let sibling = Ok(Some("/runner/hermit-e2e-invocation-10"));
+        let gone = Ok(None);
+
+        assert_eq!(
+            check(
+                true,
+                Ok(vec![7, 8, 9]),
+                &[(7, inside), (8, nested), (9, inside)]
+            ),
+            Ok(())
+        );
+        // A member that exited between the scan and its cgroup read is gone,
+        // not outside.
+        assert_eq!(
+            check(true, Ok(vec![7, 8]), &[(7, inside), (8, gone)]),
+            Ok(())
+        );
+        // A reaped leader is not checked; only its group's members remain.
+        assert_eq!(check(false, Ok(vec![8]), &[(8, nested)]), Ok(()));
+
+        for (label, leader_unreaped, members, cgroups, offender) in [
+            (
+                "member in the parent",
+                true,
+                vec![7, 8],
+                vec![(7, inside), (8, parent)],
+                "process 8 (a member",
+            ),
+            (
+                "member in a sibling",
+                true,
+                vec![7, 8],
+                vec![(7, inside), (8, sibling)],
+                "process 8 (a member",
+            ),
+            (
+                "member after the leader exited",
+                false,
+                vec![8],
+                vec![(8, parent)],
+                "process 8 (a member",
+            ),
+            // The leader left its process group as well as its cgroup; the
+            // pidfd-named leader is still checked.
+            (
+                "leader in another group",
+                true,
+                vec![],
+                vec![(7, parent)],
+                "process 7 (the leader)",
+            ),
+            (
+                "leader in its group",
+                true,
+                vec![7],
+                vec![(7, sibling)],
+                "process 7 (the leader)",
+            ),
+        ] {
+            let refusal = check(leader_unreaped, Ok(members), &cgroups)
+                .expect_err(&format!("{label}: a process outside must be refused"));
+            assert!(refusal.contains(offender), "{label}: {refusal}");
+            assert!(
+                refusal.contains("outside its invocation cgroup /runner/hermit-e2e-invocation-1"),
+                "{label}: {refusal}"
+            );
+        }
+
+        // A check that cannot be made refuses rather than passes.
+        let unreadable = check(true, Ok(vec![7, 8]), &[(7, inside), (8, Err("EACCES"))])
+            .expect_err("an unreadable member must be refused");
+        assert!(
+            unreadable.contains("cannot check") && unreadable.contains("EACCES"),
+            "{unreadable}"
+        );
+        let unscanned = check(true, Err("/proc: EMFILE".into()), &[])
+            .expect_err("a failed process-group scan must be refused");
+        assert!(
+            unscanned.contains("cannot check") && unscanned.contains("EMFILE"),
+            "{unscanned}"
+        );
+
+        assert!(within_cgroup(invocation, invocation));
+        assert!(within_cgroup(
+            "/runner/hermit-e2e-invocation-1/a/b",
+            invocation
+        ));
+        assert!(!within_cgroup(
+            "/runner/hermit-e2e-invocation-10",
+            invocation
+        ));
+        assert!(!within_cgroup("/runner", invocation));
+        assert!(!within_cgroup("/", invocation));
+    }
+
+    #[test]
+    fn the_real_membership_readers_find_this_process_and_its_group() {
+        // The production readers, on this test process: it is in its own
+        // process group's member list and in the cgroup its `0::` line names.
+        let pid = std::process::id();
+        let pgid = unsafe { libc::getpgid(0) } as u32;
+        let members = process_group_members(pgid).unwrap();
+        assert!(members.contains(&pid), "{pid} not among {members:?}");
+        let own = fs::read_to_string("/proc/self/cgroup").unwrap();
+        let expected = own
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .expect("a cgroup v2 line");
+        assert_eq!(process_cgroup(pid).unwrap().as_deref(), Some(expected));
+        // Other processes share this test's process group, and other tests
+        // move their children between cgroups, so only this process is fed
+        // to the check, through the real cgroup reader.
+        assert_eq!(
+            check_cgroup_membership(pid, true, expected, |_| Ok(vec![pid]), process_cgroup),
+            Ok(())
+        );
+        let elsewhere = check_cgroup_membership(
+            pid,
+            true,
+            "/not-this-cgroup",
+            |_| Ok(vec![pid]),
+            process_cgroup,
+        )
+        .expect_err("this process is not in /not-this-cgroup");
+        assert!(
+            elsewhere.contains(&format!("is in cgroup {expected},")),
+            "{elsewhere}"
+        );
+        // A reaped process reads as gone, not as an error.
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let reaped = child.id();
+        child.wait().unwrap();
+        assert_eq!(process_cgroup(reaped), Ok(None));
+    }
+
+    #[test]
+    fn the_process_group_is_read_after_the_last_parenthesis_of_any_command_name() {
+        // A command name holds up to 15 bytes of anything: parentheses,
+        // spaces and bytes that are not UTF-8.
+        assert_eq!(
+            stat_process_group(b"4124033 (a\xff) (\xfe b) S 1 4124001 4124001 0 -1"),
+            Some(4124001)
+        );
+        assert_eq!(stat_process_group(b"7 (sleep) S 1 7 7 0 -1"), Some(7));
+        for malformed in [
+            &b"7 sleep S 1 7 7 0 -1"[..],
+            b"7 (sleep) S 1",
+            b"7 (sleep) S 1 x 7",
+            b"7 (sleep) S 1 \xff 7",
+            b"",
+        ] {
+            assert_eq!(
+                stat_process_group(malformed),
+                None,
+                "{}",
+                String::from_utf8_lossy(malformed)
+            );
+        }
+    }
+
+    fn reads(
+        script: Vec<Result<StatRead, String>>,
+    ) -> (
+        std::rc::Rc<std::cell::Cell<usize>>,
+        impl FnMut(u32) -> Result<StatRead, String>,
+    ) {
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = count.clone();
+        let mut script = script.into_iter();
+        let read = move |pid: u32| {
+            assert_eq!(pid, 7);
+            seen.set(seen.get() + 1);
+            script.next().expect("no more reads were expected")
+        };
+        (count, read)
+    }
+
+    fn bytes(stat: &[u8]) -> Result<StatRead, String> {
+        Ok(StatRead::Bytes(stat.to_vec()))
+    }
+
+    fn unasked(_: u32) -> Result<bool, String> {
+        panic!("existence must not be checked when the first read decides")
+    }
+
+    #[test]
+    fn a_stat_that_parses_names_its_group_from_one_read() {
+        let (count, read) = reads(vec![bytes(b"7 (sleep) S 1 42 42 0 -1")]);
+        assert_eq!(member_process_group(7, read, unasked), Ok(Some(42)));
+        assert_eq!(count.get(), 1);
+    }
+
+    #[test]
+    fn a_process_gone_at_its_first_read_is_skipped() {
+        let (count, read) = reads(vec![Ok(StatRead::Gone)]);
+        assert_eq!(member_process_group(7, read, unasked), Ok(None));
+        assert_eq!(count.get(), 1);
+        let (_, failing) = reads(vec![Err("/proc/7/stat: EACCES".into())]);
+        assert_eq!(
+            member_process_group(7, failing, unasked),
+            Err("/proc/7/stat: EACCES".into())
+        );
+    }
+
+    #[test]
+    fn a_malformed_stat_of_a_process_whose_proc_entry_is_gone_is_skipped() {
+        let (count, read) = reads(vec![bytes(b"")]);
+        assert_eq!(member_process_group(7, read, |_| Ok(false)), Ok(None));
+        assert_eq!(count.get(), 1, "a gone process is not read again");
+        let (_, read) = reads(vec![bytes(b"")]);
+        assert_eq!(
+            member_process_group(7, read, |_| Err("/proc/7: EACCES".into())),
+            Err("/proc/7: EACCES".into())
+        );
+    }
+
+    #[test]
+    fn a_malformed_stat_whose_reread_finds_the_process_gone_is_skipped() {
+        let (count, read) = reads(vec![bytes(b"7 (sleep) S 1"), Ok(StatRead::Gone)]);
+        assert_eq!(member_process_group(7, read, |_| Ok(true)), Ok(None));
+        assert_eq!(count.get(), 2);
+    }
+
+    #[test]
+    fn a_malformed_stat_that_parses_when_reread_names_its_group() {
+        let (count, read) = reads(vec![bytes(b""), bytes(b"7 (sleep) S 1 42 42 0 -1")]);
+        assert_eq!(member_process_group(7, read, |_| Ok(true)), Ok(Some(42)));
+        assert_eq!(count.get(), 2);
+    }
+
+    #[test]
+    fn a_live_process_whose_stat_still_does_not_parse_fails_with_both_reads_bytes() {
+        let long = [b'x'; 70];
+        let (count, read) = reads(vec![bytes(b"7 (a\"\xff\n"), bytes(&long)]);
+        let error = member_process_group(7, read, |_| Ok(true))
+            .expect_err("a live, unparseable process must fail the check");
+        assert_eq!(count.get(), 2, "read exactly once more");
+        assert_eq!(
+            error,
+            format!(
+                "/proc/7/stat is malformed in two reads of a live process: \
+                 first 7 bytes \"7 (a\\\"\\xff\\n\"; re-read 70 bytes \"{}\"",
+                "x".repeat(64)
+            )
+        );
+    }
+
+    #[test]
+    fn the_real_existence_reader_sees_this_process_and_not_a_reaped_one() {
+        assert_eq!(process_exists(std::process::id()), Ok(true));
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let reaped = child.id();
+        child.wait().unwrap();
+        assert_eq!(process_exists(reaped), Ok(false));
+        assert!(matches!(read_process_stat(reaped), Ok(StatRead::Gone)));
+    }
+
+    #[test]
+    fn a_process_named_with_bytes_that_are_not_utf8_does_not_fail_the_scan() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // Exec names a process after the last component of the path it ran,
+        // so a child run through this symlink is named with bytes that are
+        // not UTF-8. The scan reads every process's stat, whichever group it
+        // looks for, so such a name anywhere on the host reaches it.
+        let base = std::env::temp_dir().join(format!("runner-non-utf8-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let name = b"scan\xff) (\xfe";
+        let link = base.join(OsStr::from_bytes(name));
+        std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
+        let mut child = Command::new(&link)
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Exec renames the process after the spawn has returned, so wait for
+        // the name before scanning.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let renamed = loop {
+            let comm = fs::read(format!("/proc/{pid}/comm")).unwrap_or_default();
+            if comm.strip_suffix(b"\n") == Some(&name[..]) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        let members = process_group_members(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_dir_all(&base).unwrap();
+        assert!(renamed, "the child never took the symlink's name");
+        assert_eq!(members, Ok(vec![pid]));
+    }
+
+    #[test]
+    fn a_membership_refusal_stops_the_invocation_and_charges_nothing() {
+        use std::cell::Cell;
+
+        // Each place the monitor checks membership must turn a refusal into a
+        // stopped, reaped, uncharged invocation: at a live poll, before a wall
+        // stop, and after the leader returned.
+        for (case, script, poll, wall) in [
+            ("poll", "exec sleep 30", Duration::from_millis(50), 20),
+            ("wall", "exec sleep 30", Duration::from_secs(600), 1),
+            ("return", "exit 0", Duration::from_secs(600), 20),
+        ] {
+            let root = cpu_reader_test_root(&format!("membership-refusal-{case}"));
+            let (child, started, mut observation) = spawn_fixture_with_source(
+                &root,
+                case,
+                script,
+                Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+            );
+            let pid = child.id();
+            let checks = Cell::new(Vec::new());
+            let result = monitor_live_cpu_in(
+                child,
+                ProcessLimits {
+                    deadline: started + Duration::from_secs(wall),
+                    cpu_budget_usec: Some(60_000_000),
+                    cpu_poll_interval: poll,
+                },
+                started,
+                &mut observation,
+                None,
+                |checked, leader_unreaped| {
+                    let mut seen = checks.take();
+                    seen.push((checked, leader_unreaped));
+                    let refuse = case != "poll" || seen.len() >= 2;
+                    checks.set(seen);
+                    if refuse {
+                        Err("process 1 (fixture) is outside its invocation cgroup".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| Ok(()),
+                |_, _| Ok(10),
+            );
+            let error = result.map(|_| ()).expect_err(&format!(
+                "{case}: a membership refusal must fail the invocation"
+            ));
+            assert!(
+                error.contains("outside its invocation cgroup"),
+                "{case}: {error}"
+            );
+            assert_eq!(
+                observation.termination,
+                TerminationPath::CgroupMembershipStop,
+                "{case}"
+            );
+            assert_eq!(
+                observation.returned_cpu_charge,
+                ReturnedCpuCharge::Unavailable,
+                "{case}"
+            );
+            assert!(owned_child_is_reaped(pid), "{case}");
+            let seen = checks.take();
+            assert!(
+                seen.iter().all(|(checked, _)| *checked == pid),
+                "{case}: {seen:?}"
+            );
+            let live = enabled_cpu(&observation);
+            match case {
+                // The refused poll took no sample, so no trigger can be
+                // recorded beside the refusal.
+                "poll" => {
+                    assert_eq!(seen, vec![(pid, true), (pid, true)]);
+                    assert_eq!(live.polls, 1);
+                }
+                "wall" => {
+                    assert_eq!(seen, vec![(pid, true)]);
+                    assert_eq!(live.polls, 0);
+                }
+                _ => {
+                    assert_eq!(seen, vec![(pid, false)]);
+                    assert!(matches!(
+                        observation.final_wait,
+                        FinalWaitObservation::Reaped { raw_status: 0, .. }
+                    ));
+                }
+            }
+            validate_native_observation(&observation);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// A process moves itself out of its invocation cgroup into the runner's
+    /// own cgroup above it, keeping the command's process group. The cgroup
+    /// counter no longer sees its CPU, which the process-group scan the
+    /// cgroup replaced would have charged, so the invocation must be stopped
+    /// and refused rather than charged or passed. The four cases put the
+    /// escape where each check must catch it: at a live poll (the leader
+    /// itself, and a member found by the process-group scan), after the
+    /// leader exits with status 0, and before a wall stop, the last two with
+    /// no live poll at all.
+    #[test]
+    fn a_process_that_moves_out_of_its_invocation_cgroup_is_stopped_and_refused() {
+        use crate::invocation_cgroup::tests::KillPidFile;
+        use crate::invocation_cgroup::tests::OWN_CGROUP_SH;
+        use crate::invocation_cgroup::tests::RemoveLeftoverCgroup;
+        let test = "a_process_that_moves_out_of_its_invocation_cgroup_is_stopped_and_refused";
+        let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        drop(probe);
+        let _plan = LiveCpuPlanOverride::set(Ok(false), None);
+        let mut failures = Vec::new();
+        // (case, CPU poll interval, wall budget, latest acceptable refusal)
+        for (case, poll, wall, refused_within) in [
+            ("leader", CELL_CPU_POLL_INTERVAL, 8, 6),
+            ("member", CELL_CPU_POLL_INTERVAL, 8, 6),
+            ("member-then-leader-exits", Duration::from_secs(600), 8, 6),
+            ("member-until-wall", Duration::from_secs(600), 2, 6),
+        ] {
+            let root = cpu_reader_test_root(&format!("cgroup-escape-{case}"));
+            let saved = root.join("leader.cgroup");
+            let pid_file = root.join("escaped.pid");
+            let _leftovers = RemoveLeftoverCgroup(saved.clone());
+            let _escaped = KillPidFile(pid_file.clone());
+            // `$cg` is the invocation cgroup; `${cg%/*}` is the runner's own
+            // cgroup above it. A background job of a noninteractive shell
+            // stays in the leader's process group.
+            let member = format!(
+                r#"/bin/sh -c 'echo $$ > "$1/cgroup.procs" && echo $$ > "$2.tmp" && mv "$2.tmp" "$2" && exec sleep 30' sh "${{cg%/*}}" '{pid}' & while [ ! -s '{pid}' ]; do sleep 0.05; done; "#,
+                pid = pid_file.display()
+            );
+            let body = match case {
+                "leader" => format!(
+                    r#"echo $$ > "${{cg%/*}}/cgroup.procs" && echo $$ > '{pid}' && exec sleep 30"#,
+                    pid = pid_file.display()
+                ),
+                "member-then-leader-exits" => format!("{member}exit 0"),
+                _ => format!("{member}exec sleep 30"),
+            };
+            let script = format!(
+                "cat /proc/self/cgroup > '{saved}'; {OWN_CGROUP_SH}{body}",
+                saved = saved.display()
+            );
+            let request = ProcessRequest::new(
+                InvocationRole::Execution {
+                    attempt_index: "1".into(),
+                    backend: RequiredNullable::Null,
+                },
+                &root,
+                "/bin/sh",
+                &["-c".into(), script],
+                &BTreeMap::new(),
+                &root.join("leader.stdout"),
+                &root.join("leader.stderr"),
+            );
+            let mut observations = Vec::new();
+            let started = Instant::now();
+            let result = execute_process_with_cpu_poll_interval(
+                request,
+                ProcessLimits {
+                    deadline: started + Duration::from_secs(wall),
+                    cpu_budget_usec: Some(60_000_000),
+                    cpu_poll_interval: poll,
+                },
+                &mut observations,
+            );
+            let elapsed = started.elapsed();
+            let shown = match &result {
+                Ok(output) => format!(
+                    "Ok(status {:?}, timeout {:?}, cpu {} usec)",
+                    output.status, output.timeout, output.cpu_usage_usec
+                ),
+                Err(reason) => format!("Err({reason})"),
+            };
+            let observation = &observations[0];
+            let termination = serde_json::to_value(&observation.termination).unwrap();
+            let mut problems = Vec::new();
+            match &result {
+                Err(reason) if reason.contains("outside its invocation cgroup") => {}
+                _ => problems.push("the result is not a cgroup refusal".to_string()),
+            }
+            if termination != serde_json::json!("cgroup_membership_stop") {
+                problems.push(format!("termination {termination}"));
+            }
+            if observation.returned_cpu_charge != ReturnedCpuCharge::Unavailable {
+                problems.push(format!("charge {:?}", observation.returned_cpu_charge));
+            }
+            if enabled_cpu(observation).source != LiveCpuSource::CgroupV2InvocationCpuStatV1 {
+                problems.push("not the cgroup source".into());
+            }
+            if elapsed >= Duration::from_secs(refused_within) {
+                problems.push(format!("refused only after {elapsed:?}"));
+            }
+            if case == "member-then-leader-exits"
+                && !matches!(
+                    observation.final_wait,
+                    FinalWaitObservation::Reaped { raw_status: 0, .. }
+                )
+            {
+                problems.push(format!("final wait {:?}", observation.final_wait));
+            }
+            let directory = saved_cgroup_directory(&saved);
+            if directory.exists() {
+                problems.push(format!("{} is left behind", directory.display()));
+            }
+            // The escaped process kept the leader's process group, so the
+            // stop's group signals reach it outside the cgroup.
+            let LaunchObservation::Spawned { pid: leader } = observation.launch else {
+                panic!("{case}: not launched: {observation:?}");
+            };
+            let escaped = fs::read_to_string(&pid_file).unwrap_or_default();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let state = fs::read_to_string(format!("/proc/{}/stat", escaped.trim()))
+                    .ok()
+                    .and_then(|stat| {
+                        let rest = stat.rsplit_once(") ")?.1.to_owned();
+                        let mut fields = rest.split_whitespace();
+                        Some((fields.next()?.to_owned(), fields.nth(1)?.to_owned()))
+                    });
+                match state {
+                    Some((state, group)) if state != "Z" && group == leader.to_string() => {
+                        if Instant::now() >= deadline {
+                            problems.push(format!("escaped process {} survived", escaped.trim()));
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    _ => break,
+                }
+            }
+            if problems.is_empty() {
+                validate_native_observation(observation);
+            } else {
+                failures.push(format!("{case}: {problems:?} after {elapsed:?}: {shown}"));
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]
@@ -9913,12 +16848,17 @@ int main(int argc, char **argv) {
             &root.join("work.stderr"),
         );
         let started = Instant::now();
-        let mut observation =
-            InvocationCpuObservation::pending(1, request.role, request.command, true);
+        let mut observation = InvocationCpuObservation::pending(
+            1,
+            request.role,
+            request.command,
+            Some(LiveCpuSource::AgentUtilsPairedPidfdStatV1),
+        );
         let child = spawn_process(
             &request.cwd,
             &request.stdout,
             &request.stderr,
+            None,
             &mut observation,
         )
         .unwrap();
@@ -10295,6 +17235,7 @@ int main(int argc, char **argv) {
             enabled: true,
             timeout_seconds: 10,
             cpu_timeout_seconds: 1,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: root.clone(),
@@ -10319,6 +17260,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
 
         let result = run_cell(&context, &cell).unwrap();
@@ -10370,6 +17312,7 @@ int main(int argc, char **argv) {
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: root.clone(),
@@ -10394,6 +17337,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let result = host_inapplicable_result(
             &context,
@@ -10495,6 +17439,7 @@ int main(int argc, char **argv) {
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let mut context = RunContext {
             root: root.clone(),
@@ -10519,6 +17464,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let path = root.join("results.jsonl");
         prepare_result_path(&path).unwrap();
@@ -10699,6 +17645,7 @@ backends_disabled:
   dbt: unsupported
   kvm: unsupported
   sabre: unsupported
+  in-guest-trap: unsupported
 "#,
         )
         .unwrap();
@@ -10771,6 +17718,7 @@ backends_disabled:
                 enabled: true,
                 timeout_seconds: 15,
                 cpu_timeout_seconds: 10,
+                host_level: HostLevel::default(),
             };
             let context = RunContext {
                 root: PathBuf::from("/repo"),
@@ -10795,6 +17743,7 @@ backends_disabled:
                 timeout_multipliers: TimeoutMultipliers::default(),
                 scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
                 isolated_workdir: None,
+                exact_branch_counter: None,
             };
             let spec = build_spec(
                 &context,
@@ -10847,6 +17796,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -10871,6 +17821,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let spec = build_spec(
             &context,
@@ -10905,6 +17856,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -10929,6 +17881,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: Some(PathBuf::from("/test")),
+            exact_branch_counter: None,
         };
         let spec = build_spec(
             &context,
@@ -10968,6 +17921,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let replay = build_spec(
             &context,
@@ -11010,6 +17964,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let custom = build_spec(
             &context,
@@ -11048,6 +18003,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let naked_error = build_spec(
             &context,
@@ -11080,6 +18036,8 @@ backends_disabled:
             "README.md".into(),
             ".".into(),
             "missing/path".into(),
+            "./README.md".into(),
+            "./tests/./e2e".into(),
         ];
         resolve_repo_guest_args(&root, &mut argv);
         assert_eq!(argv[0], "tool");
@@ -11087,11 +18045,17 @@ backends_disabled:
         assert_eq!(argv[2], root.join("README.md").to_string_lossy());
         assert_eq!(argv[3], ".");
         assert_eq!(argv[4], "missing/path");
+        // The manifests spell six repo paths `./examples/...`; the resolved
+        // path must carry no `.` component after the root.
+        assert_eq!(argv[5], root.join("README.md").to_string_lossy());
+        assert_eq!(argv[6], root.join("tests/e2e").to_string_lossy());
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A dbt verify cell's guest starts in the bound /tmp/test like every other
+    /// backend's, so its repo-relative arguments are resolved in both shapes.
     #[test]
-    fn ordinary_dbt_arguments_remain_literal_until_isolation_is_requested() {
+    fn dbt_repo_arguments_resolve_before_the_guest_changes_directory() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-dbt-literal-args-{}",
             std::process::id()
@@ -11111,27 +18075,106 @@ backends_disabled:
         cell.test.direct = Some(DirectCommand::Argv(original.clone()));
         let mut context = run_context(root.as_path());
         let dir = root.as_path().join("results/cell");
-        assert_eq!(prepare_test(&context, &cell, &dir).unwrap(), original);
+        let resolved = vec![
+            original[0].clone(),
+            root.as_path()
+                .join("literal.txt")
+                .to_string_lossy()
+                .into_owned(),
+            // `./literal.txt` resolves without its `.` component.
+            root.as_path()
+                .join("literal.txt")
+                .to_string_lossy()
+                .into_owned(),
+            original[3].clone(),
+            original[4].clone(),
+        ];
+        assert_eq!(prepare_test(&context, &cell, &dir).unwrap(), resolved);
 
         context.isolated_workdir = Some(PathBuf::from("/test"));
-        let isolated = prepare_test(&context, &cell, &dir).unwrap();
+        assert_eq!(prepare_test(&context, &cell, &dir).unwrap(), resolved);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The compat corpus hands its guests fixtures below the run state and
+    /// files below the checkout. A verify guest names both at fixed guest
+    /// paths, so the reference and each candidate cell, which have their own
+    /// run state and bundle checkout under Buck, pass the same arguments
+    /// (https://github.com/rrnewton/hermit/issues/4337). The harness's own
+    /// per-cell trees are not rebased onto the checkout.
+    #[test]
+    fn verify_guests_name_fixtures_and_checkout_files_at_fixed_guest_paths() {
+        let mut context = run_context(Path::new("/repo"));
+        context.result_root = PathBuf::from("/repo/target/results");
+        context.build_root = PathBuf::from("/repo/target/build");
+        let cell_dir = Path::new("/repo/target/results/cell");
+        let argv_for = |run_state: &str| {
+            let roots = equalized_roots(&context, Some(OsStr::new(run_state)));
+            let fixtures = format!("{run_state}/strict-compat/real-compat-fixtures");
+            equalized_guest_argv(
+                cell_dir,
+                &roots,
+                vec![
+                    "env".into(),
+                    format!("REAL_COMPAT_FIXTURES={fixtures}"),
+                    "bash".into(),
+                    "/repo/tests/compat/real_compat_workload.sh".into(),
+                    format!("{fixtures}/README.md"),
+                    "/repo/target/results/cell/tmp/out".into(),
+                    format!("{run_state}/strict-compat/shell-build"),
+                    "--tab-file=/repo/ci/compat/findmnt.fixture".into(),
+                ],
+            )
+        };
+        let (reference, reference_roots) = argv_for("/repo/target/validation/run-a/state");
+        let (candidate, candidate_roots) = argv_for("/repo/target/validation/run-b/state");
         assert_eq!(
-            isolated,
-            vec![
-                original[0].clone(),
-                root.as_path()
-                    .join("literal.txt")
-                    .to_string_lossy()
-                    .into_owned(),
-                root.as_path()
-                    .join("./literal.txt")
-                    .to_string_lossy()
-                    .into_owned(),
-                original[3].clone(),
-                original[4].clone(),
+            reference[..5],
+            [
+                "env".to_string(),
+                format!("REAL_COMPAT_FIXTURES={COMPAT_FIXTURES_GUEST_PATH}"),
+                "bash".into(),
+                format!("{REPOSITORY_GUEST_PATH}/tests/compat/real_compat_workload.sh"),
+                format!("{COMPAT_FIXTURES_GUEST_PATH}/README.md"),
             ]
         );
-        fs::remove_dir_all(root).unwrap();
+        assert_eq!(reference[..5], candidate[..5]);
+        // Per-run harness paths stay host paths, and so does a path embedded
+        // in an option.
+        assert_eq!(reference[5], "/repo/target/results/cell/tmp/out");
+        assert_eq!(
+            reference[6],
+            "/repo/target/validation/run-a/state/strict-compat/shell-build"
+        );
+        assert_eq!(reference[7], "--tab-file=/repo/ci/compat/findmnt.fixture");
+        // Each named root is bound from that cell's own directory.
+        let binds = |roots: &[EqualizedRoot]| {
+            let mut argv = Vec::new();
+            append_equalized_input_binds(&mut argv, cell_dir, roots);
+            argv.split_off(EQUALIZED_INPUTS.len())
+        };
+        assert_eq!(
+            binds(&reference_roots),
+            [
+                format!(
+                    "--bind=/repo/target/validation/run-a/state/strict-compat/real-compat-fixtures:{COMPAT_FIXTURES_GUEST_PATH}"
+                ),
+                format!("--bind=/repo:{REPOSITORY_GUEST_PATH}"),
+            ]
+        );
+        assert_eq!(
+            binds(&candidate_roots)[0],
+            format!(
+                "--bind=/repo/target/validation/run-b/state/strict-compat/real-compat-fixtures:{COMPAT_FIXTURES_GUEST_PATH}"
+            )
+        );
+        // An argv that names neither root binds neither.
+        let (_, none) = equalized_guest_argv(
+            cell_dir,
+            &equalized_roots(&context, None),
+            vec!["/usr/bin/true".into()],
+        );
+        assert!(none.is_empty());
     }
 
     #[test]
@@ -11171,10 +18214,22 @@ backends_disabled:
             cell_dir.join("workdir/1"),
             "the ordinary supported path must retain hermit-132's per-attempt bind"
         );
+        // Absolute before the guest changes to /tmp/test, and named at the
+        // repository's guest path, bound from the checkout, so every backend's
+        // run of the test names it alike
+        // (https://github.com/rrnewton/hermit/issues/4337).
         assert_eq!(
             spec.guest_argv[1],
-            root.join("fixtures/input.txt").to_string_lossy(),
+            format!("{REPOSITORY_GUEST_PATH}/fixtures/input.txt"),
             "repo input must be absolute before the guest changes to /tmp/test"
+        );
+        assert!(
+            spec.argv.contains(&format!(
+                "--bind={}:{REPOSITORY_GUEST_PATH}",
+                root.display()
+            )),
+            "{:?}",
+            spec.argv
         );
         assert_eq!(spec.guest_argv[2], ".");
         fs::remove_dir_all(root).unwrap();
@@ -11184,15 +18239,28 @@ backends_disabled:
     fn verify_relaxations_are_explicit_and_recorded() {
         let mut test = recipe(true);
         let mode = test.modes.get_mut("verify").unwrap();
-        mode.compare_io_buffers = Some(false);
-        mode.compare_io_buffers_disabled_reason = Some(
-            "guest assertions validate sanitizer-specific invariants while whole files may vary"
-                .into(),
-        );
         mode.rcb_time = Some(false);
         mode.rcb_time_disabled_reason =
             Some("data-dependent assertion work must not perturb virtual time".into());
         validate_mode("fixture/test", "verify", mode, 15).unwrap();
+        // Without the I/O-buffer comparison Hermit never reports bitwise
+        // parity, so validation refuses the relaxation whatever the reason.
+        let io_reason =
+            "guest assertions validate sanitizer-specific invariants while whole files may vary";
+        for reason in [None, Some(io_reason)] {
+            let mut io_off = mode.clone();
+            io_off.compare_io_buffers = Some(false);
+            io_off.compare_io_buffers_disabled_reason = reason.map(String::from);
+            let error = validate_mode("fixture/test", "verify", &io_off, 15).unwrap_err();
+            assert!(
+                error.contains("compare_io_buffers=false is refused, with or without a reason"),
+                "{reason:?}: {error}"
+            );
+        }
+        // A recipe built without validation, as for a row recorded before the
+        // refusal, still renders and records the relaxation.
+        mode.compare_io_buffers = Some(false);
+        mode.compare_io_buffers_disabled_reason = Some(io_reason.into());
         let cell = SelectedCell {
             category: "fixture".into(),
             id: CellId {
@@ -11204,6 +18272,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -11228,6 +18297,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let spec = build_spec(
             &context,
@@ -11262,14 +18332,6 @@ backends_disabled:
                     "--no-rcb-time: data-dependent assertion work must not perturb virtual time",
                 ),
             ]
-        );
-
-        let mut missing_reason = recipe(true).modes.remove("verify").unwrap();
-        missing_reason.compare_io_buffers = Some(false);
-        assert!(
-            validate_mode("fixture/test", "verify", &missing_reason, 15)
-                .unwrap_err()
-                .contains("requires compare_io_buffers_disabled_reason")
         );
 
         assert!(
@@ -11331,9 +18393,9 @@ backends_disabled:
     /// A verify cell's guest sees its home, xdg-config and fixture directories
     /// only at the fixed guest paths below `/tmp/e2e`, so the ptrace and
     /// candidate cells of one test, which run from different cell directories,
-    /// give their guests the same argv and environment in both runner shapes.
-    /// dbt refuses `--bind` and keeps the host paths, as does every mode the
-    /// parity post-pass does not compare. The row's own environment keeps the
+    /// give their guests the same argv and environment in both runner shapes,
+    /// dbt included. Every mode the parity post-pass does not compare keeps the
+    /// host paths. The row's own environment keeps the
     /// host paths, which name where the directories are.
     #[test]
     fn verify_cells_give_every_bindable_backend_the_same_guest_inputs() {
@@ -11355,6 +18417,7 @@ backends_disabled:
                     format!("{host}/fixtures/program"),
                     format!("{host}/home/test/.rc"),
                     format!("{host}/xdg-config"),
+                    format!("{host}/xdg-config/git/config"),
                     // Embedded and look-alike paths are not rewritten.
                     format!("--input={host}/fixtures/data"),
                     format!("{host}/fixtures-extra"),
@@ -11393,6 +18456,7 @@ backends_disabled:
                     "/tmp/e2e/fixtures/program".to_string(),
                     "/tmp/e2e/home/test/.rc".to_string(),
                     "/tmp/e2e/xdg-config".to_string(),
+                    "/tmp/e2e/xdg-config/git/config".to_string(),
                     format!("--input={reference_dir}/fixtures/data"),
                     format!("{reference_dir}/fixtures-extra"),
                     "plain".to_string(),
@@ -11417,7 +18481,7 @@ backends_disabled:
                 );
             }
 
-            for backend in ["kvm", "liteinst", "sabre"] {
+            for backend in ["dbt", "kvm", "liteinst", "in-guest-trap", "sabre"] {
                 let (dir, candidate) = spec_for(backend, "verify");
                 assert_ne!(dir, reference_dir);
                 assert_equalized_guest_env(&candidate.argv, &dir, tmp, jobs);
@@ -11425,14 +18489,20 @@ backends_disabled:
                 let (env, targets, argv) = guest_view(&candidate);
                 let (reference_env, reference_targets, reference_argv) = guest_view(&reference);
                 assert_eq!((env, targets), (reference_env, reference_targets));
-                assert_eq!(argv[..3], reference_argv[..3], "{backend}");
-                assert_eq!(argv[5], reference_argv[5], "{backend}");
+                assert_eq!(argv[..4], reference_argv[..4], "{backend}");
+                assert_eq!(argv[6], reference_argv[6], "{backend}");
             }
 
+            // dbt refuses --mount: its adapter mounts the hermetic /test itself,
+            // and outside the hermetic shape it binds the workdir like the rest.
             let (dir, dbt) = spec_for("dbt", "verify");
-            assert_minimal_guest_env(&dbt.argv, &dir, tmp, jobs);
-            assert_eq!(dbt.guest_argv[0], format!("{dir}/fixtures/program"));
-            assert!(!dbt.argv.iter().any(|arg| arg.starts_with("--bind=")));
+            assert!(!dbt.argv.iter().any(|arg| arg.starts_with("--mount=")));
+            assert_eq!(
+                dbt.argv
+                    .iter()
+                    .any(|arg| *arg == format!("--bind={dir}/workdir/1:/tmp/test")),
+                isolated.is_none()
+            );
 
             for mode in ["chaos", "replay", "custom"] {
                 let (dir, spec) = spec_for("ptrace", mode);
@@ -11445,11 +18515,12 @@ backends_disabled:
                     spec.argv
                 );
                 assert_eq!(spec.guest_argv[0], format!("{dir}/fixtures/program"));
+                assert_eq!(spec.guest_argv[2], format!("{dir}/xdg-config"));
+                assert_eq!(spec.guest_argv[3], format!("{dir}/xdg-config/git/config"));
             }
         }
-        assert!(!equalizes_guest_inputs("verify", "dbt"));
-        assert!(!equalizes_guest_inputs("naked", "ptrace"));
-        assert!(equalizes_guest_inputs("verify", "ptrace"));
+        assert!(equalizes_guest_inputs("verify"));
+        assert!(!equalizes_guest_inputs("naked"));
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -11570,7 +18641,7 @@ backends_disabled:
             host_capabilities: probe_host_capabilities(),
             attempt: 1,
             run_index: None,
-            epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now).unwrap(),
+            epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH")).unwrap(),
             source_sha: "0".repeat(40),
             source_dirty: false,
             binary_build_sha: probe_binary_build_sha(&hermit_bin),
@@ -11587,6 +18658,7 @@ backends_disabled:
             timeout_multipliers: crate::timeouts::timeout_multipliers_from_env().unwrap(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir,
+            exact_branch_counter: None,
         };
         let manifests = ManifestSet::load(&root).unwrap();
         let [cell] = manifests
@@ -11694,6 +18766,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -11718,6 +18791,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let spec = build_spec(
             &context,
@@ -11767,6 +18841,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let replay = build_spec(
             &context,
@@ -11819,6 +18894,7 @@ backends_disabled:
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let custom = build_spec(
             &context,
@@ -12024,6 +19100,7 @@ backends_disabled:
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            exact_branch_counter: None,
             attempt: 1,
             run_index: None,
             hermit_sha: "sha".into(),
@@ -12058,7 +19135,6 @@ backends_disabled:
             execution_path: None,
             diversity: None,
             attempts: vec![attempt_with_sabre_evidence("evidence")],
-            backend_parity: None,
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
@@ -12068,6 +19144,8 @@ backends_disabled:
             reason: None,
             artifact_dir: "/repo/artifacts".into(),
             expected_guest_exit: None,
+            declared_stdout: None,
+            strictness: None,
         }
     }
 
@@ -12463,6 +19541,7 @@ backends_disabled:
         ] {
             for (mode, expected) in [
                 ("verify", ObservedResult::DeterminismFailure),
+                ("chaos", ObservedResult::DeterminismFailure),
                 ("replay", ObservedResult::ReplayFailure),
             ] {
                 for earlier in [false, true] {
@@ -12497,6 +19576,61 @@ backends_disabled:
                 assert_eq!(
                     observed_result(mode, "PASS", &[passed], None),
                     Some(ObservedResult::Pass)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_diverged_chaos_cell_is_a_determinism_failure_as_in_verify() {
+        // A chaos cell compares two runs of one seed with the strict comparator,
+        // as a verify cell compares its two runs, so the same diverged
+        // comparison is the same product failure in both modes. Typed
+        // crash-error instead, the row carried divergence evidence that the
+        // stress series refuses for any outcome but diverged.
+        let report = r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1","display_name":"BitwiseInfoV1","compare_io_buffers":true,"log_scope":"info","virtualize_time":true,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,"exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right","compared_outputs":{"left":{"exit_code":null,"signal":null,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdout_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stderr_bytes":0},"right":{"exit_code":null,"signal":null,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdout_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stderr_bytes":0}},"no_result_reason":null,"infrastructure_error":null,"guest_exit_code":null,"guest_signal":null}"#;
+        let mut diverged = attempt_with_sabre_evidence("");
+        diverged.outcome = "FAIL".into();
+        diverged.status = Some(1);
+        diverged.verification_report = Some(report.into());
+        assert_eq!(verification_verdict(&diverged), Some(Verdict::Diverged));
+        for mode in ["verify", "chaos"] {
+            let result = observed_result(mode, "FAIL", std::slice::from_ref(&diverged), None);
+            assert_eq!(result, Some(ObservedResult::DeterminismFailure), "{mode}");
+            assert_eq!(
+                failure_class("FAIL", result, None),
+                Some(FailureClass::ProductFailure),
+                "{mode}"
+            );
+
+            // A failure without a diverged attempt is still a crash.
+            let mut crashed = diverged.clone();
+            crashed.verification_report = None;
+            assert_eq!(
+                observed_result(mode, "FAIL", &[crashed], None),
+                Some(ObservedResult::CrashError),
+                "{mode}"
+            );
+
+            // The timeout and non-product guards still decide first.
+            let mut timed_out = diverged.clone();
+            timed_out.index = "2".into();
+            timed_out.timed_out = true;
+            assert_eq!(
+                observed_result(mode, "FAIL", &[diverged.clone(), timed_out], None),
+                Some(ObservedResult::Timeout),
+                "{mode}"
+            );
+            for error_kind in ["infrastructure", "incomplete-verification-evidence"] {
+                assert_eq!(
+                    observed_result(
+                        mode,
+                        "ERROR",
+                        std::slice::from_ref(&diverged),
+                        Some(error_kind)
+                    ),
+                    None,
+                    "{mode}, {error_kind}"
                 );
             }
         }
@@ -12751,6 +19885,7 @@ backends_disabled:
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
+            exact_branch_counter: None,
         }
     }
 
@@ -12823,7 +19958,7 @@ backends_disabled:
             &hermit,
             r#"#!/bin/sh
 set -eu
-if [ "${1-}" = "log-diff" ]; then
+if [ "${1-}" = "log-diff" ] && [ "${2-}" != "--verify-json" ]; then
   printf 'log-diff\n' >> "$PWD/invocations"
   exit 3
 fi
@@ -12831,26 +19966,34 @@ fi
 backend=
 verdict=
 logdir=
+rundir=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --backend) backend=$2; shift 2 ;;
     --verify-json) verdict=$2; shift 2 ;;
     --verify-log-dir) logdir=$2; shift 2 ;;
+    --verify-run) rundir=$2; shift 2 ;;
     *) shift ;;
   esac
 done
-printf 'run:%s\n' "$backend" >> "$PWD/invocations"
+
+if [ -n "$rundir" ]; then
+  # One run of the pair ([`VERIFY_PAIR_SCRIPT`]).
+  printf 'run:%s\n' "$backend" >> "$PWD/invocations"
+  mkdir "$rundir"
+  printf '{}\n' > "$rundir/verify-run.json"
+  if [ -n "${HERMIT_SABRE_PATH_EVIDENCE-}" ]; then
+    printf '%s\n' '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' >> "$HERMIT_SABRE_PATH_EVIDENCE"
+  fi
+  exit 0
+fi
+printf 'compare\n' >> "$PWD/invocations"
 
 # This log differs from anything a ptrace run of the same guest would write.
 # Before https://github.com/rrnewton/hermit/issues/3301 that difference was a
 # ParityFailure; now nothing compares it with another backend.
 mkdir -p "$logdir"
-printf 'INFO detcore: %s-only\n' "$backend" > "$logdir/run1_log_fixture.log"
-
-if [ -n "${HERMIT_SABRE_PATH_EVIDENCE-}" ]; then
-  evidence='{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}'
-  printf '%s\n%s\n' "$evidence" "$evidence" > "$HERMIT_SABRE_PATH_EVIDENCE"
-fi
+printf 'INFO detcore: only\n' > "$logdir/run1_log_fixture.log"
 
 cp "$PWD/verification.json" "$verdict"
 exit "$(cat "$PWD/exit-status")"
@@ -12888,59 +20031,63 @@ exit "$(cat "$PWD/exit-status")"
         (result, invocations, retained_parity_report)
     }
 
+    /// Every candidate verify cell full validation selects, of every test in
+    /// the parity population (every test whose ptrace verify cell full
+    /// validation selects, https://github.com/rrnewton/hermit/issues/3301),
+    /// hands its guest the same arguments as the ptrace reference, so a
+    /// parity comparison of the two can be labelled equal-input. The only
+    /// exceptions are the cells pinned in `DELIBERATELY_UNEQUAL`, each with
+    /// why: their guests are told which backend they run on, so their argv
+    /// differs from ptrace's and their parity comparison is labelled
+    /// unequal-input (`parity::inputs_equalized` compares argv). A new
+    /// difference fails here until it is fixed or pinned with its reason, and
+    /// a pinned cell that stops differing fails too.
     #[test]
-    fn selected_portable_parity_candidates_preserve_identical_guest_arguments() {
+    fn population_parity_candidates_preserve_identical_guest_arguments() {
+        const DELIBERATELY_UNEQUAL: &[(&str, &str, &str)] = &[
+            (
+                "c-programs/madvise-determinism",
+                "kvm",
+                "`--kvm` adds the guest's KVM-only madvise advice checks",
+            ),
+            (
+                "c-programs/pipe2-errno-precedence",
+                "kvm",
+                "the kvm cell passes no expected pipe capacity (ptrace, dbt and sabre pass \
+                 8192), so its guest prints F_GETPIPE_SZ without asserting Detcore's pin",
+            ),
+        ];
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let manifests = ManifestSet::load(&root).unwrap();
-        // The tests folded from the retired backend-parity-c bucket into
-        // c-programs (https://github.com/rrnewton/hermit/issues/3301, slice S6).
-        let folded = crate::retired_ids::RetiredIds::load(&root)
-            .unwrap()
-            .successors_of("backend-parity-c")
-            .unwrap();
         let cells = manifests
             .select(&Selection {
-                lane: Some("portable".into()),
-                category: Some("c-programs".into()),
                 population: Some(Population::Required),
+                mode: Some("verify".into()),
                 ..Selection::default()
             })
             .unwrap();
+        let population = cells
+            .iter()
+            .filter(|cell| cell.id.backend.as_deref() == Some("ptrace"))
+            .map(|cell| cell.id.test.clone())
+            .collect::<BTreeSet<_>>();
         let candidates = cells
             .iter()
-            .filter(|cell| folded.contains(&cell.id.test))
-            .filter(|cell| cell.id.mode == "verify" && cell.id.backend.as_deref() != Some("ptrace"))
+            .filter(|cell| population.contains(&cell.id.test))
+            .filter(|cell| cell.id.backend.as_deref() != Some("ptrace"))
             .collect::<Vec<_>>();
-        // Pin the selected population and per-backend split, and check every
-        // candidate's arguments.
-        // S13 of https://github.com/rrnewton/hermit/issues/3301 enabled dbt on
-        // pid-probe, which adds the one portable dbt candidate.
-        // Six more portable KVM verify cells preserve the same parity argument contract.
-        // https://github.com/rrnewton/reverie/issues/891
-        // The three socket candidates join the six earlier KVM selections.
-        // https://github.com/rrnewton/reverie/issues/891
-        // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
-        // One epoll-pwait2 KVM candidate: https://github.com/rrnewton/reverie/issues/905.
-        // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-        // 89 SaBRe candidates from the 2026-10-03 selection of ten-for-ten
-        // SaBRe verify cells (timeouts::SABRE_2026_10_03_EVIDENCE_SHA).
-        assert_eq!(candidates.len(), 174 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89);
-        let mut by_backend = BTreeMap::new();
-        for cell in &candidates {
-            *by_backend
-                .entry(cell.id.backend.as_deref().unwrap())
-                .or_insert(0) += 1;
-        }
-        assert_eq!(
-            by_backend,
-            BTreeMap::from([
-                ("dbt", 1),
-                ("kvm", 75 + 6 + 3 + 1 + 1 + 1 + 1 + 1),
-                ("liteinst", 97),
-                ("sabre", 1 + 89)
-            ])
+        // The population's selected candidates (`generate-parity-cells`
+        // counts 536 at this change), on every candidate backend that has one.
+        assert!(candidates.len() > 500, "{}", candidates.len());
+        let backends = candidates
+            .iter()
+            .filter_map(|cell| cell.id.backend.as_deref())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            ["dbt", "kvm", "sabre"]
+                .iter()
+                .all(|backend| backends.contains(backend)),
+            "{backends:?}"
         );
         assert!(
             candidates
@@ -12948,29 +20095,40 @@ exit "$(cat "$PWD/exit-status")"
                 .any(|cell| cell.id.test == "c-programs/readdir-order-identity"
                     && cell.id.backend.as_deref() == Some("kvm"))
         );
+        let mut unequal = BTreeMap::new();
         for cell in candidates {
-            let mode = &cell.test.modes["verify"];
             let candidate = cell.id.backend.as_deref().unwrap();
-            assert!(
-                mode.backends_enabled
-                    .iter()
-                    .any(|backend| backend == "ptrace")
+            let (theirs, ours) = (
+                cell_guest_args(cell, candidate),
+                cell_guest_args(cell, "ptrace"),
             );
-            assert_eq!(
-                mode.guest_args.get(candidate).cloned().unwrap_or_default(),
-                mode.guest_args.get("ptrace").cloned().unwrap_or_default(),
-                "{}",
-                cell.id.test
-            );
+            if theirs != ours {
+                unequal.insert(
+                    (cell.id.test.clone(), candidate.to_string()),
+                    format!("{theirs:?} vs ptrace {ours:?}"),
+                );
+            }
             if cell.id.test == "c-programs/readdir-order-identity" {
-                assert_eq!(mode.guest_args[candidate], ["--require-small-determinized"]);
-                assert_eq!(mode.guest_args["ptrace"], ["--require-small-determinized"]);
+                let required = [
+                    "--require-small-determinized",
+                    "--require-large-determinized",
+                ];
+                assert_eq!(theirs, required);
+                assert_eq!(ours, required);
             }
         }
+        let pinned = DELIBERATELY_UNEQUAL
+            .iter()
+            .map(|(test, backend, _)| (test.to_string(), backend.to_string()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            unequal.keys().cloned().collect::<BTreeSet<_>>(),
+            pinned,
+            "candidates whose guest arguments differ from ptrace's: {unequal:#?}"
+        );
     }
 
-    /// The kvm, liteinst and sabre candidates pinned above (75 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-    /// 97 and 1 + 89) used to add a ptrace reference run and a `hermit log-diff` comparison, and the
+    /// The kvm, liteinst and sabre candidates checked above used to add a ptrace reference run and a `hermit log-diff` comparison, and the
     /// comparison could overwrite their outcome. Since
     /// https://github.com/rrnewton/hermit/issues/3301 each one runs only its own
     /// backend's strict verification, even when its log differs from ptrace's.
@@ -12983,7 +20141,6 @@ exit "$(cat "$PWD/exit-status")"
             assert_eq!(result.result, Some(ObservedResult::Pass), "{backend}");
             assert_eq!(result.failure_class, None, "{backend}");
             assert_eq!(result.error_kind, None, "{backend}");
-            assert!(result.backend_parity.is_none(), "{backend}");
             assert!(!retained_parity_report, "{backend}");
             assert_eq!(result.attempts.len(), 1, "{backend}");
             assert_eq!(result.attempts[0].index, "1", "{backend}");
@@ -12992,7 +20149,10 @@ exit "$(cat "$PWD/exit-status")"
                 Some(Verdict::Matched),
                 "{backend}"
             );
-            assert_eq!(invocations, format!("run:{backend}\n"));
+            assert_eq!(
+                invocations,
+                format!("run:{backend}\nrun:{backend}\ncompare\n")
+            );
             let observations = &result.cpu_observations.as_ref().unwrap().invocations;
             assert_eq!(observations.len(), 1, "{backend}: {observations:#?}");
             assert!(
@@ -13032,7 +20192,6 @@ exit "$(cat "$PWD/exit-status")"
                 "{backend}"
             );
             assert_eq!(result.error_kind, None, "{backend}");
-            assert!(result.backend_parity.is_none(), "{backend}");
             assert!(!retained_parity_report, "{backend}");
             assert_eq!(result.attempts.len(), 1, "{backend}");
             assert_eq!(
@@ -13040,7 +20199,10 @@ exit "$(cat "$PWD/exit-status")"
                 Some(Verdict::Diverged),
                 "{backend}"
             );
-            assert_eq!(invocations, format!("run:{backend}\n"));
+            assert_eq!(
+                invocations,
+                format!("run:{backend}\nrun:{backend}\ncompare\n")
+            );
             assert_eq!(result.first_divergent_scheduler_turn, Some(7), "{backend}");
             assert_eq!(
                 result.first_divergent_virtual_nanoseconds,
@@ -13096,6 +20258,7 @@ exit "$(cat "$PWD/exit-status")"
             timeout_seconds: 5,
             verdict_path: Some(verdict),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
@@ -13144,6 +20307,7 @@ exit "$(cat "$PWD/exit-status")"
             timeout_seconds: 10,
             verdict_path: Some(verdict),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
@@ -13214,6 +20378,1861 @@ exit "$(cat "$PWD/exit-status")"
                 .is_some_and(|reason| reason.contains("1 HERMIT_SKID_OVERSHOOT")),
             "comparison-null infrastructure error must retain its cause: {result:?}"
         );
+    }
+
+    /// The verify cell a row records: the fixture cell on the row's backend,
+    /// whose recipe selects exactly the row's relaxations and expected guest
+    /// exit.
+    fn cell_recorded_by(row: &CellResult) -> SelectedCell {
+        let mut cell = ptrace_cell("verify");
+        cell.id.backend = row.backend.clone();
+        let backend = row.backend.clone().unwrap_or_else(|| "native".into());
+        let recipe = cell.test.modes.get_mut("verify").unwrap();
+        for relaxation in &row.relaxations {
+            if let Some(reason) = relaxation.strip_prefix(DIAGNOSTIC_RELAXATION_PREFIX) {
+                recipe.diagnostic.insert(backend.clone(), reason.into());
+                continue;
+            }
+            let (flag, reason) = relaxation.split_once(": ").unwrap();
+            match flag {
+                "--no-detlog-io-buffers" => {
+                    recipe.compare_io_buffers = Some(false);
+                    recipe.compare_io_buffers_disabled_reason = Some(reason.into());
+                }
+                "--no-rcb-time" => {
+                    recipe.rcb_time = Some(false);
+                    recipe.rcb_time_disabled_reason = Some(reason.into());
+                }
+                "comparator=stripped" => {
+                    recipe.comparator = Some(Comparator::Stripped);
+                    recipe.comparator_reason = Some(reason.into());
+                }
+                flag if allowed_hermit_arg(flag) => {
+                    recipe
+                        .hermit_args
+                        .entry(backend.clone())
+                        .or_default()
+                        .push(flag.into());
+                    recipe.hermit_args_reason = Some(reason.into());
+                }
+                other => panic!("a fixture row records the relaxation {other:?}"),
+            }
+        }
+        recipe.expected_guest_exit = row.expected_guest_exit.clone();
+        assert_eq!(cell_relaxations(&cell), row.relaxations);
+        assert_eq!(cell_expected_guest_exit(&cell), row.expected_guest_exit);
+        cell
+    }
+
+    /// `row` with the command fields the executor writes for the cell it
+    /// records ([`cell_recorded_by`]) under `context`: each attempt's argv,
+    /// guest argv, env, cwd and shell command as `build_spec` renders them,
+    /// and the row's copies of the first attempt's (`run_cell_inner`). The
+    /// fixture attempts execute a shell script in place of Hermit, so the
+    /// command they record is the script's, which no retained row may carry
+    /// ([`retained_verify_invocation_error`]).
+    fn with_executor_invocation_in(row: CellResult, context: &RunContext) -> CellResult {
+        let cell = cell_recorded_by(&row);
+        with_executor_invocation_for(row, context, &cell)
+    }
+
+    /// `row` with the command fields the executor writes for `cell` under
+    /// `context`, as [`with_executor_invocation_in`] writes them for the cell
+    /// the row records. A caller passes a cell whose recipe adds what a row
+    /// does not record (a workdir, a guest environment) or a context with
+    /// another execution root or log retention.
+    fn with_executor_invocation_for(
+        mut row: CellResult,
+        context: &RunContext,
+        cell: &SelectedCell,
+    ) -> CellResult {
+        let dir = context.root.join("results/cell");
+        for (position, attempt) in row.attempts.iter_mut().enumerate() {
+            let spec = build_spec(
+                context,
+                cell,
+                dir.clone(),
+                attempt.guest_argv.clone(),
+                &(position + 1).to_string(),
+                None,
+                3,
+            )
+            .unwrap();
+            attempt.cwd = spec.cwd.to_string_lossy().into_owned();
+            attempt.shell_command = shell_command(&attempt.cwd, &spec.env, &spec.argv);
+            attempt.argv = spec.argv;
+            attempt.guest_argv = spec.guest_argv;
+            attempt.env = spec.env;
+        }
+        if let Some(first) = row.attempts.first() {
+            row.argv = first.argv.clone();
+            row.guest_argv = first.guest_argv.clone();
+            row.env = first.env.clone();
+            row.cwd = first.cwd.clone();
+            row.shell_command = first.shell_command.clone();
+        }
+        row.effective_args = row.argv.iter().skip(1).cloned().collect();
+        row.log_level = Some("info".into());
+        row
+    }
+
+    /// [`with_executor_invocation_in`] under the fixture context, with the
+    /// canonical comparison flag Hermit's probe enables.
+    fn with_executor_invocation(row: CellResult) -> CellResult {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-executor-invocation-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut context = run_context(&root);
+        context.run_verify_strict = true;
+        let row = with_executor_invocation_in(row, &context);
+        let _ = fs::remove_dir_all(&root);
+        row
+    }
+
+    /// A retained verify row is re-decided by what it records: its backend,
+    /// relaxations, expected guest exit and comparator. Its command lines must
+    /// therefore be the invocation the executor writes for exactly those
+    /// ([`retained_verify_invocation_error`],
+    /// <https://github.com/rrnewton/hermit/issues/1845>). Every shape the
+    /// executor writes is accepted, whatever execution root, log retention,
+    /// workdir, guest environment, relaxations or declared exit produced it.
+    /// Each row below that differs from an accepted one in one respect is
+    /// refused by the named check, and so by the skid predicate and the
+    /// retained-pass check.
+    #[test]
+    fn a_retained_command_line_must_be_the_executor_invocation_its_row_records() {
+        fn at(argv: &[String], token: &str) -> usize {
+            argv.iter()
+                .position(|arg| arg == token)
+                .unwrap_or_else(|| panic!("{token} is not in {argv:?}"))
+        }
+        // `row` with each attempt's argv edited by `edit`, its shell command
+        // rendered again and the row's copies taken again, so that the
+        // command line is the row's only defect.
+        fn with_argv(row: &CellResult, edit: impl Fn(&mut Vec<String>)) -> CellResult {
+            let mut row = row.clone();
+            for attempt in &mut row.attempts {
+                edit(&mut attempt.argv);
+                attempt.shell_command = shell_command(&attempt.cwd, &attempt.env, &attempt.argv);
+            }
+            row.argv = row.attempts[0].argv.clone();
+            row.shell_command = row.attempts[0].shell_command.clone();
+            row.effective_args = row.argv[1..].to_vec();
+            row
+        }
+        fn insert_before(token: &str, inserted: &[&str]) -> impl Fn(&mut Vec<String>) {
+            let token = token.to_owned();
+            let inserted: Vec<String> = inserted.iter().map(|arg| (*arg).to_owned()).collect();
+            move |argv| {
+                let index = at(argv, &token);
+                argv.splice(index..index, inserted.iter().cloned());
+            }
+        }
+        fn replace_after(flag: &str, value: &str) -> impl Fn(&mut Vec<String>) {
+            let (flag, value) = (flag.to_owned(), value.to_owned());
+            move |argv| {
+                let index = at(argv, &flag);
+                argv[index + 1] = value.clone();
+            }
+        }
+        fn replace_flag(old: &str, new: &str) -> impl Fn(&mut Vec<String>) {
+            let (old, new) = (old.to_owned(), new.to_owned());
+            move |argv| {
+                let index = at(argv, &old);
+                argv[index] = new.clone();
+            }
+        }
+        fn without(token: &str, values: usize) -> impl Fn(&mut Vec<String>) {
+            let token = token.to_owned();
+            move |argv| {
+                let index = at(argv, &token);
+                argv.drain(index..=index + values);
+            }
+        }
+        fn accepted(label: &str, row: &CellResult) {
+            assert_eq!(
+                retained_verify_invocation_error(row),
+                None,
+                "{label} is a command line the executor writes: {:?}",
+                row.argv
+            );
+        }
+        fn accepted_skid(label: &str, row: &CellResult, count: u64) {
+            accepted(label, row);
+            assert_eq!(
+                skid_overshoot_only_reports(row),
+                Some(count),
+                "{label} is a skid-only row: {:?}",
+                row.argv
+            );
+        }
+        fn refused(label: &str, row: &CellResult, check: &str) {
+            let error = retained_verify_invocation_error(row)
+                .unwrap_or_else(|| panic!("{label} was accepted: {:?}", row.argv));
+            assert!(
+                error.contains(check),
+                "{label} was refused by another check: {error}"
+            );
+            assert_eq!(
+                skid_overshoot_only_reports(row),
+                None,
+                "{label} still reads as a skid-only row"
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-invocation-shapes-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let context = |edit: &dyn Fn(&mut RunContext)| {
+            let mut context = run_context(&root);
+            context.run_verify_strict = true;
+            edit(&mut context);
+            context
+        };
+        // The cell a row records, with recipe additions the row does not
+        // record, rendered under `context`.
+        let rendered = |row: &CellResult, context: &RunContext, edit: &dyn Fn(&mut ModeRecipe)| {
+            let mut cell = cell_recorded_by(row);
+            edit(cell.test.modes.get_mut("verify").unwrap());
+            with_executor_invocation_for(row.clone(), context, &cell)
+        };
+        let skid = |index: &str| {
+            let mut attempt = attempt_from_script(
+                "ptrace",
+                &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+                Some(&skid_report(2)),
+            );
+            attempt.index = index.into();
+            attempt
+        };
+        let has = |row: &CellResult, token: &str| row.argv.iter().any(|arg| arg == token);
+        let has_pair = |row: &CellResult, flag: &str, value: &str| {
+            row.argv
+                .windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value)
+        };
+
+        // Every shape the executor writes.
+        let base = verify_row_from_attempts(vec![skid("1")]);
+        assert!(has(&base, "--verify-strict") && has_pair(&base, "--backend", "ptrace"));
+        accepted_skid("the fixture row", &base, 2);
+        let unprobed = rendered(
+            &base,
+            &context(&|context| context.run_verify_strict = false),
+            &|_| {},
+        );
+        assert!(!has(&unprobed, "--verify-strict"));
+        accepted_skid(
+            "a row from a Hermit without the canonical comparison flag",
+            &unprobed,
+            2,
+        );
+        let kept = rendered(
+            &base,
+            &context(&|context| context.keep_logs = true),
+            &|_| {},
+        );
+        assert!(has(&kept, "--verify-log-dir"));
+        accepted_skid("a row whose verify logs were kept", &kept, 2);
+        let test = cell_recorded_by(&base).id.test;
+        let parity = rendered(
+            &base,
+            &context(&|context| {
+                context
+                    .parity_retained
+                    .insert((test.clone(), "ptrace".into()));
+            }),
+            &|_| {},
+        );
+        assert!(has(&parity, "--verify-log-dir"));
+        accepted_skid("a row whose logs the parity post-pass kept", &parity, 2);
+        let isolated = rendered(
+            &base,
+            &context(&|context| context.isolated_workdir = Some(PathBuf::from("/test"))),
+            &|_| {},
+        );
+        assert!(has(&isolated, "--mount=type=tmpfs,target=/test"));
+        assert!(has_pair(&isolated, "--workdir", "/test"));
+        accepted_skid("a row from the hermetic /test root", &isolated, 2);
+        let requested = rendered(&base, &context(&|_| {}), &|recipe| {
+            recipe.workdir = Some("/srv/work".into())
+        });
+        assert!(has_pair(&requested, "--workdir", "/srv/work"));
+        assert!(!requested.argv.iter().any(|arg| arg.ends_with(":/tmp/test")));
+        accepted_skid("a row whose manifest names its workdir", &requested, 2);
+        let mode_env = rendered(&base, &context(&|_| {}), &|recipe| {
+            recipe
+                .env
+                .get_or_insert_default()
+                .insert("FIXTURE_MODE".into(), "on".into());
+        });
+        assert!(has_pair(&mode_env, "--env", "FIXTURE_MODE=on"));
+        accepted_skid("a row whose manifest adds a guest variable", &mode_env, 2);
+        let two = verify_row_from_attempts(vec![skid("1"), skid("2")]);
+        assert_ne!(two.attempts[0].argv, two.attempts[1].argv);
+        accepted_skid("a row with two inner attempts", &two, 4);
+        let mut relaxed = base.clone();
+        relaxed.relaxations = vec![
+            "--no-detlog-io-buffers: fixture".into(),
+            "--no-rcb-time: fixture".into(),
+            "--no-virtualize-cpuid: fixture".into(),
+            "--max-timeslice=1000: fixture".into(),
+        ];
+        let relaxed = with_executor_invocation(relaxed);
+        assert!(has(&relaxed, "--max-timeslice=1000") && has(&relaxed, "--no-rcb-time"));
+        accepted("a row recording every run-flag relaxation", &relaxed);
+        let mut declared = base.clone();
+        declared.expected_guest_exit = Some(expected_exit(Some(7), None));
+        let declared = with_executor_invocation(declared);
+        assert!(has(&declared, "--verify-allow=failure"));
+        accepted("a row declaring a guest exit", &declared);
+        let mut stripped = base.clone();
+        stripped.relaxations = vec![format!("{STRIPPED_COMPARATOR_RELAXATION_PREFIX}fixture")];
+        let stripped = with_executor_invocation(stripped);
+        assert!(!has(&stripped, "--verify-strict"));
+        accepted("a stripped-comparator row", &stripped);
+        let mut native = base.clone();
+        native.backend = None;
+        let native = with_executor_invocation(native);
+        assert!(has_pair(&native, "--backend", "native"));
+        accepted("a row recording no backend", &native);
+        let mut dbt = base.clone();
+        dbt.backend = Some("dbt".into());
+        let dbt_fixed = with_executor_invocation(dbt.clone());
+        assert!(
+            dbt_fixed
+                .argv
+                .iter()
+                .any(|arg| arg.starts_with("--bind=") && arg.ends_with(":/tmp/test"))
+        );
+        accepted("a DBT row", &dbt_fixed);
+        let dbt_isolated = rendered(
+            &dbt,
+            &context(&|context| context.isolated_workdir = Some(PathBuf::from("/test"))),
+            &|_| {},
+        );
+        assert!(has_pair(&dbt_isolated, "--workdir", "/test"));
+        assert!(
+            !dbt_isolated
+                .argv
+                .iter()
+                .any(|arg| arg.starts_with("--mount="))
+        );
+        accepted("a DBT row from the hermetic /test root", &dbt_isolated);
+        let standard = {
+            let mut cell = cell_recorded_by(&base);
+            cell.test.proc = Some(ProcLevel::Standard);
+            with_executor_invocation_for(base.clone(), &context(&|_| {}), &cell)
+        };
+        assert!(has(&standard, "--proc=standard"));
+        accepted_skid("a row whose test declares a /proc level", &standard, 2);
+        // An imported row must run at its cell's declared level, and only it.
+        let mut standard_cell = cell_recorded_by(&base);
+        standard_cell.test.proc = Some(ProcLevel::Standard);
+        assert_eq!(proc_level_mismatch(&standard, &standard_cell), None);
+        assert_eq!(proc_level_mismatch(&base, &cell_recorded_by(&base)), None);
+        assert!(proc_level_mismatch(&base, &standard_cell).is_some());
+        assert!(proc_level_mismatch(&standard, &cell_recorded_by(&base)).is_some());
+        assert!(
+            proc_level_mismatch(
+                &with_argv(&standard, replace_flag("--proc=standard", "--proc=minimal")),
+                &standard_cell
+            )
+            .is_some()
+        );
+        // The guest's own arguments are not Hermit's, whatever they spell.
+        let mut odd_guest = standard.clone();
+        odd_guest
+            .guest_argv
+            .extend(["--proc=minimal".into(), "--".into()]);
+        odd_guest
+            .argv
+            .extend(["--proc=minimal".into(), "--".into()]);
+        assert_eq!(proc_level_mismatch(&odd_guest, &standard_cell), None);
+        // A row whose argv does not end with its guest argv is refused, and
+        // so is one that drops its command line but kept its attempts.
+        let mut truncated = standard.clone();
+        truncated.argv.pop();
+        assert!(proc_level_mismatch(&truncated, &standard_cell).is_some());
+        let mut cleared = standard.clone();
+        cleared.argv.clear();
+        assert!(proc_level_mismatch(&cleared, &standard_cell).is_some());
+        // Every attempt is bound, not only the one the row copies.
+        let mut later = two.clone();
+        insert_before("--verify-strict", &["--proc=standard"])(&mut later.attempts[1].argv);
+        assert!(
+            proc_level_mismatch(&later, &cell_recorded_by(&two))
+                .is_some_and(|error| error.starts_with("attempt 2 "))
+        );
+        // The two-word spelling is a level too.
+        assert!(
+            proc_level_mismatch(
+                &with_argv(
+                    &base,
+                    insert_before("--verify-strict", &["--proc", "standard"])
+                ),
+                &cell_recorded_by(&base)
+            )
+            .is_some()
+        );
+        // Replay and custom cells' rows, as the runner writes them.
+        for mode in ["replay", "custom"] {
+            let mut cell = ptrace_cell(mode);
+            cell.test.proc = Some(ProcLevel::Standard);
+            let spec = verify_spec_of(cell.clone());
+            let mut row = standard.clone();
+            row.mode = mode.into();
+            row.argv = spec.argv.clone();
+            row.guest_argv = spec.guest_argv.clone();
+            assert_eq!(proc_level_mismatch(&row, &cell), None, "{mode}");
+            cell.test.proc = None;
+            assert!(proc_level_mismatch(&row, &cell).is_some(), "{mode}");
+        }
+
+        // The backend.
+        refused(
+            "a ptrace row whose command line selects liteinst",
+            &with_argv(&base, replace_after("--backend", "liteinst")),
+            "does not start `<hermit> --log info --backend ptrace run`",
+        );
+        refused(
+            "a row recording no backend whose command line selects ptrace",
+            &{
+                let mut row = base.clone();
+                row.backend = None;
+                row
+            },
+            "does not start `<hermit> --log info --backend native run`",
+        );
+        refused(
+            "a command line that selects a second backend after `run`",
+            &with_argv(
+                &base,
+                insert_before("--base-env=minimal", &["--backend=liteinst"]),
+            ),
+            "selects a backend again after `run` (--backend=liteinst)",
+        );
+        refused(
+            "a command line that selects a backend in front of the guest",
+            &with_argv(&base, insert_before("--", &["--backend", "liteinst"])),
+            "selects a backend again after `run` (--backend)",
+        );
+        let mut second = two.clone();
+        replace_after("--backend", "liteinst")(&mut second.attempts[1].argv);
+        second.attempts[1].shell_command = shell_command(
+            &second.attempts[1].cwd,
+            &second.attempts[1].env,
+            &second.attempts[1].argv,
+        );
+        refused(
+            "a second attempt that selects another backend",
+            &second,
+            "inner attempt 2's command line does not start",
+        );
+        // The runner's own flags, in the executor's order.
+        refused(
+            "a command line without the minimal base environment",
+            &with_argv(&base, without("--base-env=minimal", 0)),
+            "lacks `--base-env=minimal`",
+        );
+        refused(
+            "the runner's flags out of order",
+            &with_argv(&base, |argv| {
+                let (env, strict) = (at(argv, "--base-env=minimal"), at(argv, "--strict"));
+                argv.swap(env, strict);
+            }),
+            "lacks `--base-env=minimal`",
+        );
+        refused(
+            "a /proc level Hermit lacks",
+            &with_argv(&base, insert_before("--verify-strict", &["--proc=full"])),
+            "selects the /proc level \"full\", which Hermit lacks",
+        );
+        let mut mixed = two.clone();
+        insert_before("--verify-strict", &["--proc=standard"])(&mut mixed.attempts[1].argv);
+        mixed.attempts[1].shell_command = shell_command(
+            &mixed.attempts[1].cwd,
+            &mixed.attempts[1].env,
+            &mixed.attempts[1].argv,
+        );
+        refused(
+            "a second attempt at another /proc level",
+            &mixed,
+            "inner attempt 2 runs at the /proc level Some(\"standard\")",
+        );
+        refused(
+            "the /proc level after the canonical comparison flag",
+            &with_argv(&standard, |argv| {
+                let level = argv.remove(at(argv, "--proc=standard"));
+                let index = at(argv, "--verify-run");
+                argv.insert(index, level);
+            }),
+            "lacks `--verify-run @VERIFY_RUN_DIR@` where",
+        );
+        refused(
+            "a command line without `--verify-run`",
+            &with_argv(&base, without("--verify-run", 1)),
+            "lacks `--verify-run @VERIFY_RUN_DIR@` where",
+        );
+        refused(
+            "a run that writes its evidence somewhere else",
+            &with_argv(&base, replace_after("--verify-run", "/elsewhere")),
+            "lacks `--verify-run @VERIFY_RUN_DIR@` where",
+        );
+        refused(
+            "another program than the paired verification",
+            &with_argv(&base, |argv| argv[2] = "exec \"$@\"".into()),
+            "is not the paired verification program",
+        );
+        refused(
+            "the canonical comparison flag after the run flags",
+            &with_argv(&relaxed, |argv| {
+                let flag = argv.remove(at(argv, "--verify-strict"));
+                let index = at(argv, "--verify-run");
+                argv.insert(index, flag);
+            }),
+            "lacks `--verify-run @VERIFY_RUN_DIR@` where",
+        );
+        refused(
+            "the canonical comparison flag on a stripped row",
+            &with_argv(
+                &stripped,
+                insert_before("--verify-run", &["--verify-strict"]),
+            ),
+            "under the stripped comparator",
+        );
+        // The run flags the relaxations record.
+        refused(
+            "a run flag the executor never writes",
+            &with_argv(
+                &base,
+                insert_before("--verify-run", &["--no-sequentialize-threads"]),
+            ),
+            "lacks `--verify-run @VERIFY_RUN_DIR@` where",
+        );
+        refused(
+            "a run flag the row does not record",
+            &with_argv(&base, insert_before("--verify-run", &["--no-rcb-time"])),
+            "carries the run flags [\"--no-rcb-time\"]",
+        );
+        refused(
+            "a Hermit argument the row does not record",
+            &with_argv(
+                &base,
+                insert_before("--verify-run", &["--max-timeslice=1000"]),
+            ),
+            "carries the run flags [\"--max-timeslice=1000\"]",
+        );
+        refused(
+            "a recorded run flag the command line lacks",
+            &with_argv(&relaxed, without("--no-rcb-time", 0)),
+            "carries the run flags",
+        );
+        refused(
+            "a recorded Hermit argument with another value",
+            &with_argv(&relaxed, |argv| {
+                let index = at(argv, "--max-timeslice=1000");
+                argv[index] = "--max-timeslice=2000".into();
+            }),
+            "carries the run flags",
+        );
+        refused(
+            "run flags out of the executor's order",
+            &with_argv(&relaxed, |argv| {
+                let (io, rcb) = (
+                    at(argv, "--no-detlog-io-buffers"),
+                    at(argv, "--no-rcb-time"),
+                );
+                argv.swap(io, rcb);
+            }),
+            "carries the run flags",
+        );
+        // The expected-exit allowance and the valued flags.
+        refused(
+            "an expected-exit allowance the row does not declare",
+            &with_argv(&base, |argv| {
+                let index = at(argv, "--verify-json") + 2;
+                argv.insert(index, "--verify-allow=failure".into());
+            }),
+            "carries `--verify-allow=failure`",
+        );
+        refused(
+            "a declared exit without its allowance",
+            &with_argv(&declared, without("--verify-allow=failure", 0)),
+            "lacks `--verify-allow=failure`",
+        );
+        refused(
+            "a command line without its report path",
+            &with_argv(&base, without("--verify-json", 1)),
+            "lacks `--verify-json <path>`",
+        );
+        refused(
+            "a report path Hermit would read as a flag",
+            &with_argv(&base, replace_after("--verify-json", "-x")),
+            "gives `--verify-json` no value",
+        );
+        refused(
+            "an empty report path",
+            &with_argv(&base, replace_after("--verify-json", "")),
+            "gives `--verify-json` no value",
+        );
+        refused(
+            "a log directory Hermit would read as a flag",
+            &with_argv(&kept, replace_after("--verify-log-dir", "-x")),
+            "gives `--verify-log-dir` no value",
+        );
+        refused(
+            "a comparison of other directories",
+            &with_argv(&base, |argv| {
+                let index = at(argv, "--verify-json") + 3;
+                argv[index] = "/elsewhere/run1".into();
+            }),
+            "does not compare the attempt's run1 and run2 directories",
+        );
+        refused(
+            "a comparison by another Hermit",
+            &with_argv(&base, |argv| {
+                let index = at(argv, "log-diff") - 1;
+                argv[index] = "/other/hermit".into();
+            }),
+            "has no run command after its comparison",
+        );
+        refused(
+            "a workdir Hermit would read as a flag",
+            &with_argv(&requested, replace_after("--workdir", "-w")),
+            "gives `--workdir` no value",
+        );
+        // The execution root and the guest environment.
+        refused(
+            "a tmpfs mounted somewhere other than the workdir",
+            &with_argv(&isolated, replace_after("--workdir", "/elsewhere")),
+            "not its workdir",
+        );
+        refused(
+            "the fixed bind with another workdir",
+            &with_argv(&base, replace_after("--workdir", "/tmp/other")),
+            "not its workdir",
+        );
+        refused(
+            "a guest variable that assigns nothing",
+            &with_argv(&base, |argv| {
+                let index = at(argv, "--env");
+                argv[index + 1] = "FIXTURE".into();
+            }),
+            "which assigns nothing",
+        );
+        refused(
+            "a token after the guest environment",
+            &with_argv(&base, insert_before("--", &["--no-sequentialize-threads"])),
+            "carries `--no-sequentialize-threads` where the executor writes nothing",
+        );
+        // The guest and the rendered shell command.
+        refused(
+            "a command line without the guest separator",
+            &with_argv(&base, without("--", 0)),
+            "has no `--` before the guest command",
+        );
+        refused(
+            "a command line that runs another guest",
+            &with_argv(&base, |argv| argv.push("--extra".into())),
+            "does not end with the attempt's guest argv",
+        );
+        let edited = |edit: &dyn Fn(&mut CellResult)| {
+            let mut row = base.clone();
+            edit(&mut row);
+            row
+        };
+        refused(
+            "a guest argv the command line does not run",
+            &edited(&|row| {
+                row.attempts[0].guest_argv.push("--extra".into());
+                row.guest_argv = row.attempts[0].guest_argv.clone();
+            }),
+            "does not end with the attempt's guest argv",
+        );
+        refused(
+            "a stale shell command",
+            &edited(&|row| {
+                row.attempts[0].shell_command.push_str(" --extra");
+                row.shell_command = row.attempts[0].shell_command.clone();
+            }),
+            "shell command is not the one rendered",
+        );
+        refused(
+            "an attempt environment its shell command does not render",
+            &edited(&|row| {
+                row.attempts[0].env.insert("FIXTURE".into(), "1".into());
+                row.env = row.attempts[0].env.clone();
+            }),
+            "shell command is not the one rendered",
+        );
+        // The row's copies of its first attempt.
+        let copies = "is not its first inner attempt's";
+        refused(
+            "a row argv of its own",
+            &edited(&|row| row.argv.push("--extra".into())),
+            copies,
+        );
+        refused(
+            "a row guest argv of its own",
+            &edited(&|row| row.guest_argv.push("--extra".into())),
+            copies,
+        );
+        refused(
+            "a row environment of its own",
+            &edited(&|row| {
+                row.env.insert("FIXTURE".into(), "1".into());
+            }),
+            copies,
+        );
+        refused(
+            "a row cwd of its own",
+            &edited(&|row| row.cwd.push_str("/elsewhere")),
+            copies,
+        );
+        refused(
+            "a row shell command of its own",
+            &edited(&|row| row.shell_command.push_str(" --extra")),
+            copies,
+        );
+        let recorded = "effective args or log level";
+        refused(
+            "effective args that are not the argv",
+            &edited(&|row| {
+                row.effective_args.pop();
+            }),
+            recorded,
+        );
+        refused(
+            "a debug log level",
+            &edited(&|row| row.log_level = Some("debug".into())),
+            recorded,
+        );
+        refused(
+            "no log level",
+            &edited(&|row| row.log_level = None),
+            recorded,
+        );
+        refused(
+            "a row without inner attempts",
+            &edited(&|row| row.attempts.clear()),
+            "retains no inner attempt",
+        );
+
+        // A retained PASS is refused by the same check.
+        let none = DeclaredStdout::default();
+        let (plain, _) = expected_exit_row(None, canonical_verification_report(), "exit 0");
+        assert!(has_pair(&plain, "--backend", "ptrace"));
+        accepted("a verify PASS the executor wrote", &plain);
+        assert_eq!(retained_verify_pass_error(&plain, &none), None);
+        for (label, row) in [
+            (
+                "a ptrace PASS whose command line selects liteinst",
+                with_argv(&plain, replace_after("--backend", "liteinst")),
+            ),
+            (
+                "a PASS that selects a second backend",
+                with_argv(&plain, insert_before("--", &["--backend=liteinst"])),
+            ),
+            (
+                "a PASS with a run flag its row does not record",
+                with_argv(&plain, insert_before("--verify-run", &["--no-rcb-time"])),
+            ),
+        ] {
+            let error = retained_verify_pass_error(&row, &none)
+                .unwrap_or_else(|| panic!("{label} was re-decided as a verify PASS"));
+            assert!(
+                error.contains("not a verify invocation the executor writes"),
+                "{label} was refused by another check: {error}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The verify row `run_cell_inner` publishes for `attempts`: the same
+    /// outcome, reason and error-kind fold, then the same typed result and
+    /// failure class, the same declared-stdout record for a cell that
+    /// declares no stdout assertion, the same runtime and divergence
+    /// position copied from the attempts, and the command fields the executor
+    /// writes ([`with_executor_invocation`]).
+    fn verify_row_from_attempts(attempts: Vec<AttemptResult>) -> CellResult {
+        let outcome = if attempts.iter().all(|attempt| attempt.outcome == "PASS") {
+            "PASS"
+        } else if attempts.iter().any(|attempt| attempt.outcome == "ERROR") {
+            "ERROR"
+        } else {
+            "FAIL"
+        }
+        .to_string();
+        let reason = attempts.iter().find_map(|attempt| attempt.reason.clone());
+        let error_kind = attempts
+            .iter()
+            .find_map(|attempt| attempt.error_kind.clone());
+        let result = observed_result("verify", &outcome, &attempts, error_kind.as_deref());
+        let failure_class = failure_class(&outcome, result, error_kind.as_deref());
+        let declared_stdout = attempts
+            .iter()
+            .any(attempt_has_infrastructure_report)
+            .then(DeclaredStdout::default);
+        let runtime = attempts.iter().find_map(|attempt| attempt.runtime.clone());
+        let position = cell_divergence_position(&attempts);
+        with_executor_invocation(CellResult {
+            outcome,
+            result,
+            failure_class,
+            error_kind,
+            reason,
+            runtime,
+            first_divergent_scheduler_turn: position.scheduler_turn,
+            first_divergent_virtual_nanoseconds: position.virtual_nanoseconds,
+            first_divergent_record: position.record,
+            first_divergent_syscall: position.syscall,
+            first_divergent_left_message: position.left_message,
+            first_divergent_right_message: position.right_message,
+            attempts,
+            declared_stdout,
+            ..cell_result_that_located_nothing()
+        })
+    }
+
+    /// The stderr Hermit writes when it refuses a verify comparison after two
+    /// overshoot reports, copied from the failed validate attempt in
+    /// <https://github.com/rrnewton/hermit/issues/1845>.
+    const SKID_STDERR: &str = "printf '%s\\n' \
+        'HERMIT_SKID_OVERSHOOT rcb_actual=39951476 rcb_target=39950647 skid_margin=1000 overshoot=829' \
+        'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2' \
+        'Error: observed 2 HERMIT_SKID_OVERSHOOT report(s); refusing the result' >&2";
+
+    /// Hermit's skid report after a completed comparison of two runs that
+    /// both exited 0, the shape every observed overshoot had.
+    fn skid_report_value(count: u64) -> VerificationReport {
+        let mut report = parity_fixture_verification(Verdict::Matched);
+        report.verified = false;
+        report.bitwise_parity = false;
+        report.verdict = Verdict::InfrastructureError;
+        report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
+        report
+    }
+
+    fn skid_report(count: u64) -> String {
+        serde_json::to_string(&skid_report_value(count)).unwrap()
+    }
+
+    /// The report Hermit's `write_skid_overshoot_without_comparison_json`
+    /// writes: no comparison, and the guest disposition it was handed (run 1's
+    /// status, or none when the run returned only an error).
+    fn skid_report_without_comparison(
+        count: u64,
+        guest_exit_code: Option<i32>,
+        guest_signal: Option<i32>,
+    ) -> String {
+        let mut report = VerificationReport::no_result();
+        report.verdict = Verdict::InfrastructureError;
+        report.no_result_reason = None;
+        report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
+        report.guest_exit_code = guest_exit_code;
+        report.guest_signal = guest_signal;
+        let json = serde_json::to_string(&report).unwrap();
+        current_verification_report(json.as_bytes()).unwrap();
+        json
+    }
+
+    /// Hermit's report of a divergence that a host file replaced during run
+    /// 1 explains (`detcore_model::host_input`).
+    fn host_input_change_report_value() -> VerificationReport {
+        let identity = |ino| detcore_model::host_input::HostFileIdentity {
+            dev: 33,
+            ino,
+            size: 100,
+            mtime_sec: 1_700_000_000,
+            mtime_nsec: 0,
+        };
+        let mut report = parity_fixture_verification(Verdict::Diverged);
+        report.verdict = Verdict::InfrastructureError;
+        report.infrastructure_error = Some(InfrastructureError::HostInputChanged {
+            run: crate::canonical_verdict::VerificationRun::Run1,
+            path: "/etc/ld.so.cache".into(),
+            before: identity(57_899_095),
+            after: identity(57_907_831),
+        });
+        report
+    }
+
+    /// A divergence Hermit attributes to a host file changing during a run is
+    /// an infrastructure ERROR, not a product failure, and is the one row the
+    /// host-input retry accepts. A plain divergence stays a product FAIL, and
+    /// a row whose reason, report or SaBRe path evidence does not match its
+    /// own evidence does not qualify.
+    #[test]
+    fn only_a_typed_host_input_change_is_a_host_input_row() {
+        let change_report = serde_json::to_string(&host_input_change_report_value()).unwrap();
+        current_verification_report(change_report.as_bytes()).unwrap();
+        let changed = || {
+            attempt_from_script(
+                "ptrace",
+                "printf %s \"$1\" > \"$2\"; exit 1",
+                Some(&change_report),
+            )
+        };
+        let row = verify_row_from_attempts(vec![changed()]);
+        assert_eq!(row.outcome, "ERROR", "{row:?}");
+        assert_eq!(row.error_kind.as_deref(), Some("infrastructure"));
+        assert_eq!(
+            row.failure_class,
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+        let change = host_input_change_report_value()
+            .infrastructure_error
+            .unwrap();
+        assert_eq!(
+            row.reason.as_deref(),
+            Some(host_input_changed_reason(&change).as_str())
+        );
+        assert!(
+            row.reason.as_deref().unwrap().contains(
+                "host input changed during run 1: /etc/ld.so.cache (dev:ino 0:33:57899095"
+            ),
+            "{row:?}"
+        );
+        assert!(host_input_change_only(&row));
+        assert_eq!(skid_overshoot_only_reports(&row), None);
+
+        // A plain divergence is a product failure, never a host input change.
+        let diverged_report =
+            serde_json::to_string(&parity_fixture_verification(Verdict::Diverged)).unwrap();
+        let diverged = verify_row_from_attempts(vec![attempt_from_script(
+            "ptrace",
+            "printf %s \"$1\" > \"$2\"; exit 1",
+            Some(&diverged_report),
+        )]);
+        assert_eq!(diverged.outcome, "FAIL", "{diverged:?}");
+        assert_eq!(diverged.failure_class, Some(FailureClass::ProductFailure));
+        assert!(!host_input_change_only(&diverged));
+
+        // A reason the report does not produce is not evidence.
+        let mut relabelled = row.clone();
+        relabelled.attempts[0].reason = Some("host input changed during run 1".into());
+        relabelled.reason = relabelled.attempts[0].reason.clone();
+        assert!(!host_input_change_only(&relabelled));
+
+        // Nor is a report whose bytes are not the ones the runner hashed.
+        let mut swapped = row.clone();
+        swapped.attempts[0].verification_report = Some(diverged_report);
+        assert!(!host_input_change_only(&swapped));
+
+        // A timed-out attempt is not one.
+        let mut timed_out = row.clone();
+        timed_out.attempts[0].timed_out = true;
+        assert!(!host_input_change_only(&timed_out));
+
+        // The skid report is not a host input change.
+        let skid = verify_row_from_attempts(vec![attempt_from_script(
+            "ptrace",
+            &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+            Some(&skid_report(2)),
+        )]);
+        assert!(!host_input_change_only(&skid));
+
+        // SaBRe path evidence. The executor summarizes a row's retained
+        // evidence into its execution path whatever the row's outcome, makes a
+        // row whose evidence does not summarize an invalid-backend-evidence
+        // ERROR, and judges the path's eligibility only on a PASS. So a
+        // genuine SaBRe host-input row qualifies, with a clean or a fallback
+        // path, and one whose evidence does not summarize, is not the bytes
+        // its digest names, or is not the row's recorded path does not.
+        const CLEAN_PATH: &str = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+        const FALLBACK_PATH: &str = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+        let clean_evidence = format!("{CLEAN_PATH}\n{CLEAN_PATH}\n");
+        let fallback_evidence = format!("{CLEAN_PATH}\n{FALLBACK_PATH}\n");
+        let mut sabre = verify_row_from_attempts(vec![attempt_from_script(
+            "sabre",
+            "printf %s \"$1\" > \"$2\"; exit 1",
+            Some(&change_report),
+        )]);
+        sabre.backend = Some("sabre".into());
+        let sabre = with_executor_invocation(sabre);
+        let with_sabre_evidence = |evidence: &str| {
+            let mut row = sabre.clone();
+            for attempt in &mut row.attempts {
+                attempt.sabre_path_evidence = Some(evidence.to_owned());
+                attempt.sabre_path_evidence_sha256 = Some(hex_digest(evidence.as_bytes()));
+            }
+            row.execution_path = summarize_sabre_path_evidence(&row.attempts).unwrap_or(None);
+            row
+        };
+        let genuine = with_sabre_evidence(&clean_evidence);
+        assert_eq!(genuine.execution_path.as_ref().unwrap()["eligible"], true);
+        assert!(host_input_change_only(&genuine), "{genuine:?}");
+        let fallback = with_sabre_evidence(&fallback_evidence);
+        assert_eq!(fallback.execution_path.as_ref().unwrap()["eligible"], false);
+        assert!(host_input_change_only(&fallback), "{fallback:?}");
+        // Evidence without the record schema, under its own digest.
+        let malformed = with_sabre_evidence("{}\n");
+        assert!(summarize_sabre_path_evidence(&malformed.attempts).is_err());
+        assert!(!host_input_change_only(&malformed));
+        let mut misdigested = genuine.clone();
+        misdigested.attempts[0].sabre_path_evidence_sha256 =
+            Some(hex_digest(fallback_evidence.as_bytes()));
+        assert!(!host_input_change_only(&misdigested));
+        let mut mislabelled = genuine.clone();
+        mislabelled.execution_path = fallback.execution_path.clone();
+        assert!(!host_input_change_only(&mislabelled));
+        // A guest argument is not a backend selection: a ptrace row whose
+        // guest takes `--backend sabre`, on the command line the executor
+        // writes, has no SaBRe path and qualifies.
+        let mut guest_args = row.clone();
+        guest_args.attempts[0].guest_argv =
+            ["fixture", "--backend", "sabre"].map(String::from).into();
+        let mut guest_args = with_executor_invocation(guest_args);
+        let argv = &guest_args.attempts[0].argv;
+        let separator = argv.iter().position(|arg| arg == "--").unwrap();
+        let log = argv.iter().position(|arg| arg == "--log").unwrap();
+        assert_eq!(argv[log..log + 4], ["--log", "info", "--backend", "ptrace"]);
+        assert_eq!(argv[separator + 1..], ["fixture", "--backend", "sabre"]);
+        guest_args.execution_path = summarize_sabre_path_evidence(&guest_args.attempts).unwrap();
+        assert_eq!(guest_args.execution_path, None);
+        assert!(host_input_change_only(&guest_args), "{guest_args:?}");
+    }
+
+    /// A host-input attempt whose compared runs break the cell's declared
+    /// stdout assertion is not a host-input row: the host change explains the
+    /// divergence, not a wrong output. It keeps the infrastructure ERROR with
+    /// a reason naming both, and the predicate refuses it even relabelled with
+    /// the plain host-input reason, because it re-decides the row's recorded
+    /// assertion from the attempt's own report. The same attempt with the
+    /// assertion met is one.
+    #[test]
+    fn a_host_input_attempt_that_breaks_a_declared_stdout_assertion_is_not_host_input_only() {
+        let golden = "sar-ok\n";
+        let wrong = "sar-bad\n";
+        let change_with = |first: &str, second: &str| {
+            let mut report = host_input_change_report_value();
+            let outputs = report.compared_outputs.as_mut().unwrap();
+            outputs.left.stdout_sha256 = hex_digest(first.as_bytes());
+            outputs.left.stdout_bytes = first.len() as u64;
+            outputs.right.stdout_sha256 = hex_digest(second.as_bytes());
+            outputs.right.stdout_bytes = second.len() as u64;
+            report
+        };
+        let change = host_input_change_report_value()
+            .infrastructure_error
+            .unwrap();
+        let plain = host_input_changed_reason(&change);
+        let declaring = |mut row: CellResult| {
+            row.declared_stdout = Some(DeclaredStdout {
+                exact: Some(golden.to_string()),
+                contains: None,
+            });
+            row
+        };
+
+        let met = attempt_with_stdout_assertions(
+            Some(golden),
+            None,
+            change_with(golden, golden),
+            golden,
+            "exit 1",
+        );
+        assert_eq!(met.reason.as_deref(), Some(plain.as_str()), "{met:?}");
+        let met_row = declaring(verify_row_from_attempts(vec![met]));
+        assert!(host_input_change_only(&met_row));
+        // A row without the recorded declaration never qualifies.
+        let mut undeclared = met_row;
+        undeclared.declared_stdout = None;
+        assert!(!host_input_change_only(&undeclared));
+
+        let broken = attempt_with_stdout_assertions(
+            Some(golden),
+            None,
+            change_with(golden, wrong),
+            golden,
+            "exit 1",
+        );
+        assert_eq!(
+            (broken.outcome.as_str(), broken.error_kind.as_deref()),
+            ("ERROR", Some("infrastructure")),
+            "{broken:?}"
+        );
+        assert!(
+            broken
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(&format!(
+                    "{plain}, and its compared runs violate a declared stdout assertion: "
+                ))),
+            "{broken:?}"
+        );
+        let row = declaring(verify_row_from_attempts(vec![broken]));
+        assert!(!host_input_change_only(&row), "{row:?}");
+        let mut relabelled = row;
+        relabelled.reason = Some(plain.clone());
+        relabelled.attempts[0].reason = Some(plain);
+        assert!(!host_input_change_only(&relabelled));
+    }
+
+    /// Only a verify row whose every attempt is Hermit's typed overshoot
+    /// refusal, with its exit status and both stderr markers, is skid-only
+    /// (<https://github.com/rrnewton/hermit/issues/1845>). Each other row here
+    /// differs from the qualifying one in one respect and must not qualify.
+    #[test]
+    fn only_a_typed_skid_overshoot_and_nothing_else_is_a_skid_only_row() {
+        let skid = || {
+            attempt_from_script(
+                "ptrace",
+                &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+                Some(&skid_report(2)),
+            )
+        };
+        let qualifying = verify_row_from_attempts(vec![skid()]);
+        assert_eq!(qualifying.outcome, "ERROR");
+        assert_eq!(qualifying.result, None);
+        assert_eq!(
+            qualifying.failure_class,
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+        assert_eq!(skid_overshoot_only_reports(&qualifying), Some(2));
+        assert_eq!(
+            qualifying.declared_stdout,
+            Some(DeclaredStdout::default()),
+            "a row with an infrastructure report records its declared stdout"
+        );
+
+        // A row without the declared-stdout record, as an older producer
+        // wrote it, cannot have its stdout assertions re-decided and so never
+        // qualifies, however its attempts are labelled.
+        let mut legacy = qualifying.clone();
+        legacy.declared_stdout = None;
+        assert_eq!(skid_overshoot_only_reports(&legacy), None);
+
+        // Every inner attempt must be a skid attempt, and their counts add.
+        let mut second = skid();
+        second.index = "2".into();
+        let two = verify_row_from_attempts(vec![skid(), second]);
+        assert_eq!(skid_overshoot_only_reports(&two), Some(4));
+
+        let not_skid_only = |label: &str, row: &CellResult| {
+            assert_eq!(
+                skid_overshoot_only_reports(row),
+                None,
+                "{label} must not be treated as a skid-only row: {row:?}"
+            );
+        };
+
+        // Each negative row below must be classified exactly as the qualifying
+        // row is, so that only the predicate's own guard can refuse it.
+        let classified_as_skid = |label: &str, row: &CellResult| {
+            assert_eq!(
+                (
+                    row.outcome.as_str(),
+                    row.result,
+                    row.failure_class,
+                    row.error_kind.as_deref(),
+                    row.reason.as_deref(),
+                ),
+                (
+                    "ERROR",
+                    None,
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
+                    Some("infrastructure"),
+                    row.attempts[0].reason.as_deref(),
+                ),
+                "{label} must reach the predicate as a typed skid row: {row:?}"
+            );
+            assert!(
+                row.attempts[0]
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.ends_with("HERMIT_SKID_OVERSHOOT report(s)")),
+                "{label} must carry the classifier's skid reason: {row:?}"
+            );
+        };
+
+        // Each inner attempt names a distinct, nonempty index, as the runner
+        // numbers them; a history that repeats or omits one is not a history
+        // the runner wrote.
+        let mut repeated = two.clone();
+        repeated.attempts[1].index = repeated.attempts[0].index.clone();
+        classified_as_skid("a history that repeats an attempt index", &repeated);
+        not_skid_only("a history that repeats an attempt index", &repeated);
+        for blank in ["", " "] {
+            let mut unnumbered = qualifying.clone();
+            unnumbered.attempts[0].index = blank.into();
+            classified_as_skid("an attempt without an index", &unnumbered);
+            not_skid_only("an attempt without an index", &unnumbered);
+        }
+
+        // The retained report must be the bytes its recorded digest names.
+        let mut undigested = qualifying.clone();
+        undigested.attempts[0].verification_report_sha256 = None;
+        classified_as_skid("an attempt without a report digest", &undigested);
+        not_skid_only("an attempt without a report digest", &undigested);
+        let mut misdigested = qualifying.clone();
+        misdigested.attempts[0].verification_report_sha256 = Some("0".repeat(64));
+        classified_as_skid("an attempt whose report digest is wrong", &misdigested);
+        not_skid_only("an attempt whose report digest is wrong", &misdigested);
+        // Report bytes rewritten under the original digest are refused, and
+        // the same bytes qualify once their own digest is recorded, so only
+        // the digest guard separates the two.
+        let mut rewritten = qualifying.clone();
+        let changed = format!(
+            "{} ",
+            rewritten.attempts[0]
+                .verification_report
+                .as_deref()
+                .unwrap()
+        );
+        current_verification_report(changed.as_bytes()).unwrap();
+        rewritten.attempts[0].verification_report = Some(changed.clone());
+        classified_as_skid("a report rewritten under its old digest", &rewritten);
+        not_skid_only("a report rewritten under its old digest", &rewritten);
+        rewritten.attempts[0].verification_report_sha256 = Some(hex_digest(changed.as_bytes()));
+        assert_eq!(skid_overshoot_only_reports(&rewritten), Some(2));
+
+        let skid_with_stderr = |stderr_lines: &[&str], report: &str, status: i32| {
+            let printed = stderr_lines
+                .iter()
+                .map(|line| format!("'{line}'"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            attempt_from_script(
+                "ptrace",
+                &format!("printf %s \"$1\" > \"$2\"; printf '%s\\n' {printed} >&2; exit {status}"),
+                Some(report),
+            )
+        };
+        const OVERSHOOT_LINE: &str = "HERMIT_SKID_OVERSHOOT rcb_actual=39951476 rcb_target=39950647 skid_margin=1000 overshoot=829";
+        const REFUSAL_LINE: &str =
+            "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2";
+        // The fixture builder itself qualifies when given both markers.
+        let rebuilt = verify_row_from_attempts(vec![skid_with_stderr(
+            &[OVERSHOOT_LINE, REFUSAL_LINE],
+            &skid_report(2),
+            122,
+        )]);
+        classified_as_skid("the rebuilt qualifying row", &rebuilt);
+        assert_eq!(skid_overshoot_only_reports(&rebuilt), Some(2));
+
+        // A real ptrace skid report carries each run's dispatch record, and
+        // qualifies with it. The backend evidence a passing attempt must
+        // carry is checked only on a PASS by the classifier, so a skid
+        // attempt without it reaches the predicate as a typed skid row and
+        // the predicate itself must refuse it.
+        let mut dispatched = skid_report_value(2);
+        dispatched.runtime =
+            with_ptrace_dispatch(serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap()).runtime;
+        let skid_with_report = |report: &VerificationReport| {
+            let json = serde_json::to_string(report).unwrap();
+            current_verification_report(json.as_bytes()).unwrap();
+            verify_row_from_attempts(vec![skid_with_stderr(
+                &[OVERSHOOT_LINE, REFUSAL_LINE],
+                &json,
+                122,
+            )])
+        };
+        let with_dispatch = skid_with_report(&dispatched);
+        classified_as_skid("a skid report with ptrace dispatch records", &with_dispatch);
+        assert_eq!(skid_overshoot_only_reports(&with_dispatch), Some(2));
+        // The runner copies the skid report's runtime and divergence
+        // coordinates onto the attempt, and onto the row the first runtime and
+        // the divergence position its attempts give, so a copy that differs is
+        // not one the runner wrote. With only the report's runtime removed,
+        // its digest recomputed, the attempt's and the row's copies keep a
+        // dispatch record no check of the report sees.
+        assert_eq!(with_dispatch.attempts[0].runtime, dispatched.runtime);
+        assert_eq!(with_dispatch.runtime, dispatched.runtime);
+        let mut unruntimed = dispatched.clone();
+        unruntimed.runtime = None;
+        let unruntimed = serde_json::to_string(&unruntimed).unwrap();
+        let mut stale_copies = with_dispatch.clone();
+        stale_copies.attempts[0].verification_report_sha256 =
+            Some(hex_digest(unruntimed.as_bytes()));
+        stale_copies.attempts[0].verification_report = Some(unruntimed);
+        classified_as_skid("a skid attempt with runtime copies", &stale_copies);
+        not_skid_only(
+            "a skid attempt whose runtime copy its report does not carry",
+            &stale_copies,
+        );
+        // The same report with both copies cleared, as the runner writes it,
+        // is skid-only, so only the copies separate the two.
+        let mut uncopied = stale_copies.clone();
+        uncopied.attempts[0].runtime = None;
+        uncopied.runtime = None;
+        assert_eq!(skid_overshoot_only_reports(&uncopied), Some(2));
+        let mut stale_row = uncopied.clone();
+        stale_row.runtime = dispatched.runtime.clone();
+        not_skid_only(
+            "a skid row whose runtime copy no attempt carries",
+            &stale_row,
+        );
+        // A divergence coordinate only the copies carry, and a divergence
+        // message only the row carries.
+        let mut copied_coordinate = qualifying.clone();
+        copied_coordinate.attempts[0].first_divergent_record = Some(9);
+        copied_coordinate.first_divergent_record = Some(9);
+        classified_as_skid(
+            "a skid attempt with a divergence coordinate copy",
+            &copied_coordinate,
+        );
+        not_skid_only(
+            "a skid attempt whose divergence coordinate its report does not carry",
+            &copied_coordinate,
+        );
+        let mut row_message = qualifying.clone();
+        row_message.first_divergent_left_message = Some("left".into());
+        classified_as_skid("a skid row with a divergence message", &row_message);
+        not_skid_only(
+            "a skid row whose divergence message no attempt carries",
+            &row_message,
+        );
+        let mut relabeled = dispatched.clone();
+        relabeled
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap()
+            .backend = "liteinst".into();
+        let relabeled = skid_with_report(&relabeled);
+        classified_as_skid(
+            "a skid report whose run 1 names another backend",
+            &relabeled,
+        );
+        not_skid_only(
+            "a skid report whose run 1 names another backend",
+            &relabeled,
+        );
+        let mut undispatched = dispatched.clone();
+        undispatched
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run2
+            .as_mut()
+            .unwrap()
+            .dispatch = None;
+        let undispatched = skid_with_report(&undispatched);
+        classified_as_skid(
+            "a skid report without run 2's dispatch record",
+            &undispatched,
+        );
+        not_skid_only(
+            "a skid report without run 2's dispatch record",
+            &undispatched,
+        );
+        // SaBRe execution-path evidence turns only a PASS into a FAIL, so the
+        // predicate re-decides a skid row's path from the evidence its own
+        // attempts retained. A genuine SaBRe skid row qualifies: each attempt
+        // selects SaBRe, retains two clean evidence records (one per run)
+        // under the digest of their bytes, and the row records their summary.
+        const CLEAN_PATH: &str = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+        const FALLBACK_PATH: &str = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+        let clean_evidence = format!("{CLEAN_PATH}\n{CLEAN_PATH}\n");
+        let fallback_evidence = format!("{CLEAN_PATH}\n{FALLBACK_PATH}\n");
+        let mut sabre_report = dispatched.clone();
+        let sabre_runtime = sabre_report.runtime.as_mut().unwrap();
+        for stats in [sabre_runtime.run1.as_mut(), sabre_runtime.run2.as_mut()] {
+            stats.unwrap().dispatch.as_mut().unwrap().backend = "sabre".into();
+        }
+        let sabre_report = serde_json::to_string(&sabre_report).unwrap();
+        let with_sabre_evidence = |row: &mut CellResult, evidence: Option<&str>| {
+            for attempt in &mut row.attempts {
+                attempt.sabre_path_evidence = evidence.map(str::to_owned);
+                attempt.sabre_path_evidence_sha256 =
+                    evidence.map(|text| hex_digest(text.as_bytes()));
+            }
+        };
+        let recompute_path = |row: &mut CellResult| {
+            row.execution_path = summarize_sabre_path_evidence(&row.attempts).unwrap();
+        };
+        let mut genuine_sabre = verify_row_from_attempts(vec![attempt_from_script(
+            "sabre",
+            &format!(
+                "printf %s \"$1\" > \"$2\"; printf '%s\\n' '{OVERSHOOT_LINE}' '{REFUSAL_LINE}' >&2; exit 122"
+            ),
+            Some(&sabre_report),
+        )]);
+        genuine_sabre.backend = Some("sabre".into());
+        let mut genuine_sabre = with_executor_invocation(genuine_sabre);
+        assert_eq!(retained_verify_invocation_error(&genuine_sabre), None);
+        with_sabre_evidence(&mut genuine_sabre, Some(&clean_evidence));
+        recompute_path(&mut genuine_sabre);
+        assert_eq!(
+            genuine_sabre.execution_path.as_ref().unwrap()["eligible"],
+            true
+        );
+        classified_as_skid("a genuine SaBRe skid row", &genuine_sabre);
+        assert_eq!(retained_execution_path_error(&genuine_sabre), None);
+        assert_eq!(skid_overshoot_only_reports(&genuine_sabre), Some(2));
+        // Its evidence removed, under its recorded path or with the path
+        // recomputed from what is left (an incomplete, ineligible path).
+        let mut pathless = genuine_sabre.clone();
+        with_sabre_evidence(&mut pathless, None);
+        not_skid_only(
+            "a SaBRe skid row without evidence under its recorded path",
+            &pathless,
+        );
+        recompute_path(&mut pathless);
+        assert_eq!(pathless.execution_path.as_ref().unwrap()["eligible"], false);
+        not_skid_only("a SaBRe skid row without evidence", &pathless);
+        // Its evidence under a digest that does not name those bytes.
+        let mut misdigested_path = genuine_sabre.clone();
+        misdigested_path.attempts[0].sabre_path_evidence_sha256 =
+            Some(hex_digest(fallback_evidence.as_bytes()));
+        not_skid_only(
+            "a SaBRe skid row whose evidence digest names other bytes",
+            &misdigested_path,
+        );
+        // A run that used a ptrace fallback site, under the recorded eligible
+        // path or with the path recomputed.
+        let mut fallback = genuine_sabre.clone();
+        with_sabre_evidence(&mut fallback, Some(&fallback_evidence));
+        not_skid_only(
+            "a SaBRe skid row with fallback evidence under an eligible path",
+            &fallback,
+        );
+        recompute_path(&mut fallback);
+        assert_eq!(fallback.execution_path.as_ref().unwrap()["eligible"], false);
+        not_skid_only("a SaBRe skid row that used a fallback site", &fallback);
+        // A SaBRe row whose command line does not select SaBRe writes no
+        // evidence the summary reads, so it cannot stand for a SaBRe run. The
+        // path check refuses it on its own, as the invocation check does.
+        let mut unselected = genuine_sabre.clone();
+        unselected.attempts[0].argv = ["hermit", "run", "--verify"].map(String::from).to_vec();
+        recompute_path(&mut unselected);
+        assert_eq!(unselected.execution_path, None);
+        assert!(retained_execution_path_error(&unselected).is_some());
+        assert!(retained_verify_invocation_error(&unselected).is_some());
+        not_skid_only(
+            "a SaBRe skid row whose command line does not select SaBRe",
+            &unselected,
+        );
+        // A ptrace row has no SaBRe path: a recorded path, eligible or not,
+        // and a command line that selects SaBRe are both refused.
+        let mut off_path = with_dispatch.clone();
+        off_path.execution_path = Some(serde_json::json!({"eligible": false}));
+        not_skid_only(
+            "a skid row whose SaBRe execution path is ineligible",
+            &off_path,
+        );
+        let mut labelled_path = with_dispatch.clone();
+        labelled_path.execution_path = Some(serde_json::json!({"eligible": true}));
+        not_skid_only(
+            "a ptrace skid row that records an eligible SaBRe path",
+            &labelled_path,
+        );
+        // The command line is the one the executor writes for a SaBRe row,
+        // recorded on a ptrace row; the path check and the invocation check
+        // each refuse it.
+        let mut ptrace_selecting_sabre = with_dispatch.clone();
+        ptrace_selecting_sabre.backend = Some("sabre".into());
+        let mut ptrace_selecting_sabre = with_executor_invocation(ptrace_selecting_sabre);
+        ptrace_selecting_sabre.backend = with_dispatch.backend.clone();
+        with_sabre_evidence(&mut ptrace_selecting_sabre, Some(&clean_evidence));
+        recompute_path(&mut ptrace_selecting_sabre);
+        assert!(retained_execution_path_error(&ptrace_selecting_sabre).is_some());
+        assert!(retained_verify_invocation_error(&ptrace_selecting_sabre).is_some());
+        not_skid_only(
+            "a ptrace skid row whose command line selects SaBRe",
+            &ptrace_selecting_sabre,
+        );
+        assert_eq!(skid_overshoot_only_reports(&with_dispatch), Some(2));
+
+        // The retained comparison must be the complete one the row's
+        // comparator requires, as the classifier requires before it reports
+        // a skid attempt as one. A strict skid report that compared no INFO
+        // messages is incomplete verification evidence when executed, and a
+        // row carrying it under its own correct digest is refused.
+        let mut vacuous = skid_report_value(2);
+        vacuous.compared_log_messages.as_mut().unwrap().left = 0;
+        vacuous.compared_log_messages.as_mut().unwrap().right = 0;
+        let vacuous = serde_json::to_string(&vacuous).unwrap();
+        let executed = attempt_from_script(
+            "ptrace",
+            &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+            Some(&vacuous),
+        );
+        assert_eq!(
+            (executed.outcome.as_str(), executed.error_kind.as_deref()),
+            ("ERROR", Some("incomplete-verification-evidence")),
+            "{executed:?}"
+        );
+        let mut incomplete = qualifying.clone();
+        incomplete.attempts[0].verification_report = Some(vacuous.clone());
+        incomplete.attempts[0].verification_report_sha256 = Some(hex_digest(vacuous.as_bytes()));
+        classified_as_skid("a skid row whose comparison is vacuous", &incomplete);
+        not_skid_only("a skid row whose comparison is vacuous", &incomplete);
+        // The comparator is the one the row's relaxations record. A canonical
+        // report does not satisfy the stripped comparator, and a stripped
+        // skid report qualifies only in a row that records the stripped
+        // comparator, which is also the only way the classifier reports one
+        // as a skid attempt.
+        let stripped_relaxation = vec![format!(
+            "{STRIPPED_COMPARATOR_RELAXATION_PREFIX}fixture reason"
+        )];
+        // Each row is re-rendered with the command line the executor writes
+        // for its relaxations, so only the comparison can refuse it.
+        let mut canonical_as_stripped = qualifying.clone();
+        canonical_as_stripped.relaxations = stripped_relaxation.clone();
+        let canonical_as_stripped = with_executor_invocation(canonical_as_stripped);
+        assert_eq!(row_comparator(&canonical_as_stripped), Comparator::Stripped);
+        assert_eq!(
+            retained_verify_invocation_error(&canonical_as_stripped),
+            None
+        );
+        not_skid_only(
+            "a stripped row carrying a canonical skid report",
+            &canonical_as_stripped,
+        );
+        let mut stripped_skid =
+            with_ptrace_dispatch(serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap());
+        stripped_skid.verified = false;
+        stripped_skid.verdict = Verdict::InfrastructureError;
+        stripped_skid.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count: 2 });
+        let strict_executed = attempt_with_report(
+            None,
+            Comparator::Strict,
+            stripped_skid.clone(),
+            &format!("{SKID_STDERR}; exit 122"),
+            5,
+        );
+        assert_eq!(
+            strict_executed.error_kind.as_deref(),
+            Some("incomplete-verification-evidence"),
+            "{strict_executed:?}"
+        );
+        let mut stripped_row = verify_row_from_attempts(vec![attempt_with_report(
+            None,
+            Comparator::Stripped,
+            stripped_skid,
+            &format!("{SKID_STDERR}; exit 122"),
+            5,
+        )]);
+        stripped_row.relaxations = stripped_relaxation;
+        let stripped_row = with_executor_invocation(stripped_row);
+        classified_as_skid("a stripped skid row", &stripped_row);
+        assert_eq!(skid_overshoot_only_reports(&stripped_row), Some(2));
+        let mut stripped_as_strict = stripped_row.clone();
+        stripped_as_strict.relaxations.clear();
+        let stripped_as_strict = with_executor_invocation(stripped_as_strict);
+        assert_eq!(row_comparator(&stripped_as_strict), Comparator::Strict);
+        assert_eq!(retained_verify_invocation_error(&stripped_as_strict), None);
+        not_skid_only(
+            "a strict row carrying a stripped skid report",
+            &stripped_as_strict,
+        );
+
+        // The typed report without either stderr marker.
+        let unmarked = verify_row_from_attempts(vec![skid_with_stderr(&[], &skid_report(2), 122)]);
+        classified_as_skid("a typed report without stderr markers", &unmarked);
+        not_skid_only("a typed report without stderr markers", &unmarked);
+        // The refusal line without any HERMIT_SKID_OVERSHOOT line.
+        let no_overshoot_line = verify_row_from_attempts(vec![skid_with_stderr(
+            &[REFUSAL_LINE],
+            &skid_report(2),
+            122,
+        )]);
+        classified_as_skid(
+            "a refusal line without an overshoot line",
+            &no_overshoot_line,
+        );
+        not_skid_only(
+            "a refusal line without an overshoot line",
+            &no_overshoot_line,
+        );
+        // An overshoot line without the refusal line.
+        let no_refusal_line = verify_row_from_attempts(vec![skid_with_stderr(
+            &[OVERSHOOT_LINE],
+            &skid_report(2),
+            122,
+        )]);
+        classified_as_skid(
+            "an overshoot line without the refusal line",
+            &no_refusal_line,
+        );
+        not_skid_only(
+            "an overshoot line without the refusal line",
+            &no_refusal_line,
+        );
+        // Both markers beside a second Hermit classification line.
+        let second_class = verify_row_from_attempts(vec![skid_with_stderr(
+            &[
+                OVERSHOOT_LINE,
+                "HERMIT_INTERNAL_FAILURE class=container-child-exit status=Signaled(9)",
+                REFUSAL_LINE,
+            ],
+            &skid_report(2),
+            122,
+        )]);
+        classified_as_skid("a second Hermit classification line", &second_class);
+        not_skid_only("a second Hermit classification line", &second_class);
+        // Both markers beside the comparator's refusal banner.
+        let refused_banner = verify_row_from_attempts(vec![skid_with_stderr(
+            &[
+                OVERSHOOT_LINE,
+                "REFUSING to compare: both logs were truncated at the configured size bound. This is a NO-RESULT, not a difference and not a match.",
+                REFUSAL_LINE,
+            ],
+            &skid_report(2),
+            122,
+        )]);
+        classified_as_skid("a comparator refusal banner", &refused_banner);
+        not_skid_only("a comparator refusal banner", &refused_banner);
+        // Hermit's real shape when an overshoot coincides with a log cut at its
+        // size bound: the report is the comparator's refusal (verdict
+        // no_result, reason comparison_refused), while the exit status and
+        // both stderr markers still carry the overshoot. The classifier keeps
+        // the refusal as incomplete evidence, so it never reaches a retry.
+        const REFUSAL_DETAIL: &str = "both logs were truncated at the configured size bound";
+        let mut refused = VerificationReport::no_result();
+        refused.no_result_reason = Some(
+            crate::canonical_verdict::NoResultReason::ComparisonRefused {
+                detail: REFUSAL_DETAIL.into(),
+            },
+        );
+        let refused = verify_row_from_attempts(vec![skid_with_stderr(
+            &[
+                OVERSHOOT_LINE,
+                "REFUSING to compare: both logs were truncated at the configured size bound. This is a NO-RESULT, not a difference and not a match.",
+                REFUSAL_LINE,
+            ],
+            &serde_json::to_string(&refused).unwrap(),
+            122,
+        )]);
+        assert_eq!(
+            (
+                refused.outcome.as_str(),
+                refused.error_kind.as_deref(),
+                refused.reason.as_deref(),
+            ),
+            (
+                "ERROR",
+                Some("incomplete-verification-evidence"),
+                Some(REFUSAL_DETAIL),
+            ),
+            "an overshoot whose comparison was refused keeps the refusal: {refused:?}"
+        );
+        assert_ne!(
+            refused.failure_class,
+            Some(FailureClass::UnderstoodInfrastructureFailure),
+            "{refused:?}"
+        );
+        not_skid_only("an overshoot whose comparison was refused", &refused);
+        // The same refusal without the banner line is still not a skid row:
+        // the report, not the stderr scan, refuses it.
+        let mut refused_report = VerificationReport::no_result();
+        refused_report.no_result_reason = Some(
+            crate::canonical_verdict::NoResultReason::ComparisonRefused {
+                detail: REFUSAL_DETAIL.into(),
+            },
+        );
+        let unbannered = verify_row_from_attempts(vec![skid_with_stderr(
+            &[OVERSHOOT_LINE, REFUSAL_LINE],
+            &serde_json::to_string(&refused_report).unwrap(),
+            122,
+        )]);
+        assert_eq!(unbannered.outcome, "ERROR", "{unbannered:?}");
+        assert_eq!(
+            unbannered.error_kind.as_deref(),
+            Some("incomplete-verification-evidence"),
+            "{unbannered:?}"
+        );
+        not_skid_only("a refused comparison report with skid markers", &unbannered);
+        // The markers and the typed report, but not Hermit's refusal status.
+        let wrong_status = verify_row_from_attempts(vec![skid_with_stderr(
+            &[OVERSHOOT_LINE, REFUSAL_LINE],
+            &skid_report(2),
+            1,
+        )]);
+        classified_as_skid("a skid report with a non-refusal exit", &wrong_status);
+        not_skid_only("a skid report with a non-refusal exit", &wrong_status);
+        // The stderr refusal line names a different count than the report.
+        let miscounted = attempt_from_script(
+            "ptrace",
+            &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+            Some(&skid_report(3)),
+        );
+        not_skid_only(
+            "a refusal line whose count differs from the report",
+            &verify_row_from_attempts(vec![miscounted]),
+        );
+        // The stderr markers with a no-result report.
+        let no_result = attempt_from_script(
+            "ptrace",
+            &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+            Some(&serde_json::to_string(&VerificationReport::no_result()).unwrap()),
+        );
+        not_skid_only(
+            "stderr markers with a no_result report",
+            &verify_row_from_attempts(vec![no_result]),
+        );
+        // The stderr markers with a diverged report.
+        let mut diverged = canonical_verification_report();
+        diverged.verified = false;
+        diverged.bitwise_parity = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged.first_divergent_scheduler_turn = Some(4);
+        diverged.first_divergent_virtual_nanoseconds = Some(7);
+        diverged.first_divergent_record = Some(9);
+        diverged.first_divergent_syscall = Some(2);
+        diverged.first_divergent_left_message = Some("left".into());
+        diverged.first_divergent_right_message = Some("right".into());
+        let diverged = attempt_from_script(
+            "ptrace",
+            &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 1"),
+            Some(&serde_json::to_string(&diverged).unwrap()),
+        );
+        let diverged = verify_row_from_attempts(vec![diverged]);
+        assert_eq!(diverged.outcome, "FAIL", "{diverged:?}");
+        not_skid_only("stderr markers with a diverged report", &diverged);
+        // Hermit's reports for an overshoot beside a second failure, in the
+        // shapes its writers produce, each with both markers and exit 122.
+        // Every one reaches the predicate as a typed skid row, so only the
+        // completed-comparison and guest-disposition guard refuses it.
+        let marked = |report: &str| {
+            verify_row_from_attempts(vec![skid_with_stderr(
+                &[OVERSHOOT_LINE, REFUSAL_LINE],
+                report,
+                122,
+            )])
+        };
+        for (label, report) in [
+            // Run 1 exited 1, which the verify policy rejects: no run 2.
+            (
+                "an overshoot after run 1 exited with a rejected code",
+                skid_report_without_comparison(2, Some(1), None),
+            ),
+            // Run 1 died from SIGSEGV: the rejected disposition is a signal.
+            (
+                "an overshoot after run 1 died from a signal",
+                skid_report_without_comparison(2, None, Some(11)),
+            ),
+            // Run 1 failed for another reason and returned only an error.
+            (
+                "an overshoot attached to a failed run 1",
+                skid_report_without_comparison(2, None, None),
+            ),
+            // Run 2 failed for another reason; the report keeps run 1's
+            // accepted status but has no comparison.
+            (
+                "an overshoot attached to a failed run 2",
+                skid_report_without_comparison(2, Some(0), None),
+            ),
+        ] {
+            let row = marked(&report);
+            classified_as_skid(label, &row);
+            not_skid_only(label, &row);
+        }
+        // Both runs were compared, but run 2 died from SIGSEGV.
+        let mut crashed = skid_report_value(2);
+        let outputs = crashed.compared_outputs.as_mut().unwrap();
+        outputs.right.exit_code = None;
+        outputs.right.signal = Some(11);
+        let crashed = marked(&serde_json::to_string(&crashed).unwrap());
+        classified_as_skid("a compared run 2 that died from a signal", &crashed);
+        not_skid_only("a compared run 2 that died from a signal", &crashed);
+        // Two shapes Hermit's writers do not produce, so each remaining
+        // guard is exercised alone: compared outputs without the comparison
+        // they came from, and a guest disposition that contradicts them.
+        let mut uncompared = skid_report_value(2);
+        uncompared.comparison = None;
+        uncompared.compared_log_messages = None;
+        let uncompared = marked(&serde_json::to_string(&uncompared).unwrap());
+        classified_as_skid("compared outputs without a comparison", &uncompared);
+        not_skid_only("compared outputs without a comparison", &uncompared);
+        let mut contradicted = skid_report_value(2);
+        contradicted.guest_exit_code = None;
+        contradicted.guest_signal = Some(11);
+        let contradicted = marked(&serde_json::to_string(&contradicted).unwrap());
+        classified_as_skid(
+            "a guest signal beside clean compared outputs",
+            &contradicted,
+        );
+        not_skid_only(
+            "a guest signal beside clean compared outputs",
+            &contradicted,
+        );
+        // Both runs exited 7 and were compared, in a cell that declares no
+        // expected exit: 7 is not a disposition this cell accepts.
+        let mut sevens = skid_report_value(2);
+        sevens.guest_exit_code = Some(7);
+        let outputs = sevens.compared_outputs.as_mut().unwrap();
+        outputs.left.exit_code = Some(7);
+        outputs.right.exit_code = Some(7);
+        let sevens = serde_json::to_string(&sevens).unwrap();
+        let undeclared = marked(&sevens);
+        classified_as_skid("a compared exit 7 the cell does not declare", &undeclared);
+        not_skid_only("a compared exit 7 the cell does not declare", &undeclared);
+        // The same report in a cell that declares exit 7 is skid-only, and
+        // the clean-exit report is not. Each row carries the command line the
+        // executor writes for its declaration, so only the disposition can
+        // refuse it.
+        let mut declared = marked(&sevens);
+        declared.expected_guest_exit = Some(expected_exit(Some(7), None));
+        let declared = with_executor_invocation(declared);
+        classified_as_skid("a compared exit 7 the cell declares", &declared);
+        assert_eq!(
+            skid_overshoot_only_reports(&declared),
+            Some(2),
+            "{declared:?}"
+        );
+        let mut clean_in_declared = qualifying.clone();
+        clean_in_declared.expected_guest_exit = Some(expected_exit(Some(7), None));
+        let clean_in_declared = with_executor_invocation(clean_in_declared);
+        assert_eq!(retained_verify_invocation_error(&clean_in_declared), None);
+        not_skid_only(
+            "a compared exit 0 in a cell that declares exit 7",
+            &clean_in_declared,
+        );
+
+        // A skid attempt next to a passing one is a mixed history.
+        let mut passed = skid();
+        passed.outcome = "PASS".into();
+        passed.error_kind = None;
+        passed.reason = None;
+        passed.index = "2".into();
+        not_skid_only(
+            "a skid attempt next to a passing attempt",
+            &verify_row_from_attempts(vec![skid(), passed]),
+        );
+
+        let mut timed_out = qualifying.clone();
+        timed_out.attempts[0].timed_out = true;
+        not_skid_only("a timed-out attempt", &timed_out);
+        let mut signaled = qualifying.clone();
+        signaled.attempts[0].signal = Some(9);
+        not_skid_only("a signaled attempt", &signaled);
+        let mut binary_changed = qualifying.clone();
+        binary_changed.reason = Some("Hermit binary changed while the cell was executing".into());
+        not_skid_only("a cell whose Hermit binary changed", &binary_changed);
+        let mut blocked = qualifying.clone();
+        blocked.result = Some(ObservedResult::InfrastructureError);
+        not_skid_only("a row that also carries an environmental block", &blocked);
+        let mut replay = qualifying.clone();
+        replay.mode = "replay".into();
+        not_skid_only("a replay row", &replay);
+        let mut unreadable = qualifying.clone();
+        unreadable.attempts[0].verification_report = None;
+        not_skid_only("an attempt with no retained report", &unreadable);
+        // The row and its attempt both name a count other than the report's
+        // and the refusal line's, so only the count/reason guard differs.
+        let mut relabeled = qualifying.clone();
+        relabeled.reason = Some(skid_overshoot_reason(1));
+        relabeled.attempts[0].reason = Some(skid_overshoot_reason(1));
+        not_skid_only("an attempt whose reason names another count", &relabeled);
+        let mut no_attempts = qualifying.clone();
+        no_attempts.attempts.clear();
+        not_skid_only("a row with no attempts", &no_attempts);
+        let mut product = qualifying;
+        product.failure_class = Some(FailureClass::ProductFailure);
+        not_skid_only("a product failure", &product);
     }
 
     /// A backend this runner could not start and a backend that ran but recorded
@@ -13577,6 +22596,7 @@ exit "$(cat "$PWD/exit-status")"
             timeout_seconds,
             verdict_path: Some(verdict),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: expected,
@@ -13785,13 +22805,24 @@ exit "$(cat "$PWD/exit-status")"
 set -eu
 verdict=
 logdir=
+rundir=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --verify-json) verdict=$2; shift 2 ;;
     --verify-log-dir) logdir=$2; shift 2 ;;
+    --verify-run) rundir=$2; shift 2 ;;
     *) shift ;;
   esac
 done
+if [ -n "$rundir" ]; then
+  # One run of the pair: its record, then its status; the comparison below
+  # says what `run --verify` would have said.
+  mkdir "$rundir"
+  printf '{{}}\n' > "$rundir/verify-run.json"
+  status=0
+  ( {ending} ) >/dev/null 2>&1 || status=$?
+  exit "$status"
+fi
 if [ -n "$logdir" ]; then
   mkdir -p "$logdir"
   printf 'INFO detcore: shared\n' > "$logdir/run1_log_fixture.log"
@@ -13897,6 +22928,492 @@ cp "{}" "$verdict"
         assert_eq!(reread.expected_guest_exit, None);
     }
 
+    /// A retained verify PASS, as a result history keeps it after a skid
+    /// retry, is re-decided from the row's own evidence by the checks the
+    /// executor applies before it writes PASS (`retained_verify_pass_error`):
+    /// the row's labels and execution path, each inner attempt's labels,
+    /// first stderr line, report digest, the comparator the row's
+    /// relaxations record, the declared stdout, the disposition the row's
+    /// expected guest exit names, and the dispatch record of the row's
+    /// backend. Each refusal below names the check that made it
+    /// (<https://github.com/rrnewton/hermit/issues/1845>).
+    #[test]
+    fn a_retained_verify_pass_is_redecided_from_its_own_evidence() {
+        let none = DeclaredStdout::default();
+        let (pass, _) = expected_exit_row(
+            Some(expected_exit(Some(7), None)),
+            expected_exit_report(Some(7), None),
+            "exit 7",
+        );
+        assert_eq!(pass.outcome, "PASS", "{:?}", pass.reason);
+        assert_eq!(retained_verify_pass_error(&pass, &none), None);
+        let (plain, _) = expected_exit_row(None, canonical_verification_report(), "exit 0");
+        assert_eq!(plain.outcome, "PASS", "{:?}", plain.reason);
+        assert_eq!(retained_verify_pass_error(&plain, &none), None);
+        let refused = |label: &str, row: &CellResult, declared: &DeclaredStdout, check: &str| {
+            let error = retained_verify_pass_error(row, declared)
+                .unwrap_or_else(|| panic!("{label} was re-decided as a verify PASS"));
+            assert!(
+                error.contains(check),
+                "{label} was refused by another check: {error}"
+            );
+        };
+        // Replace the attempt's report bytes and digest only, as a rewritten
+        // history would.
+        let with_bare_raw_report = |row: &CellResult, raw: String| {
+            let mut row = row.clone();
+            row.attempts[0].verification_report_sha256 = Some(hex_digest(raw.as_bytes()));
+            row.attempts[0].verification_report = Some(raw);
+            row
+        };
+        // Replace the report and, when it is a current report, the copies of
+        // it the runner writes onto the attempt and the row.
+        let with_raw_report = |row: &CellResult, raw: String| {
+            let mut row = with_bare_raw_report(row, raw.clone());
+            if let Ok(report) = current_verification_report(raw.as_bytes()) {
+                let attempt = &mut row.attempts[0];
+                attempt.runtime = report.runtime.clone();
+                attempt.first_divergent_scheduler_turn = report.first_divergent_scheduler_turn;
+                attempt.first_divergent_virtual_nanoseconds =
+                    report.first_divergent_virtual_nanoseconds;
+                attempt.first_divergent_record = report.first_divergent_record;
+                attempt.first_divergent_syscall = report.first_divergent_syscall;
+                attempt.first_divergent_left_message = report.first_divergent_left_message.clone();
+                attempt.first_divergent_right_message =
+                    report.first_divergent_right_message.clone();
+                let position = cell_divergence_position(&row.attempts);
+                row.runtime = row.attempts.iter().find_map(|a| a.runtime.clone());
+                row.first_divergent_scheduler_turn = position.scheduler_turn;
+                row.first_divergent_virtual_nanoseconds = position.virtual_nanoseconds;
+                row.first_divergent_record = position.record;
+                row.first_divergent_syscall = position.syscall;
+                row.first_divergent_left_message = position.left_message;
+                row.first_divergent_right_message = position.right_message;
+            }
+            row
+        };
+        let with_report = |row: &CellResult, report: &VerificationReport| {
+            with_raw_report(row, serde_json::to_string(report).unwrap())
+        };
+
+        // Labels the executor never writes on a verify PASS row.
+        let mut replay = pass.clone();
+        replay.mode = "replay".into();
+        refused("a replay row", &replay, &none, "not a verify PASS");
+        let mut failed = pass.clone();
+        failed.outcome = "FAIL".into();
+        refused("a FAIL row", &failed, &none, "not a verify PASS");
+        let mut no_result = pass.clone();
+        no_result.result = None;
+        let mut classified = pass.clone();
+        classified.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+        let mut kinded = pass.clone();
+        kinded.error_kind = Some("fixture-kind".into());
+        let mut reasoned = pass.clone();
+        reasoned.reason = Some("fixture reason".into());
+        for (label, row) in [
+            ("a PASS row without a typed result", &no_result),
+            ("a PASS row with a failure class", &classified),
+            ("a PASS row with an error kind", &kinded),
+            ("a PASS row with a reason", &reasoned),
+        ] {
+            refused(label, row, &none, "not labelled as a verify PASS");
+        }
+
+        // A SaBRe path on a ptrace row, which no attempt of the row decides.
+        let mut labelled_path = pass.clone();
+        labelled_path.execution_path = Some(serde_json::json!({"eligible": true}));
+        refused(
+            "a ptrace PASS row recording a SaBRe path",
+            &labelled_path,
+            &none,
+            "execution-path evidence",
+        );
+
+        // Inner attempts the executor never writes under a PASS row.
+        let mut empty = pass.clone();
+        empty.attempts.clear();
+        refused(
+            "a PASS row without attempts",
+            &empty,
+            &none,
+            "no inner attempt",
+        );
+        let mut repeated = pass.clone();
+        repeated.attempts.push(repeated.attempts[0].clone());
+        refused(
+            "a repeated attempt index",
+            &repeated,
+            &none,
+            "blank or repeated",
+        );
+        let mut blank = pass.clone();
+        blank.attempts[0].index = " ".into();
+        refused("a blank attempt index", &blank, &none, "blank or repeated");
+        let mut attempt_reasoned = pass.clone();
+        attempt_reasoned.attempts[0].reason = Some("fixture reason".into());
+        let mut attempt_kinded = pass.clone();
+        attempt_kinded.attempts[0].error_kind = Some("fixture-kind".into());
+        let mut attempt_timed_out = pass.clone();
+        attempt_timed_out.attempts[0].timed_out = true;
+        let mut attempt_error = pass.clone();
+        attempt_error.attempts[0].outcome = "ERROR".into();
+        for (label, row) in [
+            ("an attempt with a reason", &attempt_reasoned),
+            ("an attempt with an error kind", &attempt_kinded),
+            ("a timed-out attempt", &attempt_timed_out),
+            ("an ERROR attempt", &attempt_error),
+        ] {
+            refused(label, row, &none, "is not a PASS without");
+        }
+
+        // Hermit's generic command-line error class on the first stderr line
+        // keeps an executed attempt ERROR even beside a matched report and
+        // the declared exit status, so a retained attempt carrying it is
+        // never a pass either. Only the first line carries Hermit's
+        // classification, for the executor and for this re-decision alike.
+        let cli_error = "HERMIT_INTERNAL_FAILURE class=cli-error";
+        let (executed, _) = expected_exit_row(
+            Some(expected_exit(Some(7), None)),
+            expected_exit_report(Some(7), None),
+            &format!("printf '%s\\n' '{cli_error}' >&2; exit 7"),
+        );
+        assert_eq!(executed.outcome, "ERROR", "{executed:?}");
+        let mut producer_failed = pass.clone();
+        producer_failed.attempts[0].stderr = format!("{cli_error}\n");
+        refused(
+            "an attempt reporting Hermit's command-line error",
+            &producer_failed,
+            &none,
+            "internal-failure class",
+        );
+        let (executed_later, _) = expected_exit_row(
+            Some(expected_exit(Some(7), None)),
+            expected_exit_report(Some(7), None),
+            &format!("printf 'guest output\\n%s\\n' '{cli_error}' >&2; exit 7"),
+        );
+        assert_eq!(executed_later.outcome, "PASS", "{executed_later:?}");
+        let mut later_line = pass.clone();
+        later_line.attempts[0].stderr = format!("guest output\n{cli_error}\n");
+        assert_eq!(retained_verify_pass_error(&later_line, &none), None);
+
+        // The retained report must be the bytes its digest names, and a
+        // current report.
+        let mut unreported = pass.clone();
+        unreported.attempts[0].verification_report = None;
+        unreported.attempts[0].verification_report_sha256 = None;
+        refused(
+            "an attempt without a report",
+            &unreported,
+            &none,
+            "no verification report",
+        );
+        let mut misdigested = pass.clone();
+        misdigested.attempts[0].verification_report_sha256 = Some("0".repeat(64));
+        refused("a misdigested report", &misdigested, &none, "not the bytes");
+        refused(
+            "an unreadable report",
+            &with_raw_report(&pass, "{}".into()),
+            &none,
+            "not a current report",
+        );
+
+        // The comparator the row's relaxations record. A canonical report
+        // under the stripped relaxation, and a stripped report under none,
+        // are refused; a stripped report under the stripped relaxation
+        // passes only when it matched and its exact outputs agree.
+        let stripped_relaxation = format!("{STRIPPED_COMPARATOR_RELAXATION_PREFIX}fixture reason");
+        // Each row carries the command line the executor writes for its
+        // relaxations, so only the comparison can refuse it.
+        let mut canonical_under_stripped = pass.clone();
+        canonical_under_stripped
+            .relaxations
+            .push(stripped_relaxation.clone());
+        let canonical_under_stripped = with_executor_invocation(canonical_under_stripped);
+        refused(
+            "a canonical report under the stripped relaxation",
+            &canonical_under_stripped,
+            &none,
+            "the row's Stripped comparator",
+        );
+        let stripped_report =
+            with_ptrace_dispatch(serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap());
+        let stripped_under_strict = with_report(&plain, &stripped_report);
+        refused(
+            "a stripped report under no relaxation",
+            &stripped_under_strict,
+            &none,
+            "the row's Strict comparator",
+        );
+        let mut stripped = stripped_under_strict.clone();
+        stripped.relaxations.push(stripped_relaxation);
+        let stripped = with_executor_invocation(stripped);
+        assert_eq!(retained_verify_pass_error(&stripped, &none), None);
+        let mut stripped_outputs_differ = stripped_report.clone();
+        stripped_outputs_differ
+            .compared_outputs
+            .as_mut()
+            .unwrap()
+            .right
+            .stdout_bytes += 1;
+        // The report reader already refuses a matched report whose two
+        // operands differ, before the comparator check is reached.
+        refused(
+            "a stripped report whose exact outputs differ",
+            &with_report(&stripped, &stripped_outputs_differ),
+            &none,
+            "operands differ in status, stdout, or stderr",
+        );
+        let mut diverged = expected_exit_report(Some(7), None);
+        diverged.verified = false;
+        diverged.bitwise_parity = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged.first_divergent_record = Some(9);
+        diverged.first_divergent_left_message = Some("left".into());
+        diverged.first_divergent_right_message = Some("right".into());
+        refused(
+            "a canonical divergence",
+            &with_report(&pass, &diverged),
+            &none,
+            "the row's Strict comparator",
+        );
+
+        // The declared stdout, decided from the report's digests and, for
+        // the contained text, from the attempt's captured stdout when it is
+        // both compared runs' stdout.
+        let golden = "golden\n";
+        let mut golden_report = expected_exit_report(Some(7), None);
+        let outputs = golden_report.compared_outputs.as_mut().unwrap();
+        for output in [&mut outputs.left, &mut outputs.right] {
+            output.stdout_sha256 = hex_digest(golden.as_bytes());
+            output.stdout_bytes = golden.len() as u64;
+        }
+        let mut golden_pass = with_report(&pass, &golden_report);
+        golden_pass.attempts[0].stdout = golden.into();
+        let exact = |text: &str| DeclaredStdout {
+            exact: Some(text.into()),
+            contains: None,
+        };
+        let contains = |text: &str| DeclaredStdout {
+            exact: None,
+            contains: Some(text.into()),
+        };
+        assert_eq!(
+            retained_verify_pass_error(&golden_pass, &exact(golden)),
+            None
+        );
+        assert_eq!(
+            retained_verify_pass_error(&golden_pass, &contains("gold")),
+            None
+        );
+        refused(
+            "stdout other than the declared bytes",
+            &pass,
+            &exact(golden),
+            "declared stdout assertion",
+        );
+        refused(
+            "stdout without the declared text",
+            &golden_pass,
+            &contains("silver"),
+            "declared stdout assertion",
+        );
+        let mut uncaptured = golden_pass.clone();
+        uncaptured.attempts[0].stdout = "gold, but not the compared bytes\n".into();
+        refused(
+            "a capture that is not the compared runs' stdout",
+            &uncaptured,
+            &contains("gold"),
+            "declared stdout assertion",
+        );
+
+        // The disposition the row's expected guest exit names: that guest
+        // ending and the Hermit status reporting it, or Hermit exit status 0
+        // when the row names none.
+        let mut undeclared = pass.clone();
+        undeclared.expected_guest_exit = None;
+        let undeclared = with_executor_invocation(undeclared);
+        refused(
+            "exit status 7 without a declaration",
+            &undeclared,
+            &none,
+            "did not end as the row requires",
+        );
+        refused(
+            "a guest that exited 0 where 7 is expected",
+            &with_report(&pass, &expected_exit_report(Some(0), None)),
+            &none,
+            "did not end as the row requires",
+        );
+        let mut hermit_succeeded = pass.clone();
+        hermit_succeeded.attempts[0].status = Some(0);
+        refused(
+            "Hermit exit status 0 where the guest exited 7",
+            &hermit_succeeded,
+            &none,
+            "did not end as the row requires",
+        );
+
+        // The dispatch record a passing attempt of the row's backend carries.
+        let mut dispatched_report = expected_exit_report(Some(7), None);
+        dispatched_report.runtime = stripped_report.runtime.clone();
+        let dispatched = with_report(&pass, &dispatched_report);
+        assert_eq!(retained_verify_pass_error(&dispatched, &none), None);
+        let mut forged: serde_json::Value = serde_json::to_value(&dispatched_report).unwrap();
+        forged["runtime"]["run1"]["dispatch"]["backend"] = serde_json::json!("liteinst");
+        let forged_pass = with_raw_report(&pass, serde_json::to_string(&forged).unwrap());
+        refused(
+            "another backend's dispatch record",
+            &forged_pass,
+            &none,
+            "dispatch evidence",
+        );
+
+        // The runner copies a passing attempt's runtime and divergence
+        // coordinates from its report onto the attempt, and onto the row the
+        // first runtime and the divergence position its attempts give. A row
+        // the runner wrote from a report carrying a runtime agrees with every
+        // copy.
+        let (executed_dispatched, _) = expected_exit_row(
+            Some(expected_exit(Some(7), None)),
+            dispatched_report.clone(),
+            "exit 7",
+        );
+        assert_eq!(
+            executed_dispatched.outcome, "PASS",
+            "{:?}",
+            executed_dispatched.reason
+        );
+        assert!(executed_dispatched.runtime.is_some());
+        assert_eq!(
+            executed_dispatched.attempts[0].runtime,
+            dispatched_report.runtime
+        );
+        assert_eq!(
+            retained_verify_pass_error(&executed_dispatched, &none),
+            None
+        );
+        // The forged history with only the report's runtime removed: the
+        // attempt's and the row's copies still carry the other backend's
+        // record, which no check of the report would see.
+        let mut unruntimed = forged.clone();
+        unruntimed.as_object_mut().unwrap().remove("runtime");
+        let stale_copies =
+            with_bare_raw_report(&forged_pass, serde_json::to_string(&unruntimed).unwrap());
+        assert!(stale_copies.attempts[0].runtime.is_some() && stale_copies.runtime.is_some());
+        refused(
+            "an attempt runtime copy the report does not carry",
+            &stale_copies,
+            &none,
+            "retained runtime or divergence coordinates differ",
+        );
+        // The attempt's copy removed too: only the row still carries it.
+        let mut stale_row = stale_copies.clone();
+        stale_row.attempts[0].runtime = None;
+        refused(
+            "a row runtime copy no attempt carries",
+            &stale_row,
+            &none,
+            "the row's runtime or divergence coordinates",
+        );
+        // A divergence coordinate only a copy carries.
+        let mut attempt_coordinate = pass.clone();
+        attempt_coordinate.attempts[0].first_divergent_record = Some(9);
+        attempt_coordinate.first_divergent_record = Some(9);
+        refused(
+            "an attempt divergence coordinate the report does not carry",
+            &attempt_coordinate,
+            &none,
+            "retained runtime or divergence coordinates differ",
+        );
+        let mut row_message = pass.clone();
+        row_message.first_divergent_left_message = Some("left".into());
+        refused(
+            "a row divergence message no attempt carries",
+            &row_message,
+            &none,
+            "the row's runtime or divergence coordinates",
+        );
+    }
+
+    /// A row whose attempt carries an `infrastructure_error` report records
+    /// the cell's declared stdout assertions, so a later reader can re-decide
+    /// them from the attempt's own evidence before treating the row as
+    /// skid-only (<https://github.com/rrnewton/hermit/issues/1845>). Every
+    /// other row keeps the historical shape, without the key.
+    #[test]
+    fn a_skid_row_records_the_cells_declared_stdout() {
+        let (skid_result, skid_row) = expected_exit_row(
+            None,
+            skid_report_value(2),
+            &format!("{SKID_STDERR}; exit 122"),
+        );
+        assert_eq!(
+            (
+                skid_result.outcome.as_str(),
+                skid_result.error_kind.as_deref()
+            ),
+            ("ERROR", Some("infrastructure")),
+            "{skid_result:?}"
+        );
+        assert_eq!(
+            skid_row["declared_stdout"],
+            serde_json::json!({"exact": null, "contains": null}),
+            "{skid_row}"
+        );
+        assert_eq!(skid_overshoot_only_reports(&skid_result), Some(2));
+        let reread: CellResult = serde_json::from_value(skid_row.clone()).unwrap();
+        assert_eq!(reread.declared_stdout, Some(DeclaredStdout::default()));
+        assert_eq!(skid_overshoot_only_reports(&reread), Some(2));
+        // Each member is required, though it may be null: a record that
+        // omits one is refused rather than read as a declaration of nothing.
+        for (omitted, record) in [
+            ("exact", serde_json::json!({"contains": null})),
+            ("contains", serde_json::json!({"exact": null})),
+            ("exact", serde_json::json!({})),
+        ] {
+            let mut row = skid_row.clone();
+            row["declared_stdout"] = record;
+            let error = serde_json::from_value::<CellResult>(row).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("missing field `{omitted}`")),
+                "{error}"
+            );
+        }
+
+        let (plain_result, plain_row) =
+            expected_exit_row(None, canonical_verification_report(), "exit 0");
+        assert_eq!(plain_result.outcome, "PASS", "{:?}", plain_result.reason);
+        assert!(
+            !plain_row
+                .as_object()
+                .unwrap()
+                .contains_key("declared_stdout"),
+            "{plain_row}"
+        );
+
+        // The record is the verify recipe's declaration for the cell's
+        // backend, exactly what the classifier checked.
+        let mut declared = ptrace_cell("verify");
+        let recipe = declared.test.modes.get_mut("verify").unwrap();
+        recipe.expected_stdout = BTreeMap::from([("ptrace".to_string(), "golden\n".to_string())]);
+        recipe.expected_stdout_contains =
+            BTreeMap::from([("ptrace".to_string(), "gold".to_string())]);
+        assert_eq!(
+            cell_declared_stdout(&declared),
+            DeclaredStdout {
+                exact: Some("golden\n".into()),
+                contains: Some("gold".into()),
+            }
+        );
+        assert_eq!(
+            cell_declared_stdout(&ptrace_cell("verify")),
+            DeclaredStdout::default()
+        );
+    }
+
     /// Only a verify cell carries a declaration; the same recipe field on any
     /// other mode is not authority for a nonzero pass there.
     #[test]
@@ -13989,7 +23506,7 @@ cp "{}" "$verdict"
         let mut verify = base.clone();
         verify.guest_args = BTreeMap::from([("ptrace".into(), vec!["workdir".into()])]);
         verify.workdir = Some("/srv".into());
-        verify.env = BTreeMap::from([("MODE".into(), "x".into())]);
+        verify.env = Some(BTreeMap::from([("MODE".into(), "x".into())]));
         verify.expected_guest_exit = Some(expected_exit(Some(3), None));
         verify.expected_stdout = BTreeMap::from([("ptrace".into(), "p\n".into())]);
         verify.expected_stdout_contains = BTreeMap::from([("ptrace".into(), "ok".into())]);
@@ -13997,7 +23514,7 @@ cp "{}" "$verdict"
         assert_eq!(cell_guest_args(&inherited, "ptrace"), ["workdir"]);
         assert_eq!(cell_guest_args(&inherited, "dbt"), Vec::<String>::new());
         assert_eq!(cell_workdir(&inherited).as_deref(), Some("/srv"));
-        assert_eq!(cell_mode_env(&inherited), verify.env);
+        assert_eq!(Some(cell_mode_env(&inherited)), verify.env);
         assert_eq!(
             cell_expected_guest_exit(&inherited),
             Some(expected_exit(Some(3), None))
@@ -14024,6 +23541,159 @@ cp "{}" "$verdict"
         assert_eq!(cell_expected_guest_exit(&chaos), None);
     }
 
+    #[test]
+    fn backend_env_is_scoped_in_argv_and_replay_inheritance() {
+        let context = run_context(Path::new("/repo"));
+        let mut cell = ptrace_cell("verify");
+        let recipe = cell.test.modes.get_mut("verify").unwrap();
+        recipe.backends_enabled.push("liteinst".into());
+        recipe.env = Some(BTreeMap::from([("TMPDIR".into(), "/tmp".into())]));
+        recipe.env_by_backend = BTreeMap::from([(
+            "liteinst".into(),
+            BTreeMap::from([("FIXTURE_CELL".into(), "on".into())]),
+        )]);
+        validate_mode_extensions("fixture/test", "verify", recipe).unwrap();
+        let verify = recipe.clone();
+        let render = |cell: &SelectedCell| {
+            build_spec(
+                &context,
+                cell,
+                PathBuf::from("/repo/results/fixture"),
+                vec!["/bin/true".into()],
+                "1",
+                None,
+                15,
+            )
+            .unwrap()
+            .argv
+        };
+        let ptrace = render(&cell);
+        cell.id.backend = Some("liteinst".into());
+        let liteinst = render(&cell);
+        assert!(ptrace.iter().any(|arg| arg == "TMPDIR=/tmp"));
+        assert!(liteinst.iter().any(|arg| arg == "TMPDIR=/tmp"));
+        assert!(!ptrace.iter().any(|arg| arg == "FIXTURE_CELL=on"));
+        let addition = liteinst
+            .windows(2)
+            .position(|pair| pair == ["--env", "FIXTURE_CELL=on"])
+            .unwrap();
+        let mut without_addition = liteinst;
+        without_addition.drain(addition..addition + 2);
+        let mut unchanged = cell.clone();
+        unchanged
+            .test
+            .modes
+            .get_mut("verify")
+            .unwrap()
+            .env_by_backend
+            .clear();
+        assert_eq!(without_addition, render(&unchanged));
+        let mut replay = replay_cell_with_verify(verify, ModeRecipe::default());
+        replay.id.backend = Some("liteinst".into());
+        assert_eq!(cell_mode_env(&replay), cell_mode_env(&cell));
+        replay.test.modes.get_mut("replay").unwrap().env = Some(BTreeMap::new());
+        assert!(cell_mode_env(&replay).is_empty());
+        assert!(!render(&replay).iter().any(|arg| arg == "FIXTURE_CELL=on"));
+    }
+
+    #[test]
+    fn backend_env_refuses_invalid_scope_names_values_and_collisions() {
+        let mut recipe = ModeRecipe {
+            backends_enabled: vec!["liteinst".into()],
+            env: Some(BTreeMap::from([("TMPDIR".into(), "/tmp".into())])),
+            ..ModeRecipe::default()
+        };
+        for (backend, name, value, needle) in [
+            ("ptrace", "FIXTURE", "on", "not in backends_enabled"),
+            ("unknown", "FIXTURE", "on", "not in backends_enabled"),
+            ("liteinst", "", "on", "not a valid NAME=VALUE"),
+            ("liteinst", "lower", "on", "not a valid NAME=VALUE"),
+            ("liteinst", "NAME", "\0", "not a valid NAME=VALUE"),
+            ("liteinst", "HOME", "x", "runner sets itself"),
+            ("liteinst", "TMPDIR", "/tmp", "repeats common env name"),
+        ] {
+            recipe.env_by_backend = BTreeMap::from([(
+                backend.into(),
+                BTreeMap::from([(name.into(), value.into())]),
+            )]);
+            let error = validate_mode_extensions("fixture/test", "verify", &recipe).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        }
+        recipe.env_by_backend = BTreeMap::from([("liteinst".into(), BTreeMap::new())]);
+        assert!(
+            validate_mode_extensions("fixture/test", "verify", &recipe)
+                .unwrap_err()
+                .contains("is empty")
+        );
+        recipe
+            .env_by_backend
+            .get_mut("liteinst")
+            .unwrap()
+            .insert("FIXTURE".into(), "on".into());
+        for mode in ["replay", "naked", "chaos", "custom"] {
+            recipe.env = None;
+            let error = validate_mode_extensions("fixture/test", mode, &recipe).unwrap_err();
+            assert!(
+                error.contains("env_by_backend, which only a verify mode accepts"),
+                "{error}"
+            );
+        }
+    }
+
+    /// A replay recipe that declares an environment, even an empty one, runs
+    /// with it instead of its verify recipe's, so a replay cell can run
+    /// without a variable its verify cell adds; the verify cell keeps it.
+    #[test]
+    fn a_replay_cell_that_declares_an_empty_env_runs_without_its_verify_env() {
+        let context = run_context(Path::new("/repo"));
+        let base = ptrace_cell("verify").test.modes["verify"].clone();
+        let mut verify = base.clone();
+        verify.env = Some(BTreeMap::from([("TMPDIR".into(), "/tmp".into())]));
+        let mut replay = base;
+        replay.env = Some(BTreeMap::new());
+        let cell = replay_cell_with_verify(verify.clone(), replay);
+        assert_eq!(cell_mode_env(&cell), BTreeMap::new());
+        let spec = build_spec(
+            &context,
+            &cell,
+            PathBuf::from("/repo/results/replay-cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            15,
+        )
+        .unwrap();
+        let log = spec.argv.iter().position(|arg| arg == "--log").unwrap();
+        assert_eq!(&spec.argv[log + 4..log + 6], ["record", "start"]);
+        assert!(
+            !spec.argv.iter().any(|arg| arg.starts_with("TMPDIR=")),
+            "{:?}",
+            spec.argv
+        );
+
+        let mut verify_cell = ptrace_cell("verify");
+        verify_cell.test.modes.insert("verify".into(), verify);
+        assert_eq!(
+            cell_mode_env(&verify_cell),
+            BTreeMap::from([("TMPDIR".into(), "/tmp".into())])
+        );
+        let spec = build_spec(
+            &context,
+            &verify_cell,
+            PathBuf::from("/repo/results/verify-cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            15,
+        )
+        .unwrap();
+        assert!(
+            spec.argv.iter().any(|arg| arg == "TMPDIR=/tmp"),
+            "{:?}",
+            spec.argv
+        );
+    }
+
     /// Verify, replay and chaos argv come from one builder: replay runs the
     /// same guest environment and mode environment, and differs only in its
     /// subcommand and recording arguments.
@@ -14032,7 +23702,7 @@ cp "{}" "$verdict"
         let context = run_context(Path::new("/repo"));
         let base = ptrace_cell("verify").test.modes["verify"].clone();
         let mut verify = base.clone();
-        verify.env = BTreeMap::from([("MODE".into(), "x".into())]);
+        verify.env = Some(BTreeMap::from([("MODE".into(), "x".into())]));
         verify.workdir = Some("/srv".into());
         let cell = replay_cell_with_verify(verify, base);
         let spec = build_spec(
@@ -14045,7 +23715,8 @@ cp "{}" "$verdict"
             15,
         )
         .unwrap();
-        assert_eq!(&spec.argv[5..7], ["record", "start"]);
+        let log = spec.argv.iter().position(|arg| arg == "--log").unwrap();
+        assert_eq!(&spec.argv[log + 4..log + 6], ["record", "start"]);
         assert!(spec.argv.iter().any(|arg| arg == "MODE=x"));
         assert!(
             spec.argv
@@ -14057,12 +23728,15 @@ cp "{}" "$verdict"
                 .windows(2)
                 .any(|window| window[0] == "--record-timeout" && window[1] == "15")
         );
-        assert!(
-            !spec
-                .argv
-                .iter()
-                .any(|arg| arg.starts_with("--verify-allow"))
-        );
+        // The recording is replayed whatever its status, as `record start
+        // --verify` replays it, and the replay replays the recording.
+        assert!(spec.argv.iter().any(|arg| arg == "--verify-allow=both"));
+        assert!(spec.argv.windows(3).any(|window| window
+            == [
+                "--verify-run",
+                VERIFY_RUN_DIR_PLACEHOLDER,
+                VERIFY_REPLAY_OF_PLACEHOLDER
+            ]));
         assert_eq!(spec.argv.last().map(String::as_str), Some("/bin/true"));
     }
 
@@ -14127,6 +23801,7 @@ cp "{}" "$verdict"
             timeout_seconds: 5,
             verdict_path: Some(verdict),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
@@ -14372,6 +24047,288 @@ cp "{}" "$verdict"
         assert!(
             error.contains("is not the second compared run's stdout"),
             "{error}"
+        );
+    }
+
+    /// A skid attempt's compared runs still answer to the cell's declared
+    /// stdout assertions (<https://github.com/rrnewton/hermit/issues/1845>).
+    /// Runs that agree on the wrong bytes, or omit the declared marker, and a
+    /// capture that cannot decide the marker, each keep the skid
+    /// infrastructure ERROR classification, the one shape every reader of a
+    /// result row accepts beside an `infrastructure_error` report, with a
+    /// reason that names both the overshoot and the assertion. None of them
+    /// is a skid-only row, so none earns the skid retry or counts as a
+    /// skid-recovered pass, even relabelled with the plain skid reason; the
+    /// same attempt with its assertions met stays one.
+    ///
+    /// The predicate re-decides the row's recorded declaration from each
+    /// attempt's own evidence, so a row an older producer classified without
+    /// the assertions (an attempt labelled `infrastructure` whatever its
+    /// stdout) qualifies only when its record shows no assertion it breaks,
+    /// and never without the record.
+    #[test]
+    fn a_skid_attempt_that_breaks_a_declared_stdout_assertion_is_not_skid_only() {
+        let skid_with = |first: &str, second: &str| {
+            let mut report = skid_report_value(2);
+            let outputs = report.compared_outputs.as_mut().unwrap();
+            outputs.left.stdout_sha256 = hex_digest(first.as_bytes());
+            outputs.left.stdout_bytes = first.len() as u64;
+            outputs.right.stdout_sha256 = hex_digest(second.as_bytes());
+            outputs.right.stdout_bytes = second.len() as u64;
+            report
+        };
+        let ending = format!("{SKID_STDERR}; exit 122");
+        let golden = "syscall-file-io-ok count=5\n";
+        let unmarked = "syscall-file-io count=5\n";
+        let marker = "-ok ";
+        let skid = skid_overshoot_reason(2);
+        // The row `run_cell_inner` publishes for a cell declaring `exact`
+        // and/or `contains`.
+        let declaring = |mut row: CellResult, exact: Option<&str>, contains: Option<&str>| {
+            row.declared_stdout = Some(DeclaredStdout {
+                exact: exact.map(str::to_string),
+                contains: contains.map(str::to_string),
+            });
+            row
+        };
+
+        // A violating attempt is published in exactly the shape of a plain
+        // skid attempt: only its reason differs. With the plain skid reason
+        // restored, the row's recorded declaration alone still refuses it.
+        let refused_whatever_its_reason = |label: &str, row: CellResult| {
+            assert_eq!(
+                (
+                    row.outcome.as_str(),
+                    row.result,
+                    row.failure_class,
+                    row.error_kind.as_deref()
+                ),
+                (
+                    "ERROR",
+                    None,
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
+                    Some("infrastructure")
+                ),
+                "{label}: {row:?}"
+            );
+            let attempt = &row.attempts[0];
+            let report = current_verification_report(
+                attempt.verification_report.as_deref().unwrap().as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                (report.verdict, report.infrastructure_error),
+                (
+                    Verdict::InfrastructureError,
+                    Some(InfrastructureError::SkidOvershoot { count: 2 })
+                ),
+                "{label}: {row:?}"
+            );
+            assert_eq!(
+                skid_overshoot_only_reports(&row),
+                None,
+                "{label} must not be a skid-only row"
+            );
+            let mut relabelled = row;
+            relabelled.reason = Some(skid.clone());
+            relabelled.attempts[0].reason = Some(skid.clone());
+            assert_eq!(
+                skid_overshoot_only_reports(&relabelled),
+                None,
+                "{label} must not be a skid-only row with the plain skid reason"
+            );
+        };
+
+        // Controls: the same skid attempts with every declared assertion met.
+        for (label, exact, contains) in [
+            ("exact stdout met", Some(golden), None),
+            ("marker met", None, Some(marker)),
+            ("both met", Some(golden), Some(marker)),
+        ] {
+            let met = attempt_with_stdout_assertions(
+                exact,
+                contains,
+                skid_with(golden, golden),
+                golden,
+                &ending,
+            );
+            assert_eq!(
+                (met.outcome.as_str(), met.error_kind.as_deref()),
+                ("ERROR", Some("infrastructure")),
+                "{label}: {met:?}"
+            );
+            let row = declaring(verify_row_from_attempts(vec![met]), exact, contains);
+            assert_eq!(
+                (row.outcome.as_str(), row.result, row.failure_class),
+                (
+                    "ERROR",
+                    None,
+                    Some(FailureClass::UnderstoodInfrastructureFailure)
+                ),
+                "{label}: {row:?}"
+            );
+            assert_eq!(
+                skid_overshoot_only_reports(&row),
+                Some(2),
+                "{label} must stay a skid-only row"
+            );
+        }
+
+        let empty_sha = hex_digest(b"");
+        let golden_sha = hex_digest(golden.as_bytes());
+        let unmarked_sha = hex_digest(unmarked.as_bytes());
+        for (label, exact, contains, report, captured, reason) in [
+            (
+                "agreeing on the wrong bytes",
+                Some(golden),
+                None,
+                skid_with("", ""),
+                "",
+                expected_stdout_mismatch_reason(
+                    "first",
+                    0,
+                    &empty_sha,
+                    golden.len() as u64,
+                    &golden_sha,
+                ),
+            ),
+            (
+                "the second run printing the wrong bytes",
+                Some(golden),
+                None,
+                skid_with(golden, unmarked),
+                golden,
+                expected_stdout_mismatch_reason(
+                    "second",
+                    unmarked.len() as u64,
+                    &unmarked_sha,
+                    golden.len() as u64,
+                    &golden_sha,
+                ),
+            ),
+            (
+                "omitting the declared marker",
+                None,
+                Some(marker),
+                skid_with(unmarked, unmarked),
+                unmarked,
+                expected_stdout_contains_mismatch_reason(
+                    unmarked.len() as u64,
+                    &unmarked_sha,
+                    marker,
+                ),
+            ),
+        ] {
+            let failed = attempt_with_stdout_assertions(exact, contains, report, captured, &ending);
+            let expected = format!(
+                "{skid}, and its compared runs violate a declared stdout assertion: {reason}"
+            );
+            assert_eq!(
+                (
+                    failed.outcome.as_str(),
+                    failed.error_kind.as_deref(),
+                    failed.reason.as_deref(),
+                ),
+                ("ERROR", Some("infrastructure"), Some(expected.as_str())),
+                "{label} beside an overshoot names both: {failed:?}"
+            );
+            let row = declaring(verify_row_from_attempts(vec![failed]), exact, contains);
+            refused_whatever_its_reason(label, row);
+        }
+
+        // A capture that is not the compared bytes cannot decide the marker.
+        let foreign = attempt_with_stdout_assertions(
+            None,
+            Some(marker),
+            skid_with(unmarked, unmarked),
+            golden,
+            &ending,
+        );
+        assert_eq!(
+            (foreign.outcome.as_str(), foreign.error_kind.as_deref()),
+            ("ERROR", Some("infrastructure")),
+            "{foreign:?}"
+        );
+        let prefix = format!(
+            "{skid}, and a declared stdout assertion cannot be checked: captured verify stdout ("
+        );
+        assert!(
+            foreign
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(&prefix)),
+            "{foreign:?}"
+        );
+        let row = declaring(verify_row_from_attempts(vec![foreign]), None, Some(marker));
+        refused_whatever_its_reason("a capture unlike the compared runs", row);
+
+        // Rows an older producer wrote: each attempt was classified without
+        // the cell's assertions, so it carries the plain skid label whatever
+        // its compared runs printed. Only the row's recorded declaration,
+        // re-decided against the attempt's own evidence, can admit it.
+        let imported = |first: &str, second: &str, captured: &str| {
+            let attempt = attempt_with_stdout_assertions(
+                None,
+                None,
+                skid_with(first, second),
+                captured,
+                &ending,
+            );
+            assert_eq!(
+                (attempt.outcome.as_str(), attempt.error_kind.as_deref()),
+                ("ERROR", Some("infrastructure")),
+                "{attempt:?}"
+            );
+            verify_row_from_attempts(vec![attempt])
+        };
+        let mut unrecorded = imported("", "", "");
+        unrecorded.declared_stdout = None;
+        assert_eq!(
+            skid_overshoot_only_reports(&unrecorded),
+            None,
+            "a row without the record never qualifies"
+        );
+        for (label, row) in [
+            (
+                "an empty pair under a declared golden",
+                declaring(imported("", "", ""), Some(golden), None),
+            ),
+            (
+                "a second run off the declared golden",
+                declaring(imported(golden, unmarked, golden), Some(golden), None),
+            ),
+            (
+                "an empty pair under a declared marker",
+                declaring(imported("", "", ""), None, Some(marker)),
+            ),
+            (
+                "an unmarked pair under a declared marker",
+                declaring(imported(unmarked, unmarked, unmarked), None, Some(marker)),
+            ),
+            (
+                "a capture unlike the compared runs under a declared marker",
+                declaring(imported(unmarked, unmarked, golden), None, Some(marker)),
+            ),
+        ] {
+            assert_eq!(
+                skid_overshoot_only_reports(&row),
+                None,
+                "{label} must not be a skid-only row: {row:?}"
+            );
+        }
+        assert_eq!(
+            skid_overshoot_only_reports(&declaring(imported("", "", ""), None, None)),
+            Some(2),
+            "a recorded row declaring nothing keeps its skid-only reading"
+        );
+        assert_eq!(
+            skid_overshoot_only_reports(&declaring(
+                imported(golden, golden, golden),
+                Some(golden),
+                Some(marker)
+            )),
+            Some(2),
+            "a recorded row whose evidence meets its declaration keeps it"
         );
     }
 
@@ -14764,6 +24721,7 @@ cp "{}" "$verdict"
             timeout_seconds: 5,
             verdict_path: Some(verdict),
             verification_log_dir: None,
+            verify_runs: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
@@ -14834,6 +24792,108 @@ cp "{}" "$verdict"
                 );
             }
         }
+    }
+
+    /// A run Hermit started and a typed failure stopped (`run_failed`) is a
+    /// product crash with Hermit's reason, for each failure kind and either
+    /// run; a zero Hermit exit contradicts it. Before the reason existed such
+    /// a run left the `not_run` stamp and was counted as no result.
+    #[test]
+    fn a_typed_run_failure_is_a_product_crash_with_its_reason() {
+        use crate::canonical_verdict::NoResultReason;
+        use crate::canonical_verdict::RunFailure;
+        use crate::canonical_verdict::VerificationRun;
+        for (status, failure) in [
+            (125, RunFailure::BackendFailure),
+            (125, RunFailure::DeterminismLoss),
+            (122, RunFailure::PolicyRefusal),
+        ] {
+            for run in [VerificationRun::Run1, VerificationRun::Run2] {
+                let reason = NoResultReason::RunFailed {
+                    run,
+                    failure,
+                    detail: "KVM guest execution failed: guest exception vector 14".into(),
+                };
+                let failed = no_result_with_exit_status(status, reason.clone());
+                assert_eq!(failed.outcome, "FAIL");
+                assert_eq!(failed.error_kind, None);
+                let text = failed.reason.clone().unwrap();
+                assert!(text.contains(failure.as_str()), "{text}");
+                assert!(text.contains("guest exception vector 14"), "{text}");
+                assert_eq!(
+                    observed_result(
+                        "verify",
+                        &failed.outcome,
+                        std::slice::from_ref(&failed),
+                        failed.error_kind.as_deref()
+                    ),
+                    Some(ObservedResult::CrashError)
+                );
+                assert_eq!(
+                    failure_class(
+                        &failed.outcome,
+                        Some(ObservedResult::CrashError),
+                        failed.error_kind.as_deref()
+                    ),
+                    Some(FailureClass::ProductFailure)
+                );
+                let contradicted = no_result_with_exit_status(0, reason);
+                assert_eq!(contradicted.outcome, "ERROR");
+                assert_eq!(
+                    contradicted.error_kind.as_deref(),
+                    Some("incomplete-verification-evidence")
+                );
+            }
+        }
+    }
+
+    /// A guest that prints a refused open in its own stderr, under a typed
+    /// first-run rejection, stays a product crash: the environmental-block
+    /// scan reads that line as a host toolchain denial only when no such
+    /// report says the guest itself failed
+    /// (https://github.com/rrnewton/hermit/issues/4029).
+    #[test]
+    fn a_guest_permission_denied_under_a_first_run_rejection_is_a_product_crash() {
+        let guest_line = "lsirq: cannot open /proc/interrupts: Permission denied\n";
+        let mut rejected = no_result_with_exit_status(
+            1,
+            crate::canonical_verdict::NoResultReason::FirstRunRejected {
+                exit_code: Some(1),
+                signal: None,
+                stdout_bytes: 0,
+                stderr_bytes: guest_line.len() as u64,
+            },
+        );
+        assert_eq!(rejected.outcome, "FAIL");
+        rejected.stderr = format!(
+            "First run errored during --verify, not continuing to a second.\n\
+             Exit status: exited with code 1\nStdout:\nStderr:\n{guest_line}"
+        );
+        let result = observed_result(
+            "verify",
+            &rejected.outcome,
+            std::slice::from_ref(&rejected),
+            rejected.error_kind.as_deref(),
+        );
+        assert_eq!(result, Some(ObservedResult::CrashError));
+        assert_eq!(
+            failure_class(&rejected.outcome, result, rejected.error_kind.as_deref()),
+            Some(FailureClass::ProductFailure)
+        );
+        // Without the typed rejection, the same line is still scanned as an
+        // environmental block, as before.
+        let mut untyped = rejected.clone();
+        untyped.verification_report = None;
+        untyped.verification_report_sha256 = None;
+        assert_eq!(
+            observed_result(
+                "verify",
+                &untyped.outcome,
+                std::slice::from_ref(&untyped),
+                untyped.error_kind.as_deref(),
+            ),
+            Some(ObservedResult::InfrastructureError)
+        );
     }
 
     #[test]
@@ -14934,6 +24994,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let error = run_preparation(
             &context,
@@ -14993,6 +25054,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let test = recipe(true);
         let cell = SelectedCell {
@@ -15006,6 +25068,7 @@ cp "{}" "$verdict"
             enabled: true,
             timeout_seconds: 1,
             cpu_timeout_seconds: 1,
+            host_level: HostLevel::default(),
         };
 
         let error = run_preparation(
@@ -15033,16 +25096,21 @@ cp "{}" "$verdict"
                 .contains("cell exceeded 1 s during fixture preparation")
         );
 
+        // A healthy preparation under a deadline succeeds silently. Its bound is
+        // generous: what must hold is the deadline above, and a 1 s bound here
+        // also asserted that spawning `sh -c true` takes under a second, which
+        // fails when a loaded, CPU-capped validation box starves the child
+        // (validate of f85de5d891ab, 2026-10-04: 4,227 of 4,228 tests passed).
         run_preparation(
             &context,
             &cell_dir,
             "/bin/sh",
             &["-c".into(), "true".into()],
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(60),
             cell.timeout_seconds,
             &mut Vec::new(),
         )
-        .expect("healthy fixture preparation must finish silently under the same bound");
+        .expect("healthy fixture preparation must finish silently under a deadline");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -15094,6 +25162,7 @@ cp "{}" "$verdict"
             enabled: true,
             timeout_seconds: 4,
             cpu_timeout_seconds: 1,
+            host_level: HostLevel::default(),
         };
         let context = run_context(&root);
 
@@ -15146,6 +25215,7 @@ cp "{}" "$verdict"
             enabled: true,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
+            host_level: HostLevel::default(),
         };
         let context = RunContext {
             root: root.clone(),
@@ -15170,6 +25240,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
 
         fs::create_dir_all(cell_dir.join("fixtures")).unwrap();
@@ -15204,6 +25275,31 @@ cp "{}" "$verdict"
             },
         })
         .unwrap()
+    }
+
+    /// The harness takes `exact_branch_counter` only from a complete, current
+    /// report; an old binary's schema-1 report, which has no such verdict, is
+    /// refused rather than read as one.
+    #[test]
+    fn exact_branch_counter_is_read_from_the_typed_host_report() {
+        let absent = CapabilityVerdict {
+            present: false,
+            evidence: "CPU fixture: Reverie performance-counter validation failed".into(),
+        };
+        let report = serde_json::to_vec(&HostCapabilitiesReport::probe(absent.clone())).unwrap();
+        assert_eq!(parse_exact_branch_counter(&report).unwrap(), absent);
+
+        let mut old: serde_json::Value = serde_json::from_slice(&report).unwrap();
+        old["schema"] = 1.into();
+        old.as_object_mut().unwrap().remove("exact_branch_counter");
+        let error = parse_exact_branch_counter(&serde_json::to_vec(&old).unwrap()).unwrap_err();
+        assert!(error.contains("exact_branch_counter"), "{error}");
+
+        let mut unevidenced: serde_json::Value = serde_json::from_slice(&report).unwrap();
+        unevidenced["exact_branch_counter"]["evidence"] = "".into();
+        let error =
+            parse_exact_branch_counter(&serde_json::to_vec(&unevidenced).unwrap()).unwrap_err();
+        assert!(error.contains("evidence must be nonempty"), "{error}");
     }
 
     /// The binary's own revision is read from its typed record, including the

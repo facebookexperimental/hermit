@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Cross-backend parity contract: set_tid_address(2) caller-TID identity.
 //
 // set_tid_address has no glibc wrapper, so it is issued raw. The kernel stores

@@ -59,6 +59,10 @@ pub enum FailureKind {
     /// than calling `unrecoverable_shutdown`, precisely because the unwind is
     /// the point.
     RunTimeout,
+    /// The backend failed while running the guest ([`crate::BackendRunFailure`]).
+    /// Carried so the parent can record the verification run as failed by its
+    /// backend instead of leaving the pending no-result stamp.
+    BackendRunFailure,
 }
 
 /// ⚠️ THE `kind` FIELD IS THE THIRD AND LAST OF ONE CHAIN OF FLATTENINGS.
@@ -139,10 +143,15 @@ impl SerializableError {
 /// be the thing `kind` exists to avoid, and it would break the moment the message
 /// is reworded. This reaches through the one wrapper that hides the type.
 fn is_policy_refusal(err: &Error) -> bool {
-    if err
-        .chain()
-        .any(|cause| cause.is::<detcore::UnsupportedSyscallError>())
-    {
+    // Detcore's refusal of an unsupported syscall, and reverie-ptrace's end of
+    // a run in which the guest made a syscall through Reverie's untraced
+    // private-page stub, which no tool saw
+    // (https://github.com/rrnewton/reverie/issues/1064).
+    fn refuses(cause: &(dyn std::error::Error + 'static)) -> bool {
+        cause.is::<detcore::UnsupportedSyscallError>()
+            || cause.is::<reverie_ptrace::UntracedStubSyscall>()
+    }
+    if err.chain().any(refuses) {
         return true;
     }
     // The wrapper case: reverie hands the tool's error back inside `Tool`, whose
@@ -150,13 +159,10 @@ fn is_policy_refusal(err: &Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<reverie::Error>()
-            .and_then(|reverie_error| match reverie_error {
-                reverie::Error::Tool(inner) => {
-                    inner.downcast_ref::<detcore::UnsupportedSyscallError>()
-                }
-                _ => None,
+            .is_some_and(|reverie_error| match reverie_error {
+                reverie::Error::Tool(inner) => inner.chain().any(refuses),
+                _ => false,
             })
-            .is_some()
     })
 }
 
@@ -178,10 +184,18 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         || error
             .downcast_ref::<crate::LiteinstInGuestRefusal>()
             .is_some()
+        || error
+            .chain()
+            .any(|cause| cause.is::<crate::cpu_profile_admission::CpuProfileRefusal>())
+        || error
+            .chain()
+            .any(|cause| cause.is::<crate::preemption_admission::UnsupportedPreemption>())
     {
         FailureKind::PolicyRefusal
     } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {
         FailureKind::RunTimeout
+    } else if error.downcast_ref::<crate::BackendRunFailure>().is_some() {
+        FailureKind::BackendRunFailure
     } else {
         FailureKind::Error
     }
@@ -233,6 +247,22 @@ impl From<SerializableError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_preemption_keeps_its_policy_class_across_the_container_boundary() {
+        let refusal = crate::preemption_admission::refuse_unsupported_preemption(
+            &detcore::Config::default(),
+            crate::Backend::Dbt,
+            true,
+            false,
+        )
+        .unwrap_err();
+        let serialized = SerializableError::from(Error::new(refusal).context("launch refused"));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(serialized.context.iter().any(|message| {
+            message.contains("unsupported_preemption") && message.contains("--backend=dbt")
+        }));
+    }
 
     #[test]
     fn into_serializable_error() {
@@ -303,8 +333,51 @@ mod tests {
         assert_eq!(refusal.kind(), FailureKind::PolicyRefusal);
         assert_eq!(
             refusal.error,
-            "HERMIT_LITEINST_IN_GUEST=1 (in-guest LiteInst) refuses this run: guest program \
-             /static is statically linked"
+            "--backend=liteinst (in-guest LiteInst) refuses this run: guest program /static is \
+             statically linked"
+        );
+    }
+
+    /// reverie-ptrace ends a run whose guest made a syscall through Reverie's
+    /// untraced private-page stub; that is a policy refusal (exit 122), not
+    /// an internal failure, both as the backend's primary cause and wrapped
+    /// (https://github.com/rrnewton/reverie/issues/1064).
+    #[test]
+    fn an_untraced_stub_syscall_is_a_policy_refusal() {
+        let refusal = || reverie_ptrace::UntracedStubSyscall {
+            tid: 7,
+            address: 0x7100_0002,
+        };
+        let primary = reverie::Error::Tool(Error::new(refusal()));
+        assert_eq!(
+            classify_ptrace_primary(&primary),
+            FailureKind::PolicyRefusal
+        );
+        let wrapped = Error::new(reverie::Error::Tool(Error::new(refusal())))
+            .context("the ptrace backend failed");
+        assert_eq!(classify_unwrapped(&wrapped), FailureKind::PolicyRefusal);
+        let serialized = SerializableError::from(Error::new(refusal()));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(
+            serialized.error.contains("0x71000002"),
+            "{}",
+            serialized.error
+        );
+    }
+
+    /// An in-guest-trap refusal names that backend and keeps the same class.
+    #[test]
+    fn in_guest_trap_refusal_is_serialized_as_a_policy_refusal() {
+        let refusal =
+            SerializableError::from(Error::new(crate::LiteinstInGuestRefusal::for_backend(
+                crate::Backend::InGuestTrap,
+                "guest program /static is statically linked",
+            )));
+        assert_eq!(refusal.kind(), FailureKind::PolicyRefusal);
+        assert_eq!(
+            refusal.error,
+            "--backend=in-guest-trap (in-guest LiteInst, site patching off) refuses this run: \
+             guest program /static is statically linked"
         );
     }
 }

@@ -64,10 +64,19 @@ use timeouts::MAX_TIMEOUT_SECONDS;
 use timeouts::MIN_TIMEOUT_SECONDS;
 use timeouts::resolve_timeout_seconds;
 
-const HERMIT_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const HERMIT_BACKENDS: [&str; 6] = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
 const NAKED_BACKENDS: [&str; 1] = ["native"];
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
-const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+// The epoch the manifest runner gives every Hermit cell: `--strict` refuses
+// an epoch drawn from the host clock.
+#[allow(dead_code)]
+#[path = "../detcore-model/src/canonical_test_epoch.rs"]
+mod canonical_test_epoch;
+const HERMIT_RUN_ENV: &str = concat!(
+    "env HERMIT_EPOCH=",
+    crate::canonical_test_epoch!(),
+    " LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\""
+);
 const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 
 fn fail(message: impl AsRef<str>) -> ! {
@@ -196,6 +205,8 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     let cell = format!("ignored/e2e-commands/work/{}", slug(id));
     let mut commands = vec![
         format!("cell={}", shell_quote(&cell)),
+        // Shell argv expansion happens before the later env command runs.
+        "XDG_CONFIG_HOME=\"$PWD/$cell/xdg-config\"".to_owned(),
         "hermit_bin=${HERMIT_BIN:-target/release/hermit}".to_owned(),
         "run_verify_strict=; if run_help=$(\"$hermit_bin\" run --help 2>&1); then case \"$run_help\" in *--verify-strict*) run_verify_strict=--verify-strict;; esac; fi".to_owned(),
         "record_verify_strict=; if record_help=$(\"$hermit_bin\" record start --help 2>&1); then case \"$record_help\" in *--verify-strict*) record_verify_strict=--verify-strict;; esac; fi".to_owned(),
@@ -322,12 +333,7 @@ fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<Str
 /// the program its verify cell runs, so for a backend its replay recipe does not
 /// name it takes `modes.verify.guest_args.<backend>`, the same rule as
 /// `hermit-manifest-plan`'s `cell_guest_args`.
-fn cell_guest_args(
-    modes: &BTreeMap<String, Value>,
-    mode: &str,
-    backend: &str,
-    id: &str,
-) -> Vec<String> {
+fn cell_guest_args(modes: &BTreeMap<String, Value>, mode: &str, backend: &str, id: &str) -> Vec<String> {
     let declares = |spec: &Value| {
         spec.get("guest_args")
             .and_then(Value::as_table)
@@ -362,6 +368,8 @@ fn guest_with_args(test: &Value, guest: &str, guest_args: &[String]) -> String {
     format!("{guest}{argv0} {rendered}")
 }
 
+/// `proc_level` is the test's `proc`, the `/proc` level every Hermit command
+/// runs the guest at when it is not Hermit's default.
 fn hermit_command(
     mode: &str,
     backend: &str,
@@ -369,24 +377,26 @@ fn hermit_command(
     seed: Option<i64>,
     extra: &[String],
     verify_bitwise_parity: bool,
+    proc_level: Option<&str>,
     guest: &str,
 ) -> String {
     let _lane = lane;
     let profile = "";
+    let level = proc_level.map_or(String::new(), |level| format!(" --proc={level}"));
     let command = match mode {
         "verify" => {
             let _verify_bitwise_parity = verify_bitwise_parity;
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run --base-env=minimal --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run --base-env=minimal --strict{level} $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
                 shell_quote(backend)
             )
         }
         "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start --base-env=minimal --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout \"$remaining\" {HERMIT_GUEST_ENV_ARGS} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start --base-env=minimal --strict{level} $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout \"$remaining\" {HERMIT_GUEST_ENV_ARGS} -- {guest}",
             shell_quote(backend)
         ),
         "chaos" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run --base-env=minimal --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run --base-env=minimal --strict{level} $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
             shell_quote(backend),
             seed.unwrap_or(0),
             seed.unwrap_or(0)
@@ -399,7 +409,7 @@ fn hermit_command(
                 .join(" ");
             let separator = if extra.is_empty() { "" } else { " " };
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run{separator}{extra} -- {guest}",
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} run{level}{separator}{extra} -- {guest}",
                 shell_quote(backend)
             )
         }
@@ -517,6 +527,7 @@ fn commands_for_test(test: &Value, bucket: &str, inherited_timeout_seconds: i64)
                     seed,
                     &extra,
                     verify_bitwise_parity,
+                    test.get("proc").and_then(Value::as_str),
                     &guest,
                 );
                 let runs = if mode == "custom" { custom_runs } else { 1 };
@@ -822,6 +833,59 @@ test:
             guest_with_args(&tests[0].2, "\"$cell/guest\"", &args),
             "\"$cell/guest\" multi 'value with spaces'"
         );
+
+        // Execute a rendered direct argv: env assignments alone happen too
+        // late to supply placeholders expanded by the caller's shell.
+        let nested = manifest(
+            r#"
+test:
+  - id: c-programs/nested-xdg
+    direct: ["/bin/cat", "{{XDG_CONFIG_HOME}}/git/config"]
+    modes:
+      naked:
+        backends_enabled: [native]
+        runs: 1
+"#,
+        );
+        let dir = std::env::temp_dir().join(format!("manifest-nested-xdg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let seed = dir.join("tests/e2e/xdg-config/git/config");
+        std::fs::create_dir_all(seed.parent().unwrap()).unwrap();
+        std::fs::write(&seed, "cell-private nested input\n").unwrap();
+        let commands = commands_for_test(&nested[0].2, "c-programs", 15);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].lines().count(), 1);
+        for ambient in [None, Some("/unrelated/ambient xdg")] {
+            let mut command = std::process::Command::new("bash");
+            command
+                .args(["-c", &commands[0]])
+                .current_dir(&dir)
+                .env_remove("XDG_CONFIG_HOME");
+            // Probe only rendering/native fixture execution, never a real Hermit.
+            command.env("HERMIT_BIN", "/bin/false");
+            if let Some(value) = ambient {
+                command.env("XDG_CONFIG_HOME", value);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"cell-private nested input\n");
+        }
+        std::fs::remove_file(&seed).unwrap();
+        // Remove the prepared copy too: an unrelated ambient tree cannot stand
+        // in for an absent cell-owned operand.
+        let (setup, guest) = setup_prefix(&nested[0].2, "c-programs/nested-xdg");
+        let output = std::process::Command::new("bash")
+            .args([
+                "-c",
+                &format!("{setup}; rm -f \"$cell/xdg-config/git/config\"; {RUN_ENV} {guest}"),
+            ])
+            .current_dir(&dir)
+            .env("HERMIT_BIN", "/bin/false")
+            .env("XDG_CONFIG_HOME", "/unrelated/ambient")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A replay cell runs its verify cell's guest arguments for every backend
@@ -1129,7 +1193,7 @@ test:
         let error = guest_args_json_lines(&tests).expect_err("unknown backend must be rejected");
         assert_eq!(
             error,
-            "c-programs/unknown-backend: modes.verify.guest_args.ptrcae names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+            "c-programs/unknown-backend: modes.verify.guest_args.ptrcae names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\", \"in-guest-trap\"]"
         );
     }
 
@@ -1170,7 +1234,7 @@ test:
         );
         assert_eq!(
             guest_args_json_lines(&normal).expect_err("native must be rejected outside naked mode"),
-            "c-programs/native-args: modes.verify.guest_args.native names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+            "c-programs/native-args: modes.verify.guest_args.native names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\", \"in-guest-trap\"]"
         );
     }
 
@@ -1201,14 +1265,32 @@ test:
 
     #[test]
     fn generated_mode_commands_match_the_harness_contract() {
-        let replay = hermit_command("replay", "ptrace", "portable", None, &[], false, "guest");
+        let replay = hermit_command(
+            "replay",
+            "ptrace",
+            "portable",
+            None,
+            &[],
+            false,
+            None,
+            "guest",
+        );
         assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout \"$remaining\""));
         assert!(replay.contains("--strict $record_verify_strict --verify"));
         assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
         assert!(replay.contains(HERMIT_GUEST_ENV_ARGS));
         assert!(!replay.contains("--no-virtualize-cpuid"));
 
-        let chaos = hermit_command("chaos", "ptrace", "portable", Some(7), &[], false, "guest");
+        let chaos = hermit_command(
+            "chaos",
+            "ptrace",
+            "portable",
+            Some(7),
+            &[],
+            false,
+            None,
+            "guest",
+        );
         assert!(chaos.contains("run --base-env=minimal"));
         assert!(chaos.contains("--verify --verify-allow=both"));
         assert!(chaos.contains("--strict $run_verify_strict --verify"));
@@ -1224,17 +1306,57 @@ test:
             None,
             &["--base-env=minimal".to_owned()],
             false,
+            None,
             "guest",
         );
         assert!(custom.contains("--backend ptrace run --base-env=minimal -- guest"));
         assert!(!custom.contains("--strict"));
         assert!(!custom.contains("--no-virtualize-cpuid"));
 
-        let verify = hermit_command("verify", "ptrace", "portable", None, &[], true, "guest");
+        let verify = hermit_command(
+            "verify",
+            "ptrace",
+            "portable",
+            None,
+            &[],
+            true,
+            None,
+            "guest",
+        );
         assert!(verify.contains("run --base-env=minimal"));
         assert!(verify.contains(
             "--strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\""
         ));
+        assert!(!verify.contains("--proc"));
+
+        // A test's `/proc` level follows `--strict` in every mode.
+        for mode in ["verify", "replay", "chaos"] {
+            let command = hermit_command(
+                mode,
+                "ptrace",
+                "portable",
+                Some(7),
+                &[],
+                false,
+                Some("standard"),
+                "guest",
+            );
+            assert!(command.contains("--strict --proc=standard $"), "{command}");
+        }
+        let custom = hermit_command(
+            "custom",
+            "ptrace",
+            "portable",
+            None,
+            &["--strict".to_owned()],
+            false,
+            Some("standard"),
+            "guest",
+        );
+        assert!(
+            custom.contains("run --proc=standard --strict -- guest"),
+            "{custom}"
+        );
     }
 
     #[test]

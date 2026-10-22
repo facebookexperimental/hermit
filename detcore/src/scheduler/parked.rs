@@ -1,7 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
- *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
@@ -26,18 +25,24 @@ use reverie::SignalTarget;
 use serde::Deserialize;
 use serde::Serialize;
 
+use super::RealTimeFate;
 use super::SchedRequest;
 use super::SchedResponse;
 use super::Scheduler;
 use super::ThreadNextTurn;
+use super::kernel_signal_bit;
 use super::real_timer::TimerFailure;
 use super::runqueue::SuspendedRunQueueEntry;
+use super::sleep_signal::SleeperStateUnreadable;
+use super::timed_waiters;
 use super::timed_waiters::SignalTimerId;
 use crate::ivar::Ivar;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::tool_global::ResumeStatus;
+use crate::types::ChildWaitExitClass;
+use crate::types::ChildWaitSpec;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
@@ -86,6 +91,10 @@ pub enum ControlCapability {
     PolledRead {
         site: CallbackSignalSite,
     },
+    /// A serial terminal wait whose complete selector remains scheduler-owned.
+    ChildWait {
+        site: CallbackSignalSite,
+    },
     PublishOnly {
         lease: ParkedObservationLease,
         site: CallbackSignalSite,
@@ -97,6 +106,7 @@ impl ControlCapability {
             Self::None => None,
             Self::ParkedWait { site, .. }
             | Self::PolledRead { site }
+            | Self::ChildWait { site }
             | Self::PublishOnly { site, .. } => Some(site),
         }
     }
@@ -131,8 +141,7 @@ struct ReadyPolledRead {
 }
 impl ReadyPolledRead {
     fn matches(&self, turn: &ThreadNextTurn, resources: &Resources) -> bool {
-        let mut expected = self.original.clone();
-        expected.poll_attempt = 0;
+        let expected = self.original.upgraded_to_runnable();
         self.original.poll_attempt > 0
             && self.request == turn.req
             && self.response == turn.resp
@@ -206,6 +215,7 @@ impl From<TimerFailure> for ProtocolFailure {
 enum SavedMembership {
     Timed(LogicalTime),
     Queued(SuspendedRunQueueEntry),
+    ChildWait { parent: DetPid, spec: ChildWaitSpec },
 }
 #[derive(Clone, Copy, Debug)]
 enum ContinuationPhase {
@@ -249,6 +259,11 @@ pub(super) struct ParkedRequests {
     pub failure: Option<ProtocolFailure>,
     pub control: Option<reverie::BackendSignalControl>,
     pub permits: BTreeMap<DetTid, SignalDeliveryPermit>,
+    /// Exiting threads whose `Exit` grant waits while another thread of their
+    /// process holds a delivery permit (`Scheduler::exit_awaits_sibling_permit`).
+    /// Releasing that permit (`consume_signal_boundary`) records each for
+    /// admission at the next deterministic drain.
+    pub exits_awaiting_permit: std::collections::BTreeSet<DetTid>,
     pub exit_fences: BTreeMap<DetTid, ExitBoundaryFence>,
     pub child_exit_reservations: BTreeMap<ProcessGeneration, ChildExitReservation>,
     pub completed_child_exits: BTreeMap<ProcessGeneration, CompletedChildExit>,
@@ -402,7 +417,9 @@ impl Scheduler {
                 _ => TimerFailure::Unsupported,
             },
         );
-        self.blocked.timed_waiters.remove_kvm_real_deadline(pid);
+        self.blocked
+            .timed_waiters
+            .remove_controlled_real_timer_deadline(pid);
         if let Some(wake) = self.report_backend_failure_location(super::BackendFailureLocation {
             pid: reverie::Pid::from_raw(pid.as_raw()),
             tid: tid.map(|tid| reverie::Tid::from_raw(tid.as_raw())),
@@ -422,10 +439,10 @@ impl Scheduler {
         if !self.rpc_incarnation_matches(tid, origin.mm) {
             return Err(ProtocolFailure::Identity);
         }
+        // A control site exists only when the Reverie backend returned one, so
+        // the site itself is the capability. `validate_site` still refuses a
+        // site whose process and task were never bound to the real-timer table.
         if let Some(site) = origin.control.site() {
-            if !self.kvm_shared_dequeue_timers || !self.backend_is_kvm {
-                return Err(ProtocolFailure::Unsupported);
-            }
             let pid = *self
                 .thread_tree
                 .thread_to_leader
@@ -434,7 +451,9 @@ impl Scheduler {
             self.real_timers.validate_site(pid, tid, origin.mm, site)?;
             match (origin.control, turn.protocol.owner) {
                 (
-                    ControlCapability::ParkedWait { .. } | ControlCapability::PolledRead { .. },
+                    ControlCapability::ParkedWait { .. }
+                    | ControlCapability::PolledRead { .. }
+                    | ControlCapability::ChildWait { .. },
                     NextTurnOwner::Ordinary | NextTurnOwner::ReturningCaught { .. },
                 ) => {}
                 (
@@ -450,7 +469,7 @@ impl Scheduler {
             .next_turns
             .get_mut(&tid)
             .ok_or(ProtocolFailure::Identity)?;
-        if turn.req.try_read().is_some() {
+        if turn.req.is_full() {
             // Existing legacy signal merging must retain its installed origin.
             if turn.protocol.origin != Some(origin) {
                 return Err(ProtocolFailure::Phase);
@@ -548,11 +567,21 @@ impl Scheduler {
         if let Some(deadline) = next {
             self.blocked
                 .timed_waiters
-                .insert_kvm_real_deadline(deadline, pid);
+                .insert_controlled_real_timer_deadline(deadline, pid);
         }
         Ok(ack)
     }
 
+    /// Replaces the process's `ITIMER_REAL`.
+    ///
+    /// The installed control decides which timer model serves it: with a
+    /// control, the real timer follows the backend's acknowledged dequeues;
+    /// without one, Detcore's own alarm model in the timed waiters serves it.
+    /// A backend whose guest is reached only through the control never runs a
+    /// sequentialized guest without one: Detcore reports that need through
+    /// [`reverie::Tool::requires_signal_control`], and reverie-kvm refuses the
+    /// run before any guest code, with ENOSYS from the runner that has no
+    /// control to offer and EINVAL from a runner whose offer was not taken.
     pub(crate) fn replace_real_timer(
         &mut self,
         pid: DetPid,
@@ -562,20 +591,22 @@ impl Scheduler {
         interval: LogicalTime,
         signal: nix::sys::signal::Signal,
     ) -> Result<(LogicalTime, LogicalTime), TimerFailure> {
-        if !self.backend_is_kvm {
+        if !self.signal_control_installed() {
             return Ok(self.register_alarm(pid, tid, now, duration, interval, signal));
         }
-        if !self.kvm_shared_dequeue_timers || signal != nix::sys::signal::Signal::SIGALRM {
+        if signal != nix::sys::signal::Signal::SIGALRM {
             return Err(TimerFailure::Unsupported);
         }
         let (old, next) = self
             .real_timers
             .replace(pid, tid, now, duration, interval)?;
-        self.blocked.timed_waiters.remove_kvm_real_deadline(pid);
+        self.blocked
+            .timed_waiters
+            .remove_controlled_real_timer_deadline(pid);
         if let Some(deadline) = next {
             self.blocked
                 .timed_waiters
-                .insert_kvm_real_deadline(deadline, pid);
+                .insert_controlled_real_timer_deadline(deadline, pid);
         }
         Ok((old.remaining, old.interval))
     }
@@ -585,7 +616,7 @@ impl Scheduler {
         pid: DetPid,
         now: LogicalTime,
     ) -> Result<super::real_timer::ItimerSnapshot, TimerFailure> {
-        if self.backend_is_kvm {
+        if self.signal_control_installed() {
             return self.real_timers.snapshot(pid, now);
         }
         Ok(match self.blocked.timed_waiters.alarm_state(pid) {
@@ -621,25 +652,357 @@ impl Scheduler {
         &mut self,
         deadline: LogicalTime,
         id: SignalTimerId,
-        tid: DetTid,
-        signal: nix::sys::signal::Signal,
+        target: timed_waiters::SignalTarget,
+        signal: timed_waiters::TimerSignal,
         normal_due: bool,
+        observed_now: LogicalTime,
     ) {
-        if self.kvm_shared_dequeue_timers && matches!(id, SignalTimerId::Alarm(_)) {
+        let tid = target.tid();
+        let signal = match signal {
+            timed_waiters::TimerSignal::Send(signal) => signal,
+            // Detcore does not deliver a timer's real-time signal. An expiration Linux
+            // discards, or queues where nothing can yet observe it, changes
+            // nothing, and the run goes on; any other stops it by name
+            // (https://github.com/rrnewton/hermit/issues/3893,
+            // https://github.com/rrnewton/hermit/issues/4089). Only a fail-closed
+            // run registers such an expiration (`Detcore::handle_timer_settime`);
+            // a permissive one never arms it.
+            timed_waiters::TimerSignal::RefuseRealTime(signo) => {
+                match self.real_time_expiration_fate(id.process(), target, signo) {
+                    RealTimeFate::Discarded => return,
+                    RealTimeFate::Queued => {
+                        *self
+                            .pending_real_time_expirations
+                            .entry(id.process())
+                            .or_default() |= kernel_signal_bit(signo);
+                        super::note_real_time_expiration_kept_pending();
+                        tracing::debug!(
+                            "[scheduler] real-time signal {} of a timer of process {} expired while every thread blocked it; pending",
+                            signo,
+                            id.process()
+                        );
+                        return;
+                    }
+                    RealTimeFate::Deliverable => super::refuse_real_time_expiration(signo),
+                }
+            }
+        };
+        if let timed_waiters::SignalTarget::Thread(thread) = target {
+            if matches!(id, SignalTimerId::Posix(..)) {
+                self.fire_posix_timer(deadline, id, target, signal);
+            } else {
+                self.fire_thread_timer(id, thread, signal);
+            }
+        } else if self.signal_control_installed() && matches!(id, SignalTimerId::Alarm(_)) {
             if let Err(failure) = self.publish_real_expiry(id.process(), deadline) {
+                self.fail_parked(tid, failure);
+            }
+        } else if self.signal_control_installed()
+            && let SignalTimerId::Posix(process, timer) = id
+        {
+            // A controlled backend's guest tasks are reached only through the
+            // control: the physical send below would hit a host process.
+            if let Err(failure) = self.publish_posix_timer_expiry(process, timer, signal) {
                 self.fail_parked(tid, failure);
             }
         } else if normal_due && matches!(id, SignalTimerId::ChildExit { .. }) {
             let parent = id.process();
-            self.blocked.sigchld_ready.insert(parent);
-            if self.blocked.sigchld_deferred.remove(&parent) {
-                self.run_queue.push_eager_io_repoll(parent);
+            // Where the scheduler models signal targets, the thread that takes
+            // this send is marked when it does (`dequeue_sigchld`); a mark for
+            // the process, its leader's id, would let any thread's delivery of
+            // any copy take it. Where the send window is not used, the mark
+            // is the process's, as before it.
+            let leader_marked = (!self.models_signal_targets
+                || !self.sigchld_window_usable(parent))
+                && self.blocked.sigchld_ready.insert(parent);
+            if let Some(deferred) = self.deferred_child_exit_sigchld(parent, tid) {
+                // That thread already dequeued a `SIGCHLD` of this process (the
+                // kernel's own, raised when the tracer released the child), and
+                // its delivery was deferred. A standard signal coalesces, so
+                // that delivery stands for this exit: commit it now instead of
+                // sending a second one, which would also find the thread in no
+                // pool at all.
+                self.blocked.sigchld_deferred.remove(&deferred);
+                self.blocked.sigchld_ready.insert(deferred);
+                self.readmit_ready_thread(deferred);
+                if let SignalTimerId::ChildExit { child, .. } = id {
+                    self.child_exit_sigchld.stand_in(parent, child);
+                }
             } else {
-                self.fire_alarm(parent, tid, signal);
+                // Where the scheduler models signal targets, send to the thread
+                // the kernel gives this shared-queue `SIGCHLD`
+                // (`fire_child_exit_alarm`): the child's creator (`tid`) if it
+                // does not block the signal and no `rt_sigsuspend` sibling the
+                // kernel would wake instead exists, otherwise the next thread
+                // that does not. Only if that thread sleeps outside the
+                // schedule is it woken (`arm_signaled_background`); a gated
+                // wait holds `SIGCHLD` until its call returns
+                // (https://github.com/rrnewton/hermit/issues/3146).
+                let SignalTimerId::ChildExit { child, .. } = id else {
+                    unreachable!("matched a ChildExit timer");
+                };
+                let receiver = match self.send_child_exit_sigchld(parent, tid, child) {
+                    super::child_exit_sigchld::ChildExitSend::NotOwned => {
+                        self.fire_child_exit_alarm(parent, tid, None)
+                    }
+                    super::child_exit_sigchld::ChildExitSend::Nothing => {
+                        // No copy will take the process's mark set above.
+                        // Without publication, nothing would clear it before a
+                        // later, host-timed SIGCHLD delivery to the leader took
+                        // it and skipped its deferral.
+                        if leader_marked && !self.backend.reports_child_exit_publication {
+                            self.blocked.sigchld_ready.remove(&parent);
+                        }
+                        None
+                    }
+                    super::child_exit_sigchld::ChildExitSend::Sent(receiver) => receiver,
+                };
+                // A receiver armed for the release barrier carries its own
+                // mark (`arm_signaled_background`) and takes this signal at a
+                // fixed point, so the process's mark set above would outlive
+                // it and could later let another, host-timed `SIGCHLD`
+                // delivery to the leader skip its deferral (the Codex review
+                // of https://github.com/rrnewton/hermit/commit/2f046e41b49d4b24b1bec605f269e3c3afde5895).
+                if leader_marked
+                    && receiver.is_some_and(|receiver| {
+                        receiver != parent && self.blocked.signaled_background.contains(&receiver)
+                    })
+                {
+                    self.blocked.sigchld_ready.remove(&parent);
+                }
             }
-        } else {
-            self.fire_alarm(id.process(), tid, signal);
+        } else if !self.divert_in_guest_fatal_alarm(deadline, id, tid, signal, observed_now) {
+            if matches!(id, SignalTimerId::Posix(..)) {
+                self.fire_posix_timer(deadline, id, target, signal);
+            } else if let SignalTimerId::Alarm(process) = id {
+                self.fire_itimer_real(deadline, process, tid, signal);
+            } else {
+                // Without publication reports, a timer dispatched here (an empty
+                // run queue's wake) takes the child-exit ledger's decision too:
+                // it records the scheduler's send, or sends nothing where the
+                // kernel's copy was delivered first.
+                let nothing_to_send = !self.backend.reports_child_exit_publication
+                    && match id {
+                        SignalTimerId::ChildExit { child, parent } => {
+                            self.child_exit_sigchld.timer(parent, child)
+                                == Some(super::child_exit_sigchld::TimerSend::Nothing)
+                        }
+                        _ => false,
+                    };
+                if !nothing_to_send {
+                    self.fire_alarm(id.process(), tid, signal);
+                }
+            }
         }
+    }
+
+    /// What Linux does with an expiration of a timer of `process` that
+    /// notifies with real-time signal `signo` (`target`: armed by this thread,
+    /// or notifying exactly this one), as far as the guest could tell
+    /// (https://github.com/rrnewton/hermit/issues/4089). The threads below are
+    /// the process's live threads, or for a thread-directed timer only its
+    /// named thread, if live: Linux queues that expiration on the thread's own
+    /// queue and drops it once the thread is gone
+    /// (https://github.com/rrnewton/hermit/issues/4164). A thread-directed
+    /// expiration kept pending is recorded for the whole process, so a call of
+    /// any thread that could observe it refuses: more refusals than Linux
+    /// would justify, never a silent difference.
+    ///
+    /// - [`RealTimeFate::Discarded`]: nobody can see it. The process has no
+    ///   live thread, or the signal is ignored and a thread that does not block
+    ///   it takes it, which discards it at delivery (or at generation,
+    ///   `sig_ignored`).
+    /// - [`RealTimeFate::Queued`]: every live thread blocks it, so Linux queues
+    ///   it, and nothing can observe it yet: no signalfd the process created or
+    ///   inherited reads it (`signalfd_masks`), no handler return may unblock it
+    ///   (`handler_restore_unblocked`), and no thread of the process has made a
+    ///   call outside the schedule (`background_call_processes`). Kept in
+    ///   `pending_real_time_expirations`.
+    /// - [`RealTimeFate::Deliverable`]: anything else, including whatever this
+    ///   cannot decide; the run refuses as before.
+    ///
+    /// Each mask is the one the schedule fixes (`thread_signal_mask_for`, or the
+    /// guest's own mask for a thread Detcore holds under a private one,
+    /// `saved_guest_sigmasks`). A thread in a call outside the schedule makes
+    /// the expiration deliverable: its live mask is host-timed, and its
+    /// recorded one is the call's temporary mask, while the mask restored
+    /// when the call returns may not block the signal. The dispositions are
+    /// read from a thread stopped at a request. Called only at the two timed
+    /// pops, where no guest thread holds the turn.
+    ///
+    /// Without signal-target modelling (`models_signal_targets`) none of those
+    /// masks is recorded, and the arming thread's state decides as before.
+    pub(super) fn real_time_expiration_fate(
+        &self,
+        process: DetPid,
+        target: timed_waiters::SignalTarget,
+        signo: i32,
+    ) -> RealTimeFate {
+        let bit = kernel_signal_bit(signo);
+        if !self.models_signal_targets {
+            return match self.read_sleeper_signal_state(target.tid()) {
+                Ok(state) if state.discarded_at_generation() & bit != 0 => RealTimeFate::Discarded,
+                Err(SleeperStateUnreadable::Gone) => RealTimeFate::Discarded,
+                _ => RealTimeFate::Deliverable,
+            };
+        }
+        let mut threads = self.process_signal_targets(process);
+        if let timed_waiters::SignalTarget::Thread(named) = target {
+            threads.retain(|thread| *thread == named);
+        }
+        if threads.is_empty() {
+            return RealTimeFate::Discarded;
+        }
+        let mut every_thread_blocks = true;
+        let mut outside_the_schedule = false;
+        let mut ignored = None;
+        for &thread in &threads {
+            if self.blocked.out_of_scheduler_masks.contains_key(&thread) {
+                outside_the_schedule = true;
+                continue;
+            }
+            let mask = match self.saved_guest_sigmasks.get(&thread) {
+                Some(mask) => *mask,
+                None => match self.thread_signal_mask_for(thread, signo) {
+                    Some(mask) => mask,
+                    None => return RealTimeFate::Deliverable,
+                },
+            };
+            if mask & bit == 0 {
+                every_thread_blocks = false;
+            }
+            if ignored.is_none() {
+                match self.read_sleeper_signal_state(thread) {
+                    Ok(state) => ignored = Some(state.ignored & bit != 0),
+                    Err(_) => return RealTimeFate::Deliverable,
+                }
+            }
+        }
+        let Some(ignored) = ignored else {
+            // Every thread is outside the schedule.
+            return RealTimeFate::Deliverable;
+        };
+        if ignored && !every_thread_blocks {
+            return RealTimeFate::Discarded;
+        }
+        let recorded =
+            |map: &BTreeMap<DetPid, u64>| map.get(&process).is_some_and(|mask| mask & bit != 0);
+        if outside_the_schedule
+            || !every_thread_blocks
+            || self.background_call_processes.contains(&process)
+            || recorded(&self.signalfd_masks)
+            || recorded(&self.handler_restore_unblocked)
+        {
+            return RealTimeFate::Deliverable;
+        }
+        RealTimeFate::Queued
+    }
+
+    /// A new process inherits what its creator recorded about signalfds and
+    /// handler returns (`signalfd_masks`, `handler_restore_unblocked`): a fork
+    /// copies the descriptor table, and a fork inside a handler returns from it
+    /// in the child too. Copied at creation, so a later re-parenting changes
+    /// nothing.
+    pub(crate) fn inherit_real_time_records(&mut self, creator: DetPid, child: DetPid) {
+        for map in [
+            &mut self.signalfd_masks,
+            &mut self.handler_restore_unblocked,
+        ] {
+            if let Some(mask) = map.get(&creator).copied() {
+                *map.entry(child).or_default() |= mask;
+            }
+        }
+    }
+
+    /// Record that a handler's return in `process` restores a mask leaving
+    /// `unblocked` (real-time signals, a kernel sigset) unblocked
+    /// (`handler_restore_unblocked`).
+    pub(crate) fn record_handler_restore_unblocked(&mut self, process: DetPid, unblocked: u64) {
+        *self.handler_restore_unblocked.entry(process).or_default() |= unblocked;
+    }
+
+    /// Record that `process` created a signalfd for `mask` (a kernel sigset),
+    /// so a real-time timer expiration it could read is never kept pending
+    /// (`real_time_expiration_fate`).
+    pub(crate) fn register_signalfd(&mut self, process: DetPid, mask: u64) {
+        *self.signalfd_masks.entry(process).or_default() |= mask;
+        // Its description may be shared with any process.
+        self.note_replay_take_cover(None, mask);
+        // The call may have changed the mask of a descriptor a background read
+        // already holds (`signalfd4` on an existing descriptor, whose
+        // description any process may share), so a read out now may read
+        // SIGCHLD whatever its descriptor read when it began
+        // (`outside_call_may_take_sigchld`).
+        if mask & super::kernel_signal_bit(libc::SIGCHLD) != 0 {
+            for read in self.background_reads.values_mut() {
+                if matches!(read.signals, super::BackgroundReadSignals::Signalfd(_)) {
+                    read.signals = super::BackgroundReadSignals::Unknown;
+                }
+            }
+        }
+        // Its reads are not observed by the fallback's records
+        // (`thread_timer_copies`), and its description may be shared with any
+        // process (`signalfd_may_read`), so every process's records of a
+        // covered signal go.
+        self.thread_timer_copies
+            .retain(|(_, signo), _| mask & super::kernel_signal_bit(*signo) == 0);
+    }
+
+    /// The real-time signals pending for `process` from timer expirations
+    /// that every thread blocked (`pending_real_time_expirations`).
+    pub(crate) fn pending_real_time_expirations(&self, process: DetPid) -> u64 {
+        self.pending_real_time_expirations
+            .get(&process)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Discard `signals` from `process`'s pending real-time expirations, as
+    /// Linux flushes a pending signal whose disposition becomes `SIG_IGN`.
+    pub(crate) fn discard_pending_real_time_expirations(&mut self, process: DetPid, signals: u64) {
+        if let Some(pending) = self.pending_real_time_expirations.get_mut(&process) {
+            *pending &= !signals;
+            if *pending == 0 {
+                self.pending_real_time_expirations.remove(&process);
+            }
+        }
+    }
+
+    /// The thread of `process` whose deferred `SIGCHLD` delivery
+    /// (`blocked.sigchld_deferred`) a child-exit timer of `process` commits.
+    /// Where the scheduler models signal targets, any thread of the process may
+    /// have dequeued the shared-queue signal: the child's creator (`creator`)
+    /// first, as the kernel prefers it, then the others in thread-ID order.
+    /// Otherwise the timer targets the leader, so only the leader is looked up,
+    /// as before.
+    pub(super) fn deferred_child_exit_sigchld(
+        &self,
+        process: DetPid,
+        creator: DetTid,
+    ) -> Option<DetTid> {
+        if !self.models_signal_targets {
+            // A delivery the child-exit ledger matched to another child's exit
+            // stands for that one (`ChildExitSigchldLedger::attributed`),
+            // where publication is not reported (with it, as before).
+            return (self.blocked.sigchld_deferred.contains(&process)
+                && (self.backend.reports_child_exit_publication
+                    || !self.child_exit_sigchld.attributed.contains(&process)))
+            .then_some(process);
+        }
+        // A delivery the child-exit ledger matched to another child's exit
+        // stands for that one, not this (`ChildExitSigchldLedger::attributed`).
+        let stands_in = |thread: &DetTid| {
+            self.sigchld_process(*thread) == process
+                && !self.child_exit_sigchld.attributed.contains(thread)
+        };
+        if self.blocked.sigchld_deferred.contains(&creator) && stands_in(&creator) {
+            return Some(creator);
+        }
+        self.blocked
+            .sigchld_deferred
+            .iter()
+            .copied()
+            .find(|thread| stands_in(thread))
     }
 
     fn publish_real_expiry(
@@ -653,9 +1016,7 @@ impl Scheduler {
             .control
             .clone()
             .ok_or(ProtocolFailure::Identity)?;
-        let mut siginfo = [0; 128];
-        siginfo[..4].copy_from_slice(&libc::SIGALRM.to_ne_bytes());
-        siginfo[8..12].copy_from_slice(&libc::SI_KERNEL.to_ne_bytes());
+        let siginfo = super::discarded_at_send::itimer_real_siginfo();
         let event = SignalEvent::new(
             libc::SIGALRM,
             siginfo,
@@ -674,6 +1035,52 @@ impl Scheduler {
         }
         self.real_timers.publication(expiry, outcome)?;
         Ok(())
+    }
+
+    /// Publishes one expiration of `process`'s process-directed POSIX timer
+    /// `timer` through the installed control, as Linux queues a
+    /// `SIGEV_SIGNAL` timer's signal on the process's shared queue with
+    /// `SI_TIMER` and the timer's id. The expiration was popped at its
+    /// virtual-time deadline (`dispatch_timed_signal`), and the publication
+    /// commits under the same scheduler lock, so what is pending after it is a
+    /// function of the schedule. A waiter it should interrupt is found the
+    /// way an `ITIMER_REAL` expiration's is, by the recipients the backend
+    /// reports for the pending signal (`select_parked_alarm`).
+    ///
+    /// `si_overrun` is 0, as `timer_getoverrun` reports; the timer's
+    /// `sigev_value` is not retained by `timer_create`, so `si_value` is 0.
+    // TODO-HUMAN-REVIEW(PR-1019): Review routing POSIX timer expirations
+    // through the backend's ProcessSignalControl::publish_timer_expiry.
+    fn publish_posix_timer_expiry(
+        &mut self,
+        pid: DetPid,
+        timer: i32,
+        signal: nix::sys::signal::Signal,
+    ) -> Result<(), ProtocolFailure> {
+        let process = self.real_timers.process_identity(pid)?;
+        let control = self
+            .parked
+            .control
+            .clone()
+            .ok_or(ProtocolFailure::Identity)?;
+        let signo = signal as libc::c_int;
+        let mut siginfo = [0; 128];
+        siginfo[..4].copy_from_slice(&signo.to_ne_bytes());
+        siginfo[8..12].copy_from_slice(&libc::SI_TIMER.to_ne_bytes());
+        // `si_timerid`, the first field of the kernel's `_timer` member.
+        siginfo[16..20].copy_from_slice(&timer.to_ne_bytes());
+        let event = SignalEvent::new(signo, siginfo, SignalTarget::Process { pid: process.tgid })
+            .map_err(|_| ProtocolFailure::Identity)?;
+        match control.process.publish_timer_expiry(process, event) {
+            ProcessSignalPublicationResult::Committed(_) => Ok(()),
+            ProcessSignalPublicationResult::FailedAfterCommit { .. } => {
+                self.parked.failures.push(process);
+                Ok(())
+            }
+            outcome @ ProcessSignalPublicationResult::RejectedBeforeCommit(_) => {
+                Err(TimerFailure::Publication(outcome).into())
+            }
+        }
     }
 
     /// Called by the daemon only after the quiescent due-event drain. Backend
@@ -734,12 +1141,42 @@ impl Scheduler {
                         ParkedWaitPolicy::PauseNoHandlerRestart => LogicalTime::INDEFINITE,
                     },
                     ControlCapability::PolledRead { .. } => LogicalTime::INDEFINITE,
+                    ControlCapability::ChildWait { .. } => {
+                        let Some(Ok(resources)) = turn.req.try_read() else {
+                            continue;
+                        };
+                        let (parent, spec) = self
+                            .validate_child_wait_resources(tid, &resources)
+                            .map_err(|failure| SelectionFailure {
+                                pid,
+                                tid: Some(tid),
+                                failure,
+                            })?;
+                        self.validate_membership(tid, Some((parent, spec)))
+                            .map_err(|failure| SelectionFailure {
+                                pid,
+                                tid: Some(tid),
+                                failure,
+                            })?;
+                        // Selection and readiness are tested under the same
+                        // scheduler lock, before reserving/dequeuing a signal.
+                        // A ready child or ECHILD wins this wait's completion.
+                        if self.ready_child_wait(parent, spec).is_some()
+                            || !self.has_child_wait_target(parent, spec)
+                        {
+                            // A selector change can leave a blocked waiter
+                            // without a matching child. Admit its original
+                            // request so ordinary completion can actually win.
+                            if self.blocked.child_waiters.remove(&tid).is_some() {
+                                self.runqueue_push_back(tid);
+                            }
+                            continue;
+                        }
+                        LogicalTime::INDEFINITE
+                    }
                     _ => continue,
                 };
-                if deadline <= self.committed_time
-                    || turn.req.try_read().is_none()
-                    || turn.resp.try_read().is_some()
-                {
+                if deadline <= self.committed_time || turn.req.is_empty() || turn.resp.is_full() {
                     continue;
                 }
                 // Other wait families remain pending for their existing return
@@ -756,9 +1193,50 @@ impl Scheduler {
         Ok(())
     }
 
-    fn validate_membership(&self, tid: DetTid) -> Result<(), ProtocolFailure> {
+    fn validate_child_wait_resources(
+        &self,
+        tid: DetTid,
+        resources: &Resources,
+    ) -> Result<(DetPid, ChildWaitSpec), ProtocolFailure> {
+        if resources.tid != tid || resources.poll_attempt != 0 || resources.resources.len() != 1 {
+            return Err(ProtocolFailure::Unsupported);
+        }
+        let Some((ResourceID::WaitChild { parent, spec }, Permission::R)) =
+            resources.resources.iter().next()
+        else {
+            return Err(ProtocolFailure::Unsupported);
+        };
+        if self.registered_process(tid) != Some(*parent)
+            || spec.owner.is_some_and(|owner| owner != tid)
+            || spec.exit_class != ChildWaitExitClass::Sigchld
+        {
+            return Err(ProtocolFailure::Identity);
+        }
+        Ok((*parent, *spec))
+    }
+
+    fn validate_membership(
+        &self,
+        tid: DetTid,
+        child_wait: Option<(DetPid, ChildWaitSpec)>,
+    ) -> Result<(), ProtocolFailure> {
         let timed = self.blocked.timed_waiters.thread_deadline(tid).is_some();
         let queued = self.run_queue.contains_tid(tid);
+        if let Some(blocked) = self.blocked.child_waiters.get(&tid) {
+            return if child_wait == Some(*blocked) && !timed && !queued {
+                Ok(())
+            } else {
+                Err(ProtocolFailure::Phase)
+            };
+        }
+        if child_wait.is_some() {
+            // A child exit or another waiter can have just woken this request.
+            return if queued && !timed {
+                Ok(())
+            } else {
+                Err(ProtocolFailure::Phase)
+            };
+        }
         match (timed, queued) {
             (true, false) | (false, true) => Ok(()),
             (true, true) => Err(ProtocolFailure::Phase),
@@ -769,6 +1247,9 @@ impl Scheduler {
     /// The daemon validates membership before changing the timer phase. It
     /// holds exclusive scheduler access through this infallible removal.
     fn take_validated_membership(&mut self, tid: DetTid) -> SavedMembership {
+        if let Some((parent, spec)) = self.blocked.child_waiters.remove(&tid) {
+            return SavedMembership::ChildWait { parent, spec };
+        }
         if let Some(deadline) = self.blocked.timed_waiters.thread_deadline(tid) {
             self.blocked.timed_waiters.remove(tid);
             return SavedMembership::Timed(deadline);
@@ -805,7 +1286,7 @@ impl Scheduler {
             .try_read()
             .ok_or(ProtocolFailure::Phase)?
             .map_err(|_| ProtocolFailure::Phase)?;
-        if turn.resp.try_read().is_some() {
+        if turn.resp.is_full() {
             return Err(ProtocolFailure::Phase);
         }
         if let ControlCapability::ParkedWait { policy, .. } = origin.control {
@@ -835,6 +1316,11 @@ impl Scheduler {
         {
             return Err(ProtocolFailure::Unsupported);
         }
+        let child_wait = if matches!(origin.control, ControlCapability::ChildWait { .. }) {
+            Some(self.validate_child_wait_resources(tid, &resources)?)
+        } else {
+            None
+        };
         let existing = self
             .parked
             .requests
@@ -876,7 +1362,7 @@ impl Scheduler {
             .nonce
             .checked_add(if existing.is_some() { 1 } else { 2 })
             .ok_or(ProtocolFailure::Overflow)?;
-        self.validate_membership(tid)?;
+        self.validate_membership(tid, child_wait)?;
         let lease = ParkedObservationLease {
             nonce: self
                 .parked
@@ -944,6 +1430,10 @@ impl Scheduler {
         current.req = Ivar::new();
         current.resp = Ivar::new();
         self.runqueue_push_back(tid);
+        // The parked wait leaves the scheduler to observe the signal: other
+        // threads may have run since it parked, as at a grant
+        // (`Scheduler::granted`).
+        self.granted.insert(tid);
         turn.resp
             .put(SchedResponse::ObserveSignal(Box::new(control)));
         Ok(())
@@ -1016,8 +1506,8 @@ impl Scheduler {
                 .get(&wait.dettid)
                 .ok_or(ProtocolFailure::Identity)?;
             if turn.protocol.owner != (NextTurnOwner::Observation { wait, lease })
-                || turn.req.try_read().is_some()
-                || turn.resp.try_read().is_some()
+                || turn.req.is_full()
+                || turn.resp.is_full()
                 || !self.run_queue.contains_tid(wait.dettid)
             {
                 return Err(ProtocolFailure::Phase);
@@ -1029,6 +1519,10 @@ impl Scheduler {
                         .permits
                         .remove(&wait.dettid)
                         .ok_or(ProtocolFailure::Identity)?;
+                    // Released here too, so an exit that waits for it
+                    // (https://github.com/rrnewton/hermit/issues/4367) is
+                    // never stranded.
+                    self.admit_exits_released_by(wait.dettid, permit.task.process);
                     self.parked
                         .control
                         .as_ref()
@@ -1091,7 +1585,7 @@ impl Scheduler {
         let result = (|| {
             if !matches!(owned.phase, ContinuationPhase::AwaitingResumeRegistration(expected) if expected == ticket)
                 || ticket.site != site
-                || response.try_read().is_some()
+                || response.is_full()
             {
                 return Err(ProtocolFailure::Identity);
             }
@@ -1121,6 +1615,24 @@ impl Scheduler {
                     let priority = self.get_priority(tid);
                     self.run_queue.suspend(tid, priority);
                     self.run_queue.restore(entry, priority);
+                }
+                SavedMembership::ChildWait { parent, spec } => {
+                    if self.blocked.child_waiters.contains_key(&tid)
+                        || self.blocked.timed_waiters.thread_deadline(tid).is_some()
+                        || !self.run_queue.contains_tid(tid)
+                    {
+                        return Err(ProtocolFailure::Phase);
+                    }
+                    // Nested signal hooks can publish an exit, consume a child,
+                    // or change group/owner matching while this waiter is an
+                    // observation gate. Recheck the full selector before
+                    // blocking again; that gate already supplies its wakeup.
+                    if self.ready_child_wait(parent, spec).is_none()
+                        && self.has_child_wait_target(parent, spec)
+                    {
+                        self.run_queue.remove_tid(tid);
+                        self.blocked.child_waiters.insert(tid, (parent, spec));
+                    }
                 }
             }
             owned.origin.rpc = RpcOrigin::ResumeParkedRequest {
@@ -1183,7 +1695,7 @@ impl Scheduler {
                 break;
             }
         }
-        if self.parked.wake.try_read().is_some() {
+        if self.parked.wake.is_full() {
             self.parked.wake = Ivar::new();
         }
     }
@@ -1212,6 +1724,75 @@ impl Scheduler {
         self.parked.requests.retain(|_, owned| owned.request != req);
     }
 
+    /// A real cross-task notification replaces a child-wait request with the
+    /// legacy WaitidSignals grant. Its original capability cannot describe
+    /// that replacement, and an ignored observation may have retained an owned
+    /// request for the old transport. Retire only that exact waiting ownership.
+    pub(super) fn retire_child_wait_signal_request(
+        &mut self,
+        tid: DetTid,
+    ) -> Result<(), ProtocolFailure> {
+        let Some(turn) = self.next_turns.get(&tid) else {
+            return Ok(());
+        };
+        let Some(origin) = turn.protocol.origin else {
+            return Ok(());
+        };
+        if !matches!(origin.control, ControlCapability::ChildWait { .. }) {
+            return Ok(());
+        }
+        if turn.protocol.owner != NextTurnOwner::Ordinary
+            || self.parked.permits.contains_key(&tid)
+            || turn.resp.is_full()
+        {
+            return Err(ProtocolFailure::Phase);
+        }
+        let resources = turn
+            .req
+            .try_read()
+            .ok_or(ProtocolFailure::Phase)?
+            .map_err(|_| ProtocolFailure::Phase)?;
+        let spec = self.validate_child_wait_resources(tid, &resources)?;
+        if let Some(admission) = self.pending_run_queue_admissions.get(&tid) {
+            // Signal notifications drain before queued admissions. A genuine
+            // child wake can therefore be between its blocked and queued
+            // states here; force_unblock_thread consumes this pending entry.
+            if !matches!(admission, super::AdmitIntent::Fixed(super::AdmitSide::Back))
+                || self.blocked.child_waiters.contains_key(&tid)
+                || self.blocked.timed_waiters.thread_deadline(tid).is_some()
+                || self.run_queue.contains_tid(tid)
+            {
+                return Err(ProtocolFailure::Phase);
+            }
+        } else {
+            self.validate_membership(tid, Some(spec))?;
+        }
+        for owned in self
+            .parked
+            .requests
+            .values()
+            .filter(|owned| owned.request == turn.req)
+        {
+            if !matches!(owned.phase, ContinuationPhase::Waiting)
+                || owned.response != turn.resp
+                || owned.origin != origin
+            {
+                return Err(ProtocolFailure::Identity);
+            }
+        }
+        self.settle_parked_grant(tid);
+        let turn = self
+            .next_turns
+            .get_mut(&tid)
+            .expect("validated child-wait owner");
+        turn.protocol
+            .origin
+            .as_mut()
+            .expect("validated child-wait origin")
+            .control = ControlCapability::None;
+        Ok(())
+    }
+
     /// Normal polling replaces a request without completing its logical
     /// operation. Match the exact request, so a hook on the same task cannot
     /// change the suspended outer wait's ownership or resources.
@@ -1238,7 +1819,7 @@ impl Scheduler {
                 && original.resources.get(&ResourceID::InternalIOPolling) == Some(&Permission::W)
                 && matches!(previous.try_read(), Some(Ok(ref prior)) if prior == original)
                 && turn.req == *replacement
-                && turn.resp.try_read().is_none())
+                && turn.resp.is_empty())
             .then(|| ReadyPolledRead {
                 request: replacement.clone(),
                 response: turn.resp.clone(),

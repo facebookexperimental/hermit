@@ -8,6 +8,9 @@
 
 //! SaBRe plugin that executes Hermit's Detcore tool inside each guest process.
 
+// SHARED FILE: detcore-liteinst/src/lib.rs compiles glibc_compat.rs too
+// (https://github.com/rrnewton/hermit/issues/3967); an edit changes both guest
+// preloads.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod glibc_compat;
 
@@ -16,7 +19,6 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io;
 use std::io::Read;
-use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -28,6 +30,7 @@ use std::sync::atomic::Ordering;
 pub use detcore::CONFIG_FINGERPRINT_ENV;
 use detcore::Detcore;
 use detcore::config_wire_fingerprint;
+use detcore::detlog::ForwardPolicy;
 use reverie::Signal;
 use reverie_memory::LocalMemory;
 use reverie_memory::MemoryAccess;
@@ -59,52 +62,78 @@ fn coordinator_socket() -> Option<PathBuf> {
     remember_coordinator_socket(&RPC_SOCKET, requested.as_deref())
 }
 
-struct RawStderr;
-
-impl Write for RawStderr {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        loop {
-            let written = unsafe {
-                libc::write(
-                    libc::STDERR_FILENO,
-                    bytes.as_ptr().cast::<libc::c_void>(),
-                    bytes.len(),
-                )
-            };
-            if written >= 0 {
-                return Ok(written as usize);
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+// The coordinator sends its per-target INFO answer (detcore::detlog::ForwardPolicy), so a
+// target-scoped RUST_LOG keeps the same records here as in-process. A value this plugin
+// cannot read is a coordinator/plugin mismatch: say so rather than drop records silently.
+fn detlog_forward_policy(requested: Option<&OsStr>) -> Result<Option<ForwardPolicy>, String> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    let requested = requested
+        .to_str()
+        .ok_or_else(|| format!("{DETLOG_FORWARD_ENV} is not UTF-8"))?;
+    ForwardPolicy::decode(requested).map(Some)
 }
 
-fn forward_detlog(record_suffix: &str, message: std::fmt::Arguments<'_>) {
-    let mut stderr = RawStderr;
-    let _ = stderr.write_all(b"INFO detcore: DETLOG ");
-    let _ = stderr.write_fmt(message);
-    let _ = stderr.write_all(record_suffix.as_bytes());
-    let _ = stderr.write_all(b"\n");
+// Says why records are not forwarded, on the standard error the forwarder would use,
+// with one raw write as detcore::detlog::forward_to_stderr does.
+fn report_unforwarded_detlogs(error: &str) {
+    let line = format!("hermit SaBRe plugin: no DETLOG forwarding: {error}\n");
+    // SAFETY: `line` is a live, initialized byte slice of the given length.
+    let _ = unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            line.as_ptr().cast::<libc::c_void>(),
+            line.len(),
+        )
+    };
 }
 
 fn init_detlog_forwarder() {
     // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
     let requested = unsafe { sabre::take_private_env(DETLOG_FORWARD_ENV) };
-    if requested.as_deref() != Some(OsStr::new("1")) {
-        return;
-    }
+    let policy = match detlog_forward_policy(requested.as_deref()) {
+        Ok(Some(policy)) => policy,
+        Ok(None) => return,
+        Err(error) => {
+            report_unforwarded_detlogs(&error);
+            return;
+        }
+    };
 
-    // Stderr is protected by reverie-sabre and is captured separately during
-    // verification. A direct sink avoids tracing's thread-local dispatcher:
-    // libc may issue its final exit_group after Rust TLS destruction begins.
-    let _ = detcore::detlog::set_forwarder(forward_detlog);
+    // With the socket `hermit run --verify` passes, each record goes to it from
+    // the descriptor reverie-sabre protects from the guest, tagged with the
+    // sending thread, and the coordinator writes it into the log at that
+    // thread's scheduler turn, as for in-guest LiteInst. Without one, records
+    // go to stderr, which reverie-sabre keeps open and verification captures
+    // separately.
+    // A socket that was requested but could not be adopted (closed or replaced
+    // before adoption, or given up) never falls back to stderr, which the
+    // guest may have pointed at a file of its own: its records are counted and
+    // dropped, and the coordinator refuses the run (detlog::check_forwarded_count).
+    let forwarder: detcore::detlog::DetlogForwarder =
+        if sabre::tool_output_fd().is_some() || sabre::tool_output_requested() {
+            // If reverie-sabre ever has to give the socket up (a guest dup onto
+            // its number with no free descriptor to move it to), the coordinator
+            // reads this and refuses the run's records as incomplete.
+            sabre::set_retirement_message(detcore::detlog::FORWARDING_RETIRED_NOTICE);
+            forward_detlog_to_socket
+        } else {
+            detcore::detlog::forward_to_stderr
+        };
+    let _ = detcore::detlog::set_forwarder(forwarder, policy);
+}
+
+/// Sends one Detcore record on the coordinator's DETLOG socket.
+fn forward_detlog_to_socket(
+    target: &str,
+    record_suffix: &str,
+    index: u64,
+    message: std::fmt::Arguments<'_>,
+) {
+    sabre::with_tool_output(|socket| {
+        detcore::detlog::send_forwarded_record(socket, target, record_suffix, index, message)
+    });
 }
 
 fn remember_coordinator_socket(
@@ -115,6 +144,31 @@ fn remember_coordinator_socket(
         let requested = requested.map(PathBuf::from)?;
         Some(slot.get_or_init(|| requested).clone())
     })
+}
+
+// The coordinator publishes its fingerprint to the image it starts, as a
+// launch-specification setting, and take_private_env consumes it. A forked child
+// constructs the plugin again from the parent's memory, where it is already gone, so
+// without this memo the child took the "published no fingerprint" branch and
+// wrote that warning, with this build's fingerprint, to the guest's own fd 2.
+// Fork inherits this slot as it inherits RPC_SOCKET; execve starts a new image,
+// where reverie-sabre passes the REVERIE_SABRE_* settings again in a launch
+// specification.
+static COORDINATOR_FINGERPRINT: OnceLock<Option<String>> = OnceLock::new();
+
+/// What the coordinator published to this process image (`None`: nothing),
+/// read once. The flag is true only for the call that read it; later calls,
+/// including a forked child's construction, reuse that reading.
+fn remember_coordinator_fingerprint(
+    slot: &OnceLock<Option<String>>,
+    take: impl FnOnce() -> Option<String>,
+) -> (Option<String>, bool) {
+    let mut first = false;
+    let published = slot.get_or_init(|| {
+        first = true;
+        take()
+    });
+    (published.clone(), first)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -290,9 +344,12 @@ impl Plugin {
     /// Checked BEFORE the RPC connect so the mismatch is reported instead of
     /// being re-encountered as a codec error a few frames later.
     fn check_coordinator_compatibility() {
-        // SAFETY: plugin construction runs before SaBRe starts guest callbacks.
-        let expected = unsafe { sabre::take_private_env(CONFIG_FINGERPRINT_ENV) }
-            .map(|v| v.to_string_lossy().into_owned());
+        let (expected, first_reading) =
+            remember_coordinator_fingerprint(&COORDINATOR_FINGERPRINT, || {
+                // SAFETY: plugin construction runs before SaBRe starts guest callbacks.
+                unsafe { sabre::take_private_env(CONFIG_FINGERPRINT_ENV) }
+                    .map(|v| v.to_string_lossy().into_owned())
+            });
         let ours = config_wire_fingerprint();
         match expected {
             Some(expected) if expected == ours => {}
@@ -305,11 +362,13 @@ impl Plugin {
             // An older coordinator does not publish the fingerprint. Say so and
             // continue: refusing here would break pairs that are actually fine,
             // and a guard that rejects matched pairs is worse than no guard.
-            None => eprintln!(
+            None if first_reading => eprintln!(
                 "detcore-sabre: coordinator published no configuration and clock RPC fingerprint \
                  ({CONFIG_FINGERPRINT_ENV} unset); proceeding unguarded. This plugin's fingerprint \
                  is {ours}."
             ),
+            // A forked child of an image that already said so.
+            None => {}
         }
     }
 
@@ -484,7 +543,8 @@ impl reverie_sabre::Tool for Plugin {
         self.handle_vdso(Sysno::time, SyscallArgs::new(tloc as usize, 0, 0, 0, 0, 0))
     }
 
-    /// Tell Detcore a signal arrived, before the guest's handler runs.
+    /// Tell Detcore a signal arrived, with the siginfo the kernel delivered,
+    /// before the guest's handler runs, and apply its answer.
     ///
     /// Reverie's central handler delivers the signal, but nothing forwarded
     /// that fact to the tool: this method was the default empty one, and the
@@ -494,25 +554,27 @@ impl reverie_sabre::Tool for Plugin {
     /// (`detcore/src/lib.rs:1228`), and under this backend its model of the
     /// guest simply had no signals in it.
     ///
-    /// Detcore answers with the signal to deliver, or `None` to suppress it.
-    /// Suppression is not actionable from here -- Reverie's central handler has
-    /// already committed to running the guest action by the time it calls this
-    /// -- so a suppressed or failed forward is reported rather than dropped.
-    fn handle_signal_event(&self, signal: i32) {
+    /// Detcore answers with the signal to deliver, possibly with a rewritten
+    /// siginfo (`Guest::set_signal_info`), or `None` to suppress it: the
+    /// kernel's own copy of a child-exit `SIGCHLD` whose exit Detcore's
+    /// scheduler notifies itself is suppressed, so the guest gets one `SIGCHLD`
+    /// per child exit (`scheduler::child_exit_sigchld`). A suppressed signal's
+    /// guest action does not run. A failed forward delivers the signal as the
+    /// kernel gave it, and is reported.
+    fn handle_signal_event_with_info(&self, signal: i32, info: &mut libc::siginfo_t) -> bool {
         let Ok(signal) = Signal::try_from(signal) else {
-            return;
+            return true;
         };
-        match self.adapter.handle_signal(signal) {
-            Ok(Some(_)) => {}
-            Ok(None) => sabre::eprintln!(
-                "detcore-sabre: Detcore suppressed signal {}, but Reverie's central handler has already committed to the guest action",
-                signal
-            ),
-            Err(error) => sabre::eprintln!(
-                "detcore-sabre: forwarding signal {} to Detcore failed: {}",
-                signal,
-                error
-            ),
+        match self.adapter.handle_signal_with_info(signal, info) {
+            Ok(delivered) => delivered.is_some(),
+            Err(error) => {
+                sabre::eprintln!(
+                    "detcore-sabre: forwarding signal {} to Detcore failed: {}",
+                    signal,
+                    error
+                );
+                true
+            }
         }
     }
 
@@ -615,6 +677,23 @@ mod tests {
                 .to_bytes(),
             b"abcdefghijklmno"
         );
+    }
+
+    #[test]
+    fn detlog_forwarding_follows_the_coordinators_per_target_policy() {
+        assert_eq!(detlog_forward_policy(None), Ok(None));
+        // The historical value still forwards everything.
+        assert_eq!(
+            detlog_forward_policy(Some(OsStr::new("1"))),
+            Ok(Some(ForwardPolicy::all()))
+        );
+        let scoped = detlog_forward_policy(Some(OsStr::new("0,detcore::random=1")))
+            .unwrap()
+            .unwrap();
+        assert!(scoped.forwards("detcore::random"));
+        assert!(!scoped.forwards("detcore::tool_local"));
+        assert!(detlog_forward_policy(Some(OsStr::new("yes"))).is_err());
+        assert!(detlog_forward_policy(Some(OsStr::from_bytes(b"\xff"))).is_err());
     }
 
     #[test]
@@ -809,6 +888,30 @@ mod tests {
         assert_eq!(
             remember_coordinator_socket(&socket, None),
             Some(PathBuf::from("/tmp/coordinator.sock"))
+        );
+    }
+
+    #[test]
+    fn coordinator_fingerprint_survives_plugin_reinitialization() {
+        let published = OnceLock::new();
+        assert_eq!(
+            remember_coordinator_fingerprint(&published, || Some("0123456789abcdef".to_owned())),
+            (Some("0123456789abcdef".to_owned()), true)
+        );
+        // A forked child's construction finds the variable already erased.
+        assert_eq!(
+            remember_coordinator_fingerprint(&published, || None),
+            (Some("0123456789abcdef".to_owned()), false)
+        );
+
+        let unpublished = OnceLock::new();
+        assert_eq!(
+            remember_coordinator_fingerprint(&unpublished, || None),
+            (None, true)
+        );
+        assert_eq!(
+            remember_coordinator_fingerprint(&unpublished, || panic!("read twice")),
+            (None, false)
         );
     }
 

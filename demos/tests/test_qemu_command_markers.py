@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Only the guest's own command frame may end a QEMU resume.
 
 Demo 6 resumes the demo 5 boot snapshot. The guest's /init (built by
@@ -68,6 +62,7 @@ DEMO_DIR = Path(__file__).resolve().parent.parent
 LIB_DIR = DEMO_DIR / "lib"
 sys.path.insert(0, str(LIB_DIR))
 
+import demo_common as dc  # noqa: E402
 import qemu_controller as qc  # noqa: E402
 
 # The frame lines, written out here so that a test states the format rather
@@ -244,7 +239,9 @@ class GuestInitFrameTest(unittest.TestCase):
         b"|   lead and trail  \r\n"
         b"| back\\slash\r\n"
         b"| to-stderr\r\n"
-        b"| no-newline-at-the-end\r\n" + _end(3) + b"\r\n"
+        b"| no-newline-at-the-end\r\n"
+        + _end(3)
+        + b"\r\n"
     )
     OUTPUT = (
         b"__HERMIT_COMMAND_END__\n"
@@ -272,9 +269,7 @@ class GuestInitFrameTest(unittest.TestCase):
             qc.CommandResult(self.OUTPUT, 3, ()),
         )
 
-    @unittest.skipUnless(
-        _guest_busybox(), "BusyBox, the guest's shell, is not installed"
-    )
+    @unittest.skipUnless(_guest_busybox(), "BusyBox, the guest's shell, is not installed")
     def test_command_output_cannot_forge_the_frame_under_busybox(self):
         self._check_frame("busybox")
 
@@ -290,9 +285,7 @@ class GuestInitFrameTest(unittest.TestCase):
             self.directory, "sleep 60 & echo started", _preferred_shell()
         )
         self.assertLess(time.monotonic() - started, SHELL_TIMEOUT)
-        self.assertEqual(
-            transcript, FRAME_BEGIN + b"\r\n| started\r\n" + _end(0) + b"\r\n"
-        )
+        self.assertEqual(transcript, FRAME_BEGIN + b"\r\n| started\r\n" + _end(0) + b"\r\n")
 
     def test_the_command_runs_through_chpst_as_user_1000(self):
         for shell in _shells():
@@ -301,7 +294,9 @@ class GuestInitFrameTest(unittest.TestCase):
                 directory.mkdir()
                 transcript = _run_frame(directory, "echo ran", shell)
                 record = directory / "chpst-arguments"
-                self.assertTrue(record.exists(), "/init ran the command without chpst")
+                self.assertTrue(
+                    record.exists(), "/init ran the command without chpst"
+                )
                 self.assertEqual(
                     record.read_text().splitlines(),
                     ["-u", "1000:1000", "sh", "-c", "echo ran"],
@@ -374,9 +369,7 @@ class GuestInitFrameTest(unittest.TestCase):
                 directory = self.directory / shell
                 directory.mkdir()
                 transcript = _run_frame(directory, command, shell)
-                before_end = transcript[
-                    : transcript.rindex(b"__HERMIT_COMMAND_END__\x01")
-                ]
+                before_end = transcript[: transcript.rindex(b"__HERMIT_COMMAND_END__\x01")]
                 self.assertNotIn(b"\x01", before_end)
                 self.assertEqual(
                     transcript,
@@ -437,10 +430,7 @@ class _ControllerRun:
             time.sleep(0.01)
 
         replacements = (
-            (
-                "subprocess",
-                types.SimpleNamespace(Popen=lambda command, env: _FakeQemu()),
-            ),
+            ("subprocess", types.SimpleNamespace(Popen=lambda command, env: _FakeQemu())),
             ("wait_for_socket", lambda path, process, timeout: None),
             ("qmp_command", record_qmp),
             ("stop_process", lambda process: None),
@@ -516,7 +506,9 @@ class ControllerWaitTest(unittest.TestCase):
             b"__HERMIT_COMMAND_END__status=0\r\n"
         )
         rest = (
-            b"| FINISHED\r\n" + _end(0) + b"\r\n"
+            b"| FINISHED\r\n"
+            + _end(0)
+            + b"\r\n"
             b"Interactive busybox shell. Type 'poweroff -f' to exit.\r\n"
         )
         self._check_waits_then_ends(before_end, rest, False, SAVE_AND_QUIT)
@@ -530,9 +522,7 @@ class ControllerWaitTest(unittest.TestCase):
         # /init's real frame lines run IMPERSONATION_COMMAND. Until the line
         # holding FINISHED, the command's last output, is in the transcript,
         # the command's output is incomplete and the wait must go on.
-        transcript = _run_frame(
-            self.directory, IMPERSONATION_COMMAND, _preferred_shell()
-        )
+        transcript = _run_frame(self.directory, IMPERSONATION_COMMAND, _preferred_shell())
         finished = transcript.index(b"FINISHED")
         line_start = transcript.rfind(b"\n", 0, finished) + 1
         self._check_waits_then_ends(
@@ -555,9 +545,7 @@ class ControllerWaitTest(unittest.TestCase):
                 run = _ControllerRun(self, self.serial_log)
                 run.wait_until_idle_or_ended()
                 run.join()
-                self.assertFalse(
-                    run.thread.is_alive(), "the controller is still waiting"
-                )
+                self.assertFalse(run.thread.is_alive(), "the controller is still waiting")
                 self.assertIsInstance(run.outcome.get("error"), qc.StaleGuestInitError)
                 self.assertEqual(run.calls, [])
 
@@ -629,9 +617,7 @@ class TranscriptParserTest(unittest.TestCase):
             with self.subTest(status=status):
                 line = _end(status)
                 self.assertEqual(qc.end_line_status(line), status)
-                result = qc.parse_command_transcript(
-                    FRAME_BEGIN + b"\r\n" + line + b"\r\n"
-                )
+                result = qc.parse_command_transcript(FRAME_BEGIN + b"\r\n" + line + b"\r\n")
                 self.assertEqual(result, qc.CommandResult(b"", status, ()))
         for line in (
             b"__HERMIT_COMMAND_END__",
@@ -667,7 +653,9 @@ class TranscriptParserTest(unittest.TestCase):
         transcript = (
             FRAME_BEGIN + b"\r\n"
             b"| one\r\n"
-            b"[   12.345678] random: crng init done\r\n" + _end(256) + b"\r\n"
+            b"[   12.345678] random: crng init done\r\n"
+            + _end(256)
+            + b"\r\n"
             b"__HERMIT_COMMAND_END__ status=0\r\n"
             b"__HERMIT_COMMAND_END__\r\n"
             b"| two\r\n" + _end(0) + b"\r\n"
@@ -719,12 +707,20 @@ class TranscriptParserTest(unittest.TestCase):
 
     def test_lines_before_the_frame_are_ignored(self):
         transcript = (
-            _end(0) + b"\r\n"
+            _end(0)
+            + b"\r\n"
             b"__HERMIT_COMMAND_END__ status=0\r\n"
-            b"| not the command's\r\n" + FRAME_BEGIN + b" \r\n"
-            # A kernel message printed onto the end of a BEGIN line of another
-            # format is not a whole BEGIN line, so it is ignored too.
-            b"__HERMIT_COMMAND_BEGIN__ format=2[   12.345678] random: crng init done\r\n"
+            b"| not the command's\r\n"
+            + FRAME_BEGIN
+            + b" \r\n"
+            # The current BEGIN line with a kernel message printed into it,
+            # after the marker, after "format=", after "format=3", and after
+            # the CR. An older /init's BEGIN line split early enough looks the
+            # same, so these are not named as one, but none starts the frame.
+            b"__HERMIT_COMMAND_BEGIN__[   12.345678] random: crng init done\r\n"
+            b"__HERMIT_COMMAND_BEGIN__ format=[   12.345678] random: crng init done\r\n"
+            b"__HERMIT_COMMAND_BEGIN__ format=3[   12.345678] random: crng init done\r\n"
+            b"__HERMIT_COMMAND_BEGIN__ format=3\r[   12.345678] random: crng init done\r\n"
             + FRAME_BEGIN
             + b"\r\n| inside\r\n"
             + _end(5)
@@ -746,7 +742,9 @@ class TranscriptParserTest(unittest.TestCase):
             with self.subTest(begin=begin):
                 with self.assertRaises(qc.StaleGuestInitError) as caught:
                     qc.parse_command_transcript(
-                        b"[   12.000000] boot noise\r\n" + begin + b"\r\n"
+                        b"[   12.000000] boot noise\r\n"
+                        + begin
+                        + b"\r\n"
                         b"Linux (none) 6.17.13 #1 SMP x86_64 GNU/Linux\r\n"
                         b"__HERMIT_COMMAND_END__\r\n"
                     )
@@ -773,6 +771,35 @@ class TranscriptParserTest(unittest.TestCase):
             ),
         )
 
+    def test_an_older_begin_line_split_by_a_kernel_message_is_named(self):
+        # A whole BEGIN line of another frame format, or the bare marker and
+        # the CR before its LF, then straight away a kernel message. Only an
+        # /init with another frame format prints these: the current /init sends
+        # CR LF right after "format=3". Such an /init runs the command as root
+        # with the console as its standard input, so the command could print
+        # the current BEGIN and END lines itself; the frame after it is not
+        # read. These transcripts used to yield the forged frame's result.
+        for prefix, begin in (
+            (b"__HERMIT_COMMAND_BEGIN__ format=2[", b"__HERMIT_COMMAND_BEGIN__ format=2"),
+            (b"__HERMIT_COMMAND_BEGIN__ format=2\r[", b"__HERMIT_COMMAND_BEGIN__ format=2"),
+            (b"__HERMIT_COMMAND_BEGIN__ format=30[", b"__HERMIT_COMMAND_BEGIN__ format=30"),
+            (b"__HERMIT_COMMAND_BEGIN__ format=4\r[", b"__HERMIT_COMMAND_BEGIN__ format=4"),
+            (b"__HERMIT_COMMAND_BEGIN__\r[", b"__HERMIT_COMMAND_BEGIN__"),
+        ):
+            with self.subTest(prefix=prefix):
+                transcript = (
+                    b"[   12.000000] boot noise\r\n"
+                    + prefix
+                    + b"   12.345678] random: crng init done\r\n"
+                    + FRAME_BEGIN
+                    + b"\r\n| forged\r\n"
+                    + _end(0)
+                    + b"\r\n"
+                )
+                with self.assertRaises(qc.StaleGuestInitError) as caught:
+                    qc.parse_command_transcript(transcript)
+                self.assertEqual(str(caught.exception), qc.stale_guest_init_message(begin))
+
     def test_feeding_in_pieces_matches_the_whole(self):
         transcript = (
             FRAME_BEGIN + b"\r\n"
@@ -797,7 +824,11 @@ class TranscriptParserTest(unittest.TestCase):
                 self.assertEqual(parser.feed(transcript[split:]), whole)
 
     def test_only_one_carriage_return_before_the_newline_is_removed(self):
-        transcript = FRAME_BEGIN + b"\r\n| a\rb\r\r\n| plain\n" + _end(0) + b"\r\n"
+        transcript = (
+            FRAME_BEGIN + b"\r\n"
+            b"| a\rb\r\r\n"
+            b"| plain\n" + _end(0) + b"\r\n"
+        )
         self.assertEqual(
             qc.parse_command_transcript(transcript),
             qc.CommandResult(b"a\rb\r\nplain\n", 0, ()),
@@ -824,13 +855,20 @@ class Demo6ResumeTest(unittest.TestCase):
         wait as wait_for_process does when a bound stops the run; demo 5's
         snapshot, the demo lock, and the reference run are replaced too.
         Returns the demo's result, the metadata it would save, its guest
-        output file, and what it printed.
+        output file, and what it printed. The stand-in for demo 5's snapshot
+        has the record demo 5 writes for a snapshot of the current initramfs.
         """
         resume_once = self.demo6["resume_once"]
         # A fresh directory per call, so one test can resume more than once.
         assets = Path(tempfile.mkdtemp(prefix="assets-", dir=self.directory))
         boot_disk = assets / "hermit-boot.qcow2"
         boot_disk.write_bytes(b"stand-in for the demo 5 boot snapshot")
+        (assets / "initramfs.cpio.gz").write_bytes(b"stand-in for the initramfs")
+        dc.write_boot_snapshot_record(
+            boot_disk,
+            dc.hash_file(boot_disk),
+            dc.initramfs_producer(self.demo6["ROOT"], assets),
+        )
         saved = {}
 
         def finish_hermit(process, timeout, **keywords):
@@ -858,7 +896,8 @@ class Demo6ResumeTest(unittest.TestCase):
             "release_demo_lock": lambda handle: None,
             "stage_guest_controller": lambda destination: destination,
             "subprocess": types.SimpleNamespace(
-                Popen=lambda command, **keywords: mock.Mock(),
+                # Not yet reaped, as wait_for_process leaves Hermit for drain_output.
+                Popen=lambda command, **keywords: mock.Mock(returncode=None),
                 DEVNULL=subprocess.DEVNULL,
                 PIPE=subprocess.PIPE,
                 STDOUT=subprocess.STDOUT,
@@ -873,24 +912,19 @@ class Demo6ResumeTest(unittest.TestCase):
             "stop_process_group": lambda process: None,
         }
         printed = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", write_through=True)
-        with (
-            mock.patch.dict(resume_once.__globals__, replacements),
-            mock.patch.dict(os.environ),
-            contextlib.redirect_stdout(printed),
-        ):
+        with mock.patch.dict(resume_once.__globals__, replacements), mock.patch.dict(
+            os.environ
+        ), contextlib.redirect_stdout(printed):
             result = resume_once(command, False)
         output = (saved["run_dir"] / "guest-output.txt").read_bytes()
         return result, saved["extra"], output, printed.buffer.getvalue()
 
     def test_the_whole_output_and_the_exit_status_are_reported(self):
-        transcript = _run_frame(
-            self.directory, IMPERSONATION_COMMAND, _preferred_shell()
-        )
+        transcript = _run_frame(self.directory, IMPERSONATION_COMMAND, _preferred_shell())
         result, extra, output, printed = self._resume(transcript, IMPERSONATION_COMMAND)
         self.assertEqual(output, IMPERSONATION_OUTPUT)
         self.assertEqual(
-            extra["guest_output_sha256"],
-            hashlib.sha256(IMPERSONATION_OUTPUT).hexdigest(),
+            extra["guest_output_sha256"], hashlib.sha256(IMPERSONATION_OUTPUT).hexdigest()
         )
         self.assertEqual(extra.get("guest_exit_status"), 3)
         self.assertIn(b"Guest command exit status: 3\n", printed)
@@ -902,9 +936,7 @@ class Demo6ResumeTest(unittest.TestCase):
             self._resume(transcript, "echo partial output; sleep 1000000")
         self.assertIn("holds no complete command frame", str(caught.exception))
 
-    def test_a_command_that_never_finishes_fails_naming_the_bound_and_the_guest_state(
-        self,
-    ):
+    def test_a_command_that_never_finishes_fails_naming_the_bound_and_the_guest_state(self):
         # The command forges END lines on its standard input and its standard
         # output, then never exits: the guest prints BEGIN and no END line.
         transcript = (
@@ -919,30 +951,63 @@ class Demo6ResumeTest(unittest.TestCase):
         log_cap = self.demo6["LogCapExceeded"](
             Path("hermit-info.log"), 538072392, 536870912, 29.25
         )
-        for stopped_by, cause in (
+        # The size is checked before the deadline, so the cap can be what is
+        # reported when the check comes after QEMU_TIMEOUT too; the message
+        # then says no more than it does before QEMU_TIMEOUT.
+        late_log_cap = self.demo6["LogCapExceeded"](
+            Path("hermit-info.log"), 538072392, 536870912, 120.25
+        )
+        for name, stopped_by, cause in (
             (
+                "log cap",
                 log_cap,
                 "Hermit's INFO log hermit-info.log grew to 538072392 bytes, past "
-                "the 536870912-byte cap (QEMU_MAX_LOG_BYTES), 29.2s into the "
-                "resume, so the run was stopped before QEMU_TIMEOUT (120s)",
+                "the 536870912-byte cap (QEMU_MAX_LOG_BYTES), when checked 29.2s "
+                "into the resume (QEMU_TIMEOUT is 120s), so the demo signalled "
+                "Hermit's process group",
             ),
             (
+                "log cap checked after QEMU_TIMEOUT",
+                late_log_cap,
+                "Hermit's INFO log hermit-info.log grew to 538072392 bytes, past "
+                "the 536870912-byte cap (QEMU_MAX_LOG_BYTES), when checked 120.2s "
+                "into the resume (QEMU_TIMEOUT is 120s), so the demo signalled "
+                "Hermit's process group",
+            ),
+            (
+                "timeout",
                 TimeoutError("process exceeded timeout of 120s"),
                 "Hermit/QEMU did not exit within QEMU_TIMEOUT (120s)",
             ),
         ):
-            with self.subTest(stopped_by=type(stopped_by).__name__):
-                with mock.patch.dict(
-                    self.demo6["stopped_run_message"].__globals__, {"TIMEOUT": 120}
-                ):
+            with self.subTest(stopped_by=name):
+                with mock.patch.dict(self.demo6["stopped_run_message"].__globals__, {"TIMEOUT": 120}):
                     with self.assertRaises(RuntimeError) as caught:
                         self._resume(transcript, command, stopped_by=stopped_by)
                 self.assertEqual(
                     str(caught.exception),
-                    cause + "; the guest command had not finished: the serial log "
-                    "has the " + FRAME_BEGIN.decode() + " line but no END line",
+                    cause + "; the guest command was not seen to finish: the serial "
+                    "log has the " + FRAME_BEGIN.decode() + " line but no END line",
                 )
                 self.assertIs(caught.exception.__cause__, stopped_by)
+
+    def test_a_log_found_past_the_cap_after_hermit_exited_says_only_when_it_was_checked(self):
+        # The size checked after Hermit exited, or after the copy of its output
+        # ended, was past the cap, and nothing was seen still writing.
+        transcript = FRAME_BEGIN + b"\r\n| done\r\n" + _end(0) + b"\r\n"
+        log_cap = self.demo6["LogCapExceeded"](
+            Path("hermit-info.log"), 536871936, 536870912, 16.25, exit_status=0, final_check=True
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            self._resume(transcript, "echo done", stopped_by=log_cap)
+        self.assertEqual(
+            str(caught.exception),
+            "Hermit's INFO log hermit-info.log was 536871936 bytes, past the "
+            "536870912-byte cap (QEMU_MAX_LOG_BYTES), when checked 16.2s into the "
+            "resume, after Hermit had exited with status 0, and the demo then signalled "
+            "Hermit's process group; the guest command had finished with exit status 0",
+        )
+        self.assertIs(caught.exception.__cause__, log_cap)
 
     def test_the_guest_state_is_read_from_the_serial_log(self):
         progress = self.demo6["guest_command_progress"]
@@ -954,13 +1019,35 @@ class Demo6ResumeTest(unittest.TestCase):
         for transcript, expected in (
             (
                 b"[    0.000000] Linux version 6.17.13\r\n",
-                "the guest had not started the command: the serial log has no "
+                "the guest was not seen to start the command: the serial log has no "
+                + FRAME_BEGIN.decode()
+                + " line",
+            ),
+            (
+                # A command that started, and here finished, after a BEGIN line
+                # that a kernel message split: the frame never starts, so the
+                # serial log cannot tell it from a command not yet started.
+                FRAME_BEGIN
+                + b"[    3.141592] random: crng init done\r\n| done\r\n"
+                + _end(0)
+                + b"\r\n",
+                "the guest was not seen to start the command: the serial log has no "
                 + FRAME_BEGIN.decode()
                 + " line",
             ),
             (
                 FRAME_BEGIN + b"\r\n| started\r\n__HERMIT_COMMAND_END__ status=0\r\n",
-                "the guest command had not finished: the serial log has the "
+                "the guest command was not seen to finish: the serial log has the "
+                + FRAME_BEGIN.decode()
+                + " line but no END line",
+            ),
+            (
+                # A finished command whose END line a kernel message split: the
+                # serial log cannot tell it from a command still running.
+                FRAME_BEGIN
+                + b"\r\n| done\r\n__HERMIT_COMMAND_END__\x01sta"
+                + b"[    3.141592] random: crng init done\r\ntus=0\r\n",
+                "the guest command was not seen to finish: the serial log has the "
                 + FRAME_BEGIN.decode()
                 + " line but no END line",
             ),
@@ -989,10 +1076,7 @@ class Demo6ResumeTest(unittest.TestCase):
         self.assertEqual(
             failed_run_message(124, serial_log), "Hermit/QEMU exited with status 124"
         )
-        for begin in (
-            b"__HERMIT_COMMAND_BEGIN__",
-            b"__HERMIT_COMMAND_BEGIN__ format=2",
-        ):
+        for begin in (b"__HERMIT_COMMAND_BEGIN__", b"__HERMIT_COMMAND_BEGIN__ format=2"):
             with self.subTest(begin=begin):
                 serial_log.write_bytes(begin + b"\r\nLinux (none)\r\n")
                 self.assertEqual(

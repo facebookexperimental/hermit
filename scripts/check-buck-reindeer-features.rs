@@ -38,11 +38,25 @@
 //! read it refuses, with the file and line, instead of skipping: a `features`
 //! value other than a literal list of plain string literals ending at `,`, `)`
 //! or `}` (a variable, `select()`, a concatenation, a conditional, and so a
-//! top-level `features = [...]` assignment, which makes a variable), the string
-//! `"features"` used anywhere but as such a dict key (`kwargs["features"]`),
-//! and a string that sets a cfg feature the way a rustc flag does
-//! (`--cfg=feature="x"`). A spelling that builds the name `features` at run
-//! time, or a build file of another kind, is outside what it reads.
+//! top-level `features = [...]` assignment, which makes a variable) or the
+//! table described next, the string `"features"` used anywhere but as such a
+//! dict key (`kwargs["features"]`), and a string that sets a cfg feature the
+//! way a rustc flag does (`--cfg=feature="x"`). A spelling that builds the name
+//! `features` at run time, or a build file of another kind, is outside what it
+//! reads.
+//!
+//! One `features` value of another form is read and enables nothing: the
+//! `"features": {...}` table of a target's `autocargo` `cargo_toml_config`,
+//! from which autocargo writes the member's Cargo.toml `[features]` table. It
+//! declares each cargo feature and what that feature turns on; it enables none
+//! on the target. The shim discards `autocargo` (shim/shims.bzl), and a rule's
+//! `features` attribute is a list, so a table could not set it. Its names are
+//! therefore not counted, and the features the check compares are the same
+//! with or without one. The table is read as strictly as a list: only as
+//! an entry of the dict that is a `"cargo_toml_config"` value, holding only
+//! distinct plain string literal keys, each mapped to a literal list of plain
+//! string literals, and ending at `,`, `)` or `}`. A `features` table anywhere
+//! else, or of any other form, is refused.
 //!
 //! Reindeer's resolution also reads three fields of a crate's fixups
 //! (src/index.rs at the pinned revision): `omit_features` drops a feature
@@ -131,9 +145,13 @@ const RESOLVER_FIXUPS: [(&str, &str); 3] = [
 /// Why a workspace member's fixups that set a resolver field are refused.
 const FIXUPS_REMEDY: &str = "this check does not model that, so remove it from the workspace \
      member's fixups or teach this check to apply it";
-/// The only `features` value the scan reads; anything else is refused.
-const READABLE_VALUE: &str =
-    "this check reads only a literal list of plain string literals ending at `,`, `)` or `}`";
+/// The only `features` values the scan reads; anything else is refused.
+const READABLE_VALUE: &str = "this check reads only a literal list of plain string literals \
+     ending at `,`, `)` or `}`, or, as an entry of a `\"cargo_toml_config\"` dict, a literal \
+     table of such lists under distinct plain string literal keys";
+/// The dict key whose value is the only place the scan reads a `features`
+/// table: autocargo's configuration of the Cargo.toml it writes.
+const CARGO_TOML_CONFIG: &str = "cargo_toml_config";
 /// Why a file the tokenizer stops in yields no features at all.
 const UNREADABLE_FILE: &str = "so this check cannot read the file";
 /// Why an unresolved feature is refused, printed once under the violations.
@@ -183,6 +201,9 @@ struct Scan {
     features: BTreeSet<String>,
     /// How many literal lists were read.
     lists: usize,
+    /// How many autocargo feature tables were read. They declare cargo
+    /// features rather than enable them, so they add nothing to `features`.
+    tables: usize,
     /// The line of each value the scan refuses to read, and why.
     refusals: Vec<(usize, String)>,
 }
@@ -282,9 +303,10 @@ fn describe(token: Option<&Token>) -> String {
     }
 }
 
-/// The names in the literal list at `tokens[start]`, or why it is not one
-/// this check reads.
-fn literal_list(tokens: &[Lexeme], start: usize) -> Result<Vec<String>, String> {
+/// The names in the literal list at `tokens[start]` and the index of the
+/// token after it, which is a `,`, `)` or `}`, or why it is not one this check
+/// reads.
+fn literal_list(tokens: &[Lexeme], start: usize) -> Result<(Vec<String>, usize), String> {
     let token = |index: usize| tokens.get(index).map(|lexeme| &lexeme.token);
     if token(start) != Some(&Token::Punct("[")) {
         return Err(format!("is {} rather than a list", describe(token(start))));
@@ -315,8 +337,79 @@ fn literal_list(tokens: &[Lexeme], start: usize) -> Result<Vec<String>, String> 
         }
     }
     match token(index + 1) {
-        Some(Token::Punct(",") | Token::Punct(")") | Token::Punct("}")) => Ok(names),
+        Some(Token::Punct(",") | Token::Punct(")") | Token::Punct("}")) => Ok((names, index + 1)),
         other => Err(format!("continues past its list with {}", describe(other))),
+    }
+}
+
+/// Nothing when `tokens[start]` begins a literal Cargo feature table this
+/// check reads: plain string literal keys, each named once and mapped to a
+/// literal list of plain string literals, the table ending at `,`, `)` or
+/// `}`. Otherwise why it is not one.
+fn feature_table(tokens: &[Lexeme], start: usize) -> Result<(), String> {
+    let token = |index: usize| tokens.get(index).map(|lexeme| &lexeme.token);
+    if token(start) != Some(&Token::Punct("{")) {
+        return Err(format!("is {} rather than a table", describe(token(start))));
+    }
+    let mut keys = BTreeSet::new();
+    let mut index = start + 1;
+    loop {
+        let key = match token(index) {
+            Some(Token::Punct("}")) => break,
+            Some(Token::Str(key)) if !key.contains('\\') => key,
+            other => {
+                return Err(format!(
+                    "holds {} where a feature name without escapes belongs",
+                    describe(other)
+                ));
+            }
+        };
+        if !keys.insert(key) {
+            return Err(format!("declares the feature {key:?} twice"));
+        }
+        if token(index + 1) != Some(&Token::Punct(":")) {
+            return Err(format!(
+                "holds {} after the feature name {key:?} rather than `:`",
+                describe(token(index + 1))
+            ));
+        }
+        let (_, end) = literal_list(tokens, index + 2)
+            .map_err(|why| format!("maps the feature {key:?} to a value that {why}"))?;
+        match token(end) {
+            Some(Token::Punct(",")) => index = end + 1,
+            Some(Token::Punct("}")) => {
+                index = end;
+                break;
+            }
+            other => {
+                return Err(format!(
+                    "holds {} after the feature {key:?} rather than `,` or `}}`",
+                    describe(other)
+                ));
+            }
+        }
+    }
+    match token(index + 1) {
+        Some(Token::Punct(",") | Token::Punct(")") | Token::Punct("}")) => Ok(()),
+        other => Err(format!("continues past its table with {}", describe(other))),
+    }
+}
+
+/// The key of the dict entry whose value begins at `tokens[index]`, when the
+/// two tokens before it are a string literal and `:`.
+fn entry_key(tokens: &[Lexeme], index: usize) -> Option<&str> {
+    match tokens.get(index.checked_sub(2)?..index)? {
+        [
+            Lexeme {
+                token: Token::Str(key),
+                ..
+            },
+            Lexeme {
+                token: Token::Punct(":"),
+                ..
+            },
+        ] => Some(key),
+        _ => None,
     }
 }
 
@@ -346,16 +439,53 @@ fn scan(text: &str) -> Scan {
             return scan;
         }
     };
-    let list =
-        |start| literal_list(&tokens, start).map_err(|why| format!("a `features` value {why}"));
+    let token = |index: usize| tokens.get(index).map(|lexeme| &lexeme.token);
+    let list = |start| {
+        literal_list(&tokens, start)
+            .map(|(names, _)| names)
+            .map_err(|why| format!("a `features` value {why}"))
+    };
+    // For each bracket still open, innermost last, the key of the dict entry
+    // whose value it begins, or `None` when it begins no entry's value.
+    let mut open = Vec::new();
     for (index, lexeme) in tokens.iter().enumerate() {
-        let next = tokens.get(index + 1).map(|next| &next.token);
+        let next = token(index + 1);
         let value = match &lexeme.token {
+            Token::Punct("(" | "[" | "{") => {
+                open.push(entry_key(&tokens, index));
+                continue;
+            }
+            Token::Punct(")" | "]" | "}") => {
+                open.pop();
+                continue;
+            }
             // A read or comparison of a variable named `features` sets
             // nothing; whatever reaches a rule's attribute passes through a
             // `features =` or a `"features":` checked here.
             Token::Name(name) if name == "features" && next == Some(&Token::Punct("=")) => {
                 list(index + 2)
+            }
+            // A table declares cargo features for the Cargo.toml autocargo
+            // writes and enables none, so its names are not added.
+            Token::Str(text)
+                if text == "features"
+                    && next == Some(&Token::Punct(":"))
+                    && token(index + 2) == Some(&Token::Punct("{")) =>
+            {
+                if open.last() != Some(&Some(CARGO_TOML_CONFIG)) {
+                    Err(format!(
+                        "a `features` value is a table outside a `\"{CARGO_TOML_CONFIG}\"` \
+                         dict, the one place where a table declares cargo features"
+                    ))
+                } else {
+                    match feature_table(&tokens, index + 2) {
+                        Ok(()) => {
+                            scan.tables += 1;
+                            continue;
+                        }
+                        Err(why) => Err(format!("a `features` table {why}")),
+                    }
+                }
             }
             Token::Str(text) if text == "features" && next == Some(&Token::Punct(":")) => {
                 list(index + 2)
@@ -501,6 +631,7 @@ fn violations(platforms: &Platforms, members: &[Member], named: &BTreeSet<String
 fn summary(
     files: usize,
     lists: usize,
+    tables: usize,
     named: &BTreeSet<String>,
     platforms: &Platforms,
     members: &[Member],
@@ -531,8 +662,9 @@ fn summary(
     };
     format!(
         "check-buck-reindeer-features.rs: {lists} literal `features` lists in {files} tracked \
-         build files name {named:?}; {outcome}; {featureless} of {} workspace members have no \
-         cargo features",
+         build files name {named:?}; {outcome}; {tables} autocargo `features` tables declare \
+         cargo features and enable none; {featureless} of {} workspace members have no cargo \
+         features",
         members.len()
     )
 }
@@ -726,11 +858,13 @@ fn load(root: &Path) -> Result<Inputs, String> {
 fn check(inputs: &Inputs) -> Result<String, Vec<String>> {
     let mut named = BTreeSet::new();
     let mut lists = 0;
+    let mut tables = 0;
     let mut refused = Vec::new();
     for (path, text) in &inputs.files {
         let scan = scan(text);
         named.extend(scan.features);
         lists += scan.lists;
+        tables += scan.tables;
         refused.extend(
             scan.refusals
                 .into_iter()
@@ -748,6 +882,7 @@ fn check(inputs: &Inputs) -> Result<String, Vec<String>> {
         return Ok(summary(
             inputs.files.len(),
             lists,
+            tables,
             &named,
             &inputs.platforms,
             &inputs.members,
@@ -937,6 +1072,87 @@ mod tests {
             scan.features,
             names(&["buck-release-provenance", "dbt", "liteinst", "sabre"])
         );
+    }
+
+    /// A target in the shape hermit-cli/BUCK gives libhermit: an autocargo
+    /// `cargo_toml_config` whose `features` table is `table`, beside a
+    /// `features` list that enables liteinst on the target.
+    fn autocargo_target(table: &str) -> String {
+        format!(
+            "rust_library(\n    name = \"libhermit\",\n    autocargo = {{\n        \
+             \"cargo_toml_dir\": \".\",\n        \"cargo_toml_config\": {{\n            \
+             \"package\": {{\"version\": \"0.4.1\", \"keywords\": [\"linux\", \"hermit\"]}},\n            \
+             \"dependencies_override\": {{\n                \"dependencies\": \
+             {{\"hermit-test-workdir\": {{\"optional\": True}}}},\n            }},\n            \
+             \"features\": {table},\n        }},\n    }},\n    features = [\"liteinst\"],\n)\n"
+        )
+    }
+
+    // The table declares the cargo features of the Cargo.toml that autocargo
+    // writes; only the target's own list enables one.
+    #[test]
+    fn reads_an_autocargo_feature_table_as_declaring_and_enabling_nothing() {
+        let table = "{\n                \"default\": [],\n                \
+                     \"dbt\": [\"dep:detcore-dbt\", \"dep:reverie-dbt\"],\n                \
+                     \"sabre\": [\"dep:reverie-rpc-transport\"],\n                \
+                     \"third-party-backends\": [\"dbt\", \"sabre\", \"liteinst\"],\n                \
+                     \"kvm-native-test-support\": [\"reverie-kvm/native-test-support\"],\n            }";
+        for table in [
+            table,
+            "{}",
+            "{\"dbt\": []}",
+            "{\"dbt\": [\"dep:reverie-dbt\",],}",
+        ] {
+            let read = scan(&autocargo_target(table));
+            assert!(read.refusals.is_empty(), "{table}: {:?}", read.refusals);
+            assert_eq!((read.lists, read.tables), (1, 1), "{table}");
+            assert_eq!(read.features, names(&["liteinst"]), "{table}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_feature_table_anywhere_but_a_cargo_toml_config_entry() {
+        for text in [
+            "ARGS = {\"features\": {\"dbt\": []}}\n",
+            "rust_library(autocargo = {\"features\": {\"dbt\": []}})\n",
+            "C = {\"cargo_toml_config\": {\"package\": {\"features\": {\"dbt\": []}}}}\n",
+            "rust_library(features = {\"dbt\": []})\n",
+            "C = {\"cargo_toml_config\": [{\"features\": {\"dbt\": []}}]}\n",
+        ] {
+            assert_eq!(refused_lines(text), [1], "{text}");
+            let scan = scan(text);
+            assert_eq!((scan.tables, scan.features.len()), (0, 0), "{text}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_feature_table_that_is_not_literal() {
+        for table in [
+            "DBT_TABLE",
+            "{\"dbt\": DBT}",
+            "{NAME: []}",
+            "{name: [] for name in NAMES}",
+            "{\"dbt\": select({\"DEFAULT\": []})}",
+            "{\"dbt\": [\"a\"] + [\"b\"]}",
+            "{\"dbt\": {}}",
+            "{\"d\\x62t\": []}",
+            "{\"dbt\": [\"dep:reverie\\x2ddbt\"]}",
+            "{\"dbt\": [], \"dbt\": [\"dep:reverie-dbt\"]}",
+            "{\"dbt\" []}",
+            "{\"dbt\": [] \"sabre\": []}",
+            "{\"dbt\": [])",
+            "{\"dbt\": []} | EXTRA",
+            "{\"dbt\": []} if FULL else {}",
+        ] {
+            let text = autocargo_target(table);
+            assert_eq!(
+                refused_lines(&text),
+                [10],
+                "{table}: {:?}",
+                scan(&text).refusals
+            );
+            assert_eq!(scan(&text).tables, 0, "{table}");
+        }
     }
 
     #[test]
@@ -1339,6 +1555,48 @@ mod tests {
         let lines = check(&load(&root).unwrap()).unwrap_err();
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].starts_with("member: "), "{lines:?}");
+        assert_eq!(lines[1], RESOLUTION_RULE);
+        assert_run_fails(&root, 1, &lines);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // A table's names are not counted, so the comparison is the one the
+    // target's own list makes: with no list it passes, and with one naming
+    // liteinst, which this platform leaves unresolved, it still fails.
+    #[test]
+    fn a_feature_table_leaves_the_comparison_to_the_targets_list() {
+        let table = "{\"default\": [], \"liteinst\": []}";
+        let declared = autocargo_target(table).replace("    features = [\"liteinst\"],\n", "");
+        let root = repository(
+            "table-declared",
+            &["default"],
+            &[("BUCK", declared.as_str())],
+            &[],
+        );
+        let line = check(&load(&root).unwrap()).unwrap();
+        assert!(
+            line.contains("0 literal `features` lists in 1 tracked build files name {};"),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "; 1 autocargo `features` tables declare cargo features and enable none;"
+            ),
+            "{line}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        let enabled = autocargo_target(table);
+        let root = repository(
+            "table-enabled",
+            &["default"],
+            &[("BUCK", enabled.as_str())],
+            &[],
+        );
+        let lines = check(&load(&root).unwrap()).unwrap_err();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("member: "), "{lines:?}");
+        assert!(lines[0].contains("[\"liteinst\"]"), "{lines:?}");
         assert_eq!(lines[1], RESOLUTION_RULE);
         assert_run_fails(&root, 1, &lines);
         fs::remove_dir_all(&root).unwrap();

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 mod user_access_event_tests {
     use rand::RngExt;
     use rand::SeedableRng;
@@ -79,7 +71,9 @@ mod user_access_event_tests {
         config.detlog_heap = true;
         config.detlog_stack = true;
         config.detlog_io_buffers = true;
-        config.syscall_clobbers_virtualized_by_backend = false;
+        config.backend.virtualizes_syscall_clobbers = false;
+        // This fixture audits the timer setters implemented by EventGuest.
+        config.backend.delivers_preemption_timer_events = true;
         config.max_timeslice = std::num::NonZeroU64::new(1_000_000_000);
         tool.cfg = config.clone();
         let end = guest.thread.thread_logical_time.as_nanos() + std::time::Duration::from_secs(1);
