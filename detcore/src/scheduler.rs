@@ -13070,6 +13070,9 @@ impl Scheduler {
             ResourceID::BlockingExternalIO(op_id)
             | ResourceID::BlockingVfork(op_id)
             | ResourceID::BlockingRtSigsuspend(op_id) => {
+                // The published list of kernel-run blocking calls (A5 design
+                // 16.11) is exactly what this arm sends outside the schedule.
+                debug_assert!(rid.is_kernel_run_blocking());
                 if matches!(rid, ResourceID::BlockingVfork(_)) {
                     self.begin_vfork_barrier(dettid);
                     if let Some(origin) = self.next_turns[&dettid].protocol.origin {
@@ -25130,6 +25133,40 @@ mod test {
                 .block_for_one_resource(thread, &rid, &Permission::RW, None, mask, &Ivar::new())
                 .is_err()
         );
+    }
+
+    /// Every resource in the published list of kernel-run blocking calls
+    /// (A5 design 16.11, `ResourceID::is_kernel_run_blocking`) is granted
+    /// outside the schedule: the thread leaves the run queue and the
+    /// scheduler records the call as running in the background. With the
+    /// `debug_assert!` in `block_for_one_resource`'s background arm, this ties
+    /// the list to that arm in both directions.
+    #[test]
+    fn every_kernel_run_blocking_resource_is_granted_outside_the_schedule() {
+        let mut granted = 0;
+        for rid in crate::resources::one_resource_of_each_variant(ExternalOpId::new(
+            DetTid::from_raw(101),
+            1,
+        )) {
+            if !rid.is_kernel_run_blocking() {
+                continue;
+            }
+            let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            commit_out_of_scheduler_call(&mut scheduler, creator, rid.clone(), None);
+            assert!(
+                !scheduler.run_queue.contains_tid(creator),
+                "{rid:?} left the thread in the run queue"
+            );
+            let op = ExternalOpId::new(creator, 1);
+            let background = if matches!(rid, ResourceID::BlockingRtSigsuspend(_)) {
+                scheduler.blocked.rt_sigsuspend_blockers.get(&creator)
+            } else {
+                scheduler.blocked.external_io_blockers.get(&creator)
+            };
+            assert_eq!(background, Some(&op), "{rid:?}");
+            granted += 1;
+        }
+        assert_eq!(granted, 3);
     }
 
     /// A thread sleeping in `rt_sigsuspend` or in other IO outside the runnable

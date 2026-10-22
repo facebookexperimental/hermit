@@ -391,6 +391,112 @@ pub enum ResourceID {
     InGuestFatalAlarm,
 }
 
+impl ResourceID {
+    /// Whether a granted request for this resource makes its thread's call a
+    /// kernel-run blocking call: the call runs outside the schedule, in the
+    /// kernel, where it may sleep for as long as the kernel decides, while
+    /// the scheduler commits other threads' turns. The thread rejoins with a
+    /// [`ResourceID::BlockedExternalContinue`] request (a failed vfork with
+    /// [`ResourceID::VforkFailed`]), filed at a moment host timing chooses.
+    /// So, in committed state, the call is running from the grant of this
+    /// resource until the grant of that request.
+    ///
+    /// This is the published list of kernel-run blocking calls of the A5
+    /// signal-delivery design (dev-hermit
+    /// `ai_docs/2026-10-16-a5-signal-delivery-design.md`, 16.11). Step 3c.1
+    /// refuses by name a caught or default-fatal signal that a committed send
+    /// makes pending for a thread in one of them, because the in-guest
+    /// runtime's mask keeps the signal pending where Linux would interrupt
+    /// the call. The request names the call: its `fyi` is the syscall's name,
+    /// or `clone_vfork`.
+    ///
+    /// That reason holds for a call that sleeps under the thread's own mask.
+    /// Three forms instead hand the kernel the guest's temporary mask
+    /// (`Resources::blocked_signal_mask`): `rt_sigsuspend` as
+    /// `BlockingRtSigsuspend`, `rt_sigsuspend` with a signal already pending
+    /// as `BlockingExternalIO`, and a masked `pselect6` with `nfds` above 64.
+    /// The kernel installs that mask for the call, so a caught signal it
+    /// unblocks interrupts the call and is delivered on the return into
+    /// runtime code. That is the temporary-mask problem of 16.11 (step 3c.w),
+    /// not a signal kept pending.
+    ///
+    /// A call that may block inside its own turn is not one. The scheduler
+    /// commits no other turn until that thread files its next request, so no
+    /// committed send and no expiry can make a signal pending for it
+    /// meanwhile.
+    ///
+    /// Which calls file these requests is decided by their handlers, from
+    /// Detcore's descriptor model and configuration. The list applies to a
+    /// sequentialized `hermit run`, the configuration in which the in-guest
+    /// backends run (record and replay run on ptrace). Without sequentialized
+    /// threads, `resource_request` sends no request to the scheduler, so
+    /// nothing is granted in the background and there is no committed state
+    /// to key on. In a sequentialized `hermit run` they are:
+    /// - `rt_sigsuspend`, always, except on a backend whose `rt_sigsuspend`
+    ///   never sleeps (`rt_sigsuspend_never_sleeps`, KVM);
+    /// - `vfork`, and `clone` or `clone3` with `CLONE_VFORK` (the in-guest
+    ///   runtime refuses those two before they run);
+    /// - `read` and `readv` of an inherited external input;
+    /// - `read`, `recvfrom`, `recvmsg`, `recvmmsg`, `sendto`, `sendmsg`,
+    ///   `sendmmsg`, `connect`, `accept` and `accept4` on a descriptor that is
+    ///   blocking both logically and physically, or that Detcore cannot
+    ///   classify (`execute_nonblockable_fd_syscall`). Detcore makes the
+    ///   sockets, pipes and eventfds it creates physically nonblocking, and
+    ///   its timerfds while time is virtual, so these are, for example,
+    ///   inotify and signalfd descriptors and sockets Detcore did not create;
+    /// - `select` and `pselect6` with `nfds` above 64 and a timeout that is
+    ///   not zero (a zero timeout runs in the turn first);
+    /// - `futex` under `--debug-futex-mode=external`. (A `restart_syscall`
+    ///   never resumes such a wait: Detcore keeps a futex restart record only
+    ///   in the precise and polling modes, which external mode returns
+    ///   before.)
+    ///
+    /// The scheduler grants exactly these resources in its background arm
+    /// (`Scheduler::block_for_one_resource`, which asserts it). The work-span
+    /// report also counts the continuation (`BlockedExternalContinue`) as a
+    /// wait outside the schedule, though the kernel call has returned by then.
+    ///
+    /// `write`, `writev` and `readv` on a physically blocking descriptor
+    /// (for `readv`, one that is not an inherited input), `preadv2` and
+    /// `pwritev2` at offset -1 on a stream, and a masked
+    /// `epoll_pwait` or `epoll_pwait2` on a backend without
+    /// `supports_blocked_wait_signal_interruption`, run in the turn instead.
+    ///
+    /// Exhaustive, so that a new variant has to be classified.
+    pub(crate) fn is_kernel_run_blocking(&self) -> bool {
+        match self {
+            ResourceID::BlockingExternalIO(_)
+            | ResourceID::BlockingVfork(_)
+            | ResourceID::BlockingRtSigsuspend(_) => true,
+            ResourceID::FileContents(_)
+            | ResourceID::FileMetadata(_)
+            | ResourceID::DirectoryContents(_)
+            | ResourceID::MemAddrSpace(_)
+            | ResourceID::Path(_)
+            | ResourceID::PathsTransitive(_)
+            | ResourceID::Device(_)
+            | ResourceID::Exit { .. }
+            | ResourceID::ParentContinue { .. }
+            | ResourceID::SleepUntil(_)
+            | ResourceID::InternalIOPolling
+            | ResourceID::TraceReplay
+            | ResourceID::FutexWait
+            | ResourceID::VforkFailed(_)
+            | ResourceID::BlockedExternalContinue(_)
+            | ResourceID::PriorityChangePoint(..)
+            | ResourceID::WaitChild { .. }
+            | ResourceID::WaitPhysicalChild(_)
+            | ResourceID::InboundSignal(_)
+            | ResourceID::WaitidSignals(_)
+            | ResourceID::SchedYield
+            | ResourceID::HappensBeforeCheckpoint(_)
+            | ResourceID::HappensBeforeSyscallCheckpoint { .. }
+            | ResourceID::HappensBeforePosthookInterrupted { .. }
+            | ResourceID::InGuestFatalAlarm => false,
+        }
+    }
+}
+
 /// Permission to a device, which behaves like a predefined "inode".
 /// These correspond to special files under /dev
 #[allow(clippy::enum_variant_names)]
@@ -871,9 +977,169 @@ impl Permission {
     }
 }
 
+/// One value of every [`ResourceID`] variant, in declaration order, for
+/// tests that must cover them all; `op` names the operation of the variants
+/// that carry one.
+#[cfg(test)]
+pub(crate) fn one_resource_of_each_variant(op: ExternalOpId) -> Vec<ResourceID> {
+    use crate::types::ChildWaitExitClass;
+    use crate::types::ChildWaitSelector;
+    let tid = op.tid;
+    let pid = DetPid::from_raw(1);
+    vec![
+        ResourceID::FileContents(DetInode::mint(1)),
+        ResourceID::FileMetadata(DetInode::mint(1)),
+        ResourceID::DirectoryContents(DetInode::mint(1)),
+        ResourceID::MemAddrSpace(pid),
+        ResourceID::Path(PathBuf::from("/a")),
+        ResourceID::PathsTransitive(PathBuf::from("/a")),
+        ResourceID::Device(Device::ContainerStdin),
+        ResourceID::Exit {
+            group: true,
+            process: pid,
+            mm: MmId::initial(tid),
+        },
+        ResourceID::ParentContinue {
+            parent: tid,
+            child: DetTid::from_raw(tid.as_raw() + 1),
+        },
+        ResourceID::SleepUntil(LogicalTime::from_nanos(1)),
+        ResourceID::InternalIOPolling,
+        ResourceID::TraceReplay,
+        ResourceID::FutexWait,
+        ResourceID::BlockingExternalIO(op),
+        ResourceID::BlockingVfork(op),
+        ResourceID::VforkFailed(op),
+        ResourceID::BlockedExternalContinue(op),
+        ResourceID::PriorityChangePoint(1, LogicalTime::from_nanos(1), 1, Vec::new()),
+        ResourceID::WaitChild {
+            parent: pid,
+            spec: ChildWaitSpec {
+                selector: ChildWaitSelector::Any,
+                owner: None,
+                exit_class: ChildWaitExitClass::Sigchld,
+            },
+        },
+        ResourceID::WaitPhysicalChild(pid),
+        ResourceID::InboundSignal(SigWrapper(libc::SIGUSR1)),
+        ResourceID::WaitidSignals(vec![SigWrapper(libc::SIGUSR1)]),
+        ResourceID::SchedYield,
+        ResourceID::HappensBeforeCheckpoint(1),
+        ResourceID::HappensBeforeSyscallCheckpoint {
+            count: 1,
+            anchors: Vec::new(),
+        },
+        ResourceID::HappensBeforePosthookInterrupted {
+            count: 1,
+            anchors: Vec::new(),
+            code: "ERESTARTSYS".to_owned(),
+        },
+        ResourceID::BlockingRtSigsuspend(op),
+        ResourceID::InGuestFatalAlarm,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classification the published list of kernel-run blocking calls
+    /// (A5 design 16.11, `ResourceID::is_kernel_run_blocking`) is pinned to,
+    /// written independently of it. Exhaustive, so that a new variant does
+    /// not compile until this test classifies it too.
+    fn pinned_kernel_run_blocking(resource: &ResourceID) -> bool {
+        match resource {
+            ResourceID::BlockingExternalIO(_)
+            | ResourceID::BlockingVfork(_)
+            | ResourceID::BlockingRtSigsuspend(_) => true,
+            ResourceID::FileContents(_)
+            | ResourceID::FileMetadata(_)
+            | ResourceID::DirectoryContents(_)
+            | ResourceID::MemAddrSpace(_)
+            | ResourceID::Path(_)
+            | ResourceID::PathsTransitive(_)
+            | ResourceID::Device(_)
+            | ResourceID::Exit { .. }
+            | ResourceID::ParentContinue { .. }
+            | ResourceID::SleepUntil(_)
+            | ResourceID::InternalIOPolling
+            | ResourceID::TraceReplay
+            | ResourceID::FutexWait
+            | ResourceID::VforkFailed(_)
+            | ResourceID::BlockedExternalContinue(_)
+            | ResourceID::PriorityChangePoint(..)
+            | ResourceID::WaitChild { .. }
+            | ResourceID::WaitPhysicalChild(_)
+            | ResourceID::InboundSignal(_)
+            | ResourceID::WaitidSignals(_)
+            | ResourceID::SchedYield
+            | ResourceID::HappensBeforeCheckpoint(_)
+            | ResourceID::HappensBeforeSyscallCheckpoint { .. }
+            | ResourceID::HappensBeforePosthookInterrupted { .. }
+            | ResourceID::InGuestFatalAlarm => false,
+        }
+    }
+
+    /// Each variant's position in declaration order. Exhaustive, so that a
+    /// new variant needs an ordinal here; renumbering the variants after it
+    /// then leaves a gap in `one_resource_of_each_variant` until that table
+    /// gains the new variant. (A variant appended at the end and missing from
+    /// the table is not caught: stable Rust cannot count variants.)
+    fn variant_ordinal(resource: &ResourceID) -> usize {
+        match resource {
+            ResourceID::FileContents(_) => 0,
+            ResourceID::FileMetadata(_) => 1,
+            ResourceID::DirectoryContents(_) => 2,
+            ResourceID::MemAddrSpace(_) => 3,
+            ResourceID::Path(_) => 4,
+            ResourceID::PathsTransitive(_) => 5,
+            ResourceID::Device(_) => 6,
+            ResourceID::Exit { .. } => 7,
+            ResourceID::ParentContinue { .. } => 8,
+            ResourceID::SleepUntil(_) => 9,
+            ResourceID::InternalIOPolling => 10,
+            ResourceID::TraceReplay => 11,
+            ResourceID::FutexWait => 12,
+            ResourceID::BlockingExternalIO(_) => 13,
+            ResourceID::BlockingVfork(_) => 14,
+            ResourceID::VforkFailed(_) => 15,
+            ResourceID::BlockedExternalContinue(_) => 16,
+            ResourceID::PriorityChangePoint(..) => 17,
+            ResourceID::WaitChild { .. } => 18,
+            ResourceID::WaitPhysicalChild(_) => 19,
+            ResourceID::InboundSignal(_) => 20,
+            ResourceID::WaitidSignals(_) => 21,
+            ResourceID::SchedYield => 22,
+            ResourceID::HappensBeforeCheckpoint(_) => 23,
+            ResourceID::HappensBeforeSyscallCheckpoint { .. } => 24,
+            ResourceID::HappensBeforePosthookInterrupted { .. } => 25,
+            ResourceID::BlockingRtSigsuspend(_) => 26,
+            ResourceID::InGuestFatalAlarm => 27,
+        }
+    }
+
+    /// Pins the published list against one value of every variant, so that a
+    /// change to the list changes `pinned_kernel_run_blocking`.
+    #[test]
+    fn the_kernel_run_blocking_calls_are_the_three_outside_the_schedule() {
+        let op = ExternalOpId::new(DetTid::from_raw(1), 7);
+        let every_variant = one_resource_of_each_variant(op);
+        let ordinals: Vec<usize> = every_variant.iter().map(variant_ordinal).collect();
+        assert_eq!(ordinals, (0..every_variant.len()).collect::<Vec<_>>());
+        assert_eq!(every_variant.len(), 28);
+        for resource in &every_variant {
+            assert_eq!(
+                resource.is_kernel_run_blocking(),
+                pinned_kernel_run_blocking(resource),
+                "{resource:?}"
+            );
+        }
+        let kernel_run = every_variant
+            .iter()
+            .filter(|resource| resource.is_kernel_run_blocking())
+            .count();
+        assert_eq!(kernel_run, 3);
+    }
 
     #[test]
     fn control_tokens_do_not_alias_unrelated_operations() {

@@ -382,6 +382,9 @@ fn resource_wait_kind(resource: &ResourceID) -> Option<WaitKind> {
         | ResourceID::Device(_) => Some(WaitKind::Resource),
         ResourceID::InternalIOPolling => Some(WaitKind::Poll),
         ResourceID::FutexWait => Some(WaitKind::Futex),
+        // The kernel-run blocking calls (`ResourceID::is_kernel_run_blocking`),
+        // and the continuation a backgrounded call files once its kernel call
+        // has returned, which still waits outside the schedule for its grant.
         ResourceID::BlockingExternalIO(_)
         | ResourceID::BlockingVfork(_)
         | ResourceID::BlockedExternalContinue(_)
@@ -402,16 +405,6 @@ fn resource_wait_kind(resource: &ResourceID) -> Option<WaitKind> {
         | ResourceID::HappensBeforePosthookInterrupted { .. }
         | ResourceID::InGuestFatalAlarm => None,
     }
-}
-
-/// Whether a granted `resource` sends the call outside the schedule.
-fn goes_outside(resource: &ResourceID) -> bool {
-    matches!(
-        resource,
-        ResourceID::BlockingExternalIO(_)
-            | ResourceID::BlockingVfork(_)
-            | ResourceID::BlockingRtSigsuspend(_)
-    )
 }
 
 /// Note `kind` as the binding predecessor if `candidate` exceeds `best`.
@@ -858,7 +851,14 @@ impl Scheduler {
         state.commits += 1;
         self.work_span_raise_waiters(tid, commit.hi);
         let state = &mut self.work_span;
-        if request.is_some_and(|request| request.resources.keys().any(goes_outside)) {
+        // A granted kernel-run blocking call sends the call outside the
+        // schedule.
+        if request.is_some_and(|request| {
+            request
+                .resources
+                .keys()
+                .any(ResourceID::is_kernel_run_blocking)
+        }) {
             state.waiting.insert(tid, (0, WaitKind::Outside));
         }
         if let Some(process) = own_exit {

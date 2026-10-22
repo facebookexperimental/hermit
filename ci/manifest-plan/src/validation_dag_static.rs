@@ -1143,9 +1143,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And hermit-manifest-plan's
     // a_verify_rows_divergence_is_admitted_and_its_impossible_forms_refused
     // (first divergence in the cell row): 1808.
-    // And +3 from 9c05a306: 1811.
-    // And +2 from 4a3194e4: 1813.
-    // And +1 from f412ae41: 1814.
+    // And the three config::tests of Config::in_guest_reserved_signals
+    // (A5 step 3c slice 0a: legacy form, round trip, predicate): 1811, listed.
+    // And the two config::tests of Config::in_guest_refuses_host_timed_producers
+    // (A5 step 3c slice 0b: legacy form, round trip): 1813, listed.
+    // And hermit-manifest-plan's
+    // parity::tests::run_comparisons_belong_to_a_red_candidate_and_must_be_consistent
+    // (parity post-pass, 3c19ef32): 1814, listed.
     ("test.regular_crates", 1814),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
@@ -1733,9 +1737,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tests::in_guest_reserved_signals_follow_the_backend_and_the_subscription
     // and tests::a_poisoned_reserved_signal_set_never_survives_preparation
     // (A5 step 3c slice 0a): 1077, listed.
-    // And +2 from 9c05a306: 1077.
-    // And +5 from 4a3194e4: 1082.
-    // And +1 from dc608afd: 1083.
+    // And tests::{a_poisoned_producer_refusal_never_survives_preparation,
+    // an_in_guest_launch_logs_the_cpu_limit_it_found_and_refuses_one_it_cannot_raise,
+    // an_inherited_signal_producer_is_refused_by_descriptor,
+    // the_launch_audit_reports_what_the_guest_check_found,
+    // the_inherited_descriptor_scan_finds_a_producer_without_close_on_exec}
+    // (A5 step 3c slice 0b): 1082, listed.
+    // Slice 0c renames
+    // tests::in_guest_reserved_signals_follow_the_backend_and_the_subscription
+    // to ..._follow_the_backend_the_subscription_and_site_patching and adds
+    // tests::the_default_route_reserves_sigtrap_only_with_site_patching_on:
+    // 1083, listed.
     ("test.hermit_unit", 1083),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
@@ -2672,9 +2684,20 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +9 from e931b265: 2278.
     // And the five io_buffers/statx-tail units of https://github.com/rrnewton/hermit/pull/4559
     // (two stat records, two field decoders, the statx tail): 2283.
-    // And +6 from 9c05a306: 2289.
-    // And +9 from 4a3194e4: 2298.
-    ("test.detcore_unit", 2298),
+    // And the six reserved-send units of A5 step 3c slice 0a (the two
+    // syscalls::signal::tests predicate units, a_reserved_thread_send_must_name_the_threads_own_group,
+    // a_reserved_send_checks_its_siginfo_as_linux_copies_it,
+    // known_siginfo_layout_matches_linuxs_table and
+    // time::tests::timer_create_clock_refusal_matches_linuxs_clock_table): 2289, listed.
+    // And the six host_timed_producers units (one of them
+    // a_negative_setown_owner_is_a_process_group), the two parent-death-signal
+    // route units in syscalls::misc, and
+    // a_held_parent_death_signal_that_would_fire_in_guest_is_refused_by_name
+    // (A5 step 3c slice 0b): 2298, listed.
+    // And resources::tests::the_kernel_run_blocking_calls_are_the_three_outside_the_schedule
+    // and scheduler::test::every_kernel_run_blocking_resource_is_granted_outside_the_schedule
+    // (A5 step 3c slice 0f, the published kernel-run call list): 2300, listed.
+    ("test.detcore_unit", 2300),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3853,9 +3876,23 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/4532): 587, listed.
     // Less no_namespace_preserves_affinity_for_run_and_verify, ignored as a
     // known failure by https://github.com/rrnewton/hermit/pull/4559: 586.
-    // And +4 from 9c05a306: 590.
-    // And +9 from 4a3194e4: 599.
-    // And +1 from dc608afd: 600.
+    // And liteinst_in_guest_programs::{liteinst_in_guest_reserved_signal_sends_and_armings_are_refused,
+    // liteinst_in_guest_reserved_group_sends_stay_refused_by_name,
+    // liteinst_in_guest_reserved_sends_to_exited_targets_keep_linuxs_answers,
+    // liteinst_in_guest_reserved_sends_keep_linuxs_siginfo_answers} (A5 step 3c
+    // slice 0a): 590, listed.
+    // And liteinst_in_guest_programs::{liteinst_in_guest_host_timed_producer_completions_are_refused,
+    // liteinst_in_guest_parent_death_signals_are_held_or_refused_at_arming,
+    // liteinst_in_guest_a_held_parent_death_signal_that_would_fire_ends_the_run_by_name,
+    // liteinst_in_guest_a_held_parent_death_signal_at_an_unscheduled_death_ends_the_run_by_name,
+    // liteinst_in_guest_cpu_limit_changes_are_refused_with_a_warning,
+    // liteinst_in_guest_launch_raises_a_soft_cpu_limit_and_refuses_a_hard_one,
+    // liteinst_in_guest_launch_refuses_an_inherited_signal_producer,
+    // liteinst_in_guest_library_launch_refuses_a_configured_producer,
+    // liteinst_in_guest_library_launch_checks_what_a_caller_callback_leaves}
+    // (A5 step 3c slice 0b): 599, listed.
+    // And liteinst_in_guest_programs::liteinst_in_guest_patching_off_by_environment_still_reserves_sigtrap
+    // (A5 step 3c slice 0c): 600, listed.
     ("test.cli", 600),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
@@ -4340,6 +4377,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --signal-at tests: 519, listed.
     // And the same two review --signal-at tests: 521, listed.
     // Less no_namespace_preserves_affinity_for_run_and_verify (https://github.com/rrnewton/hermit/pull/4559): 520.
+    // The four in-guest reserved-signal tests (A5 step 3c slice 0a), the nine
+    // in-guest host-timed producer tests (slice 0b) and the in-guest SIGTRAP
+    // test (slice 0c) need CPUID faulting and join the hosted exclusions:
+    // unchanged at 520.
     ("test.cli_on_host", 520),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
@@ -4731,9 +4772,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same retirement-refusal unit: 2269.
     // And +9 from e931b265: 2278.
     // And the five io_buffers/statx-tail units of https://github.com/rrnewton/hermit/pull/4559: 2283.
-    // And +6 from 9c05a306: 2289.
-    // And +9 from 4a3194e4: 2298.
-    ("test.detcore_unit_on_host", 2298),
+    // And the same six slice 0a reserved-send units: 2289, listed.
+    // And the same nine host-timed producer units (slice 0b): 2298, listed.
+    // And the same two slice 0f kernel-run call-list units: 2300, listed.
+    ("test.detcore_unit_on_host", 2300),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5067,9 +5109,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from e931b265: 1074.
     // And the same CPUID-faulting VM pointer test: 1075.
     // And the same two slice 0a reserved-signal tests: 1077, listed.
-    // And +2 from 9c05a306: 1077.
-    // And +5 from 4a3194e4: 1082.
-    // And +1 from dc608afd: 1083.
+    // And the same five host-timed producer units (slice 0b): 1082, listed.
+    // And the same slice 0c default-route SIGTRAP unit: 1083, listed.
     ("test.hermit_unit_on_host", 1083),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
@@ -5254,9 +5295,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two replay-into-full manifest-plan tests: 1782, listed.
     // The same eleven capture controls retain the unchanged fourteen exclusions.
     // And the same first-divergence cell-row test: 1794.
-    // And +3 from 9c05a306: 1797.
-    // And +2 from 4a3194e4: 1799.
-    // And +1 from f412ae41: 1800.
+    // And the same three in_guest_reserved_signals config tests: 1797, listed.
+    // And the same two in_guest_refuses_host_timed_producers config tests: 1799,
+    // listed.
+    // And the same parity post-pass run-comparison test: 1800, listed.
     ("test.regular_crates_on_host", 1800),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
