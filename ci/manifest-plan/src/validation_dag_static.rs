@@ -3060,7 +3060,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Less under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change,
     // ignored as a known failure by https://github.com/rrnewton/hermit/pull/4559: 311.
     // And 28 retained coherent mapping-capture controls: 339.
-    ("test.hermit_integration_3", 339),
+    // Split the five birth cases into separately bounded identities (+4): 343.
+    ("test.hermit_integration_3", 343),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4892,7 +4893,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Less under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change
     // (https://github.com/rrnewton/hermit/pull/4559): 657.
     // And the same 28 retained coherent mapping-capture controls: 685.
-    ("test.hermit_integration_on_host", 685),
+    // Split the five birth cases into separately bounded identities (+4): 689.
+    ("test.hermit_integration_on_host", 689),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

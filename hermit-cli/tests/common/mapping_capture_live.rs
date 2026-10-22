@@ -1029,99 +1029,115 @@ fn birth_guest() -> &'static Path {
     })
 }
 
-#[test]
-fn dbt_mapping_capture_birth_attempts_keep_the_domain_unavailable() {
+fn check_birth_attempt_keeps_the_domain_unavailable(case: &str, setup: &str) {
     let guest = birth_guest();
-    for (case, setup) in [
-        ("fork", "fork-retired=1\n"),
-        ("failed-clone", "clone-failed=EINVAL\n"),
-        ("threads-1", "siblings-ready=1\n"),
-        ("threads-2", "siblings-ready=2\n"),
-        ("threads-8", "siblings-ready=8\n"),
-    ] {
-        let directory = tempfile::Builder::new()
-            .prefix(&format!("{case}-"))
-            .tempdir_in(guest.parent().expect("birth fixture directory"))
-            .expect("create birth control evidence directory")
-            .keep();
-        let setup_path = directory.join("setup");
-        let stdout_path = directory.join("stdout");
-        let stderr_path = directory.join("stderr");
-        eprintln!("mapping capture birth evidence: {}", directory.display());
-        let run = run(
-            Some("birth-domain"),
-            guest.to_str().expect("UTF-8 birth fixture path"),
-            &[
-                case,
-                setup_path.to_str().expect("UTF-8 birth setup path"),
-                stdout_path.to_str().expect("UTF-8 birth stdout path"),
-                stderr_path.to_str().expect("UTF-8 birth stderr path"),
-            ],
-        );
-        assert_eq!(
-            std::fs::read(&setup_path).expect("actual successful birth setup receipt"),
-            setup.as_bytes(),
-            "incomplete or incorrect birth setup for {case}"
-        );
-        assert_eq!(
-            std::fs::read(&stdout_path).expect("retained actual birth guest stdout"),
-            setup.as_bytes(),
-            "birth guest did not reach its exact pre-NUMA boundary for {case}"
-        );
-        assert!(
-            std::fs::read(&stderr_path)
-                .expect("retained actual birth guest stderr")
-                .is_empty(),
-            "birth guest reported a setup or unexpected-return error for {case}"
-        );
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("{case}-"))
+        .tempdir_in(guest.parent().expect("birth fixture directory"))
+        .expect("create birth control evidence directory")
+        .keep();
+    let setup_path = directory.join("setup");
+    let stdout_path = directory.join("stdout");
+    let stderr_path = directory.join("stderr");
+    eprintln!("mapping capture birth evidence: {}", directory.display());
+    let run = run(
+        Some("birth-domain"),
+        guest.to_str().expect("UTF-8 birth fixture path"),
+        &[
+            case,
+            setup_path.to_str().expect("UTF-8 birth setup path"),
+            stdout_path.to_str().expect("UTF-8 birth stdout path"),
+            stderr_path.to_str().expect("UTF-8 birth stderr path"),
+        ],
+    );
+    assert_eq!(
+        std::fs::read(&setup_path).expect("actual successful birth setup receipt"),
+        setup.as_bytes(),
+        "incomplete or incorrect birth setup for {case}"
+    );
+    assert_eq!(
+        std::fs::read(&stdout_path).expect("retained actual birth guest stdout"),
+        setup.as_bytes(),
+        "birth guest did not reach its exact pre-NUMA boundary for {case}"
+    );
+    assert!(
+        std::fs::read(&stderr_path)
+            .expect("retained actual birth guest stderr")
+            .is_empty(),
+        "birth guest reported a setup or unexpected-return error for {case}"
+    );
 
-        let error = require_runner_error(run.outcome);
-        let mut withdrawals = 0;
-        let mut native_refusals = 0;
-        for record in &run.records {
-            match record.get("phase") {
-                "birth-withdraw" => {
-                    record.exact_keys(&["phase", "syscall", "requested"]);
-                    let syscall = record.unsigned("syscall");
-                    assert!(
-                        [libc::SYS_clone, libc::SYS_fork, libc::SYS_clone3]
-                            .into_iter()
-                            .any(|expected| syscall == expected as u64),
-                        "not an actual fixture birth syscall: {record:?}"
-                    );
-                    assert_eq!(record.unsigned("requested"), 0);
-                    withdrawals += 1;
-                }
-                "birth-refused" => {
-                    record.exact_keys(&["phase", "requested"]);
-                    assert_eq!(record.unsigned("requested"), 0);
-                    native_refusals += 1;
-                }
-                _ => panic!("unexpected birth control phase for {case}: {record:?}"),
+    let error = require_runner_error(run.outcome);
+    let mut withdrawals = 0;
+    let mut native_refusals = 0;
+    for record in &run.records {
+        match record.get("phase") {
+            "birth-withdraw" => {
+                record.exact_keys(&["phase", "syscall", "requested"]);
+                let syscall = record.unsigned("syscall");
+                assert!(
+                    [libc::SYS_clone, libc::SYS_fork, libc::SYS_clone3]
+                        .into_iter()
+                        .any(|expected| syscall == expected as u64),
+                    "not an actual fixture birth syscall: {record:?}"
+                );
+                assert_eq!(record.unsigned("requested"), 0);
+                withdrawals += 1;
             }
+            "birth-refused" => {
+                record.exact_keys(&["phase", "requested"]);
+                assert_eq!(record.unsigned("requested"), 0);
+                native_refusals += 1;
+            }
+            _ => panic!("unexpected birth control phase for {case}: {record:?}"),
         }
-        assert!(withdrawals > 0, "no real pre-syscall withdrawal for {case}");
-        assert!(native_refusals <= 1, "repeated capture refusal for {case}");
-        let error_text = error.to_string();
-        let shared_refusal = error_text.contains("runtime-private numa_maps view unavailable:");
-        let pending_refusal = error_text
-            .contains("contained mapping capture did not complete restoration (phase=prepared)")
-            || error_text.contains(
-                "contained mapping capture did not complete restoration (phase=controller-read)",
-            );
-        assert!(
-            shared_refusal || pending_refusal,
-            "not a named mapping-domain refusal for {case}: {error}"
-        );
-        // Prepare can refuse before native operation0. An absent birth-refused
-        // marker is therefore distinct from a successful native capture; all
-        // accepted record variants above require requested=0 and forbid a
-        // restored-success marker. Preserve the actual reason, not a relabel.
-        eprintln!(
-            "birth control {case}: native_operation0_refused={} runner_error={error}",
-            native_refusals == 1
-        );
     }
+    assert!(withdrawals > 0, "no real pre-syscall withdrawal for {case}");
+    assert!(native_refusals <= 1, "repeated capture refusal for {case}");
+    let error_text = error.to_string();
+    let shared_refusal = error_text.contains("runtime-private numa_maps view unavailable:");
+    let pending_refusal = error_text
+        .contains("contained mapping capture did not complete restoration (phase=prepared)")
+        || error_text.contains(
+            "contained mapping capture did not complete restoration (phase=controller-read)",
+        );
+    assert!(
+        shared_refusal || pending_refusal,
+        "not a named mapping-domain refusal for {case}: {error}"
+    );
+    // Prepare can refuse before native operation0. An absent birth-refused
+    // marker is therefore distinct from a successful native capture; all
+    // accepted record variants above require requested=0 and forbid a
+    // restored-success marker. Preserve the actual reason, not a relabel.
+    eprintln!(
+        "birth control {case}: native_operation0_refused={} runner_error={error}",
+        native_refusals == 1
+    );
+}
+
+#[test]
+fn dbt_mapping_capture_birth_fork_keeps_the_domain_unavailable() {
+    check_birth_attempt_keeps_the_domain_unavailable("fork", "fork-retired=1\n");
+}
+
+#[test]
+fn dbt_mapping_capture_birth_failed_clone_keeps_the_domain_unavailable() {
+    check_birth_attempt_keeps_the_domain_unavailable("failed-clone", "clone-failed=EINVAL\n");
+}
+
+#[test]
+fn dbt_mapping_capture_birth_one_thread_keeps_the_domain_unavailable() {
+    check_birth_attempt_keeps_the_domain_unavailable("threads-1", "siblings-ready=1\n");
+}
+
+#[test]
+fn dbt_mapping_capture_birth_two_threads_keeps_the_domain_unavailable() {
+    check_birth_attempt_keeps_the_domain_unavailable("threads-2", "siblings-ready=2\n");
+}
+
+#[test]
+fn dbt_mapping_capture_birth_eight_threads_keeps_the_domain_unavailable() {
+    check_birth_attempt_keeps_the_domain_unavailable("threads-8", "siblings-ready=8\n");
 }
 
 const TOPOLOGY_GUEST: &str = r#"

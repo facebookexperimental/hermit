@@ -933,7 +933,9 @@ mod tests {
             // procfs_determinism's mapping_capture_live module, the DBT NUMA
             // coherent-capture tests from the dbt NUMA + E5 landing (Hermit
             // b4cd1664 and 74ed9f94; +28): 685.
-            assert_eq!(population, 685);
+            // Split the five mapping-capture birth cases into separately bounded
+            // test identities, preserving every case and assertion (+4): 689.
+            assert_eq!(population, 689);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
