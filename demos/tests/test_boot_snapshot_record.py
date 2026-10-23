@@ -1508,6 +1508,11 @@ class Demo7ChecksTheSnapshotFirstTest(unittest.TestCase):
 
     def test_the_snapshot_is_checked_before_any_pass(self):
         events = []
+
+        def start_pass(*_):
+            events.append(("pass",))
+            raise ReachedHermit()
+
         main = self.module["main"]
         with mock.patch.dict(
             main.__globals__,
@@ -1516,12 +1521,10 @@ class Demo7ChecksTheSnapshotFirstTest(unittest.TestCase):
                 "ensure_boot_snapshot": lambda *arguments: events.append(
                     ("ensure",) + arguments
                 ),
-                "_run_once": mock.Mock(
-                    side_effect=lambda *_: events.append(("pass",)) or ReachedHermit()
-                ),
+                "_run_once": mock.Mock(side_effect=start_pass),
             },
         ), mock.patch.dict(os.environ, self.environment):
-            with self.assertRaises(Exception):
+            with self.assertRaises(ReachedHermit):
                 main()
         self.assertEqual(
             events[0],
