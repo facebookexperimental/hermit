@@ -17,6 +17,11 @@ def need(value, why):
         raise RuntimeError(why)
 
 
+def cancellation(pending, error):
+    """Keep the first KeyboardInterrupt/SystemExit to re-raise after every close."""
+    return pending if pending is not None or isinstance(error, Exception) else error
+
+
 def sha(path):
     digest = hashlib.sha256()
     with Path(path).open('rb') as stream:
@@ -60,9 +65,11 @@ def invoke(value, args):
     previous = sys.argv
     try:
         sys.argv = [str(value.__file__),*args]
-        value.main()
+        status = value.main()
     finally:
         sys.argv = previous
+    # A stage reports failure by an exit status as well as by raising.
+    need(status is None or status == 0, 'pipeline stage returned failure status: '+repr(status))
 
 
 def stage_output(root, stage):
@@ -157,6 +164,7 @@ def main():
     closes=[]
     ac = lc = None
     body_error = None
+    cancelled = None
     def record(stage,path):
         value = owned.file_fact(path)
         journal['stages'].append(dict(stage=stage,result=value))
@@ -237,6 +245,7 @@ def main():
     except BaseException as error:
         body_error = error
         journal.update(state='FAIL',error=repr(error))
+        cancelled = cancellation(cancelled, error)
     finally:
         errors = []
         # Successful publication already executed final_close immediately
@@ -246,9 +255,15 @@ def main():
             *([lambda: owned.files_close(lc),lambda: owned.private_close(lc)] if lc is not None else [])]
         for close in remaining_closes:
             try: close()
-            except BaseException as error: errors.append(repr(error))
+            except BaseException as error:
+                errors.append(repr(error))
+                cancelled = cancellation(cancelled, error)
         if errors: journal.update(state='FAIL',close_errors=errors)
-        save(out/'pipeline-result.json',journal)
+        try:
+            save(out/'pipeline-result.json',journal)
+        finally:
+            if cancelled is not None:
+                raise cancelled
     need(journal['state'] == 'PUBLISHED_PRIVATE_STATIC_DATA_NOT_QUALIFIED',
          repr({'body_error':repr(body_error),'close_errors':journal.get('close_errors',[])}))
 

@@ -4,6 +4,7 @@ One serial host-library build, exact Cargo JSON rlib selection, tiny diagnostic.
 Actual maintained static archive build; no tests, final link/loading, image launch or qualification.
 """
 import argparse
+from contextlib import ExitStack
 import hashlib
 import importlib.util
 import json
@@ -30,6 +31,11 @@ STREAM = 64 * 1024 * 1024
 def need(ok, why):
     if not ok:
         raise RuntimeError(why)
+
+
+def cancellation(pending, error):
+    """Keep the first KeyboardInterrupt/SystemExit to re-raise after every close."""
+    return pending if pending is not None or isinstance(error, Exception) else error
 
 
 def sha(path):
@@ -282,8 +288,28 @@ def main():
         result['commands'].append(row)
         save(out / 'result.json', result)
         started = time.monotonic()
-        with (out / (name + '.stdout')).open('xb') as o, (out / (name + '.stderr')).open('xb') as e:
-            child = subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=o, stderr=e, env=env)
+        command_cancelled = None
+        def close_stream(stream):
+            nonlocal command_cancelled
+            try:
+                stream.close()
+            except BaseException as error:
+                command_cancelled = cancellation(command_cancelled, error)
+                raise
+        try:
+            with ExitStack() as streams:
+                try:
+                    o = (out / (name + '.stdout')).open('xb')
+                    streams.callback(close_stream, o)
+                    e = (out / (name + '.stderr')).open('xb')
+                    streams.callback(close_stream, e)
+                    child = subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=o, stderr=e, env=env)
+                except BaseException as error:
+                    command_cancelled = cancellation(command_cancelled, error)
+                    raise
+        finally:
+            if command_cancelled is not None:
+                raise command_cancelled
         row.update(exit=child.returncode, wall_seconds=time.monotonic() - started)
         for stream in ['stdout', 'stderr']:
             q = out / (name + '.' + stream)
@@ -292,6 +318,7 @@ def main():
         need(child.returncode == 0, name + ' failed')
         need(all(row[s]['bytes'] <= STREAM for s in ['stdout', 'stderr']), name + ' retained stream exceeds guard')
         return (out / (name + '.stdout')).read_text()
+    cancelled = None
     try:
         files_close(c)
         result['private_before'] = private_close(c)
@@ -354,6 +381,7 @@ def main():
         result['root_diagnostic'] = 'ROOT_TRANSFER_DIAGNOSTIC_ONLY_NOT_PROVEN' if c.get('elf') else 'NOT_RUN'
     except BaseException as error:
         result.update(state='FAIL', error=repr(error))
+        cancelled = cancellation(cancelled, error)
         raise
     finally:
         close_errors = []
@@ -361,20 +389,27 @@ def main():
             files_close(c)
         except BaseException as error:
             close_errors.append('source/tools: ' + repr(error))
+            cancelled = cancellation(cancelled, error)
         try:
             result['private_after'] = private_close(c)
             need(result.get('private_before') == result['private_after'], 'private inventory close mismatch')
         except BaseException as error:
             close_errors.append('private inventory: ' + repr(error))
+            cancelled = cancellation(cancelled, error)
         try:
             if result.get('archive'):
                 need(sha(result['archive']['path']) == result['archive']['sha256'], 'archive changed at close')
         except BaseException as error:
             close_errors.append('selected archive: ' + repr(error))
+            cancelled = cancellation(cancelled, error)
         result['source_tools_closed'] = not close_errors
         if close_errors:
             result.update(state='FAIL', close_errors=close_errors)
-        save(out / 'result.json', result)
+        try:
+            save(out / 'result.json', result)
+        finally:
+            if cancelled is not None:
+                raise cancelled
     need(result['state'] == 'ARCHIVE_BUILD_ONLY_NOT_QUALIFIED', 'archive/source/private-input close failed')
 
 

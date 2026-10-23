@@ -2,7 +2,7 @@
 import ast,hashlib,unittest
 from pathlib import Path
 SOURCE=Path(__file__).with_name('prepare.py')
-SHA = '082f7bfbd2ba08a5260aec194b3b09306cfd1de2b261a1d59431b854e2fb4e1e'
+SHA = 'f78167f4cc6520b6316d006695eb68d073aeee0b83d37ce67ffa7c9601029d45'
 class InventoryIdentity(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

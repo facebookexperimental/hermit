@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Retain decoded DATA from the same closed owned link; never qualification."""
 import argparse
+from contextlib import ExitStack
 import hashlib
 import importlib.util
 import json
@@ -61,16 +62,40 @@ def main():
         close()
         row = dict(name=name, argv=argv, cwd=c['H'])
         record['commands'].append(row)
+        command_cancelled = None
+        def close_stream(stream):
+            nonlocal command_cancelled
+            try:
+                stream.close()
+            except BaseException as error:
+                command_cancelled = m.cancellation(command_cancelled, error)
+                raise
         try:
-            with (out / (name + '.stdout')).open('xb') as o, (out / (name + '.stderr')).open('xb') as e:
-                m.bounded_stream_command(argv, c['H'], m.declared_child_environment(c, host=True),
-                                         o, e, 512 * 1024 * 1024, 300, row)
+            with ExitStack() as streams:
+                try:
+                    o = (out / (name + '.stdout')).open('xb')
+                    streams.callback(close_stream, o)
+                    e = (out / (name + '.stderr')).open('xb')
+                    streams.callback(close_stream, e)
+                    m.bounded_stream_command(argv, c['H'], m.declared_child_environment(c, host=True),
+                                             o, e, 512 * 1024 * 1024, 300, row)
+                except BaseException as error:
+                    command_cancelled = m.cancellation(command_cancelled, error)
+                    raise
+        except BaseException as error:
+            command_cancelled = m.cancellation(command_cancelled, error)
+            raise
         finally:
-            for stream in ['stdout','stderr']:
-                v = out / (name + '.' + stream)
-                if v.exists(): row[stream] = m.file_fact(v)
-            close()
+            try:
+                for stream in ['stdout','stderr']:
+                    v = out / (name + '.' + stream)
+                    if v.exists(): row[stream] = m.file_fact(v)
+                close()
+            finally:
+                if command_cancelled is not None:
+                    raise command_cancelled
         m.need(row.get('exit') == 0, name + ' failed')
+    cancelled = None
     try:
         close()
         record['private_before'] = m.private_close(c)
@@ -93,22 +118,31 @@ def main():
         record['state'] = 'RECORDS_OBSERVED_NOT_QUALIFIED'
     except BaseException as error:
         record.update(state='FAIL', error=repr(error))
+        cancelled = m.cancellation(cancelled, error)
     finally:
         errors = []
+        def failed(error):
+            nonlocal cancelled
+            errors.append(repr(error))
+            cancelled = m.cancellation(cancelled, error)
         for row in record['commands']:
             for stream in ['stdout','stderr']:
                 if stream in row:
                     try: m.need(m.file_fact(row[stream]['path']) == row[stream], 'coordinate stream changed')
-                    except BaseException as error: errors.append(repr(error))
+                    except BaseException as error: failed(error)
         try: close()
-        except BaseException as error: errors.append(repr(error))
+        except BaseException as error: failed(error)
         try:
             record['private_after'] = m.private_close(c)
             m.need(record.get('private_before') == record['private_after'], 'private inventory changed')
-        except BaseException as error: errors.append(repr(error))
+        except BaseException as error: failed(error)
         record['source_tools_closed'] = not errors
         if errors: record.update(state='FAIL', close_errors=errors)
-        m.save(out / 'result.json', record)
+        try:
+            m.save(out / 'result.json', record)
+        finally:
+            if cancelled is not None:
+                raise cancelled
     m.need(record['state'] == 'RECORDS_OBSERVED_NOT_QUALIFIED', 'coordinate observation failed')
 
 

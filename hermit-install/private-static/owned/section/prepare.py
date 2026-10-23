@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Prepare V12 section/script inputs from actual maintained archive evidence; NEVER link."""
 import argparse, fnmatch, hashlib, importlib.util, json, os, re, resource, struct, subprocess, sys, time
+from contextlib import ExitStack
 from pathlib import Path
 sys.dont_write_bytecode = True
 ASSETS=Path(__file__).resolve().parent.parent/'assets'
 ROOT='detcore_liteinst_mapped_entry'
 MAINTAINED=Path(__file__).resolve().parent.parent/'archive/prepare.py'
-MAINTAINED_SHA='940a819545326130742df22c1761f3d3da0a7721236be9a290871245bea7659f'
+MAINTAINED_SHA='38cd2bf11368a119c7c2e52c3f477f665518f0fd5dbc7f7b326fff40c6465e1a'
 # Preserve the existing private static-image C/TLS ABI; retention is not provenance.
 ABI_ROOTS=['__init_tls', 'malloc', '__libc_malloc', '__libc_malloc_impl', 'calloc', '__libc_calloc', 'free', '__libc_free', 'realloc', '__libc_realloc', 'reallocarray', 'aligned_alloc', 'memalign', 'valloc', 'posix_memalign', 'malloc_usable_size', '__malloc_allzerop']
 RO_ROOTS={'.reverie_inguest_fixed_gate_template':(4096,4096,2),'.rodata.hermit_mapped_layout':(96,8,0x200002)} # measured SHF_ALLOC / SHF_ALLOC|SHF_GNU_RETAIN
@@ -19,6 +20,9 @@ RELOCS=1024*1024*1024
 
 def need(ok,why):
  if not ok: raise RuntimeError(why)
+def cancellation(pending,error):
+ # Keep the first KeyboardInterrupt/SystemExit to re-raise after every close.
+ return pending if pending is not None or isinstance(error,Exception) else error
 def sha(path):
  h=hashlib.sha256()
  with Path(path).open('rb') as f:
@@ -183,7 +187,7 @@ def main():
  need(evidence.is_absolute() and evidence.resolve()==evidence and evidence.is_dir(),'canonical evidence root required')
  out=evidence/('loader-maintained-final-link-inputs-'+a.attempt);out.mkdir(exist_ok=False)
  result={'state':'RUNNING','scope':'SECTION_SCRIPT_INPUT_PREPARATION_ONLY','link':'NOT_RUN','qualification':'NOT_PROVEN','startup':'NOT_RUN','readiness':'NOT_RUN','guests_executed':0,'tests_executed':0,'commands':[]}
- save(out/'result.json',result);guard=None;produced={};began=time.monotonic()
+ save(out/'result.json',result);guard=None;produced={};began=time.monotonic();cancelled=None
  try:
   buildpath=Path(a.build_result).resolve();bindingpath=Path(a.build_binding).resolve();recipepath=Path(a.build_recipe).resolve()
   need(all(p.is_relative_to(evidence) for p in (buildpath,bindingpath,recipepath)),'inputs outside owned evidence')
@@ -258,24 +262,36 @@ def main():
   def run(name,argv):
    limit=RELOCS if name.endswith('-relocations') else LIMIT
    row={'name':name,'argv':argv,'state':'RUNNING','output_limit_bytes':limit};result['commands'].append(row);save(out/'result.json',result);started=time.monotonic()
+   command_cancelled=None
+   def close_stream(stream):
+    nonlocal command_cancelled
+    try:stream.close()
+    except BaseException as error:command_cancelled=cancellation(command_cancelled,error);raise
    try:
     guard()
-    with (out/(name+'.stdout')).open('xb') as o,(out/(name+'.stderr')).open('xb') as e:
-     child=subprocess.run(argv,cwd=h,env=env,stdin=subprocess.DEVNULL,stdout=o,stderr=e,timeout=120,preexec_fn=lambda:resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit)))
+    with ExitStack() as streams:
+     try:
+      o=(out/(name+'.stdout')).open('xb');streams.callback(close_stream,o)
+      e=(out/(name+'.stderr')).open('xb');streams.callback(close_stream,e)
+      child=subprocess.run(argv,cwd=h,env=env,stdin=subprocess.DEVNULL,stdout=o,stderr=e,timeout=120,preexec_fn=lambda:resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit)))
+     except BaseException as error:command_cancelled=cancellation(command_cancelled,error);raise
     row['exit']=child.returncode;need(child.returncode==0,'metadata tool failed: '+name);row['state']='PASS'
-   except BaseException as error:row.update(state='FAIL',error=repr(error));raise
+   except BaseException as error:command_cancelled=cancellation(command_cancelled,error);row.update(state='FAIL',error=repr(error));raise
    finally:
-    row['wall_seconds']=time.monotonic()-started
-    for stream in ('stdout','stderr'):
-     path=out/(name+'.'+stream)
-     if path.exists():
-      row[stream]=identity(path);produced[str(path)]=row[stream]
-      if row[stream]['bytes']>limit:row.update(state='FAIL',output_error='metadata output cap exceeded')
     try:
-     guard()
-     need('output_error' not in row,'metadata output cap exceeded')
-    except BaseException as error:row.update(state='FAIL',custody_error=repr(error));raise
-    finally:save(out/'result.json',result)
+     row['wall_seconds']=time.monotonic()-started
+     for stream in ('stdout','stderr'):
+      path=out/(name+'.'+stream)
+      if path.exists():
+       row[stream]=identity(path);produced[str(path)]=row[stream]
+       if row[stream]['bytes']>limit:row.update(state='FAIL',output_error='metadata output cap exceeded')
+     try:
+      guard()
+      need('output_error' not in row,'metadata output cap exceeded')
+     except BaseException as error:command_cancelled=cancellation(command_cancelled,error);row.update(state='FAIL',custody_error=repr(error));raise
+     finally:save(out/'result.json',result)
+    finally:
+     if command_cancelled is not None:raise command_cancelled
    return out/(name+'.stdout')
   native=[];archives=[('detcore',archive)]
   for label,name,size,digest in [('libc','libc.a',6406314,'e699c64b0c6b427d89ad5bf767bf78beb30c19930c5dedff635951636e8f9f70'),('libunwind','libunwind.a',201418,'eb16569e611a5d6cdda2e7604fd6402a3ad810817dd8d63ed50baa2ce8070aaa')]:
@@ -324,11 +340,14 @@ def main():
    if path.is_file() and path.name!='result.json':produced[str(path)]=identity(path)
   guard()
   result.update(state='PASS_SECTION_SCRIPT_PREPARATION_ONLY',prepared_inputs=identity(out/'prepared-link-inputs.json'),archive=build['archive'],h_head=a.h_head,r_head=a.r_head)
- except BaseException as error:result.update(state='FAIL',error=repr(error));raise
+ except BaseException as error:result.update(state='FAIL',error=repr(error));cancelled=cancellation(cancelled,error);raise
  finally:
   if guard:
    try:guard();save(out/'source-after.json',c['source_before']);result['source_and_inputs_unchanged']=True
-   except BaseException as error:result.update(state='FAIL',custody_error=repr(error),source_and_inputs_unchanged=False)
-  result['produced_outputs']=produced;result['wall_seconds']=time.monotonic()-began;save(out/'result.json',result)
+   except BaseException as error:result.update(state='FAIL',custody_error=repr(error),source_and_inputs_unchanged=False);cancelled=cancellation(cancelled,error)
+  result['produced_outputs']=produced;result['wall_seconds']=time.monotonic()-began
+  try:save(out/'result.json',result)
+  finally:
+   if cancelled is not None:raise cancelled
  return 0 if result['state']=='PASS_SECTION_SCRIPT_PREPARATION_ONLY' else 1
 if __name__=='__main__':raise SystemExit(main())

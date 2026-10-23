@@ -4,6 +4,7 @@ One serial host-library build, exact Cargo JSON rlib selection, tiny diagnostic.
 Actual fresh source-owned static archive and ONE owned diagnostic link; no image loading, guest or qualification.
 """
 import argparse
+from contextlib import ExitStack
 import hashlib
 import importlib.util
 import json
@@ -28,13 +29,18 @@ PRIVATE_INVENTORY_SHA256 = 'f825b66769fb55bee298b0a41277b38767970e5cad4beca8400f
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
 STREAM = 64 * 1024 * 1024
 RUNTIME_COHORT = D / 'runtime_cohort.py'
-RUNTIME_COHORT_SHA256 = 'c363fe11ac5f468903597d6ec3405b030c6dc05ca4ec12112c05e233fb9a2c12'
+RUNTIME_COHORT_SHA256 = '04168aef6f04f86d469095d2d60aec4b996e78c717a01b503b137553a845b326'
 REQUIRED_HANDOFF_SOURCE_SHA256 = '85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75'
 
 
 def need(ok, why):
     if not ok:
         raise RuntimeError(why)
+
+
+def cancellation(pending, error):
+    """Keep the first KeyboardInterrupt/SystemExit to re-raise after every close."""
+    return pending if pending is not None or isinstance(error, Exception) else error
 
 
 def sha(path):
@@ -65,6 +71,7 @@ def bounded_stream_command(argv, cwd, env, stdout_file, stderr_file, limit, time
     deadline = time.monotonic() + timeout
     drain_deadline = None
     failure = None
+    cancelled = None
 
     def leader_exited_without_reap():
         # Popen.poll()/wait() would release PID custody too early. WNOWAIT
@@ -115,21 +122,44 @@ def bounded_stream_command(argv, cwd, env, stdout_file, stderr_file, limit, time
                     row['stream_failure'] = failure
                     kill_retained_group();drain_deadline = time.monotonic() + 5
         need(failure is None, str(failure))
+    except BaseException as error:
+        cancelled = cancellation(cancelled, error)
+        raise
     finally:
         # The leader still owns its PID/PGID: no poll, wait, or reaping waitid
-        # occurs above. Signal first, then release that ownership exactly once.
-        try:
-            kill_retained_group()
-        finally:
-            selector.close()
-            if child is not None:
-                for pipe in [child.stdout, child.stderr]:
-                    if pipe is not None: pipe.close()
+        # occurs above. Attempt every close, signal before the sole wait, and
+        # retain cancellation even when cleanup itself fails.
+        cleanup_errors = []
+
+        def cleanup(action):
+            nonlocal cancelled
+            try:
+                action()
+            except BaseException as error:
+                cleanup_errors.append(error)
+                cancelled = cancellation(cancelled, error)
+
+        cleanup(kill_retained_group)
+        cleanup(selector.close)
+        if child is not None:
+            for pipe in [child.stdout, child.stderr]:
+                if pipe is not None:
+                    cleanup(pipe.close)
+
+            def reap():
                 try:
                     row['exit'] = child.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     row['reap_deadline_hit'] = True
                     raise RuntimeError('leader not reaped after bounded group kill')
+
+            cleanup(reap)
+        if cleanup_errors:
+            row['cleanup_errors'] = [repr(error) for error in cleanup_errors]
+        if cancelled is not None:
+            raise cancelled
+        if cleanup_errors:
+            raise cleanup_errors[-1]
 
 
 def producer_environment(c):
@@ -443,7 +473,7 @@ def inspect_produced(c, out, result, produced, command):
         ('final-unresolved', [tools['nm']['path'], '-u', str(target)]),
     ]:
         try:run(name, argv)
-        except BaseException as error:raw_errors.append(name + ': ' + repr(error))
+        except Exception as error:raw_errors.append(name + ': ' + repr(error))
     need(not raw_errors, 'strict raw final inspections failed: ' + repr(raw_errors))
     header = headers.elf_headers(target)
     need(len(header['tls']) == 1, 'actual private-musl TLS segment missing/ambiguous')
@@ -631,27 +661,53 @@ def main():
         effective_timeout = min(declared_timecap, timeout) if timeout is not None else declared_timecap
         row['declared_command_timecap_seconds'] = declared_timecap
         started = time.monotonic()
+        command_cancelled = None
+        def close_stream(stream):
+            nonlocal command_cancelled
+            try:
+                stream.close()
+            except BaseException as error:
+                command_cancelled = cancellation(command_cancelled, error)
+                raise
         try:
-            with (out / (name + '.stdout')).open('xb') as o, (out / (name + '.stderr')).open('xb') as e:
-                bounded_stream_command(argv, cwd, env, o, e, limit, effective_timeout, row)
+            with ExitStack() as streams:
+                try:
+                    o = (out / (name + '.stdout')).open('xb')
+                    streams.callback(close_stream, o)
+                    e = (out / (name + '.stderr')).open('xb')
+                    streams.callback(close_stream, e)
+                    bounded_stream_command(argv, cwd, env, o, e, limit, effective_timeout, row)
+                except BaseException as error:
+                    # Capture before buffered stream __exit__ can fail.
+                    command_cancelled = cancellation(command_cancelled, error)
+                    raise
         except BaseException as error:
+            command_cancelled = cancellation(command_cancelled, error)
             row['error'] = repr(error);raise
         finally:
-            row['wall_seconds'] = time.monotonic() - started
-            for stream in ['stdout', 'stderr']:
-                p = out / (name + '.' + stream)
-                if p.exists():
-                    row[stream] = file_fact(p);produced[str(p)] = row[stream]
-            # The typed method may return Err after preserving partial outputs.
-            if name == 'owned-link':
-                for name0 in ['initializer-definitions.not-qualified.elf', 'initializer-definitions.map']:
-                    p = Path(c['link_paths']['output_directory']) / name0
-                    if p.exists():produced[str(p)] = file_fact(p)
-            try: files_close(c)
-            finally: save(out / 'result.json', result)
+            try:
+                row['wall_seconds'] = time.monotonic() - started
+                for stream in ['stdout', 'stderr']:
+                    p = out / (name + '.' + stream)
+                    if p.exists():
+                        row[stream] = file_fact(p);produced[str(p)] = row[stream]
+                # The typed method may return Err after preserving partial outputs.
+                if name == 'owned-link':
+                    for name0 in ['initializer-definitions.not-qualified.elf', 'initializer-definitions.map']:
+                        p = Path(c['link_paths']['output_directory']) / name0
+                        if p.exists():produced[str(p)] = file_fact(p)
+                try: files_close(c)
+                except BaseException as error:
+                    command_cancelled = cancellation(command_cancelled, error)
+                    raise
+                finally: save(out / 'result.json', result)
+            finally:
+                if command_cancelled is not None:
+                    raise command_cancelled
         need(all(row[s]['bytes'] <= limit for s in ['stdout', 'stderr']), name + ' retained stream exceeds guard')
         need(allow_failure or row['exit'] == 0, name + ' failed')
         return (out / (name + '.stdout')).read_text()
+    cancelled = None
     try:
         handoff_source = runtime_handoff_preflight(c)
         need(handoff_source == c['runtime_handoff_source'] and
@@ -800,7 +856,7 @@ def main():
                     produced[identity0['path']] = captured0
                 if parsed0['state'] != 'ACTUAL_LEAF_FACTORY_CONTROLS_ONLY_NOT_QUALIFIED':
                     view_leaf_error = 'actual View leaf controls refused'
-            except BaseException as error0:
+            except Exception as error0:
                 view_leaf_error = repr(error0)
                 result['view_leaf_controls'] = {'state': 'FAIL_OR_NOT_REACHED', 'error': view_leaf_error,
                     'qualification': 'NOT_PROVEN', 'readiness': 'NOT_PROVEN'}
@@ -1071,7 +1127,7 @@ def main():
                 result['factory_stream_roles']={role:[{'runner_record_index':i,'command':records[i]} for i in indices]
                                                 for role,indices in role_indices.items()}
 
-        except BaseException as error:
+        except Exception as error:
             owned_error = repr(error)
         if view_leaf_error is not None:
             owned_error = repr({'original_owned_error': owned_error, 'view_leaf_error': view_leaf_error})
@@ -1083,7 +1139,7 @@ def main():
         try:
             inspect_produced(c, out, result, produced, command)
             result['final_inspection'] = 'PASS_EXPLICIT_OPTIONAL_STRUCTURE_ONLY_DEFAULT_STRICT_FAIL_RETAINED'
-        except BaseException as error:
+        except Exception as error:
             inspection_error = repr(error)
             result.update(final_inspection='FAIL_OR_NOT_RUN', final_inspection_error=inspection_error)
         need(sha(binary) == result['driver_binary']['sha256'], 'driver changed')
@@ -1095,6 +1151,7 @@ def main():
         result['pre_fs_closure'] = 'NOT_PROVEN'
     except BaseException as error:
         result.update(state='FAIL', error=repr(error))
+        cancelled = cancellation(cancelled, error)
         raise
     finally:
         close_errors = []
@@ -1102,23 +1159,32 @@ def main():
             files_close(c)
         except BaseException as error:
             close_errors.append('source/tools: ' + repr(error))
+            cancelled = cancellation(cancelled, error)
         try:
             result['private_after'] = private_close(c)
             need(result.get('private_before') == result['private_after'], 'private inventory close mismatch')
         except BaseException as error:
             close_errors.append('private inventory: ' + repr(error))
+            cancelled = cancellation(cancelled, error)
         try:
             if result.get('archive'):
                 need(sha(result['archive']['path']) == result['archive']['sha256'], 'archive changed at close')
         except BaseException as error:
             close_errors.append('selected archive: ' + repr(error))
+            cancelled = cancellation(cancelled, error)
         for path, expected in produced.items():
             try: need(file_fact(path) == expected, 'produced evidence changed: ' + path)
-            except BaseException as error: close_errors.append('output custody: ' + repr(error))
+            except BaseException as error:
+                close_errors.append('output custody: ' + repr(error))
+                cancelled = cancellation(cancelled, error)
         result['source_tools_closed'] = not close_errors
         if close_errors:
             result.update(state='FAIL', close_errors=close_errors)
-        save(out / 'result.json', result)
+        try:
+            save(out / 'result.json', result)
+        finally:
+            if cancelled is not None:
+                raise cancelled
     need(result['state'] == 'PASS_OWNED_FINAL_LINK_INSPECTION_ONLY', 'owned link/inspection/source close failed')
 
 

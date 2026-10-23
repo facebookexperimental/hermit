@@ -13,6 +13,11 @@ def need(value, message):
         raise RuntimeError(message)
 
 
+def cancellation(pending, error):
+    """Keep the first KeyboardInterrupt/SystemExit to re-raise after every cleanup."""
+    return pending if pending is not None or isinstance(error, Exception) else error
+
+
 def validate_roles(roles):
     """Check closed conditional DATA expectations, not source authority."""
     need(type(roles) is dict and set(roles) == {'fallback_entry','completion_syscall','sites'},
@@ -117,6 +122,7 @@ def publish(m, c, result_path, coordinates_path, roles, destination, close_pipel
     created_image = created_data = False
     original_error = None
     final_errors = []
+    cancelled = None
     destination = Path(destination)
     need(destination.is_absolute() and destination.resolve() == destination and
          not destination.exists(), 'fresh canonical package directory required')
@@ -301,21 +307,32 @@ def publish(m, c, result_path, coordinates_path, roles, destination, close_pipel
                     owned_result=m.file_fact(result_path),coordinates=m.file_fact(coordinates_path))
     except BaseException as error:
         original_error = error
+        cancelled = cancellation(cancelled, error)
         raise
     finally:
         # Do not hide a body/publication failure behind a later cleanup failure.
         # Own only fresh paths this invocation created; no existing file removal.
+        def failed(error):
+            nonlocal cancelled
+            final_errors.append(repr(error))
+            cancelled = cancellation(cancelled, error)
         try:
             os.close(fd)
-        except BaseException as error: final_errors.append(repr(error))
+        except BaseException as error: failed(error)
         for path in [pending_image,pending_data]:
             if path is not None:
                 try: path.unlink(missing_ok=True)
-                except BaseException as error: final_errors.append(repr(error))
+                except BaseException as error: failed(error)
         if original_error is not None or final_errors:
             for created,path in [(created_data,data_path),(created_image,image_path)]:
                 if created:
                     try: path.unlink()
-                    except BaseException as error: final_errors.append(repr(error))
+                    except BaseException as error: failed(error)
+        # After every cleanup and rollback, a KeyboardInterrupt or SystemExit
+        # keeps its identity; the ordinary diagnostics become its cause.
+        if cancelled is not None:
+            if cancelled is original_error and not final_errors:
+                raise cancelled
+            raise cancelled from RuntimeError({'body_error':repr(original_error),'cleanup_errors':final_errors})
         if final_errors:
             raise RuntimeError({'body_error':repr(original_error),'cleanup_errors':final_errors}) from original_error

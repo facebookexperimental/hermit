@@ -175,12 +175,21 @@ def bind(workspace):
         result = dict(cohort=matches[0], files=[fact for _,_,fact in opened])
     except BaseException as failure:
         error = failure
+    # Close every successful read, then re-raise the first KeyboardInterrupt
+    # or SystemExit itself; ordinary failures keep the aggregate RuntimeError.
+    cancelled = error if error is not None and not isinstance(error, Exception) else None
     closes = []
     for _,_,fact in opened:
         try:
             need(observed_file(Path(fact['path'])) == fact, 'runtime cohort source changed at close')
         except BaseException as failure:
             closes.append(repr(failure))
+            if cancelled is None and not isinstance(failure, Exception):
+                cancelled = failure
+    if cancelled is not None:
+        if error is cancelled and not closes:
+            raise cancelled
+        raise cancelled from RuntimeError(dict(body_error=repr(error),close_errors=closes))
     if error is not None or closes:
         raise RuntimeError(dict(body_error=repr(error),close_errors=closes)) from error
     return result
