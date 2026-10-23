@@ -142,16 +142,40 @@ int main(void) {
       return 12;
     }
   }
-  if (timestamps[0].tv_sec != timestamp_prefix ||
-      timestamps[1].tv_sec != timestamp_prefix) {
-    fprintf(
-        stderr,
-        "batched timestamps escaped the fixed logical epoch: %ld,%ld != "
-        "%d\n",
-        (long)timestamps[0].tv_sec,
-        (long)timestamps[1].tv_sec,
-        timestamp_prefix);
-    return 13;
+  /* Each batched timestamp must lie between the clock read before the bytes
+   * were sent and one taken after they were received: that holds for logical
+   * time whatever the epoch and the clock's rate, and natively for packet
+   * times. Requiring the whole second of the first timestamp failed whenever
+   * a second boundary fell between the two receives, which depends on the
+   * epoch's fraction: a window of about 3 ms with the preemption timer, and
+   * about 108 ms without it, where virtual time runs 500 times faster. */
+  struct timespec received_now;
+  if (clock_gettime(CLOCK_REALTIME, &received_now) != 0) {
+    perror("clock_gettime");
+    return 6;
+  }
+  for (int index = 0; index < MESSAGE_COUNT; ++index) {
+    const struct timespec* stamp = &timestamps[index];
+    int before_sends = stamp->tv_sec < observed_now.tv_sec ||
+        (stamp->tv_sec == observed_now.tv_sec &&
+         stamp->tv_nsec < observed_now.tv_nsec);
+    int after_receive = stamp->tv_sec > received_now.tv_sec ||
+        (stamp->tv_sec == received_now.tv_sec &&
+         stamp->tv_nsec > received_now.tv_nsec);
+    if (before_sends || after_receive) {
+      fprintf(
+          stderr,
+          "batched timestamp %d escaped logical time: %ld.%09ld outside "
+          "[%ld.%09ld, %ld.%09ld]\n",
+          index,
+          (long)stamp->tv_sec,
+          stamp->tv_nsec,
+          (long)observed_now.tv_sec,
+          observed_now.tv_nsec,
+          (long)received_now.tv_sec,
+          received_now.tv_nsec);
+      return 13;
+    }
   }
 
   puts("truncated=ok alias=ok batch=ok");

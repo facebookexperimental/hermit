@@ -63,8 +63,10 @@ fn guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root =
-                Path::new(env!("CARGO_TARGET_TMPDIR")).join("chown-virtual-root-identity");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+                "chown-virtual-root-identity-{}",
+                std::process::id()
+            ));
             fs::create_dir_all(&build_root).expect("failed to create build directory");
             let output = build_root.join("chown_virtual_root_identity");
             let mut command = Command::new("cc");
@@ -94,7 +96,10 @@ fn guest() -> &'static Path {
 /// own scratch directory under the target dir rather than the repository.
 fn scratch(tag: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("chown-virtual-root-identity")
+        .join(format!(
+            "chown-virtual-root-identity-{}",
+            std::process::id()
+        ))
         .join(tag);
     fs::create_dir_all(&dir).expect("failed to create scratch directory");
     dir
@@ -159,9 +164,7 @@ fn run_guest(tag: &str, strict: bool, extra: &[&str]) {
 
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start guest: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 

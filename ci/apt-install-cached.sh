@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Cached, bounded `apt-get install` for the hosted portable workflow.
 #
 # Called only by .github/actions/apt-install/action.yml, which every

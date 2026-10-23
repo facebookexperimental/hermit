@@ -18,6 +18,16 @@ pub const READONLY_WARNING: &str =
     "hermit: warning: /proc is mounted read-only; guest writes to procfs may fail with EROFS.\n";
 
 fn write_warning(warning: &str) {
+    // While --max-log-bytes is in force, termination must not depend on this
+    // write: the loop below waits as long as a full stderr pipe stays unread.
+    // write_without_waiting makes one attempt that cannot block and drops the
+    // warning when stderr cannot take it at once. Like the loop, it makes only
+    // syscalls and signal-set operations, so it is safe in the pre_exec
+    // callback too; the flag it is chosen by was set before the fork.
+    if crate::nonwaiting_write::diagnostics_must_not_wait() {
+        crate::nonwaiting_write::write_without_waiting(libc::STDERR_FILENO, warning.as_bytes());
+        return;
+    }
     // This also runs in the namespace-only pre_exec callback. Avoid allocation,
     // stdio locks, and formatting after fork. Diagnostics are best effort if
     // stderr is closed; a warning must not turn a successful setup into an error.

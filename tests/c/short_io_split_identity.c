@@ -1,12 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/*
  * Backend-parity contract: PARTIAL-TRANSFER SPLIT PATTERN, plus completion.
  *
  * Short reads and short writes are legal, so a backend that splits a transfer

@@ -1,10 +1,8 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
 
 //! Two readers of the validate-run ledger: the TREE-KEYED result cache
 //! (`cache_lookup_record`, validate.sh:620) and the runtime ESTIMATE
@@ -108,6 +106,46 @@ pub(crate) fn canonical_ledger_reader(adapter: &Path) -> Command {
     command
 }
 
+/// The adapter flags that cut each row to what these readers use: of
+/// `cell_results`, only its distinct `cell_verdict.state` values, its `run_id`
+/// and its `binding_contract`; of each gate, only [`HISTORY_GATE_FIELDS`]; and
+/// no `raw_result_input_census_v1`. A row that carries an
+/// `admission_floor_evidence` claim is printed whole (`--whole-admission-rows`):
+/// [`admission_cache_row`] decodes such a row as a complete `HistoryRow` before
+/// trusting the claim, and that decode refuses malformed or duplicated fields
+/// a cut would delete, which would turn a refused row into a cache hit.
+/// [`history_projection`] applies the same cut here after that check, so an
+/// adapter that predates any of these flags gives the same rows.
+pub(crate) fn history_projection_args() -> Vec<&'static str> {
+    let mut args = vec![
+        "--whole-admission-rows",
+        "--cell-verdict-states",
+        "--omit-field",
+        "raw_result_input_census_v1",
+    ];
+    for field in HISTORY_GATE_FIELDS {
+        args.extend(["--keep-gate-field", field]);
+    }
+    args
+}
+
+/// Every field `GateHistoryRow` types (`ci/manifest-plan/src/ledger.rs`). Its
+/// decoder refuses one of these that is malformed or duplicated, and
+/// `pass_row_qualifies` decodes the kept row again, so none may be cut. Of
+/// them, [`failure_row_blocks_pass_cache`] reads `result`, `exit_code`,
+/// `real_seconds`, `failure_origin` and `failed_substeps`; no other reader here
+/// looks inside a gate.
+const HISTORY_GATE_FIELDS: [&str; 8] = [
+    "name",
+    "result",
+    "kind",
+    "exit_code",
+    "real_seconds",
+    "source_node",
+    "failure_origin",
+    "failed_substeps",
+];
+
 /// Read the one logical ledger into rows, skipping unparseable lines.
 ///
 /// In an admitted dev-hermit run, `ledger` is the parent's logical `ledger/`
@@ -115,12 +153,27 @@ pub(crate) fn canonical_ledger_reader(adapter: &Path) -> Command {
 /// shard (or the retired raw shadow file) here would create a second receipt
 /// authority.  An ordinary file remains supported only for isolated fixtures
 /// and genuinely standalone checkouts.
+///
+/// # Memory
+///
+/// Rows are parsed one line at a time as the adapter writes them, and each is
+/// kept only as its [`history_projection`]. On the 2026-10-10 ledger the adapter
+/// printed 979 MB for 3,208 rows, and `cell_results` was 798 MB of it. Holding
+/// that whole output and then every parsed row took this process to 8.2 GB, and
+/// the adapter itself peaked at 6.9 GB just before. Inside a validation unit
+/// capped at 8 GiB the kernel killed the driver, systemd then stopped the
+/// unit, and every Hermit validation from 05:07Z on was abandoned as
+/// "supervisor received signal 15". What is held now is one line plus the
+/// projected rows: 346,288 KiB peak on the 3,212-row ledger, with 43,588,449
+/// bytes of projected rows as text. Rows that carry an admission claim still
+/// cross the pipe whole (829 of those 3,212 rows, 898 MB of the 990 MB) but are
+/// cut here, one at a time, after their claim is checked.
 pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
     let explicit = std::env::var("HERMIT_VALIDATE_LEDGER")
         .ok()
         .filter(|value| !value.is_empty())
         .is_some_and(|value| Path::new(&value) == ledger);
-    let text = if !explicit && ledger.file_name().is_some_and(|name| name == "ledger") {
+    if !explicit && ledger.file_name().is_some_and(|name| name == "ledger") {
         let configured_tool_root = std::env::var_os("DEV_HERMIT_TOOL_ROOT")
             .filter(|value| !value.is_empty())
             .map(std::path::PathBuf::from);
@@ -128,36 +181,172 @@ pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
         else {
             return Vec::new();
         };
-        let Ok(output) = canonical_ledger_reader(&adapter).output() else {
+        return match read_adapter_rows(&adapter, true) {
+            AdapterRead::Rows(rows) => rows,
+            // A tool root from before the projection flags refuses them with
+            // argparse's usage error; read the whole view and cut it here.
+            AdapterRead::ProjectionRefused => match read_adapter_rows(&adapter, false) {
+                AdapterRead::Rows(rows) => rows,
+                AdapterRead::ProjectionRefused | AdapterRead::Failed => Vec::new(),
+            },
+            AdapterRead::Failed => Vec::new(),
+        };
+    }
+    let Ok(file) = std::fs::File::open(ledger) else {
+        return Vec::new();
+    };
+    projected_rows(std::io::BufReader::new(file)).unwrap_or_default()
+}
+
+enum AdapterRead {
+    Rows(Vec<serde_json::Value>),
+    /// The adapter exited 2 naming an unrecognized argument.
+    ProjectionRefused,
+    /// Already reported on stderr.
+    Failed,
+}
+
+fn read_adapter_rows(adapter: &Path, project: bool) -> AdapterRead {
+    use std::process::Stdio;
+    let mut command = canonical_ledger_reader(adapter);
+    if project {
+        command.args(history_projection_args());
+    }
+    let Ok(mut child) = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        eprintln!(
+            "validate: warning: cannot launch canonical ledger reader {}",
+            adapter.display()
+        );
+        return AdapterRead::Failed;
+    };
+    // Drained beside stdout so a chatty refusal cannot fill its pipe and stall
+    // the adapter while this thread waits on stdout.
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut text);
+            text
+        })
+    });
+    let rows = child
+        .stdout
+        .take()
+        .map(|pipe| projected_rows(std::io::BufReader::new(pipe)));
+    let status = child.wait();
+    let stderr = stderr
+        .and_then(|handle| handle.join().ok())
+        .map(|text| String::from_utf8_lossy(&text).trim().to_string())
+        .unwrap_or_default();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status)
+            if project && status.code() == Some(2) && stderr.contains("unrecognized arguments") =>
+        {
+            return AdapterRead::ProjectionRefused;
+        }
+        _ => {
             eprintln!(
-                "validate: warning: cannot launch canonical ledger reader {}",
+                "validate: warning: canonical ledger reader {} refused: {stderr}",
                 adapter.display()
             );
-            return Vec::new();
-        };
-        if !output.status.success() {
-            eprintln!(
-                "validate: warning: canonical ledger reader {} refused: {}",
-                adapter.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            return Vec::new();
+            return AdapterRead::Failed;
         }
-        let Ok(text) = String::from_utf8(output.stdout) else {
-            eprintln!("validate: warning: canonical ledger reader emitted non-UTF-8 data");
-            return Vec::new();
-        };
-        text
-    } else {
-        let Ok(text) = std::fs::read_to_string(ledger) else {
-            return Vec::new();
-        };
-        text
+    }
+    match rows {
+        Some(Ok(rows)) => AdapterRead::Rows(rows),
+        Some(Err(error)) => {
+            eprintln!("validate: warning: canonical ledger reader output unreadable: {error}");
+            AdapterRead::Failed
+        }
+        None => AdapterRead::Failed,
+    }
+}
+
+/// Parse and project one line at a time. Unreadable or non-UTF-8 input is an
+/// error for the whole read, as it was when the output was decoded at once;
+/// an unparseable line is skipped.
+fn projected_rows(mut input: impl std::io::BufRead) -> std::io::Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if input.read_line(&mut line)? == 0 {
+            return Ok(rows);
+        }
+        let raw = line.trim_end_matches(['\n', '\r']);
+        if raw.trim().is_empty() {
+            continue;
+        }
+        if let Some(row) = admission_cache_row(raw) {
+            rows.push(history_projection(row));
+        }
+    }
+}
+
+/// Cut a row to what this module's readers use: of `cell_results`, one cell per
+/// distinct `cell_verdict.state`, in first-seen order (a cell without one
+/// stands for itself as `{}`), the `run_id` that the admission check compares
+/// and the `binding_contract` the decoder checks; of each gate, only
+/// [`HISTORY_GATE_FIELDS`]; and no `raw_result_input_census_v1`. The readers
+/// ask only whether any cell has a given state, so the cell count and which
+/// cell had which state are not kept. Kept per cell, the 666,101 cells of the
+/// 2026-10-10 ledger cost this process 1.7 GB as parsed values. A
+/// `cell_results` without a `cells` list is left as written. It runs after
+/// [`admission_cache_row`]. A row with an admission claim reaches that check as
+/// its complete line, whichever adapter printed it: one that knows
+/// `--whole-admission-rows` prints such rows whole, and one that does not
+/// refuses the flags and prints every row whole.
+pub(crate) fn history_projection(mut row: serde_json::Value) -> serde_json::Value {
+    let Some(object) = row.as_object_mut() else {
+        return row;
     };
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(admission_cache_row)
-        .collect()
+    object.remove("raw_result_input_census_v1");
+    if let Some(gates) = object
+        .get_mut("gates")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for gate in gates {
+            if let Some(gate) = gate.as_object_mut() {
+                gate.retain(|key, _| HISTORY_GATE_FIELDS.contains(&key.as_str()));
+            }
+        }
+    }
+    if let Some(cell_results) = object.get_mut("cell_results") {
+        let cells = cell_results
+            .get("cells")
+            .and_then(serde_json::Value::as_array)
+            .map(|cells| {
+                let mut states: Vec<serde_json::Value> = Vec::new();
+                for cell in cells {
+                    let projected = match cell.pointer("/cell_verdict/state") {
+                        Some(state) => serde_json::json!({"cell_verdict": {"state": state}}),
+                        None => serde_json::json!({}),
+                    };
+                    if !states.contains(&projected) {
+                        states.push(projected);
+                    }
+                }
+                states
+            });
+        if let Some(cells) = cells {
+            let mut kept = serde_json::Map::new();
+            kept.insert("cells".into(), serde_json::Value::Array(cells));
+            // The admission check compares `run_id` with the claimed run, and
+            // the decoder checks `binding_contract`.
+            for key in ["run_id", "binding_contract"] {
+                if let Some(value) = cell_results.get(key) {
+                    kept.insert(key.into(), value.clone());
+                }
+            }
+            *cell_results = serde_json::Value::Object(kept);
+        }
+    }
+    row
 }
 
 /// Preserve original duplicate evidence before the generic history view can
@@ -295,6 +484,17 @@ fn row_release_builder(row: &serde_json::Value) -> Option<&str> {
     }
 }
 
+/// A Buck runner's row records the Cargo payload identity, because its cells
+/// run that binary, so the builder alone cannot keep it from answering a cargo
+/// request. `e2e_runner` does: a row that names any runner but `cargo` is never
+/// a cache hit. A row from before the field existed ran its cells under Cargo.
+fn row_cells_ran_under_cargo(row: &serde_json::Value) -> bool {
+    match row.get("e2e_runner") {
+        None => true,
+        Some(runner) => runner.as_str() == Some(crate::E2E_RUNNER_CARGO),
+    }
+}
+
 /// The gate-coverage half of the predicate, shared by both producers.
 fn gate_coverage_ok(row: &serde_json::Value) -> bool {
     match (i(row, "gates_expected"), i(row, "gates_run")) {
@@ -403,10 +603,10 @@ fn failure_row_blocks_pass_cache(row: &serde_json::Value, key: &CacheKey<'_>) ->
                     })
                 })
     });
-    // Schema 10 keeps reference and cross-backend outcomes separate. This
-    // conservative cache refusal grants no qualification or failure-obligation
-    // authority; those readers authenticate the complete retained artifacts.
-    let parity_divergence = i(row, "schema_version") == Some(10)
+    // Schema 10 cells carry the same ordinary verdict. This conservative
+    // cache refusal grants no qualification or failure-obligation authority;
+    // those readers authenticate the complete retained artifacts.
+    let schema10_divergence = i(row, "schema_version") == Some(10)
         && row
             .get("cell_results")
             .and_then(|v| v.get("cells"))
@@ -417,28 +617,9 @@ fn failure_row_blocks_pass_cache(row: &serde_json::Value, key: &CacheKey<'_>) ->
                         .and_then(|v| v.get("state"))
                         .and_then(serde_json::Value::as_str)
                         == Some("compared-and-diverged")
-                        || cell
-                            .get("backend_parity")
-                            .and_then(|v| v.get("attempts"))
-                            .and_then(serde_json::Value::as_array)
-                            .is_some_and(|attempts| {
-                                attempts.iter().any(|attempt| {
-                                    ["candidate", "reference"].iter().any(|role| {
-                                        attempt
-                                            .get(role)
-                                            .and_then(|v| v.get("state"))
-                                            .and_then(serde_json::Value::as_str)
-                                            == Some("compared-and-diverged")
-                                    }) || attempt
-                                        .get("cross")
-                                        .and_then(|v| v.get("state"))
-                                        .and_then(serde_json::Value::as_str)
-                                        == Some("diverged")
-                                })
-                            })
                 })
             });
-    if typed_cell_divergence || parity_divergence {
+    if typed_cell_divergence || schema10_divergence {
         return true;
     }
     let known_flaky = row.get("known_flaky_failure").and_then(|v| v.as_bool());
@@ -460,10 +641,23 @@ fn has_blocking_failure(rows: &[serde_json::Value], key: &CacheKey<'_>) -> bool 
 /// Dispatched on `producer`; an unrecognized producer is REFUSED rather than
 /// guessed at, so a future third writer cannot be silently cached under
 /// whichever field name happens to be present.
+///
+/// A row admitted on a `disjoint-main` floor is never reused, as a cache hit or
+/// as a `--selective` baseline. Its claim (main's move from E to M is disjoint
+/// from the target and touches no floor-sensitive path) holds only while
+/// `disjoint_main_proof` passes, and the parent's two-hour bound on E is not in
+/// the record at all. [`admission_cache_row`] decodes the claim but does not
+/// prove it, so refusing the kind here is what keeps a by-tree reuse from
+/// carrying an unproven floor. The cost is one real run in the rare case of an
+/// identical tree.
 fn pass_row_qualifies(row: &serde_json::Value) -> bool {
     if row.get("admission_floor_evidence").is_some()
         && !serde_json::from_value::<hermit_manifest_plan::ledger::HistoryRow>(row.clone())
-            .is_ok_and(|original| original.admission_evidence().is_ok_and(|e| e.is_some()))
+            .is_ok_and(|original| {
+                original.admission_evidence().is_ok_and(|e| {
+                    e.is_some_and(|evidence| evidence.floor().kind != "disjoint-main")
+                })
+            })
     {
         return false;
     }
@@ -528,7 +722,9 @@ pub fn cache_lookup(
             continue;
         }
         if want_result == "pass"
-            && (row_release_builder(row) != Some(key.release_builder) || !pass_row_qualifies(row))
+            && (row_release_builder(row) != Some(key.release_builder)
+                || !row_cells_ran_under_cargo(row)
+                || !pass_row_qualifies(row))
         {
             continue;
         }
@@ -685,9 +881,20 @@ pub fn history_estimate(
 /// (`resolve_selective_baseline`, validate.sh:4364).
 ///
 /// Precedence: explicit `--baseline`, then `$HERMIT_LAST_GREEN_SHA`, then the
-/// most recent passing Cargo ledger row (preferring this slot). Only a commit that
-/// EXISTS locally is returned; anything else yields `None` so selection fails
-/// safe to the full lane. Never fail-open on a stale or missing baseline.
+/// most recent clean full Cargo pass in the ledger (preferring this slot). Only a
+/// commit that EXISTS locally is returned; anything else yields `None` so
+/// selection fails safe to the full lane. Never fail-open on a stale or missing
+/// baseline.
+///
+/// A ledger row is a baseline only when it is a full pass by the bar a reused
+/// pass must meet: profile `full`, selection mode `full`, anchored to its commit
+/// with a clean tree (`commit_anchored`, not `tree_dirty`, as `row_matches_key`
+/// requires), cells run under Cargo, and `pass_row_qualifies` (no failures,
+/// every expected gate run, tests and nodes executed, no planned node absent).
+/// A dirty-tree pass validated something other than its commit. A quick, `--only`, `--selected` or
+/// test-free pass ran less than the nodes `--selective` would skip as unchanged
+/// since it, so it cannot vouch for them
+/// (<https://github.com/rrnewton/hermit/issues/3924>).
 pub fn selective_baseline(
     rows: &[serde_json::Value],
     explicit: Option<&str>,
@@ -723,6 +930,12 @@ fn selective_baseline_from(
                     // invariants, so it is not a last-known-green for Cargo.
                     s(r, "result") == "pass"
                         && row_release_builder(r) == Some("cargo")
+                        && s(r, "profile") == "full"
+                        && s(r, "selection_mode") == "full"
+                        && r.get("commit_anchored").and_then(|v| v.as_bool()) == Some(true)
+                        && r.get("tree_dirty").and_then(|v| v.as_bool()) == Some(false)
+                        && row_cells_ran_under_cargo(r)
+                        && pass_row_qualifies(r)
                         && s(r, "commit") != "unknown"
                         && !s(r, "commit").is_empty()
                         && want_slot.map(|w| s(r, "slot") == w).unwrap_or(true)
@@ -941,6 +1154,27 @@ pub fn self_test() -> Result<String, String> {
         if cache_lookup(std::slice::from_ref(row), "pass", &buck_key).is_some() {
             return Err(format!(
                 "cache: a {why} Cargo green answered a Buck request"
+            ));
+        }
+        refused += 1;
+    }
+    // A Buck runner records the Cargo identity; its runner keeps it out.
+    let mut cargo_runner = cargo_named.clone();
+    cargo_runner["e2e_runner"] = serde_json::json!("cargo");
+    if cache_lookup(std::slice::from_ref(&cargo_runner), "pass", &key).is_none() {
+        return Err("cache: a row whose cells ran under cargo must be a Cargo HIT".into());
+    }
+    accepted += 1;
+    for runner in [
+        serde_json::json!("buck-local"),
+        serde_json::json!("buck-hybrid"),
+        serde_json::json!(null),
+    ] {
+        let mut row = cargo_named.clone();
+        row["e2e_runner"] = runner.clone();
+        if cache_lookup(std::slice::from_ref(&row), "pass", &key).is_some() {
+            return Err(format!(
+                "cache: a row with e2e_runner {runner} answered a cargo request"
             ));
         }
         refused += 1;
@@ -1277,26 +1511,116 @@ pub fn self_test() -> Result<String, String> {
         );
     }
 
-    for role in ["reference", "cross"] {
-        let mut parity_failure = failing.clone();
-        parity_failure["schema_version"] = serde_json::json!(10);
-        let state = if role == "cross" {
-            "diverged"
-        } else {
-            "compared-and-diverged"
-        };
-        parity_failure["cell_results"] = serde_json::json!({"cells":[{
-            "cell_verdict":{"state":"compared-and-matched"},
-            "backend_parity":{"attempts":[{role:{"state":state}}]}
-        }]});
-        if cache_lookup(&[parity_failure.clone(), rs_pass.clone()], "pass", &key).is_some()
-            || cache_lookup(&[rs_pass.clone(), parity_failure], "pass", &key).is_some()
+    let mut schema10_failure = failing.clone();
+    schema10_failure["schema_version"] = serde_json::json!(10);
+    schema10_failure["cell_results"] = serde_json::json!({"cells":[{
+        "cell_verdict":{"state":"compared-and-diverged"},
+        "backend_parity":null
+    }]});
+    if cache_lookup(&[schema10_failure.clone(), rs_pass.clone()], "pass", &key).is_some()
+        || cache_lookup(&[rs_pass.clone(), schema10_failure], "pass", &key).is_some()
+    {
+        return Err("cache: an ordinary pass erased a schema-10 divergence".into());
+    }
+
+    // The streamed reader keeps each row only as its projection, and the
+    // projection must decide every lookup exactly as the whole row does: a
+    // divergence still latches over a pass, and a clean pass is still a hit.
+    let mut heavy_failure = failing.clone();
+    heavy_failure["cell_results"] = serde_json::json!({
+        "run_id": "r-heavy",
+        "shared": {"bulk": "x".repeat(4096)},
+        "cells": [
+            {"id": "a", "cell_verdict": {"state": "compared-and-matched", "detail": "y".repeat(512)}},
+            {"id": "b", "cell_verdict": {"state": "compared-and-diverged"}},
+            {"id": "c"},
+            {"id": "d", "cell_verdict": {"state": "compared-and-matched"}},
+            {"id": "e"},
+        ],
+    });
+    heavy_failure["gates"][0]["attempts"] = serde_json::json!([{"log": "w".repeat(2048)}]);
+    heavy_failure["gates"][0]["name"] = serde_json::json!("check.example");
+    heavy_failure["raw_result_input_census_v1"] = serde_json::json!({"inputs": ["z".repeat(1024)]});
+    let mut heavy_pass = rs_pass.clone();
+    heavy_pass["raw_result_input_census_v1"] = serde_json::json!({"inputs": ["z".repeat(1024)]});
+    let jsonl = format!("{heavy_failure}\n\n{heavy_pass}\r\nnot json\n");
+    let streamed = projected_rows(jsonl.as_bytes())
+        .map_err(|error| format!("projection: a readable ledger was refused: {error}"))?;
+    if streamed.len() != 2 {
+        return Err(format!(
+            "projection: expected 2 rows (blank and unparseable lines skipped), got {}",
+            streamed.len()
+        ));
+    }
+    if streamed[0]["cell_results"]
+        != serde_json::json!({"run_id": "r-heavy", "cells": [
+            {"cell_verdict": {"state": "compared-and-matched"}},
+            {"cell_verdict": {"state": "compared-and-diverged"}},
+            {},
+        ]})
+        || streamed
+            .iter()
+            .any(|row| row.get("raw_result_input_census_v1").is_some())
+        || streamed[0]["gates"]
+            != serde_json::json!([{"result": "fail", "exit_code": 1, "real_seconds": 5.0,
+                                   "failure_origin": "outer_gate", "name": "check.example"}])
+    {
+        return Err(format!(
+            "projection: unexpected projected row {}",
+            streamed[0]
+        ));
+    }
+    // A projected row must still be a HistoryRow wherever the whole row is:
+    // pass_row_qualifies and the admission check decode it as one.
+    let history_row = |row: &serde_json::Value| {
+        serde_json::from_value::<hermit_manifest_plan::ledger::HistoryRow>(row.clone()).is_ok()
+    };
+    if !history_row(&heavy_failure) || !history_row(&streamed[0]) {
+        return Err("projection: a projected row is no longer a HistoryRow".into());
+    }
+    let mut unprojected = heavy_failure.clone();
+    unprojected["cell_results"] = serde_json::json!({"run_id": "r-1"});
+    unprojected["gates"] = failing["gates"].clone();
+    if history_projection(unprojected.clone()) != {
+        let mut expected = unprojected.clone();
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("raw_result_input_census_v1");
+        expected
+    } {
+        return Err("projection: a cell_results without cells must be left as written".into());
+    }
+    for (label, full, projected) in [
+        (
+            "fail-then-pass",
+            vec![heavy_failure.clone(), heavy_pass.clone()],
+            streamed.clone(),
+        ),
+        (
+            "pass alone",
+            vec![heavy_pass.clone()],
+            vec![streamed[1].clone()],
+        ),
+    ] {
+        if cache_lookup(&full, "pass", &key).is_some()
+            != cache_lookup(&projected, "pass", &key).is_some()
         {
             return Err(format!(
-                "cache: an ordinary pass erased a schema-10 {role} divergence"
+                "projection: {label} decides the pass cache differently"
             ));
         }
     }
+    if cache_lookup(&streamed, "pass", &key).is_some()
+        || cache_lookup(&[streamed[1].clone()], "pass", &key).is_none()
+    {
+        return Err("projection: the projected divergence must latch and the pass must hit".into());
+    }
+    if projected_rows(&b"{\"result\":\"pass\"}\n\xff\n"[..]).is_ok() {
+        return Err("projection: non-UTF-8 output must refuse the whole read".into());
+    }
+    accepted += 3;
+    refused += 3;
 
     // The two historical orderings are both refused: fail-then-pass and
     // pass-then-fail. A cache key is content identity, so append order must not
@@ -1562,11 +1886,28 @@ pub fn self_test() -> Result<String, String> {
         ));
     }
 
+    // Selective-baseline brackets: every row below is a clean full pass
+    // (`pass_row_qualifies`), so each refusal is attributable to the one
+    // property its bracket spoils.
+    let qualifying = |extra: serde_json::Value| -> serde_json::Value {
+        let mut row = base(serde_json::json!({
+            "executed_tests": 873, "executed_nodes": 47, "gates_expected": 47, "gates_run": 47,
+            "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []},
+        }));
+        if let (Some(o), Some(e)) = (row.as_object_mut(), extra.as_object()) {
+            for (k, val) in e {
+                o.insert(k.clone(), val.clone());
+            }
+        }
+        row
+    };
     // Selective-baseline brackets: a nonexistent commit must be REFUSED (so the
     // caller falls back to the full lane) and an existing one ACCEPTED.
     let ledger_rows = vec![
-        base(serde_json::json!({"slot": "other", "commit": "aaa", "producer": "validate.rs"})),
-        base(serde_json::json!({"slot": "mine", "commit": "bbb", "producer": "validate.rs"})),
+        qualifying(
+            serde_json::json!({"slot": "other", "commit": "aaa", "producer": "validate.rs"}),
+        ),
+        qualifying(serde_json::json!({"slot": "mine", "commit": "bbb", "producer": "validate.rs"})),
     ];
     let exists_all = |_: &str| true;
     let exists_none = |_: &str| false;
@@ -1616,7 +1957,7 @@ pub fn self_test() -> Result<String, String> {
             row["e2e_payload"] = payload;
         }
         let mut with_buck = ledger_rows.clone();
-        with_buck.push(base(row));
+        with_buck.push(qualifying(row));
         if selective_baseline(&with_buck, None, "mine", &exists_all).as_deref() != Some("bbb") {
             return Err(format!(
                 "selective: newer green {commit} (Buck or non-string builder) must not become the Cargo baseline"
@@ -1624,19 +1965,19 @@ pub fn self_test() -> Result<String, String> {
         }
     }
     let mut named_cargo = ledger_rows.clone();
-    named_cargo.push(base(serde_json::json!({"slot": "mine", "commit": "eee", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("cargo")})));
+    named_cargo.push(qualifying(serde_json::json!({"slot": "mine", "commit": "eee", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("cargo")})));
     if selective_baseline(&named_cargo, None, "mine", &exists_all).as_deref() != Some("eee") {
         return Err("selective: an explicitly Cargo green must remain a baseline".into());
     }
     let mut mismatched = ledger_rows.clone();
-    mismatched.push(base(serde_json::json!({"slot": "mine", "commit": "fff", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("buck")})));
-    mismatched.push(base(serde_json::json!({"slot": "mine", "commit": "ggg", "producer": "validate.rs", "release_builder": "cargo"})));
+    mismatched.push(qualifying(serde_json::json!({"slot": "mine", "commit": "fff", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("buck")})));
+    mismatched.push(qualifying(serde_json::json!({"slot": "mine", "commit": "ggg", "producer": "validate.rs", "release_builder": "cargo"})));
     if selective_baseline(&mismatched, None, "mine", &exists_all).as_deref() != Some("bbb") {
         return Err("selective: a green whose payload is not the Cargo identity must not become the Cargo baseline".into());
     }
     // A contemporary pairless green is not a Cargo baseline either.
     let mut pairless_green = ledger_rows.clone();
-    pairless_green.push(base(serde_json::json!({"slot": "mine", "commit": "hhh", "producer": "validate.rs", "finished_at": "2026-09-26T00:00:00Z"})));
+    pairless_green.push(qualifying(serde_json::json!({"slot": "mine", "commit": "hhh", "producer": "validate.rs", "finished_at": "2026-09-26T00:00:00Z"})));
     if selective_baseline(&pairless_green, None, "mine", &exists_all).as_deref() != Some("bbb") {
         return Err(
             "selective: a pairless green after the writer must not become the Cargo baseline"
@@ -1656,8 +1997,9 @@ pub fn self_test() -> Result<String, String> {
         ("future 11", Some(serde_json::json!(11))),
         ("future 999", Some(serde_json::json!(999))),
     ] {
-        let mut row =
-            base(serde_json::json!({"slot": "mine", "commit": "jjj", "producer": "validate.rs"}));
+        let mut row = qualifying(
+            serde_json::json!({"slot": "mine", "commit": "jjj", "producer": "validate.rs"}),
+        );
         match schema {
             Some(schema) => row["schema_version"] = schema,
             None => {
@@ -1674,15 +2016,79 @@ pub fn self_test() -> Result<String, String> {
         refused += 1;
     }
     let mut historical = ledger_rows.clone();
-    historical.push(base(serde_json::json!({"slot": "mine", "commit": "kkk", "producer": "validate.rs", "schema_version": 10})));
+    historical.push(qualifying(serde_json::json!({"slot": "mine", "commit": "kkk", "producer": "validate.rs", "schema_version": 10})));
     if selective_baseline(&historical, None, "mine", &exists_all).as_deref() != Some("kkk") {
         return Err("selective: a newer pairless schema-10 green before the cutoff must remain a Cargo baseline".into());
+    }
+    // Only a clean full pass is a baseline
+    // (https://github.com/rrnewton/hermit/issues/3924): a newer pass that ran
+    // less, or nothing, is passed over for the older full one.
+    for (why, spoil) in [
+        (
+            "a quick-profile pass",
+            serde_json::json!({"profile": "quick"}),
+        ),
+        (
+            "an envelope-only pass",
+            serde_json::json!({"profile": "envelope-only"}),
+        ),
+        (
+            "an --only pass",
+            serde_json::json!({"selection_mode": "only"}),
+        ),
+        (
+            "a --selected pass",
+            serde_json::json!({"selection_mode": "selected"}),
+        ),
+        (
+            "a pass that executed no test",
+            serde_json::json!({"executed_tests": 0}),
+        ),
+        (
+            "a pass with an absent planned node",
+            serde_json::json!({"coverage": {"planned_test_nodes": 20, "executed_test_nodes": 19, "absent_nodes": ["test.x"]}}),
+        ),
+        (
+            "a pass that recorded a failure",
+            serde_json::json!({"failures": 1}),
+        ),
+        (
+            "a pass whose cells ran under Buck",
+            serde_json::json!({"e2e_runner": "buck-local"}),
+        ),
+        (
+            "a pass of a dirty tree",
+            serde_json::json!({"tree_dirty": true}),
+        ),
+        (
+            "a pass not anchored to its commit",
+            serde_json::json!({"commit_anchored": false}),
+        ),
+    ] {
+        let mut row = qualifying(
+            serde_json::json!({"slot": "mine", "commit": "lll", "producer": "validate.rs"}),
+        );
+        if let (Some(o), Some(e)) = (row.as_object_mut(), spoil.as_object()) {
+            for (k, val) in e {
+                o.insert(k.clone(), val.clone());
+            }
+        }
+        let mut rows = ledger_rows.clone();
+        rows.push(row.clone());
+        if selective_baseline(&rows, None, "mine", &exists_all).as_deref() != Some("bbb") {
+            return Err(format!("selective: {why} must not become the baseline"));
+        }
+        if selective_baseline(std::slice::from_ref(&row), None, "mine", &exists_all).is_some() {
+            return Err(format!("selective: {why} alone must give no baseline"));
+        }
+        refused += 1;
     }
     refused += 5;
     accepted += 4;
     Ok(format!(
         "history: cache bracketed {accepted} accept / {refused} refuse (incl. both \
          cross-producer counter traps), estimate bracketed thin/median/no-ledger/fail-poison, \
-         selective baseline bracketed slot-preference/explicit/missing-commit/builder"
+         selective baseline bracketed slot-preference/explicit/missing-commit/builder/full-pass-only, \
+         streamed rows bracketed projection/divergence/non-UTF-8"
     ))
 }

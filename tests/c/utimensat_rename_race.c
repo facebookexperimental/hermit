@@ -9,8 +9,8 @@
 // One thread sets an explicit mtime on DIR/target through utimensat while
 // another keeps renaming prepared files over that name. Each prepared file also
 // has a permanent hard link, DIR/keep_N, and the guest finally reports which of
-// them it sees with the explicit mtime. hermit-cli/tests/utimensat_mtime.rs
-// runs it twice under Hermit:
+// them it sees with the explicit mtime. hermit-cli/tests/utimensat_mtime.rs runs
+// it twice under Hermit:
 // - With thread sequentialization no rename runs during a call. Every file the
 //   guest sees with the explicit mtime must really have it, and a final call
 //   after the renames end must reach the last file, so the report lists that
@@ -131,10 +131,6 @@ int main(int argc, char** argv) {
     }
     printf("keep_%d %d\n", n, st.st_mtim.tv_sec == EXPLICIT);
   }
-  fprintf(
-      stderr,
-      "%d utimensat calls, %d replacements\n",
-      CALLS,
-      atomic_load(&replacements));
+  fprintf(stderr, "%d utimensat calls, %d replacements\n", CALLS, atomic_load(&replacements));
   return 0;
 }

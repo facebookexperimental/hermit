@@ -83,6 +83,10 @@ class CargoCacheMounts(unittest.TestCase):
             "    by_destination = {dict(field.split('=', 1) for field in mount.split(','))['destination']: dict(field.split('=', 1) for field in mount.split(','))['source'] for mount in mounts}\n"
             "    for destination in ['/src/agent-utils/rs/target', '/src/agent-utils/rs/.agent-utils-locks', '/src/agent-utils/rs/.agent-utils-snapshots']:\n"
             "        pathlib.Path(by_destination[destination], 'container-write').write_text(destination + '\\n')\n"
+            "if sys.argv[1] == 'run' and os.environ.get('PINNED_ROOT_EXEC_PAYLOAD') == '1':\n"
+            "    os.sched_setaffinity(0, json.loads(os.environ['PINNED_ROOT_RUNTIME_AFFINITY']))\n"
+            "    image = next(i for i, arg in enumerate(sys.argv) if arg.startswith('fixture@sha256:'))\n"
+            "    os.execv(sys.argv[image + 1], sys.argv[image + 1:])\n"
             "if sys.argv[1:3] == ['image', 'inspect']: print('c' * 64); sys.exit(0)\n"
             "sys.exit(0 if sys.argv[1:3] == ['image', 'exists'] or sys.argv[1] == 'run' else 90)\n"
         )
@@ -97,6 +101,8 @@ class CargoCacheMounts(unittest.TestCase):
         proc_locks_runtime=None,
         calibration=False,
         git_location=None,
+        command=None,
+        caller_affinity=None,
     ):
         # The wrapper gets this process's environment, as it does in
         # production, so an inherited Git location variable reaches it.
@@ -128,14 +134,18 @@ class CargoCacheMounts(unittest.TestCase):
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
                 *forwarded,
                 "--",
-                "/not-executed/command",
-                "literal argument",
+                *(command or ["/not-executed/command", "literal argument"]),
             ],
             cwd=self.root,
             env=env,
             capture_output=True,
             text=True,
             timeout=10,
+            preexec_fn=(
+                None
+                if caller_affinity is None
+                else lambda: os.sched_setaffinity(0, caller_affinity)
+            ),
         )
         calls = [json.loads(line) for line in self.capture.read_text().splitlines()]
         return result, calls
@@ -176,7 +186,7 @@ class CargoCacheMounts(unittest.TestCase):
             self.assertEqual(
                 calls[1], ["image", "inspect", "--format", "{{.Id}}", calls[0][-1]]
             )
-            self.assertEqual(calls[2][-3], calls[0][-1])
+            self.assertEqual(calls[2][-6], calls[0][-1])
             mounts = [
                 calls[2][i + 1]
                 for i, value in enumerate(calls[2])
@@ -302,13 +312,72 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
         self.assertEqual(
-            argv[-3:],
+            argv[-6:],
             [
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "/bin/taskset",
+                "--cpu-list",
+                ",".join(map(str, sorted(os.sched_getaffinity(0)))),
                 "/not-executed/command",
                 "literal argument",
             ],
         )
+
+    def test_payload_takes_no_optional_git_locks(self):
+        # A read-only `git status` in one node otherwise creates and deletes
+        # .git/index.lock in a Cargo git checkout that another node is copying
+        # (71e738ab's validation: "cp: cannot stat '.git/index.lock'").
+        result, calls = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[1]
+        settings = [argv[index + 1] for index, arg in enumerate(argv) if arg == "-e"]
+        self.assertIn("GIT_OPTIONAL_LOCKS=0", settings)
+        image = argv.index(
+            "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        self.assertLess(argv.index("GIT_OPTIONAL_LOCKS=0"), image)
+
+    def test_payload_uses_cargo_checksum_freshness(self):
+        # Every pinned-root container shares /src/target, and Cargo marks a
+        # unit dirty when its prior build used checksum freshness and this
+        # one does not, so the setting must reach every container.
+        result, calls = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[1]
+        settings = [argv[index + 1] for index, arg in enumerate(argv) if arg == "-e"]
+        self.assertIn("CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true", settings)
+        image = argv.index(
+            "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        self.assertLess(argv.index("CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true"), image)
+
+    def test_payload_keeps_caller_affinity_when_runtime_widens_it(self):
+        available = sorted(os.sched_getaffinity(0))
+        if len(available) < 2:
+            self.skipTest("affinity expansion requires two available CPUs")
+        inherited = available[::2]
+        os.environ["PINNED_ROOT_EXEC_PAYLOAD"] = "1"
+        os.environ["PINNED_ROOT_RUNTIME_AFFINITY"] = json.dumps(available)
+        self.addCleanup(os.environ.pop, "PINNED_ROOT_EXEC_PAYLOAD", None)
+        self.addCleanup(os.environ.pop, "PINNED_ROOT_RUNTIME_AFFINITY", None)
+        # The fake runtime really widens its own affinity before exec. The
+        # original payload must inherit the wrapper's narrower set, preserve
+        # its literal argument, and return its own nonzero status unchanged.
+        result, calls = self.invoke(
+            caller_affinity=inherited,
+            command=[
+                sys.executable,
+                "-c",
+                "import json, os, sys; "
+                "print(json.dumps([sorted(os.sched_getaffinity(0)), sys.argv[1:]])); "
+                "sys.exit(23)",
+                "literal argument",
+            ],
+        )
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [inherited, ["literal argument"]])
+        self.assertEqual(sorted(os.sched_getaffinity(0)), available)
+        self.assertEqual(len(calls), 2)
 
     def test_agent_utils_writable_state_is_confined_to_the_pinned_output(self):
         host_state = self.root / "source/agent-utils/rs"
@@ -474,9 +543,12 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
         self.assertEqual(
-            argv[-3:],
+            argv[-6:],
             [
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "/bin/taskset",
+                "--cpu-list",
+                ",".join(map(str, sorted(os.sched_getaffinity(0)))),
                 "/not-executed/command",
                 "literal argument",
             ],
@@ -1052,10 +1124,19 @@ class CargoCacheMounts(unittest.TestCase):
                 )
                 self.assertEqual(destinations[guest_common]["source"], str(common))
                 self.assertEqual(destinations[guest_common]["ro"], "true")
-                for actual, destination in (
-                    (common / "config", guest_common + "/config"),
-                    (directory / "config.worktree", guest_dir + "/config.worktree"),
-                ):
+                # The linked topologies share their common config with the
+                # repository they were added from, which sets no core.worktree:
+                # nothing may be bound over it, because a lock-and-rename write
+                # to it would detach the bind mid-run
+                # (https://github.com/rrnewton/hermit/issues/3920). Only the
+                # submodule root, a repository of its own, needs its copy.
+                overlays = [(directory / "config.worktree", guest_dir + "/config.worktree")]
+                if topology == "parent-submodule":
+                    overlays.append((common / "config", guest_common + "/config"))
+                else:
+                    self.assertNotIn(guest_common + "/config", destinations)
+                    self.assertNotIn(str(common / "config"), destinations)
+                for actual, destination in overlays:
                     overlay = destinations[destination]
                     self.assertEqual(overlay["ro"], "true")
                     copied = Path(overlay["source"])
@@ -1109,9 +1190,12 @@ class CargoCacheMounts(unittest.TestCase):
                     "/src/nested module",
                 )
                 self.assertEqual(
-                    argv[-3:],
+                    argv[-6:],
                     [
                         "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                        "/bin/taskset",
+                        "--cpu-list",
+                        ",".join(map(str, sorted(os.sched_getaffinity(0)))),
                         "/not-executed/command",
                         "literal argument",
                     ],
@@ -1136,6 +1220,132 @@ class CargoCacheMounts(unittest.TestCase):
                         ),
                         identities[str(repo)],
                     )
+
+    def test_a_shared_config_rewrite_renames_over_no_mount_destination(self):
+        """A Git config write in the shared checkout replaces no mounted file.
+
+        Git writes config by lock-and-rename, and a rename over a bind-mount
+        destination detaches the bind in every mount namespace, mid-run
+        (https://github.com/rrnewton/hermit/issues/3920). This performs that
+        write while the wrapper's mounts would be live: it maps every file
+        mount destination back to the host file it covers, rewrites the shared
+        common config the way any agent's `git config` does, and requires
+        every covered file to keep its identity. A common config that sets
+        core.worktree for every worktree, directly or through include.path,
+        still gets its private copy; a core.worktree that the extension does
+        not apply does not.
+        """
+        git_bin = shutil.which("git")
+        self.assertIsNotNone(git_bin)
+        git_env = repository_neutral_env()
+        git_env.update(
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_OPTIONAL_LOCKS="0",
+        )
+
+        def git(root, *args):
+            result = subprocess.run(
+                [git_bin, "-c", "protocol.file.allow=always", "-c", "user.name=fixture",
+                 "-c", "user.email=fixture@example.invalid", "-C", str(root), *args],
+                env=git_env, capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            return result.stdout.decode().strip()
+
+        leaf = self.root / "rewrite-leaf"
+        leaf.mkdir()
+        git(leaf, "init", "-q")
+        (leaf / "payload").write_text("leaf\n")
+        git(leaf, "add", "payload")
+        git(leaf, "commit", "-qm", "leaf")
+        shared = self.root / "rewrite-shared"
+        shared.mkdir()
+        git(shared, "init", "-q")
+        (shared / "payload").write_text("shared\n")
+        git(shared, "add", "payload")
+        git(shared, "commit", "-qm", "shared")
+        git(shared, "submodule", "add", "-q", str(leaf), "nested")
+        git(shared, "commit", "-qam", "nested")
+        # The production shared checkout: the worktree extension on, and no
+        # core.worktree in its common config.
+        git(shared, "config", "extensions.worktreeConfig", "true")
+
+        # Each case: how the shared config is set for the run, and whether its
+        # common config must still get a private copy.
+        included = self.root / "rewrite-included.config"
+        cases = {
+            # Production: the extension on, no core.worktree.
+            "no-common-worktree": ({}, False),
+            # With the extension on, a common core.worktree applies to every
+            # worktree. It points at the checkout so the wrapper's own
+            # submodule walk still finds its working tree.
+            "common-worktree": ({"core.worktree": "checkout"}, True),
+            # Read as Git reads it, through include.path.
+            "included-worktree": ({"include.path": str(included)}, True),
+            # With the extension off, Git applies a common core.worktree to
+            # the main worktree alone.
+            "extension-off": (
+                {"core.worktree": "checkout", "extensions.worktreeConfig": "false"},
+                False,
+            ),
+        }
+        for case, (settings, copied) in cases.items():
+            with self.subTest(case=case):
+                checkout = self.root / f"rewrite-{case}"
+                git(shared, "worktree", "add", "--detach", str(checkout))
+                git(checkout, "submodule", "update", "--init", "--recursive")
+                common = Path(git(checkout, "rev-parse", "--path-format=absolute",
+                                  "--git-common-dir"))
+                included.write_text(f"[core]\n\tworktree = {checkout}\n")
+                for key, value in settings.items():
+                    value = str(checkout) if value == "checkout" else value
+                    git(shared, "config", key, value)
+                self.capture.unlink(missing_ok=True)
+                result, calls = self.invoke(source=checkout)
+                for key in settings:
+                    git(shared, "config", "--unset", key)
+                git(shared, "config", "extensions.worktreeConfig", "true")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                argv = calls[1]
+                mounts = [
+                    dict(field.split("=", 1) for field in argv[i + 1].split(","))
+                    for i, arg in enumerate(argv)
+                    if arg == "--mount"
+                ]
+                directories = sorted(
+                    ((m["destination"], m["source"]) for m in mounts
+                     if Path(m["source"]).is_dir()),
+                    key=lambda pair: len(pair[0]),
+                    reverse=True,
+                )
+
+                def covered(destination):
+                    # The host file a file-mount destination sits on: the
+                    # destination as seen through the deepest directory mount
+                    # that contains it, or the host path itself.
+                    for guest, host in directories:
+                        if destination.startswith(guest + "/"):
+                            return Path(host) / destination[len(guest) + 1:]
+                    return Path(destination)
+
+                files = {
+                    m["destination"]: covered(m["destination"])
+                    for m in mounts
+                    if Path(m["source"]).is_file() and covered(m["destination"]).exists()
+                }
+                bound_common = [d for d, f in files.items() if f == common / "config"]
+                if copied:
+                    self.assertEqual(len(bound_common), 1, files)
+                    continue
+                self.assertEqual(bound_common, [], "the shared common config is bound over")
+                before = {d: f.stat().st_ino for d, f in files.items()}
+                common_before = (common / "config").stat().st_ino
+                git(shared, "config", "fixture.rewritten", "yes")
+                self.assertNotEqual((common / "config").stat().st_ino, common_before,
+                                    "git config no longer renames; the reproducer is void")
+                after = {d: f.stat().st_ino for d, f in files.items()}
+                self.assertEqual(after, before, "a mount destination was renamed over")
 
     def test_inherited_git_location_variables_leave_the_mounts_unchanged(self):
         # https://github.com/rrnewton/hermit/issues/3362: a `git rebase --exec`
@@ -1196,6 +1406,13 @@ class CargoCacheMounts(unittest.TestCase):
         source = self.root / "location-source"
         git(product, "worktree", "add", "-q", "--detach", str(source))
         git(source, "submodule", "update", "--init", "--recursive")
+        # A worktree-specific core.worktree gives the root a private config
+        # copy to relocate. A linked root's common config is no longer copied
+        # unless it sets core.worktree for every worktree
+        # (https://github.com/rrnewton/hermit/issues/3920), and the root copy
+        # is what an inherited GIT_DIR once redirected.
+        git(source, "config", "extensions.worktreeConfig", "true")
+        git(source, "config", "--worktree", "core.worktree", str(source))
         metadata = [
             Path(
                 git(repo, "rev-parse", "--path-format=absolute", option)
@@ -1528,7 +1745,11 @@ class PinnedGuestPathContract(unittest.TestCase):
         self.assertTrue(paths)
         for path in paths:
             self.assertRegex(path, r"^/usr/bin/[A-Za-z0-9_-]+$")
-        source = (here.parents[1] / "hermit-cli/tests/liteinst_advanced.rs").read_text()
+        # The in-guest LiteInst program tests, run by test.cli in the pinned
+        # root (formerly hermit-cli/tests/liteinst_advanced.rs).
+        source = (
+            here.parents[1] / "hermit-cli/tests/common/liteinst_in_guest_programs.rs"
+        ).read_text()
         literals = set(re.findall(r'"(/usr/bin/[A-Za-z0-9_-]+)"', source))
         self.assertTrue(literals, "the source population must not disappear")
         self.assertEqual(
@@ -1542,6 +1763,9 @@ class PinnedGuestPathContract(unittest.TestCase):
         self.assertIn(
             "/usr/bin/printf", paths, "DBT ptrace argument-forwarding reference"
         )
+        # test.record_replay's curl_recording_replays_offline_with_identical_logs
+        # finds curl on PATH (https://github.com/rrnewton/hermit/issues/3786).
+        self.assertIn("/usr/bin/curl", paths, "record_replay curl guest")
 
 
 if __name__ == "__main__":

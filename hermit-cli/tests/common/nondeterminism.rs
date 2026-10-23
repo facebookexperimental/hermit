@@ -165,9 +165,10 @@ impl<'a> NondeterminismCase<'a> {
 
 fn run_command(mut command: Command, source: &str, phase: &str) -> Output {
     let rendered = format!("{command:?}");
-    command.output().unwrap_or_else(|error| {
-        panic!("failed to start {phase} for NONDET_SOURCE {source}: {rendered}: {error}")
-    })
+    super::hermit_binary::hermit_output(
+        &format!("{phase} for NONDET_SOURCE {source}: {rendered}"),
+        &mut command,
+    )
 }
 
 fn outputs_differ(left: &Output, right: &Output) -> bool {

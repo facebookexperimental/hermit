@@ -171,7 +171,7 @@ SELECT group_concat(x, ',') FROM (SELECT x FROM t ORDER BY x);
 ```
 
 Record completed and printed `1,2,3`. Replay panicked in
-`hermit-cli/src/replayer/macros.rs` because the next event was an unexpected
+`hermit-replay/src/replayer/macros.rs` because the next event was an unexpected
 `SyscallEvent::Mmap`. The diagnostic serialized the entire mapping buffer,
 producing approximately 650 KiB of stderr before the non-unwinding abort.
 
@@ -186,10 +186,10 @@ syscall/event mismatch rather than treated as only an address-placement issue.
 The repository's existing target also passes:
 
 ```text
-cargo test -p hermit --test record_replay
+cargo test -p hermit-run --test record_replay
 17 passed; 0 failed; finished in 120.16s
 
-cargo test -p hermit --test record_replay -- --test-threads=1
+cargo test -p hermit-run --test record_replay -- --test-threads=1
 17 passed; 0 failed; finished in 95.90s
 ```
 

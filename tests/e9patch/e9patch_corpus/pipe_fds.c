@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /* fd-hygiene: pipe2 returns 0 and allocates the two lowest free descriptors
  * for the read (3) and write (4) ends. Regresses fd-pair allocation parity
  * between e9patch preprocessing and plain ptrace. */

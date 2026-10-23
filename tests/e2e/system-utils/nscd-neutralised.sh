@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Defends the empty-directory mount hermit places over /var/run/nscd
 # (hermit-cli/src/bin/hermit/container.rs, identity_hardening_mounts). Without
 # it the guest's glibc reaches the host nscd socket, and its answers depend on

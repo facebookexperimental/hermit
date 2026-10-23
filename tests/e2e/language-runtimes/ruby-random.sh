@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Ruby's Random default seed is drawn from the kernel CSPRNG (getrandom(2)) at
 # interpreter startup, so bare `rand` output varies natively but is determinized
 # by Hermit. The deterministic arithmetic, string sort, and length checks

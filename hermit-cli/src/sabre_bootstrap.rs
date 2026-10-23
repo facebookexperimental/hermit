@@ -1,7 +1,5 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
@@ -32,13 +30,17 @@ use std::path::PathBuf;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::ensure;
+use detcore::random::EarlyRequest;
 use detcore::random::InitialImage;
+use detcore::random::LimitReadCall;
 use detcore::random::LoaderState;
+use detcore::random::MAX_EARLY_GETRANDOM;
+use detcore::random::MAX_EARLY_LIMIT_READS;
 use detcore::random::encode_continuation;
 use detcore::random::encode_initial_state;
-use detcore::random::getrandom;
-use detcore::random::initialize_auxv;
+use detcore::random::getrandom_unrecorded;
 use detcore::random::root_prng;
+use detcore::random::write_initial_auxv;
 use nix::unistd::Pid;
 use object::Object;
 use object::ObjectSegment;
@@ -57,11 +59,18 @@ mod bootstrap {
     pub const IMAGE: u64 = 1;
     pub const GETRANDOM: u64 = 2;
     pub const TAKE_STATE: u64 = 3;
+    pub const PRLIMIT: u64 = 4;
+    pub const GETRLIMIT: u64 = 5;
     pub const MAX_STATE_BYTES: usize = 4096;
     pub const SYSCALL_SYMBOL: &str = "sbr_bootstrap_syscall_v1";
 }
 pub(super) const ENVIRONMENT: &str = "REVERIE_SABRE_BOOTSTRAP_V1";
 const LAYOUT_SYMBOL: &str = "sbr_bootstrap_frame_layout_v1";
+/// Version 2 of the descriptor also gives r10, the fourth syscall argument,
+/// which a forwarded prlimit64's output pointer occupies. A loader that answers
+/// pre-plugin resource-limit reads exports it; one that does not exports only
+/// version 1, and such reads are then not offered.
+const LAYOUT_SYMBOL_V2: &str = "sbr_bootstrap_frame_layout_v2";
 
 const IN_MEMORY_SNAPSHOT_LIMIT: usize = 128 * 1024 * 1024;
 const MAX_MAPS: usize = 1024 * 1024;
@@ -748,28 +757,38 @@ impl HeldObject {
 
     fn layout(&self) -> Result<FrameLayout> {
         let elf = object::File::parse(self.bytes.as_slice())?;
-        let definitions: BTreeSet<_> = elf
-            .symbols()
-            .chain(elf.dynamic_symbols())
-            .filter(|s| s.name().ok() == Some(LAYOUT_SYMBOL) && !s.is_undefined())
-            .map(|s| {
-                (
-                    s.address() as usize,
-                    s.size() as usize,
-                    s.kind() == object::SymbolKind::Data,
-                )
-            })
-            .collect();
+        let definitions = |name: &str| -> BTreeSet<_> {
+            elf.symbols()
+                .chain(elf.dynamic_symbols())
+                .filter(|s| s.name().ok() == Some(name) && !s.is_undefined())
+                .map(|s| {
+                    (
+                        s.address() as usize,
+                        s.size() as usize,
+                        s.kind() == object::SymbolKind::Data,
+                    )
+                })
+                .collect()
+        };
+        let version2 = definitions(LAYOUT_SYMBOL_V2);
+        let (symbol, definitions) = if version2.is_empty() {
+            (LAYOUT_SYMBOL, definitions(LAYOUT_SYMBOL))
+        } else {
+            (LAYOUT_SYMBOL_V2, version2)
+        };
         ensure!(
             definitions.len() == 1,
             "missing/ambiguous bootstrap frame descriptor"
         );
         let (address, size, data) = *definitions.first().unwrap();
+        let expected = if symbol == LAYOUT_SYMBOL_V2 { 10 } else { 9 } * 8;
         ensure!(
-            data && size == 9 * 8,
+            data && size == expected,
             "wrong bootstrap frame descriptor type/extent"
         );
-        FrameLayout::decode(self.at_virtual(address, size, true)?)
+        let mut layout = FrameLayout::decode(self.at_virtual(address, size, true)?)?;
+        layout.descriptor = symbol;
+        Ok(layout)
     }
 
     fn symbol(&self, name: &str) -> Result<usize> {
@@ -1010,10 +1029,10 @@ fn initial_arguments(pid: Pid, rows: &[Map], stack: usize) -> Result<Vec<Vec<u8>
         "initial argv is not on the owned writable stack"
     );
     let argc = word(&remote_bytes(pid, stack, 8)?, 0)?;
-    // run_sabre prepends the loader, plugin and delimiter to the existing
-    // supported guest argc (4096). IMAGE retains that original guest bound.
+    // run_sabre execs SaBRe with the guest's own argv (see
+    // reverie_sabre_stats::launch), within the supported guest argc (4096).
     ensure!(
-        (4..=4099).contains(&argc),
+        (1..=4096).contains(&argc),
         "unsupported initial loader argc"
     );
     let vector_size = (argc + 2) * 8;
@@ -1055,33 +1074,17 @@ fn initial_arguments(pid: Pid, rows: &[Map], stack: usize) -> Result<Vec<Vec<u8>
     Ok(arguments)
 }
 
-fn guest_arguments(initial: Vec<Vec<u8>>, script: Option<&[u8]>) -> Result<Vec<Vec<u8>>> {
-    // find_client_path_idx scans after argv[0], and stops at the first exact
-    // delimiter. Later literal "--" arguments belong to the client unchanged.
-    let delimiter = initial
-        .iter()
-        .skip(1)
-        .position(|value| value == b"--\0")
-        .map(|index| index + 1)
-        .ok_or_else(|| anyhow!("initial loader argv lacks delimiter"))?;
+/// The argv the guest's image must start with: SaBRe's own initial argv,
+/// unchanged. run_sabre execs SaBRe with the guest's argv, a script's already
+/// resolved to its interpreter as the kernel would, and passes the plugin and
+/// image in a launch specification, so the loader leaves argv as the kernel
+/// built it.
+fn guest_arguments(initial: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
     ensure!(
-        delimiter + 1 < initial.len(),
-        "initial loader argv lacks client"
-    );
-    let mut expected = Vec::new();
-    if let Some(script) = script {
-        for token in script_words(script)? {
-            let mut value = token.to_vec();
-            value.push(0);
-            expected.push(value);
-        }
-    }
-    expected.extend(initial.into_iter().skip(delimiter + 1));
-    ensure!(
-        !expected.is_empty() && expected.len() <= 4096,
+        !initial.is_empty() && initial.len() <= 4096,
         "unsupported bootstrap argc"
     );
-    Ok(expected)
+    Ok(initial)
 }
 
 fn authenticate_arguments(
@@ -1192,6 +1195,13 @@ pub(super) struct Bootstrap {
     generation: u64,
     image: Option<InitialImage>,
     prng: rand_pcg::Pcg64Mcg,
+    /// The bytes written at AT_RANDOM, for the handoff's post-exec record.
+    at_random_value: Option<[u8; 16]>,
+    /// The loader's getrandom fills, in order, for the handoff's post-exec
+    /// records: the root thread's seeding records must precede them.
+    /// The getrandom fills and resource-limit reads served before post-exec,
+    /// in order, for post-exec to record.
+    early_requests: Vec<EarlyRequest>,
     taken: bool,
     sigill: Option<SigillOrigin>,
     initial_random: usize,
@@ -1210,16 +1220,25 @@ struct FrameLayout {
     rdi: usize,
     rsi: usize,
     rdx: usize,
+    /// Present in a version 2 descriptor.
+    r10: Option<usize>,
     architectural_return: usize,
     scratch_return: usize,
+    /// The loader symbol the descriptor came from.
+    descriptor: &'static str,
 }
 impl FrameLayout {
+    /// The descriptor's size in bytes: 9 words in version 1, 10 in version 2.
+    fn extent(&self) -> usize {
+        if self.r10.is_some() { 80 } else { 72 }
+    }
+
     fn decode(bytes: &[u8]) -> Result<Self> {
+        let version = if bytes.len() >= 8 { word(bytes, 0)? } else { 0 };
         ensure!(
-            bytes.len() == 72
-                && word(bytes, 0)? == 1
-                && word(bytes, 56)? == 8
-                && word(bytes, 64)? == 9,
+            ((bytes.len() == 72 && version == 1 && word(bytes, 64)? == 9)
+                || (bytes.len() == 80 && version == 2 && word(bytes, 64)? == 10))
+                && word(bytes, 56)? == 8,
             "unsupported bootstrap frame descriptor"
         );
         let size = word(bytes, 8)?;
@@ -1227,13 +1246,16 @@ impl FrameLayout {
             (8..=4096).contains(&size) && size.is_multiple_of(8),
             "invalid bootstrap full frame size"
         );
-        let offsets = [
+        let mut offsets = vec![
             word(bytes, 16)?,
             word(bytes, 24)?,
             word(bytes, 32)?,
             word(bytes, 40)?,
             word(bytes, 48)?,
         ];
+        if version == 2 {
+            offsets.push(word(bytes, 72)?);
+        }
         ensure!(
             offsets
                 .iter()
@@ -1249,8 +1271,14 @@ impl FrameLayout {
             rdi: offsets[0],
             rsi: offsets[1],
             rdx: offsets[2],
+            r10: offsets.get(5).copied(),
             architectural_return: offsets[3],
             scratch_return: offsets[4],
+            descriptor: if version == 2 {
+                LAYOUT_SYMBOL_V2
+            } else {
+                LAYOUT_SYMBOL
+            },
         })
     }
 }
@@ -1319,10 +1347,7 @@ impl Bootstrap {
         let rows = maps(root)?;
         let expected_arguments = if launch.initializes_random() {
             let registers = nix::sys::ptrace::getregs(root)?;
-            guest_arguments(
-                initial_arguments(root, &rows, registers.rsp as usize)?,
-                launch.script.as_ref().map(|script| script.bytes.as_slice()),
-            )?
+            guest_arguments(initial_arguments(root, &rows, registers.rsp as usize)?)?
         } else {
             // Static legacy TAKE has no IMAGE/argv proof. Preserve its
             // existing admission instead of imposing the dynamic argc bound.
@@ -1358,6 +1383,8 @@ impl Bootstrap {
             generation,
             image: None,
             prng,
+            at_random_value: None,
+            early_requests: Vec::new(),
             taken: false,
             sigill: None,
             initial_random,
@@ -1400,18 +1427,19 @@ impl Bootstrap {
         );
         // Recheck the complete immutable descriptor in its live readonly load
         // mapping as well as the pre-launch held-file extraction.
-        let descriptor = loader.symbol(LAYOUT_SYMBOL)?;
+        let descriptor = loader.symbol(self.launch.layout.descriptor)?;
+        let extent = self.launch.layout.extent();
         let address = bias
             .checked_add(descriptor)
             .ok_or_else(|| anyhow!("descriptor address overflow"))?;
-        let mapping = containing(rows, address, 72)?;
+        let mapping = containing(rows, address, extent)?;
         ensure!(
             mapping.permissions.starts_with("r-") && !mapping.permissions.contains('w'),
             "live bootstrap descriptor is writable"
         );
         loader.authenticate(pid, mapping)?;
         ensure!(
-            remote_bytes(pid, address, 72)? == loader.at_virtual(descriptor, 72, true)?,
+            remote_bytes(pid, address, extent)? == loader.at_virtual(descriptor, extent, true)?,
             "live bootstrap descriptor differs from held object"
         );
         Ok(bias)
@@ -1516,12 +1544,12 @@ impl Bootstrap {
             row.permissions.contains('x'),
             "interpreter entry not executable"
         );
-        initialize_auxv(
+        // No record here: the guest's post-exec emits it from the handoff.
+        self.at_random_value = Some(write_initial_auxv(
             &mut self.prng,
             RemoteMemory(pid),
             AddrMut::from_raw(random).ok_or_else(|| anyhow!("null final AT_RANDOM"))?,
-            detcore::types::DetTid::from_raw(pid.as_raw()),
-        )?;
+        )?);
         self.image = Some(InitialImage {
             pid: pid.as_raw(),
             start_time_ticks: self.generation,
@@ -1613,14 +1641,19 @@ impl Bootstrap {
         }
         self.same_owner(pid)?;
         let regs = nix::sys::ptrace::getregs(pid)?;
-        if regs.rax != libc::SYS_getrandom as u64
+        let forwarded = [
+            libc::SYS_getrandom,
+            libc::SYS_prlimit64,
+            libc::SYS_getrlimit,
+        ];
+        if !forwarded.iter().any(|sysno| regs.rax == *sysno as u64)
             || remote_bytes(pid, regs.rip as usize, 2)? != [0x0f, 0xff]
         {
             return Ok(());
         }
         ensure!(
             self.image.is_some(),
-            "getrandom SIGILL before authenticated IMAGE"
+            "bootstrap SIGILL before authenticated IMAGE"
         );
         let info = nix::sys::ptrace::getsiginfo(pid)?;
         ensure!(
@@ -1637,15 +1670,32 @@ impl Bootstrap {
         Ok(())
     }
 
+    /// Authenticates a forwarded request against the syscall it came from:
+    /// `sysno` is the syscall the operation stands for, and `arguments` its
+    /// leading arguments (rdi, rsi, rdx, r10 order), two to four of them.
+    ///
+    /// On the ordinary path the loader chose the operation from the real
+    /// syscall number. On the SIGILL path the saved registers carry it, and it
+    /// must match: otherwise a guest's own SIGILL handler could present one
+    /// trapped syscall's arguments as another operation's.
     fn origin(
         &mut self,
         pid: Pid,
         rows: &[Map],
-        arguments: [usize; 3],
+        sysno: libc::c_long,
+        arguments: &[usize],
         wrapper: usize,
         loader_bias: usize,
     ) -> Result<()> {
+        ensure!(
+            (2..=4).contains(&arguments.len()),
+            "bootstrap request authenticates 2 to 4 syscall arguments"
+        );
         let layout = self.launch.layout;
+        ensure!(
+            arguments.len() < 4 || layout.r10.is_some(),
+            "bootstrap frame descriptor has no r10"
+        );
         if let Some(saved) = self.sigill.take() {
             ensure!(
                 saved.generation == self.generation,
@@ -1653,7 +1703,17 @@ impl Bootstrap {
             );
             let regs = saved.registers;
             ensure!(
-                [regs.rdi as usize, regs.rsi as usize, regs.rdx as usize] == arguments,
+                regs.rax == sysno as u64,
+                "SIGILL syscall differs from forwarded operation"
+            );
+            let original = [
+                regs.rdi as usize,
+                regs.rsi as usize,
+                regs.rdx as usize,
+                regs.r10 as usize,
+            ];
+            ensure!(
+                original[..arguments.len()] == *arguments,
                 "SIGILL original arguments differ from forwarded request"
             );
             ensure!(
@@ -1684,12 +1744,19 @@ impl Bootstrap {
             "ordinary bootstrap frame is not on owned stack"
         );
         let frame = remote_bytes(pid, wrapper, layout.size)?;
+        let mut original = vec![
+            word(&frame, layout.rdi)?,
+            word(&frame, layout.rsi)?,
+            word(&frame, layout.rdx)?,
+        ];
+        if arguments.len() == 4 {
+            let r10 = layout
+                .r10
+                .ok_or_else(|| anyhow!("bootstrap frame descriptor has no r10"))?;
+            original.push(word(&frame, r10)?);
+        }
         ensure!(
-            [
-                word(&frame, layout.rdi)?,
-                word(&frame, layout.rsi)?,
-                word(&frame, layout.rdx)?
-            ] == arguments,
+            original[..arguments.len()] == *arguments,
             "assembly frame arguments differ from forwarded request"
         );
         let returned = word(&frame, layout.architectural_return)?;
@@ -1928,7 +1995,14 @@ impl Bootstrap {
             bootstrap::GETRANDOM => {
                 ensure!(self.image.is_some(), "early getrandom before IMAGE");
                 let args = [regs.rdx as usize, regs.r10 as usize, regs.r8 as usize];
-                self.origin(pid, &rows, args, regs.r9 as usize, loader_bias)?;
+                self.origin(
+                    pid,
+                    &rows,
+                    libc::SYS_getrandom,
+                    &args,
+                    regs.r9 as usize,
+                    loader_bias,
+                )?;
                 let call = Syscall::from_raw(
                     Sysno::getrandom,
                     SyscallArgs::new(args[0], args[1], args[2], 0, 0, 0),
@@ -1936,12 +2010,26 @@ impl Bootstrap {
                 let Syscall::Getrandom(call) = call else {
                     unreachable!()
                 };
-                random_response(getrandom(
-                    &mut self.prng,
-                    RemoteMemory(pid),
-                    detcore::types::DetTid::from_raw(pid.as_raw()),
-                    call,
-                ))?
+                ensure!(
+                    self.early_requests
+                        .iter()
+                        .filter(|request| matches!(request, EarlyRequest::Getrandom(_)))
+                        .count()
+                        < MAX_EARLY_GETRANDOM,
+                    "more than {MAX_EARLY_GETRANDOM} early getrandom requests"
+                );
+                // Detcore's root thread does not exist yet, so its seeding
+                // records are still to come: emit no record now. Post-exec
+                // emits this fill's record from the handoff, after them.
+                random_response(
+                    getrandom_unrecorded(&mut self.prng, RemoteMemory(pid), call).map(
+                        |(result, fill)| {
+                            self.early_requests
+                                .extend(fill.map(EarlyRequest::Getrandom));
+                            result
+                        },
+                    ),
+                )?
             }
             bootstrap::TAKE_STATE => {
                 ensure!(
@@ -1950,16 +2038,121 @@ impl Bootstrap {
                 );
                 let image = self.image.ok_or_else(|| anyhow!("TAKE before IMAGE"))?;
                 self.check_current_auxv(pid, &rows, image)?;
-                let bytes = encode_initial_state(&self.launch.config, image, &self.prng)?;
+                let at_random_value = self
+                    .at_random_value
+                    .ok_or_else(|| anyhow!("TAKE before the AT_RANDOM write"))?;
+                let bytes = encode_initial_state(
+                    &self.launch.config,
+                    image,
+                    &self.prng,
+                    at_random_value,
+                    &self.early_requests,
+                )?;
                 let result = Self::write_take(pid, regs, &bytes)?;
                 if result > 0 {
                     self.taken = true;
                 }
                 result
             }
+            bootstrap::PRLIMIT => {
+                ensure!(self.image.is_some(), "early prlimit64 before IMAGE");
+                // prlimit64(pid, resource, NULL, old): the loader forwards only
+                // reads, so the new-limit argument must be NULL.
+                let (target, resource, old) =
+                    (regs.rdx as usize, regs.r10 as usize, regs.r8 as usize);
+                self.origin(
+                    pid,
+                    &rows,
+                    libc::SYS_prlimit64,
+                    &[target, resource, 0, old],
+                    regs.r9 as usize,
+                    loader_bias,
+                )?;
+                // pid_t is a C int: the upper half of the register is not
+                // part of the argument.
+                let target = target as i32;
+                self.early_limit_read(pid, resource, old, LimitReadCall::Prlimit64 { pid: target })?
+            }
+            bootstrap::GETRLIMIT => {
+                ensure!(self.image.is_some(), "early getrlimit before IMAGE");
+                ensure!(regs.r8 == 0, "invalid GETRLIMIT protocol shape");
+                let (resource, limit) = (regs.rdx as usize, regs.r10 as usize);
+                self.origin(
+                    pid,
+                    &rows,
+                    libc::SYS_getrlimit,
+                    &[resource, limit],
+                    regs.r9 as usize,
+                    loader_bias,
+                )?;
+                self.early_limit_read(pid, resource, limit, LimitReadCall::Getrlimit)?
+            }
             _ => return Err(anyhow!("unknown loader bootstrap operation")),
         };
         Ok(Some(result))
+    }
+
+    /// Answers a resource-limit read the loader forwarded before the plugin
+    /// exists, with Detcore's initial limit, as Detcore's own handlers answer it
+    /// once running: an invalid resource is EINVAL, a prlimit64 aimed at
+    /// another process is EPERM, a getrlimit without a buffer is EFAULT. A
+    /// successful read joins the early requests post-exec records.
+    fn early_limit_read(
+        &mut self,
+        pid: Pid,
+        resource: usize,
+        destination: usize,
+        call: LimitReadCall,
+    ) -> Result<i64> {
+        let reads = self
+            .early_requests
+            .iter()
+            .filter(|request| matches!(request, EarlyRequest::LimitRead { .. }))
+            .count();
+        ensure!(
+            reads < MAX_EARLY_LIMIT_READS,
+            "more than {MAX_EARLY_LIMIT_READS} early resource-limit reads"
+        );
+        // The resource is a C int: the upper half of the register is not part
+        // of the argument, for Linux or for Detcore's handlers.
+        let resource = resource as u32;
+        let destination = AddrMut::<u8>::from_raw(destination);
+        if call == LimitReadCall::Getrlimit {
+            // Detcore's getrlimit, in order: a negative resource is EINVAL
+            // (Reverie decodes it as an int), then a missing buffer is EFAULT,
+            // then an unknown resource is EINVAL. Its prlimit64 accepts a
+            // missing old pointer.
+            if (resource as i32) < 0 {
+                return Ok(-libc::EINVAL as i64);
+            }
+            if destination.is_none() {
+                return Ok(-libc::EFAULT as i64);
+            }
+        }
+        let Some((current, maximum)) = detcore::initial_resource_limit(resource) else {
+            return Ok(-libc::EINVAL as i64);
+        };
+        if let LimitReadCall::Prlimit64 { pid: target } = call
+            && target != 0
+            && target != pid.as_raw()
+        {
+            return Ok(-libc::EPERM as i64);
+        }
+        if let Some(destination) = destination {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&current.to_ne_bytes());
+            bytes[8..].copy_from_slice(&maximum.to_ne_bytes());
+            if let Err(error) = RemoteMemory(pid).write_exact(destination, &bytes) {
+                return Ok(-(error.into_raw() as i64));
+            }
+        }
+        self.early_requests.push(EarlyRequest::LimitRead {
+            call,
+            resource,
+            current,
+            maximum,
+        });
+        Ok(0)
     }
 
     fn write_take(pid: Pid, regs: &libc::user_regs_struct, bytes: &[u8]) -> Result<i64> {
@@ -2310,6 +2503,43 @@ mod tests {
         );
     }
 
+    // Version 2 appends r10's offset; struct syscall_stackframe puts it sixth.
+    const FRAME_WORDS_V2: [u64; 10] = [2, 144, 72, 80, 88, 128, 136, 8, 10, 48];
+
+    #[test]
+    fn frame_descriptor_v2_decodes_r10() {
+        let layout = FrameLayout::decode(&words(&FRAME_WORDS_V2)).unwrap();
+        assert_eq!(layout.r10, Some(48));
+        assert_eq!(layout.extent(), 80);
+        assert_eq!(layout.descriptor, LAYOUT_SYMBOL_V2);
+        let v1 = FrameLayout::decode(&words(&FRAME_WORDS)).unwrap();
+        assert_eq!(
+            (v1.r10, v1.extent(), v1.descriptor),
+            (None, 72, LAYOUT_SYMBOL)
+        );
+        // A version 2 descriptor that claims 9 words, or a version 1 one padded
+        // to 10, is neither.
+        let mut nine = FRAME_WORDS_V2;
+        nine[8] = 9;
+        expect_error(
+            FrameLayout::decode(&words(&nine)),
+            "unsupported bootstrap frame descriptor",
+        );
+        let mut padded_v1 = FRAME_WORDS_V2;
+        padded_v1[0] = 1;
+        expect_error(
+            FrameLayout::decode(&words(&padded_v1)),
+            "unsupported bootstrap frame descriptor",
+        );
+        // r10 must lie inside the frame like every other field.
+        let mut outside = FRAME_WORDS_V2;
+        outside[9] = 144;
+        expect_error(
+            FrameLayout::decode(&words(&outside)),
+            "bootstrap frame field outside extent",
+        );
+    }
+
     #[test]
     fn frame_descriptor_rejects_invalid_protocol() {
         let bytes = words(&FRAME_WORDS);
@@ -2571,27 +2801,17 @@ mod tests {
         let registers = nix::sys::ptrace::getregs(pid).unwrap();
         let rows = maps(pid).unwrap();
         let captured = initial_arguments(pid, &rows, registers.rsp as usize).unwrap();
-        let direct = guest_arguments(captured.clone(), None).unwrap();
-        assert_eq!(direct[0], b"client\0");
-        assert_eq!(direct[1], b"--\0");
-        assert_eq!(&direct[2][..long.len()], long);
-        assert_eq!(direct[2].last(), Some(&0));
-        assert_eq!(&direct[3][..raw.len()], raw);
-        let script =
-            guest_arguments(captured, Some(b"#! /raw-\xff --option ignored\nbody")).unwrap();
-        assert_eq!(
-            &script[..2],
-            &[b"/raw-\xff\0".to_vec(), b"--option\0".to_vec()]
-        );
-        assert_eq!(&script[2..], direct);
-        expect_error(
-            guest_arguments(vec![b"loader\0".to_vec(), b"--\0".to_vec()], None),
-            "lacks client",
-        );
-        expect_error(
-            guest_arguments(vec![b"loader\0".to_vec(), b"client\0".to_vec()], None),
-            "lacks delimiter",
-        );
+        // The guest's argv is SaBRe's initial argv, kernel bytes and literal
+        // `--` arguments included, unchanged.
+        let direct = guest_arguments(captured.clone()).unwrap();
+        assert_eq!(direct, captured);
+        assert_eq!(direct[0], b"/bin/true\0");
+        assert_eq!(direct[1], b"plugin\0");
+        assert_eq!(direct[2], b"--\0");
+        assert_eq!(&direct[5][..long.len()], long);
+        assert_eq!(direct[5].last(), Some(&0));
+        assert_eq!(&direct[6][..raw.len()], raw);
+        expect_error(guest_arguments(Vec::new()), "unsupported bootstrap argc");
     }
 
     #[test]
@@ -2905,26 +3125,6 @@ mod tests {
             ),
         ] {
             assert_eq!(script_words(script).unwrap(), expected);
-            let arguments = guest_arguments(
-                vec![
-                    b"loader\0".to_vec(),
-                    b"plugin\0".to_vec(),
-                    b"--\0".to_vec(),
-                    b"script\0".to_vec(),
-                ],
-                Some(script),
-            )
-            .unwrap();
-            let mut expected_arguments: Vec<_> = expected
-                .iter()
-                .map(|word| {
-                    let mut value = word.to_vec();
-                    value.push(0);
-                    value
-                })
-                .collect();
-            expected_arguments.push(b"script\0".to_vec());
-            assert_eq!(arguments, expected_arguments);
         }
         expect_error(
             script_words(b"#!/interpreter\0bad --option\n"),

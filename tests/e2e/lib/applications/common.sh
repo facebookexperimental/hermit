@@ -169,6 +169,10 @@ function run_hermit_verify {
     # The guest's whole ancestor chain is then `/` plus its own private /tmp,
     # and every mutation under it is the guest's own -- which Hermit already
     # makes deterministic.
+    # `--strict` refuses an epoch drawn from the host clock; validation gives
+    # HERMIT_EPOCH the canonical test epoch (CANONICAL_TEST_EPOCH in
+    # detcore-model/src/canonical_test_epoch.rs).
+    : "${HERMIT_EPOCH:?the application workloads run hermit --strict, which needs HERMIT_EPOCH}"
     timeout "$HERMIT_APPLICATION_TIMEOUT" \
         "$HERMIT_BIN" --log=info run --no-virtualize-cpuid \
         --max-timeslice=disabled --base-env=minimal --strict "${execution_root_args[@]}" \

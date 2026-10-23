@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Boot the demo kernel and BusyBox initramfs in single-threaded QEMU TCG with
 # instruction counting, so guest time advances with executed instructions.
 

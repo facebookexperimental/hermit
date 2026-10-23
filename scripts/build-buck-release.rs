@@ -1,7 +1,7 @@
 #!/usr/bin/env -S rust-script --force
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "1151317720218c8dd830a50d9f6bf10fc7d175e5" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "bfd648864b74d14b96cd3af9e36f04186aca7075" }
 //! detcore-model = { path = "../detcore-model" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! flate2 = "=1.1.10"
@@ -102,13 +102,14 @@ const RELEASE_NEEDED_LIBRARIES: [&str; 5] = [
 ];
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 const GENERATED_MARKERS: [&str; 3] = [
-    "name = \"reverie-dbt-0.4-materialized-manifest\"",
-    "manifest_dir = \":reverie-dbt-0.4-materialized-manifest\"",
+    "name = \"reverie-dbt-0.5-materialized-manifest\"",
+    "manifest_dir = \":reverie-dbt-0.5-materialized-manifest\"",
     "load(\"@shim//build_defs:materialized_manifest.bzl\", \"materialized_manifest\")",
 ];
-const REQUIRED_RESOURCES: [(&str, bool); 10] = [
+const REQUIRED_RESOURCES: [(&str, bool); 11] = [
     ("rsrcs/libdetcore_dbt.so", false),
     ("rsrcs/libdetcore_sabre.so", false),
+    ("rsrcs/libdetcore_liteinst.so", false),
     ("rsrcs/libreverie_dbt_client.so", false),
     ("rsrcs/libreverie_liteinst.so", false),
     ("rsrcs/dynamorio/bin64/drrun", true),
@@ -1443,7 +1444,7 @@ fn verify_generated_buck(text: &str) -> Result<(), String> {
     let mapped_files = text
         .lines()
         .filter(|line| {
-            line.trim_start().starts_with('"') && line.contains(": \"vendor/reverie-dbt-0.4.0/")
+            line.trim_start().starts_with('"') && line.contains(": \"vendor/reverie-dbt-0.5.1/")
         })
         .count();
     if mapped_files != reverie_dbt_inventory::REVERIE_DBT_FILES {
@@ -3569,12 +3570,7 @@ fn verify_closed_report_shape(value: &Value) -> Result<(), String> {
                     stats,
                     &format!("runtime.{run}"),
                     &["scheduler_turns", "virtual_nanoseconds"],
-                    &[
-                        "scheduler_turns",
-                        "virtual_nanoseconds",
-                        "syscalls",
-                        "dispatch",
-                    ],
+                    &["scheduler_turns", "virtual_nanoseconds", "syscalls", "dispatch"],
                 )?;
             }
         }
@@ -5092,7 +5088,11 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
         publish_unwind_buck_input(&root, &evidence_dir, require_unwind_closure()?)?;
 
     checked_output(
-        Command::new(root.join("bootstrap/regenerate-rust-deps")).current_dir(&root),
+        // A release vendors from its own lock rather than trusting a host
+        // cache another checkout wrote (bootstrap/rust-deps-cache.sh).
+        Command::new(root.join("bootstrap/regenerate-rust-deps"))
+            .current_dir(&root)
+            .env("HERMIT_RUST_DEPS_CACHE", "off"),
         "deterministic Rust dependency regeneration",
     )?;
     let generated_buck = root.join("shim/third-party/rust/BUCK");
@@ -5413,7 +5413,11 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
 
     let regenerate = root.join("bootstrap/regenerate-rust-deps");
     checked_output(
-        Command::new(&regenerate).current_dir(&root),
+        // A release vendors from its own lock rather than trusting a host
+        // cache another checkout wrote (bootstrap/rust-deps-cache.sh).
+        Command::new(&regenerate)
+            .current_dir(&root)
+            .env("HERMIT_RUST_DEPS_CACHE", "off"),
         "deterministic Rust dependency regeneration",
     )?;
     let generated_buck = root.join("shim/third-party/rust/BUCK");
@@ -5981,6 +5985,15 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("rsrcs/unprobed-resource"), b"generation-one\n").unwrap();
+        checked_output(
+            Command::new("python3")
+                .arg(source_root().join("ci/test_packaged_detcore.py"))
+                .arg("--write-fixture")
+                .arg(root)
+                .arg(reverie_sha),
+            "write synthetic packaging receipt reader fixture",
+        )
+        .unwrap();
     }
 
     fn canonical_report(virtualize_time: bool) -> Value {
@@ -6052,7 +6065,8 @@ mod tests {
             "host_capabilities": {
                 "cpuid-faulting": {"present": true, "evidence": cpuid_evidence},
                 "kvm": {"present": false, "evidence": "open /dev/kvm = ENOENT"}
-            }
+            },
+            "exact_branch_counter": {"present": true, "evidence": "Reverie PMU validation passed"}
         })
         .to_string()
     }
@@ -6271,9 +6285,28 @@ mod tests {
             ),
             (
                 "wrong-schema",
-                spaced.replacen(r#""schema":1"#, r#""schema":2"#, 1),
+                spaced.replacen(
+                    &format!(r#""schema":{}"#, HostCapabilitiesReport::SCHEMA),
+                    &format!(r#""schema":{}"#, HostCapabilitiesReport::SCHEMA + 1),
+                    1,
+                ),
+            ),
+            (
+                "schema-1-without-branch-counter",
+                spaced
+                    .replacen(
+                        &format!(r#""schema":{}"#, HostCapabilitiesReport::SCHEMA),
+                        r#""schema":1"#,
+                        1,
+                    )
+                    .replacen(
+                        r#","exact_branch_counter":{"evidence":"Reverie PMU validation passed","present":true}"#,
+                        "",
+                        1,
+                    ),
             ),
         ] {
+            assert_ne!(value, spaced, "mutation {name} changed nothing");
             assert!(
                 decode_host_capabilities(&value, "fixture").is_err(),
                 "accepted {name}: {value}"
@@ -6292,7 +6325,7 @@ mod tests {
             let mut text = GENERATED_MARKERS.join("\n");
             for index in 0..files {
                 text.push_str(&format!(
-                    "\n    \"f{index}\": \"vendor/reverie-dbt-0.4.0/f{index}\","
+                    "\n    \"f{index}\": \"vendor/reverie-dbt-0.5.1/f{index}\","
                 ));
             }
             text
@@ -7288,6 +7321,7 @@ mod tests {
         let root = fixture_root("buck-shadow-publication-source");
         fs::create_dir_all(root.join("ci")).unwrap();
         for name in [
+            "verify-packaged-detcore.py",
             "publish-hermit-e2e-artifact.sh",
             "verify-hermit-e2e-artifact.sh",
         ] {
@@ -7397,6 +7431,7 @@ mod tests {
         let root = fixture_root("overlay-stage-origin");
         fs::create_dir_all(root.join("ci")).unwrap();
         for name in [
+            "verify-packaged-detcore.py",
             "publish-hermit-e2e-artifact.sh",
             "verify-hermit-e2e-artifact.sh",
         ] {
@@ -7529,6 +7564,7 @@ esac
         let root = fixture_root("validate-artifact-install");
         fs::create_dir_all(root.join("ci")).unwrap();
         for name in [
+            "verify-packaged-detcore.py",
             "publish-hermit-e2e-artifact.sh",
             "run-with-hermit-e2e-artifact.sh",
             "verify-hermit-e2e-artifact.sh",

@@ -20,6 +20,17 @@ pub struct MmId {
 }
 
 impl MmId {
+    /// Deterministic task that created this model address-space incarnation.
+    /// This is an equality binding, not kernel memory-management attestation.
+    pub const fn creator(self) -> DetTid {
+        self.creator
+    }
+
+    /// Exact monotonic model exec generation, including initial generation zero.
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
     /// Create the initial address space owned by a task.
     pub const fn initial(creator: DetTid) -> Self {
         Self {

@@ -9,9 +9,25 @@ feature branch does not activate it. Manual Docs publication remains available
 while nightly rebuilding is inactive.
 
 The same workflow publishes the complete documentation site: rustdoc, the
-Hermetic Infra landing page, every retained compatibility build, and
-`compatibility/latest/`. It has no pull-request or main-push trigger. All
-publication runs are serialized and restricted to `rrnewton/hermit:main`.
+Hermetic Infra landing page, the retained compatibility builds, their index at
+`compatibility/builds/`, and `compatibility/latest/`. It has no pull-request or
+main-push trigger. All publication runs are serialized and restricted to
+`rrnewton/hermit:main`.
+
+## Retained builds
+
+Pages serves only the newest builds. The `retention` object in
+`.github/compatibility-site-builder.json` states the rule and its numbers: keep
+the newest N builds published at or after `not_before`, where
+N = min(`max_builds`, floor(`budget_bytes` / size of the latest build)), and at
+least 1. The latest build is always kept. With a 1 GB budget and a 100 MB build,
+N is 10. The publisher computes N again on every publication, so a smaller build
+raises it. Builds are ordered by their GitHub release's publication time.
+
+Pruning removes a build from Pages only. Every build stays downloadable as its
+release asset and stays listed in `compatibility/releases.json`, which remains
+append-only. `compatibility/builds/` lists each kept build with its publication
+time, the Hermit main commit it was built from, and its size.
 
 ## Source access
 
@@ -80,8 +96,9 @@ cells, comparison credit, reference denominator and history.
 
 The job validates the built website, creates an immutable checksum-bound
 archive and append-only release registry, and requests a stable, non-draft data
-release with `--latest=false`. It downloads and validates every retained archive
-before deploying the full site. After deployment it compares nine ordinary
+release with `--latest=false`. It checks every release in the registry, then
+downloads and validates the archives the retention rule keeps before deploying
+the full site. After deployment it compares nine ordinary
 public URLs with the exact built manifest, page, CSS, JavaScript and browser
 data. A stale or unreadable result makes the job fail. The uploaded receipt
 records the exact source commits, archive identity and deployment result;

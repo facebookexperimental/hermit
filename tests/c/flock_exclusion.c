@@ -66,6 +66,41 @@
  *   vfork-upgrade  A copied vfork child must not enter a blocking flock that
  *              bypasses Detcore while its parent is suspended.
  *
+ *   pipe-fork-vfork  A pipe, an ordinary fork whose child exits, then vfork
+ *              and exec. Matches native Linux and runs under --verify. No lock
+ *              was ever taken, so DBT's vfork flock guard must not refuse it:
+ *              every DBT `make -jN` reaches exactly this shape.
+ *
+ *   locked-pipe-fork-vfork  The same with a LOCK_EX taken on the pipe before
+ *              the fork. HERMIT/DBT ONLY: the lock may still be held after the
+ *              fork, so DBT refuses the vfork.
+ *
+ *   pipe-fork-locked-vfork  The same with a LOCK_EX|LOCK_NB taken on the
+ *              pipe after the fork, while Detcore no longer knows its mode.
+ *              HERMIT/DBT ONLY: DBT refuses the vfork.
+ *
+ *   copied-pidfd-getfd  A forked holder takes LOCK_SH on a fresh open file
+ *              description; the parent vforks, and the copied child duplicates
+ *              the holder's descriptor with pidfd_getfd and unlocks it.
+ *              HERMIT/DBT ONLY: DBT refuses the copied child's pidfd_getfd
+ *              before the holder's claim can go stale: by name, ending the
+ *              run, by default; with EPERM under --allow-unsupported-syscalls,
+ *              which this scenario reports.
+ *
+ *   copied-recvmsg-import  The parent opens /dev/urandom (a description
+ *              DBT promotes to its shared model at the fork) and forks a
+ *              holder, which takes LOCK_SH on it and sends it over a
+ *              socketpair; the parent closes its own copy and vforks, and the
+ *              copied child receives the description with recvmsg and unlocks
+ *              it. HERMIT/DBT ONLY: DBT refuses the copied child's recvmsg,
+ *              by name, ending the run by default; with EPERM under
+ *              --allow-unsupported-syscalls, which this scenario reports.
+ *
+ *   copied-native-locks  A copied vfork child queries an OFD lock with
+ *              F_OFD_GETLK and takes and drops a POSIX lock with F_SETLK. Both
+ *              stay native in a DBT copied child: neither changes an OFD or
+ *              flock lock the /proc/locks ledger records.
+ *
  *   holder     Take LOCK_EX|LOCK_NB, print, release. Deliberately minimal, so
  *              a record/replay driver can tell "replay re-took the kernel
  *              lock" from "replay only replayed the return value".
@@ -87,6 +122,9 @@
 
 /* Harness failure: something unrelated to flock semantics broke. */
 #define HARNESS_FAILURE 2
+
+/* argv[0], for a scenario that execs this program again. */
+static const char* self_path = NULL;
 
 /* argv[2], when present, overrides the lock file path. Hermit replaces guest
  * /tmp with a per-run isolated directory, so a driver that needs the host and
@@ -1300,6 +1338,241 @@ static int scenario_vfork_upgrade(int make_unknown, enum vfork_form form) {
   return 1;
 }
 
+enum pipe_lock {
+  PIPE_NEVER_LOCKED,
+  PIPE_LOCKED_BEFORE_FORK,
+  PIPE_LOCKED_AFTER_FORK,
+};
+
+/* A pipe, an ordinary fork whose child exits, then vfork + exec: the shape of
+ * `make -jN`, which creates its job pipes, forks a job, and later spawns
+ * another through vfork. `lock` adds a flock on the pipe before or after the
+ * fork, for the two negative controls. */
+static int scenario_pipe_fork_vfork(enum pipe_lock lock) {
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    printf("FAIL: pipe failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  if (lock == PIPE_LOCKED_BEFORE_FORK && flock(pipe_fds[0], LOCK_EX) != 0) {
+    printf("FAIL: LOCK_EX on the pipe was refused (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+
+  fflush(stdout);
+  pid_t fork_child = fork();
+  if (fork_child < 0) {
+    printf("FAIL: fork failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  if (fork_child == 0)
+    _exit(0);
+  int fork_status = 0;
+  if (waitpid(fork_child, &fork_status, 0) != fork_child ||
+      !WIFEXITED(fork_status) || WEXITSTATUS(fork_status) != 0) {
+    printf("FAIL: forked child did not exit 0 (status=%d)\n", fork_status);
+    return HARNESS_FAILURE;
+  }
+  if (lock == PIPE_LOCKED_AFTER_FORK &&
+      flock(pipe_fds[0], LOCK_EX | LOCK_NB) != 0) {
+    printf("FAIL: LOCK_EX|LOCK_NB on the pipe was refused (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+
+  fflush(stdout);
+  pid_t child = vfork();
+  if (child < 0) {
+    printf("FAIL: vfork failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  if (child == 0) {
+    execl(self_path, self_path, "exit-zero", (char*)NULL);
+    _exit(127);
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    printf("FAIL: vfork child did not exec and exit 0 (status=%d)\n", status);
+    return 1;
+  }
+  printf("flock-pipe-fork-vfork-ok lock=%d\n", (int)lock);
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
+  return 0;
+}
+
+/* The descriptor number the copied-pidfd-getfd holder locks, fixed so the
+ * parent's copied child can name it without another channel. */
+#define COPIED_PIDFD_HOLDER_FD 50
+
+static int scenario_copied_pidfd_getfd(void) {
+  const char* path = lock_path("copied-pidfd-getfd");
+  int gate[2];
+  int ready[2];
+  if (pipe(gate) != 0 || pipe(ready) != 0) {
+    printf("FAIL: pipe failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  fflush(stdout);
+  pid_t holder = fork();
+  if (holder < 0) {
+    printf("FAIL: fork failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  if (holder == 0) {
+    /* A fresh description, opened after the fork, so Detcore in the holder
+     * knows its mode: the blocking LOCK_SH leaves a held claim. */
+    close(gate[1]);
+    close(ready[0]);
+    int fd = open_lock(path);
+    char byte = 'r';
+    if (fd < 0 || dup2(fd, COPIED_PIDFD_HOLDER_FD) != COPIED_PIDFD_HOLDER_FD ||
+        flock(COPIED_PIDFD_HOLDER_FD, LOCK_SH) != 0 ||
+        write(ready[1], &byte, 1) != 1)
+      _exit(HARNESS_FAILURE);
+    /* Wait until the parent closes the gate. */
+    (void)read(gate[0], &byte, 1);
+    _exit(0);
+  }
+  close(gate[0]);
+  close(ready[1]);
+  char byte = 0;
+  if (read(ready[0], &byte, 1) != 1) {
+    printf("FAIL: holder did not take its lock\n");
+    return HARNESS_FAILURE;
+  }
+  int pidfd = (int)syscall(SYS_pidfd_open, holder, 0);
+  if (pidfd < 0) {
+    printf("FAIL: pidfd_open failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  fflush(stdout);
+  pid_t child = vfork();
+  if (child < 0) {
+    printf("FAIL: vfork failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  if (child == 0) {
+    int duplicate =
+        (int)syscall(SYS_pidfd_getfd, pidfd, COPIED_PIDFD_HOLDER_FD, 0);
+    if (duplicate >= 0) {
+      (void)flock(duplicate, LOCK_UN);
+      _exit(0);
+    }
+    _exit(errno == EPERM ? 10 : 3);
+  }
+  int status = 0;
+  (void)waitpid(child, &status, 0);
+  close(gate[1]);
+  (void)waitpid(holder, NULL, 0);
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 10) {
+    /* --allow-unsupported-syscalls: DBT answered EPERM without running it. */
+    printf("flock-copied-pidfd-getfd-refused errno=EPERM\n");
+    return 0;
+  }
+  printf(
+      "FAIL: copied vfork child reached pidfd_getfd (status=%d)\n", status);
+  return 1;
+}
+
+static int scenario_copied_recvmsg_import(void) {
+  int sockets[2];
+  int gate[2];
+  int ready[2];
+  int rng = open("/dev/urandom", O_RDONLY);
+  if (rng < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0 ||
+      pipe(gate) != 0 || pipe(ready) != 0) {
+    printf("FAIL: could not prepare the import scenario (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  fflush(stdout);
+  pid_t holder = fork();
+  if (holder < 0) {
+    printf("FAIL: fork failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  if (holder == 0) {
+    close(gate[1]);
+    close(ready[0]);
+    char byte = 'r';
+    if (flock(rng, LOCK_SH) != 0 || send_fd(sockets[1], rng) != 0 ||
+        write(ready[1], &byte, 1) != 1)
+      _exit(HARNESS_FAILURE);
+    /* Wait until the parent closes the gate. */
+    (void)read(gate[0], &byte, 1);
+    _exit(0);
+  }
+  close(gate[0]);
+  close(ready[1]);
+  char byte = 0;
+  if (read(ready[0], &byte, 1) != 1) {
+    printf("FAIL: holder did not lock and send its description\n");
+    return HARNESS_FAILURE;
+  }
+  /* Only the holder (and the message in flight) holds it now. */
+  close(rng);
+  fflush(stdout);
+  pid_t child = vfork();
+  if (child < 0) {
+    printf("FAIL: vfork failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  if (child == 0) {
+    int imported = receive_fd(sockets[0]);
+    if (imported >= 0) {
+      (void)flock(imported, LOCK_UN);
+      _exit(0);
+    }
+    _exit(errno == EPERM ? 10 : 3);
+  }
+  int status = 0;
+  (void)waitpid(child, &status, 0);
+  close(gate[1]);
+  (void)waitpid(holder, NULL, 0);
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 10) {
+    /* --allow-unsupported-syscalls: DBT answered EPERM without running it. */
+    printf("flock-copied-recvmsg-import-refused errno=EPERM\n");
+    return 0;
+  }
+  printf("FAIL: copied vfork child reached recvmsg (status=%d)\n", status);
+  return 1;
+}
+
+static int scenario_copied_native_locks(void) {
+  int fd = open_lock(lock_path("copied-native-locks"));
+  if (fd < 0) {
+    printf("FAIL: could not open the lock file (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  fflush(stdout);
+  pid_t child = vfork();
+  if (child < 0) {
+    printf("FAIL: vfork failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  if (child == 0) {
+    struct flock query = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    if (fcntl(fd, F_OFD_GETLK, &query) != 0 || query.l_type != F_UNLCK)
+      _exit(3);
+    struct flock posix = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    if (fcntl(fd, F_SETLK, &posix) != 0)
+      _exit(4);
+    posix.l_type = F_UNLCK;
+    if (fcntl(fd, F_SETLK, &posix) != 0)
+      _exit(5);
+    _exit(0);
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    printf("FAIL: copied child's native lock calls failed (status=%d)\n", status);
+    return 1;
+  }
+  printf("flock-copied-native-locks-ok\n");
+  close(fd);
+  return 0;
+}
+
 static int scenario_holder(void) {
   const char* path = lock_path("holder");
   int fd = lock_override != NULL ? open(path, O_RDONLY) : open_lock(path);
@@ -1325,6 +1598,7 @@ static int scenario_holder(void) {
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IOLBF, 0);
   const char* scenario = (argc > 1) ? argv[1] : "exclusion";
+  self_path = argv[0];
   if (argc > 2) {
     lock_override = argv[2];
   }
@@ -1390,6 +1664,27 @@ int main(int argc, char** argv) {
   }
   if (strcmp(scenario, "clone3-files-process") == 0) {
     return scenario_clone_files_process(CLONE3_FILES_SYSCALL);
+  }
+  if (strcmp(scenario, "pipe-fork-vfork") == 0) {
+    return scenario_pipe_fork_vfork(PIPE_NEVER_LOCKED);
+  }
+  if (strcmp(scenario, "locked-pipe-fork-vfork") == 0) {
+    return scenario_pipe_fork_vfork(PIPE_LOCKED_BEFORE_FORK);
+  }
+  if (strcmp(scenario, "pipe-fork-locked-vfork") == 0) {
+    return scenario_pipe_fork_vfork(PIPE_LOCKED_AFTER_FORK);
+  }
+  if (strcmp(scenario, "copied-pidfd-getfd") == 0) {
+    return scenario_copied_pidfd_getfd();
+  }
+  if (strcmp(scenario, "copied-recvmsg-import") == 0) {
+    return scenario_copied_recvmsg_import();
+  }
+  if (strcmp(scenario, "copied-native-locks") == 0) {
+    return scenario_copied_native_locks();
+  }
+  if (strcmp(scenario, "exit-zero") == 0) {
+    return 0;
   }
   if (strcmp(scenario, "holder") == 0) {
     return scenario_holder();

@@ -21,25 +21,28 @@ backend-parity-c bucket was folded into c-programs,
 https://github.com/rrnewton/hermit/issues/3301)
 separate calibrated blocking cells from discoverable migration inventory. CI
 creates one independently schedulable run node for every bucket.
-Seven buckets currently contain calibrated blocking workloads:
+Every bucket now contains blocking workloads. Counted on 2026-10-15 as rows
+with at least one mode whose `ci` is true for some backend:
 
-- `system-utils.yaml`
-- `data-handling.yaml`
-- `determinism-stress.yaml`
-- `language-runtimes.yaml`
-- `applications.yaml`
-- `c-programs.yaml` (eight calibrated Buck-derived C probes)
-- `compat.yaml` (the 189-program strict compatibility corpus, written as a
-  `corpus` section; five of its rows are diagnostics; it also holds the
-  `sabre-compat-only` run type's SaBRe cells and its 27 extra rows, and the
-  `strict-compat-only` run type's 193 strict variant tests)
+- `c-programs.yaml`: 283 of its 284 Buck-derived C guests;
+- the other six C buckets (`bin-c`, `chaos-c`, `debugger-c`,
+  `determinism-stress-c`, `shared-futex-c`, `util-c`): 17 of 20 rows;
+- `system-utils.yaml` 39 of 39, `language-runtimes.yaml` 19 of 19,
+  `data-handling.yaml` 6 of 6, `determinism-stress.yaml` 6 of 6 and
+  `applications.yaml` 5 of 6;
+- `compat.yaml`: the 189-program strict compatibility corpus, written as a
+  `corpus` section. Five of its rows are diagnostics. 63 of its rows also
+  have a verify cell on liteinst and on in-guest-trap that the full run type
+  runs (`additional`). It also holds the `sabre-compat-only` run type's SaBRe
+  cells and its 27 extra rows, and the `rr-compat-only` run type's 139 replay
+  cells. Each row is one test: its ptrace verify cell runs at the host's
+  strictness level, below.
 
-Eight additional `*-c.yaml`/`c-programs.yaml` buckets make 180 more C guests
-centrally discoverable. Eight `c-programs.yaml` entries have calibrated
-standalone build and output contracts and run in blocking CI; the remaining
-172 C guests keep `ci = false` until they are calibrated. Buckets without a
-calibrated cell still have a CI node that intentionally reports zero cells,
-and the correspondence audit proves that this cannot hide a calibrated cell.
+These counts go stale as cells are enabled; the YAML is the authority, and
+`ci/optional-e2e-cells.txt` lists the enabled `ci = false` cells. A bucket
+without a calibrated cell would still have a CI node that intentionally
+reports zero cells, and the correspondence audit proves that this cannot hide
+a calibrated cell.
 Every entry still declares all five modes and every backend exclusion, so
 inventory does not silently imply support.
 
@@ -48,7 +51,7 @@ inventory does not silently imply support.
 Compatibility coverage enters through these shared schema-v3 manifests, not
 through a backend-owned guest list. Every test declares all five modes, and
 every non-naked mode partitions the complete `ptrace`, `dbt`, `kvm`, `sabre`,
-and `liteinst` axis into enabled cells and explicit gaps. Any active mode must
+`liteinst` and `in-guest-trap` axis into enabled cells and explicit gaps. Any active mode must
 include ptrace so the reference behavior is established before another backend
 ratchets it.
 
@@ -105,8 +108,9 @@ command. Program extensions select the runner:
 tables: `verify`, `chaos`, `replay`, `naked`, and `custom`. Each table has a
 `backends_enabled` list and a `backends_disabled` table. The two must form a
 complete, disjoint partition and every disabled backend needs a nonempty WHY.
-For non-naked modes the axis is `ptrace`, `dbt`, `kvm`, `sabre`, and
-`liteinst`; naked partitions only `native`.
+For non-naked modes the axis is `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`,
+and `in-guest-trap` (in-guest LiteInst with syscall site patching off, a
+column of its own); naked partitions only `native`.
 
 ```yaml
 test:
@@ -120,6 +124,7 @@ test:
           kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its compatibility partition
+          in-guest-trap: in-guest-trap coverage is tracked apart from liteinst
 ```
 
 
@@ -131,7 +136,12 @@ Most tokens are descriptive prerequisites only and can never suppress a cell.
 The sole current host capability mapping is `cpuid` to `cpuid-faulting`.
 Independently of `requires`, a `kvm` backend cell needs the `kvm` capability:
 a missing `/dev/kvm` (ENOENT) is proof of absence even when the CPU advertises
-vmx or svm, which is what RE workers and containers show.
+vmx or svm, which is what RE workers and containers show. Likewise a
+`liteinst` or `in-guest-trap` backend cell needs `cpuid-faulting`: the in-guest
+LiteInst runtime arms CPUID faulting before the guest's first instruction and
+refuses to start without it, and RE workers and GitHub-hosted runners may lack
+it. Each such cell's plan row names the capability, which also keeps the Buck
+cell generator from routing it to RE (`ci/buck-e2e/defs.bzl`).
 One descriptive token is enforced at load time: a verify golden that prints
 the vDSO getrandom leg (`vdso-getrandom[`) can only be produced on a host
 kernel that exports `__vdso_getrandom` (Linux 6.11+ on x86-64), so its test
@@ -183,9 +193,15 @@ and `E2E_FIXTURE_DIR` name those paths and a prepared program runs as
 `/tmp/e2e/fixtures/program`. Every backend's guest therefore sees the same
 strings, which the parity post-pass requires before it reports a
 comparison's `credit` rather than its `unequalized_credit`
-(<https://github.com/rrnewton/hermit/issues/3301>). dbt refuses `--bind`, so a
-dbt guest, and a guest in any other mode, sees the host paths. Read these
-directories through the variables rather than assuming either form.
+(<https://github.com/rrnewton/hermit/issues/3301>). The parity population is
+the verify matrix itself, with no selection file: every test whose ptrace
+`verify` cell full validation selects, on every candidate backend (dbt,
+in-guest-trap, kvm, liteinst and sabre). A candidate whose `verify` cell is disabled, not selected,
+red or missing scores 0 and is counted; only a test whose ptrace run left no
+golden is left out, and counted apart. `ci/compat-envelope/parity-cells.json`
+snapshots it. A guest in any other mode
+sees the host paths. Read these directories through the variables rather
+than assuming either form.
 
 `ci` may also be a mapping when enabled backends have different validation
 status. The mapping must name every enabled backend and no disabled backend.
@@ -256,7 +272,7 @@ exporter look up the requested backend's arguments exactly, without inheriting
 another backend's arguments; an omitted backend receives no guest arguments.
 The exporter uses JSON Lines so empty strings, tabs, newlines, and explicitly
 empty vectors retain their exact argument boundaries.
-The only valid backend for `naked` is `native`; other modes accept only the five
+The only valid backend for `naked` is `native`; other modes accept only the six
 Hermit backends.
 
 A verify cell whose guest ends unsuccessfully on purpose declares exactly how it
@@ -330,8 +346,8 @@ https://github.com/rrnewton/hermit/blob/82e24cc0e6fac0f7f9a8dac4b4b25d9ad8e3231d
 The matrix compared the
 stdout of three `--strict` runs with one attempt. A verify cell compares two
 runs, their stdout and their recorded event streams, and like every manifest
-cell a failed attempt is retried once; a passing retry passes the cell and the
-failed attempt's row is kept in the results.
+cell but a replay cell a failed attempt is retried once; a passing retry passes
+the cell and the failed attempt's row is kept in the results.
 
 A `verify` mode may also declare, for a test whose recorded policy runs one
 specific configuration:
@@ -353,10 +369,22 @@ specific configuration:
   `--no-virtualize-cpuid` and `--max-timeslice=VALUE` are accepted. Each
   relaxes determinism, so a non-empty `hermit_args_reason` is required and
   every flag is recorded, with that reason, in the result row's
-  `relaxations`.
+  `relaxations`. `hermit_args_reason` is one string for every backend's
+  flags, or a mapping that names exactly the backends of `hermit_args`, each
+  with its own reason, so each cell records only its own.
 - `env` adds guest variables as `--env NAME=VALUE` after the runner's fixed
   guest environment; a name the runner sets (`HOME`, `TZ`, `LC_ALL`, ...) is
-  refused.
+  refused. Only a verify or a replay mode accepts it. A replay cell that does
+  not declare `env` inherits its verify cell's; one that does, an empty
+  mapping included, records with exactly the variables it declares.
+- `env_by_backend` adds guest variables only on its named enabled backend,
+  merged with common `env`. Only verify recipes may declare it. Empty backend
+  maps, names already in common `env`, invalid names or NUL values, and
+  runner-owned names are refused. Replay inherits the effective verify
+  environment unless it declares its own `env`, including an empty mapping.
+  The effective `--env` arguments are retained in invocation evidence; exact
+  manifest bytes, including these settings, remain covered by the manifest
+  digest. The guest source/direct-command digest keeps its existing scope.
 - `comparator: stripped` runs Hermit's default `--verify` comparison instead of
   `--verify-strict`. It is below L2. The cell passes only on a verified,
   matched report that compared a non-empty stripped event stream on both
@@ -389,6 +417,43 @@ specific configuration:
   Because the ledger keeps the failure out of `passed_tests`, a run with a
   diagnostic failure is not a qualifying receipt.
 
+### Strictness level: one run per test
+
+Every test runs once per validation, at the deepest strictness level the host
+and the cell allow:
+
+- **strict** on a host with CPUID faulting whose Hermit reports an exact
+  retired-branch counter (`hermit host-capabilities`): no relaxation, so CPUID
+  virtualization and the preemption timer stay on.
+- **relaxed** on any other host, or anywhere when `E2E_STRICTNESS_LEVEL=relaxed`
+  is set: a verify cell on ptrace or e9patch adds `--no-virtualize-cpuid
+  --max-timeslice=disabled`, which is what lets `hermit run --strict` run there
+  (without the preemption timer it does not refuse an inexact counter). Nothing
+  can make a host without the capabilities run the strict level.
+
+Only a verify cell on ptrace or e9patch, the backends whose virtual clock reads
+the host's branch counter, has a relaxed form. Every other cell runs as
+declared, and a chaos or replay cell that needs the counter is still
+`HOST-INAPPLICABLE` on a host without it. `test-harness run` prints the level it
+chose and why.
+
+A verify mode that does not depend on preemption or CPUID virtualization may cap
+itself at the relaxed level, so it never has a strict form on any host:
+
+```yaml
+      verify:
+        max_level: relaxed
+        max_level_reason: Prints a constant; no schedule or CPUID value reaches it
+```
+
+`max_level` accepts only `relaxed`, needs a non-empty `max_level_reason`, and
+needs a ptrace or e9patch backend in `backends_enabled`. Each flag the relaxed
+level adds is recorded in the row's `relaxations` with its reason (the cap's, or
+the host's), and every row records how its cell ran in `strictness`:
+`{"level": "strict"|"relaxed", "virtualize_cpuid": bool, "max_timeslice":
+"disabled"|<nanoseconds>, "capped": bool}`. A row without `strictness` is a row
+written before it existed; readers must not infer the level from the host.
+
 A bucket whose tests share one recipe may state it once in a `corpus` section
 instead of a `test` list (`compat.yaml` is the one such bucket).
 `ci/manifest-plan/src/manifest_corpus.rs` expands every row into an ordinary
@@ -402,31 +467,68 @@ on one more backend to every row except those its `except` names (each with
 the reason that backend is disabled there), labelled with a run type (below),
 so the default run type does not run it; it shares the section's verify
 settings except `hermit_args`, which stay on the section's backend. Each
-`variants` entry adds one more test per row except those its `except` groups
+`additional` entry adds a verify cell on one more backend to the rows its
+`rows` names, which the default (full) run type does run: it carries none of
+the row's run-type labels, has the global default budget, shares the
+section's environment, comparator and `no_retry_reason`, is never a
+diagnostic, and takes the entry's own `hermit_args` and `hermit_args_reason`,
+which join the mode's per-backend `hermit_args` (and, when the flagged cells'
+reasons differ, a per-backend `hermit_args_reason`). Every other row disables
+that backend with the entry's `disabled_reason`, or with its own reason in the
+entry's `disabled`. An additional backend may not be the section's backend or
+a focused one. An entry's optional `row_env` maps row labels from its enabled
+`rows` to nonempty environment additions for that row on that backend alone.
+It expands to `env_by_backend` without changing common `env`, sibling rows,
+other backends or generated strict variants; unknown or disabled rows refuse.
+`replay` gives every row except those its `except` groups name (each group
+with its reason) a replay cell on ptrace in the row's own test (`hermit record
+start` then replay, compared by the harness), labelled with the section's run
+type so the default run type does not run it, with the section's budget and
+`slow_reason`, an empty `env`, so it does not inherit the verify cell's
+`TMPDIR`, and none of the verify settings: no `hermit_args`, comparator,
+`no_retry_reason` or diagnostic. Its `unselected` lists the replay cells
+measured red. Each `variants` entry adds one more test per row except those its `except` groups
 name (each group with its reason): id `<bucket>/<id_prefix><id or label>`,
 labelled with the entry's run type, with one verify cell on the section's
 backend that keeps the section's environment and comparator but takes its
 `hermit_args` (none unless stated), budget, `slow_reason` and
 `no_retry_reason` from the entry and is never a diagnostic; the entry's own
-`unselected` lists its cells measured red. An entry with `mode: replay`
-instead gives each test one replay cell on ptrace (`hermit record start`
-then replay, compared by the harness), with the entry's budget and
-`slow_reason` but no `hermit_args`, environment, comparator or
-`no_retry_reason`, which a replay cell does not take; the default is
-`mode: verify`. A row's own
-`labels` put all of its cells in those run types. `unselected` lists cells
+`unselected` lists its cells measured red. A row's own `labels` put its
+verify cells in those run types, and not its replay cell, which carries only
+the `replay` section's run type. `unselected` lists cells
 measured red: each stays enabled with `ci: false` and a `ci_disabled_reason`
 carrying the class's `result`, `evidence` (an issue) and `reason`. A row's
 `argv` is a `direct` argv list, run without a shell; in it `{{ROOT_DIR}}` is
 the repository root and `{{VALIDATE_RUN_STATE}}` the validation's per-run state
-directory (`$VALIDATE_RUN_STATE`). A row that names the latter is refused, not
-run with the literal text, when the variable is unset, and any other `{{...}}`
-token is refused outright.
+directory (`$VALIDATE_RUN_STATE`). A row that names the latter is refused when
+that variable is unset. `{{XDG_CONFIG_HOME}}` names the cell's prepared copy of
+`tests/e2e/xdg-config`; verify equalizes it to `/tmp/e2e/xdg-config`, while replay
+keeps the cell's host path. A caller without cell context refuses that token.
+`readlink -f` and `realpath` canonicalize its existing nested `git/config` file,
+retaining ancestor stat coverage without shared Buck or run-state ancestors.
+Rerunnable shell commands assign their prepared cell path before expanding this
+token, so an unset or unrelated ambient XDG directory cannot change the operand.
+Any other `{{...}}` token is refused outright.
 
 A verify mode may declare `no_retry_reason`: the cell then gets one attempt
 instead of the runner's retry after a product failure, so a first-attempt
 failure stays a failure. `compat.yaml` declares it because each of its programs
 ran once per validation as its own node before the corpus moved here.
+A replay cell never gets that retry and takes no `no_retry_reason`: its
+product failure is a replay that diverged from its recording, or a recording
+that did not complete, and a fresh recording on a second attempt does not
+answer for the first.
+
+A test may carry `proc: standard` (or `proc: minimal`), the `/proc` level
+every Hermit cell of the test runs its guest at. The runner writes
+`--proc=<level>` right after `--strict` in verify, chaos and replay cells, and
+first among a custom cell's arguments. A test without the key runs at Hermit's
+default, `minimal`. Declare `standard` for a guest that reads a system-wide
+name only that level has (`/proc/vmstat`, `/proc/interrupts`, `/proc/locks`,
+the `/proc/sys/fs` counters and the rest of `detcore/src/procfs/levels.rs`'s
+`STANDARD` table). A level decides which names exist, so it is not a
+relaxation and is not recorded as one. A corpus row takes the same key and
+passes it to every test it expands to.
 
 A test may carry `labels` (lowercase words joined by `-`, unique), naming the
 run types it belongs to, and a non-naked mode may carry `labels` per enabled
@@ -535,6 +637,17 @@ inventory is mechanically complete.
 `ci/expected-e2e-plan.json` ratchets the exact blocking cells. Adding, removing,
 or reclassifying a `ci=true` cell fails validation until the expected plan is
 updated in the same review.
+
+To flip a cell (make an existing manifest cell required, or stop requiring it),
+edit only the manifest, then run `ci/sync-cell-config.sh`. It regenerates every
+file derived from the manifests: `ci/expected-e2e-plan.json`,
+`ci/optional-e2e-cells.txt` (the enabled `ci = false` cells),
+`ci/compat-envelope/parity-cells.json`, `SCORECARD.md`,
+`ci/compat-envelope/cells.json` and `ci/dag/validate.json`.
+Commit them with the manifest; the diff of the expected plan, and of the
+optional-cell inventory for a `ci = false` cell, is the record of the change. `ci/sync-cell-config.sh --check` writes nothing and fails on any
+drift, and validation runs the same checks
+(https://github.com/rrnewton/hermit/issues/3606).
 
 A `ci = false` cell is never executed **and never compiled** by ordinary
 validation, so its guest can

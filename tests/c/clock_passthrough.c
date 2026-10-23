@@ -88,11 +88,7 @@ int main(void) {
   errno = 0;
   long null_tp = syscall(SYS_clock_gettime, CLOCK_REALTIME, NULL);
   if (null_tp != -1 || errno != EFAULT) {
-    fprintf(
-        stderr,
-        "clock_gettime(NULL) returned %ld: %s\n",
-        null_tp,
-        strerror(errno));
+    fprintf(stderr, "clock_gettime(NULL) returned %ld: %s\n", null_tp, strerror(errno));
     return 1;
   }
   read_clock("after_null_tp", CLOCK_MONOTONIC);

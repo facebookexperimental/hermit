@@ -81,7 +81,7 @@ jobs:
 
       - name: Build the release hermit binary
         shell: bash
-        run: cargo build --release -p hermit --bin hermit
+        run: cargo build --release -p hermit-run --bin hermit
 
       - name: Boot Linux under Hermit (--strict --verify)
         shell: bash

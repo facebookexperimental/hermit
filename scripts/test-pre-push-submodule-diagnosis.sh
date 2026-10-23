@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Both directions of the pre-push hook's "could not check" vs "does not compile"
 # distinction, with no cargo run: the checker is stubbed so only the hook's own
 # branch selection is under test.

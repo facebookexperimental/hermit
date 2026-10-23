@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Read a current `--verify-json` file through Hermit's producer-owned type.
 //!
 //! Shell and Python tests call this instead of maintaining their own accepted
@@ -64,6 +56,11 @@ fn no_result_detail(report: &VerificationReport) -> String {
             "the first run was rejected: exit_code={exit_code:?} signal={signal:?} stdout_bytes={stdout_bytes} stderr_bytes={stderr_bytes}"
         ),
         Some(NoResultReason::ComparisonRefused { detail }) => detail.clone(),
+        Some(NoResultReason::RunFailed {
+            run,
+            failure,
+            detail,
+        }) => format!("{run:?} failed ({}): {detail}", failure.as_str()),
         None => "the producer recorded no specific no-result cause".into(),
     }
 }

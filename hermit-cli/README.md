@@ -89,20 +89,22 @@ before changing the host's perf policy.
 
 ```sh
 hermit run -- /bin/echo hello
-hermit run --strict -- /bin/echo hello
-hermit run --strict --verify --verify-strict -- /bin/echo reproducible < /dev/null
+hermit run --strict --epoch=2026-01-01T00:00:00Z -- /bin/echo hello
+hermit run --strict --epoch=2026-01-01T00:00:00Z --verify --verify-strict -- /bin/echo reproducible < /dev/null
 ```
 
-`--strict` selects strict launch behavior. `--verify-strict` selects the full
-canonical observation comparison; ordinary `--verify` uses a weaker diagnostic
-comparison. Hermit does not make a changing filesystem or external network
-reproducible; provide stable inputs for repeatability checks.
+`--strict` selects strict launch behavior and requires every input of the run
+on the command line: it refuses a run that would take its virtual-time epoch
+from the host clock, so pass `--epoch` or set `HERMIT_EPOCH`. `--verify-strict`
+selects the full canonical observation comparison; ordinary `--verify` uses a
+weaker diagnostic comparison. Hermit does not make a changing filesystem or
+external network reproducible; provide stable inputs for repeatability checks.
 
-Virtual time starts at the current host time captured once for the invocation.
-Hermit reports the exact epoch and `reproduce with --epoch=...` on stderr, or in
-the selected `--log-file`. Reuse that epoch and the same seed for time-dependent
-reproduction. Explicit `--epoch` and `HERMIT_EPOCH` values are preserved;
-`--seed` defaults to 0. See the
+Without `--strict` and without an epoch, virtual time starts at the current
+host time captured once for the invocation. Hermit reports the exact epoch and
+`reproduce with --epoch=...` on stderr, or in the selected `--log-file`. Reuse
+that epoch and the same seed for time-dependent reproduction. Explicit
+`--epoch` and `HERMIT_EPOCH` values are preserved; `--seed` defaults to 0. See the
 [virtual-time behavior notes](https://github.com/rrnewton/reverie/issues/946).
 
 ## Record and replay

@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """GitHub Actions adapter for the maintained, source-pinned website builder.
 
 Python keeps this adapter on the existing builder/publisher API. It contains no
@@ -36,9 +30,6 @@ PUBLIC_FILES = (
     "assets/site.js",
     "data/site-manifest.json.gz",
     "data/site-summary.json.gz",
-    "data/cells.json.gz",
-    "data/runs.json.gz",
-    "data/tests.json.gz",
 )
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / ".github/scripts/publish-compatibility-site.py"
@@ -145,8 +136,14 @@ def configuration(path=CONFIG):
     if (
         not isinstance(value, dict)
         or set(value)
-        != {"schema", "parent_repository", "parent_commit", "hermit_commit"}
-        or value["schema"] != 1
+        != {
+            "schema",
+            "parent_repository",
+            "parent_commit",
+            "hermit_commit",
+            "retention",
+        }
+        or value["schema"] != 2
         or value["parent_repository"] != "rrnewton/dev-hermit"
         or any(
             not isinstance(value[key], str)
@@ -156,6 +153,22 @@ def configuration(path=CONFIG):
     ):
         raise ValueError(
             "website builder requires exact reviewed parent and Hermit source commits"
+        )
+    # The publisher applies the retention rule, so ask it whether it accepts
+    # this block before an expensive rebuild reaches publication. One function
+    # (load_retention in the publisher) decides; this adapter keeps no copy.
+    checked = subprocess.run(
+        [sys.executable, str(HELPER), "check-retention", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+    )
+    if checked.returncode != 0:
+        reason = checked.stderr.strip().splitlines() or ["no reason given"]
+        raise ValueError(
+            "website builder retention settings are refused by the publisher: "
+            + reason[-1]
         )
     return value
 
@@ -196,6 +209,93 @@ def require_sources(parent, config):
     if git(ledger, "config", "--get", "remote.origin.url") != LEDGER:
         raise ValueError("cell ledger origin is not the existing canonical repository")
     return ledger
+
+
+# The builder reads the cell ledger at one commit (ls-tree and cat-file of that
+# tree) plus, for the parity panel, the commit its scorecard/parity.json
+# summarized and that commit's ancestry. It never walks older history, and the
+# full ledger history no longer fits the workflow's clone budget: on
+# https://github.com/rrnewton/hermit/actions/runs/38167459473 the full-history
+# submodule clone ran past its 15-minute step timeout (1,358 commits, 44 GB as
+# a local repository on 2026-10-11, 121 commits that day). So the ledger is
+# fetched at depth 1 and deepened only until the summarized commit is an
+# ancestor, a few commits in practice.
+# 2,700 s since 2026-10-12. The depth-1 fetch of the published commit was
+# done in the workflow's prepare step until hermit afa00a30, and took 527,
+# 592 and 793 s there on the runs that finished (it then timed out at 900 s on
+# three runs); fetched here it ran past the old 1,200 s on
+# https://github.com/rrnewton/hermit/actions/runs/38256949845. The fetch moves
+# about 711 MiB at a GitHub serving rate near 1 MB/s; its bytes shrink by the
+# scorecard history parts (265.9 MiB of the pack at ledger f8361f72) once
+# those leave the ledger's main branch (dev-hermit option (a),
+# https://github.com/rrnewton/dev-hermit/issues/558). The rebuild step's own
+# 180-minute bound holds the fetch, the 36-42 minute build and the upload.
+LEDGER_FETCH_TIMEOUT = 2700
+LEDGER_DEEPEN_STEP = 50
+LEDGER_DEEPEN_LIMIT = 2000
+# The ref naming the published commit this run fetched, kept for the next run
+# (docs.yml caches the ledger repository across runs).
+LEDGER_CACHE_REF = "refs/cache/published"
+
+
+def _parity_summary_commit(ledger, ledger_commit):
+    """The series_commit scorecard/parity.json at ledger_commit names, if any."""
+    try:
+        text = run(
+            ["git", "--no-replace-objects", "-C", ledger, "show",
+             f"{ledger_commit}:scorecard/parity.json"]
+        )
+        value = json.loads(text)["generated_from"]["series_commit"]
+    except (subprocess.CalledProcessError, ValueError, KeyError, TypeError):
+        return None  # the builder reports a missing or malformed summary itself
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) else None
+
+
+def _is_ancestor(ledger, ancestor, descendant):
+    result = subprocess.run(
+        ["git", "--no-replace-objects", "-C", str(ledger), "merge-base",
+         "--is-ancestor", ancestor, descendant],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+    )
+    return result.returncode == 0
+
+
+def _history_complete(ledger, ledger_commit, depth):
+    """Whether the fetch at DEPTH already reached ledger_commit's root commit.
+
+    After the ledger's main is squashed to one snapshot commit
+    (https://github.com/rrnewton/dev-hermit/issues/562), a parity summary
+    written before the squash names a commit that is in no history this fetch
+    can reach, and deepening further only repeats the fetch.
+    """
+    try:
+        count = int(run(["git", "--no-replace-objects", "-C", ledger, "rev-list", "--count",
+                         ledger_commit]))
+    except (subprocess.CalledProcessError, ValueError):
+        return False
+    return count < depth
+
+
+def fetch_ledger(ledger, ledger_commit):
+    """Fetch ledger_commit and only the history the builder reads."""
+    fetch = ["git", "-C", ledger, "fetch", "--no-tags", "--no-recurse-submodules"]
+    depth = 1
+    run([*fetch, "--depth", str(depth), "origin", ledger_commit], timeout=LEDGER_FETCH_TIMEOUT)
+    summarized = _parity_summary_commit(ledger, ledger_commit)
+    while (
+        summarized not in (None, ledger_commit)
+        and not _is_ancestor(ledger, summarized, ledger_commit)
+        and depth < LEDGER_DEEPEN_LIMIT
+        and not _history_complete(ledger, ledger_commit, depth)
+    ):
+        # Past the limit the builder still refuses only the parity panel,
+        # naming the summarized commit it could not place.
+        depth += LEDGER_DEEPEN_STEP
+        run([*fetch, "--depth", str(depth), "origin", ledger_commit], timeout=LEDGER_FETCH_TIMEOUT)
+    # The workflow caches this repository; the next run's fetch offers this
+    # commit as already present and downloads only what changed since.
+    run(["git", "-C", ledger, "update-ref", LEDGER_CACHE_REF, ledger_commit])
+    return depth
 
 
 def published_registry(scratch):
@@ -293,36 +393,112 @@ def asset_id(release, pin, name, sha, size):
     return assets[0]["id"]
 
 
+# A release asset upload is bounded by the asset's size, not by run()'s 120 s
+# default. The self-hosted rebuild of
+# https://github.com/rrnewton/hermit/actions/runs/38287816650 built the whole
+# website and then lost it to `gh release create` with both assets attached,
+# killed at 120 s while uploading the archive (hundreds of MB, at an egress
+# rate near 20 MB/min that afternoon). Each attempt gets 300 s plus the time
+# the asset takes at 200 kB/s.
+UPLOAD_FLOOR_BYTES_PER_SECOND = 200_000
+UPLOAD_ATTEMPTS = 3
+
+
+def upload_timeout(size):
+    return 300 + size // UPLOAD_FLOOR_BYTES_PER_SECOND
+
+
+def upload_asset(release, pin, path, sha, size):
+    """Upload one asset until the release holds exactly these bytes.
+
+    An asset already uploaded is never replaced: different bytes are refused
+    by asset_id. Only an asset an interrupted upload left in another state is
+    replaced (--clobber). A failed or timed-out attempt is judged by the
+    release it leaves, read back, not by gh's exit status.
+    """
+    for attempt in range(UPLOAD_ATTEMPTS + 1):
+        present = [item for item in release.get("assets", []) if item["name"] == path.name]
+        if present and all(item.get("state") == "uploaded" for item in present):
+            asset_id(release, pin, path.name, sha, size)
+            return release
+        if attempt == UPLOAD_ATTEMPTS:
+            break
+        args = ["release", "upload", pin["tag"], path, "--repo", REPOSITORY]
+        if present:
+            args.append("--clobber")
+        try:
+            run(["gh", *args], timeout=upload_timeout(size))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            print(
+                f"release asset {path.name} upload attempt {attempt + 1} of "
+                f"{UPLOAD_ATTEMPTS} failed: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        release = release_by_tag(pin["tag"])
+        if release is None:
+            raise ValueError("release disappeared while its assets were uploaded")
+    raise ValueError(
+        f"release asset {path.name} did not upload in {UPLOAD_ATTEMPTS} attempts"
+    )
+
+
+# The release's tag is made on the default branch's head, not on the builder's
+# Hermit commit. GitHub refuses the workflow token (GITHUB_TOKEN, which can
+# never hold the workflows permission) a new tag whose commit's
+# .github/workflows differ from the default branch's: `gh release create
+# --target <builder Hermit commit>` got "HTTP 403: Resource not accessible by
+# integration" on https://github.com/rrnewton/hermit/actions/runs/38300990871,
+# where docs.yml had changed after that commit (2a258a17 against main
+# f1e2a1b1, 2026-10-12), while the 10-11 releases, whose target commits had
+# main's workflows, were made. The builder's Hermit commit is named in the
+# release notes instead, and stays in the registry entry.
+RELEASE_TARGET = "main"
+
+
 def publish_release(pin, archive, registry, ledger_commit, hermit_commit):
-    """Create stable data assets without replacing any existing published bytes."""
+    """Create stable data assets without replacing any existing published bytes.
+
+    The release is created without assets, which takes seconds, and each asset
+    is uploaded on its own (upload_asset), so a run that stops part way leaves
+    a release the next run with the same build completes instead of refusing.
+    """
     tag = pin["tag"]
     registry_bytes = registry.read_bytes()
     registry_sha = hashlib.sha256(registry_bytes).hexdigest()
     release = release_by_tag(tag)
     if release is None:
-        gh(
-            "release",
-            "create",
-            tag,
-            "--repo",
-            REPOSITORY,
-            "--target",
-            hermit_commit,
-            "--latest=false",
-            "--title",
-            pin["release_title"],
-            "--notes",
-            "Website rebuilt from existing cell ledger "
-            + ledger_commit
-            + ". This rebuild did not run Hermit tests or refresh measurement dates.",
-            archive,
-            registry,
-        )
+        try:
+            gh(
+                "release",
+                "create",
+                tag,
+                "--repo",
+                REPOSITORY,
+                "--target",
+                RELEASE_TARGET,
+                "--latest=false",
+                "--title",
+                pin["release_title"],
+                "--notes",
+                "Website rebuilt from existing cell ledger "
+                + ledger_commit
+                + " by the website builder at Hermit "
+                + hermit_commit
+                + ". This rebuild did not run Hermit tests or refresh measurement dates.",
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            # A create that failed may still have made the release; the
+            # lookup below decides.
+            print(f"release create failed: {error}", file=sys.stderr, flush=True)
         release = release_by_tag(tag)
+        if release is None:
+            raise ValueError("release creation failed; no release exists for its tag")
+    release = upload_asset(
+        release, pin, archive, pin["archive_sha256"], pin["archive_bytes"]
+    )
+    release = upload_asset(release, pin, registry, registry_sha, len(registry_bytes))
     asset_id(release, pin, archive.name, pin["archive_sha256"], pin["archive_bytes"])
-    if not any(item["name"] == registry.name for item in release["assets"]):
-        gh("release", "upload", tag, registry, "--repo", REPOSITORY)
-        release = release_by_tag(tag)
     return asset_id(release, pin, registry.name, registry_sha, len(registry_bytes))
 
 
@@ -346,18 +522,7 @@ def rebuild(parent, scratch, receipt, *, ledger_commit, validation_history_commi
         )
     # Fetch objects/ref only: moving the ledger submodule HEAD would dirty the
     # immutable parent reader. Capture one commit for every subsequent read.
-    run(
-        [
-            "git",
-            "-C",
-            ledger,
-            "fetch",
-            "--no-tags",
-            "--no-recurse-submodules",
-            "origin",
-            ledger_commit,
-        ]
-    )
+    fetch_ledger(ledger, ledger_commit)
     if git(ledger, "rev-parse", ledger_commit + "^{commit}") != ledger_commit:
         raise ValueError(
             "fetched cell ledger differs from its captured commit; rerun the workflow capture steps"

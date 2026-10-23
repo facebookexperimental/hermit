@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Reading /proc/sys/kernel/random/uuid makes the *kernel* format a fresh
 # version-4 UUID from its CSPRNG on every read and return it as file content.
 # This is a distinct entropy channel from getrandom(2)/libuuid (uuidgen-random)

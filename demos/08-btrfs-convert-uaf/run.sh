@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Demo 8: a real, schedule-dependent use-after-free in btrfs-convert.
 #
 # btrfs-convert runs a background "progress" thread that reads a shared
@@ -16,8 +10,12 @@
 # crashing interleaving on specific seeds and reproduced the crash in every run
 # counted in README.md.
 #
-# The demo runs AddressSanitizer builds of two btrfs-convert variants: `buggy`
-# (before 73e211a7) and `fixed` (73e211a7). It reports what one native buggy run
+# The demo runs AddressSanitizer builds of two btrfs-convert variants. Both are
+# btrfs-progs v7.1 with the demo's own shutdown code for the progress thread,
+# not the upstream code before or at 73e211a7 (README.md, "How it works"):
+# `buggy` returns from task_stop() without joining the detached thread, as the
+# code before 73e211a7 did, and `fixed` joins the thread before its data is
+# freed, as 73e211a7 does. The demo reports what one native buggy run
 # showed, then shows that the chaos buggy run crashes on a known seed, the chaos
 # fixed run on the same seed is clean, and a second run of the seed prints the
 # same complete AddressSanitizer report, byte for byte, from its ERROR line

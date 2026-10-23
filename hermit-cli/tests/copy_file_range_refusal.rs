@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -15,7 +18,10 @@ fn copy_file_range_refusal_is_deterministic() {
         .parent()
         .expect("hermit-cli should be inside the repository");
     let source = repository.join("tests/c/copy_file_range_refusal_probe.c");
-    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join("copy-file-range-refusal-probe");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "copy-file-range-refusal-probe-{}",
+        std::process::id()
+    ));
 
     let compile = Command::new("cc")
         .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
@@ -30,22 +36,23 @@ fn copy_file_range_refusal_is_deterministic() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    let verify = Command::new("timeout")
-        .args(["--kill-after", "5s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=info",
-            "--backend=ptrace",
-            "run",
-            "--strict",
-            "--verify",
-            "--panic-on-unsupported-syscalls",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(guest)
-        .output()
-        .expect("failed to run copy_file_range refusal probe");
+    let verify = hermit_test::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after", "5s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log=info",
+                "--backend=ptrace",
+                "run",
+                "--strict",
+                "--verify",
+                "--panic-on-unsupported-syscalls",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(guest),
+    );
     let stdout = String::from_utf8_lossy(&verify.stdout);
     let stderr = String::from_utf8_lossy(&verify.stderr);
     assert!(

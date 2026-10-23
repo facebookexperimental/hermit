@@ -1,12 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/*
  * F_GETPIPE_SZ / F_SETPIPE_SZ pipe-capacity round-trip parity fixture.
  *
  * Exercises the pipe-buffer sizing fcntl command family (distinct from the

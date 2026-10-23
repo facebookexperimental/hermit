@@ -30,6 +30,7 @@ use detcore_model::happens_before::CodeLocation;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::HappensBeforeSpec;
 use detcore_model::happens_before::Position;
+use detcore_model::happens_before::syscall_never_reaches_tracer;
 use object::Object;
 use object::ObjectSection;
 use object::ObjectSymbol;
@@ -304,6 +305,148 @@ pub fn load_program(path: &Path) -> anyhow::Result<HappensBeforeProgram> {
     Ok(program)
 }
 
+/// How a run will execute the guest, as far as happens-before enforcement is
+/// concerned ([`refuse_unenforceable_anchors`]).
+#[derive(Debug, Clone, Copy)]
+pub struct HbLaunch<'a> {
+    /// The selected backend's name, for messages.
+    pub backend: &'a str,
+    /// True when the guest runs under the ptrace runtime, where Detcore traces
+    /// the guest from outside and receives the happens-before program: the
+    /// ptrace backend, or e9patch preprocessing followed by ptrace.
+    pub ptrace: bool,
+    /// True for `--namespace-only` (alias `--lite`): no interception and no
+    /// scheduler at all.
+    pub namespace_only: bool,
+    /// True for `--passthru-opt`: only an allow-list of syscalls is intercepted.
+    pub passthru_opt: bool,
+    /// True when the run requests a preemption timer (`--max-timeslice` is not
+    /// `disabled`). A version-2 spec needs one to charge its hold budget.
+    pub preemption: bool,
+    /// True for `--replay-schedule-from`, which replays a recorded schedule
+    /// event by event and has no event for a posthook gate's turn.
+    pub replay_schedule: bool,
+}
+
+/// Refuse, before anything is launched or any input is read, a program the run
+/// cannot enforce as written:
+/// - a syscall anchor for the polling phase (syscall anchors fire at the
+///   prehook of the thread's nth matching call, or when it completes);
+/// - a count or syscall-occurrence anchor when the run bypasses interception
+///   (`--namespace-only`) or runs the guest under a runtime other than ptrace
+///   (in-guest Detcore never receives the program,
+///   <https://github.com/rrnewton/hermit/issues/3943>);
+/// - a syscall-occurrence anchor with `--passthru-opt` (some syscalls are left
+///   unintercepted; a count anchor still counts the intercepted ones);
+/// - a syscall anchor on a syscall that never reaches Detcore
+///   ([`syscall_never_reaches_tracer`]);
+/// - a posthook anchor with `--replay-schedule-from`: its gate adds a
+///   scheduler turn after the syscall's posthook schedule event, and this
+///   version does not claim the composition replays exactly
+///   (<https://github.com/rrnewton/hermit/issues/3929>);
+/// - a version-2 spec with `--max-timeslice disabled`
+///   ([`refuse_hold_without_preemption`]).
+///
+/// Ignoring any of these would let a run pass, or blame the guest, with the
+/// ordering unexercised. Applied on the run path only, so `--hb-list-events`
+/// can still preview such a spec.
+pub fn refuse_unenforceable_anchors(
+    program: &HappensBeforeProgram,
+    path: &Path,
+    launch: HbLaunch<'_>,
+) -> anyhow::Result<()> {
+    for anchor in program.anchors.values() {
+        let refusal = match &anchor.position {
+            Position::Syscall { .. } if !anchor.is_syscall_occurrence() => {
+                "names the polling phase, which is not enforced; syscall anchors fire at the \
+                 prehook or, with \"phase\": \"posthook\", when the syscall completes"
+                    .to_owned()
+            }
+            Position::Syscall { .. } if anchor.fires_at_posthook() && launch.replay_schedule => {
+                "fires at the posthook, which is not supported with --replay-schedule-from: \
+                 its gate adds a scheduler turn the recorded schedule does not have"
+                    .to_owned()
+            }
+            Position::Syscall { sysno, .. } if syscall_never_reaches_tracer(*sysno) => format!(
+                "names {}, which never reaches Hermit's tracer: it runs untraced so the \
+                 signal frame is restored safely",
+                sysno.name()
+            ),
+            Position::Syscall { .. } | Position::SyscallCount(_) => {
+                let kind = if anchor.is_syscall_occurrence() {
+                    "syscall-occurrence anchor"
+                } else {
+                    "count anchor"
+                };
+                if launch.namespace_only {
+                    format!(
+                        "is a {kind}, but --namespace-only runs the guest without interception \
+                         or a scheduler"
+                    )
+                } else if !launch.ptrace {
+                    format!(
+                        "is a {kind}, which is enforced only on the ptrace backend; this run \
+                         selected the {} backend",
+                        launch.backend
+                    )
+                } else if launch.passthru_opt && anchor.is_syscall_occurrence() {
+                    // A count anchor counts the intercepted syscalls, which
+                    // --passthru-opt still determines; an occurrence anchor
+                    // names one syscall, which may be left unintercepted.
+                    format!(
+                        "is a {kind}, which needs every syscall intercepted; --passthru-opt \
+                         leaves some unintercepted"
+                    )
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        anyhow::bail!(
+            "happens-before spec {}: anchor '{}' ({}) {}",
+            path.display(),
+            anchor.name,
+            anchor.position,
+            refusal
+        );
+    }
+    if !launch.preemption {
+        refuse_hold_without_preemption(
+            program,
+            path,
+            "--max-timeslice disabled turns the preemption timer off",
+        )?;
+    }
+    Ok(())
+}
+
+/// Refuse a version-2 program on a run without a preemption timer, saying
+/// why (`reason`). A version-2 spec bounds every hold by `max_hold_ns`,
+/// charged in committed virtual time; without the timer a thread that spins
+/// without syscalls never ends its turn, committed time stops, and a hold
+/// could never be charged, so the run would hang instead of ending in
+/// `HERMIT_HB_HOLD_BUDGET_EXCEEDED`. Called before launch twice: for an
+/// explicit `--max-timeslice disabled`, and after argument validation, when
+/// the timer can also be lost because the host cannot arm it. A version-1
+/// program has no budget and is never refused here.
+pub fn refuse_hold_without_preemption(
+    program: &HappensBeforeProgram,
+    path: &Path,
+    reason: &str,
+) -> anyhow::Result<()> {
+    if !program.is_version_2() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "HERMIT_HB_HOLD_WITHOUT_PREEMPTION: happens-before spec {} is version {}, which bounds \
+         every hold by max_hold_ns and needs the preemption timer to charge it, but {}",
+        path.display(),
+        program.version,
+        reason
+    )
+}
+
 /// Render one anchor for `--list-events`-style introspection, showing the
 /// resolved address and source description when available.
 pub fn describe_anchor(anchor: &Anchor, resolver: Option<&DebugInfoResolver>) -> String {
@@ -460,5 +603,173 @@ mod tests {
         assert_eq!(missing, vec!["A".to_string()]);
 
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    /// Every launch-time refusal names its anchor, and a spec the run can
+    /// enforce passes: the polling phase, an unobservable syscall
+    /// (rt_sigreturn), namespace-only, a non-ptrace backend, --passthru-opt,
+    /// and a posthook anchor with --replay-schedule-from.
+    /// `load_program` itself (shared with `--hb-list-events`) still loads all of
+    /// these for preview.
+    #[test]
+    fn launch_refuses_every_anchor_it_cannot_enforce() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.json");
+        let ptrace = HbLaunch {
+            backend: "Ptrace",
+            ptrace: true,
+            namespace_only: false,
+            passthru_opt: false,
+            preemption: true,
+            replay_schedule: false,
+        };
+        let check = |json: &str, launch: HbLaunch<'_>| -> Result<(), String> {
+            std::fs::write(&spec, json).unwrap();
+            let program = load_program(&spec).expect("every spec here loads for preview");
+            refuse_unenforceable_anchors(&program, &spec, launch).map_err(|e| e.to_string())
+        };
+        let fd_anchor = r#"{"version": 1,
+            "events": {"w": {"thread": "3", "syscall": "write", "fd": 1}}}"#;
+        let err = check(
+            r#"{"version": 1,
+                "events": {"closed": {"thread": "3", "syscall": "close", "fd": 4, "phase": "polling"}}}"#,
+            ptrace,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("anchor 'closed'")
+                && err.contains("names the polling phase, which is not enforced"),
+            "{err}"
+        );
+        let err = check(
+            r#"{"version": 1, "events": {"ret": {"thread": "3", "syscall": "rt_sigreturn"}}}"#,
+            ptrace,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("anchor 'ret'") && err.contains("never reaches Hermit's tracer"),
+            "{err}"
+        );
+        let err = check(
+            fd_anchor,
+            HbLaunch {
+                namespace_only: true,
+                ..ptrace
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("anchor 'w'") && err.contains("--namespace-only"),
+            "{err}"
+        );
+        let err = check(
+            fd_anchor,
+            HbLaunch {
+                backend: "Kvm",
+                ptrace: false,
+                ..ptrace
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("anchor 'w'") && err.contains("the Kvm backend"),
+            "{err}"
+        );
+        let err = check(
+            fd_anchor,
+            HbLaunch {
+                passthru_opt: true,
+                ..ptrace
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("anchor 'w'") && err.contains("--passthru-opt"),
+            "{err}"
+        );
+        assert!(check(fd_anchor, ptrace).is_ok());
+        // A posthook anchor is enforced, except with --replay-schedule-from,
+        // whose recorded schedule has no event for its gate's turn
+        // (https://github.com/rrnewton/hermit/issues/3929). A prehook anchor
+        // is still enforced there.
+        let posthook = r#"{"version": 1,
+            "events": {"p": {"thread": "3", "syscall": "write", "fd": 1, "phase": "posthook"}}}"#;
+        assert!(check(posthook, ptrace).is_ok());
+        let replay = HbLaunch {
+            replay_schedule: true,
+            ..ptrace
+        };
+        let err = check(posthook, replay).unwrap_err();
+        assert!(
+            err.contains("anchor 'p'") && err.contains("not supported with --replay-schedule-from"),
+            "{err}"
+        );
+        assert!(check(fd_anchor, replay).is_ok());
+        assert!(
+            check(
+                r#"{"version": 1,
+                    "events": {"closed": {"thread": "3", "syscall": "close", "fd": 4, "phase": "pre"}}}"#,
+                ptrace
+            )
+            .is_ok()
+        );
+        // A count anchor cannot be enforced without interception or off
+        // ptrace either (https://github.com/rrnewton/hermit/issues/3943), but
+        // --passthru-opt still counts the intercepted syscalls it names.
+        let count_only = r#"{"version": 1, "events": {"c": {"thread": "3", "syscalls": 5}}}"#;
+        let err = check(
+            count_only,
+            HbLaunch {
+                namespace_only: true,
+                ..ptrace
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("anchor 'c' (after 5 syscalls) is a count anchor, but --namespace-only"),
+            "{err}"
+        );
+        let err = check(
+            count_only,
+            HbLaunch {
+                backend: "Sabre",
+                ptrace: false,
+                ..ptrace
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("is a count anchor, which is enforced only on the ptrace backend")
+                && err.contains("the Sabre backend"),
+            "{err}"
+        );
+        assert!(
+            check(
+                count_only,
+                HbLaunch {
+                    passthru_opt: true,
+                    ..ptrace
+                }
+            )
+            .is_ok()
+        );
+        assert!(check(count_only, ptrace).is_ok());
+
+        // A version-2 spec needs the preemption timer for its hold budget; a
+        // version-1 spec has no budget and runs without it, as before.
+        let v2 = r#"{"version": 2, "events": {"w": {"thread": "3", "syscall": "write", "fd": 1}}}"#;
+        let no_timer = HbLaunch {
+            preemption: false,
+            ..ptrace
+        };
+        let err = check(v2, no_timer).unwrap_err();
+        assert!(
+            err.starts_with("HERMIT_HB_HOLD_WITHOUT_PREEMPTION: happens-before spec ")
+                && err.contains("is version 2")
+                && err.ends_with("but --max-timeslice disabled turns the preemption timer off"),
+            "{err}"
+        );
+        assert!(check(v2, ptrace).is_ok());
+        assert!(check(fd_anchor, no_timer).is_ok());
     }
 }

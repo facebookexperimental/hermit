@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Compile the workspace in the DEFAULT feature configuration with warnings
 # denied -- the exact configuration CI lints in, and the one local testing skips.
 #
@@ -47,6 +41,12 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 cd "$ROOT_DIR"
+
+# Fill any local git mirror that lacks a commit Cargo.lock pins, so clippy's
+# fetch does not fail with "not our ref". Advisory, and a no-op on a host
+# without a url.<mirror>.insteadOf rule; see the script. Run through bash and
+# `|| true` so that even a missing or non-executable copy cannot fail this gate.
+bash "$ROOT_DIR/scripts/fill-git-mirrors.sh" "$ROOT_DIR/Cargo.lock" || true
 
 if [[ ${1-} == "--quiet" ]]; then
     output=$(mktemp)

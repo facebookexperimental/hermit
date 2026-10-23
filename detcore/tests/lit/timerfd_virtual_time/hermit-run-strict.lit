@@ -1,6 +1,5 @@
-# timerfd_settime currently arms a host-kernel timer while CLOCK_MONOTONIC is
-# virtualized. The blocking read therefore completes after host time passes,
-# before the guest's virtual deadline. A timerfd virtual-time implementation
-# should turn this XPASS, at which point this marker must be removed.
-XFAIL: *
+# Under --strict, timerfd_settime arms a deadline on Detcore's virtual clock,
+# so the blocking read completes once the guest's virtual CLOCK_MONOTONIC has
+# passed it. The guest exits nonzero unless it reads exactly one expiration
+# and sees at least the requested 10 ms elapse.
 RUN: %hermit run --strict -- %me

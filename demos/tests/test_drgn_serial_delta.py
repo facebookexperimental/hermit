@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Tests for demo 7's count of serial bytes that arrive while a drgn read runs."""
 
 import contextlib
@@ -145,12 +139,17 @@ class EvolutionLineTest(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(module, "_run_once", return_value=passes)
             )
+            # The boot snapshot check is tested in test_boot_snapshot_record.
+            ensure = stack.enter_context(
+                mock.patch.object(module, "_ensure_boot_snapshot")
+            )
             stack.enter_context(mock.patch.dict(os.environ, environment))
             stack.enter_context(contextlib.redirect_stdout(output))
             try:
                 status = module.main()
             except RuntimeError as error:
                 status = error
+        ensure.assert_called_once_with()
         lines = [
             line
             for line in output.getvalue().splitlines()

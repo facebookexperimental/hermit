@@ -86,6 +86,10 @@ results in a consistent, reproducible output string.
 - `devrand.sh`: Generates random numbers similar to `rand.py`, but uses
 `/dev/urandom` as the source of its data.
 
+- `nix/`: Runs Nix builds under Hermit, so that a derivation whose builder
+reads the clock or random data still gives the same output on every build.
+See `nix/README.md`.
+
 It is highly recommended to take a look at the contents of these example
 scripts to see what is being tested.
 

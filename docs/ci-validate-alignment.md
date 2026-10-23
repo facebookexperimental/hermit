@@ -84,8 +84,9 @@ so without this the ptrace and candidate guests of one test saw different
 strings, and those strings alone made ptrace diverge from ptrace in 16 of 18
 control pairs
 (<https://github.com/rrnewton/hermit/issues/3301#issuecomment-5874842696>).
-The dbt backend refuses `--bind`, so dbt cells, and cells in every other mode,
-keep the host paths. The parity post-pass sets `inputs_equalized` only when both
+Every backend gets them, dbt included: the dbt backend applies `--bind` in
+its own per-run mount namespace, which needs the pinned root. Cells in every
+other mode keep the host paths. The parity post-pass sets `inputs_equalized` only when both
 operands were launched this way with the same argv, guest environment,
 working directory, bind targets and `HERMIT_EPOCH`; it reports `credit` for
 those comparisons and `unequalized_credit` for the rest.

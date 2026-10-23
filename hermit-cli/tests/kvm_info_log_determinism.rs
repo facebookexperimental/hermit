@@ -18,6 +18,9 @@
 //! prerequisites for that verdict: repeated input must match, and a changed
 //! syscall-buffer hash in the retained stream must make verification fail.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -27,6 +30,11 @@ use std::process::Output;
 use std::sync::Mutex;
 
 use tempfile::NamedTempFile;
+
+// Separately run Hermit processes are compared, so they share one epoch: a
+// host-drawn one differs per run, and Hermit then reports the recording it
+// saved on stderr (https://github.com/rrnewton/hermit/issues/4321).
+const EPOCH: &str = "--epoch=2026-01-01T00:00:00Z";
 
 /// KVM runs are serialized for the same reason `kvm_harder.rs` serializes them.
 static KVM_RUN_LOCK: Mutex<()> = Mutex::new(());
@@ -219,23 +227,30 @@ fn compile_guest(name: &str, extra_args: &[&str]) -> PathBuf {
 }
 
 fn run_kvm_log(binary: &Path, log_level: &str, extra_run_flags: &[&str]) -> String {
-    let output = Command::new("timeout")
-        .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", log_level, "--backend", "kvm"])
-        .args(["run", "--strict"])
-        .args(extra_run_flags)
-        .arg("--")
-        .arg(binary)
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run guest under KVM: {error}"));
+    // The log goes to its own file: Hermit's controller notices (the epoch
+    // line) stay on stderr, outside the compared record stream.
+    let log_dir = tempfile::tempdir().expect("failed to create KVM log directory");
+    let log_path = log_dir.path().join("kvm.log");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log", log_level, "--backend", "kvm"])
+            .arg("--log-file")
+            .arg(&log_path)
+            .args(["run", "--strict", EPOCH])
+            .args(extra_run_flags)
+            .arg("--")
+            .arg(binary),
+    );
     assert!(
         output.status.success(),
         "KVM strict run failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    String::from_utf8_lossy(&output.stderr).into_owned()
+    fs::read_to_string(&log_path).expect("failed to read the KVM log")
 }
 
 #[derive(Debug)]
@@ -325,29 +340,29 @@ fn run_verify(
     let _ = fs::remove_dir_all(&log_dir);
     fs::create_dir_all(&log_dir).expect("failed to create verification log directory");
 
-    let output = Command::new("timeout")
-        .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "info", "--backend", backend])
-        .args([
-            "run",
-            "--strict",
-            "--verify",
-            "--verify-strict",
-            "--keep-logs",
-            "--verify-log-dir",
-        ])
-        .arg(&log_dir)
-        .args(extra_run_flags)
-        .arg("--verify-json")
-        .arg(&report_path)
-        .arg("--tmp=/tmp")
-        .arg("--")
-        .arg(binary)
-        .output()
-        .unwrap_or_else(|error| {
-            panic!("failed to verify io-buffer guest under {backend}: {error}")
-        });
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log", "info", "--backend", backend])
+            .args([
+                "run",
+                "--strict",
+                EPOCH,
+                "--verify",
+                "--verify-strict",
+                "--keep-logs",
+                "--verify-log-dir",
+            ])
+            .arg(&log_dir)
+            .args(extra_run_flags)
+            .arg("--verify-json")
+            .arg(&report_path)
+            .arg("--tmp=/tmp")
+            .arg("--")
+            .arg(binary),
+    );
     let report = serde_json::from_slice(&fs::read(&report_path).unwrap_or_else(|error| {
         panic!(
             "{backend} verification did not write {}: {error}; stderr:\n{}",

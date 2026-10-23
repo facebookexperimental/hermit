@@ -17,9 +17,7 @@ use std::process::Output;
 fn command_output(mut command: Command, label: &str) -> Output {
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -35,7 +33,8 @@ fn zero_copy_pipe_syscalls_fail_closed_by_default_and_allow_compatibility_opt_ou
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("zero-copy-pipe-fallback");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("zero-copy-pipe-fallback-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     let cases = [
@@ -75,7 +74,7 @@ fn zero_copy_pipe_syscalls_fail_closed_by_default_and_allow_compatibility_opt_ou
         let stderr = String::from_utf8_lossy(&default_output.stderr);
         assert!(
             stdout.contains(&format!("{syscall} deterministically unavailable")),
-            "{syscall} default run did not expose deterministic ENOSYS\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "{syscall} default run did not expose its deterministic refusal (EINVAL for splice/tee, ENOSYS for vmsplice)\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
             stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),

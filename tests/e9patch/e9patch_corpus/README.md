@@ -54,7 +54,7 @@ and a built e9tool/e9patch pair, and no validation lane has either, so CI never
 runs these guests. Run it locally:
 
 ```bash
-cargo build -p hermit --features e9patch
+cargo build -p hermit-run --features e9patch
 HERMIT_E9TOOL=<path>/e9tool HERMIT_E9PATCH_BACKEND=<path>/e9patch \
     python3 tests/e9patch/e9patch_corpus.py \
     --hermit target/debug/hermit --require-backend

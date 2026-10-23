@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Rewrite one copy of the s17 parity inputs so `test-harness parity compare`
 can re-measure them at a commit where backend-parity-c is retired.
 
@@ -21,7 +15,6 @@ cell the run's own post-pass measured (its parity.jsonl), mapped the same way.
 
 Usage: map_s17.py <copy root> <retired-ids.json> <report.json>
 """
-
 import copy
 import hashlib
 import json
@@ -93,7 +86,7 @@ def main():
                 i = positions[0] + 1
                 old = argv[i]
                 assert old.startswith(PREFIX), (test, old)
-                new = os.path.join(root, "e2e", old[len(PREFIX) :])
+                new = os.path.join(root, "e2e", old[len(PREFIX):])
                 assert os.path.isdir(new), new
                 argv[i] = new
                 counts["argv_rewrites"] += 1
@@ -114,17 +107,13 @@ def main():
             f.write("\n".join(out) + "\n")
         counts["results_sha256_out"] = sha256_file(results)
         # The cells the run's own post-pass measured, mapped the same way.
-        records = [
-            json.loads(l) for l in open(os.path.join(node, "parity.jsonl")) if l.strip()
-        ]
+        records = [json.loads(l) for l in open(os.path.join(node, "parity.jsonl")) if l.strip()]
         cells = []
         for record in records:
             test = successor.get(record["test_id"], record["test_id"])
             cells.append(f"{test}@{record['backend']}")
         assert len(cells) == len(set(cells)), "duplicate cell"
-        cells_path = os.path.join(
-            os.path.dirname(os.path.abspath(report_path)), f"cells-{lane}.txt"
-        )
+        cells_path = os.path.join(os.path.dirname(os.path.abspath(report_path)), f"cells-{lane}.txt")
         with open(cells_path, "w") as f:
             f.write("\n".join(cells) + "\n")
         counts["records_in_run_post_pass"] = len(records)

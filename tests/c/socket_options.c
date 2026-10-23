@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Cross-backend parity contract: setsockopt(2)/getsockopt(2) boolean
 // socket-option round-trip on an AF_UNIX socket pair, with NO data transfer.
 //

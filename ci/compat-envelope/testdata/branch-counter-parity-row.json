@@ -1,0 +1,550 @@
+{
+ "provenance": {
+  "derived_from": "ci-hub/series/tests/fixtures/run1838-backend-parity.json row (canonical run 1838, hermit 158a89f6217b25db9540237f9c1e256cdbaf785c)",
+  "evidence_sha256": "763763fee9e6daf7bfe2bd571ce4c6dfce703878665c1fe68c241280896c87c2",
+  "purpose": "Shared evidence-identity fixture: hermit ci/compat-envelope/scorecard.rs (evidence_identity) and dev-hermit ci-hub/series/series.py (_cell_result_evidence_sha256) must both hash this row to evidence_sha256.",
+  "transformation": "The ptrace reference's exact_branch_counter verdict added, as hermit writes it: appended last to attempt 1's verification_report string (its verification_report_sha256 recomputed) and to backend_parity.reference.verification. The kvm candidate has none, as a kvm report never carries it. Nothing else changed."
+ },
+ "row": {
+  "argv": [
+   "/src/target/ci/hermit-e2e-artifacts/14bba346f08484eaad8b9614100b4594bdcf5bc6d053f5440850de09808cd18f/hermit",
+   "--log",
+   "info",
+   "run",
+   "--base-env=minimal",
+   "--backend",
+   "kvm",
+   "--strict",
+   "--verify-strict",
+   "--verify",
+   "--verify-json",
+   "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-1.json",
+   "--keep-logs",
+   "--verify-log-dir",
+   "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-1",
+   "--mount=type=tmpfs,target=/test",
+   "--workdir",
+   "/test",
+   "--env",
+   "LC_ALL=C",
+   "--env",
+   "TZ=UTC",
+   "--env",
+   "HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home",
+   "--env",
+   "XDG_CONFIG_HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config",
+   "--env",
+   "E2E_TMPDIR=/test",
+   "--env",
+   "E2E_FIXTURE_DIR=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures",
+   "--env",
+   "HERMIT_E2E_SCHEDULED_JOBS=8",
+   "--",
+   "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures/program"
+  ],
+  "artifact_dir": "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm",
+  "attempt": 1,
+  "attempts": [
+   {
+    "argv": [
+     "/src/target/ci/hermit-e2e-artifacts/14bba346f08484eaad8b9614100b4594bdcf5bc6d053f5440850de09808cd18f/hermit",
+     "--log",
+     "info",
+     "run",
+     "--base-env=minimal",
+     "--backend",
+     "kvm",
+     "--strict",
+     "--verify-strict",
+     "--verify",
+     "--verify-json",
+     "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-1.json",
+     "--keep-logs",
+     "--verify-log-dir",
+     "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-1",
+     "--mount=type=tmpfs,target=/test",
+     "--workdir",
+     "/test",
+     "--env",
+     "LC_ALL=C",
+     "--env",
+     "TZ=UTC",
+     "--env",
+     "HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home",
+     "--env",
+     "XDG_CONFIG_HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config",
+     "--env",
+     "E2E_TMPDIR=/test",
+     "--env",
+     "E2E_FIXTURE_DIR=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures",
+     "--env",
+     "HERMIT_E2E_SCHEDULED_JOBS=8",
+     "--",
+     "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures/program"
+    ],
+    "cpu_usage_usec": 113676,
+    "cwd": "/src",
+    "duration_ms": 341,
+    "env": {
+     "E2E_FIXTURE_DIR": "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures",
+     "E2E_TMPDIR": "/tmp/hermit-e2e",
+     "HERMIT_E2E_SCHEDULED_JOBS": "8",
+     "HOME": "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home",
+     "LC_ALL": "C",
+     "TZ": "UTC",
+     "XDG_CONFIG_HOME": "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config"
+    },
+    "error_kind": null,
+    "first_divergent_left_message": null,
+    "first_divergent_record": null,
+    "first_divergent_right_message": null,
+    "first_divergent_scheduler_turn": null,
+    "first_divergent_syscall": null,
+    "first_divergent_virtual_nanoseconds": null,
+    "guest_argv": [
+     "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures/program"
+    ],
+    "index": "1",
+    "observation_sha256": "902e139fca010ca5941b7d97e2eb518b972859e4f045a673813147b2e8c88d49",
+    "outcome": "PASS",
+    "reason": null,
+    "runtime": {
+     "run1": {
+      "scheduler_turns": 6,
+      "syscalls": 36,
+      "virtual_nanoseconds": 3960030
+     },
+     "run2": {
+      "scheduler_turns": 6,
+      "syscalls": 36,
+      "virtual_nanoseconds": 3960030
+     }
+    },
+    "sabre_path_evidence": null,
+    "sabre_path_evidence_sha256": null,
+    "shell_command": "cd /src && env E2E_FIXTURE_DIR=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=8 HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config /src/target/ci/hermit-e2e-artifacts/14bba346f08484eaad8b9614100b4594bdcf5bc6d053f5440850de09808cd18f/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-1.json --keep-logs --verify-log-dir /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home --env XDG_CONFIG_HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=8 -- /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures/program",
+    "signal": null,
+    "status": 0,
+    "stderr": ":: Run1...\n:: Run2...\n:: Comparing captured verification logs...\nLogs contain 97 | 97 messages total\nLogs contain 96 | 96 detcore-specific messages\nLogs contain 97 | 97 INFO messages\nLogs contain 86 | 86 DETLOG & scheduler COMMIT messages\nCanonicalizing host addresses (ordinal by first appearance); comparing everything else exactly...\n  Comparing INFO messages...\n\nDone processing logs, no substantive differences found (97 | 97 INFO messages compared).\nLogs contain 1 | 1 scheduler empty-run-queue kick messages\nLogs contain 0 | 0 scheduler COMMIT records reading /proc/self/maps\n:: Verification logs retained:\n::   run 1: /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-1/run1_log_E4SE1\n::   run 2: /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-1/run2_log_bT9ZO\n:: comparison=BitwiseInfoV1 relaxations=none\n:: Success: deterministic. Determinism verified.\n:: Backend: KVM (reverie-kvm KvmGuest<Detcore>)\n",
+    "stdout": "aio ok=5\n",
+    "timed_out": false,
+    "verification_report": "{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"no_result_reason\":null,\"infrastructure_error\":null,\"comparison\":{\"strictness\":\"canonical\",\"display_name\":\"BitwiseInfoV1\",\"compare_logs\":true,\"compare_io_buffers\":true,\"log_scope\":\"info\",\"record_envelope\":\"all_records_v1\",\"virtualize_time\":true,\"strip_lines\":false,\"canonicalize_addresses\":true,\"full_trace\":true,\"exact_remainder\":true,\"stripped_prefixes\":[\"real-wall-clock-prefix/v1\"],\"canonicalizations\":[\"host-address-to-first-appearance-ordinal/v1\"],\"ignore_lines\":false,\"skip_commit\":false,\"skip_detlog\":false},\"compared_log_messages\":{\"left\":97,\"right\":97},\"compared_outputs\":{\"left\":{\"exit_code\":0,\"signal\":null,\"stdout_sha256\":\"926d56f119998cadc2eefa19b35b5cd401066fbbdd5d43a897664aaac808777a\",\"stdout_bytes\":9,\"stderr_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"stderr_bytes\":0},\"right\":{\"exit_code\":0,\"signal\":null,\"stdout_sha256\":\"926d56f119998cadc2eefa19b35b5cd401066fbbdd5d43a897664aaac808777a\",\"stdout_bytes\":9,\"stderr_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"stderr_bytes\":0}},\"runtime\":{\"run1\":{\"scheduler_turns\":6,\"virtual_nanoseconds\":3960030,\"syscalls\":36},\"run2\":{\"scheduler_turns\":6,\"virtual_nanoseconds\":3960030,\"syscalls\":36}},\"guest_exit_code\":0,\"guest_signal\":null,\"first_divergent_scheduler_turn\":null,\"first_divergent_virtual_nanoseconds\":null,\"first_divergent_record\":null,\"first_divergent_syscall\":null,\"first_divergent_left_message\":null,\"first_divergent_right_message\":null}\n",
+    "verification_report_sha256": "4c978f7ea9681ba87329098aa7ba0825491ca40b0866dc4d921cae83969697dd"
+   },
+   {
+    "argv": [
+     "/src/target/ci/hermit-e2e-artifacts/14bba346f08484eaad8b9614100b4594bdcf5bc6d053f5440850de09808cd18f/hermit",
+     "--log",
+     "info",
+     "run",
+     "--base-env=minimal",
+     "--backend",
+     "ptrace",
+     "--strict",
+     "--verify-strict",
+     "--verify",
+     "--verify-json",
+     "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-parity-reference.json",
+     "--keep-logs",
+     "--verify-log-dir",
+     "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-parity-reference",
+     "--mount=type=tmpfs,target=/test",
+     "--workdir",
+     "/test",
+     "--env",
+     "LC_ALL=C",
+     "--env",
+     "TZ=UTC",
+     "--env",
+     "HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home",
+     "--env",
+     "XDG_CONFIG_HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config",
+     "--env",
+     "E2E_TMPDIR=/test",
+     "--env",
+     "E2E_FIXTURE_DIR=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures",
+     "--env",
+     "HERMIT_E2E_SCHEDULED_JOBS=8",
+     "--",
+     "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures/program"
+    ],
+    "cpu_usage_usec": 160438,
+    "cwd": "/src",
+    "duration_ms": 216,
+    "env": {
+     "E2E_FIXTURE_DIR": "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures",
+     "E2E_TMPDIR": "/tmp/hermit-e2e",
+     "HERMIT_E2E_SCHEDULED_JOBS": "8",
+     "HOME": "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home",
+     "LC_ALL": "C",
+     "TZ": "UTC",
+     "XDG_CONFIG_HOME": "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config"
+    },
+    "error_kind": null,
+    "first_divergent_left_message": null,
+    "first_divergent_record": null,
+    "first_divergent_right_message": null,
+    "first_divergent_scheduler_turn": null,
+    "first_divergent_syscall": null,
+    "first_divergent_virtual_nanoseconds": null,
+    "guest_argv": [
+     "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures/program"
+    ],
+    "index": "parity-reference",
+    "observation_sha256": "902e139fca010ca5941b7d97e2eb518b972859e4f045a673813147b2e8c88d49",
+    "outcome": "PASS",
+    "reason": null,
+    "runtime": {
+     "run1": {
+      "scheduler_turns": 6,
+      "syscalls": 36,
+      "virtual_nanoseconds": 3965445
+     },
+     "run2": {
+      "scheduler_turns": 6,
+      "syscalls": 36,
+      "virtual_nanoseconds": 3965445
+     }
+    },
+    "sabre_path_evidence": null,
+    "sabre_path_evidence_sha256": null,
+    "shell_command": "cd /src && env E2E_FIXTURE_DIR=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=8 HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config /src/target/ci/hermit-e2e-artifacts/14bba346f08484eaad8b9614100b4594bdcf5bc6d053f5440850de09808cd18f/hermit --log info run --base-env=minimal --backend ptrace --strict --verify-strict --verify --verify-json /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-parity-reference.json --keep-logs --verify-log-dir /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-parity-reference --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home --env XDG_CONFIG_HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=8 -- /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures/program",
+    "signal": null,
+    "status": 0,
+    "stderr": ":: Run1...\n:: Run2...\n:: Comparing captured verification logs...\nLogs contain 107 | 107 messages total\nLogs contain 106 | 106 detcore-specific messages\nLogs contain 107 | 107 INFO messages\nLogs contain 86 | 86 DETLOG & scheduler COMMIT messages\nCanonicalizing host addresses (ordinal by first appearance); comparing everything else exactly...\n  Comparing INFO messages...\n\nDone processing logs, no substantive differences found (107 | 107 INFO messages compared).\nLogs contain 1 | 1 scheduler empty-run-queue kick messages\nLogs contain 0 | 0 scheduler COMMIT records reading /proc/self/maps\n:: Verification logs retained:\n::   run 1: /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-parity-reference/run1_log_gBoZW\n::   run 2: /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-parity-reference/run2_log_0JbYT\n:: comparison=BitwiseInfoV1 relaxations=none\n:: Success: deterministic. Determinism verified.\n",
+    "stdout": "aio ok=5\n",
+    "timed_out": false,
+    "verification_report": "{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"no_result_reason\":null,\"infrastructure_error\":null,\"comparison\":{\"strictness\":\"canonical\",\"display_name\":\"BitwiseInfoV1\",\"compare_logs\":true,\"compare_io_buffers\":true,\"log_scope\":\"info\",\"record_envelope\":\"all_records_v1\",\"virtualize_time\":true,\"strip_lines\":false,\"canonicalize_addresses\":true,\"full_trace\":true,\"exact_remainder\":true,\"stripped_prefixes\":[\"real-wall-clock-prefix/v1\"],\"canonicalizations\":[\"host-address-to-first-appearance-ordinal/v1\"],\"ignore_lines\":false,\"skip_commit\":false,\"skip_detlog\":false},\"compared_log_messages\":{\"left\":107,\"right\":107},\"compared_outputs\":{\"left\":{\"exit_code\":0,\"signal\":null,\"stdout_sha256\":\"926d56f119998cadc2eefa19b35b5cd401066fbbdd5d43a897664aaac808777a\",\"stdout_bytes\":9,\"stderr_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"stderr_bytes\":0},\"right\":{\"exit_code\":0,\"signal\":null,\"stdout_sha256\":\"926d56f119998cadc2eefa19b35b5cd401066fbbdd5d43a897664aaac808777a\",\"stdout_bytes\":9,\"stderr_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"stderr_bytes\":0}},\"runtime\":{\"run1\":{\"scheduler_turns\":6,\"virtual_nanoseconds\":3965445,\"syscalls\":36},\"run2\":{\"scheduler_turns\":6,\"virtual_nanoseconds\":3965445,\"syscalls\":36}},\"guest_exit_code\":0,\"guest_signal\":null,\"first_divergent_scheduler_turn\":null,\"first_divergent_virtual_nanoseconds\":null,\"first_divergent_record\":null,\"first_divergent_syscall\":null,\"first_divergent_left_message\":null,\"first_divergent_right_message\":null,\"exact_branch_counter\":{\"present\":true,\"evidence\":\"AuthenticAMD family 0x19 model 0x11 microcode 0xa0011d7: Reverie performance-counter validation passed\"}}\n",
+    "verification_report_sha256": "5905151cdc69c87987dcc66743b01ca7027e66df147b62566bad7362973a646e"
+   }
+  ],
+  "backend": "kvm",
+  "backend_parity": {
+   "candidate": {
+    "backend": "kvm",
+    "output": {
+     "exit_code": 0,
+     "signal": null,
+     "stderr_bytes": 0,
+     "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "stdout_bytes": 9,
+     "stdout_sha256": "926d56f119998cadc2eefa19b35b5cd401066fbbdd5d43a897664aaac808777a"
+    },
+    "retained_log": "verify-logs/verify-1/run1_log_E4SE1",
+    "retained_log_sha256": "a459a4d83eef341d79f2eace5d6261262e7998798ba4c944d3c2d9d6c866dca2",
+    "verification": {
+     "bitwise_parity": true,
+     "compared_log_messages": {
+      "left": 97,
+      "right": 97
+     },
+     "compared_outputs": {
+      "left": {
+       "exit_code": 0,
+       "signal": null,
+       "stderr_bytes": 0,
+       "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "stdout_bytes": 9,
+       "stdout_sha256": "926d56f119998cadc2eefa19b35b5cd401066fbbdd5d43a897664aaac808777a"
+      },
+      "right": {
+       "exit_code": 0,
+       "signal": null,
+       "stderr_bytes": 0,
+       "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "stdout_bytes": 9,
+       "stdout_sha256": "926d56f119998cadc2eefa19b35b5cd401066fbbdd5d43a897664aaac808777a"
+      }
+     },
+     "comparison": {
+      "canonicalizations": [
+       "host-address-to-first-appearance-ordinal/v1"
+      ],
+      "canonicalize_addresses": true,
+      "compare_io_buffers": true,
+      "compare_logs": true,
+      "display_name": "BitwiseInfoV1",
+      "exact_remainder": true,
+      "full_trace": true,
+      "ignore_lines": false,
+      "log_scope": "info",
+      "record_envelope": "all_records_v1",
+      "skip_commit": false,
+      "skip_detlog": false,
+      "strictness": "canonical",
+      "strip_lines": false,
+      "stripped_prefixes": [
+       "real-wall-clock-prefix/v1"
+      ],
+      "virtualize_time": true
+     },
+     "first_divergent_left_message": null,
+     "first_divergent_record": null,
+     "first_divergent_right_message": null,
+     "first_divergent_scheduler_turn": null,
+     "first_divergent_syscall": null,
+     "first_divergent_virtual_nanoseconds": null,
+     "guest_exit_code": 0,
+     "guest_signal": null,
+     "infrastructure_error": null,
+     "no_result_reason": null,
+     "runtime": {
+      "run1": {
+       "scheduler_turns": 6,
+       "syscalls": 36,
+       "virtual_nanoseconds": 3960030
+      },
+      "run2": {
+       "scheduler_turns": 6,
+       "syscalls": 36,
+       "virtual_nanoseconds": 3960030
+      }
+     },
+     "verdict": "matched",
+     "verified": true
+    }
+   },
+   "comparison": {
+    "comparison": {
+     "canonicalize_host_addresses": true,
+     "git_diff": false,
+     "ignored_line_substrings": [],
+     "included_detlog_kinds": [
+      "syscall",
+      "syscall_result",
+      "other"
+     ],
+     "record_envelope": "cross_backend_detcore_v1",
+     "require_structured_events": true,
+     "skip_commit": false,
+     "skip_detlog": false,
+     "stream": "info",
+     "unsafe_strip_lines": false
+    },
+    "first_divergent_left_message": "INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 1, syscall_nanos: Some(250000), rcbs: 227, weighted_rcbs: None, nondet_instrs: 1, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0, inherited_nanos: LogicalTime(0) }",
+    "first_divergent_record": 10,
+    "first_divergent_right_message": "INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: brk(NULL) = ?",
+    "first_divergent_scheduler_turn": 1,
+    "first_divergent_syscall": null,
+    "first_divergent_virtual_nanoseconds": 1767225600000500000,
+    "inputs": {
+     "left": {
+      "bytes": 25830,
+      "sha256": "e2f447c3f302a95c8713aa5322d7749f47a74dd0be6aee2b336b22b7aafcddf0"
+     },
+     "right": {
+      "bytes": 22804,
+      "sha256": "a459a4d83eef341d79f2eace5d6261262e7998798ba4c944d3c2d9d6c866dca2"
+     }
+    },
+    "records": {
+     "available_left": 107,
+     "available_right": 97,
+     "compared": 97,
+     "withheld_incomplete_tail": false
+    },
+    "schema": 1,
+    "selected_messages": {
+     "left": 106,
+     "right": 96
+    },
+    "verdict": "diverged"
+   },
+   "reference": {
+    "backend": "ptrace",
+    "output": {
+     "exit_code": 0,
+     "signal": null,
+     "stderr_bytes": 0,
+     "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "stdout_bytes": 9,
+     "stdout_sha256": "926d56f119998cadc2eefa19b35b5cd401066fbbdd5d43a897664aaac808777a"
+    },
+    "retained_log": "verify-logs/verify-parity-reference/run1_log_gBoZW",
+    "retained_log_sha256": "e2f447c3f302a95c8713aa5322d7749f47a74dd0be6aee2b336b22b7aafcddf0",
+    "verification": {
+     "bitwise_parity": true,
+     "compared_log_messages": {
+      "left": 107,
+      "right": 107
+     },
+     "compared_outputs": {
+      "left": {
+       "exit_code": 0,
+       "signal": null,
+       "stderr_bytes": 0,
+       "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "stdout_bytes": 9,
+       "stdout_sha256": "926d56f119998cadc2eefa19b35b5cd401066fbbdd5d43a897664aaac808777a"
+      },
+      "right": {
+       "exit_code": 0,
+       "signal": null,
+       "stderr_bytes": 0,
+       "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "stdout_bytes": 9,
+       "stdout_sha256": "926d56f119998cadc2eefa19b35b5cd401066fbbdd5d43a897664aaac808777a"
+      }
+     },
+     "comparison": {
+      "canonicalizations": [
+       "host-address-to-first-appearance-ordinal/v1"
+      ],
+      "canonicalize_addresses": true,
+      "compare_io_buffers": true,
+      "compare_logs": true,
+      "display_name": "BitwiseInfoV1",
+      "exact_remainder": true,
+      "full_trace": true,
+      "ignore_lines": false,
+      "log_scope": "info",
+      "record_envelope": "all_records_v1",
+      "skip_commit": false,
+      "skip_detlog": false,
+      "strictness": "canonical",
+      "strip_lines": false,
+      "stripped_prefixes": [
+       "real-wall-clock-prefix/v1"
+      ],
+      "virtualize_time": true
+     },
+     "exact_branch_counter": {
+      "evidence": "AuthenticAMD family 0x19 model 0x11 microcode 0xa0011d7: Reverie performance-counter validation passed",
+      "present": true
+     },
+     "first_divergent_left_message": null,
+     "first_divergent_record": null,
+     "first_divergent_right_message": null,
+     "first_divergent_scheduler_turn": null,
+     "first_divergent_syscall": null,
+     "first_divergent_virtual_nanoseconds": null,
+     "guest_exit_code": 0,
+     "guest_signal": null,
+     "infrastructure_error": null,
+     "no_result_reason": null,
+     "runtime": {
+      "run1": {
+       "scheduler_turns": 6,
+       "syscalls": 36,
+       "virtual_nanoseconds": 3965445
+      },
+      "run2": {
+       "scheduler_turns": 6,
+       "syscalls": 36,
+       "virtual_nanoseconds": 3965445
+      }
+     },
+     "verdict": "matched",
+     "verified": true
+    }
+   },
+   "schema": 1,
+   "verdict": "diverged"
+  },
+  "binary_build_sha": "158a89f6217b",
+  "binary_sha256": "f629628b3076aacfe11673642516647ed9777f44b836b4d7b9bc741a476737f3",
+  "category": "backend-parity-c",
+  "classification": "required",
+  "cpu_usage_usec": 524975,
+  "cwd": "/src",
+  "diversity": null,
+  "duration_ms": 1756,
+  "effective_args": [
+   "--log",
+   "info",
+   "run",
+   "--base-env=minimal",
+   "--backend",
+   "kvm",
+   "--strict",
+   "--verify-strict",
+   "--verify",
+   "--verify-json",
+   "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-1.json",
+   "--keep-logs",
+   "--verify-log-dir",
+   "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-1",
+   "--mount=type=tmpfs,target=/test",
+   "--workdir",
+   "/test",
+   "--env",
+   "LC_ALL=C",
+   "--env",
+   "TZ=UTC",
+   "--env",
+   "HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home",
+   "--env",
+   "XDG_CONFIG_HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config",
+   "--env",
+   "E2E_TMPDIR=/test",
+   "--env",
+   "E2E_FIXTURE_DIR=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures",
+   "--env",
+   "HERMIT_E2E_SCHEDULED_JOBS=8",
+   "--",
+   "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures/program"
+  ],
+  "env": {
+   "E2E_FIXTURE_DIR": "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures",
+   "E2E_TMPDIR": "/tmp/hermit-e2e",
+   "HERMIT_E2E_SCHEDULED_JOBS": "8",
+   "HOME": "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home",
+   "LC_ALL": "C",
+   "TZ": "UTC",
+   "XDG_CONFIG_HOME": "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config"
+  },
+  "error_kind": null,
+  "execution_cpu_timeout_seconds": 22,
+  "execution_path": null,
+  "execution_wall_timeout_seconds": 57,
+  "failure_class": "product_failure",
+  "first_divergent_left_message": "INFO detcore: [dtid 3] inbound rdtsc, new logical time: DetTime { syscalls: 1, syscall_nanos: Some(250000), rcbs: 227, weighted_rcbs: None, nondet_instrs: 1, extra_nanos: 0, starting_micros: 1767225600000000, multiplier: 1.0, inherited_nanos: LogicalTime(0) }",
+  "first_divergent_record": 10,
+  "first_divergent_right_message": "INFO detcore: DETLOG [syscall][detcore, dtid 3] inbound syscall: brk(NULL) = ?",
+  "first_divergent_scheduler_turn": 1,
+  "first_divergent_syscall": null,
+  "first_divergent_virtual_nanoseconds": 1767225600000500000,
+  "guest_argv": [
+   "/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures/program"
+  ],
+  "hermit_sha": "158a89f6217b25db9540237f9c1e256cdbaf785c",
+  "host_capabilities": {
+   "cpuid-faulting": {
+    "evidence": "arch_prctl(ARCH_SET_CPUID, 0) = 0; /proc/cpuinfo advertises cpuid_fault",
+    "present": true
+   },
+   "kvm": {
+    "evidence": "open(/dev/kvm, O_RDWR) = ok; /proc/cpuinfo advertises vmx or svm",
+    "present": true
+   }
+  },
+  "kernel_version": "7.1.3-0_fbk0_rc18_0_gd373cd4b8dbf",
+  "lane": "portable",
+  "log_level": "info",
+  "machine_shortname": "measurement-host",
+  "mode": "verify",
+  "outcome": "FAIL",
+  "reason": "kvm diverged from ptrace: shared Detcore INFO records",
+  "relaxations": [],
+  "result": "parity-failure",
+  "run_id": "validate-ops-tick-158a89f6217b-088d91951315",
+  "runtime": {
+   "run1": {
+    "scheduler_turns": 6,
+    "syscalls": 36,
+    "virtual_nanoseconds": 3960030
+   },
+   "run2": {
+    "scheduler_turns": 6,
+    "syscalls": 36,
+    "virtual_nanoseconds": 3960030
+   }
+  },
+  "schema": 4,
+  "shell_command": "cd /src && env E2E_FIXTURE_DIR=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=8 HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config /src/target/ci/hermit-e2e-artifacts/14bba346f08484eaad8b9614100b4594bdcf5bc6d053f5440850de09808cd18f/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-1.json --keep-logs --verify-log-dir /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/home --env XDG_CONFIG_HOME=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=8 -- /results/runs/validate-ops-tick-158a89f6217b-088d91951315/backend-parity-c-aio-refusal-verify-kvm/fixtures/program",
+  "source_tree_dirty": false,
+  "test": "backend-parity-c/aio-refusal",
+  "test_sha256": "ca2c622afa3d06a4dd107af83fa89b53f989a57740cc63f6b4ab9911d348fee4",
+  "timeout_seconds": 57
+ }
+}

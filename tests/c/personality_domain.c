@@ -1,12 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/*
  * Process execution-domain round-trip via personality(2).
  *
  * The contract asserts only process-local relational state, never the host's
@@ -40,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/personality.h>
+#include <sys/utsname.h>
 
 int main(void) {
   enum { EXPECTED_CHECKS = 5 };
@@ -77,6 +70,16 @@ int main(void) {
     ok++;
   }
 
+  /*
+   * The release uname reports with UNAME26 toggled (set, from Hermit's
+   * starting persona). Linux reports "2.6.<60 + minor>..." for it; Hermit's
+   * Detcore replaces the release on every backend, so every backend prints
+   * Detcore's release here. Printed, not checked, like `start`.
+   */
+  struct utsname uts;
+  const char *release =
+      target_may_be_active && uname(&uts) == 0 ? uts.release : "?";
+
   /* Restore best-effort even when the set return or follow-up query was bad. */
   rc = personality(start);
   if (target_may_be_active && rc != -1 && (unsigned int)rc == target) {
@@ -111,10 +114,11 @@ int main(void) {
    * passing run but names WHICH check failed on a failing one.
    */
   printf(
-      "pers ok=%d start=0x%x final=0x%x restored=%d\n",
+      "pers ok=%d start=0x%x final=0x%x restored=%d release=%s\n",
       ok,
       start,
       final,
-      final_eq_start ? 1 : 0);
+      final_eq_start ? 1 : 0,
+      release);
   return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

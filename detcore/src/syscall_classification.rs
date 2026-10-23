@@ -112,8 +112,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-892): Query logical interval-timer state.
         | Sysno::getitimer
+        // Successful own IDs come from shared ThreadState after the inner
+        // Tool observes the call; nested namespaces retain its answer.
+        | Sysno::getpid
         | Sysno::getrandom
         | Sysno::getrusage
+        | Sysno::gettid
         | Sysno::gettimeofday
         | Sysno::inotify_add_watch
         | Sysno::inotify_init
@@ -494,11 +498,13 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // callers take their portable read/write fallback.
         | Sysno::copy_file_range
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-855): Fail-closed ENOSYS for zero-copy pipe
-        // transfers. Detcore does not model kernel pipe-buffer ownership or
-        // vmsplice page pinning. Fail-closed runs expose the portable fallback
-        // boundary; the explicit compatibility opt-out retains record/replay
-        // pass-through.
+        // TODO-HUMAN-REVIEW(PR-855): Fail-closed refusal for zero-copy pipe
+        // transfers: EINVAL for splice and tee, ENOSYS for vmsplice. Detcore
+        // does not model kernel pipe-buffer ownership or vmsplice page pinning.
+        // Fail-closed runs expose the portable read/write fallback boundary;
+        // the explicit `hermit run --allow-unsupported-syscalls` opt-out
+        // forwards these calls to the host. Record and replay always fail
+        // closed, so they always return the refusal.
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::splice
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -686,6 +692,13 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fchown
         | Sysno::fchownat
         | Sysno::lchown => SyscallClassification::Determinized,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-b3a4c): Process groups and sessions are answered
+        // from Detcore's model on every backend, not by the backend's kernel or
+        // executor: they differed (DBT's launcher makes the guest a group
+        // leader, KVM's executor failed getsid; slice B3a-4c of
+        // https://github.com/rrnewton/hermit/issues/4266). Dispatched in lib.rs.
+        Sysno::getpgid | Sysno::getpgrp | Sysno::getsid => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -695,14 +708,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         Sysno::access
         | Sysno::brk
         | Sysno::getcwd
-        | Sysno::getpid
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
-        | Sysno::getpgid
-        | Sysno::getpgrp
         | Sysno::getppid
-        | Sysno::getsid
-        | Sysno::gettid
         | Sysno::mprotect
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-889): Review process-local robust-list
@@ -1218,9 +1226,11 @@ pub(crate) const fn is_host_security_identity_probe_syscall(sysno: Sysno) -> boo
 // TODO-HUMAN-REVIEW(PR-855): Fail-closed zero-copy pipe fallback set.
 /// Linux zero-copy pipe transfers. Their observable blocking and buffer
 /// ownership depend on kernel pipe state, while `vmsplice` can additionally
-/// pin guest pages beyond the syscall boundary. Fail-closed runs return
-/// `ENOSYS`, the documented signal for callers to use read/write fallbacks.
-/// The explicit compatibility opt-out retains host forwarding.
+/// pin guest pages beyond the syscall boundary. Fail-closed runs refuse
+/// `splice` and `tee` with `EINVAL` (the descriptor pair cannot be spliced),
+/// which is what callers such as GNU grep fall back to read/write on, and
+/// `vmsplice` with `ENOSYS`. The explicit compatibility opt-out retains host
+/// forwarding.
 pub(crate) const fn is_zero_copy_pipe_syscall(sysno: Sysno) -> bool {
     matches!(
         sysno,
@@ -1454,6 +1464,9 @@ mod tests {
         "getgid",
         "getitimer",
         "getpeername",
+        "getpgid",
+        "getpgrp",
+        "getpid",
         "getpmsg",
         "getpriority",
         "getrandom",
@@ -1461,8 +1474,10 @@ mod tests {
         "getresuid",
         "getrlimit",
         "getrusage",
+        "getsid",
         "getsockname",
         "getsockopt",
+        "gettid",
         "gettimeofday",
         "getuid",
         "init_module",
@@ -1702,12 +1717,7 @@ mod tests {
         "get_thread_area",
         "getcwd",
         "getgroups",
-        "getpgid",
-        "getpgrp",
-        "getpid",
         "getppid",
-        "getsid",
-        "gettid",
         "getxattr",
         "lgetxattr",
         "link",
@@ -2064,9 +2074,6 @@ mod tests {
             Sysno::getgroups,
             Sysno::getppid,
             Sysno::getxattr,
-            Sysno::getpgid,
-            Sysno::getpgrp,
-            Sysno::getsid,
             Sysno::lgetxattr,
             Sysno::link,
             Sysno::linkat,
@@ -2708,13 +2715,15 @@ mod tests {
 
     #[test]
     fn deterministic_refusal_aggregate_includes_fixed_error_families() {
-        // The aggregate predicate is the union of the fixed-ENOSYS/EPERM refusal
-        // families the fail-closed dispatcher rejects without consulting the
-        // host.
-        // Backends that execute guest syscalls outside Detcore's dispatcher
-        // (the DBT copied-child fast path, the KVM executor) consult this
-        // predicate to enforce the same fixed refusal, so representative members
-        // of every family must be present.
+        // The aggregate predicate is the union of the refusal families the
+        // fail-closed dispatcher rejects with a fixed errno, without consulting
+        // the host. Most refuse with ENOSYS or EPERM; splice and tee refuse
+        // with EINVAL and vmsplice with ENOSYS.
+        // A backend that executes guest syscalls outside Detcore's dispatcher
+        // consults this predicate to enforce the same fixed refusal. The DBT
+        // copied pre-exec child is the only production consumer; KVM delivers
+        // these syscalls to the dispatcher. Representative members of every
+        // family must be present.
         let refused_members = [
             Sysno::rseq,
             Sysno::perf_event_open,

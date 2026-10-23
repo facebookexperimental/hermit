@@ -31,6 +31,12 @@ impl Tool for NoopTool {
     type GlobalState = GlobalState;
     type ThreadState = ();
 
+    fn native_mm_ownership(_cfg: &Config) -> reverie::NativeMmOwnership {
+        // This Tool has no worker, codec state, or FFI construction: it only
+        // delegates the intercepted operation to the managed Guest.
+        reverie::NativeMmOwnership::ManagedRuntimeOnly
+    }
+
     fn subscriptions(_cfg: &Config) -> Subscription {
         // Don't subscribe to anything by default. This noop-tool doesn't care
         // about any syscalls and will be ORed with the detcore subscriptions.
@@ -47,3 +53,5 @@ impl Tool for NoopTool {
         Ok(guest.inject(call).await?)
     }
 }
+#[cfg(test)]
+mod mapping_capture_tests;

@@ -113,7 +113,7 @@ fn run_hermit_strict(python: &Path, script: &Path) -> String {
         .args(["-S", "-I"])
         .arg(script);
     hermit_test::configure_guest_execution(&mut command);
-    let output = command.output().expect("failed to run python under Hermit");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(
         output.status.success(),
         "hermit python failed:\nstdout:\n{}\nstderr:\n{}",

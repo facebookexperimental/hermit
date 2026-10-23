@@ -1,11 +1,9 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+//! Copyright (c) Meta Platforms, Inc. and affiliates.
+//! All rights reserved.
+//!
+//! This source code is licensed under the BSD-style license found in the
+//! LICENSE file in the root directory of this source tree.
+//!
 //! Validate the centralized e2e manifests and expand their execution plan.
 //!
 //! Usage:
@@ -46,7 +44,7 @@ use serde_json::json;
 mod manifest_value;
 use manifest_value::Value;
 
-const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const KNOWN_BACKENDS: [&str; 6] = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const CI_REASON_BASELINE: &str = "ci/ci-reason-baseline.json";
@@ -1135,6 +1133,7 @@ fn validate_and_expand(
             "modes",
             "preprocessors",
             "labels",
+            "proc",
         ],
         &id,
     );
@@ -1218,6 +1217,13 @@ fn validate_and_expand(
         let preprocessors = string_array(Some(preprocessors), &format!("{id}.preprocessors"));
         if preprocessors.iter().any(|value| value != "e9patch") {
             die(format!("{id}: the only supported preprocessor is e9patch"));
+        }
+    }
+    if let Some(level) = test.get("proc") {
+        if !matches!(level.as_str(), Some("minimal" | "standard")) {
+            die(format!(
+                "{id}: proc must be minimal|standard, got {level:?}"
+            ));
         }
     }
 
@@ -1360,11 +1366,18 @@ fn validate_mode_with_cpu(
             "hermit_args",
             "hermit_args_reason",
             "env",
+            "env_by_backend",
             "comparator",
             "comparator_reason",
             "diagnostic",
             "no_retry_reason",
+            "max_level",
+            "max_level_reason",
         ]),
+        // A replay cell may restate the environment it records with, an empty
+        // mapping included (runner::cell_mode_env); otherwise it inherits its
+        // verify cell's.
+        "replay" => allowed.push("env"),
         _ => {}
     }
     ensure_keys(spec_value, &allowed, &format!("{id}.modes.{mode}"));
@@ -1402,10 +1415,17 @@ fn validate_mode_with_cpu(
                 ))
             })
         });
+        // `compare_io_buffers: false` is refused with or without a reason. The
+        // runner would pass `--no-detlog-io-buffers`, and Hermit then never
+        // reports `bitwise_parity` (`is_bitwise_parity` in
+        // hermit-cli/src/bin/hermit/verify.rs), so the cell could never reach
+        // a canonical match. The reason key stays known so that a manifest
+        // naming it gets this explanation rather than "unknown keys".
         match (compare_io_buffers, disabled_reason) {
-            (Some(false), Some(reason)) if !reason.trim().is_empty() => {}
             (Some(false), _) => die(format!(
-                "{id}: modes.verify.compare_io_buffers=false requires a substantive compare_io_buffers_disabled_reason"
+                "{id}: modes.verify.compare_io_buffers=false is refused, with or without a reason: \
+                 under --no-detlog-io-buffers Hermit never reports bitwise_parity, so the cell \
+                 could never reach a canonical match; fix the divergence or disable the cell with its reason"
             )),
             (None | Some(true), Some(_)) => die(format!(
                 "{id}: modes.verify comparison reason is stale while I/O-buffer comparison is enabled"
@@ -1727,6 +1747,12 @@ fn validate_mode_with_cpu(
         let args = string_array(spec.get("args"), &format!("{id}.modes.custom.args"));
         if args.is_empty() {
             die(format!("{id}: enabled custom mode requires args"));
+        }
+        // The test's `proc` key is the one way to choose a /proc level.
+        if let Some(arg) = args.iter().find(|arg| arg.starts_with("--proc")) {
+            die(format!(
+                "{id}: custom args may not choose a /proc level ({arg}); declare the test's proc"
+            ));
         }
         let assertions = spec
             .get("assert")
@@ -2055,6 +2081,9 @@ ptrace = ["strict-compat"]
 [env]
 TMPDIR = "/tmp"
 
+[env_by_backend.ptrace]
+FIXTURE_CELL = "on"
+
 [diagnostic]
 ptrace = "bounded probe; its product failure does not fail the run"
 
@@ -2063,6 +2092,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#;
 
     #[test]
@@ -2088,6 +2118,83 @@ liteinst = "unsupported"
             "custom",
             90,
             &parse_mode(VERIFY_EXTENSIONS),
+            &mut Vec::new(),
+        );
+    }
+
+    /// A replay mode that restates its environment as an empty mapping, as
+    /// compat.yaml's replay cells do so they record without the verify cell's
+    /// TMPDIR.
+    const REPLAY_WITH_ENV: &str = r#"
+ci = true
+backends_enabled = ["ptrace"]
+
+[labels]
+ptrace = ["rr-compat-only"]
+
+[env]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+in-guest-trap = "unsupported"
+"#;
+
+    #[test]
+    fn accepts_an_env_in_a_replay_mode() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "replay",
+            90,
+            &parse_mode(REPLAY_WITH_ENV),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bucket/test.modes.custom: unknown keys: [\"env\"]")]
+    fn rejects_an_env_outside_verify_and_replay() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "custom",
+            90,
+            &parse_mode(REPLAY_WITH_ENV),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "custom args may not choose a /proc level (--proc)")]
+    fn rejects_a_proc_level_in_custom_args() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "custom",
+            90,
+            &parse_mode(
+                r#"
+ci = true
+backends_enabled = ["ptrace"]
+args = ["--strict", "--proc", "standard"]
+
+[assert]
+runs = 1
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+in-guest-trap = "unsupported"
+"#,
+            ),
             &mut Vec::new(),
         );
     }
@@ -2121,6 +2228,17 @@ liteinst = "unsupported"
     }
 
     #[test]
+    fn accepts_a_test_proc_level() {
+        expand_util_c_with("proc: standard");
+    }
+
+    #[test]
+    #[should_panic(expected = "proc must be minimal|standard")]
+    fn rejects_a_proc_level_hermit_lacks() {
+        expand_util_c_with("proc: full");
+    }
+
+    #[test]
     #[should_panic(expected = "unknown keys: [\"label\"]")]
     fn rejects_a_misspelled_labels_key() {
         expand_util_c_with("label: [strict-compat]");
@@ -2134,7 +2252,7 @@ liteinst = "unsupported"
     }
 
     #[test]
-    #[should_panic(expected = "compare_io_buffers=false requires a substantive")]
+    #[should_panic(expected = "compare_io_buffers=false is refused, with or without a reason")]
     fn rejects_io_buffer_comparison_relaxation_without_reason() {
         let spec = parse_mode(
             r#"
@@ -2147,6 +2265,36 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "compare_io_buffers=false is refused, with or without a reason")]
+    fn rejects_io_buffer_comparison_relaxation_with_reason() {
+        let spec = parse_mode(
+            r#"
+ci = true
+compare_io_buffers = false
+compare_io_buffers_disabled_reason = "guest assertions validate the output while whole buffers may vary"
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2174,6 +2322,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2204,6 +2353,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2235,6 +2385,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2274,6 +2425,7 @@ backends_enabled = ["ptrace"]
 dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2327,6 +2479,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         let mut rows = Vec::new();
@@ -2339,7 +2492,7 @@ liteinst = "unsupported"
             &spec,
             &mut rows,
         );
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), KNOWN_BACKENDS.len());
         let applicable: Vec<_> = rows.iter().filter(|row| row.applicable).collect();
         assert_eq!(applicable.len(), 1);
         assert_eq!(applicable[0].backend, "ptrace");
@@ -2350,7 +2503,7 @@ liteinst = "unsupported"
             rows.iter()
                 .all(|row| row.timeout_seconds == 90 && row.attempts == Some(1))
         );
-        assert_eq!(rows.iter().filter(|row| !row.applicable).count(), 4);
+        assert_eq!(rows.iter().filter(|row| !row.applicable).count(), 5);
     }
 
     #[test]
@@ -2368,6 +2521,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         let mut rows = Vec::new();
@@ -2405,6 +2559,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2432,6 +2587,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2457,6 +2613,7 @@ workdir = "/tmp"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2486,6 +2643,7 @@ reason = "canonical comparison diverged at scheduler turn 10"
 dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         let mut rows = Vec::new();
@@ -2531,6 +2689,7 @@ reason = "x"
 dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2700,6 +2859,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2726,6 +2886,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#
         ))
     }
@@ -2800,6 +2961,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#
         ))
     }
@@ -2878,6 +3040,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2904,6 +3067,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2931,6 +3095,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2977,6 +3142,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 
 [assert]
 {assert_body}
@@ -2999,7 +3165,7 @@ liteinst = "unsupported"
         );
         let mut rows = Vec::new();
         validate_chaos(&spec, &mut rows);
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), KNOWN_BACKENDS.len());
         assert_eq!(rows.iter().filter(|row| row.applicable).count(), 1);
         assert!(rows.iter().all(|row| row.mode == "chaos"));
     }
@@ -3012,7 +3178,7 @@ liteinst = "unsupported"
         );
         let mut rows = Vec::new();
         validate_chaos(&spec, &mut rows);
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), KNOWN_BACKENDS.len());
         assert_eq!(rows.iter().filter(|row| row.applicable).count(), 1);
     }
 

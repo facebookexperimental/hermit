@@ -35,14 +35,22 @@ int main(int argc, char** argv) {
     puts("splice legacy passthrough preserved");
     return 0;
   }
-  if (!expect_passthrough && result == -1 && errno == ENOSYS) {
-    puts("splice deterministically unavailable");
-    return 0;
+  // The file name predates the refusal errno. A refused splice must say
+  // EINVAL, the errno GNU grep (3.12) falls back to read(2) on; under ENOSYS
+  // grep reports a read error and exits 2. Take that fallback here too.
+  if (!expect_passthrough && result == -1 && errno == EINVAL) {
+    char byte = 0;
+    if (read(pipefd[0], &byte, 1) == 1 && byte == 'x') {
+      puts("splice deterministically unavailable; read fallback got x");
+      return 0;
+    }
+    perror("read fallback after splice EINVAL");
+    return 1;
   }
   {
     fprintf(
         stderr,
-        "splice returned %ld with errno %d (%s), expected ENOSYS\n",
+        "splice returned %ld with errno %d (%s), expected EINVAL\n",
         result,
         errno,
         strerror(errno));

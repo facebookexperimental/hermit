@@ -1,0 +1,321 @@
+#!/bin/bash
+# The validation DAG's two Buck runner nodes. e2e.buck_stage (--stage-only) stages the
+# inputs Buck does not build; e2e.buck_cells (--cells-only) runs every e2e manifest cell
+# under Buck against them and leaves the rows, unjudged, where the import twins
+# (<bucket>_buck) read them. With no argument it does both, in order, as one process.
+#
+# usage: ci/buck-e2e/validate-node [--stage-only | --cells-only]
+#        ci/buck-e2e/validate-node -h|--help
+#
+#   --stage-only  only ci/buck-e2e/stage --from-cargo: a cargo build in the checkout's
+#                 target/ and a fresh ci/buck-e2e/staged/ for HEAD, whose SOURCE_SHA is
+#                 written last. It needs none of the environment below, no buck2 and no
+#                 runner; what it checks is what the stage checks: its host prerequisites,
+#                 a clean tree of tracked files, and that every build and fixture step
+#                 succeeds.
+#   --cells-only  everything but the staging: regenerate the third-party rules, stage the
+#                 RE link inputs for buck-hybrid, run the cells. It refuses with exit 2,
+#                 before any step runs, unless ci/buck-e2e/staged/SOURCE_SHA exists and
+#                 names HEAD, so it never runs cells against another commit's staging.
+#
+# scripts/validate.rs --e2e-runner buck-local|buck-hybrid --buck2 PATH selects both nodes
+# and passes, through the environment (the cells, and the no-argument form, need it):
+#   HERMIT_VALIDATE_E2E_RUNNER  buck-local (every cell locally) or buck-hybrid (RE-routed
+#                               cells on Meta RE, the rest locally). Anything else,
+#                               including cargo or unset, exits 2: nothing falls back.
+#   HERMIT_VALIDATE_BUCK2       the absolute path of the internal buck2 (a DotSlash file),
+#                               which is never committed.
+#   VALIDATE_RUN_STATE          the run's state directory. The rows go to
+#                               $VALIDATE_RUN_STATE/buck-e2e/results, Buck's event logs to
+#                               $VALIDATE_RUN_STATE/buck-e2e/work.
+#   E2E_RESULT_ROOT             the run's durable E2E result directory. The verify logs of
+#                               every cell execution that did not pass go to
+#                               $E2E_RESULT_ROOT/buck-failed-verify-logs (see
+#                               ci/buck-e2e/ingest.py --failed-verify-logs), beside the
+#                               rows the import twins publish; the state directory is not
+#                               kept. Each `buck2 test` invocation's own record (its console
+#                               log, exit status, test-run id, start and end time and event
+#                               log: NAME.log, .rc, .test_id, .times, .event-log.pb.zst for
+#                               NAME re, local, all and rerun-local, see ci/buck-e2e/run)
+#                               goes to $E2E_RESULT_ROOT/buck-invocations on every exit of
+#                               the cells, with NAME.stages.txt, where that invocation's
+#                               cells spent their time (ci/buck-e2e/stages.py), and
+#                               phases.tsv, the epoch time each step of this node began
+#                               and the time and status it exited with (`exit N`), or the
+#                               signal that ended it (`signal TERM`, INT or HUP). Only
+#                               records this attempt wrote are kept: an earlier attempt's
+#                               are removed from the work directory before any step runs.
+#                               Keeping them is best effort under a time budget (below);
+#                               it never changes the node's status, and on a signal the
+#                               node still dies of that signal.
+# Optional: HERMIT_GIT_DEP_MIRRORS (see bootstrap/git-dep-mirrors.sh) serves Cargo.lock's
+# git dependencies from local mirrors while the third-party rules are regenerated.
+# HERMIT_VALIDATE_BUCK_RETENTION_SECONDS (default 30, a positive integer) bounds the copies
+# and stage summaries made on exit; a node ended by a signal spends at most 2 seconds on
+# them, within the scheduler's grace before it reaps the process group. Every command in
+# that work runs under `timeout --foreground`, so it stays in the node's process group.
+# HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS (a positive integer; the DAG sets it to
+# e2e.buck_cells' wall bound) ends that work 10 seconds, kept for stopping the buck2
+# daemon and exiting, before the bound that dagrun enforces from the step's start in
+# DAGRUN_STEP_STARTED_MONOTONIC_NS, and skips it when that time has gone, so work that
+# completed is never reported as a timeout. When it is set, the start must be a time on
+# CLOCK_MONOTONIC that has passed, or the node exits 2. Bash cannot read CLOCK_MONOTONIC,
+# so the node reads it once, with the wall clock, as it starts (python3, given 60 seconds
+# because an interpreter can take seconds to start on a loaded host; a failed read exits
+# 2 with its own message), and from then on counts down to the bound on the wall clock.
+#
+# Steps, all on the host, in the checkout: regenerate the Buck third-party rules
+# (bootstrap/regenerate-rust-deps), stage the RE link inputs for buck-hybrid
+# (shim/modes/stage-re-inputs), stage the inputs Buck does not build yet with a cargo
+# build in the checkout's target/ (ci/buck-e2e/stage --from-cargo), then
+# ci/buck-e2e/run --no-verdict with -c hermit_e2e.hermit=staged, so the cells test that
+# cargo-built validate-profile target/validate/hermit, the payload a Cargo-runner run
+# certifies. The stage builds in target/release, target/stage-hermit and target/validate.
+# In the full plan it runs beside build.rust_scripts, which builds in
+# target/ci/rust-script-build, and setup.manifest_plan, which builds in target/debug;
+# Cargo locks each profile directory separately, so none of them waits on another. The
+# other Cargo nodes build in the pinned root's own target. Whenever the cells run (the
+# --cells-only and no-argument forms), the buck2 daemon is killed on every exit.
+# Network steps run through with-proxy when it is installed.
+#
+# Exit status: 0 once the rows are written (or, for --stage-only, once the inputs are
+# staged), whatever the cells' verdicts (the twins judge them); 2 for a usage error or a
+# missing input; otherwise the failing step's status. A node sent TERM, INT or HUP while
+# the cells run dies of that signal.
+set -euo pipefail
+
+usage() { sed -n '2,/^set -euo pipefail$/{/^set /d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
+phase=all
+case ${1:-} in
+    -h|--help) usage; exit 0 ;;
+    '') ;;
+    --stage-only) phase=stage ;;
+    --cells-only) phase=cells ;;
+    *) echo "validate-node: unexpected argument: $1 (see --help)" >&2; exit 2 ;;
+esac
+if [[ $# -gt 1 ]]; then
+    echo "validate-node: unexpected argument: $2 (see --help)" >&2
+    exit 2
+fi
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root=$(cd "$here/../.." && pwd)
+proxy=()
+kept=
+if command -v with-proxy >/dev/null 2>&1; then proxy=(with-proxy); fi
+step() {
+    echo "validate-node: $*" >&2
+    [[ -z $kept ]] || printf '%s\t%s\n' "$(date -u +%s.%N)" "$*" >>"$kept/phases.tsv" || true
+}
+stage_inputs() {
+    step "staging the inputs Buck does not build (cargo, target/)"
+    "${proxy[@]}" ./ci/buck-e2e/stage --from-cargo
+}
+
+if [[ $phase == stage ]]; then
+    cd "$root"
+    stage_inputs
+    exit 0
+fi
+if [[ $phase == cells ]]; then
+    staged_sha_file=$here/staged/SOURCE_SHA
+    if ! head_sha=$(git -C "$root" rev-parse HEAD 2>/dev/null); then
+        echo "validate-node: --cells-only cannot read HEAD in $root to check the staged inputs against it" >&2
+        exit 2
+    fi
+    if [[ ! -s $staged_sha_file ]]; then
+        echo "validate-node: --cells-only needs staged inputs, and $staged_sha_file is missing: the stage (e2e.buck_stage, ci/buck-e2e/validate-node --stage-only) did not finish" >&2
+        exit 2
+    fi
+    staged_sha=$(<"$staged_sha_file")
+    if [[ $staged_sha != "$head_sha" ]]; then
+        echo "validate-node: --cells-only refuses: the inputs were staged for $staged_sha, but HEAD is $head_sha; stage again (ci/buck-e2e/validate-node --stage-only)" >&2
+        exit 2
+    fi
+fi
+
+runner=${HERMIT_VALIDATE_E2E_RUNNER:-}
+# Each mode names its Buck mode file. buck-local needs shim/modes/meta-local, not the bare
+# .buckconfig: the Meta buck2 the validation host runs refuses `buck2 test` without
+# test.v2_test_executor ("Cannot use internal test runner. Config value must be provided
+# for test.v2_test_executor"), and ci/buck-e2e/ingest.py reads the results through TestX
+# either way. With no mode file, e2e.buck_cells in buck-local failed 9 s after it started
+# (validate-claude-coord-685023149cde-1792253229043517790-2205237-22189032).
+case $runner in
+    buck-local) mode=local; buck_args=(@shim/modes/meta-local) ;;
+    buck-hybrid) mode=hybrid; buck_args=(@shim/modes/hybrid) ;;
+    *)
+        echo "validate-node: HERMIT_VALIDATE_E2E_RUNNER is '${runner}', not buck-local or buck-hybrid; run scripts/validate.rs --e2e-runner buck-local|buck-hybrid --buck2 PATH" >&2
+        exit 2 ;;
+esac
+buck2=${HERMIT_VALIDATE_BUCK2:-}
+if [[ $buck2 != /* || ! -f $buck2 || ! -x $buck2 ]]; then
+    echo "validate-node: HERMIT_VALIDATE_BUCK2 is '${buck2}', not an absolute path to an executable file; pass scripts/validate.rs --buck2 PATH" >&2
+    exit 2
+fi
+if [[ -z ${VALIDATE_RUN_STATE:-} ]]; then
+    echo "validate-node: VALIDATE_RUN_STATE is unset; this node runs under scripts/validate.rs" >&2
+    exit 2
+fi
+if [[ -z ${E2E_RESULT_ROOT:-} ]]; then
+    echo "validate-node: E2E_RESULT_ROOT is unset; this node runs under scripts/validate.rs" >&2
+    exit 2
+fi
+retention_seconds=${HERMIT_VALIDATE_BUCK_RETENTION_SECONDS:-30}
+if [[ ! $retention_seconds =~ ^[1-9][0-9]{0,5}$ ]]; then
+    echo "validate-node: HERMIT_VALIDATE_BUCK_RETENTION_SECONDS is '${retention_seconds}', not a positive number of seconds" >&2
+    exit 2
+fi
+# dagrun exports when this step started, but not its wall bound; the DAG passes the bound.
+step_wall_seconds=${HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS:-}
+step_started_ns=${DAGRUN_STEP_STARTED_MONOTONIC_NS:-}
+step_reserve_seconds=10
+step_end_us= # the epoch microseconds of this step's wall bound, less the reserve
+if [[ -n $step_wall_seconds ]]; then
+    if [[ ! $step_wall_seconds =~ ^[1-9][0-9]{0,5}$ ]]; then
+        echo "validate-node: HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is '${step_wall_seconds}', not a positive number of seconds" >&2
+        exit 2
+    fi
+    if [[ ! $step_started_ns =~ ^[0-9]{1,18}$ ]]; then
+        echo "validate-node: HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is set, but DAGRUN_STEP_STARTED_MONOTONIC_NS is '${step_started_ns}', not a time on CLOCK_MONOTONIC that has passed" >&2
+        exit 2
+    fi
+    # One reading of both clocks, so the time python3 takes to start is in neither.
+    clocks_status=0
+    clocks=$(timeout --foreground -k 1 60 python3 -c 'import time; print(time.monotonic_ns(), time.time_ns())') ||
+        clocks_status=$?
+    if ((clocks_status != 0)) || [[ ! $clocks =~ ^([0-9]{1,18})\ ([0-9]{1,19})$ ]]; then
+        echo "validate-node: HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is set, but CLOCK_MONOTONIC could not be read: python3 exited ${clocks_status} within 60 s and printed '${clocks}', not two clock readings" >&2
+        exit 2
+    fi
+    if ((BASH_REMATCH[1] < step_started_ns)); then
+        echo "validate-node: HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is set, but DAGRUN_STEP_STARTED_MONOTONIC_NS is '${step_started_ns}', not a time on CLOCK_MONOTONIC that has passed" >&2
+        exit 2
+    fi
+    step_end_us=$(((BASH_REMATCH[2] + step_started_ns + step_wall_seconds * 1000000000 - BASH_REMATCH[1]) / 1000 - step_reserve_seconds * 1000000))
+fi
+state=$VALIDATE_RUN_STATE/buck-e2e
+failed_logs=$(realpath -m -- "$E2E_RESULT_ROOT")/buck-failed-verify-logs
+invocations=$(realpath -m -- "$E2E_RESULT_ROOT")/buck-invocations
+
+# The invocations' records are evidence, not input, like the failed cells' logs: an earlier
+# attempt's copy that cannot be replaced costs this run its copy, never the run, and so does
+# any copy or summary that fails below.
+if rm -rf -- "${invocations:?}" && mkdir -p -- "$invocations"; then
+    kept=$invocations
+else
+    echo "validate-node: cannot replace the earlier $invocations (above); this run keeps no Buck invocation records" >&2
+fi
+# ci/buck-e2e/run removes an earlier attempt's records from $state/work only once it starts;
+# a step that fails before then must not leave them to be kept as this attempt's.
+if [[ -n $kept ]] && ! rm -f -- "$state/work"/{re,local,all,rerun-local}.{log,rc,test_id,times,event-log.pb.zst}; then
+    echo "validate-node: cannot remove an earlier attempt's Buck invocation records from $state/work (above); this run keeps none" >&2
+    kept=
+fi
+time_left() { # set left to the seconds until the caller's deadline (epoch microseconds); fail once it has passed
+    local now=${EPOCHREALTIME/[^0-9]/}
+    ((now < deadline)) || return 1
+    printf -v left '%d.%06d' $(((deadline - now) / 1000000)) $(((deadline - now) % 1000000))
+}
+keep_invocations() { # $1: a deadline (epoch microseconds); $2: what set it. Copy each invocation's
+    # record from $state/work into $kept, with its stage summary. Each command gets what is left
+    # before $1 and none starts after it, so a stalled copy or summary costs records, never the
+    # node's status or its daemon cleanup.
+    local deadline=$1 left name file
+    for name in re local all rerun-local; do
+        for file in "$state/work/$name".{log,rc,test_id,times,event-log.pb.zst}; do
+            [[ -f $file ]] || continue
+            if ! time_left; then
+                echo "validate-node: $2 ran out before $file" >&2
+                return
+            fi
+            timeout --foreground -k 0.5 "$left" cp -- "$file" "$kept/"
+        done
+        [[ -f $state/work/$name.event-log.pb.zst ]] || continue
+        if ! time_left; then
+            echo "validate-node: $2 ran out before the $name invocation's stage summary" >&2
+            return
+        fi
+        if ! timeout --foreground -k 0.5 "$left" "$buck2" log show "$state/work/$name.event-log.pb.zst" |
+            timeout --foreground -k 0.5 "$left" python3 "$here/stages.py" - >"$kept/$name.stages.txt"; then
+            echo "validate-node: the stage summary of the $name invocation is incomplete (above)" >&2
+        fi
+    done
+}
+exiting=
+on_exit() { # keep the invocations' records, then stop the buck2 daemon; the node's status stands
+    local status=$?
+    set +e
+    exiting=1
+    if [[ -n $kept ]]; then
+        printf '%s\texit %s\n' "$(date -u +%s.%N)" "$status" >>"$kept/phases.tsv"
+        local now deadline why
+        now=${EPOCHREALTIME/[^0-9]/}
+        deadline=$((now + retention_seconds * 1000000))
+        why="the $retention_seconds s for keeping the Buck invocation records"
+        if [[ -n $step_wall_seconds ]] && ((step_end_us < deadline)); then
+            deadline=$step_end_us
+            why="the time left before this step's $step_wall_seconds s wall bound, less $step_reserve_seconds s for stopping buck2,"
+        fi
+        keep_invocations "$deadline" "$why"
+    fi
+    "$buck2" kill >/dev/null 2>&1
+}
+on_signal() { # $1: the signal. Record it, keep what records fit in 2 seconds (none if the exit
+    # had begun keeping them), stop the buck2 daemon, then die of $1 as if it were not caught.
+    # Bash runs this once the foreground command returns; on an uncaught signal its EXIT trap
+    # would see that command's status and record a signal as an ordinary exit.
+    trap - EXIT
+    set +e
+    if [[ -n $kept ]]; then
+        printf '%s\tsignal %s\n' "$(date -u +%s.%N)" "$1" >>"$kept/phases.tsv"
+        [[ -n $exiting ]] || keep_invocations $((${EPOCHREALTIME/[^0-9]/} + 2000000)) "the 2 s a signalled node keeps for the Buck invocation records"
+    fi
+    timeout --foreground -k 0.5 1 "$buck2" kill >/dev/null 2>&1
+    trap - "$1"
+    kill -s "$1" "$$"
+}
+
+cd "$root"
+trap on_exit EXIT
+trap 'on_signal TERM' TERM
+trap 'on_signal INT' INT
+trap 'on_signal HUP' HUP
+
+step "regenerating the Buck third-party rules"
+"${proxy[@]}" ./bootstrap/regenerate-rust-deps
+if [[ $mode == hybrid ]]; then
+    step "staging the RE link inputs"
+    "${proxy[@]}" ./shim/modes/stage-re-inputs
+fi
+if [[ $phase == all ]]; then
+    stage_inputs
+fi
+rm -rf -- "${state:?}/results"
+# The failed cells' logs are evidence, not input: an earlier attempt's copy that cannot be
+# removed costs this run its copy, never the run.
+failed_logs_args=(--failed-verify-logs "$failed_logs")
+if ! rm -rf -- "${failed_logs:?}"; then
+    echo "validate-node: cannot remove the earlier $failed_logs (above); this run keeps no failed-cell verify logs" >&2
+    failed_logs_args=()
+fi
+mkdir -p "$state/work"
+# Every cell of the run gets one HERMIT_EPOCH: backend parity compares a ptrace reference with
+# its candidates only when they share the guest epoch, and each cell is its own harness
+# process, which would otherwise sample its own start time. The epoch is derived from the
+# inputs, the checked-out commit's committer time, not sampled: it is part of every cell's
+# action digest, so a sample would keep any cell result from being reused, while this keeps
+# a re-validation of the same commit cacheable and its runs reproducible. An exported
+# HERMIT_EPOCH overrides it.
+if [[ -n ${HERMIT_EPOCH:-} ]]; then
+    epoch=$HERMIT_EPOCH
+elif committed=$(git -C "$root" show -s --format=%ct HEAD) && [[ $committed =~ ^[0-9]+$ ]]; then
+    epoch=$(date -u -d "@$committed" +%Y-%m-%dT%H:%M:%S+00:00)
+else
+    echo "validate-node: cannot read the checked-out commit's committer time for HERMIT_EPOCH; export HERMIT_EPOCH to supply one" >&2
+    exit 2
+fi
+step "running every cell under Buck ($runner), HERMIT_EPOCH=$epoch"
+./ci/buck-e2e/run --mode "$mode" --no-verdict --out "$state/results" --work "$state/work" \
+    "${failed_logs_args[@]}" \
+    --buck2 "$buck2" -- "${buck_args[@]}" -c hermit_e2e.hermit=staged -c "hermit_e2e.epoch=$epoch"

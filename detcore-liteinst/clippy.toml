@@ -1,0 +1,18 @@
+# the in-guest LiteInst runtime runs in the guest's process, so the C library's malloc heap is the
+# guest's. These calls allocate from it; see detcore/clippy.toml, whose list
+# this repeats, and detcore's util::canonicalize and util::find_in_directory.
+disallowed-methods = [
+    { path = "std::fs::canonicalize", reason = "allocates from the guest's C library heap in-process; use util::canonicalize (see detcore/clippy.toml)" },
+    { path = "std::path::Path::canonicalize", reason = "allocates from the guest's C library heap in-process; use util::canonicalize (see detcore/clippy.toml)" },
+    { path = "std::fs::read_dir", reason = "glibc opendir allocates from the guest's C library heap in-process; use util::find_in_directory (see detcore/clippy.toml)" },
+    { path = "std::path::Path::read_dir", reason = "glibc opendir allocates from the guest's C library heap in-process; use util::find_in_directory (see detcore/clippy.toml)" },
+    { path = "libc::realpath", reason = "allocates from the guest's C library heap in-process; use util::canonicalize (see detcore/clippy.toml)" },
+    { path = "libc::opendir", reason = "allocates from the guest's C library heap in-process; use util::find_in_directory (see detcore/clippy.toml)" },
+    { path = "libc::fdopendir", reason = "allocates from the guest's C library heap in-process; use util::find_in_directory (see detcore/clippy.toml)" },
+    { path = "nix::dir::Dir::open", reason = "fdopendir allocates from the guest's C library heap in-process; use util::find_in_directory (see detcore/clippy.toml)" },
+    { path = "nix::dir::Dir::openat", reason = "fdopendir allocates from the guest's C library heap in-process; use util::find_in_directory (see detcore/clippy.toml)" },
+    { path = "nix::dir::Dir::from_fd", reason = "fdopendir allocates from the guest's C library heap in-process; use util::find_in_directory (see detcore/clippy.toml)" },
+    { path = "std::fs::remove_dir_all", reason = "walks with fdopendir, which allocates from the guest's C library heap in-process (see detcore/clippy.toml)" },
+    { path = "tokio::fs::read_dir", reason = "calls std::fs::read_dir (glibc opendir) on a worker; use util::find_in_directory (see detcore/clippy.toml)" },
+    { path = "tokio::fs::canonicalize", reason = "calls glibc realpath on a worker; use util::canonicalize (see detcore/clippy.toml)" },
+]

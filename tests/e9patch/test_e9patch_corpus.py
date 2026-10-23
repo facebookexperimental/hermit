@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Consumer contracts of the e9patch preprocessing parity corpus driver.
 
 `e9patch_corpus.py` beside this file is a manual driver. It needs e9tool and a
@@ -122,12 +116,8 @@ class HermitCommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             tmp_a = Path(raw) / "run-a"
             tmp_b = Path(raw) / "run-b"
-            command_a = e9patch_corpus.hermit_command(
-                hermit, False, False, guest, tmp_a
-            )
-            command_b = e9patch_corpus.hermit_command(
-                hermit, False, False, guest, tmp_b
-            )
+            command_a = e9patch_corpus.hermit_command(hermit, False, False, guest, tmp_a)
+            command_b = e9patch_corpus.hermit_command(hermit, False, False, guest, tmp_b)
         self.assertIn(f"--tmp={tmp_a}", command_a)
         self.assertIn(f"--tmp={tmp_b}", command_b)
         self.assertNotIn(f"--tmp={tmp_b}", command_a)

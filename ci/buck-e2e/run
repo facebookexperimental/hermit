@@ -5,7 +5,8 @@
 # write. Only import mode may read IMPORT_DIR; see ci/buck-e2e/ingest.py.
 #
 # usage: ci/buck-e2e/run --mode hybrid|local --out IMPORT_DIR --work DIR
-#            [--buck2 PATH] [--no-verdict] [-- EXTRA_BUCK2_TEST_ARGS...]
+#            [--buck2 PATH] [--no-verdict] [--failed-verify-logs DIR]
+#            [-- EXTRA_BUCK2_TEST_ARGS...]
 #        ci/buck-e2e/run -h|--help
 #
 #   hybrid  RE-routed cells run on Meta RE and the rest locally (see defs.bzl). The two
@@ -17,7 +18,12 @@
 #           fetches the results with testx ($TESTX, else testx on PATH).
 #   --no-verdict  stop after ingesting: leave the rows in IMPORT_DIR unjudged, for a caller
 #           that judges them itself (`test-harness run` in import mode, as verdict.py does),
-#           and exit 0 whatever the cells' verdicts are. No validation-DAG node does this yet.
+#           and exit 0 whatever the cells' verdicts are. The validation DAG's e2e.buck_cells node
+#           (ci/buck-e2e/validate-node) does this; its <bucket>_buck import twins judge.
+#   --failed-verify-logs DIR  keep the verify logs (run1_log_*, run2_log_*) of every cell
+#           execution that did not pass in DIR, with DIR/index.jsonl; IMPORT_DIR and --work
+#           are scratch, DIR is the evidence a failure leaves (see ingest.py). An RE cell's
+#           logs exist only as its Tpx artifacts, so nothing else brings them to this host.
 #
 # The inputs Buck does not build yet must already be staged (ci/buck-e2e/stage), and
 # HEAD must be the staged SOURCE_SHA with no uncommitted changes to tracked files before
@@ -26,10 +32,23 @@
 # Tpx retries a failed cell once (--retry 1); cells pass --no-retry to the harness, and
 # ingest.py turns a retried cell's executions into attempts 1 and 2. EXTRA args go to
 # every `buck2 test` before the `--` (e.g. @shim/modes/hybrid).
+# An RE worker can lack a capability a cell needs that the plan cannot route on, because
+# workers differ: `hermit run --strict` on ptrace refuses where the branch counter is
+# inexact. There the harness withholds the cell (HOST-INAPPLICABLE), and its run, having
+# executed no cell, fails, so Tpx retries it on another worker. ingest.py numbers no
+# withheld execution as an attempt. A cell withheld on every RE execution is run once
+# more, locally (-c hermit_e2e.routing=local, only those targets), and the run is
+# ingested again, so import mode never judges a claim this machine did not make. A cell
+# whose retry after a failed attempt was withheld runs once more locally too, without a
+# Tpx retry (--retry 0), so that execution is the attempt Tpx gave it and the cell keeps
+# at most two attempts.
 # The release hermit is built unstamped (-c hermit_release.unstamped=true: no commit
 # hash or build date in the binary), so a commit that changes no compiled source
 # rebuilds nothing and its cells stay cached. Only scripts/build-buck-release.rs stamps.
-# Each invocation's event log and test-run id are kept in --work.
+# Each invocation's event log, test-run id, console log (NAME.log), exit status (NAME.rc) and
+# start and end time (NAME.times, two epoch-second lines) are kept in --work, as NAME.*
+# for NAME re and local (hybrid), all (local) and rerun-local; a run first removes an
+# earlier run's, so every NAME.* there is this run's.
 #
 # ci/buck-e2e/verdict.py then judges the rows as the cargo flow's e2e nodes judge theirs:
 # the staged test-harness, in import mode, once per (lane, category) bucket of the plan.
@@ -43,7 +62,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
-mode= out= work= buck2=${BUCK2:-buck2} verdict=1
+mode= out= work= buck2=${BUCK2:-buck2} verdict=1 failed_logs=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --mode) mode=$2; shift 2 ;;
@@ -51,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --work) work=$2; shift 2 ;;
         --buck2) buck2=$2; shift 2 ;;
         --no-verdict) verdict=0; shift ;;
+        --failed-verify-logs) failed_logs=(--failed-verify-logs "$2"); shift 2 ;;
         -h | --help) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "${BASH_SOURCE[0]}"; exit 0 ;;
         --) shift; break ;;
         *) echo "ci/buck-e2e/run: unknown argument $1" >&2; exit 2 ;;
@@ -58,6 +78,17 @@ while [[ $# -gt 0 ]]; do
 done
 [[ $mode == hybrid || $mode == local ]] || { echo "ci/buck-e2e/run: --mode hybrid|local is required" >&2; exit 2; }
 [[ -n $out && -n $work ]] || { echo "ci/buck-e2e/run: --out and --work are required" >&2; exit 2; }
+# ingest.py checks the directories it is given, but sees only --work/artifacts; the rest of
+# --work (event logs, the verdict) is this script's, and replacing it would delete them.
+overlaps() { local a b; a=$(realpath -m -- "$1")/ b=$(realpath -m -- "$2")/; [[ $a == "$b"* || $b == "$a"* ]]; }
+if ((${#failed_logs[@]})); then
+    for other in "$out" "$work"; do
+        if overlaps "${failed_logs[1]}" "$other"; then
+            echo "ci/buck-e2e/run: --failed-verify-logs ${failed_logs[1]} overlaps $other; replacing it would delete that directory's files" >&2
+            exit 2
+        fi
+    done
+fi
 [[ -s $here/staged/SOURCE_SHA ]] || { echo "ci/buck-e2e/run: stage the inputs first (ci/buck-e2e/stage)" >&2; exit 2; }
 [[ -x $here/staged/bin/test-harness ]] || {
     echo "ci/buck-e2e/run: $here/staged/bin/test-harness is missing; stage the inputs again (ci/buck-e2e/stage)" >&2
@@ -90,47 +121,98 @@ require_staged_source "before the run" 2
 mkdir -p "$out" "$work"
 # A previous run's verdict must not stand beside this run's rows, whether it fails or is unjudged.
 rm -rf -- "${work:?}/verdict"
+# Nor may an earlier run's invocation records: validate-node keeps every one it finds here.
+for previous in re local all rerun-local; do
+    rm -f -- "$work/$previous".{log,rc,test_id,times,event-log.pb.zst}
+done
 extra=("$@")
 tpx=(-- --retry 1 --no-retry-on-skip)
 
-invoke() { # invoke NAME TARGET [buck2 args...]: one `buck2 test`, its exit status in NAME.rc
-    local name=$1 target=$2
-    shift 2
+invoke() { # invoke NAME TARGET... [buck2 args...]: one `buck2 test`, its exit status in NAME.rc
+    local name=$1
+    shift
     set +e
+    date -u +%s.%N >"$work/$name.times"
     env -C "$root" "$buck2" test -c hermit_release.unstamped=true "${extra[@]}" "$@" \
         --event-log "$work/$name.event-log.pb.zst" --write-test-id "$work/$name.test_id" \
-        "$target" "${tpx[@]}" >"$work/$name.log" 2>&1
+        "${tpx[@]}" >"$work/$name.log" 2>&1
     echo $? >"$work/$name.rc"
+    date -u +%s.%N >>"$work/$name.times"
     set -e
+}
+
+ids=() event_logs=()
+collect() { # collect NAME...: append each invocation's test-run id to ids, or exit 1
+    local r rc
+    for r in "$@"; do
+        # buck2 test exits 32 when tests fail: the verdicts are the rows', not the exit code.
+        rc=$(cat "$work/$r.rc")
+        if [[ ! -s $work/$r.test_id ]] || { [[ $rc != 0 && $rc != 32 ]]; }; then
+            echo "ci/buck-e2e/run: buck2 test ($r) failed with exit $rc; see $work/$r.log" >&2
+            tail -20 "$work/$r.log" >&2
+            exit 1
+        fi
+        ids+=("$(cat "$work/$r.test_id")")
+        # Read by ingest.py only to name why an execution wrote no row.
+        if [[ -s $work/$r.event-log.pb.zst ]]; then
+            event_logs+=(--event-log "$work/$r.event-log.pb.zst")
+        fi
+    done
+}
+
+ingest() { # ingest: rows for every invocation in ids, and the cells withheld on RE that run again locally
+    python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
+        --local-artifacts "$root/buck-out/v2/test/execution" --withheld-on-re "$work/withheld-on-re" \
+        --withheld-retries "$work/withheld-retries" "${failed_logs[@]}" \
+        --buck2 "$buck2" "${event_logs[@]}" "${ids[@]}" || {
+        echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
+        exit 1
+    }
 }
 
 if [[ $mode == hybrid ]]; then
     invoke re //ci/buck-e2e:re &
     invoke local //ci/buck-e2e:local &
     wait
-    runs=(re local)
+    collect re local
 else
     invoke all //ci/buck-e2e:all -c hermit_e2e.routing=local
-    runs=(all)
+    collect all
 fi
-
-ids=()
-for r in "${runs[@]}"; do
-    # buck2 test exits 32 when tests fail: the verdicts are the rows', not the exit code.
-    rc=$(cat "$work/$r.rc")
-    if [[ ! -s $work/$r.test_id ]] || { [[ $rc != 0 && $rc != 32 ]]; }; then
-        echo "ci/buck-e2e/run: buck2 test ($r) failed with exit $rc; see $work/$r.log" >&2
-        tail -20 "$work/$r.log" >&2
+require_staged_source "after the run" 1
+ingest
+if [[ -s $work/withheld-on-re || -s $work/withheld-retries ]]; then
+    reruns=()
+    if [[ -s $work/withheld-on-re ]]; then
+        mapfile -t withheld <"$work/withheld-on-re"
+        echo "ci/buck-e2e/run: ${#withheld[@]} cell(s) were withheld on every RE worker that ran them; running them locally:" \
+            "${withheld[*]}" >&2
+        invoke rerun-local "${withheld[@]/#/"//ci/buck-e2e:"}" -c hermit_e2e.routing=local
+        reruns+=(rerun-local)
+    fi
+    if [[ -s $work/withheld-retries ]]; then
+        mapfile -t retries <"$work/withheld-retries"
+        echo "ci/buck-e2e/run: ${#retries[@]} cell(s) had their retry withheld on RE; running that attempt locally:" \
+            "${retries[*]}" >&2
+        tpx=(-- --retry 0 --no-retry-on-skip)
+        invoke retry-local "${retries[@]/#/"//ci/buck-e2e:"}" -c hermit_e2e.routing=local
+        tpx=(-- --retry 1 --no-retry-on-skip)
+        reruns+=(retry-local)
+    fi
+    collect "${reruns[@]}"
+    require_staged_source "after the local rerun" 1
+    ingest
+    if [[ -s $work/withheld-retries ]]; then
+        echo "ci/buck-e2e/run: after the local rerun, cells still end with a retry withheld on RE: $(paste -sd' ' "$work/withheld-retries");" \
+            "the run has no verdict" >&2
         exit 1
     fi
-    ids+=("$(cat "$work/$r.test_id")")
-done
-require_staged_source "after the run" 1
-python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
-    --local-artifacts "$root/buck-out/v2/test/execution" "${ids[@]}" || {
-    echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
-    exit 1
-}
+    if [[ -s $work/withheld-on-re ]]; then
+        echo "ci/buck-e2e/run: after the local rerun, cells still have only RE claims: $(paste -sd' ' "$work/withheld-on-re");" \
+            "the run has no verdict" >&2
+        exit 1
+    fi
+fi
 ((verdict)) || {
     echo "ci/buck-e2e/run: --no-verdict: the rows in $out are unjudged; this run has no verdict" >&2
     exit 0

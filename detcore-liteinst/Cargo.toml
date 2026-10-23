@@ -1,0 +1,48 @@
+[package]
+name = "detcore-liteinst"
+description = "In-guest LiteInst runtime for Detcore, the Hermit deterministic execution engine."
+version = "0.5.1"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+publish = false
+
+# This crate is a preload runtime, not a testable library. Its `.init_array`
+# constructor (src/lib.rs) runs before any Rust test harness and `_exit(127)`s
+# when `REVERIE_LITEINST_COORDINATOR` is unset, so a generated unit-test binary
+# would abort during `nextest --list`. The test and doctest targets are
+# disabled: hermit-cli's in-guest CLI tests run it as a real preload.
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[features]
+# Real-runtime allocation regression; never selects a different allocator.
+allocator-fixture = ["reverie-liteinst/allocator-fixture"]
+# Private InitialImage entry; ordinary builds retain the loader constructor.
+exec-private-init = ["detcore/dispatch-observer", "reverie-liteinst/exec-private-init", "reverie-inguest/exec-private-init", "dep:detcore-model", "dep:reverie-rpc-transport"]
+
+# Explicit static-private artifact mechanism; effective only for musl in Reverie.
+# No entry, constructor, ownership or readiness activation follows from this.
+loader-private-runtime = ["exec-private-init", "reverie-liteinst/loader-private-runtime", "reverie-inguest/loader-private-runtime"]
+
+# Explicit native successor; no constructor/environment activation.
+exec-native-injection = ["exec-private-init", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "reverie-inguest/exec-native-injection", "dep:bincode", "dep:serde", "dep:sha2"]
+
+[dependencies]
+detcore = { package = "hermit-detcore", version = "0.5.1", path = "../detcore" }
+libc = "0.2.186"
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14" }
+reverie-inguest = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14", default-features = false }
+reverie-liteinst = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14", default-features = false }
+
+detcore-model = { version = "0.5.1", path = "../detcore-model", optional = true }
+reverie-rpc-transport = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14", optional = true }
+bincode = { version = "2", features = ["serde"], optional = true }
+serde = { version = "1.0.219", features = ["derive"], optional = true }
+sha2 = { version = "0.10.6", optional = true }
+
+[dev-dependencies]
+# Native consumer controls are also type-checked by all-target Clippy.
+tempfile = "3.27.0"

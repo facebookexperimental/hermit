@@ -26,6 +26,9 @@
 //! the minimum that can vary at all but admits only two permutations, so a
 //! short sample misses it. This test therefore requires at least three.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -77,14 +80,15 @@ fn guest_path() -> PathBuf {
 
 /// Run to `turn` and return the futex rows of the summary, in the order printed.
 fn futex_rows(guest: &Path, turn: u32) -> Vec<String> {
-    let output = Command::new("timeout")
-        .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--strict", &format!("--stop-after-turn={turn}")])
-        .arg("--")
-        .arg(guest)
-        .output()
-        .expect("failed to start hermit");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new("timeout")
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["run", "--strict", &format!("--stop-after-turn={turn}")])
+            .arg("--")
+            .arg(guest),
+    );
     String::from_utf8_lossy(&output.stderr)
         .lines()
         .map(str::trim)

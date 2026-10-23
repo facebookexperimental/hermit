@@ -9,6 +9,7 @@
 /usr/bin/cksum
 /usr/bin/cmp
 /usr/bin/comm
+/usr/bin/curl
 /usr/bin/cut
 /usr/bin/date
 /usr/bin/dd

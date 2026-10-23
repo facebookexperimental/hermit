@@ -1,0 +1,12 @@
+load("@fbcode//fbpkg:fbpkg.bzl", "fbpkg")
+
+oncall("hermit")
+
+fbpkg.builder(
+    name = "hermetic_infra.hermit_cli",
+    architectures = ["x86_64"],
+    path_actions = {
+        "hermit": "//hermetic_infra/hermit/hermit-cli:hermit",
+        "install.toml": "install.toml",
+    },
+)

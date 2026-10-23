@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Tests for demos/lib/hermit-tmp-binds.sh and demo 9's use of it.
 
 `hermit run` gives the program it runs a private, empty /tmp, and Hermit
@@ -181,9 +175,7 @@ class HelperTest(unittest.TestCase):
     def test_paths_outside_tmp_bind_nothing(self):
         program = self.outside / "bin" / "prog"
         self._assert_accepted(program, self.outside / "data", "relative/file")
-        self.assertEqual(
-            self._binds(program, self.outside / "data", "relative/file"), []
-        )
+        self.assertEqual(self._binds(program, self.outside / "data", "relative/file"), [])
         self.assertEqual(self._binds(), [])
 
     def test_a_file_inside_the_program_directory_is_not_bound_again(self):
@@ -316,7 +308,9 @@ class HelperTest(unittest.TestCase):
             ("/", "tmp/{}/a.img".format(below_tmp)),
         ):
             with self.subTest(cwd=cwd, relative=relative):
-                self._assert_refused([program, relative], relative, problem, cwd=cwd)
+                self._assert_refused(
+                    [program, relative], relative, problem, cwd=cwd
+                )
 
     def test_a_relative_file_through_a_symbolic_link_and_dot_dot_is_refused(self):
         # The program resolves the absolute link in its own view, where it

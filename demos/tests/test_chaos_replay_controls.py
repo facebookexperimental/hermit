@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Tests for the checks in demo 3's last step, the schedule replay.
 
 Demo 3 records a failing chaos run of hello_race (seed 0) with
@@ -38,7 +32,7 @@ DEMO_DIR = Path(__file__).resolve().parent.parent
 RUN = DEMO_DIR / "03-chaos-concurrency" / "run.sh"
 SUCCESS_LINE = "=== Demo 3: Chaos Concurrency Testing: SUCCESS ==="
 
-STUB_HERMIT = r"""#!{python}
+STUB_HERMIT = r'''#!{python}
 import json, os, sys
 from pathlib import Path
 
@@ -103,7 +97,7 @@ if outcome_seed in FAILING:
     sys.exit(1)
 print("Final value: 2")
 print("Did not find antagonistic schedule. Succeeding.")
-"""
+'''
 
 
 class ChaosReplayControlsTest(unittest.TestCase):
@@ -120,9 +114,7 @@ class ChaosReplayControlsTest(unittest.TestCase):
         # from running them.
         for name in ("cargo", "cc"):
             tool = self.bin / name
-            tool.write_text(
-                "#!/bin/sh\necho 'unexpected {} call' >&2\nexit 99\n".format(name)
-            )
+            tool.write_text("#!/bin/sh\necho 'unexpected {} call' >&2\nexit 99\n".format(name))
             tool.chmod(0o755)
         self.guest = self.directory / "hello_race"
         self.guest.write_text("#!/bin/sh\nexit 99\n")
@@ -133,12 +125,7 @@ class ChaosReplayControlsTest(unittest.TestCase):
 
     def _run(self, replay_mode, **extra_env):
         env = dict(os.environ)
-        for name in (
-            "HERMIT_EPOCH",
-            "HERMIT_LOG_FILE",
-            "HERMIT_PRNG",
-            "HERMIT_SCHED_SEED",
-        ):
+        for name in ("HERMIT_EPOCH", "HERMIT_LOG_FILE", "HERMIT_PRNG", "HERMIT_SCHED_SEED"):
             env.pop(name, None)
         env.update(
             PATH="{}:{}".format(self.bin, os.environ.get("PATH", "/usr/bin:/bin")),
@@ -165,11 +152,7 @@ class ChaosReplayControlsTest(unittest.TestCase):
         return [json.loads(line) for line in self.stub_log.read_text().splitlines()]
 
     def _call_with(self, option):
-        matches = [
-            call
-            for call in self._calls()
-            if any(arg.startswith(option) for arg in call["argv"])
-        ]
+        matches = [call for call in self._calls() if any(arg.startswith(option) for arg in call["argv"])]
         self.assertEqual(len(matches), 1, "expected one call with {}".format(option))
         return matches[0]
 
@@ -182,9 +165,7 @@ class ChaosReplayControlsTest(unittest.TestCase):
     def test_a_replay_that_follows_the_file_passes(self):
         self._assert_success(self._run("faithful"))
 
-    def test_a_replay_that_follows_the_file_passes_with_hermit_epoch_and_log_file_set(
-        self,
-    ):
+    def test_a_replay_that_follows_the_file_passes_with_hermit_epoch_and_log_file_set(self):
         result = self._run(
             "faithful",
             HERMIT_EPOCH="2031-07-15T12:34:56+00:00",
@@ -206,19 +187,12 @@ class ChaosReplayControlsTest(unittest.TestCase):
         recording = self._call_with("--record-preemptions-to=")
         replay = self._call_with("--replay-preemptions-from=")
         self.assertIn("--seed=0", recording["argv"])
-        self.assertIn(
-            "--record-preemptions-to={}".format(self.schedule), recording["argv"]
-        )
-        self.assertEqual(
-            [arg for arg in replay["argv"] if arg.startswith("--seed")], ["--seed=1"]
-        )
-        self.assertIn(
-            "--replay-preemptions-from={}".format(self.schedule), replay["argv"]
-        )
+        self.assertIn("--record-preemptions-to={}".format(self.schedule), recording["argv"])
+        self.assertEqual([arg for arg in replay["argv"] if arg.startswith("--seed")], ["--seed=1"])
+        self.assertIn("--replay-preemptions-from={}".format(self.schedule), replay["argv"])
         for call in (recording, replay):
             self.assertIsNone(call["HERMIT_EPOCH"])
             self.assertIsNone(call["HERMIT_LOG_FILE"])
-
         # Apart from the seed and the file option, the two runs use the same
         # flags as each other.
         def without(argv, *prefixes):
@@ -233,8 +207,7 @@ class ChaosReplayControlsTest(unittest.TestCase):
         result = self._run("ignores-file")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(
-            "replaying the failing schedule under seed 1: exit status 0, expected 1",
-            result.stderr,
+            "replaying the failing schedule under seed 1: exit status 0, expected 1", result.stderr
         )
         self.assertNotIn(SUCCESS_LINE, result.stdout)
 
@@ -242,17 +215,12 @@ class ChaosReplayControlsTest(unittest.TestCase):
         result = self._run("host-clock")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(
-            "the replay did not start its virtual clock at the instant stored in {}".format(
-                self.schedule
-            ),
+            "the replay did not start its virtual clock at the instant stored in {}".format(self.schedule),
             result.stderr,
         )
         recording = json.loads(self.schedule.read_text())
         self.assertIn(
-            "recording: {} host-now; replay: 2026-10-03T12:00:".format(
-                recording["epoch"]
-            ),
-            result.stderr,
+            "recording: {} host-now; replay: 2026-10-03T12:00:".format(recording["epoch"]), result.stderr
         )
         self.assertNotIn(SUCCESS_LINE, result.stdout)
 

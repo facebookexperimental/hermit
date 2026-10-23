@@ -43,7 +43,11 @@ Every PR contains `Plain Language Summary and Project Impact` first, then
 `Determinism`, `Linux Semantics`, and `Validation`.
 KVM changes also contain `Relationship to gVisor`; a triggered PR contains
 `Human Review Required` naming the numbered triggers. A determinism proof
-explains the model, not only tests.
+explains the model, not only tests. For a change to the Linux behaviour Hermit
+presents (syscall results, errno, restart or interruption, signals, `/proc`),
+`Linux Semantics` cites the kernel source it matches (function and `file:line`
+at a named kernel tag, with a link) beside the native measurement; check that
+the cited code says what the PR claims.
 
 For non-KVM L2 evidence, use `--verify --verify-strict --verify-json` and require
 `bitwise_parity: true`. Exit status/stdout/stderr are byte-equal; INFO events use

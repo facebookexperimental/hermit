@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -15,7 +9,7 @@ artifact_dir="$fixture/target/reproducible-builds"
 
 if [[ ! -x "$hermit_bin" ]]; then
     printf 'Hermit binary not found: %s\n' "$hermit_bin" >&2
-    printf 'Build it with: cargo build --release -p hermit --bin hermit\n' >&2
+    printf 'Build it with: cargo build --release -p hermit-run --bin hermit\n' >&2
     exit 1
 fi
 

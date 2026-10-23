@@ -11,7 +11,7 @@ Build the test natively. Do not put Cargo, Buck, a compiler, or a build daemon
 inside Hermit. For this repository, for example:
 
 ```bash
-cargo build --release -p hermit --bin hermit
+cargo build --release -p hermit-run --bin hermit
 ```
 
 For a Buck test, let Buck build the target and discover its executable, then run

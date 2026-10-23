@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
@@ -20,6 +23,10 @@ use std::sync::MutexGuard;
 const NATIVE_ATTEMPTS: usize = 5;
 const STRICT_ATTEMPTS: usize = 3;
 const COMMAND_TIMEOUT: &str = "30s";
+// The strict runs are separate Hermit processes compared with each other, so
+// they share one epoch. A host-drawn one differs per run, and Ruby's
+// Random.new_seed mixes in the clock: three strict runs gave three seeds.
+const EPOCH: &str = "--epoch=2026-01-01T00:00:00Z";
 
 static HERMIT_RUNTIME_LOCK: Mutex<()> = Mutex::new(());
 
@@ -55,7 +62,10 @@ fn source(name: &str) -> PathBuf {
 
 fn fresh_build_dir(name: &str) -> PathBuf {
     let directory = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("language-runtime-determinism")
+        .join(format!(
+            "language-runtime-determinism-{}",
+            std::process::id()
+        ))
         .join(name);
     if directory.exists() {
         fs::remove_dir_all(&directory).expect("failed to clean runtime test build directory");
@@ -86,9 +96,7 @@ fn bounded_command(program: impl Into<OsString>) -> Command {
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -108,7 +116,7 @@ fn run_native(invocation: &Invocation, label: &str) -> Vec<u8> {
 fn run_strict(invocation: &Invocation, label: &str) -> Vec<u8> {
     let mut command = bounded_command(env!("CARGO_BIN_EXE_hermit"));
     command
-        .args(["run", "--strict", "--"])
+        .args(["run", "--strict", EPOCH, "--"])
         .arg(&invocation.program)
         .args(&invocation.args);
     command_output(command, label).stdout
@@ -162,9 +170,8 @@ fn go_runtime_entropy_is_determinized() {
 }
 
 #[test]
-#[ignore = "requires the optional Ruby runtime"]
 fn ruby_runtime_entropy_is_determinized() {
-    let ruby = executable(&["/usr/bin/ruby"]);
+    let ruby = executable(&["/usr/bin/ruby", "/bin/ruby"]);
     assert_runtime_entropy_is_determinized(
         "Ruby",
         Invocation::new(
@@ -178,10 +185,9 @@ fn ruby_runtime_entropy_is_determinized() {
 }
 
 #[test]
-#[ignore = "requires the optional Ruby runtime plus PMU/mount namespaces"]
 fn ruby_thread_prctls_are_supported_in_fail_closed_mode() {
     let _guard = runtime_lock();
-    let ruby = executable(&["/usr/bin/ruby"]);
+    let ruby = executable(&["/usr/bin/ruby", "/bin/ruby"]);
     let mut command = bounded_command(env!("CARGO_BIN_EXE_hermit"));
     command
         .args([
@@ -201,9 +207,8 @@ fn ruby_thread_prctls_are_supported_in_fail_closed_mode() {
 }
 
 #[test]
-#[ignore = "requires the optional Node.js runtime"]
 fn node_runtime_entropy_is_determinized() {
-    let node = executable(&["/usr/bin/node"]);
+    let node = executable(&["/usr/bin/node", "/bin/node"]);
     assert_runtime_entropy_is_determinized(
         "Node.js",
         Invocation::new(node, [source("random.js").into_os_string()]),
@@ -252,9 +257,8 @@ fn ocaml_runtime_entropy_is_determinized() {
 }
 
 #[test]
-#[ignore = "requires an OSS CPython 3 runtime"]
 fn python_runtime_entropy_is_determinized() {
-    let python = executable(&["/usr/bin/python3"]);
+    let python = executable(&["/usr/bin/python3", "/bin/python3"]);
     let mut version = bounded_command(python.as_os_str());
     version.arg("-VV");
     let version = command_output(version, "inspect Python runtime");

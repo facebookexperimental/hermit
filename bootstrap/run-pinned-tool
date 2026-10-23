@@ -26,7 +26,13 @@ case "$tool" in
     ;;
 esac
 
-if [[ -n ${HERMIT_BUCK2_TOOL_CACHE:-} ]]; then
+# HERMIT_BUCK2_SHARED_TOOL_CACHE names a cache that other checkouts and
+# concurrent runs also use, such as one validation service's cache per host.
+# Only a script with the protections below reads it; an older checkout ignores
+# it and keeps its own cache.
+if [[ -n ${HERMIT_BUCK2_SHARED_TOOL_CACHE:-} ]]; then
+  cache_root=$HERMIT_BUCK2_SHARED_TOOL_CACHE
+elif [[ -n ${HERMIT_BUCK2_TOOL_CACHE:-} ]]; then
   cache_root=$HERMIT_BUCK2_TOOL_CACHE
 elif [[ -n ${XDG_CACHE_HOME:-} ]]; then
   cache_root=$XDG_CACHE_HOME/hermit-buck2-tools
@@ -34,9 +40,16 @@ else
   cache_root=$HOME/.cache/hermit-buck2-tools
 fi
 
-source_dir=$cache_root/source/$tool-$revision
-target_dir=$cache_root/target/$tool-$revision
+# Everything a build depends on names it: the tool revision, the toolchain, and
+# this script's build recipe. Bump build_recipe when the cargo command or the
+# environment the miss gives it changes, so a cache that outlives one checkout
+# never hands a binary built one way to a checkout that builds it another way.
+build_recipe=1
+build_key=$tool-$revision-$toolchain-r$build_recipe
+source_dir=$cache_root/source/$build_key
+target_dir=$cache_root/target/$build_key
 binary=$target_dir/release/$tool
+lock_file=$cache_root/$build_key.lock
 
 if [[ ! -x $binary ]]; then
   # The cache checkout and its build are named by path. Git exports GIT_DIR,
@@ -45,30 +58,53 @@ if [[ ! -x $binary ]]; then
   # and `checkout --detach` below would act on the caller's repository instead
   # (https://github.com/rrnewton/hermit/issues/3362). The subshell drops them for
   # the cache-miss work only; the tool itself still runs with the caller's
-  # environment.
+  # environment. It also drops the caller's rustc flags, wrappers and
+  # CARGO_PROFILE_*/CARGO_TARGET_* settings, which are not part of the build key.
+  # It does not drop RUSTC, CARGO_BUILD_TARGET or cargo configuration files;
+  # nothing sets them for this build today, and in a shared cache whoever builds
+  # first would decide them for everyone.
+  #
+  # A hit takes no lock. That is safe because cargo writes the binary to a
+  # temporary name and renames it into place, so a hit never sees a partial one.
   (
     unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
       GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
+    unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS RUSTC_WRAPPER \
+      RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER \
+      RUSTDOCFLAGS CARGO_ENCODED_RUSTDOCFLAGS
+    while read -r name; do
+      unset "$name"
+    done < <(compgen -e | grep -E '^CARGO_(PROFILE|TARGET)_' || true)
 
     command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
     command -v rustup >/dev/null || { echo "rustup is required" >&2; exit 1; }
+    command -v flock >/dev/null || { echo "flock is required" >&2; exit 1; }
 
     mkdir -p "$cache_root/source" "$cache_root/target"
-    if [[ ! -d $source_dir/.git ]]; then
-      mkdir -p "$source_dir"
-      git -C "$source_dir" init
-      git -C "$source_dir" remote add origin "$repository"
+    # Concurrent misses on one build key build once: the rest wait here and
+    # then find the binary. A checkout left by an interrupted miss (an init
+    # without its remote, a partial fetch) is never resumed; the holder of the
+    # lock starts the checkout again. Every command below closes the lock's
+    # descriptor (9>&-), so nothing it leaves running holds the lock.
+    exec 9>"$lock_file"
+    flock 9
+    if [[ -x $binary ]]; then
+      exit 0
     fi
-    git -C "$source_dir" fetch --depth 1 origin "$revision"
-    git -C "$source_dir" checkout --detach FETCH_HEAD
-    actual_revision=$(git -C "$source_dir" rev-parse HEAD)
+    rm -rf -- "${source_dir:?}"
+    mkdir -p "$source_dir"
+    git -C "$source_dir" init 9>&-
+    git -C "$source_dir" remote add origin "$repository" 9>&-
+    git -C "$source_dir" fetch --depth 1 origin "$revision" 9>&-
+    git -C "$source_dir" checkout --detach FETCH_HEAD 9>&-
+    actual_revision=$(git -C "$source_dir" rev-parse HEAD 9>&-)
     if [[ $actual_revision != "$revision" ]]; then
       echo "expected $tool revision $revision, got $actual_revision" >&2
       exit 1
     fi
 
-    if ! rustup run "$toolchain" rustc --version >/dev/null 2>&1; then
-      rustup toolchain install "$toolchain" --profile minimal
+    if ! rustup run "$toolchain" rustc --version >/dev/null 2>&1 9>&-; then
+      rustup toolchain install "$toolchain" --profile minimal 9>&-
     fi
 
     CARGO_TARGET_DIR=$target_dir \
@@ -76,7 +112,7 @@ if [[ ! -x $binary ]]; then
         --locked \
         --release \
         --manifest-path "$source_dir/Cargo.toml" \
-        --bin "$tool"
+        --bin "$tool" 9>&-
   )
 fi
 

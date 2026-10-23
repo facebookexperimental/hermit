@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /// Whether one argument requests conventional command-line help.
 ///
 /// The manifest tools deliberately keep their small hand-written parsers. This

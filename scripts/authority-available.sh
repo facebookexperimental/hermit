@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Obtain the pinned authority ONCE and print a directory to use as
 # DEV_HERMIT_PARENT, so every later adapter invocation in this checker reads it
 # locally instead of fetching it again.

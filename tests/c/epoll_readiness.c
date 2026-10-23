@@ -1,12 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/*
  * epoll_readiness: cross-backend parity for the epoll readiness interface.
  *
  * The io_uring fallback row only checks that epoll_create1 succeeds. This row

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Fail-closed authority for strict determinism greens.
 //!
 //! This binary is the only writer of accepted strict-green records. It does

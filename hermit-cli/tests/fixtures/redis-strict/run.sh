@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
 
 set -euo pipefail
 
@@ -29,7 +24,7 @@ for command in cmp curl grep make nproc sha256sum tar timeout with-proxy; do
 done
 
 if [[ ! -x $hermit_bin ]]; then
-  cargo build -p hermit
+  cargo build -p hermit-run
 fi
 
 mkdir -p "$(dirname "$archive")" "$(dirname "$source_root")"

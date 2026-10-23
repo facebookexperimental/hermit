@@ -2,11 +2,12 @@
 
 Hermit makes Linux program execution more reproducible by running a guest under
 the Reverie tracing framework and handling nondeterministic events in Detcore.
-This document focuses on the production ptrace backend: where state lives, how an
-event travels from the guest to Detcore and back, and how scheduling, resources,
-time, record/replay, signals, procfs, and CPUID fit together. It also describes
-the backend strategy — the abstraction that lets the same Detcore policy run over
-alternative execution mechanisms (in-process DBT and hardware virtualization).
+This document focuses on the ptrace backend, the default and best-tested one:
+where state lives, how an event travels from the guest to Detcore and back, and
+how scheduling, resources, time, record/replay, signals, procfs, and CPUID fit
+together. It also describes the backend strategy — the abstraction that lets
+the same Detcore policy run over Hermit's six other backends — and where those
+backends are being consolidated.
 
 The most important boundary is:
 
@@ -16,6 +17,66 @@ The most important boundary is:
   serialize, record, replay, or pass through to Linux.
 - **Linux still implements most operations.** Detcore virtualizes selected
   results and orders selected effects; it is not a replacement kernel.
+
+## Architectural principles
+
+These rules bind every backend and every change, and a review checks a change
+against them (owner, 2026-10-15). A *backend* is a Reverie implementation of
+the `Tool`/`Guest` contract (ptrace, dbt, in-guest-trap, liteinst, sabre,
+e9patch, kvm); the *tool* is Detcore. Known violations are listed in the
+[backend architecture audit](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/2026-10-15-kvm-backend-architecture-audit.md)
+and tracked from https://github.com/rrnewton/hermit/issues/4485.
+
+1. **A backend only intercepts.** It hooks guest syscalls and other events and
+   delivers them to the tool through the standard callbacks. How it hooks, and
+   where the tool's state lives, are its private business.
+   Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+2. **`inject()` reaches a kernel beneath the backend.** A syscall the tool
+   injects runs on the host Linux kernel (ptrace and the in-guest backends) or,
+   for KVM, on a swappable Linux provider behind a trait (host Linux, or an
+   emulated-Linux crate). A backend crate never embeds Linux semantics itself.
+   Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+3. **Re-implemented Linux lives only in Detcore's shared layer.** Behaviour
+   Hermit must model rather than pass through (futexes, scheduling, signals,
+   `/proc`, pids, time) is written once in Detcore and is identical for every
+   backend.
+   Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+4. **Detcore never branches on the backend.** Per-backend differences (task
+   creation by fork, clone or vfork; exec; delivering a signal to a handler
+   with a mask; the preemption timer; exit) are backend traits with written
+   semantics and invariants, which Detcore calls. A capability field may
+   describe mechanism; it never selects semantics.
+   Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+5. **Only launch and setup differ per backend.** Apart from interception (1)
+   and the traits of (4), the code that starts the guest is the only code that
+   may differ between backends.
+   Checked by: `tests/isolation/conformance.rs` for the container contract (https://github.com/rrnewton/hermit/issues/4009); the rest not yet enforced.
+6. **Unsupported means a loud, named refusal.** A feature Hermit does not
+   support on a backend stops the run with a message that names it (see
+   [ERROR_CATALOG.md](ERROR_CATALOG.md)), never a plausible Linux errno
+   (`ENOSYS`, `EPERM`, `EOPNOTSUPP`, ...) or a zero in place of the real result.
+   One opt-in is approved (owner, 2026-10-15): with `--allow-unsupported-syscalls`
+   the run prints the same named refusal and then returns the errno to the
+   guest instead of stopping. Without the flag, the run stops.
+   Checked by: not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+7. **Interchangeability is shown by tests.** The Reverie-level
+   native-comparison conformance test runs the same tool on every backend and
+   on native Linux over the test corpus, and a cell-by-cell comparison against
+   ptrace shows where each backend's outcomes differ. Per-backend coverage
+   ratcheting waits until the foundation follows rules 1-6 (owner, 2026-10-15).
+   Checked by: both tests are being built; not yet enforced; see https://github.com/rrnewton/hermit/issues/4485.
+
+### Approved exceptions
+
+A listed item is VM mechanics, not Linux semantics: the backend applies or
+mirrors the effect and forwards the syscall; it never chooses the result the
+guest sees. Add an item only with the owner's approval and a written reason.
+
+- **kvm:** guest page tables and memory slots that mirror host mappings; vCPU
+  state (registers, FS/GS base, segment state); trap entry and exit (VM exits
+  and re-entry); building and popping the signal frame on the vCPU stack for
+  `rt_sigreturn`, while Detcore decides which signal is delivered with which
+  mask.
 
 ## System overview
 
@@ -61,77 +122,89 @@ contract, not against ptrace directly. A backend's job is purely mechanism:
 observe guest events, expose register and memory access, and inject or suppress
 operations. Detcore supplies the policy — what is emulated, transformed,
 ordered, recorded, or replayed. Keeping that seam clean is what makes more than
-one backend conceivable without rewriting the deterministic core.
+one backend possible without rewriting the deterministic core.
 
-Five backend mechanisms sit at different points on the speed/completeness/
-determinism curve:
+`hermit run --backend <name>` selects one of seven backends
+(`Backend` in `hermit-cli/src/lib.rs`). Every one of them runs the same Detcore
+policy; they differ in how a guest event reaches it and where Detcore's
+per-thread half runs. In every case Detcore's global state (scheduler, virtual
+time) stays in the hermit process.
 
-| Backend | Mechanism | Status | Trade-off |
+| Backend | How a syscall reaches Detcore | Where Detcore's per-thread half runs | Status |
 | --- | --- | --- | --- |
-| **ptrace** | seccomp-BPF `SECCOMP_RET_TRACE` + `PTRACE`, out-of-process tracer | Production; the only in-tree backend (`reverie-ptrace`) | Complete and strongly deterministic; per-event context-switch cost |
-| **LiteInst + ptrace** | Online hot-site patching with a ptrace-owned Tool and in-guest patch/helper DSO | Experimental hybrid | Keeps ptrace lifecycle/PMU correctness while replacing eligible repeated syscall traps; dynamically linked scope, and hook installation is single-task only |
-| **DBT** (SaBRe / DynamoRIO style) | In-process binary rewriting / function hooking of syscall sites | Experimental / research | Low overhead; today it is a syscall-boundary interceptor, **not** a deterministic backend |
-| **KVM / SVM** | Run the guest inside a hardware VM and trap via VM-exits | Exploratory | Can trap instructions ptrace cannot (see CPUID below); heaviest isolation and integration cost |
-| **e9patch + ptrace** | Cached offline main-ELF rewriting followed by the ptrace Detcore runtime | Experimental hybrid | Exact coverage of e9tool-recovered candidate sites; raw random/TSX instructions remain unsupported even when mapped |
+| **ptrace** | seccomp `SECCOMP_RET_TRACE` and a ptrace stop (`reverie-ptrace`) | In the tracer, outside the guest | Default and reference; the rest of this document describes it |
+| **dbt** | DynamoRIO pre-syscall event in a DynamoRIO client (`reverie-dbt`, `detcore-dbt`) | Inside the guest, in the DynamoRIO client | Experimental; handles clone, fork, exec and signals in its own C client, contrary to principle 4 |
+| **in-guest-trap** | A seccomp filter turns every syscall into `SIGSYS`, and a handler inside the guest calls Detcore (`reverie-inguest`) | Inside the guest, in a preloaded runtime | Experimental; `fork` only: `execve` and thread creation are refused, signal handling is limited, and no preemption timer yet |
+| **liteinst** | in-guest-trap plus run-time patching: a syscall site that has trapped once is rewritten to jump straight to the handler (`reverie-liteinst`, `liteinst2`) | As in-guest-trap | Experimental; the same runtime as in-guest-trap with site patching on, so it has the same limits |
+| **sabre** | Load-time rewriting of syscall sites by the SaBRe loader, with a ptrace supervisor as the backstop for sites it missed (`reverie-sabre`, `detcore-sabre`) | Inside the guest, in a SaBRe plugin | Experimental |
+| **e9patch** | Ahead-of-time empty rewrite of the main ELF's candidate sites, then the ordinary ptrace path | In the tracer, as ptrace | Experimental; see below |
+| **kvm** | The guest runs in a KVM virtual machine and traps by VM exit (`reverie-kvm`) | In the hermit process, driven by the KVM executor | Experimental; the executor implements part of the Linux personality itself, including an allowlisted `/proc`, contrary to principles 2 and 3 |
 
-**ptrace (current).** seccomp selects which syscalls trap; ptrace delivers the
-stops to an out-of-process tracer that holds all Detcore state. This is the
-backend the rest of this document describes. It is complete (it sees every
-subscribed event from every thread) and integrates with the PMU for RCB-based
-preemption, at the cost of a context switch per intercepted event.
+in-guest-trap and liteinst are one runtime with a switch: Hermit sets
+`REVERIE_LITEINST_SITE_PATCHING=0` for in-guest-trap and refuses a run whose
+statistics show a patched site. A patcher changes only how a syscall reaches
+the dispatcher, never what the dispatcher does with it, so by design liteinst
+should never pass a test that fails on in-guest-trap.
 
-**LiteInst host hybrid.** Ptrace owns the sole Detcore Tool and GlobalTool from
-the initial exec, including PMU scheduling and CPUID/RDTSC handling. A preload
-DSO contains only LiteInst patch/helper state. The first eligible syscall site
-is validated by the tracer and may be patched; later invocations enter the
-trampoline but preserve the same ptrace-owned lifecycle. The current scope is
-dynamically linked. Threads and child processes run under the ordinary ptrace
-lifecycle, but **hook installation is single-task only**: the patch helper runs
-on a process-global stack and the installer is not re-entrant across tasks, so
-the hook set freezes at the first `clone`/`clone3`/`fork`/`vfork`. A
-task-creating syscall site is never patched, because the kernel starts the new
-task at the instruction after the `syscall` and that address must still be an
-instruction boundary. A `vfork` child and an exec after start both still fail
-closed, because neither can preserve the preload runtime.
+**ptrace.** seccomp selects which syscalls trap; ptrace delivers the stops to an
+out-of-process tracer that holds all Detcore state. It is complete (it sees
+every subscribed event from every thread) and integrates with the PMU for
+RCB-based preemption, at the cost of a context switch per intercepted event.
 
-**e9patch hybrid.** The `e9patch` backend loads the cached instruction map for
-the main executable and invokes `e9tool -O0` with an exact file-offset matcher.
-Optimization is disabled because correctness takes priority for this hybrid.
-The instruction map is a linear candidate scan and can include embedded data.
-Each candidate that e9tool recovers as an instruction receives an empty
-before-trampoline, preserving the original instruction; partial recovered-site
-coverage fails closed, and B0 is disabled because it would reserve SIGILL. The
-result is bind-mounted read-only at the original executable path and runs
-through the existing ptrace Detcore runtime. Ptrace remains the
-correctness path for trapped syscalls, CPUID, RDTSC, and RDTSCP in the main ELF,
-DSOs, vDSO, and dynamic code. Empty trampolines do not make raw `RDRAND`,
-`RDSEED`, or TSX deterministic even when those sites are mapped, so those
-instructions remain unsupported. Privilege-bearing executables fail closed
-rather than losing set-ID or file-capability semantics. A future standalone
-backend requires an in-process Detcore
-callback seam; this implementation does not claim that performance property.
+**e9patch as Hermit runs it.** The `e9patch` backend loads the cached
+instruction map for the main executable and invokes `e9tool -O0` with an exact
+file-offset matcher. Each candidate that e9tool recovers as an instruction
+receives an empty before-trampoline, preserving the original instruction;
+partial recovered-site coverage fails closed. The result is bind-mounted
+read-only at the original executable path and runs through the ordinary ptrace
+Detcore runtime, which remains the correctness path for syscalls, CPUID, RDTSC
+and RDTSCP. Raw `RDRAND`, `RDSEED` and TSX stay unsupported. The in-guest
+`reverie-e9patch` crate, which would call Detcore without a tracer, is not
+linked into Hermit.
 
-**DBT (in-process).** A dynamic binary instrumentation backend such as the
-restored SaBRe loader rewrites syscall sites in-process and calls into a tool
-without leaving the guest address space, which is much cheaper per event. The
-current state is a low-overhead *syscall interceptor*: native guest threads run
-concurrently between callbacks, physical signals still arrive at host-selected
-points, there is no PMU preemption, and instructions outside the loader's scan
-set execute natively. It is therefore not yet equivalent to ptrace + Detcore for
-general multithreaded determinism. See `ai_docs/sabre-determinism-analysis.md`
-for the gap analysis and roadmap.
-
-**KVM / SVM (hardware virtualization).** Running the guest as a VM guest lets the
-monitor use hardware controls to trap instructions such as `RDRAND` and `CPUID`
-without relying on host user-space faulting support. A sufficiently complete
-DBT could instead decode and rewrite those instructions before they execute;
-the current DBT prototype does not provide that coverage. Hardware
-virtualization has a much larger integration surface and loses the simple
-"host process under ptrace" model.
+**KVM / SVM (hardware virtualization).** Running the guest as a VM guest lets
+the monitor use hardware controls to trap instructions such as `RDRAND` and
+`CPUID` without relying on host user-space faulting support. vCPUs are not
+Linux tasks in the guest's namespaces, so the guest has no UTS namespace of its
+own and Detcore supplies the hostname.
 
 The important invariant across all backends: interception alone does not create
 determinism. Whichever backend catches an event, a Detcore handler must still
 define the event's observable result and its place in the schedule.
+
+### Consolidation (October 2026)
+
+The backends grew separate copies of code that should be shared: four in-guest
+`Guest` implementations, four guest-side RPC clients for one wire format, and
+per-backend signal policies and fork/clone/exec handling. Work on new
+per-backend results is paused until that is consolidated. The target layout:
+
+- **One container.** Every guest launch should go through
+  `launch_in_container` and `complete_container_config` in
+  `hermit-cli/src/bin/hermit/`. All seven backends use it for `hermit run`
+  today. Record, replay, `--namespace-only`
+  and `sabre strace` still build their own containers and are to move onto it
+  (https://github.com/rrnewton/hermit/issues/4009).
+- **One in-guest runtime.** `reverie-inguest` owns the seccomp filter, the
+  single `SIGSYS` handler, the dispatcher, the handler driver, the RPC client,
+  signal state and the fork/clone/exec protocol. Interception engines differ
+  (DynamoRIO events, `SIGSYS`, a patched trampoline); everything after the
+  engine is shared (https://github.com/rrnewton/hermit/issues/3520).
+- **Fail closed to SIGSYS.** A syscall that no patcher rewrote is trapped by the
+  always-armed seccomp filter and handled in the guest; a per-syscall ptrace
+  stop in an in-guest backend is a defect.
+- **Patchers are plug-ins.** liteinst (run time), SaBRe (load time) and
+  e9patch (ahead of time) become implementations of one `Patcher` interface
+  over the shared runtime; a missed site stays on the trap.
+- **One `/proc`.** Detcore serves a single virtual `/proc` tree, and a backend
+  supplies only descriptor status, the memory map and descriptor reopening.
+  KVM's hand-written `/proc` is retired once that serves it
+  (https://github.com/rrnewton/hermit/issues/4213).
+- **One DETLOG and statistics path.** In-guest backends forward DETLOG
+  through Detcore's protected tool-output socket and report dispatch counts
+  through `BackendStatsSource` and `DispatchStats`.
+- **Subset rule.** A result may be enabled or credited for a patcher backend
+  only if the same test and mode pass on in-guest-trap.
 
 ## Startup and lifetime
 
@@ -257,6 +330,19 @@ The tracer enables these ptrace options:
 
 `PTRACE_O_EXITKILL` prevents a guest from escaping if the tracer dies.
 
+### Ptrace untraced-stub gap
+
+The injection exemption also lets a deliberate guest jump to Reverie's private
+syscall stub and issue a syscall without Detcore observing it. The following
+`ud2` raises SIGILL, which records an unknown mutation, but that cannot undo the
+syscall's effect: a signal handler can retain the result, or a forked child can
+die and leave an effect behind. Rewriting or replacing the private page also
+records an unknown mutation. This remains a separate determinism gap after the
+exec-return and CPUID arming checks
+(https://github.com/rrnewton/reverie/issues/1064). The CLI's
+`unobserved_guest_execution` and `untraced_code_range` in
+`hermit-cli/src/bin/hermit/run.rs` describe the limit and guarded page range.
+
 ### One tracing task per guest thread
 
 The ptrace backend maintains an asynchronous tracing task for every guest TID.
@@ -364,8 +450,8 @@ The same emulation path is shared by CPUID and the RDTSC family — only the
 
 ### CPUID: what Detcore reports
 
-Detcore does not pass the host's real CPUID through. It serves a fixed,
-conservative table (`detcore/src/cpuid.rs`) modeled on an older Intel part, with
+By default Detcore serves a fixed, conservative table (`detcore/src/cpuid.rs`)
+modeled on an older Intel part, with
 nondeterministic feature bits — notably `RDRAND` — masked off. Reporting that a
 feature is absent is how Hermit steers a guest onto a deterministic fallback
 path: a well-behaved program that checks CPUID before using `RDRAND`, `RDSEED`,
@@ -377,6 +463,20 @@ CPUID virtualization is controlled by `Config::virtualize_cpuid`
 it only helps programs that *ask* before they act. A program that executes
 `RDRAND` unconditionally is unaffected by the CPUID table — trapping the
 instruction itself requires the KVM/SVM backend.
+
+The opt-in `--cpu-profile=host-no-rdrand` also traps every CPUID, but derives
+its answers from native host CPUID on a fixed source CPU. Admission chooses the
+lowest originally allowed CPU before container placement; both library launch
+paths pin their actual tracer to that source before constructing the guest.
+The configuration carries the source across container forks and cached tracer
+workers, so per-core topology/cache differences cannot follow random placement.
+Detcore clears hardware randomness and
+unvirtualized timing/profiling features, normalizes CPU identity fields, and
+reports leaf 0x15 consistently with its virtual TSC. It preserves the host's
+complete XSAVE leaf 0xD; the guest's XGETBV/XSAVE and XCOMP controls operate on
+the real kernel state. This is a host-specific compatibility profile, without
+the virtual v3 profile's XSAVE qualification. Its requirements and remaining
+determinism limits are described in the [user guide](USER_GUIDE.md#host-cpu-features-without-hardware-randomness).
 
 ### CPUID faulting: Intel vs AMD
 
@@ -393,14 +493,16 @@ vendor:
   support for wiring this to the same `arch_prctl` UAPI landed in Linux **6.17**;
   older kernels return `ENODEV` on AMD even when the silicon is capable.
 
-When arming fails, the backend logs `Unable to intercept CPUID: Underlying
-hardware does not support CPUID faulting` and continues **without** CPUID
-virtualization — the guest then sees real host CPUID. Because the UAPI is
-identical across vendors, no Hermit or Reverie change is needed to gain CPUID
-interception on capable AMD hardware; it requires only a new-enough kernel (or a
-backport of the AMD CPUID-faulting patch). On hardware or kernels where faulting
-is unavailable, the alternatives are the KVM/SVM backend or best-effort
-environment shims that ask specific libraries to avoid `RDRAND`.
+When CPUID virtualization is requested, ptrace requires a valid initial
+`ARCH_GET_CPUID` state, a successful `ARCH_SET_CPUID(0)`, and a second query that
+confirms CPUID is disabled. A query, set, or verification failure stops the run
+with `ptrace-cpuid-faulting-unavailable`, naming the operation and its errno or
+unexpected state. The guest cannot continue with host CPUID after this refusal.
+Linux re-enables CPUID at successful exec, so ptrace repeats this setup for each
+replacement image, after checking the exec syscall's return stop and before
+executing the image's first instruction. Capable AMD hardware needs Linux 6.17
+or the corresponding CPUID-faulting backport; an older kernel is refused when
+virtualization is requested.
 
 RDTSC faulting is independent and more portable: it is armed via
 `prctl(PR_SET_TSC, PR_TSC_SIGSEGV)` (backed by `CR4.TSD`) and works on both
@@ -727,8 +829,9 @@ Reverie sub-tools that Detcore delegates to, one for capture and one for replay.
 ```
 
 **What is recorded.** Only syscalls that cannot be made deterministic by
-emulation or scheduling reach the `Recorder` (`hermit-cli/src/recorder/`, split
-into `fs`, `mmap`, `network`, `random`, and `time`). Anything Detcore can
+emulation or scheduling reach the `Recorder` (crate `hermit-record`,
+`hermit-record/src/recorder/`, split into `fs`, `mmap`, `network`, `random`, and
+`time`). Anything Detcore can
 emulate or order locally is *not* recorded, which keeps traces small and focused
 on true external inputs.
 
@@ -739,7 +842,7 @@ on true external inputs.
   `RecordVersion`. Replay refuses a trace whose version is incompatible with the
   replayer's `RECORD_VERSION`;
 - a per-thread event stream written by the `EventWriter` and read back by the
-  `Replayer` (`hermit-cli/src/replayer/`) in the same deterministic order.
+  `Replayer` (crate `hermit-replay`, `hermit-replay/src/replayer/`) in the same deterministic order.
 
 **Replay environment.** `Replay::spawn` (`hermit-cli/src/replay.rs`) reconstructs
 the recorded process in a temporary chroot (`TempChroot`): it hard-links the
@@ -750,7 +853,7 @@ resolves the same paths it saw at record time.
 **Desync detection.** The recorder writes a raw-syscall debug stream alongside
 the result-event stream. The replayer compares each live syscall with that
 debug stream only when the `HERMIT_VERIFY` environment variable is set. A
-mismatch in that mode raises a `DesyncError` (`hermit-cli/src/desync.rs`)
+mismatch in that mode raises a `DesyncError` (`hermit-replay/src/desync.rs`)
 identifying the thread and event index. Ordinary `hermit replay` still consumes
 the recorded result events, but it does not enable this full argument-by-
 argument syscall comparison by default.
@@ -862,13 +965,17 @@ The main implementation entry points are:
 | Signal handling | `detcore/src/syscalls/signal.rs` |
 | CPUID table | `detcore/src/cpuid.rs` |
 | Syscall-family handlers | `detcore/src/syscalls/` |
-| Record (capture) sub-tool | `hermit-cli/src/recorder/`, `hermit-cli/src/record.rs` |
-| Replay sub-tool and desync detection | `hermit-cli/src/replayer/`, `hermit-cli/src/replay.rs`, `hermit-cli/src/desync.rs` |
-| Recording metadata and event stream | `hermit-cli/src/metadata.rs`, `hermit-cli/src/event_stream.rs` |
+| Record (capture) sub-tool | `hermit-record/src/recorder/` (its own crate, so its Detcore instantiation compiles in parallel), `hermit-cli/src/record.rs` |
+| Replay sub-tool and desync detection | `hermit-replay/src/replayer/` (its own crate, so its Detcore instantiation compiles in parallel), `hermit-cli/src/replay.rs`, `hermit-replay/src/desync.rs` |
+| Recording metadata and event stream | `hermit-cli/src/metadata.rs`, `hermit-record-format/src/event_stream.rs` |
 | Reverie tool contract | Reverie `reverie/src/tool.rs` and `reverie/src/guest.rs` |
 | Ptrace startup/filter | Reverie `reverie-ptrace/src/tracer.rs` |
 | Ptrace stop, injection, CPUID/RDTSC trap | Reverie `reverie-ptrace/src/task.rs` |
-| DBT backend gap analysis | `ai_docs/sabre-determinism-analysis.md` |
+| SaBRe backend gap analysis | `ai_docs/sabre-determinism-analysis.md` |
+| Backend selection and dispatch | `hermit-cli/src/lib.rs` (`Backend`, `dispatch_backend`) |
+| Shared container launch | `hermit-cli/src/bin/hermit/run.rs` (`launch_in_container`, `complete_container_config`), `hermit-cli/src/bin/hermit/container.rs` |
+| Shared in-guest runtime | Reverie `reverie-inguest/` (seccomp filter, `SIGSYS` handler, dispatcher, tool host) |
+| DBT, LiteInst, SaBRe, KVM backends | Reverie `reverie-dbt/`, `reverie-liteinst/`, `experimental/reverie-sabre/`, `reverie-kvm/`; Hermit `detcore-dbt/`, `detcore-liteinst/`, `detcore-sabre/` |
 
 Start at the Detcore dispatch for policy questions and at Reverie's tracing task
 for execution-control questions. Scheduler bugs often cross both local and

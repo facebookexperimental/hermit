@@ -34,7 +34,8 @@ folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).
   then timed out after starting Run2. The other attempt timed out in Run1 with
   an empty log.
 - Current explanation: before Hermit `221c3d77959ebdef08f2890aaf3ce5185ea5d425`,
-  DBT alone set `backend_tracks_process_children` false. When the parent reached
+  DBT alone set `backend_tracks_process_children` (now
+  `BackendCapabilities::tracks_process_children`) false. When the parent reached
   blocking `wait4` before the child exit was published, Detcore used the generic
   nonblocking retry path and recorded a host-dependent number of
   scheduler-visible polling turns. The landed repair removes that record
@@ -152,6 +153,68 @@ source bytes.
 
 # chaos-c
 
+# compat
+
+## compat/lsof
+
+### 2026-10-07T16:46:19-04:00 — buck / verify / ptrace — FAIL
+
+- Hermit: `00e634c1afaea16ca53db5fe8e3c5175fa81e7e4`; tree:
+  `f291d3da6710fe688cdce9128220bb0b74698c57`; binary: the validate's Buck
+  build.
+- Command: validate step `e2e.manifest_compat_buck`, cell `compat/lsof`
+  (verify/ptrace); step exit 1; result `stripped verification did not match:
+  verified=false verdict=diverged`. Earlier validates the same day passed it.
+- Evidence: validate log
+  `ignored/validate/validate-claude-coord-00e634c1afae-1791405417040495348-2609739-a8d4a815.log`
+  lines 337-338; verify logs `run1_log_qH5cU` and `run2_log_46FhQ` (1,149,363
+  bytes each) under
+  `ignored/validate/artifacts/validate-claude-coord-00e634c1afae-1791405417040495348-2609739-a8d4a815/e2e/buck-failed-verify-logs/buck-twshared55334-2-1791405978999682013-e81557d733ed9a6d/verify-logs/verify-1/`.
+- Observed: first divergence at turn 175, record 3929, syscall 303:
+  `getdents64(4, …, 32768) = 216` on `/proc/3/fd`. Guest PID 3 is the
+  workload's bash, whose descriptor table each
+  `lsof -O -w -p $$ -a -d 9 -a -Ffn` inspects. The workload runs lsof three
+  times and the first stops when it is refused `/proc/mounts`, so two lsof
+  processes list this table: this call is the later listing (dtid 19), and the
+  earlier one (dtid 13, also syscall 303) is identical in both runs. Removing
+  each line's wall-clock prefix with
+  `sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z +//'` leaves 5,364 lines
+  and 1,007,176 bytes in each log, and `diff` reports one differing line
+  (4275): that call's buffer hash (`635b8a5a…` in run 1, `d96bd33e…` in
+  run 2): same turn, same syscall, same byte count.
+- Current explanation: procfs numbers each `/proc/<pid>/fd/<n>` entry from a
+  host-wide counter (`get_next_ino`) when it builds the entry's dentry, and
+  memory reclaim can evict an unused dentry so that the next listing rebuilds
+  it under a new number. The inode pool gave every new host `(device, inode)`
+  a new guest number, so the `d_ino` values lsof read depended on whether the
+  host evicted those dentries between the two listings. The fix
+  (`detcore/src/procfs_inode.rs`) still numbers a procfs entry by its host
+  inode, and also records the entry's path, which the tracer finds through
+  `/proc/<tid>/fd`, `/cwd` or `/root`. A host inode the pool has not seen,
+  reached by a path it has seen, is that entry rebuilt and keeps the path's
+  number. Not covered: a path lookup through `/proc/self` or
+  `/proc/thread-self` (those name the tracer) of an entry rebuilt since its
+  last sighting, an entry rebuilt before Detcore first saw its path, and
+  record/replay modes, nor (https://github.com/rrnewton/hermit/issues/3988)
+  a descriptor that a backgrounded call allocates while Detcore's `O_PATH`
+  descriptor for a path is open. The fix also reports a link count of 1 for
+  `/proc`,
+  whose host count includes every host process.
+- Ruled out / next: not a scheduling divergence (the runs agree on every
+  scheduling record). A reproducer that closes a descriptor, fails an `lstat`
+  of `/proc/self/fd/<n>`, reopens it and lists again renumbers the entry
+  natively (3805416763 to 3805416765) and under `--verify` at
+  `f72b943306a0ff54ae7093f3f9cd3d5583cc38cf` (guest 9007 to 9015), and keeps
+  9007 with the fix. `detcore/tests/misc/procfs_inode.rs` forces the same
+  rebuild against a native control. The workload itself
+  (`tests/compat/real_compat_workload.sh lsof` with its mount-table fixture,
+  under `bin/safehermit` with the cell's verify flags) passed L2 in 21 of 21
+  runs with the fix, 8 of them while the run's cgroup was made to reclaim
+  memory every 20 ms; an unfixed build at `f72b9433` also passed all 20 of
+  its runs, so the workload does not reproduce the flake on demand and those
+  runs show only that the fix keeps it at L2. Next: the exact-head cell at the fix, then 20
+  repetitions before this entry is removed.
+
 # data-handling
 
 ## data-handling/dd-partial-transfers
@@ -186,7 +249,7 @@ source bytes.
     "$dev_hermit/bin/safehermit" --sh-deadline 120 \
     --sh-report "$run/safehermit.report" \
     "$hermit_bin" --log info --backend ptrace run --base-env=minimal \
-    --strict --verify-strict --verify --verify-json "$run/verify.json" \
+    --strict --epoch=2026-01-01T00:00:00Z --verify-strict --verify --verify-json "$run/verify.json" \
     --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C \
     --env TZ=UTC --env HOME="$run/home" \
     --env XDG_CONFIG_HOME="$run/xdg-config" --env E2E_TMPDIR=/test \

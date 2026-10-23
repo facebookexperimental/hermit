@@ -84,8 +84,8 @@ During iteration, prefer the narrowest relevant target, for example:
 
 ```bash
 cargo test -p hermit-detcore
-cargo test -p hermit-detcore --test tests_time
-cargo test -p hermit
+cargo test -p hermit-detcore-tests --test tests_time
+cargo test -p hermit-run
 ```
 
 The `tests` and `flaky-tests` workspace members mostly contain guest binaries
@@ -132,18 +132,23 @@ and the reason is documented.
 
 ## Workspace Map
 
-The root Cargo workspace has thirteen members:
+The root Cargo workspace has eighteen members:
 
 | Path | Role |
 | --- | --- |
-| `hermit-cli` | Main `hermit` CLI and `libhermit`; run, record, replay, log-diff, analyze, and container orchestration. |
+| `hermit-cli` | Main `hermit` CLI and the `hermit` library; run, record, replay, log-diff, analyze, and container orchestration. |
+| `hermit-cdylib` | `libhermit.so`, the shared-object form of the `hermit` library, kept out of `hermit-cli` so Cargo can pipeline it. |
 | `detcore` | Core determinism engine and Reverie tool; scheduler, virtual time, syscall handling, content digests, CPUID handling, and record/replay behavior. |
 | `detcore-model` | Shared deterministic state and model types, including PIDs, file descriptors, futexes, schedules, and logical time. |
 | `detcore-dbt` | Feature-gated DynamoRIO backend glue; private while the public DBT package boundary and name remain undecided. |
+| `detcore-dbt-cdylib` | `libdetcore_dbt.so`, the Detcore runtime the DBT client loads, built from `detcore-dbt`. |
 | `detcore-sabre` | Feature-gated SaBRe backend glue; private while third-party backend packaging remains provisional. |
+| `detcore-liteinst` | In-guest Detcore runtime that Hermit preloads into the guest for `--backend=liteinst`. |
 | `detcore/tests/testutils` | Helpers used by Detcore integration tests. |
+| `detcore/tests/lit-guests` | Private package that builds the Rust programs `detcore/tests/lit`'s fixtures run as `%me`, for `hermit-cli/tests/lit.rs`. |
 | `hermit-verify` | Verification executable for stress, trace, schedule, and replay checks. |
 | `common/test-allocator` | Test allocator and supporting test binary. |
+| `common/test-workdir` | Per-run filesystem isolation for Hermit tests inside the pinned root. |
 | `ci/manifest-plan` | Private generator and validator for the E2E manifest, test inventory, and test-selection artifacts. |
 | `hermit-install` | Private build helper that stages feature-gated third-party backend resources for tests and development. |
 | `hermit-resources` | Resource accounting and limit types shared by Hermit and Detcore. |
@@ -208,8 +213,8 @@ Start investigations in these locations:
 - `detcore/src/cpuid.rs`, `detcore/src/time.rs`, and
   `detcore/src/record_or_replay.rs` for those subsystems.
 - `hermit-cli/src/bin/hermit/` for CLI subcommands.
-- `hermit-cli/src/recorder/` and `hermit-cli/src/replayer/` for log recording
-  and replay.
+- `hermit-record/src/recorder/` and `hermit-replay/src/replayer/` for log recording
+  and replay; `hermit-record-format/` for the event format they share.
 - `docs/Developers/Architecture.md` for the architecture overview and
   `docs/Users.md` for user-facing behavior.
 
@@ -226,6 +231,10 @@ presupposes the ones below it:
 | L2 | Canonical full-observation repeat parity | `hermit run --strict --verify --verify-strict --verify-json <path> -- ...` and require JSON `bitwise_parity: true` with nonzero compared INFO-message counts |
 | L3 | Memory determinism | Add `--detlog-heap --detlog-stack` to the L2 command |
 | L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
+
+`--strict` refuses a run whose epoch would come from the host clock, so every
+command above also passes `--epoch` or `HERMIT_EPOCH`. Tests and E2E cells use
+the canonical test epoch, `detcore_model::config::CANONICAL_TEST_EPOCH`.
 
 A claim that a run "passes" is meaningless without a level. Write, for example,
 "passes at L2 (ptrace backend)". When reporting a run, also state:
@@ -278,6 +287,10 @@ before reading source:
   quantity; [docs/TIMEOUT_LADDER.md](docs/TIMEOUT_LADDER.md) describes each rung,
   why an exit code cannot say which one fired, and how the stderr class line
   distinguishes them.
+- A rare flake in Hermit's own host-timed handling, such as a backgrounded call
+  racing the scheduler, can be forced with race probes (`HERMIT_RACE_PROBE`, off
+  by default); [docs/RACE_PROBES.md](docs/RACE_PROBES.md) lists the points and
+  why an outcome under a probe is one host timing alone could produce.
 
 When a symptom depends on PMU access, CPUID interception, or specific CPU
 features, capture the host environment in the report; those are host
@@ -372,6 +385,16 @@ Typical flow for a change:
   Administrative history, task bookkeeping, and review mechanics come later.
   Record `Task: <task-id>` after this opening section when the change implements
   task work.
+- A change to the Linux behaviour Hermit or Detcore presents (a syscall's
+  result, errno, restart or interruption; signal delivery, masks or handler
+  order; `/proc` or `/sys` contents) cites the Linux source it matches in its
+  **Linux Semantics** section: the kernel function and `file:line` at a named
+  kernel tag, with a link (for example
+  `https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/signal.c?h=v6.9#n2850`),
+  next to the native measurement the tests compare against. A measurement shows
+  what one kernel did; the citation shows why, and lets a reviewer check the
+  rule rather than one sample. Reviewers check the citation. (Owner,
+  2026-10-18.)
 - Run the workspace test, format, and Clippy gates relevant to the change, and
   report the assurance level reached along with the backend, log level, and any
   relaxations.
@@ -418,11 +441,11 @@ to justify accepting something arbitrarily stale is citing half a rule.
 That block is about a Reverie pin, but the property it names is general.
 
 Two things it does not say, and both are separate questions rather than extra
-conditions on landing. Validation ADMISSION has the opposite answer:
-`scripts/validate.rs` refuses to start a run whose head is behind `origin/main`,
-because a run must measure a commit that includes everything available when it
-starts. And a REVIEW attestation binds an exact sha, so a head move leaves an
-approval bound to the older one. Neither makes an earlier commit's validation
+conditions on landing. Validation ADMISSION has the opposite answer: the
+dev-hermit parent's `ci-hub validate-lock` refuses to admit a run whose head is
+behind `origin/main`, because a run must measure a commit that includes
+everything available when it starts. And a REVIEW attestation binds an exact
+sha, so a head move leaves an approval bound to the older one. Neither makes an earlier commit's validation
 evidence unusable at the landing boundary.
 
 ## A gate nobody can pass is a defect, not a high standard
@@ -465,7 +488,8 @@ Language Summary and Project Impact**, giving the substantive outcome and its
 connection to the product vision or owner request rather than administrative
 history. It also requires **Determinism** (why the change is
 deterministic plus a logic or informal proof, not only tests), **Linux
-Semantics** (how the change preserves faithful Linux behavior), and
+Semantics** (how the change preserves faithful Linux behavior, citing the
+kernel source it matches as described in the change flow above), and
 **Validation**. KVM changes also require **Relationship to gVisor**. A labeled
 PR additionally requires **Human Review Required**, naming the specific
 numbered trigger rather than a vague category such as "backend change". For a

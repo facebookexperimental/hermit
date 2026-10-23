@@ -1,0 +1,23 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under both the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree and the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree.
+
+load("@prelude//configurations:constraint_alias.bzl", "constraint_with_aliases")
+
+constraint_with_aliases(
+    name = "broken_in_oss",
+    aliases = {
+        "disable": "disable",
+        "enable": "enable",
+    },
+    default = "unspecified",
+    values = [
+        "enable",
+        "disable",
+        "unspecified",
+    ],
+    visibility = ["PUBLIC"],
+)

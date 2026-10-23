@@ -20,24 +20,59 @@ use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use tracing::info;
 
 use crate::Detcore;
+use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::InGuestSleepSigalrm;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::SigalrmSleepDisposition;
+use crate::scheduler::HostTimedSignalScope;
+use crate::scheduler::OwnProcessSignalInputs;
+use crate::scheduler::SiblingSignalState;
+use crate::scheduler::discarded_at_send::DiscardToken;
+use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
+use crate::scheduler::discarded_at_send::DiscardedSignalControl;
+use crate::scheduler::discarded_at_send::QueueId;
+use crate::scheduler::pid_namespaces::GuestPidAnswer;
+use crate::scheduler::signal_lists::KernelSiginfo;
+use crate::syscalls::guest_siginfo::GuestSiginfo;
+use crate::syscalls::helpers::REAL_TIME_SIGNALS;
+use crate::syscalls::helpers::act_on_pending_real_time;
+use crate::syscalls::helpers::observe_under_mask;
+use crate::syscalls::helpers::pending_real_time_among;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::helpers::unblocked_by;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
+use crate::syscalls::threads::kernel_sigset_bit;
+use crate::syscalls::threads::read_thread_wait_signal_state;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::SigalrmControl;
 use crate::tool_global::alarm_remaining;
+use crate::tool_global::commit_sigkill;
+use crate::tool_global::host_timed_signals;
+use crate::tool_global::names_a_retired_exited_leader;
 use crate::tool_global::notify_signal_pending;
+use crate::tool_global::own_process_signal_inputs;
+use crate::tool_global::record_host_timed_signals;
+use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::register_alarm;
-use crate::tool_global::resolve_kill_targets;
+use crate::tool_global::registered_process_of;
+use crate::tool_global::reserve_sigkill;
+use crate::tool_global::reserve_sigkill_group;
+use crate::tool_global::resolve_kill_targets_and_exit;
 use crate::tool_global::resource_request;
+use crate::tool_global::set_sigchld_disposition;
+use crate::tool_global::set_sigtimedwait_set;
+use crate::tool_global::sigalrm_refuses;
+use crate::tool_global::signal_target_process;
 use crate::tool_global::thread_observe_time;
 use crate::types::DetPid;
 use crate::types::DetTid;
@@ -60,9 +95,10 @@ use crate::types::LogicalTime;
 ///                   behaved differently from native, which no cell can catch.
 ///
 /// Everything else in 1..31 matches native exactly; 9/19 and 32/33 refuse
-/// `sigaction` natively too and are not hermit's. Realtime 34..64 fail by a
-/// different mechanism (they cannot be represented at the reverie ptrace
-/// boundary) and are tracked separately -- they are not appropriation.
+/// `sigaction` natively too and are not hermit's. Realtime 34..64 are
+/// delivered and handled like any other signal under ptrace
+/// (<https://github.com/rrnewton/reverie/issues/207>); they are not
+/// appropriation.
 const APPROPRIATED_SIGNALS: [(i32, &str); 2] = [
     (
         libc::SIGTRAP,
@@ -123,9 +159,50 @@ fn validate_kernel_sigset_size(sigsetsize: usize) -> Result<(), Errno> {
     }
 }
 
+/// The mask Linux installs when a call names `mask` as the signal mask to sleep
+/// under (`rt_sigsuspend`, `ppoll`, `pselect6`): `set_current_blocked` drops
+/// `SIGKILL` and `SIGSTOP`, which can never be blocked.
+pub(crate) fn kernel_installed_signal_mask(mask: KernelSigset) -> KernelSigset {
+    let unblockable = (1_u64 << (libc::SIGKILL - 1)) | (1_u64 << (libc::SIGSTOP - 1));
+    mask & !unblockable
+}
+
 fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
     let bit = (reverie::PERF_EVENT_SIGNAL as u32) - 1;
     mask & !(1_u64 << bit)
+}
+
+/// The result of a kernel-access probe that is a call's first injection,
+/// made before anything of the call happens (`read_kernel_sigset`,
+/// `read_kernel_sigaction`, pselect6's wrapper validation), with the
+/// backend's not-run report, `-ERESTARTSYS` (which no probe returns
+/// itself), turned into `-ERESTARTNOINTR`. The report means a signal reached
+/// the thread at the call's entry and stopped the probe before its `syscall`
+/// instruction; the backend holds it. The call then restarts once the signal
+/// is delivered, as if the signal had come before the call: its handler runs
+/// under the thread's own mask, and the call runs. Ending the call with the
+/// not-run report instead returned EINTR, from a wait whose temporary mask
+/// the handler never saw and from calls that never fail with EINTR
+/// (`rt_sigprocmask`, `rt_sigaction`), which no Linux run produces
+/// (https://github.com/rrnewton/hermit/issues/4526).
+///
+/// Only for a call's first injection. A probe after an earlier injection
+/// keeps the not-run report, since a restart would repeat that injection
+/// (pselect6's mask read after its wrapper validation and its observation of
+/// a pending real-time timer expiration, for example), and so does one after
+/// a scheduler request, which changes scheduler state (a record/replay
+/// zero-timeout ppoll). Where an earlier phase injects only sometimes, the
+/// caller says whether it did or can: epoll_pwait and epoll_pwait2's
+/// observation (`observe_under_temporary_mask`, which reports whether it
+/// injected), and a run-mode zero-timeout ppoll's publication of virtual
+/// timerfd expirations, which can inject only for a process holding an armed
+/// virtual timerfd. Record/replay pselect6's entry read is always the call's
+/// first injection (https://github.com/rrnewton/hermit/issues/4526).
+pub(crate) fn restart_if_first_probe_not_run<V>(result: Result<V, Error>) -> Result<V, Error> {
+    match result {
+        Err(Error::Errno(Errno::ERESTARTSYS)) => Err(Errno::ERESTARTNOINTR.into()),
+        other => other,
+    }
 }
 
 /// Read one raw kernel signal mask while preserving the kernel's user-access check.
@@ -137,6 +214,14 @@ fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
 /// value makes `rt_sigprocmask` copy exactly the kernel-sized input and then
 /// return `EINVAL` without changing the mask. Use that as a permission probe,
 /// then read the already-validated word while the guest is stopped.
+/// The x86-64 System V red zone below the stack pointer, which a leaf function
+/// may use and an injected call therefore must not.
+pub(super) const STACK_RED_ZONE: usize = 128;
+
+/// The two eight-byte scratch cells `handle_rt_sigsuspend` places below the
+/// red zone: the rt_sigpending result and the copy of the call's mask.
+const SCRATCH_CELLS_SIZE: usize = 2 * std::mem::size_of::<u64>();
+
 pub(super) async fn read_kernel_sigset<G, T>(
     guest: &mut G,
     address: Addr<'_, libc::sigset_t>,
@@ -160,6 +245,253 @@ where
         }
     }
     Ok(guest.memory().read_value(address.cast())?)
+}
+
+/// Whether a thread-directed SIGKILL (`tgkill` or `tkill`) names `tid`, a
+/// thread-group leader that has exited while a sibling runs on. Linux keeps
+/// such a leader as a zombie, and a SIGKILL that names it does not end its
+/// group: `complete_signal` finds that the exiting leader does not want the
+/// signal, and a thread-directed signal goes to no other thread. So the send
+/// is not reserved as a group kill; it takes the ordinary path, and the
+/// kernel answers it as Linux does, with no effect. Only a leader the
+/// scheduler retired at its own `exit` counts: it commits no other turn until
+/// the kernel shows such a leader a zombie, so by this turn it is one, in
+/// every run (`Scheduler::names_a_retired_exited_leader`). A leader that left
+/// the scheduler at a host-timed deregistration, as on DBT, does not
+/// (https://github.com/rrnewton/hermit/issues/4445).
+pub(crate) async fn sigkill_names_an_exited_leader<G, T>(guest: &mut G, tid: DetTid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    names_a_retired_exited_leader(guest, tid).await
+}
+
+/// Signal phase 1: the guest's SIGALRM disposition (a guest handler or not)
+/// and SIGALRM blocked bit, as its runtime keeps them virtual, read back with
+/// a query `rt_sigaction` and `rt_sigprocmask` that the runtime answers from
+/// its virtual state.
+async fn virtual_sigalrm_state<G, T>(guest: &mut G) -> Result<(bool, bool), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let state = read_sigalrm_sleep_state(guest).await?;
+    Ok((
+        state.disposition == SigalrmSleepDisposition::Handled,
+        state.blocked,
+    ))
+}
+
+/// Query through the runtime, which reports the guest's action and mask even
+/// when it owns a physical SIGALRM handler. These queries run in an owned turn;
+/// a scheduler-side read of the callback's physical mask is not a substitute.
+async fn read_sigalrm_sleep_state<G, T>(guest: &mut G) -> Result<InGuestSleepSigalrm, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut stack = guest.stack().await;
+    let action = stack.reserve::<KernelSigaction>();
+    let mask = stack.reserve::<KernelSigset>();
+    let _stack_guard = stack.commit()?;
+    guest
+        .inject(
+            syscalls::RtSigaction::new()
+                .with_signum(libc::SIGALRM)
+                .with_action(None)
+                .with_old_action(Some(action.cast()))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE),
+        )
+        .await?;
+    guest
+        .inject(
+            syscalls::RtSigprocmask::new()
+                .with_how(libc::SIG_BLOCK)
+                .with_set(None)
+                .with_oldset(Some(mask.cast()))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE),
+        )
+        .await?;
+    let action: KernelSigaction = guest.memory().read_value(action)?;
+    let mask: KernelSigset = guest.memory().read_value(mask)?;
+    let disposition = if action.handler == libc::SIG_DFL as u64 {
+        SigalrmSleepDisposition::Default
+    } else if action.handler == libc::SIG_IGN as u64 {
+        SigalrmSleepDisposition::Ignored
+    } else {
+        SigalrmSleepDisposition::Handled
+    };
+    Ok(InGuestSleepSigalrm {
+        disposition,
+        blocked: mask & kernel_sigset_bit(libc::SIGALRM) != 0,
+    })
+}
+
+/// Take one pending copy of `signo` from the calling thread's queues, its own
+/// first and then its process's shared one, as Linux dequeues it, with a
+/// zero-timeout `rt_sigtimedwait` injected while the thread holds its turn.
+/// Returns the signal taken, or the call's error (EAGAIN: none was pending).
+pub(crate) async fn take_pending_signal<G, T>(guest: &mut G, signo: i32) -> Result<i64, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut stack = guest.stack().await;
+    let set = stack.push(kernel_sigset_bit(signo));
+    let timeout = stack.push(Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    });
+    let stack_guard = stack.commit()?;
+    // SAFETY: the kernel only reads the set; Reverie types the argument as
+    // mutable.
+    let set = unsafe { set.cast::<libc::sigset_t>().into_mut() };
+    let taken = guest
+        .inject(
+            syscalls::RtSigtimedwait::new()
+                .with_set(Some(set))
+                .with_info(None)
+                .with_timeout(Some(timeout))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE),
+        )
+        .await;
+    drop(stack_guard);
+    Ok(taken?)
+}
+
+/// Claim a pending `SIGCHLD` for the calling thread, in its own turn, so that
+/// it is delivered to this thread as it next resumes and no other thread can
+/// take it. Returns whether there was one.
+///
+/// A harmless `getpid` is injected. Reverie runs an injected call by stepping
+/// the thread through user mode, so while a signal is pending and unblocked the
+/// kernel dequeues it at that step, Reverie holds it for delivery as the thread
+/// resumes, and the injection returns a restart errno instead of running. The
+/// caller calls this only while SIGCHLD is the signal the kernel dequeues next,
+/// so that held signal is the copy: claimed. If an outside thread took the copy
+/// first, nothing is pending, the call runs, and nothing is claimed. The call
+/// consumes no signal itself, so a stop that ends it can lose nothing (the Codex
+/// review of a version that took the copy with `rt_sigtimedwait` and queued it
+/// again).
+pub(crate) async fn claim_pending_sigchld<G, T>(guest: &mut G) -> Result<bool, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match guest.inject(syscalls::Getpid::new()).await {
+        Ok(_) => Ok(false),
+        Err(errno) if is_restart_errno(errno) => Ok(true),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Test-only fault hook, like `HERMIT_TEST_TIMERFD_FAULT`, acting once per run
+/// at the first claim of a `SIGCHLD` (`claim_pending_sigchld`), for the orders
+/// of https://github.com/rrnewton/hermit/issues/4346 that host timing alone
+/// gives too rarely to test:
+/// - `usr1-before-claim`: just before the claim, Detcore sends the claiming
+///   thread SIGUSR1 from its own process (an injected send would itself
+///   dequeue the pending SIGCHLD), so the thread's own queue holds a lower
+///   signal and the claim takes SIGUSR1 instead;
+/// - `usr1-after-claim`: just after the claim, Detcore sends the claiming
+///   thread SIGUSR1, which a guest that blocks it leaves pending, so the
+///   backend passes the claimed SIGCHLD on unreported;
+/// - `drop-claimed`: the claimed copy is dropped, as the ledger drops a
+///   duplicate (`Detcore::child_exit_sigchld_delivers`), at its delivery stop
+///   or where the backend passes it on unreported
+///   (`Tool::filter_unreported_signal`), so no handler runs and the sleep
+///   restarts: a relative `nanosleep` through the kernel's `restart_syscall`
+///   (`helpers::RestartCall::Nanosleep`).
+///
+/// Unset, nothing changes.
+const CLAIM_FAULT_ENV: &str = "HERMIT_TEST_SIGCHLD_CLAIM_FAULT";
+
+/// Whether the claim fault hook has fired in this process. It fires once.
+static CLAIM_FAULT_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A fault `HERMIT_TEST_SIGCHLD_CLAIM_FAULT` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaimFault {
+    Usr1BeforeClaim,
+    Usr1AfterClaim,
+    DropClaimed,
+}
+
+/// Whether the hook asks for `fault` now: at most once per process.
+pub(crate) fn take_claim_fault(fault: ClaimFault) -> bool {
+    let asked = match std::env::var(CLAIM_FAULT_ENV).as_deref() {
+        Ok("usr1-before-claim") => ClaimFault::Usr1BeforeClaim,
+        Ok("usr1-after-claim") => ClaimFault::Usr1AfterClaim,
+        Ok("drop-claimed") => ClaimFault::DropClaimed,
+        _ => return false,
+    };
+    asked == fault && !CLAIM_FAULT_FIRED.swap(true, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// For `usr1-before-claim` or `usr1-after-claim` (`fault`,
+/// `take_claim_fault`): send the claiming thread SIGUSR1 from Detcore's
+/// process, which shares the guest's pid namespace.
+fn send_claim_fault_signal<G, T>(guest: &G, fault: ClaimFault)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if take_claim_fault(fault) {
+        // SAFETY: tgkill only sends a signal.
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_tgkill,
+                guest.pid().as_raw(),
+                guest.tid().as_raw(),
+                libc::SIGUSR1,
+            )
+        };
+        if sent == 0 {
+            tracing::warn!("claim fault hook: sent SIGUSR1 {:?}", fault);
+        } else {
+            tracing::error!(
+                "claim fault hook: could not send SIGUSR1 {:?}: {}",
+                fault,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Whether `errno` is a restart errno, which an injection returns when a signal
+/// stop ended it before it ran (`claim_pending_sigchld`).
+fn is_restart_errno(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::ERESTARTSYS
+            | Errno::ERESTARTNOINTR
+            | Errno::ERESTARTNOHAND
+            | Errno::ERESTART_RESTARTBLOCK
+    )
+}
+
+/// The guest's virtual SIGALRM blocked bit, read from the runtime (which
+/// answers the query from its virtual state).
+pub(crate) async fn virtual_sigalrm_blocked<G, T>(guest: &mut G) -> Result<bool, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut stack = guest.stack().await;
+    let mask = stack.reserve::<KernelSigset>();
+    let _stack_guard = stack.commit()?;
+    guest
+        .inject(
+            syscalls::RtSigprocmask::new()
+                .with_how(libc::SIG_BLOCK)
+                .with_set(None)
+                .with_oldset(Some(mask.cast()))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE),
+        )
+        .await?;
+    let mask: KernelSigset = guest.memory().read_value(mask)?;
+    Ok(mask & kernel_sigset_bit(libc::SIGALRM) != 0)
 }
 
 /// Validate the entire action through the kernel before copying it privately.
@@ -217,13 +549,220 @@ fn logical_time_to_alarm_seconds(value: LogicalTime) -> i64 {
     value.as_nanos().div_ceil(1_000_000_000) as i64
 }
 
+/// `alarm()`'s return as Linux computes it (`alarm_setitimer`,
+/// `kernel/time/itimer.c`): the whole seconds left, plus one when the
+/// remainder is at least half a second, or when no whole second is left but
+/// the timer is still active. So an active timer, even one with less than a
+/// microsecond left, returns at least 1
+/// (https://github.com/rrnewton/hermit/issues/4139).
+fn linux_alarm_seconds(value: LogicalTime) -> i64 {
+    let ns = value.as_nanos();
+    let (secs, rem) = (ns / 1_000_000_000, ns % 1_000_000_000);
+    let round_up = (secs == 0 && rem != 0) || rem >= 500_000_000;
+    (secs + u64::from(round_up)) as i64
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#663)
-fn deterministic_kill_target(targets: &[DetTid], sig: libc::c_int) -> Result<DetTid, Errno> {
+/// A pid no task can have: above the largest `pid_max` Linux allows (2^22).
+/// `rt_sigqueueinfo` to it makes the kernel check the siginfo exactly as for
+/// any pid and then answer ESRCH, which is Linux's answer for a gone process
+/// (<https://github.com/rrnewton/hermit/issues/4124>).
+pub(crate) const NO_SUCH_PID: libc::pid_t = libc::pid_t::MAX;
+
+/// The 128 siginfo bytes at `info`. A page the kernel may write a siginfo to
+/// can lack read permission (`PROT_WRITE` alone), which `process_vm_readv`
+/// refuses; the tracer then reads it through `/proc/<tid>/mem`, as ptrace
+/// access does, which needs no read permission on the mapping.
+/// The siginfo a guest's send `call` of `signal` queues, as the receiver
+/// sees it (4262 design N8-5): the first 48 bytes of the caller's
+/// `siginfo_t` for `rt_sigqueueinfo` and `rt_tgsigqueueinfo`, or Linux's
+/// `SI_USER` (`kill`) or `SI_TKILL` (`tgkill`, `tkill`) record with the
+/// caller's process id and real uid; for `pidfd_send_signal`, the caller's
+/// siginfo or `SI_USER`. `None` when it cannot be read, or for a call
+/// Detcore does not decode, which the scheduler records as `SI_USER`.
+/// The process id is the container's, which is the receiver's unless either
+/// is in a nested PID namespace.
+fn sent_siginfo<T, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    call: &syscalls::Syscall,
+    signal: i32,
+) -> Option<KernelSiginfo>
+where
+    T: RecordOrReplay,
+{
+    if !crate::scheduler::discarded_at_send::records(guest.config()) {
+        return None;
+    }
+    let code = match call {
+        syscalls::Syscall::RtSigqueueinfo(call) => {
+            return read_siginfo(guest, call.siginfo()?)
+                .map(|bytes| KernelSiginfo::from_user(&bytes));
+        }
+        syscalls::Syscall::RtTgsigqueueinfo(call) => {
+            return read_siginfo(guest, call.siginfo()?)
+                .map(|bytes| KernelSiginfo::from_user(&bytes));
+        }
+        // `pidfd_send_signal` queues the caller's siginfo when it passes one,
+        // and Linux's `SI_USER` record otherwise.
+        syscalls::Syscall::Other(sysno, args) if *sysno == Sysno::pidfd_send_signal => {
+            match AddrMut::<libc::siginfo_t>::from_raw(args.arg2) {
+                Some(info) => {
+                    return read_siginfo(guest, info).map(|bytes| KernelSiginfo::from_user(&bytes));
+                }
+                None => libc::SI_USER,
+            }
+        }
+        syscalls::Syscall::Kill(_) => libc::SI_USER,
+        syscalls::Syscall::Tgkill(_) | syscalls::Syscall::Tkill(_) => libc::SI_TKILL,
+        _ => return None,
+    };
+    let pid = guest.thread_state().detpid?.as_raw();
+    let uid = crate::syscalls::real_uid(guest.tid().as_raw())?;
+    Some(crate::scheduler::signal_lists::ordinary_siginfo(
+        signal, code, pid, uid,
+    ))
+}
+
+/// The 128 bytes of the guest's `siginfo_t` at `info`, `None` when they
+/// cannot be read. A range that would pass the end of the address space is
+/// unreadable, as it is to Linux's copy (EFAULT), and is never handed to the
+/// guest-memory reader, whose page walk would overflow on it.
+fn read_siginfo<T, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    info: AddrMut<libc::siginfo_t>,
+) -> Option<[u8; 128]>
+where
+    T: RecordOrReplay,
+{
+    info.as_raw().checked_add(128)?;
+    if let Ok(bytes) = guest.memory().read_value(info.cast::<[u8; 128]>()) {
+        return Some(bytes);
+    }
+    use std::os::unix::fs::FileExt;
+    let mem = std::fs::File::open(format!("/proc/{}/mem", guest.tid().as_raw())).ok()?;
+    let mut bytes = [0u8; 128];
+    mem.read_exact_at(&mut bytes, info.as_raw() as u64).ok()?;
+    Some(bytes)
+}
+
+/// The first bytes of the guest range at `address`, up to `len`, that are
+/// mapped: read a page at a time, through `/proc/<tid>/mem` where the page
+/// lacks read permission (`PROT_WRITE` alone, or `PROT_NONE`), and stopping at
+/// the first page that is not mapped. The kernel's copy to user mode stops at
+/// the first byte it cannot write, so every byte it can change in the range
+/// is in this prefix (the Codex re-check of
+/// https://github.com/rrnewton/hermit/pull/4351, P2-1).
+fn read_mapped_prefix<T, G: Guest<Detcore<T>>>(guest: &mut G, address: usize, len: usize) -> Vec<u8>
+where
+    T: RecordOrReplay,
+{
+    const PAGE: usize = 4096;
+    let mut bytes = Vec::with_capacity(len);
+    let mut mem = None;
+    while bytes.len() < len {
+        let at = address + bytes.len();
+        let take = (PAGE - at % PAGE).min(len - bytes.len());
+        let mut piece = vec![0u8; take];
+        let Some(remote) = AddrMut::<u8>::from_raw(at) else {
+            break;
+        };
+        if guest.memory().read_exact(remote, &mut piece).is_err() {
+            use std::os::unix::fs::FileExt;
+            if mem.is_none() {
+                mem = std::fs::File::open(format!("/proc/{}/mem", guest.tid().as_raw())).ok();
+            }
+            let Some(file) = mem.as_ref() else {
+                break;
+            };
+            if file.read_exact_at(&mut piece, at as u64).is_err() {
+                break;
+            }
+        }
+        bytes.extend_from_slice(&piece);
+    }
+    bytes
+}
+
+/// The most a signalfd read's records can need restored: one 128-byte record
+/// for each standard signal in each of the two queues it reads (the thread's
+/// and the process's). Real-time signals, which can queue more copies, are
+/// out of scope (https://github.com/rrnewton/hermit/issues/4319).
+const SIGNALFD_CAPTURED: usize = 2 * 64 * SIGNALFD_RECORD;
+
+/// What the guest's buffers `extents` (address, length) hold, in order, up to
+/// `limit` bytes and at most `SIGNALFD_CAPTURED`, read before a signalfd read
+/// writes them, so a record that read drops can leave them as they were
+/// (`apply_signalfd_answers`). The capture stops at the first byte that is not
+/// mapped, which the read cannot write either.
+pub(crate) fn capture_signalfd_buffer<T, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    extents: &[(usize, usize)],
+    limit: usize,
+) -> Vec<u8>
+where
+    T: RecordOrReplay,
+{
+    let total: usize = extents.iter().map(|(_, len)| *len).sum();
+    let len = total.min(limit).min(SIGNALFD_CAPTURED);
+    let mut bytes = Vec::with_capacity(len);
+    for (address, length) in signalfd_extent_pieces(extents, len) {
+        let piece = read_mapped_prefix(guest, address, length);
+        let short = piece.len() < length;
+        bytes.extend_from_slice(&piece);
+        if short {
+            break;
+        }
+    }
+    bytes
+}
+
+/// Put back, in the guest's siginfo buffer at `info`, the bytes that differ
+/// from `before`, the mapped prefix of its 128 bytes before a take whose copy
+/// is dropped (`read_mapped_prefix`). Only the bytes the kernel wrote differ,
+/// and it wrote only what user mode could, so no write reaches a page user
+/// mode could not write; a buffer that ends at an unmapped page keeps its
+/// prefix as it was (the Codex re-check of
+/// https://github.com/rrnewton/hermit/pull/4351, P2-1).
+fn restore_changed_bytes<T, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    info: AddrMut<libc::siginfo_t>,
+    before: &[u8],
+) where
+    T: RecordOrReplay,
+{
+    let now = read_mapped_prefix(guest, info.as_raw(), before.len());
+    let before = &before[..now.len()];
+    let mut at = 0;
+    while at < before.len() {
+        if now[at] == before[at] {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < before.len() && now[at] != before[at] {
+            at += 1;
+        }
+        if let Some(address) = AddrMut::<u8>::from_raw(info.as_raw() + start) {
+            let _ = guest.memory().write_exact(address, &before[start..at]);
+        }
+    }
+}
+
+/// The thread a process-directed signal goes to. `zombie` is the process's
+/// exit state (`Scheduler::exited_process_is_zombie`). `Ok(None)` is a zombie:
+/// no live threads, but its parent can still wait for it, so Linux still finds
+/// the process and the send succeeds (https://github.com/rrnewton/hermit/issues/4091).
+fn deterministic_kill_target(
+    targets: &[DetTid],
+    zombie: Option<bool>,
+    sig: libc::c_int,
+) -> Result<Option<DetTid>, Errno> {
     match targets {
+        [] if zombie == Some(true) => Ok(None),
         [] => Err(Errno::ESRCH),
-        [target] => Ok(*target),
-        [target, ..] if sig == 0 => Ok(*target),
+        [target] => Ok(Some(*target)),
+        [target, ..] if sig == 0 => Ok(Some(*target)),
         _ => Err(Errno::ENOSYS),
     }
 }
@@ -259,6 +798,86 @@ fn self_sigkill_targets_current_task(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Bind a supported in-guest emulated sleep to its guest disposition/mask.
+    /// Ordinary admitted creation does not share signal dispositions between
+    /// processes, and each supported in-guest process has one guest thread.
+    /// The snapshot therefore stays current until this request resumes.
+    pub(crate) async fn in_guest_sleep_sigalrm_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Option<InGuestSleepSigalrm> {
+        if !self.cfg.backend.virtualizes_guest_sigalrm {
+            return None;
+        }
+        match read_sigalrm_sleep_state(guest).await {
+            Ok(state) => Some(state),
+            Err(error) => {
+                self.stop_after_in_guest_sleep_signal_loss(
+                    guest,
+                    format!("could not query its SIGALRM action/mask before sleeping: {error}"),
+                )
+                .await
+            }
+        }
+    }
+
+    /// A typed wake means the scheduler generated a one-shot SIGALRM for this
+    /// exact sleep without sending it physically. Stage it through the frozen
+    /// runtime self-signal path, which runs signal and exit callbacks before
+    /// Linux kills the process. The caller must immediately return its handler:
+    /// it must neither resume guest code nor copy nanosleep's remainder out.
+    pub(crate) async fn stage_in_guest_fatal_alarm<G: Guest<Self>>(&self, guest: &mut G) {
+        if !self.cfg.backend.virtualizes_guest_sigalrm {
+            self.stop_after_in_guest_sleep_signal_loss(
+                guest,
+                "received an in-guest fatal alarm on another backend".into(),
+            )
+            .await;
+        }
+        match read_sigalrm_sleep_state(guest).await {
+            Ok(InGuestSleepSigalrm {
+                disposition: SigalrmSleepDisposition::Default,
+                blocked: false,
+            }) => {}
+            other => {
+                self.stop_after_in_guest_sleep_signal_loss(
+                    guest,
+                    format!("its default/unblocked SIGALRM sleep snapshot changed: {other:?}"),
+                )
+                .await;
+            }
+        }
+        let call = syscalls::Tgkill::new()
+            .with_tgid(guest.pid().as_raw())
+            .with_tid(guest.tid().as_raw())
+            .with_sig(libc::SIGALRM);
+        if guest.inject(call).await != Ok(0) {
+            self.stop_after_in_guest_sleep_signal_loss(
+                guest,
+                "could not stage its default-fatal SIGALRM after a sleep wake".into(),
+            )
+            .await;
+        }
+    }
+
+    async fn stop_after_in_guest_sleep_signal_loss<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        reason: String,
+    ) -> ! {
+        let reason = format!(
+            "thread {} cannot complete its in-guest SIGALRM sleep delivery: {reason}",
+            guest.thread_state().dettid,
+        );
+        crate::tool_global::report_determinism_loss(guest, reason).await;
+        crate::guest_log::flush_unsent();
+        match guest
+            .tail_inject(
+                syscalls::ExitGroup::new().with_status(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            )
+            .await {}
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// We send the alarms to the global scheduler to handle.
@@ -275,7 +894,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Signal::SIGALRM,
             )
             .await;
-            Ok(logical_time_to_alarm_seconds(remaining.0))
+            // Record and replay keep the rounding they recorded with.
+            Ok(if self.cfg.recordreplay_modes {
+                logical_time_to_alarm_seconds(remaining.0)
+            } else {
+                linux_alarm_seconds(remaining.0)
+            })
         } else {
             info!(
                 "[dtid {}] Running without scheduler, so letting alarm call through...",
@@ -309,6 +933,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let timer: libc::itimerval = guest.memory().read_value(value)?;
         let interval = timeval_to_logical_time(timer.it_interval)?;
         let duration = timeval_to_logical_time(timer.it_value)?;
+        // A zero value disarms the timer, whatever its interval.
+        if duration.as_nanos() != 0 && interval.as_nanos() != 0 {
+            refuse_sigalrm(guest, SigalrmControl::ArmRecurringTimer).await?;
+        }
         let (remaining, old_interval) =
             register_alarm(guest, duration, interval, Signal::SIGALRM).await;
         if let Some(old_value) = call.ovalue() {
@@ -364,20 +992,49 @@ impl<T: RecordOrReplay> Detcore<T> {
             // `LogicalTime::INDEFINITE` records that, and the scheduler refuses to
             // fast-forward virtual time onto it (see `step2d_handle_empty_queue`),
             // so the `Normal` arm below stays unreachable.
-            let req = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
-            match crate::tool_global::parked_wait_request(
-                guest,
-                req,
-                crate::scheduler::parked::ParkedWaitPolicy::PauseNoHandlerRestart,
-            )
-            .await
-            {
-                ResumeStatus::Normal => {
-                    panic!(
-                        "Internal violation: pause should never return from the scheduler except by interruption!"
-                    )
+            loop {
+                // A signal that already ended the call before it parked: one sent
+                // while this thread was stopped short of filing the request, as
+                // when its timeslice ended in the syscall's prehook.
+                if sleep_signal(guest, SleepCheck::BeforePark, true).await? == SleepSignal::Pending
+                {
+                    return Err(Errno::ERESTARTNOHAND.into());
                 }
-                ResumeStatus::Signaled(_) => Err(reverie::Error::Errno(Errno::EINTR)),
+                let mut req = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
+                req.fyi(crate::resources::PAUSE_FYI);
+                req.in_guest_sleep_sigalrm = self.in_guest_sleep_sigalrm_snapshot(guest).await;
+                match crate::tool_global::parked_wait_request(
+                    guest,
+                    req,
+                    crate::scheduler::parked::ParkedWaitPolicy::PauseNoHandlerRestart,
+                )
+                .await
+                {
+                    ResumeStatus::InGuestFatalAlarm => {
+                        self.stage_in_guest_fatal_alarm(guest).await;
+                        return Err(Errno::EINTR.into());
+                    }
+                    // A pause never asks for `NothingElseCanRun`.
+                    ResumeStatus::Normal | ResumeStatus::NothingElseCanRun => {
+                        panic!(
+                            "Internal violation: pause should never return from the scheduler except by interruption!"
+                        )
+                    }
+                    ResumeStatus::Signaled(signals) => {
+                        match sleep_signal(guest, SleepCheck::AfterWake(signals), true).await? {
+                            SleepSignal::Pending | SleepSignal::Claimed => {
+                                return Err(Errno::ERESTARTNOHAND.into());
+                            }
+                            SleepSignal::Held => return Err(Errno::EINTR.into()),
+                            SleepSignal::None => {
+                                info!(
+                                    "[dtid {}] pause woken for a signal no longer pending for it; waiting again",
+                                    guest.thread_state().dettid
+                                );
+                            }
+                        }
+                    }
+                }
             }
         } else {
             info!(
@@ -388,11 +1045,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Run rt_sigsuspend without holding the deterministic scheduler turn.
+    /// Run rt_sigsuspend, without holding the deterministic scheduler turn where
+    /// the call sleeps.
     ///
     /// The kernel must perform the temporary mask swap atomically and restore the
     /// original mask after signal delivery, so execute the real blocking syscall
     /// while marking this thread as blocked outside the runnable set.
+    ///
+    /// On a backend whose `rt_sigsuspend` never sleeps
+    /// (`rt_sigsuspend_never_sleeps`: KVM), the call instead runs in the
+    /// caller's own turn, and a refused wait yields the turn
+    /// (<https://github.com/rrnewton/hermit/issues/4360>).
     pub async fn handle_rt_sigsuspend<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -405,10 +1068,41 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EFAULT.into());
         };
 
-        let temporary_mask = read_kernel_sigset(guest, mask_addr).await?;
-        let mut stack = guest.stack().await;
-        let pending_addr = stack.push(0_u64);
-        let pending_guard = stack.commit()?;
+        let temporary_mask =
+            restart_if_first_probe_not_run(read_kernel_sigset(guest, mask_addr).await)?;
+        super::signal_shadow::note_wait_mask(guest, temporary_mask);
+        // The temporary mask lets the kernel take a pending real-time timer
+        // expiration that every thread blocked when it expired
+        // (https://github.com/rrnewton/hermit/issues/4089).
+        observe_under_mask(guest, temporary_mask).await?;
+        // The real call sleeps under a private copy of the mask read here, not
+        // under the guest's buffer. The scheduler decides from this copy which
+        // signals can end the call (`Resources::blocked_signal_mask`), and
+        // another process sharing the buffer (MAP_SHARED) may rewrite it before
+        // the call runs; Linux copies the mask when the call starts, and from
+        // the guest's view the call has already started.
+        //
+        // The copy and the rt_sigpending result live in two cells just below
+        // the stack's red zone, the scratch area an injected call may use, but
+        // never on the caller's buffer: a guest may keep its mask there while
+        // it blocks every signal, and a copy placed on that very buffer would
+        // be the original again, while the pending cell would overwrite the
+        // guest's mask. If the buffer overlaps the two cells, they move to just
+        // below it. They are written directly rather than through a scratch
+        // stack, whose commit writes one contiguous region down from the red
+        // zone and so would cover a buffer inside it.
+        let caller_mask = mask_addr.as_raw()..mask_addr.as_raw() + KERNEL_SIGSET_SIZE;
+        let below_red_zone = (guest.regs().await.rsp as usize).wrapping_sub(STACK_RED_ZONE);
+        let cells = (below_red_zone - SCRATCH_CELLS_SIZE)..below_red_zone;
+        let cells_start = if cells.start < caller_mask.end && caller_mask.start < cells.end {
+            (caller_mask.start - SCRATCH_CELLS_SIZE) & !(std::mem::align_of::<u64>() - 1)
+        } else {
+            cells.start
+        };
+        let pending_addr = Addr::<u64>::from_raw(cells_start).ok_or(Errno::EFAULT)?;
+        let mask_copy = AddrMut::<u64>::from_raw(cells_start + std::mem::size_of::<u64>())
+            .ok_or(Errno::EFAULT)?;
+        guest.memory().write_value(mask_copy, &temporary_mask)?;
         let pending_out = AddrMut::<libc::sigset_t>::from_raw(pending_addr.as_raw())
             .expect("stack address must be non-null");
         let pending_call = syscalls::RtSigpending::new()
@@ -416,16 +1110,53 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(pending_call).await?;
         let pending: u64 = guest.memory().read_value(pending_addr)?;
-        drop(pending_guard);
+        let call = call.with_mask(Some(Addr::from_raw(mask_copy.as_raw()).expect("non-null")));
 
+        // On a backend whose `rt_sigsuspend` never sleeps
+        // (`rt_sigsuspend_never_sleeps`), the call returns at once, so it runs
+        // in this thread's own turn, as any call that cannot block does.
+        // Backgrounded as a sleeper, it left nothing holding the scheduler
+        // between the background grant and its continuation, so the scheduler
+        // reported a deadlock or skipped virtual time to a timed waiter, as
+        // host timing decided (https://github.com/rrnewton/hermit/issues/4360).
+        //
+        // The backend refuses a wait for a signal not yet pending (ENOSYS), and
+        // a guest retries it, so that refusal hands the turn on first with a
+        // strong yield (`ResourceID::SchedYield`): the caller is not selected
+        // again until another thread has had a turn, and under chaos not until
+        // a thread that did not yield has (a yield epoch), so the threads it
+        // waits on run before it retries, in the order the scheduler gives. In
+        // its own turn alone, the caller spun and never let its child's exit
+        // be granted; a weak yield, which `sched_yield` makes under chaos,
+        // would let a caller in a higher band win every turn (the Codex
+        // review).
+        if rt_sigsuspend_never_sleeps(&self.cfg.backend) {
+            let result = self.record_or_replay(guest, call).await;
+            if result == Err(Errno::ENOSYS) && self.cfg.sequentialize_threads {
+                if self.cfg.max_timeslice.is_some() {
+                    guest
+                        .thread_state_mut()
+                        .reset_timeslice_for_explicit_yield();
+                }
+                let request = Self::sched_yield_request(guest);
+                resource_request(guest, request).await;
+            }
+            return Ok(result?);
+        }
+        // The scheduler records the mask the call sleeps under, read here in
+        // this thread's turn, to choose a SIGCHLD target while the thread is
+        // outside the runnable set (`Resources::blocked_signal_mask`).
+        let installed_mask = kernel_installed_signal_mask(temporary_mask);
         if pending & !temporary_mask != 0 {
             // The kernel will consume an already-pending signal as soon as it
             // atomically installs the temporary mask. Keep this immediate case
             // out of the terminal-wait classification; the real syscall still
             // performs delivery and restores the old mask.
-            self.record_or_replay_blocking(guest, call.into()).await
+            self.record_or_replay_blocking_with_mask(guest, call.into(), Some(installed_mask))
+                .await
         } else {
-            self.record_or_replay_rt_sigsuspend(guest, call).await
+            self.record_or_replay_rt_sigsuspend(guest, call, installed_mask)
+                .await
         }
     }
 
@@ -444,20 +1175,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         // writing old_action. This preserves Linux's action-before-old_action
         // pointer ordering, including when both arguments alias.
         let kernel_action = match call.action() {
-            Some(action) => Some(read_kernel_sigaction(guest, action).await?),
+            Some(action) => Some(restart_if_first_probe_not_run(
+                read_kernel_sigaction(guest, action).await,
+            )?),
             None => None,
         };
 
-        // Both appropriated signals are reported here, at the one point where the
-        // guest states its expectation. SIGTRAP falls through to the ordinary
-        // path below (its handler really is installed; ptrace just eats the
-        // signal), so this must run before the SIGSTKFLT early return.
-        if let Some(action) = kernel_action {
+        // SIGTRAP is reported here, at the one point where the guest states its
+        // expectation: it falls through to the ordinary path below (its handler
+        // really is installed; ptrace just eats the signal).
+        // SIGSTKFLT's disposition is not installed at all; the branch below
+        // announces that once per run instead.
+        if let Some(action) = kernel_action
+            && call.signum() != reverie::PERF_EVENT_SIGNAL as i32
+        {
             warn_appropriated_signal(call.signum(), action.handler);
         }
 
         // PERF_EVENT_SIGNAL is reserved.
         if call.signum() == reverie::PERF_EVENT_SIGNAL as i32 {
+            // A kept fake success, announced: once per run, the coordinator
+            // names the signal and says the disposition was not installed.
+            if kernel_action.is_some_and(|action| action.handler != libc::SIG_DFL as u64) {
+                crate::tool_global::announce_signal_handler_not_installed(guest, call.signum())
+                    .await;
+            }
             // The go runtime attempts to register this (unused) signal handler.  We will never
             // deliver signals of this kind to the guest, so we just turn this action into a noop
             // rather than returning `Err(Errno::EINVAL.into())`. Preserve that established
@@ -476,7 +1218,44 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             return Ok(0);
         }
-        Ok(if let Some(kernel_action) = kernel_action {
+        // Signal phase 1 (step I3): on a backend that keeps a handled SIGALRM
+        // virtual, the scheduler's ledger must agree with the runtime.
+        let phase1 = self.cfg.backend.virtualizes_guest_sigalrm
+            && call.signum() == libc::SIGALRM
+            && kernel_action.is_some();
+        let was_handled = guest.thread_state().sigalrm_handled;
+        let to_handler = kernel_action.is_some_and(|action| {
+            action.handler != libc::SIG_DFL as u64 && action.handler != libc::SIG_IGN as u64
+        });
+        if phase1 {
+            if to_handler {
+                self.refuse_sigalrm_handler(guest).await?;
+            } else if was_handled
+                && kernel_action.is_some_and(|action| action.handler == libc::SIG_DFL as u64)
+            {
+                refuse_sigalrm(guest, SigalrmControl::HandlerToDefault).await?;
+            }
+        }
+        // Whether this call moves the signal from `SIG_IGN` to an action that
+        // does not ignore it, read before the change: Linux then re-queues a
+        // periodic POSIX timer's ignored expiry (`posixtimer_sig_unignore`,
+        // <https://github.com/rrnewton/hermit/issues/4293>).
+        let unignores = crate::scheduler::discarded_at_send::records(guest.config())
+            && (1..32).contains(&call.signum())
+            && kernel_action.is_some_and(|action| {
+                action.handler != libc::SIG_IGN as u64
+                    && !(action.handler == libc::SIG_DFL as u64
+                        && [libc::SIGCONT, libc::SIGCHLD, libc::SIGWINCH, libc::SIGURG]
+                            .contains(&call.signum()))
+            })
+            && match crate::syscalls::signal_shadow::copied_dispositions_for(guest, call.signum()) {
+                Some(copied) => copied.ignored & kernel_sigset_bit(call.signum()) != 0,
+                None => {
+                    crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
+                        .is_ok_and(|state| state.ignored & kernel_sigset_bit(call.signum()) != 0)
+                }
+            };
+        let result = if let Some(kernel_action) = kernel_action {
             // The kernel treats `action` as input. Sanitize a private copy instead
             // of writing through the guest pointer: the input may be read-only,
             // and changing it would make the syscall wrapper observable.
@@ -487,10 +1266,208 @@ impl<T: RecordOrReplay> Detcore<T> {
             let _stack_guard = stack.commit()?;
             guest
                 .inject(call.with_action(Some(sanitized_action.cast())))
-                .await?
+                .await
         } else {
-            guest.inject(call).await?
-        })
+            guest.inject(call).await
+        };
+        super::signal_shadow::record_rt_sigaction(
+            guest,
+            call.signum(),
+            kernel_action.map(|action| KernelSigaction {
+                mask: without_perf_event_signal(action.mask),
+                ..action
+            }),
+            call.old_action(),
+            &result,
+        );
+        // Publish the state the runtime now holds whenever the disposition may
+        // have changed: from a handler, or to one the runtime did not refuse.
+        // Any result counts, since an EFAULT copying the old action out comes
+        // after the change. A default or ignored action set while none is
+        // handled changes nothing the scheduler records, so it costs nothing.
+        if phase1 && (was_handled || (to_handler && result != Err(Errno::EPERM))) {
+            self.publish_virtual_sigalrm(guest).await?;
+        }
+        // Linux reaps a process's children automatically at exit when its
+        // SIGCHLD action is SIG_IGN or carries SA_NOCLDWAIT, and a signal to
+        // such a child then finds no zombie. Mirror the new action for the
+        // scheduler's exit model, with the same success rule as above
+        // (https://github.com/rrnewton/hermit/issues/4091).
+        if call.signum() == libc::SIGCHLD
+            && guest.config().sequentialize_threads
+            && let Some(action) = kernel_action
+            && matches!(result, Ok(_) | Err(Errno::EFAULT))
+        {
+            let dettid = guest.thread_state().dettid;
+            if let Some(process) = registered_process_of(guest, dettid).await {
+                set_sigchld_disposition(
+                    guest,
+                    process,
+                    action.handler == libc::SIG_IGN as u64,
+                    action.flags & libc::SA_NOCLDWAIT as u64 != 0,
+                )
+                .await;
+            }
+        }
+        // Linux flushes a pending SIGCHLD when its action becomes SIG_IGN or
+        // SIG_DFL, which ignores it (`do_sigaction`, `sig_handler_ignored`): the
+        // child-exit ledger's send window goes with it, in this committed turn
+        // (https://github.com/rrnewton/hermit/issues/4126).
+        if call.signum() == libc::SIGCHLD
+            && guest.config().sequentialize_threads
+            && matches!(result, Ok(_) | Err(Errno::EFAULT))
+            && kernel_action.is_some_and(|action| {
+                action.handler == libc::SIG_IGN as u64 || action.handler == libc::SIG_DFL as u64
+            })
+        {
+            crate::tool_global::child_exit_sigchld(
+                guest,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::Flushed,
+            )
+            .await;
+        }
+        // Linux flushes the pending instances of a signal whose disposition
+        // becomes SIG_IGN (`do_sigaction`), among them a pending real-time timer
+        // expiration (https://github.com/rrnewton/hermit/issues/4089).
+        if result.is_ok()
+            && kernel_action.is_some_and(|action| action.handler == libc::SIG_IGN as u64)
+            && (1..=64).contains(&call.signum())
+        {
+            let bit = kernel_sigset_bit(call.signum());
+            let pending = pending_real_time_among(guest, bit).await;
+            act_on_pending_real_time(guest, pending, 0, bit).await;
+        }
+        // The same flush takes a `SIGEV_THREAD_ID` timer's pending copy of a
+        // standard signal, for SIG_IGN or for SIG_DFL on a signal whose
+        // default is to ignore it (`sig_handler_ignored`), so it no longer
+        // counts as the timer's own (https://github.com/rrnewton/hermit/issues/4164).
+        let ignored = |handler: u64| {
+            handler == libc::SIG_IGN as u64
+                || (handler == libc::SIG_DFL as u64
+                    && [libc::SIGCONT, libc::SIGCHLD, libc::SIGWINCH, libc::SIGURG]
+                        .contains(&call.signum()))
+        };
+        // The kernel reads the new action from Detcore's sanitized copy, so an
+        // EFAULT can only come from writing `old_action`, after the new action
+        // is installed.
+        if (result.is_ok() || matches!(result, Err(Errno::EFAULT)))
+            && kernel_action.is_some_and(|action| ignored(action.handler))
+            && (1..32).contains(&call.signum())
+            && crate::scheduler::timer_copies_recorded()
+        {
+            crate::tool_global::forget_thread_timer_copies(guest, call.signum()).await;
+        }
+        // A handler's mask decides where a POSIX timer's next entry goes when a
+        // delivery promotes it (<https://github.com/rrnewton/hermit/issues/4262>).
+        if crate::scheduler::discarded_at_send::records(guest.config())
+            && (result.is_ok() || matches!(result, Err(Errno::EFAULT)))
+            && (1..32).contains(&call.signum())
+            && let Some(action) = kernel_action
+        {
+            crate::tool_global::discarded_signal(
+                guest,
+                DiscardedSignalControl::Handler {
+                    signal: call.signum(),
+                    caught: action.handler != libc::SIG_IGN as u64
+                        && action.handler != libc::SIG_DFL as u64,
+                    mask: action.mask,
+                    nodefer: action.flags & libc::SA_NODEFER as u64 != 0,
+                },
+            )
+            .await;
+        }
+        // The flush takes every pending copy of the signal from every queue of
+        // the process, so none of them is one Linux discarded any more; and an
+        // unignore makes a still-current periodic timer expiry a kept one
+        // (`scheduler::discarded_at_send`).
+        if crate::scheduler::discarded_at_send::records(guest.config())
+            && (result.is_ok() || matches!(result, Err(Errno::EFAULT)))
+            && (1..32).contains(&call.signum())
+        {
+            let signal = call.signum();
+            if kernel_action.is_some_and(|action| ignored(action.handler)) {
+                crate::tool_global::discarded_signal(
+                    guest,
+                    DiscardedSignalControl::Flushed { signal },
+                )
+                .await;
+            } else if unignores {
+                crate::tool_global::discarded_signal(
+                    guest,
+                    DiscardedSignalControl::Unignored { signal },
+                )
+                .await;
+            }
+        }
+        Ok(result?)
+    }
+
+    /// Signal phase 1's Detcore-side refusals of a new guest SIGALRM handler,
+    /// each EPERM before anything changes (design section 6 and closure 5):
+    /// threads not sequentialized (`alarm` would arm a kernel timer; named
+    /// with a WARN, `unsequentialized_handler_refused_warning`), a signalfd in
+    /// the process's descriptor table, and a kernel producer of SIGALRM armed
+    /// anywhere in the run.
+    async fn refuse_sigalrm_handler<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        // Without sequentialization a run has no premise P (design 16.2: one
+        // guest thread runs guest code at a time), so it may not catch a
+        // signal: the first caught-handler install is refused, by name, with
+        // EPERM and a WARN (coordinator decision D32). A run that catches no
+        // signal keeps running, a labelled relaxation as on ptrace. Today this
+        // phase 1 SIGALRM handler is the only handler the in-guest runtime
+        // lets through to Detcore (it refuses every other one itself, and
+        // resets any handler installed before it to SIG_DFL). A5 step 3c.2's
+        // handler admission must carry the same rule for every handler
+        // install under --no-sequentialize-threads.
+        if !guest.config().sequentialize_threads {
+            tracing::warn!(
+                "{}",
+                crate::refused_signal_controls::unsequentialized_handler_refused_warning(
+                    libc::SIGALRM,
+                    guest.thread_state().dettid.as_raw(),
+                )
+            );
+            return Err(Errno::EPERM.into());
+        }
+        // The model's own signalfds, and any the kernel's table holds that
+        // the model labels otherwise (an inherited descriptor).
+        let holds_signalfd = guest
+            .thread_state()
+            .file_metadata
+            .lock()
+            .expect("file metadata mutex poisoned")
+            .file_handles
+            .values()
+            .any(|fd| fd.ty() == FdType::Signalfd)
+            || crate::sigalrm_phase1::process_holds_signalfd(guest.pid().as_raw());
+        if holds_signalfd {
+            return Err(Errno::EPERM.into());
+        }
+        Ok(refuse_sigalrm(guest, SigalrmControl::InstallHandler).await?)
+    }
+
+    /// Read the guest's SIGALRM disposition and blocked bit back from the
+    /// runtime (which answers these queries from its virtual state), then
+    /// publish them to the scheduler and record the disposition in the thread
+    /// state, inside this call's turn.
+    async fn publish_virtual_sigalrm<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        let (handled, blocked) = virtual_sigalrm_state(guest).await?;
+        sigalrm_refuses(guest, SigalrmControl::Publish { handled, blocked }).await;
+        guest.thread_state_mut().sigalrm_handled = handled;
+        guest.thread_state_mut().sigalrm_blocked_published = blocked;
+        Ok(())
+    }
+
+    /// After a guest call that may have changed its virtual mask in a process
+    /// that handles SIGALRM, publish its SIGALRM blocked bit.
+    async fn publish_virtual_sigalrm_blocked<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), Error> {
+        let blocked = virtual_sigalrm_blocked(guest).await?;
+        sigalrm_refuses(guest, SigalrmControl::PublishBlocked(blocked)).await;
+        guest.thread_state_mut().sigalrm_blocked_published = blocked;
+        Ok(())
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -504,13 +1481,109 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel checks sigsetsize before copying from either user pointer.
         validate_kernel_sigset_size(call.sigsetsize())?;
 
+        let (result, validated_set) = self.rt_sigprocmask_inner(guest, call).await;
+        let set_not_read = matches!(validated_set, ValidatedSet::NotRun);
+        if guest.thread_state().signal_shadow.is_some() {
+            use super::signal_shadow::SetInput;
+            let errno_result = match &result {
+                Ok(value) => Some(Ok(*value)),
+                Err(Error::Errno(errno)) => Some(Err(*errno)),
+                Err(_) => {
+                    super::signal_shadow::give_up(
+                        guest,
+                        "rt_sigprocmask failed without an errno, so its effect is unknown",
+                    );
+                    None
+                }
+            };
+            let set = match (call.set(), validated_set) {
+                (None, _) => SetInput::None,
+                (Some(_), ValidatedSet::Validated(set)) => {
+                    SetInput::Validated(without_perf_event_signal(set))
+                }
+                (Some(_), ValidatedSet::NotRun) => SetInput::NotRun,
+                // Read after the call, from memory the kernel itself just
+                // read, and only when it succeeded; an old mask written over
+                // any of the set's bytes leaves it unknown.
+                (Some(set), ValidatedSet::NotValidated) => SetInput::Unvalidated(
+                    (result.is_ok()
+                        && !call.oldset().is_some_and(|old| {
+                            old.as_raw().abs_diff(set.as_raw()) < KERNEL_SIGSET_SIZE
+                        }))
+                    .then(|| {
+                        guest
+                            .memory()
+                            .read_value::<_, KernelSigset>(set.cast::<KernelSigset>())
+                            .ok()
+                    })
+                    .flatten()
+                    .map(without_perf_event_signal),
+                ),
+            };
+            if let Some(errno_result) = errno_result {
+                super::signal_shadow::record_rt_sigprocmask(
+                    guest,
+                    call.how(),
+                    set,
+                    call.oldset(),
+                    &errno_result,
+                );
+            }
+        }
+        // The set's probe did not run, and the call restarts
+        // (`restart_if_first_probe_not_run`): nothing changed, so nothing
+        // follows from a change; the restarted call does the rest.
+        if set_not_read && matches!(result, Err(Error::Errno(Errno::ERESTARTNOINTR))) {
+            return result;
+        }
+        if call.how() != libc::SIG_BLOCK && call.set().is_some() {
+            // The new mask may unblock a pending real-time timer expiration
+            // that every thread blocked when it expired, which the kernel then
+            // delivers (https://github.com/rrnewton/hermit/issues/4089). Whatever
+            // the call returned: an EFAULT copying the old set out comes after
+            // the change. A mask that cannot be read could unblock any of them.
+            let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
+            if pending != 0 {
+                let (observable, discarded) =
+                    match read_thread_wait_signal_state(guest.pid(), guest.tid()) {
+                        Ok(state) => unblocked_by(&state, state.blocked),
+                        Err(_) => (REAL_TIME_SIGNALS, 0),
+                    };
+                act_on_pending_real_time(guest, pending, observable, discarded).await;
+            }
+        }
+        if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
+            // Signal phase 1: the scheduler's blocked bit follows the virtual
+            // mask, whatever the call returned (an EFAULT copying the old set
+            // out comes after the change).
+            self.publish_virtual_sigalrm_blocked(guest).await?;
+        }
+        result
+    }
+
+    /// The call itself. Also says whether, and with what set, the kernel ran
+    /// it: the `SIG_BLOCK` and `SIG_SETMASK` paths read the set through the
+    /// kernel first and inject nothing when that fails.
+    async fn rt_sigprocmask_inner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigprocmask,
+    ) -> (Result<i64, Error>, ValidatedSet) {
         if call.how() != libc::SIG_BLOCK && call.how() != libc::SIG_SETMASK {
-            Ok(guest.inject_with_retry(call).await?)
+            let result = guest.inject_with_retry(call).await;
+            (result.map_err(Into::into), ValidatedSet::NotValidated)
         } else if let Some(set) = call.set() {
-            let set_mask = read_kernel_sigset(guest, set).await?;
+            let set_mask =
+                match restart_if_first_probe_not_run(read_kernel_sigset(guest, set).await) {
+                    Ok(set_mask) => set_mask,
+                    Err(error) => return (Err(error), ValidatedSet::NotRun),
+                };
             let mut stack = guest.stack().await;
             let new_set = stack.push(without_perf_event_signal(set_mask));
-            let _stack_guard = stack.commit()?;
+            let _stack_guard = match stack.commit() {
+                Ok(guard) => guard,
+                Err(error) => return (Err(error.into()), ValidatedSet::NotRun),
+            };
             let modified_call = syscalls::RtSigprocmask::new()
                 .with_how(call.how())
                 .with_set(Some(new_set.cast()))
@@ -518,9 +1591,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_sigsetsize(call.sigsetsize());
             // Keep returning to the handler so post_handler_hook can run, but
             // do not expose a tracer preemption as ERESTARTSYS to the guest.
-            Ok(guest.inject_with_retry(modified_call).await?)
+            let result = guest.inject_with_retry(modified_call).await;
+            (
+                result.map_err(Into::into),
+                ValidatedSet::Validated(set_mask),
+            )
         } else {
-            Ok(guest.inject_with_retry(call).await?)
+            let result = guest.inject_with_retry(call).await;
+            (result.map_err(Into::into), ValidatedSet::NotValidated)
         }
     }
 
@@ -543,39 +1621,406 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let dettid = guest.thread_state().dettid;
 
-        let maybe_timeout = if let Some(timeout) = call.timeout() {
+        let ns_delta = if let Some(timeout) = call.timeout() {
             let ts: Timespec = guest.memory().read_value(timeout)?;
-            let ns_delta =
-                Duration::from_secs(ts.tv_sec as u64) + Duration::from_nanos(ts.tv_nsec as u64);
-            let base_time = thread_observe_time(guest).await;
-            let target_time = base_time + ns_delta;
-            Some(target_time)
+            Some(Duration::from_secs(ts.tv_sec as u64) + Duration::from_nanos(ts.tv_nsec as u64))
         } else {
             None
         };
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("rt_sigtimedwait");
-        retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout).await
+        // While it polls, a signal in the set is taken at the next poll
+        // whatever the thread's mask, which a process-directed signal another
+        // thread sends must account for
+        // (`Scheduler::own_process_signal_inputs`). An unreadable set fails in
+        // the kernel at the first poll.
+        let waited = match call.set() {
+            Some(set) => match read_kernel_sigset(guest, set.into()).await {
+                Err(error @ Error::Errno(Errno::ERESTARTSYS)) => {
+                    return restart_if_first_probe_not_run(Err(error));
+                }
+                read => read.ok(),
+            },
+            None => None,
+        };
+        // After the set's probe, the call's first injection: observing the
+        // virtual clock asks the scheduler, which a restart would repeat.
+        let maybe_timeout = match ns_delta {
+            Some(ns_delta) => Some(thread_observe_time(guest).await + ns_delta),
+            None => None,
+        };
+        if waited.is_some() {
+            set_sigtimedwait_set(guest, waited).await;
+        }
+        // Linux writes the siginfo only for a signal it returns. A dropped
+        // copy's siginfo is replaced by what the buffer held before.
+        let records = crate::scheduler::discarded_at_send::records(guest.config());
+        let before = match call.info() {
+            Some(info) if self.cfg.backend.reports_child_exit_publication || records => {
+                Some(read_mapped_prefix(guest, info.as_raw(), 128))
+            }
+            _ => None,
+        };
+        let result = loop {
+            let result =
+                retry_nonblocking_syscall_with_timeout(guest, call, rsrc.clone(), maybe_timeout)
+                    .await;
+            // A consumed child-exit copy that the notification ledger drops
+            // is not returned: the wait goes on, to the same deadline.
+            let stands = self
+                .synchronous_sigchld_stands(guest, call, waited, &result)
+                .await;
+            // Nor is a copy Linux discarded when it was sent, which Linux never
+            // dequeues (https://github.com/rrnewton/hermit/issues/4293). The
+            // take went into the guest's own buffer, so the kernel made the
+            // copy-out with its own partial-write and EFAULT rules for a kept
+            // copy; for a dropped one, the bytes it changed are put back.
+            let outcome = if records {
+                self.take_outcome_of(guest, waited, &result).await
+            } else {
+                crate::scheduler::posix_timer_coalesce::TakeOutcome {
+                    skip: false,
+                    rewrite: None,
+                }
+            };
+            if stands && !outcome.skip {
+                // A POSIX timer's entry, or a kept signal standing on another
+                // sender's record, is returned with its own siginfo
+                // (<https://github.com/rrnewton/hermit/issues/4262>); the
+                // kernel's copy-out succeeded, so the buffer is writable.
+                if let (Ok(_), Some(info), Some(rewrite)) = (&result, call.info(), outcome.rewrite)
+                    && guest
+                        .memory()
+                        .write_value(info.cast::<[u8; 128]>(), &rewrite.to_user())
+                        .is_err()
+                {
+                    tracing::warn!(
+                        "[dtid {}] rt_sigtimedwait's siginfo keeps the physical record",
+                        guest.thread_state().dettid
+                    );
+                }
+                break result;
+            }
+            if let (Some(info), Some(bytes)) = (call.info(), before.as_ref()) {
+                restore_changed_bytes(guest, info, bytes);
+            }
+        };
+        if waited.is_some() {
+            set_sigtimedwait_set(guest, None).await;
+        }
+        // O2: any completion of a wait for SIGALRM may have dequeued the
+        // process's ITIMER_REAL copy, including one that then failed copying
+        // out the siginfo (https://github.com/rrnewton/hermit/issues/4139).
+        if waited.is_some_and(|set| {
+            set & crate::syscalls::threads::kernel_sigset_bit(libc::SIGALRM) != 0
+        }) {
+            crate::tool_global::reconcile_alarm(guest).await;
+        }
+        result
+    }
+
+    /// What to do with the take that ended this thread's `rt_sigtimedwait`
+    /// for the signals `waited` with `result` (`take_outcome`, from the
+    /// queues read after it; for an EFAULT, which names no signal,
+    /// `DiscardedSignalControl::TakeFaulted`).
+    async fn take_outcome_of<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        waited: Option<u64>,
+        result: &Result<i64, Error>,
+    ) -> crate::scheduler::posix_timer_coalesce::TakeOutcome {
+        use crate::scheduler::posix_timer_coalesce::TakeOutcome;
+        let skip = |skip| TakeOutcome {
+            skip,
+            rewrite: None,
+        };
+        match result {
+            Ok(signal) if (1..32).contains(&(*signal as i32)) => {
+                let after =
+                    crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
+                        .ok()
+                        .map(|state| (state.thread_pending, state.shared_pending));
+                crate::syscalls::helpers::take_outcome(guest, *signal as i32, after).await
+            }
+            Err(Error::Errno(Errno::EFAULT)) => {
+                let Some(set) = waited else {
+                    return skip(false);
+                };
+                let Ok(state) =
+                    crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
+                else {
+                    return skip(false);
+                };
+                let at = guest.thread_state().thread_logical_time.as_nanos();
+                skip(matches!(
+                    crate::tool_global::discarded_signal(
+                        guest,
+                        DiscardedSignalControl::TakeFaulted {
+                            set,
+                            thread_pending: state.thread_pending,
+                            shared_pending: state.shared_pending,
+                            at,
+                        },
+                    )
+                    .await,
+                    DiscardedSignalAnswer::Discarded(true)
+                ))
+            }
+            _ => skip(false),
+        }
+    }
+
+    /// The `signalfd_siginfo` records a successful signalfd `read` returned,
+    /// `len` bytes at `buf`, reconciled with the child-exit ledger
+    /// (`reconcile_signalfd_extents`). Returns the bytes kept, or `None` to
+    /// refuse.
+    pub(crate) async fn reconcile_signalfd_records<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        buf: AddrMut<'_, u8>,
+        len: usize,
+        before: &[u8],
+    ) -> Option<usize> {
+        self.reconcile_signalfd_extents(guest, &[(buf.as_raw(), len)], len, before)
+            .await
+    }
+
+    /// The `signalfd_siginfo` records a successful signalfd read returned:
+    /// the first `read` bytes of the guest buffers `extents` (address,
+    /// length), in order, as `read`, `readv`, `preadv` and `preadv2` scatter
+    /// them. They are reconciled with the child-exit ledger as a SIGCHLD
+    /// delivered to a handler (`Detcore::child_exit_sigchld_delivers`) or
+    /// consumed by `rt_sigtimedwait` (`synchronous_sigchld_stands`) is: the
+    /// scheduler's copy gets the siginfo Linux gives the parent, the kernel's
+    /// coalesced copy for a SIGKILL cohort names the cohort's lowest pid, and
+    /// a copy for an exit a SIGCHLD already stood for is dropped. Other
+    /// records are kept as read. The kept records are scattered back over the
+    /// same extents, in order, with the bytes the buffer held before the read
+    /// (`before`) over the bytes of dropped ones. Returns the bytes kept, a
+    /// whole number of records, or `None` when a record is dropped whose bytes
+    /// `before` does not cover, which the caller refuses
+    /// (`refuse_unrestorable_signalfd_record`).
+    pub(crate) async fn reconcile_signalfd_extents<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        extents: &[(usize, usize)],
+        read: usize,
+        before: &[u8],
+    ) -> Option<usize> {
+        let len = read - read % SIGNALFD_RECORD;
+        let pieces = signalfd_extent_pieces(extents, len);
+        let mut bytes = Vec::with_capacity(len);
+        for (address, length) in &pieces {
+            let mut piece = vec![0u8; *length];
+            let Some(address_mut) = AddrMut::<u8>::from_raw(*address) else {
+                return Some(len);
+            };
+            if guest.memory().read_exact(address_mut, &mut piece).is_err() {
+                use std::os::unix::fs::FileExt;
+                let read = std::fs::File::open(format!("/proc/{}/mem", guest.tid().as_raw()))
+                    .and_then(|mem| mem.read_exact_at(&mut piece, *address as u64));
+                if read.is_err() {
+                    // The kernel has just written these bytes, so the buffer
+                    // is mapped and writable; `/proc/<tid>/mem` reads any
+                    // such page.
+                    return Some(len);
+                }
+            }
+            bytes.extend_from_slice(&piece);
+        }
+        let controls = signalfd_record_controls(&bytes, std::process::id());
+        let mut answers = Vec::with_capacity(controls.len());
+        for control in controls {
+            answers.push(match control {
+                Some(control) => Some(crate::tool_global::child_exit_sigchld(guest, control).await),
+                None => None,
+            });
+        }
+        // A record of a copy Linux discarded when it was sent is dropped, as a
+        // duplicate is: the guest never sees it
+        // (`crate::syscalls::helpers::take_was_discarded`,
+        // <https://github.com/rrnewton/hermit/issues/4293>).
+        // A POSIX timer's entry, or a kept signal standing on another
+        // sender's record, gets its own record in place of the kernel's
+        // (<https://github.com/rrnewton/hermit/issues/4262>), and a stale
+        // timer entry is dropped as a discarded copy is.
+        if crate::scheduler::discarded_at_send::records(guest.config()) {
+            for (record, answer) in bytes.chunks_mut(SIGNALFD_RECORD).zip(answers.iter_mut()) {
+                let signal = signalfd_field(record, 0) as i32;
+                if !(1..32).contains(&signal) {
+                    continue;
+                }
+                let outcome = crate::syscalls::helpers::take_outcome(guest, signal, None).await;
+                if outcome.skip {
+                    *answer = Some(
+                        crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer::Claimed(true),
+                    );
+                } else if let Some(rewrite) = outcome.rewrite {
+                    record.copy_from_slice(&crate::scheduler::signal_lists::signalfd_record(
+                        &rewrite,
+                    ));
+                }
+            }
+        }
+        let rewritten = match apply_signalfd_answers(&bytes, &answers, before) {
+            Ok(Some(rewritten)) => rewritten,
+            Ok(None) => return Some(len),
+            Err(()) => return None,
+        };
+        let mut offset = 0;
+        for (address, length) in &pieces {
+            let written = AddrMut::<u8>::from_raw(*address).map(|address| {
+                guest
+                    .memory()
+                    .write_exact(address, &rewritten.bytes[offset..offset + length])
+            });
+            if !matches!(written, Some(Ok(()))) {
+                tracing::warn!(
+                    "[dtid {}] the signalfd records at {:#x} keep the kernel's siginfo",
+                    guest.thread_state().dettid,
+                    address,
+                );
+                return Some(len);
+            }
+            offset += length;
+        }
+        Some(rewritten.kept)
+    }
+
+    /// A child-exit SIGCHLD that a synchronous wait consumed goes through the
+    /// same notification ledger as one delivered to a handler
+    /// (`Detcore::child_exit_sigchld_delivers`), on a backend where both the
+    /// kernel and the scheduler send it (`scheduler::child_exit_sigchld`).
+    /// The scheduler's copy is returned with the siginfo Linux gives the
+    /// parent, and a copy for an exit that a SIGCHLD already stood for is
+    /// dropped. Returns whether the consumed signal stands.
+    async fn synchronous_sigchld_stands<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigtimedwait,
+        waited: Option<u64>,
+        result: &Result<i64, Error>,
+    ) -> bool {
+        if !self.cfg.backend.reports_child_exit_publication {
+            return true;
+        }
+        // Linux copies the set in before it dequeues, and the siginfo out
+        // after, so an EFAULT with a readable set (`waited`) took a signal it
+        // never reports; an unreadable set dequeued nothing. Which copy it
+        // took: a recorded private one if SIGCHLD is gone from the thread's
+        // private queue, which only committed guest sends fill; otherwise,
+        // with SIGCHLD the only signal in the set, the shared queue's. A wider
+        // set falls back to the shared queue's pending bit (the Claude and
+        // Codex re-checks of https://github.com/rrnewton/hermit/pull/4131).
+        if matches!(result, Err(Error::Errno(Errno::EFAULT)))
+            && guest.config().sequentialize_threads
+            && let Some(set) = waited
+        {
+            let sigchld = kernel_sigset_bit(libc::SIGCHLD);
+            if set & sigchld != 0
+                && let Ok(state) = crate::syscalls::threads::read_thread_wait_signal_state(
+                    guest.pid(),
+                    guest.tid(),
+                )
+            {
+                let shared_pending = if set & !sigchld == 0 {
+                    false
+                } else {
+                    state.shared_pending & sigchld != 0
+                };
+                crate::tool_global::child_exit_sigchld(
+                    guest,
+                    crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::WaitFaulted {
+                        private_pending: state.thread_pending & sigchld != 0,
+                        shared_pending,
+                    },
+                )
+                .await;
+            }
+            return true;
+        }
+        if !matches!(result, Ok(signal) if *signal == libc::SIGCHLD as i64) {
+            return true;
+        }
+        // Without a siginfo buffer the guest sees only the signal number,
+        // which every copy shares; the ledger still learns that the wait took
+        // one (`DequeuedCopy::Unknown`), which may be the shared queue's.
+        let Some(info) = call.info().map(AddrMut::cast::<GuestSiginfo>) else {
+            crate::tool_global::child_exit_sigchld(
+                guest,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::Dequeue {
+                    copy: crate::scheduler::child_exit_sigchld::DequeuedCopy::Unknown,
+                    admits: false,
+                },
+            )
+            .await;
+            return true;
+        };
+        let Some(bytes) = read_siginfo(guest, info.cast()) else {
+            return true;
+        };
+        Self::synchronous_sigchld_copy_stands(guest, info, &bytes).await
+    }
+
+    /// The child-exit ledger's answer for the `SIGCHLD` with siginfo `bytes`
+    /// that `rt_sigtimedwait` returned into `info`
+    /// (`synchronous_sigchld_stands`).
+    async fn synchronous_sigchld_copy_stands<G: Guest<Self>>(
+        guest: &mut G,
+        info: AddrMut<'_, GuestSiginfo>,
+        bytes: &[u8; 128],
+    ) -> bool {
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use crate::scheduler::child_exit_sigchld::OwnCopy;
+        // Taken by the wait, a kept copy makes no `InboundSignal` request.
+        let Some(control) =
+            crate::scheduler::child_exit_sigchld::control_for(bytes, std::process::id(), false)
+        else {
+            return true;
+        };
+        match crate::tool_global::child_exit_sigchld(guest, control).await {
+            ChildExitSigchldAnswer::Claimed(dropped) => !dropped,
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate) => false,
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
+            | ChildExitSigchldAnswer::ClaimedFor(own) => {
+                if let Err(error) = guest
+                    .memory()
+                    .write_value(info.cast::<[u8; 128]>(), &own.to_bytes())
+                {
+                    tracing::warn!(
+                        "[dtid {}] the SIGCHLD for child {} keeps its siginfo: {}",
+                        guest.thread_state().dettid,
+                        own.pid,
+                        error
+                    );
+                }
+                true
+            }
+            _ => true,
+        }
     }
 
     /// Fence an exact self-SIGKILL at the scheduler-selected syscall turn.
     ///
-    /// KVM commits this syscall as an immediate, nonreturning process exit. It
-    /// therefore has no later return boundary at which the ordinary pending
-    /// signal path could acquire a delivery permit. Without this preflight, the
-    /// backend's terminal child callback arrives with no generation-bound
-    /// reservation and must fail closed. `ResourceID::Exit` is the same fence
-    /// used by `exit_group`; the KVM-only configuration guard avoids changing
-    /// ptrace, DBT, or non-sequential execution.
-    async fn reserve_kvm_self_sigkill_exit<G: Guest<Self>>(
+    /// This applies only when Detcore holds the backend's process signal
+    /// control (`BackendSignalControlMode::ToolControlled`). A backend that
+    /// installed that control commits this syscall as an immediate,
+    /// nonreturning process exit. It therefore has no later return boundary at
+    /// which the ordinary pending signal path could acquire a delivery permit.
+    /// Without this preflight, the backend's terminal child callback arrives
+    /// with no generation-bound reservation and must fail closed.
+    /// `ResourceID::Exit` is the same fence used by `exit_group`. A run without
+    /// the installed control (`Unchanged`, including every non-sequentialized
+    /// run) keeps its ordinary signal path and reserves nothing.
+    pub(crate) async fn reserve_controlled_self_sigkill_exit<G: Guest<Self>>(
         &self,
         guest: &mut G,
         signal: libc::c_int,
         target_process: Option<DetPid>,
         target_thread: Option<DetTid>,
     ) -> bool {
-        if !self.cfg.kvm_shared_dequeue_timers {
+        if guest.signal_control_mode() != reverie::BackendSignalControlMode::ToolControlled {
             return false;
         }
         let (current_thread, mm) = {
@@ -603,6 +2048,49 @@ impl<T: RecordOrReplay> Detcore<T> {
         true
     }
 
+    /// A backend that cannot deliver a guest's signal (the KVM backend, to
+    /// another process for example) refuses it with ENOSYS and the typed
+    /// refusal `UnsupportedOperation::Signal`. Report that refusal by name and
+    /// route it through the unsupported-operation policy, instead of handing
+    /// the guest the backend's bare ENOSYS, which left a waiting parent
+    /// deadlocked. The name goes to tracing and directly to stderr in both
+    /// dispositions, so neither --log=off nor --log-file hides it. Callers pass
+    /// the handler's result right after the injection that may have been
+    /// refused: the next injection replaces the backend's record. Every other
+    /// result passes through unchanged. No backend is named here; a backend
+    /// that records no refusal is unaffected.
+    pub(crate) async fn report_backend_signal_refusal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        result: Result<i64, Error>,
+    ) -> Result<i64, Error> {
+        if !matches!(result, Err(Error::Errno(Errno::ENOSYS))) {
+            return result;
+        }
+        let Some(refusal) = guest
+            .take_unsupported_refusal()
+            .filter(|refusal| refusal.operation == reverie::UnsupportedOperation::Signal)
+        else {
+            return result;
+        };
+        let message = format!(
+            "[dtid {}] {sysno} refused by the backend: {}. No signal was sent.",
+            guest.thread_state().dettid,
+            refusal.diagnostic
+        );
+        tracing::error!("{message}");
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("hermit: {message}\n"),
+        );
+        if !self.cfg.panic_on_unsupported_syscalls {
+            crate::tool_global::report_unsupported_syscall(guest, sysno).await;
+        }
+        self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+            .await
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     // TODO-HUMAN-REVIEW(PR-1058): Review process-pending signal preservation.
@@ -619,53 +2107,789 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Kill,
     ) -> Result<i64, Error> {
+        // A group send (pid 0 or below) is not a target here: the paths below
+        // refuse it (`refuse_group_signal`) unless it is a SIGKILL.
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::kill,
+                call.sig(),
+                ReservedSendTarget::Process(call.pid()),
+                ReservedSendSiginfo::None,
+            )
+            .await
+        {
+            return refused;
+        }
+        self.record_orphaned_group_signals(guest, call.sig()).await;
+        // A thread below the container's PID namespace names pids of its own
+        // namespace, where none of Hermit's tasks is visible
+        // (https://github.com/rrnewton/hermit/issues/4155).
+        let nested = guest.thread_state().nested_pid_namespace;
         if !guest.config().sequentialize_threads {
+            // Without sequentialization every other kill goes to the kernel as
+            // is, but never one to a process group or to every process: the
+            // guest's process group is inherited from Hermit's, so it can hold
+            // Hermit and the user's shell or test runner, which a group kill
+            // would reach (https://github.com/rrnewton/hermit/issues/4057).
+            // Signal 0 sends nothing, and INT_MIN is ESRCH before any lookup.
+            if call.sig() != 0 && call.pid() <= 0 && call.pid() != libc::pid_t::MIN {
+                return self
+                    .refuse_group_signal(guest, call.pid(), call.sig())
+                    .await;
+            }
+            if !nested
+                && self
+                    .drop_signal_to_hermit(guest, Sysno::kill, None, call.pid(), call.sig())
+                    .await
+            {
+                return Ok(0);
+            }
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
-        if call.sig() == 0 {
+        // A nested caller's process-group ids are its namespace's, which
+        // Detcore does not translate yet; a SIGKILL to one would otherwise be
+        // reserved for the container's group of that number.
+        if nested && call.pid() <= 0 && call.pid() != libc::pid_t::MIN && call.sig() != 0 {
+            return self
+                .refuse_group_signal(guest, call.pid(), call.sig())
+                .await;
+        }
+        let (named, own_init_caught) = if call.pid() > 0 {
+            match self.name_guest_pid(guest, Sysno::kill, call.pid()).await {
+                NamedGuestPid::Task {
+                    task,
+                    own_init_caught,
+                } => (task.as_raw(), own_init_caught),
+                NamedGuestPid::Answer(answer) => return answer,
+            }
+        } else {
+            (call.pid(), None)
+        };
+        if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
+            let task = DetTid::from_raw(named);
+            return self
+                .send_to_own_init(guest, call, task, QueueId::Process(task), call.sig())
+                .await;
+        }
+
+        // Linux's `kill_something_info` answers ESRCH for pid INT_MIN before
+        // anything else ("-INT_MIN is undefined"), so the kernel's answer is
+        // deterministic and sends nothing; negating it here would overflow
+        // (https://github.com/rrnewton/hermit/issues/4046).
+        if call.sig() == 0 && call.pid() > 0 {
+            // An existence check answers from the same model as a signal, so
+            // that one pid never answers 0 to one and ESRCH to the other: a
+            // process with no live threads is a zombie (0) or gone (ESRCH)
+            // whenever Detcore saw it exit, whatever the host has reaped by
+            // now (https://github.com/rrnewton/hermit/issues/4091).
+            let (targets, zombie) =
+                resolve_kill_targets_and_exit(guest, DetPid::from_raw(named)).await;
+            if targets.is_empty() {
+                match zombie {
+                    Some(true) => return Ok(0),
+                    Some(false) => return Err(Errno::ESRCH.into()),
+                    None => {}
+                }
+            }
+        }
+        if call.sig() == 0 || call.pid() == libc::pid_t::MIN {
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
-        let tgid = call.pid();
+        let tgid = named;
+        // A process-group or broadcast SIGALRM is refused by name below. The
+        // scheduler resolves a thread id to its process itself.
+        if call.sig() == libc::SIGALRM && tgid > 0 {
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tgid))).await?;
+        }
+        if self
+            .drop_signal_to_hermit(guest, Sysno::kill, None, tgid, call.sig())
+            .await
+        {
+            return Ok(0);
+        }
         if can_forward_process_group_signal(
             tgid,
             call.sig(),
             guest
                 .config()
-                .backend_requires_thread_directed_process_signals,
+                .backend
+                .requires_thread_directed_process_signals,
         ) {
+            // The scheduler is not told about each killed process, but it must
+            // know the group was killed: a held process in it will die, so a
+            // wait for it is not part of a deadlock
+            // (https://github.com/rrnewton/hermit/issues/3904). Told before
+            // the kill, inside this committed turn: the sender may be in the
+            // group and die before the call returns. A kill that then fails
+            // only suppresses a deadlock report, which is the safe direction.
+            // `kill(INT_MIN)` names no group; Linux refuses it with ESRCH.
+            let group = tgid.checked_neg().map(DetPid::from_raw);
+            if group.is_some() {
+                crate::tool_global::notify_unresolved_sigkill(guest, group).await;
+            }
+            // Every member is retired at this turn
+            // (https://github.com/rrnewton/hermit/issues/3994).
+            if guest.config().sequentialize_threads
+                && let Some(group) = group
+                && let Some(reservation) = reserve_sigkill_group(guest, group).await
+            {
+                return self.send_reserved_sigkill(guest, reservation, call).await;
+            }
             return Ok(self.record_or_replay(guest, call).await?);
         }
         if tgid <= 0 {
-            return Err(Errno::ENOSYS.into());
+            return self.refuse_group_signal(guest, tgid, call.sig()).await;
         }
+        // A kill may name the process by any of its live threads' ids (Linux's
+        // kill_pid_info looks the id up as a task); everything below that acts
+        // on the process uses its leader
+        // (https://github.com/rrnewton/hermit/issues/4094).
+        let process = signal_target_process(guest, DetPid::from_raw(tgid))
+            .await
+            .map_or(tgid, |process| process.as_raw());
         // Exact self-SIGKILL is group-fatal, so it has no recipient-selection
         // ambiguity even when the process has several live threads. Reserve it
         // before the generic process-signal path rejects that thread set.
         if self
-            .reserve_kvm_self_sigkill_exit(guest, call.sig(), Some(DetPid::from_raw(tgid)), None)
+            .reserve_controlled_self_sigkill_exit(
+                guest,
+                call.sig(),
+                Some(DetPid::from_raw(process)),
+                None,
+            )
             .await
         {
             return Ok(self.record_or_replay(guest, call).await?);
         }
-        let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
-        let tid = deterministic_kill_target(&targets, call.sig())?;
+        // A SIGKILL to another process retires every thread of it at this
+        // turn (https://github.com/rrnewton/hermit/issues/3994). It needs no
+        // recipient, so a multithreaded target is accepted.
+        if call.sig() == libc::SIGKILL
+            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tgid)).await
+        {
+            return self.send_reserved_sigkill(guest, reservation, call).await;
+        }
+        match self
+            .own_process_signal(guest, Sysno::kill, tgid, process, call.sig())
+            .await?
+        {
+            OwnProcessSend::Admitted => {
+                return self
+                    .forward_own_process_signal(guest, call.sig(), call, DetTid::from_raw(tgid))
+                    .await;
+            }
+            OwnProcessSend::Refused(answer) => return answer,
+            OwnProcessSend::NotOwn => {}
+        }
+        let Some(tid) = self
+            .process_signal_target(guest, Sysno::kill, DetPid::from_raw(process), call.sig())
+            .await?
+        else {
+            // A zombie: exited, and its parent can still wait for it. Linux's
+            // kill_pid_info still finds it and the send succeeds, discarding
+            // the signal, so answer 0 without a system call: the host process
+            // may already be gone if a backend reaped it, and the logical
+            // answer must not depend on when
+            // (https://github.com/rrnewton/hermit/issues/4091). Linux checks
+            // the signal number after finding the task, so an invalid one is
+            // EINVAL.
+            if !(1..=libc::SIGRTMAX()).contains(&call.sig()) {
+                return Err(Errno::EINVAL.into());
+            }
+            return Ok(0);
+        };
         let value = if !guest
             .config()
-            .backend_requires_thread_directed_process_signals
+            .backend
+            .requires_thread_directed_process_signals
         {
-            self.record_or_replay(guest, call).await?
+            self.send_guest_signal(
+                guest,
+                call,
+                tid,
+                call.sig(),
+                Some(DetPid::from_raw(process)),
+                false,
+                DetTid::from_raw(tgid),
+            )
+            .await?
+        } else if process == self.detpid.as_raw()
+            && tid == guest.thread_state().dettid
+            && (1..=libc::SIGRTMAX()).contains(&call.sig())
+        {
+            // This backend must name the receiving thread, but an original
+            // process-directed kill still carries SI_USER, not tgkill's
+            // SI_TKILL. For the current task Linux accepts an explicit SI_USER
+            // payload. Keep the sender in the same deterministic PID namespace
+            // as getpid; obtain its real UID from this actual task, not a host
+            // lookup using the deterministic PID. Other tasks cannot accept
+            // caller-supplied SI_USER and retain the existing tgkill route.
+            let uid = guest.inject_with_retry(syscalls::Getuid::new()).await? as u32;
+            let mut info = [0_u8; 128];
+            info[0..4].copy_from_slice(&call.sig().to_ne_bytes());
+            info[8..12].copy_from_slice(&libc::SI_USER.to_ne_bytes());
+            // Linux x86-64 siginfo's sender union follows three ints and
+            // alignment padding: pid_t at 16, uid_t at 20.
+            info[16..20].copy_from_slice(&self.detpid.as_raw().to_ne_bytes());
+            info[20..24].copy_from_slice(&uid.to_ne_bytes());
+            let mut stack = guest.stack().await;
+            let info = stack.push(info);
+            let _stack_guard = stack.commit()?;
+            let targeted = syscalls::RtTgsigqueueinfo::new()
+                .with_tgid(process)
+                .with_tid(tid.as_raw())
+                .with_sig(call.sig())
+                // The syscall wrapper uses AddrMut, but Linux only reads this
+                // private siginfo. Its committed storage outlives the send.
+                .with_siginfo(Some(unsafe { info.cast().into_mut() }));
+            // A process-directed kill: Linux classifies the send against
+            // the leader (https://github.com/rrnewton/hermit/issues/4293).
+            self.send_guest_signal(
+                guest,
+                targeted,
+                tid,
+                call.sig(),
+                Some(DetPid::from_raw(process)),
+                false,
+                DetTid::from_raw(tgid),
+            )
+            .await?
         } else {
             let targeted = syscalls::Tgkill::new()
-                .with_tgid(tgid)
+                .with_tgid(process)
                 .with_tid(tid.as_raw())
                 .with_sig(call.sig());
-            self.record_or_replay(guest, targeted).await?
+            self.send_guest_signal(
+                guest,
+                targeted,
+                tid,
+                call.sig(),
+                Some(DetPid::from_raw(process)),
+                false,
+                DetTid::from_raw(tgid),
+            )
+            .await?
         };
-        self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(tgid)))
-            .await;
+        self.notify_cross_task_signal(
+            guest,
+            tid,
+            call.sig(),
+            Some(DetPid::from_raw(process)),
+            crate::tool_global::SignalScope::Process,
+        )
+        .await;
         Ok(value)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4046)
+    /// Refuse by name a `kill` to a process group (`pid` 0 for the caller's own,
+    /// `-pgid` for another) or to every process it may signal (`pid` -1).
+    ///
+    /// Linux sends the signal to each process in the set
+    /// (`__kill_pgrp_info`, `kill_something_info` in kernel/signal.c), and each
+    /// process then picks its receiving thread as a process-directed signal
+    /// does. Detcore models neither the set's membership nor that choice, so
+    /// the call goes through the unsupported-operation policy: a fail-closed
+    /// run stops with the policy-refusal status and
+    /// `--allow-unsupported-syscalls` returns ENOSYS, as the call did before.
+    /// A SIGKILL to another group is forwarded before this point
+    /// (`can_forward_process_group_signal`) when threads are sequentialized,
+    /// except on a backend that needs thread-directed process signals (DBT),
+    /// where it is refused here too. Without sequentialization every such kill
+    /// is refused here, for host safety: the guest's process group is
+    /// inherited from Hermit's (https://github.com/rrnewton/hermit/issues/4057).
+    async fn refuse_group_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        pid: libc::pid_t,
+        sig: libc::c_int,
+    ) -> Result<i64, Error> {
+        let target = match pid {
+            0 => "its own process group".to_owned(),
+            -1 => "every process it may signal".to_owned(),
+            pid => format!("process group {}", pid.unsigned_abs()),
+        };
+        let reason = if guest.config().sequentialize_threads {
+            "Detcore does not model process-group membership or each process's receiving \
+             thread (https://github.com/rrnewton/hermit/issues/4046)"
+        } else {
+            "with threads not sequentialized (--no-sequentialize-threads, --strace-only) it \
+             would go to the host kernel as is, and the guest's process group is inherited from \
+             Hermit's, so it can reach Hermit and the processes that started it \
+             (https://github.com/rrnewton/hermit/issues/4057)"
+        };
+        tracing::error!(
+            "[detcore, dtid {}] signal {} to {} by kill is not supported: {}",
+            guest.thread_state().dettid,
+            sig,
+            target,
+            reason,
+        );
+        self.refuse_unserviceable_operation(guest, Sysno::kill, Errno::ENOSYS)
+            .await
+    }
+
+    /// Decide a process-directed `sig` that the calling thread sends by `sysno`
+    /// to `pid` when `pid` names its own process (`process`, the process that
+    /// `pid` names: any of its live threads' ids names it), and the process
+    /// has another live thread (https://github.com/rrnewton/hermit/issues/4034).
+    /// Only where the kernel's signal state for a guest thread is the guest's
+    /// own (`BackendCapabilities::kernel_signal_state_is_guests`: ptrace and
+    /// e9patch): the decision reads each thread's blocked, pending, ignored
+    /// and caught sets from the kernel, and Detcore reads every other input
+    /// from the schedule.
+    async fn own_process_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        pid: libc::pid_t,
+        process: libc::pid_t,
+        sig: libc::c_int,
+    ) -> Result<OwnProcessSend, Error> {
+        if !guest.config().backend.kernel_signal_state_is_guests {
+            return Ok(OwnProcessSend::NotOwn);
+        }
+        let sender = guest.thread_state().dettid;
+        if process != self.detpid.as_raw() {
+            return Ok(OwnProcessSend::NotOwn);
+        }
+        // Linux prefers the thread `pid` names when it takes the signal; a
+        // sibling's id, like the process's, leaves the sender as the receiver
+        // only when every sibling blocks it.
+        let names_sender = pid == sender.as_raw();
+        let inputs = own_process_signal_inputs(guest).await;
+        if inputs
+            .siblings
+            .iter()
+            .all(|(_, state)| *state == SiblingSignalState::ExitGranted)
+        {
+            return Ok(OwnProcessSend::NotOwn);
+        }
+        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let send = OwnProcessSignal {
+            sig,
+            names_sender,
+            blocked: state.blocked,
+            thread_pending: state.thread_pending,
+            ignored: state.ignored,
+            caught: state.caught,
+            inputs,
+            record_replay: self.cfg.recordreplay_modes,
+            schedule_replay: self.cfg.replay_schedule_from.is_some(),
+            stacktrace_signal: self.cfg.stacktrace_signal.is_some(),
+            posthook_anchor: !guest.thread_state().stats.hb_pending_posthook.is_empty(),
+            signalfd: guest.thread_state().holds_a_signalfd(),
+        };
+        tracing::debug!(
+            "[detcore, dtid {}] signal {} to its own process: {:?}",
+            sender,
+            sig,
+            send
+        );
+        let Some(refusal) = own_process_signal_refusal(&send) else {
+            return Ok(OwnProcessSend::Admitted);
+        };
+        tracing::error!(
+            "[detcore, dtid {}] process-directed signal {} to process {} by {} is not supported: \
+             {} (https://github.com/rrnewton/hermit/issues/4034)",
+            sender,
+            sig,
+            self.detpid,
+            sysno,
+            refusal,
+        );
+        Ok(OwnProcessSend::Refused(
+            self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+                .await,
+        ))
+    }
+
+    /// Forward an admitted process-directed signal to the sender's own process
+    /// unchanged, holding the sender's turn until it takes the signal
+    /// (`own_signal_turn_hold`). A call the kernel fails sends nothing and
+    /// holds nothing.
+    async fn forward_own_process_signal<G: Guest<Self>, C>(
+        &self,
+        guest: &mut G,
+        sig: libc::c_int,
+        call: C,
+        named: DetTid,
+    ) -> Result<i64, Error>
+    where
+        C: Into<syscalls::Syscall>,
+        syscalls::Syscall: From<C>,
+    {
+        let token = self
+            .discard_pre_send(guest, named, QueueId::Process(self.detpid), sig)
+            .await;
+        let call: syscalls::Syscall = call.into();
+        let siginfo = sent_siginfo(guest, &call, sig);
+        guest.thread_state_mut().own_signal_turn_hold = Some(sig);
+        let result = self.record_or_replay(guest, call).await;
+        if result.is_err() {
+            guest.thread_state_mut().own_signal_turn_hold = None;
+        } else {
+            self.discard_sent(guest, token, siginfo).await;
+        }
+        Ok(result?)
+    }
+
+    /// Forward a signal to a task of the caller's own PID namespace's init
+    /// that the kernel drops (`own_namespace_init_drops`), recording, around
+    /// the send, the copy that ptrace still queues (`discard_pre_send`).
+    async fn send_to_own_init<G: Guest<Self>, C>(
+        &self,
+        guest: &mut G,
+        call: C,
+        named: DetTid,
+        queue: QueueId,
+        sig: libc::c_int,
+    ) -> Result<i64, Error>
+    where
+        C: Into<syscalls::Syscall>,
+        syscalls::Syscall: From<C>,
+    {
+        let token = self.discard_pre_send(guest, named, queue, sig).await;
+        let call: syscalls::Syscall = call.into();
+        let siginfo = sent_siginfo(guest, &call, sig);
+        let result = self.record_or_replay(guest, call).await;
+        if result.is_ok() {
+            self.discard_sent(guest, token, siginfo).await;
+        }
+        Ok(result?)
+    }
+
+    /// Classify, in the sender's turn and before the physical send, a guest's
+    /// send of `raw_signal` into `queue` naming `named`, and read the queue
+    /// (`scheduler::discarded_at_send`, <https://github.com/rrnewton/hermit/issues/4293>).
+    /// `None` where Detcore does not sequentialize threads, or for a signal
+    /// the record does not track.
+    pub(crate) async fn discard_pre_send<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        named: DetTid,
+        queue: QueueId,
+        raw_signal: i32,
+    ) -> Option<DiscardToken> {
+        if !crate::scheduler::discarded_at_send::records(guest.config())
+            || !(1..32).contains(&raw_signal)
+        {
+            return None;
+        }
+        match crate::tool_global::discarded_signal(
+            guest,
+            DiscardedSignalControl::PreSend {
+                named,
+                queue,
+                signal: raw_signal,
+            },
+        )
+        .await
+        {
+            DiscardedSignalAnswer::Token(token) => Some(token),
+            _ => None,
+        }
+    }
+
+    /// Record a send `token` classified (`discard_pre_send`) once the send
+    /// succeeded, with the siginfo the receiver sees (`sent_siginfo`).
+    pub(crate) async fn discard_sent<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        token: Option<DiscardToken>,
+        siginfo: Option<KernelSiginfo>,
+    ) {
+        if let Some(token) = token {
+            crate::tool_global::discarded_signal(
+                guest,
+                DiscardedSignalControl::Sent(token, siginfo),
+            )
+            .await;
+        }
+    }
+
+    /// What an `rt_sigqueueinfo` whose `siginfo_t` Hermit may not be able to
+    /// read comes to, decided before admission (`do_rt_sigqueueinfo` in
+    /// kernel/signal.c). No call that Linux could deliver reaches the kernel
+    /// without admission (Codex re-check 2 of
+    /// https://github.com/rrnewton/hermit/pull/4116).
+    ///
+    /// The kernel always copies the first 48 bytes (`kernel_siginfo_t`) and
+    /// the other 80 only for a `si_code` whose layout it does not know
+    /// (`copy_siginfo_from_user`). Its `copy_from_user` reads what user mode
+    /// can: on x86 a page with any of read, write or execute permission; it
+    /// faults on a `PROT_NONE` page; and a fault in a hole just below a
+    /// grow-down mapping can grow that mapping and succeed. The tracer's own
+    /// reads say nothing about that (`process_vm_readv` refuses a write-only
+    /// page, and `/proc/<tid>/mem` force-reads a `PROT_NONE` one), so the
+    /// mappings of `/proc/<tid>/smaps` decide first:
+    /// - the first byte of the 48 that user mode cannot read lies in a
+    ///   `PROT_NONE` mapping, or in a hole whose next mapping above is not
+    ///   grow-down (`VmFlags` `gd`; only that mapping can grow into it):
+    ///   EFAULT is certain, and Hermit answers it without the kernel;
+    /// - any other byte of the 128 that user mode cannot read (a hole below a
+    ///   grow-down mapping, a tail running into a hole or a `PROT_NONE` page),
+    ///   or a listing that cannot be read: `Unreadable`, refused by name;
+    /// - all 128 user-readable: the tracer reads them (`process_vm_readv`, then
+    ///   `/proc/<tid>/mem` for a write-only page), and a page neither reaches
+    ///   (a `VM_IO`/`VM_PFNMAP` page such as the vDSO's `[vvar]`) is
+    ///   `Unreadable`. A `si_code` only the target thread itself may use
+    ///   (`si_code >= 0` or `SI_TKILL`, from a caller that is not `pid`) is
+    ///   then `KernelFails`: after a complete copy Linux fails it with EPERM,
+    ///   or E2BIG first, and sends nothing, so it goes to the kernel unchanged.
+    fn rt_sigqueueinfo_precheck<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &syscalls::RtSigqueueinfo,
+    ) -> RtSigqueueinfoPrecheck {
+        const SIZE: usize = std::mem::size_of::<libc::siginfo_t>();
+        // `sizeof(kernel_siginfo_t)` on x86_64: the part every copy reads.
+        const KERNEL_SIGINFO: usize = 48;
+        let address = call.siginfo().map_or(0, |address| address.as_raw());
+        let Ok(smaps) = std::fs::read_to_string(format!("/proc/{}/smaps", guest.tid().as_raw()))
+        else {
+            return RtSigqueueinfoPrecheck::Unreadable;
+        };
+        let mappings = parse_smaps(&smaps);
+        match first_user_unreadable(&mappings, address, KERNEL_SIGINFO) {
+            None => {}
+            Some(Unreadable::NoPermission)
+            | Some(Unreadable::Hole {
+                below_growsdown: false,
+            }) => {
+                return RtSigqueueinfoPrecheck::Efault;
+            }
+            Some(Unreadable::Hole {
+                below_growsdown: true,
+            }) => {
+                return RtSigqueueinfoPrecheck::Unreadable;
+            }
+        }
+        if first_user_unreadable(&mappings, address, SIZE).is_some() {
+            return RtSigqueueinfoPrecheck::Unreadable;
+        }
+        let read = call.siginfo().and_then(|info| {
+            guest.memory().read_value(info).ok().or_else(|| {
+                use std::os::unix::fs::FileExt;
+                let mut bytes = [0u8; SIZE];
+                std::fs::File::open(format!("/proc/{}/mem", guest.tid().as_raw()))
+                    .and_then(|mem| mem.read_exact_at(&mut bytes, address as u64))
+                    .ok()?;
+                // SAFETY: `siginfo_t` is plain data, and `bytes` holds exactly
+                // one, read from the guest.
+                Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<libc::siginfo_t>()) })
+            })
+        });
+        let Some(info) = read else {
+            return RtSigqueueinfoPrecheck::Unreadable;
+        };
+        let code = info.si_code;
+        if (code >= 0 || code == libc::SI_TKILL)
+            && guest.thread_state().dettid.as_raw() != call.tgid()
+        {
+            RtSigqueueinfoPrecheck::KernelFails
+        } else {
+            RtSigqueueinfoPrecheck::Proceeds
+        }
+    }
+
+    /// Record, in the sending call's turn and before it reaches the kernel, the
+    /// signals a send of a default-stop signal lets Linux send to an orphaned
+    /// process group later (`orphaned_group_signals`), for every process of
+    /// the container, whatever the target and its disposition and whether the
+    /// send then succeeds: no gated wait ends for them, and a process-directed
+    /// send the sender does not block them for is refused
+    /// (https://github.com/rrnewton/hermit/issues/4034). A send of SIGSTKFLT,
+    /// Reverie's timer marker, is recorded too
+    /// (`Scheduler::record_guest_marker_signal`).
+    pub(crate) async fn record_orphaned_group_signals<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sig: libc::c_int,
+    ) {
+        if sig == libc::SIGSTKFLT {
+            crate::tool_global::record_guest_marker_signal(guest).await;
+        }
+        let signals = orphaned_group_signals(sig);
+        if signals != 0 && guest.config().backend.host_timed_signals_are_physical {
+            record_host_timed_signals(guest, HostTimedSignalScope::Container, signals).await;
+        }
+    }
+
+    /// Whether to drop, answering 0 and sending nothing, a signal `sig` the
+    /// guest addresses to `target` (a pid, or a tid in thread group `tgid` for
+    /// the calls that name one) that is one of Hermit's own tasks: its container
+    /// init, PID 1 of the guest's PID namespace, or another thread of that
+    /// process. A forwarded SIGTERM ended Hermit's run
+    /// (https://github.com/rrnewton/hermit/issues/4066).
+    ///
+    /// This is what Linux does for a signal sent from inside a PID namespace to
+    /// its init when the init has no handler for it: `sig_task_ignored` drops
+    /// it (the init is `SIGNAL_UNKILLABLE`, and a sender in its own namespace
+    /// does not force it), SIGKILL included, and the call returns 0. To the
+    /// guest Hermit is such an init; the handlers Hermit installs are for
+    /// supervisors outside the namespace. Signal 0, an invalid signal number
+    /// and a nonpositive target go to the caller's own path, as do targets
+    /// that are guest tasks ([`crate::tool_global::hermit_task_named`]).
+    /// The task a positive pid the calling thread names refers to. At depth 0
+    /// the pid is the DetTid. In a nested PID namespace it is a pid of that
+    /// namespace, translated through the scheduler's record
+    /// (`scheduler::pid_namespaces`, https://github.com/rrnewton/hermit/issues/4155);
+    /// a pid no task of the namespace has is ESRCH, as Linux's `find_vpid`
+    /// answers. Detcore's own bookkeeping uses the translated task; a call
+    /// forwarded to the kernel keeps the guest's number, which the kernel reads
+    /// in the caller's namespace. On a backend that rewrites a process signal
+    /// into a thread-directed one with Detcore's ids, a nested caller is
+    /// refused by name.
+    async fn name_guest_pid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        pid: libc::pid_t,
+    ) -> NamedGuestPid {
+        if !guest.thread_state().nested_pid_namespace {
+            return NamedGuestPid::Task {
+                task: DetTid::from_raw(pid),
+                own_init_caught: None,
+            };
+        }
+        let refusal = if guest
+            .config()
+            .backend
+            .requires_thread_directed_process_signals
+        {
+            "this backend sends process signals with Detcore's container-namespace ids".to_owned()
+        } else {
+            match crate::tool_global::guest_pid(guest, pid).await {
+                GuestPidAnswer::Task {
+                    task,
+                    own_init_caught,
+                } => {
+                    return NamedGuestPid::Task {
+                        task,
+                        own_init_caught,
+                    };
+                }
+                GuestPidAnswer::NoSuchPid => {
+                    return NamedGuestPid::Answer(Err(Errno::ESRCH.into()));
+                }
+                GuestPidAnswer::Untranslatable(reason) => reason,
+            }
+        };
+        tracing::error!(
+            "[detcore, dtid {}] {} naming pid {} from a nested PID namespace is not supported: {} (https://github.com/rrnewton/hermit/issues/4155)",
+            guest.thread_state().dettid,
+            sysno,
+            pid,
+            refusal,
+        );
+        NamedGuestPid::Answer(
+            self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+                .await,
+        )
+    }
+
+    /// Whether the kernel drops `sig` sent to a task of the caller's own PID
+    /// namespace's init (`own_init_caught`, `name_guest_pid`): Linux drops it
+    /// unless the init has a handler for it, and SIGKILL and SIGSTOP always
+    /// (`SIGNAL_UNKILLABLE`, `sig_task_ignored`). Such a call is forwarded
+    /// unchanged: the kernel makes its own checks (signal number, siginfo),
+    /// then drops the signal and answers 0, and nothing reaches a task, so
+    /// Detcore has nothing to schedule or record.
+    pub(crate) fn own_namespace_init_drops(own_init_caught: Option<u64>, sig: libc::c_int) -> bool {
+        own_init_caught.is_some_and(|caught| {
+            (1..=libc::SIGRTMAX()).contains(&sig)
+                && (sig == libc::SIGKILL
+                    || sig == libc::SIGSTOP
+                    || caught & kernel_sigset_bit(sig) == 0)
+        })
+    }
+
+    async fn drop_signal_to_hermit<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        tgid: Option<libc::pid_t>,
+        target: libc::pid_t,
+        sig: libc::c_int,
+    ) -> bool {
+        if !(1..=libc::SIGRTMAX()).contains(&sig) || target <= 0 {
+            return false;
+        }
+        if !crate::tool_global::names_hermit_task(guest, tgid, target).await {
+            return false;
+        }
+        tracing::info!(
+            "[detcore, dtid {}] {} of signal {} to task {}, one of Hermit's own: dropped and \
+             answered 0, as Linux drops a signal from inside a PID namespace to its init \
+             (https://github.com/rrnewton/hermit/issues/4066)",
+            guest.thread_state().dettid,
+            sysno,
+            sig,
+            target,
+        );
+        true
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4034)
+    /// The thread, of `tgid`'s live `targets`, that a process-directed signal
+    /// `sig` is routed to.
+    ///
+    /// With several live threads the call is refused by name: Linux's
+    /// `complete_signal` (kernel/signal.c) gives the signal to any thread that
+    /// `wants_signal` (one that does not block it, is not exiting and is not
+    /// stopped), which depends on the threads' masks and run states, and Detcore
+    /// does not model that choice. The refusal goes through the
+    /// unsupported-operation policy, so a fail-closed run stops with the
+    /// policy-refusal status and `--allow-unsupported-syscalls` returns ENOSYS.
+    pub(crate) async fn process_signal_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        tgid: DetPid,
+        sig: libc::c_int,
+    ) -> Result<Option<DetTid>, Error> {
+        let (targets, zombie) = resolve_kill_targets_and_exit(guest, tgid).await;
+        // SIGKILL ends the whole thread group whichever thread receives it, so
+        // it needs no recipient choice. On a backend that sends process
+        // signals to a named thread (DBT), whose kill notice retires the
+        // target's whole group (`Scheduler::note_process_sigkill`), send it to
+        // the lowest live thread (https://github.com/rrnewton/hermit/issues/4362).
+        // Elsewhere a SIGKILL to another process is reserved and retired
+        // before this point.
+        if sig == libc::SIGKILL
+            && targets.len() > 1
+            && guest
+                .config()
+                .backend
+                .requires_thread_directed_process_signals
+        {
+            return Ok(targets.first().copied());
+        }
+        match deterministic_kill_target(&targets, zombie, sig) {
+            Err(Errno::ENOSYS) => {
+                tracing::error!(
+                    "[detcore, dtid {}] process-directed signal {} to process {} by {} is not supported: \
+                     the process has {} live threads, and Detcore does not choose the receiving \
+                     thread as Linux's complete_signal does \
+                     (https://github.com/rrnewton/hermit/issues/4034)",
+                    guest.thread_state().dettid,
+                    sig,
+                    tgid,
+                    sysno,
+                    targets.len(),
+                );
+                self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+                    .await
+                    .and(Err(Errno::ENOSYS.into()))
+            }
+            target => Ok(target?),
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -677,21 +2901,117 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tgkill,
     ) -> Result<i64, Error> {
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::tgkill,
+                call.sig(),
+                ReservedSendTarget::Thread {
+                    tgid: Some(call.tgid()),
+                    tid: call.tid(),
+                },
+                ReservedSendSiginfo::None,
+            )
+            .await
+        {
+            return refused;
+        }
+        self.record_orphaned_group_signals(guest, call.sig()).await;
+        // A nested caller names its own namespace's ids; Detcore's model uses
+        // the tasks they name, and the forwarded call keeps them
+        // (https://github.com/rrnewton/hermit/issues/4155). Non-positive ids
+        // are EINVAL in Linux before any lookup.
+        let nested = guest.thread_state().nested_pid_namespace;
+        let (tgid, tid) = if nested && call.tgid() > 0 && call.tid() > 0 {
+            let (tid, own_init_caught) =
+                match self.name_guest_pid(guest, Sysno::tgkill, call.tid()).await {
+                    NamedGuestPid::Task {
+                        task,
+                        own_init_caught,
+                    } => (task, own_init_caught),
+                    NamedGuestPid::Answer(answer) => return answer,
+                };
+            let tgid = match self.name_guest_pid(guest, Sysno::tgkill, call.tgid()).await {
+                NamedGuestPid::Task { task, .. } => task,
+                NamedGuestPid::Answer(answer) => return answer,
+            };
+            if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
+                return self
+                    .send_to_own_init(guest, call, tid, QueueId::Thread(tid), call.sig())
+                    .await;
+            }
+            (tgid.as_raw(), tid.as_raw())
+        } else {
+            (call.tgid(), call.tid())
+        };
+        if call.sig() == libc::SIGALRM {
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tid))).await?;
+        }
+        if !nested
+            && self
+                .drop_signal_to_hermit(guest, Sysno::tgkill, Some(tgid), tid, call.sig())
+                .await
+        {
+            return Ok(0);
+        }
         let _reserved = self
-            .reserve_kvm_self_sigkill_exit(
+            .reserve_controlled_self_sigkill_exit(
                 guest,
                 call.sig(),
-                Some(DetPid::from_raw(call.tgid())),
-                Some(DetTid::from_raw(call.tid())),
+                Some(DetPid::from_raw(tgid)),
+                Some(DetTid::from_raw(tid)),
             )
             .await;
-        let value = self.record_or_replay(guest, call).await?;
+        // A SIGKILL to a thread of another process ends that whole process,
+        // and is retired at this turn, like `kill`'s. Only a valid pair is
+        // reserved: Linux rejects a thread outside the named group (ESRCH) or a
+        // non-positive id (EINVAL) before anything happens, so such a send
+        // takes the ordinary path and gets the kernel's errno. Nor is a send
+        // to a leader that has exited while its siblings run on
+        // (`sigkill_names_an_exited_leader`).
+        let mut exited_leader = false;
+        if call.sig() == libc::SIGKILL
+            && guest.config().sequentialize_threads
+            && tgid > 0
+            && tid > 0
+            && registered_process_of(guest, DetTid::from_raw(tid)).await
+                == Some(DetPid::from_raw(tgid))
+        {
+            exited_leader = sigkill_names_an_exited_leader(guest, DetTid::from_raw(tid)).await;
+            if !exited_leader
+                && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tid)).await
+            {
+                return self.send_reserved_sigkill(guest, reservation, call).await;
+            }
+        }
+        let value = self
+            .send_guest_signal(
+                guest,
+                call,
+                DetTid::from_raw(call.tid()),
+                call.sig(),
+                None,
+                true,
+                DetTid::from_raw(tid),
+            )
+            .await?;
+        // The kernel accepted a SIGKILL that changes nothing: no thread takes
+        // it and no process dies, so the scheduler is not told of a kill.
+        if exited_leader {
+            return Ok(value);
+        }
         // `pthread_kill` lowers to `tgkill`, so this is the ordinary way one
         // guest THREAD signals a sibling. Like `kill`, a successful cross-task
         // send must tell the scheduler, or a target parked in a child wait is
         // never woken and the wait hangs.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig(), None)
-            .await;
+        self.notify_cross_task_signal(
+            guest,
+            DetTid::from_raw(tid),
+            call.sig(),
+            None,
+            crate::tool_global::SignalScope::Thread,
+        )
+        .await;
         Ok(value)
     }
 
@@ -706,20 +3026,243 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tkill,
     ) -> Result<i64, Error> {
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::tkill,
+                call.sig(),
+                ReservedSendTarget::Thread {
+                    tgid: None,
+                    tid: call.tid(),
+                },
+                ReservedSendSiginfo::None,
+            )
+            .await
+        {
+            return refused;
+        }
+        self.record_orphaned_group_signals(guest, call.sig()).await;
+        // A nested caller names its own namespace's tid
+        // (https://github.com/rrnewton/hermit/issues/4155).
+        let nested = guest.thread_state().nested_pid_namespace;
+        let tid = if nested && call.tid() > 0 {
+            match self.name_guest_pid(guest, Sysno::tkill, call.tid()).await {
+                NamedGuestPid::Task {
+                    task,
+                    own_init_caught,
+                } => {
+                    if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
+                        return self
+                            .send_to_own_init(guest, call, task, QueueId::Thread(task), call.sig())
+                            .await;
+                    }
+                    task.as_raw()
+                }
+                NamedGuestPid::Answer(answer) => return answer,
+            }
+        } else {
+            call.tid()
+        };
+        if call.sig() == libc::SIGALRM {
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tid))).await?;
+        }
+        if !nested
+            && self
+                .drop_signal_to_hermit(guest, Sysno::tkill, None, tid, call.sig())
+                .await
+        {
+            return Ok(0);
+        }
         let _reserved = self
-            .reserve_kvm_self_sigkill_exit(
+            .reserve_controlled_self_sigkill_exit(
                 guest,
                 call.sig(),
                 None,
-                Some(DetTid::from_raw(call.tid())),
+                Some(DetTid::from_raw(tid)),
             )
             .await;
-        let value = self.record_or_replay(guest, call).await?;
+        // A non-positive tid is EINVAL in Linux, before anything happens.
+        let mut exited_leader = false;
+        if call.sig() == libc::SIGKILL && guest.config().sequentialize_threads && tid > 0 {
+            exited_leader = sigkill_names_an_exited_leader(guest, DetTid::from_raw(tid)).await;
+            if !exited_leader
+                && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tid)).await
+            {
+                return self.send_reserved_sigkill(guest, reservation, call).await;
+            }
+        }
+        let value = self
+            .send_guest_signal(
+                guest,
+                call,
+                DetTid::from_raw(call.tid()),
+                call.sig(),
+                None,
+                true,
+                DetTid::from_raw(tid),
+            )
+            .await?;
+        // As in `tgkill`, a SIGKILL to an exited leader changes nothing.
+        if exited_leader {
+            return Ok(value);
+        }
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
         // spelling of the same thread-directed send.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig(), None)
-            .await;
+        self.notify_cross_task_signal(
+            guest,
+            DetTid::from_raw(tid),
+            call.sig(),
+            None,
+            crate::tool_global::SignalScope::Thread,
+        )
+        .await;
         Ok(value)
+    }
+
+    /// Complete a reserved SIGKILL (https://github.com/rrnewton/hermit/issues/3994).
+    ///
+    /// A send whose victims exclude the caller's own process returns: it is
+    /// sent, and then committed with its real result. One that includes the
+    /// caller's process cannot return, because the kernel ends the caller:
+    /// the caller records its own exit status for its parent (`CLD_KILLED`,
+    /// `SIGKILL`), takes the `exit_group` grant for its own process, as
+    /// `exit_group` does, commits the other victims inside that exit turn, and
+    /// then sends. The commit comes after the grant: it installs the physical
+    /// fence, which waits for victims that only the send itself kills. The
+    /// reservation validated the target against the scheduler's record, so the
+    /// send cannot fail in a way the caller sees.
+    pub(crate) async fn send_reserved_sigkill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        reservation: crate::scheduler::sigkill_retirement::SigkillReservation,
+        call: impl Into<syscalls::Syscall> + Copy,
+    ) -> Result<i64, Error> {
+        if !reservation.includes_sender {
+            let result = self.record_or_replay(guest, call).await;
+            commit_sigkill(guest, reservation.token, result.is_ok()).await;
+            return Ok(result?);
+        }
+        if self.cfg.backend.reports_kernel_child_exit_signals {
+            let uid = crate::syscalls::real_uid(guest.tid().as_raw())
+                .unwrap_or_else(|| unsafe { libc::getuid() });
+            crate::tool_global::child_exit_sigchld(
+                guest,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::ExitStatus {
+                    code: libc::CLD_KILLED,
+                    status: libc::SIGKILL,
+                    uid,
+                },
+            )
+            .await;
+        }
+        let request = guest.thread_state().mk_request(
+            ResourceID::Exit {
+                group: true,
+                process: guest.thread_state().detpid.expect("detpid unset"),
+                mm: guest.thread_state().mm_id,
+            },
+            Permission::RW,
+        );
+        resource_request(guest, request).await;
+        commit_sigkill(guest, reservation.token, true).await;
+        Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    /// Send a guest's signal with `syscall`, first recording, for a `SIGCHLD`,
+    /// the queue its copy will join (`record_guest_sigchld_send`), and undoing
+    /// that record if the send fails. Recorded before the physical send: a
+    /// thread outside the schedule (in a real `rt_sigsuspend` or blocking
+    /// call) can take the copy the moment it is queued, before this handler
+    /// could record it afterwards (the Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4131). `thread_directed`: the
+    /// send names one thread (`tkill`, `tgkill`, `rt_tgsigqueueinfo`, a
+    /// thread-scoped `pidfd_send_signal`). `named`: the task Linux reads to
+    /// decide whether it discards the signal (`kill`'s pid, `tgkill`'s tid),
+    /// which the discarded-at-send record classifies the send against
+    /// (`discard_pre_send`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is one fact about the send the kernel call cannot tell"
+    )]
+    pub(crate) async fn send_guest_signal<G, S>(
+        &self,
+        guest: &mut G,
+        syscall: S,
+        target: DetTid,
+        raw_signal: i32,
+        target_process: Option<DetPid>,
+        thread_directed: bool,
+        named: DetTid,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+        S: Into<reverie::syscalls::Syscall>,
+    {
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+        let mut undo = None;
+        if raw_signal == libc::SIGCHLD && guest.config().sequentialize_threads {
+            // Without a process, or on a backend that sends process signals to
+            // a thread, the copy joins the target's private queue.
+            if thread_directed
+                || target_process.is_none()
+                || guest
+                    .config()
+                    .backend
+                    .requires_thread_directed_process_signals
+            {
+                let answer = crate::tool_global::child_exit_sigchld(
+                    guest,
+                    ChildExitSigchldControl::PrivateSent { target },
+                )
+                .await;
+                // A copy already pending there coalesces: only a new record is
+                // undone.
+                if answer == ChildExitSigchldAnswer::Placed(true) {
+                    undo = Some(ChildExitSigchldControl::SendFailed {
+                        private: Some(target),
+                        shared: None,
+                    });
+                }
+            } else if let Some(process) = target_process {
+                crate::tool_global::child_exit_sigchld(
+                    guest,
+                    ChildExitSigchldControl::SharedSent { target: process },
+                )
+                .await;
+                undo = Some(ChildExitSigchldControl::SendFailed {
+                    private: None,
+                    shared: Some(process),
+                });
+            }
+        }
+        // Without a process, or on a backend that sends process signals to a
+        // thread, the copy joins the target's private queue.
+        let queue = match target_process {
+            Some(process)
+                if !thread_directed
+                    && !guest
+                        .config()
+                        .backend
+                        .requires_thread_directed_process_signals =>
+            {
+                QueueId::Process(process)
+            }
+            _ => QueueId::Thread(target),
+        };
+        let token = self.discard_pre_send(guest, named, queue, raw_signal).await;
+        let syscall: syscalls::Syscall = syscall.into();
+        let siginfo = sent_siginfo(guest, &syscall, raw_signal);
+        let result = self.record_or_replay(guest, syscall).await;
+        if result.is_err()
+            && let Some(undo) = undo
+        {
+            crate::tool_global::child_exit_sigchld(guest, undo).await;
+        }
+        if result.is_ok() {
+            self.discard_sent(guest, token, siginfo).await;
+        }
+        Ok(result?)
     }
 
     /// Tell the scheduler that a successful thread-directed send left a signal
@@ -731,12 +3274,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// thread hang a `waitid` that a `kill` from a sibling process could
     /// interrupt. Self-directed signals are excluded: the sender is running, so
     /// it is not parked waiting to be woken.
-    async fn notify_cross_task_signal<G: Guest<Self>>(
+    pub(crate) async fn notify_cross_task_signal<G: Guest<Self>>(
         &self,
         guest: &mut G,
         target: DetTid,
         raw_signal: i32,
         target_process: Option<DetPid>,
+        scope: crate::tool_global::SignalScope,
     ) {
         // ⚠️ NO `Signal::try_from` GATE. It used to stand here, and because
         // `nix`'s `Signal` models only 1..=31 it rejected EVERY realtime signal:
@@ -747,8 +3291,244 @@ impl<T: RecordOrReplay> Detcore<T> {
         // can be represented and none is dropped for being unnameable. Signal
         // zero is only an existence/permission probe and queues no signal.
         if should_notify_cross_task_signal(guest.thread_state().dettid, target, raw_signal) {
-            notify_signal_pending(guest, target, SigWrapper(raw_signal), target_process).await;
+            notify_signal_pending(guest, target, SigWrapper(raw_signal), target_process, scope)
+                .await;
         }
+    }
+
+    /// Refuse, with EPERM and a WARN, a send of one of the in-guest runtime's
+    /// reserved signals (`Config::in_guest_reserved_signals`) to a process
+    /// other than the caller's own. `None` leaves the call to its handler's
+    /// ordinary path, unchanged. A5 step 3c, design section 16.30: such a
+    /// signal would run the target's runtime handler on a thread that does not
+    /// hold the scheduler's turn.
+    ///
+    /// Each send handler calls this beside its other opening checks (pidfd's
+    /// once its descriptor names a target), so every later path (record and
+    /// replay, a nested caller's own-init forward) is covered. It decides from
+    /// the configured set, the signal number and Detcore's model of processes
+    /// and their live threads alone:
+    /// - a signal outside the set takes the ordinary path before any request
+    ///   is made, so with the set empty (every backend but the in-guest ones'
+    ///   default route) nothing at all changes; signal 0 is never in it;
+    /// - a target in the caller's own process takes the ordinary path. A
+    ///   caller in the container's PID namespace that names its own thread or
+    ///   process makes no request for it; a caller in a nested namespace first
+    ///   has each id translated (one `GuestPid` request per id);
+    /// - only a target with a live thread in Detcore's model is refused. A
+    ///   target with none takes the ordinary path, which keeps Linux's answer:
+    ///   a zombie (exited, not yet reaped) still takes a signal (0), and a
+    ///   reaped process, an id no task has, or a thread that has exited is
+    ///   ESRCH. So are an id Detcore cannot translate, a non-positive id, and a
+    ///   thread outside the group `tgkill` names;
+    /// - group sends (`kill(0)`, `kill(-pgid)`, `kill(-1)`, and
+    ///   `pidfd_send_signal`'s process-group scope) are not passed here: their
+    ///   handlers refuse every non-SIGKILL group send first
+    ///   (`refuse_group_signal`), a stopping refusal or ENOSYS by policy, and
+    ///   SIGKILL is never reserved.
+    ///
+    /// A send it would refuse first gets the answers Linux gives before any
+    /// permission check, without the WARN: a `tgkill` or `rt_tgsigqueueinfo`
+    /// whose tgid is not the named thread's own process is ESRCH
+    /// (`do_send_specific`), and an unreadable or malformed `siginfo`
+    /// (`siginfo`) is EFAULT, E2BIG or, for `pidfd_send_signal`, EINVAL
+    /// (`reserved_send_siginfo_errno`). Nothing is delivered either way.
+    pub(crate) async fn refuse_reserved_signal_send<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        signal: i32,
+        target: ReservedSendTarget,
+        siginfo: ReservedSendSiginfo,
+    ) -> Option<Result<i64, Error>> {
+        if !guest.config().reserves_in_guest_signal(signal.into()) {
+            return None;
+        }
+        let own = self.detpid;
+        let caller = guest.thread_state().dettid;
+        // `query`, the id whose process's live threads decide, `thread`, the
+        // thread a thread-directed send must reach, and `group`, the thread
+        // group a `tgkill` or `rt_tgsigqueueinfo` names.
+        let (query, thread, group) = match target {
+            ReservedSendTarget::Process(pid) => {
+                if pid <= 0 {
+                    return None;
+                }
+                let named = self.reserved_send_task(guest, pid).await?;
+                if reserved_send_names_own(own, caller, named, None) {
+                    return None;
+                }
+                (named, None, None)
+            }
+            ReservedSendTarget::Thread { tgid, tid } => {
+                if tid <= 0 || tgid.is_some_and(|tgid| tgid <= 0) {
+                    return None;
+                }
+                let thread = self.reserved_send_task(guest, tid).await?;
+                let group = match tgid {
+                    Some(tgid) => Some(self.reserved_send_task(guest, tgid).await?),
+                    None => None,
+                };
+                if reserved_send_names_own(own, caller, thread, group) {
+                    return None;
+                }
+                (group.unwrap_or(thread), Some(thread), group)
+            }
+            ReservedSendTarget::Pidfd { named, thread } => {
+                let named = named?;
+                if reserved_send_names_own(own, caller, named, None) {
+                    return None;
+                }
+                (named, thread.then_some(named), None)
+            }
+        };
+        let (targets, _) = resolve_kill_targets_and_exit(guest, query).await;
+        if !reserved_send_refuses(caller, thread, &targets) {
+            return None;
+        }
+        let leader = registered_process_of(guest, targets[0]).await;
+        if !reserved_send_names_its_group(group, leader) {
+            return None;
+        }
+        if let Some(errno) = self.reserved_send_siginfo_errno(guest, signal, siginfo) {
+            return Some(Err(errno.into()));
+        }
+        let process = leader.unwrap_or(query);
+        tracing::warn!(
+            "{}",
+            crate::refused_signal_controls::reserved_signal_send_refused_warning(
+                sysno.name(),
+                signal,
+                caller.as_raw(),
+                process.as_raw(),
+            )
+        );
+        Some(Err(Errno::EPERM.into()))
+    }
+
+    /// Linux's answer for the `siginfo` of a send that would otherwise be
+    /// refused (`refuse_reserved_signal_send`), which it gives before any
+    /// permission check: the copy from the caller's memory, read here in the
+    /// caller's own turn and in Linux's order (`siginfo_copy_errno`): the
+    /// head, then the expansion only for a layout Linux does not know. A
+    /// range that would pass the end of the address space is EFAULT, never
+    /// computed. `None` when the copy succeeds or the call carries none.
+    ///
+    /// The bytes are read through `Guest::memory()`. On the in-guest backends
+    /// that is `process_vm_readv` (reverie-inguest `read_guest`,
+    /// src/guest/host.rs:2463-2476 at a214eb85), which refuses some memory
+    /// x86's `copy_from_user` can read, such as a write-only mapping: such a
+    /// siginfo is EFAULT here where Linux would copy it. Detcore's ptrace-side
+    /// readers (`read_siginfo`, `read_mapped_prefix`,
+    /// `rt_sigqueueinfo_precheck`) fall back to `/proc/<tid>/mem` for that,
+    /// which cannot be reused in-guest, where guest thread ids are not host
+    /// thread ids.
+    fn reserved_send_siginfo_errno<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+        siginfo: ReservedSendSiginfo,
+    ) -> Option<Errno> {
+        let (address, pidfd) = match siginfo {
+            ReservedSendSiginfo::None => return None,
+            ReservedSendSiginfo::Queued(address) => (address, false),
+            ReservedSendSiginfo::Pidfd(None) => return None,
+            ReservedSendSiginfo::Pidfd(Some(address)) => (address, true),
+        };
+        // Each range must end inside the address space: a pointer within a
+        // siginfo's length of its top cannot be copied (EFAULT).
+        let head = address
+            .checked_add(KERNEL_SIGINFO_SIZE)
+            .and_then(|_| AddrMut::<[u8; KERNEL_SIGINFO_SIZE]>::from_raw(address))
+            .and_then(|head| guest.memory().read_value(head).ok());
+        let read_expansion = || {
+            let start = address.checked_add(KERNEL_SIGINFO_SIZE)?;
+            start.checked_add(SI_EXPANSION_SIZE)?;
+            let expansion = AddrMut::<[u8; SI_EXPANSION_SIZE]>::from_raw(start)?;
+            guest.memory().read_value(expansion).ok()
+        };
+        siginfo_copy_errno(signal, pidfd, head, read_expansion)
+    }
+
+    /// The task a reserved send's `id` names (`refuse_reserved_signal_send`):
+    /// the id itself for a caller in the container's PID namespace, and for a
+    /// caller in a nested one the task its namespace's `id` is. `None` when
+    /// Detcore cannot name one, which leaves the call to its ordinary path.
+    async fn reserved_send_task<G: Guest<Self>>(&self, guest: &mut G, id: i32) -> Option<DetTid> {
+        if !guest.thread_state().nested_pid_namespace {
+            return Some(DetTid::from_raw(id));
+        }
+        if guest
+            .config()
+            .backend
+            .requires_thread_directed_process_signals
+        {
+            return None;
+        }
+        match crate::tool_global::guest_pid(guest, id).await {
+            GuestPidAnswer::Task { task, .. } => Some(task),
+            GuestPidAnswer::NoSuchPid | GuestPidAnswer::Untranslatable(_) => None,
+        }
+    }
+
+    /// Refuse, with EPERM and a WARN, an arming of one of the in-guest
+    /// runtime's reserved signals (`Config::in_guest_reserved_signals`) as a
+    /// notification signal by `arming`, whatever the target: its deliveries
+    /// would reach the runtime's handler for the signal rather than the
+    /// guest's action (A5 step 3c, design section 16.30). The caller makes
+    /// Linux's earlier checks of the call first. A disarm (signal 0) is never
+    /// reserved, and with the set empty nothing changes.
+    pub(crate) fn refuse_reserved_signal_arming<G: Guest<Self>>(
+        guest: &mut G,
+        arming: crate::refused_signal_controls::ReservedArming,
+        signal: i64,
+    ) -> Result<(), Error> {
+        if !guest.config().reserves_in_guest_signal(signal) {
+            return Ok(());
+        }
+        tracing::warn!(
+            "{}",
+            crate::refused_signal_controls::reserved_signal_arming_refused_warning(
+                arming,
+                signal as i32,
+                guest.thread_state().dettid.as_raw(),
+            )
+        );
+        Err(Errno::EPERM.into())
+    }
+
+    /// Refuse by name a guest's `SIGCHLD` that carries the scheduler's own-copy
+    /// mark (`SI_QUEUE` with `OWN_SIGCHLD_MARK`), which a receiver in a nested
+    /// PID namespace would take for the scheduler's copy
+    /// (<https://github.com/rrnewton/hermit/issues/4155>). `None` for any other
+    /// call; an unreadable siginfo is left to the kernel's EFAULT.
+    pub(crate) async fn refuse_forged_own_sigchld<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        signal: i32,
+        info: Option<AddrMut<'_, GuestSiginfo>>,
+    ) -> Option<Result<i64, Error>> {
+        if signal != libc::SIGCHLD {
+            return None;
+        }
+        let bytes = read_siginfo(guest, info?.cast())?;
+        let (code, _) = crate::scheduler::child_exit_sigchld::siginfo_code_and_pid(&bytes);
+        let value = i32::from_ne_bytes(bytes[24..28].try_into().expect("four bytes"));
+        if code != libc::SI_QUEUE || value != crate::scheduler::child_exit_sigchld::OWN_SIGCHLD_MARK
+        {
+            return None;
+        }
+        tracing::error!(
+            "[detcore, dtid {}] {} sends a SIGCHLD carrying the scheduler's own-copy mark {:#x}, which a nested PID namespace's receiver could not tell from the scheduler's (https://github.com/rrnewton/hermit/issues/4155)",
+            guest.thread_state().dettid,
+            sysno,
+            crate::scheduler::child_exit_sigchld::OWN_SIGCHLD_MARK,
+        );
+        Some(
+            self.refuse_unserviceable_operation(guest, sysno, Errno::EPERM)
+                .await,
+        )
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -762,12 +3542,144 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtTgsigqueueinfo,
     ) -> Result<i64, Error> {
-        let value = self.record_or_replay(guest, call).await?;
+        if let Some(refused) = self
+            .refuse_forged_own_sigchld(
+                guest,
+                Sysno::rt_tgsigqueueinfo,
+                call.sig(),
+                call.siginfo().map(AddrMut::cast),
+            )
+            .await
+        {
+            return refused;
+        }
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::rt_tgsigqueueinfo,
+                call.sig(),
+                ReservedSendTarget::Thread {
+                    tgid: Some(call.tgid()),
+                    tid: call.tid(),
+                },
+                ReservedSendSiginfo::Queued(call.siginfo().map_or(0, |info| info.as_raw())),
+            )
+            .await
+        {
+            return refused;
+        }
+        self.record_orphaned_group_signals(guest, call.sig()).await;
+        // A nested caller names its own namespace's tid
+        // (https://github.com/rrnewton/hermit/issues/4155); a tid no task of
+        // that namespace has goes to the kernel, which checks the siginfo
+        // first and then answers ESRCH.
+        let nested = guest.thread_state().nested_pid_namespace;
+        let tid = if nested && call.tgid() > 0 && call.tid() > 0 {
+            match self
+                .name_guest_pid(guest, Sysno::rt_tgsigqueueinfo, call.tid())
+                .await
+            {
+                NamedGuestPid::Task {
+                    task,
+                    own_init_caught,
+                } => {
+                    if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
+                        return self
+                            .send_to_own_init(guest, call, task, QueueId::Thread(task), call.sig())
+                            .await;
+                    }
+                    task.as_raw()
+                }
+                NamedGuestPid::Answer(Err(Error::Errno(Errno::ESRCH))) => {
+                    return Ok(self.record_or_replay(guest, call).await?);
+                }
+                NamedGuestPid::Answer(answer) => return answer,
+            }
+        } else {
+            call.tid()
+        };
+        if call.sig() == libc::SIGALRM {
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tid))).await?;
+        }
+        if !nested
+            && self
+                .drop_signal_to_hermit(
+                    guest,
+                    Sysno::rt_tgsigqueueinfo,
+                    Some(call.tgid()),
+                    tid,
+                    call.sig(),
+                )
+                .await
+        {
+            return Ok(0);
+        }
+        // A SIGKILL to an exited leader changes nothing, as in `tgkill`
+        // (https://github.com/rrnewton/hermit/issues/4445).
+        let exited_leader = call.sig() == libc::SIGKILL
+            && guest.config().sequentialize_threads
+            && tid > 0
+            && sigkill_names_an_exited_leader(guest, DetTid::from_raw(tid)).await;
+        // Any other SIGKILL to a thread of a valid pair in another process
+        // ends that thread's whole process, and is reserved and retired at
+        // this turn as `tgkill`'s is
+        // (https://github.com/rrnewton/hermit/issues/3994); before, its victims
+        // were retired at their host-timed deaths. A send the kernel then
+        // refuses (EFAULT, EPERM, E2BIG: its siginfo checks are subtle)
+        // releases the reservation, because `send_reserved_sigkill` commits a
+        // send that excludes the sender with its outcome. A send to the
+        // sender's own process is not reserved: it would take the sender's
+        // Exit grant before the call runs, and so must know beforehand that
+        // the kernel accepts the siginfo (Codex review); it keeps its
+        // host-timed retirement. Nor is a nested caller's send, whose tgid
+        // names its own namespace.
+        if call.sig() == libc::SIGKILL
+            && !nested
+            && !exited_leader
+            && guest.config().sequentialize_threads
+            && call.tgid() > 0
+            && tid > 0
+            && guest
+                .thread_state()
+                .detpid
+                .is_none_or(|own| own.as_raw() != call.tgid())
+            && registered_process_of(guest, DetTid::from_raw(tid)).await
+                == Some(DetPid::from_raw(call.tgid()))
+            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tid)).await
+        {
+            if reservation.includes_sender {
+                // Only when the sender's own process was not known above: give
+                // the reservation back and take the unreserved path.
+                commit_sigkill(guest, reservation.token, false).await;
+            } else {
+                return self.send_reserved_sigkill(guest, reservation, call).await;
+            }
+        }
+        let value = self
+            .send_guest_signal(
+                guest,
+                call,
+                DetTid::from_raw(call.tid()),
+                call.sig(),
+                None,
+                true,
+                DetTid::from_raw(tid),
+            )
+            .await?;
+        if exited_leader {
+            return Ok(value);
+        }
         // Thread-directed like `tgkill`, so it carries the same wakeup
         // obligation. `sigqueue`/`pthread_sigqueue` reach a parked sibling
         // through here.
-        self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig(), None)
-            .await;
+        self.notify_cross_task_signal(
+            guest,
+            DetTid::from_raw(tid),
+            call.sig(),
+            None,
+            crate::tool_global::SignalScope::Thread,
+        )
+        .await;
         Ok(value)
     }
 
@@ -783,35 +3695,235 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigqueueinfo,
     ) -> Result<i64, Error> {
+        if let Some(refused) = self
+            .refuse_forged_own_sigchld(
+                guest,
+                Sysno::rt_sigqueueinfo,
+                call.sig(),
+                call.siginfo().map(AddrMut::cast),
+            )
+            .await
+        {
+            return refused;
+        }
+        // Linux names no group here: a non-positive pid is ESRCH.
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::rt_sigqueueinfo,
+                call.sig(),
+                ReservedSendTarget::Process(call.tgid()),
+                ReservedSendSiginfo::Queued(call.siginfo().map_or(0, |info| info.as_raw())),
+            )
+            .await
+        {
+            return refused;
+        }
+        self.record_orphaned_group_signals(guest, call.sig()).await;
+        let nested = guest.thread_state().nested_pid_namespace;
         if !guest.config().sequentialize_threads {
+            if !nested
+                && self
+                    .drop_signal_to_hermit(
+                        guest,
+                        Sysno::rt_sigqueueinfo,
+                        None,
+                        call.tgid(),
+                        call.sig(),
+                    )
+                    .await
+            {
+                return Ok(0);
+            }
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
-        if call.sig() == 0 {
-            return Ok(self.record_or_replay(guest, call).await?);
-        }
-
-        let tgid = call.tgid();
+        // A nested caller names its own namespace's pid
+        // (https://github.com/rrnewton/hermit/issues/4155); a pid no task of
+        // that namespace has goes to the kernel, which checks the siginfo
+        // first and then answers ESRCH.
+        let tgid = if nested && call.tgid() > 0 {
+            match self
+                .name_guest_pid(guest, Sysno::rt_sigqueueinfo, call.tgid())
+                .await
+            {
+                NamedGuestPid::Task {
+                    task,
+                    own_init_caught,
+                } => {
+                    if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
+                        return self
+                            .send_to_own_init(guest, call, task, QueueId::Process(task), call.sig())
+                            .await;
+                    }
+                    task.as_raw()
+                }
+                NamedGuestPid::Answer(Err(Error::Errno(Errno::ESRCH))) => {
+                    return Ok(self.record_or_replay(guest, call).await?);
+                }
+                NamedGuestPid::Answer(answer) => return answer,
+            }
+        } else {
+            call.tgid()
+        };
         if tgid <= 0 {
-            return Err(Errno::ENOSYS.into());
+            // POSIX.1b has no process groups: Linux's `do_rt_sigqueueinfo` looks
+            // the pid up with `find_vpid`, which finds no process for 0 or a
+            // negative pid, so the call fails (EFAULT for an unreadable
+            // `siginfo_t`, EPERM for a forged `si_code`, E2BIG for an unknown
+            // `si_code` with nonzero expansion bytes, otherwise ESRCH) and
+            // sends nothing. The kernel's own answer is therefore deterministic
+            // (https://github.com/rrnewton/hermit/issues/4046).
+            return Ok(self.record_or_replay(guest, call).await?);
         }
-        let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
-        let tid = deterministic_kill_target(&targets, call.sig())?;
+        if call.sig() == 0 {
+            // An existence check answers from the same exit model as a signal
+            // (https://github.com/rrnewton/hermit/issues/4124): a process
+            // Detcore saw exit and that is gone is ESRCH after the siginfo
+            // checks, whatever the host has reaped by now.
+            let (targets, zombie) =
+                resolve_kill_targets_and_exit(guest, DetPid::from_raw(tgid)).await;
+            if targets.is_empty() && zombie == Some(false) {
+                return Ok(self
+                    .record_or_replay(guest, call.with_tgid(NO_SUCH_PID))
+                    .await?);
+            }
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+        if call.sig() == libc::SIGALRM {
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tgid))).await?;
+        }
+        if self
+            .drop_signal_to_hermit(guest, Sysno::rt_sigqueueinfo, None, tgid, call.sig())
+            .await
+        {
+            return Ok(0);
+        }
+        // A call the kernel fails without sending, after a complete copy of
+        // its `siginfo_t` (EPERM for a `si_code` only the target thread itself
+        // may use), goes to it unchanged; a copy that certainly faults is
+        // answered EFAULT here; and a `siginfo_t` Hermit cannot read whole is
+        // refused by name (`rt_sigqueueinfo_precheck`).
+        if guest.config().backend.host_task_reads_reach_guest_threads {
+            match self.rt_sigqueueinfo_precheck(guest, &call) {
+                RtSigqueueinfoPrecheck::KernelFails => {
+                    return Ok(self.record_or_replay(guest, call).await?);
+                }
+                RtSigqueueinfoPrecheck::Efault => return Err(Errno::EFAULT.into()),
+                RtSigqueueinfoPrecheck::Unreadable => {
+                    tracing::error!(
+                        "[detcore, dtid {}] rt_sigqueueinfo with a siginfo_t at {:#x} is not \
+                         supported: Hermit cannot read all 128 bytes of it to decide the call \
+                         (https://github.com/rrnewton/hermit/issues/4034)",
+                        guest.thread_state().dettid,
+                        call.siginfo().map_or(0, |info| info.as_raw()),
+                    );
+                    return self
+                        .refuse_unserviceable_operation(
+                            guest,
+                            Sysno::rt_sigqueueinfo,
+                            Errno::ENOSYS,
+                        )
+                        .await;
+                }
+                RtSigqueueinfoPrecheck::Proceeds => {}
+            }
+        }
+        // As for kill, a live non-leader thread's id names its process
+        // (https://github.com/rrnewton/hermit/issues/4094).
+        let process = signal_target_process(guest, DetPid::from_raw(tgid))
+            .await
+            .map_or(tgid, |process| process.as_raw());
+        match self
+            .own_process_signal(guest, Sysno::rt_sigqueueinfo, tgid, process, call.sig())
+            .await?
+        {
+            OwnProcessSend::Admitted => {
+                return self
+                    .forward_own_process_signal(guest, call.sig(), call, DetTid::from_raw(tgid))
+                    .await;
+            }
+            OwnProcessSend::Refused(answer) => return answer,
+            OwnProcessSend::NotOwn => {}
+        }
+        let target = match self
+            .process_signal_target(
+                guest,
+                Sysno::rt_sigqueueinfo,
+                DetPid::from_raw(process),
+                call.sig(),
+            )
+            .await
+        {
+            // Gone: Linux checks the siginfo before it looks the process up
+            // (EFAULT, then E2BIG for an unknown code with padding, then EPERM
+            // for a forged code), and only then answers ESRCH. Let the kernel
+            // make those checks against a pid no task can have, so its answer
+            // cannot depend on whether the host has reaped the real one yet
+            // (https://github.com/rrnewton/hermit/issues/4124).
+            Err(Error::Errno(Errno::ESRCH)) => {
+                return Ok(self
+                    .record_or_replay(guest, call.with_tgid(NO_SUCH_PID))
+                    .await?);
+            }
+            target => target?,
+        };
+        let Some(tid) = target else {
+            // A zombie: its parent can still wait for it, so Linux still
+            // finds it. Unlike kill, the kernel checks the siginfo first
+            // (EFAULT, EPERM for a forged si_code, E2BIG), so let it answer:
+            // it validates, finds the zombie, and returns 0. A backend that
+            // must name a receiving thread has none to name, and keeps ESRCH
+            // (https://github.com/rrnewton/hermit/issues/4091).
+            if guest
+                .config()
+                .backend
+                .requires_thread_directed_process_signals
+            {
+                return Err(Errno::ESRCH.into());
+            }
+            return Ok(self.record_or_replay(guest, call).await?);
+        };
         let value = if !guest
             .config()
-            .backend_requires_thread_directed_process_signals
+            .backend
+            .requires_thread_directed_process_signals
         {
-            self.record_or_replay(guest, call).await?
+            self.send_guest_signal(
+                guest,
+                call,
+                tid,
+                call.sig(),
+                Some(DetPid::from_raw(process)),
+                false,
+                DetTid::from_raw(tgid),
+            )
+            .await?
         } else {
             let targeted = syscalls::RtTgsigqueueinfo::new()
-                .with_tgid(tgid)
+                .with_tgid(process)
                 .with_tid(tid.as_raw())
                 .with_sig(call.sig())
                 .with_siginfo(call.siginfo());
-            self.record_or_replay(guest, targeted).await?
+            self.send_guest_signal(
+                guest,
+                targeted,
+                tid,
+                call.sig(),
+                Some(DetPid::from_raw(process)),
+                false,
+                DetTid::from_raw(tgid),
+            )
+            .await?
         };
-        self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(tgid)))
-            .await;
+        self.notify_cross_task_signal(
+            guest,
+            tid,
+            call.sig(),
+            Some(DetPid::from_raw(process)),
+            crate::tool_global::SignalScope::Process,
+        )
+        .await;
         Ok(value)
     }
 
@@ -824,16 +3936,1549 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigpending,
     ) -> Result<i64, Error> {
+        // Signal phase 1 refuses rt_sigpending in a process that handles
+        // SIGALRM (`sigalrm_phase1`), so the ledger's entry never needs to be
+        // shown here. The pending set would show a real-time timer expiration
+        // that every thread blocked when it expired, which the kernel never
+        // queued (https://github.com/rrnewton/hermit/issues/4089).
+        let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
+        act_on_pending_real_time(guest, pending, REAL_TIME_SIGNALS, 0).await;
         Ok(self.record_or_replay(guest, call).await?)
     }
+
+    /// A delivered signal may run a handler, whose return restores, through an
+    /// `rt_sigreturn` that ptrace does not stop at, a mask Detcore cannot read
+    /// here: the thread's own mask, or for a handler that interrupts a call
+    /// with a temporary mask, the mask saved before the call. So every
+    /// delivery records every real-time signal as possibly unblocked by a
+    /// handler's return (`Scheduler::handler_restore_unblocked`), and a
+    /// real-time timer expiration of the process is never kept pending after
+    /// it (https://github.com/rrnewton/hermit/issues/4089). Only where real-time
+    /// expirations are kept pending at all (`models_signal_targets`), and once
+    /// per thread.
+    pub(crate) async fn record_handler_restore_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+    ) {
+        if !self.cfg.models_signal_targets()
+            || guest.thread_state().handler_restore_rt_reported == REAL_TIME_SIGNALS
+        {
+            return;
+        }
+        // Only a caught signal runs a handler that returns. The dispositions
+        // are the process's, so they say that whatever mask the delivery
+        // interrupted; a signal acted on by default (the teardown's own
+        // termination signals among them) records nothing.
+        let caught =
+            match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal.raw()) {
+                Some(copied) => Ok(copied.caught),
+                None => read_thread_wait_signal_state(guest.pid(), guest.tid())
+                    .map(|state| state.caught),
+            };
+        if let Ok(caught) = caught
+            && caught & kernel_sigset_bit(signal.raw()) == 0
+        {
+            return;
+        }
+        let Some(detpid) = guest.thread_state().detpid else {
+            return;
+        };
+        crate::tool_global::record_handler_restore_mask(guest, detpid, REAL_TIME_SIGNALS).await;
+        guest.thread_state_mut().handler_restore_rt_reported = REAL_TIME_SIGNALS;
+    }
+
+    /// rt_sigreturn: the mask it restores, from the frame's `uc_sigmask`, may
+    /// unblock a pending real-time timer expiration that every thread blocked
+    /// when it expired, which the kernel then delivers as the call returns
+    /// (https://github.com/rrnewton/hermit/issues/4089). The call itself
+    /// passes through.
+    pub(crate) async fn observe_sigreturn_mask<G: Guest<Self>>(&self, guest: &mut G) {
+        let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
+        if pending == 0 {
+            return;
+        }
+        // x86-64 `rt_sigreturn` reads `frame = sp - sizeof(long)` and restores
+        // `frame->uc.uc_sigmask`; `uc` starts at `sp`.
+        let sp = guest.regs().await.rsp as usize;
+        let restored = Addr::<u64>::from_raw(sp.wrapping_add(UC_SIGMASK_OFFSET))
+            .and_then(|addr| guest.memory().read_value(addr).ok());
+        let (observable, discarded) = match (
+            restored,
+            read_thread_wait_signal_state(guest.pid(), guest.tid()),
+        ) {
+            (Some(mask), Ok(state)) => unblocked_by(&state, mask),
+            // A frame the kernel cannot read either kills the guest with
+            // SIGSEGV, which delivers nothing pending.
+            (None, _) => (0, 0),
+            // A state that cannot be read could hide any delivery.
+            (Some(_), Err(_)) => (REAL_TIME_SIGNALS, 0),
+        };
+        act_on_pending_real_time(guest, pending, observable, discarded).await;
+    }
 }
+
+/// What [`Detcore::rt_sigprocmask_inner`] knows of the set the kernel used.
+enum ValidatedSet {
+    /// The kernel read and accepted this set before Detcore injected the call.
+    Validated(KernelSigset),
+    /// Detcore injected nothing: its own read of the set failed first.
+    NotRun,
+    /// The call ran as the guest made it; only the kernel read its set.
+    NotValidated,
+}
+
+/// The offset of `uc_sigmask` in the x86-64 kernel `ucontext` that
+/// `rt_sigreturn` restores: after uc_flags (8), uc_link (8), uc_stack (24) and
+/// uc_mcontext (256 bytes).
+pub(super) const UC_SIGMASK_OFFSET: usize = 8 + 8 + 24 + 256;
 
 fn should_notify_cross_task_signal(sender: DetTid, target: DetTid, raw_signal: i32) -> bool {
     raw_signal != 0 && target != sender
 }
 
+/// Which check [`sleep_signal`] makes for an emulated `pause` or `nanosleep`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SleepCheck {
+    /// Before the sleep parks: whether a signal already pending for the thread
+    /// ends it at once.
+    BeforePark,
+    /// After the scheduler woke the sleep for these signals.
+    AfterWake(Option<Vec<SigWrapper>>),
+}
+
+/// What ends an emulated `pause` or `nanosleep`, per [`sleep_signal`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SleepSignal {
+    /// A signal pending for this thread, unblocked and caught or acted on by
+    /// default: the kernel delivers it as the call returns. `pause` returns
+    /// `ERESTARTNOHAND` for it and `nanosleep` `EINTR`.
+    Pending,
+    /// The scheduler woke the sleep for a held signal of its own that ends it
+    /// (`held_wake_ends_sleep`), or this backend does not report the guest's
+    /// signal state: the call returns `EINTR`, as every wake did before.
+    Held,
+    /// Nothing ends the sleep, and it waits (again) with its original deadline.
+    None,
+    /// The scheduler's `SIGCHLD`, in a process whose send window is unusable,
+    /// that this thread claimed (`claim_pending_sigchld`): it is held for
+    /// delivery to this thread as it resumes, so a signal is always pending
+    /// then. Each call returns its restart code, as Linux's does: `EINTR` when
+    /// a handler runs, whatever its `SA_RESTART`, and a restart when none does
+    /// (the child-exit ledger drops a duplicate copy). `pause` and an absolute
+    /// `clock_nanosleep` return `ERESTARTNOHAND`, and the kernel re-executes
+    /// them. A relative `nanosleep` returns `ERESTART_RESTARTBLOCK` and keeps
+    /// its deadline for the kernel's `restart_syscall`, which only a restart
+    /// makes (`helpers::RestartCall::Nanosleep`).
+    Claimed,
+}
+
+/// Decides, in this thread's own turn, whether a signal ends an emulated
+/// `pause` or `nanosleep` (<https://github.com/rrnewton/hermit/issues/3982>).
+///
+/// Only on a backend whose kernel reports the guest's signal state; on any
+/// other, a sleep never checks before it parks, and a wake always ends it
+/// (`Held`). A signal ends the sleep when it is pending for this thread,
+/// unblocked, and caught or acted on by default
+/// (`KernelSignalState::pending_interrupting`). Before the sleep parks, a stop
+/// signal does so only when `stops_end_it`, which `nanosleep` leaves unset
+/// because Detcore does not keep its deadline for the kernel's restart after a
+/// stop, so the stop takes effect when the sleep ends, as before. After a wake,
+/// which only the scheduler's own sends (a timer, a child-exit `SIGCHLD`) can
+/// commit for a stop on a `nanosleep`, a pending stop ends it, as every wake
+/// did before, so that the stop takes effect promptly.
+///
+/// `SIGCHLD` and the signals a host-timed source armed by a guest can post
+/// (`host_timed_signals`) are held: the kernel can post them at a moment set by
+/// host timing, and `/proc` cannot tell that copy from one a guest sent. They
+/// never end a sleep before it parks, nor does the scheduler record a guest's
+/// cross-task send of one for a sleep. A wake the scheduler committed for its
+/// own child-exit `SIGCHLD` ends the sleep with `Held` only while the copy it
+/// sent is still pending in the process's shared queue
+/// (`ChildExitSigchldControl::PlacedPending`, which `/proc` cannot answer),
+/// `/proc` shows it pending, and it is unblocked and caught or default-fatal
+/// (`held_wake_ends_sleep`); a host-timed held signal, from the mask and
+/// dispositions alone. Like the precise futex
+/// wait's check, this reads the pending set before the sleep parks as well as
+/// after a wake: a signal sent while the thread was stopped short of filing
+/// its request, as when its timeslice ended in the syscall's prehook, is
+/// pending and was never recorded for its sleep. After a wake whose
+/// non-held signals are no longer pending, a `SIGCONT` having cancelled a stop
+/// or `sigaction(SIG_IGN)` having flushed it, a Linux sleep would still be
+/// asleep, so this returns `None`.
+///
+/// A state that cannot be read is handled as a wait's first read is
+/// (`read_wait_signal_state`, here `read_thread_wait_signal_state`, since
+/// Reverie can report the creator's pid for a process a raw `clone` made): a
+/// thread that no longer exists ends the call
+/// with `ERESTARTNOINTR`, which nothing observes, and otherwise the run ends
+/// with a diagnostic.
+pub(crate) async fn sleep_signal<G, T>(
+    guest: &mut G,
+    check: SleepCheck,
+    stops_end_it: bool,
+) -> Result<SleepSignal, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !guest
+        .config()
+        .backend
+        .supports_blocked_wait_signal_interruption
+    {
+        return Ok(match check {
+            SleepCheck::BeforePark => SleepSignal::None,
+            SleepCheck::AfterWake(_) => SleepSignal::Held,
+        });
+    }
+    let host_timed = host_timed_signals(guest).await;
+    let held = kernel_sigset_bit(libc::SIGCHLD) | host_timed;
+    let before_park = check == SleepCheck::BeforePark;
+    // `held_woken`: the held signals the scheduler woke this sleep for.
+    // `unknown_held_wake`: a wake that names no signal.
+    let (deciding, held_woken, unknown_held_wake) = match check {
+        SleepCheck::BeforePark => (!held, 0, false),
+        SleepCheck::AfterWake(None) => (0, 0, true),
+        SleepCheck::AfterWake(Some(woken)) => {
+            let woken = woken
+                .iter()
+                .fold(0, |set, signal| set | kernel_sigset_bit(signal.raw()));
+            (woken & !held, woken & held, false)
+        }
+    };
+    if deciding != 0 || held_woken != 0 {
+        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let mut ending = state.pending_interrupting(state.blocked, false) & deciding;
+        if !stops_end_it && before_park {
+            ending &= !(state.default_job_control_stops() | kernel_sigset_bit(libc::SIGSTOP));
+        }
+        // A copy Linux discarded when it was sent ends nothing, except a
+        // signal the scheduler committed at the wake, which is kept
+        // (<https://github.com/rrnewton/hermit/issues/4293>).
+        let committed = if before_park { 0 } else { deciding };
+        let ending =
+            crate::syscalls::threads::without_discarded(guest, &state, ending, committed).await;
+        if ending != 0 {
+            return Ok(SleepSignal::Pending);
+        }
+        // A committed `SIGCHLD` counts only while the schedule says this thread
+        // will take it (`PlacedPending`): a guest's thread-directed copy in its
+        // private queue, or the scheduler's or a guest's shared copy still in
+        // the window. `/proc` cannot tell either from a kernel copy that host
+        // timing posted, so its bits only prompt the question: a woken sleep
+        // asks for the `SIGCHLD` it was woken for, and any sleep asks when its
+        // private queue holds one, which a guest sent before it parked
+        // (https://github.com/rrnewton/hermit/issues/4132).
+        let sigchld = kernel_sigset_bit(libc::SIGCHLD) & !host_timed;
+        let committed = if asks_committed_sigchld(held_woken, &state, sigchld)
+            && matches!(
+                crate::tool_global::child_exit_sigchld(
+                    guest,
+                    crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::PlacedPending,
+                )
+                .await,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer::Placed(true)
+            ) {
+            // A committed copy shows in `/proc`: an invariant, not a second
+            // condition.
+            if state.pending & sigchld == 0 {
+                tracing::error!(
+                    "[dtid {}] a committed SIGCHLD is pending by the schedule but not in /proc",
+                    guest.thread_state().dettid
+                );
+                debug_assert!(false, "a committed SIGCHLD is not pending in /proc");
+            }
+            sigchld
+        } else {
+            0
+        };
+        if let Some(verdict) = committed_sigchld_verdict(&state, held_woken, committed) {
+            return Ok(verdict);
+        }
+        // Where the process does not use the send window, a thread outside the
+        // schedule could take the scheduler's copy at a moment host timing
+        // chooses, so the window records none, and `PlacedPending` says no
+        // whether or not that thread took it. Parked again, the sleep ran to its
+        // deadline with the copy pending and the handler ran as it returned, an
+        // outcome Linux never gives (https://github.com/rrnewton/hermit/issues/4229).
+        // So this thread claims the copy itself, in its own turn
+        // (`claim_pending_sigchld`), while SIGCHLD is the signal its kernel
+        // dequeues next: held for delivery to it, where no other thread can
+        // take it, so the handler runs as the sleep returns (`Claimed`). If the
+        // outside thread took it first, the claim finds none and the sleep
+        // parks again, as on Linux, where the woken sleeper finds no signal. Reading the pending bit and then ending the sleep
+        // left a gap in which the outside thread could take it, and then the
+        // sleep returned EINTR with no handler
+        // (https://github.com/rrnewton/hermit/issues/4341).
+        //
+        // In record and replay too, but only while no other thread of the
+        // process is outside the schedule in a call that could take the copy
+        // (`Scheduler::outside_call_may_take_sigchld`, through
+        // `WindowUnusable`). Then nothing but this claim can take it, so its
+        // pending bit, and the claim, are the same in a recording and its
+        // replay (https://github.com/rrnewton/hermit/issues/4343). While such a
+        // call is out, whether it took the copy is host-timed, and replay
+        // serves a signalfd read from the log without taking anything, so the
+        // two could decide differently; the sleep parks again, as before.
+        if committed == 0
+            && held_woken & sigchld != 0
+            && woken_sigchld_pending(&state, sigchld)
+            && matches!(
+                crate::tool_global::child_exit_sigchld(
+                    guest,
+                    crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::WindowUnusable,
+                )
+                .await,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer::Placed(true)
+            )
+            && state.next_dequeued(state.blocked).map(|(signal, _)| signal) == Some(libc::SIGCHLD)
+            && {
+                send_claim_fault_signal(guest, ClaimFault::Usr1BeforeClaim);
+                let claimed = claim_pending_sigchld(guest).await?;
+                if claimed {
+                    send_claim_fault_signal(guest, ClaimFault::Usr1AfterClaim);
+                }
+                claimed
+            }
+        {
+            // Its delivery stop places it, so it is not deferred behind a
+            // runnable sibling (`ThreadState::claimed_sigchld`).
+            guest.thread_state_mut().claimed_sigchld = true;
+            return Ok(SleepSignal::Claimed);
+        }
+        let held_woken = held_woken & !sigchld;
+        if held_wake_ends_sleep(&state, held_woken) {
+            return Ok(SleepSignal::Held);
+        }
+        return Ok(SleepSignal::None);
+    }
+    Ok(if unknown_held_wake {
+        SleepSignal::Held
+    } else {
+        SleepSignal::None
+    })
+}
+
+/// Whether this backend's `rt_sigsuspend` returns at once rather than sleeping
+/// until a signal arrives (`Detcore::handle_rt_sigsuspend`). Reverie names no
+/// capability for it, so this derives it from the one that implies it: a
+/// backend that owns guest signal delivery (`provides_process_signal_control`,
+/// KVM) implements the call itself, and its scheduler-modeled wake does not
+/// exist, so it returns EINTR for a signal already pending under the temporary
+/// mask and refuses a wait for one that is not (ENOSYS) rather than parking
+/// the vCPU outside the schedule. Every other backend runs the kernel's call,
+/// which sleeps. `rt_sigsuspend_never_sleeps_per_backend` pins the answer for
+/// every backend Reverie defines; a backend that gains a sleeping
+/// `rt_sigsuspend` must change it.
+pub(crate) fn rt_sigsuspend_never_sleeps(backend: &reverie::BackendCapabilities) -> bool {
+    backend.provides_process_signal_control
+}
+
+/// Whether a `SIGCHLD` this thread claimed (`ThreadState::claimed_sigchld`,
+/// `claimed`) is still claimed at a syscall entry, or after a `SIGCHLD` the
+/// ledger dropped: SIGCHLD is still pending in its queue or its process's,
+/// whatever its mask. The claim may have held another signal instead
+/// (https://github.com/rrnewton/hermit/issues/4346), whose handler can block
+/// SIGCHLD and make syscalls before its `rt_sigreturn` lets SIGCHLD be
+/// delivered (the Codex review of the claimed-delivery fix), or a duplicate
+/// the ledger drops while another copy waits (the Claude review).
+/// Once SIGCHLD is not pending, its delivery never came to this thread. A
+/// state that cannot be read (`read_state`, asked only for a claim) forgets
+/// the claim, so the delivery is deferred as before the claim existed.
+pub(crate) fn claim_still_pending<E>(
+    claimed: bool,
+    read_state: impl FnOnce() -> Result<crate::syscalls::threads::KernelSignalState, E>,
+) -> bool {
+    claimed && read_state().is_ok_and(|state| state.pending & kernel_sigset_bit(libc::SIGCHLD) != 0)
+}
+
+/// Whether `sigchld`, the scheduler's copy a sleep was woken for, is still
+/// pending for it and ends it: in the thread's or its process's queue, and
+/// unblocked and caught or acted on by default (`sleep_signal`, for a process
+/// whose send window is unusable).
+fn woken_sigchld_pending(
+    state: &crate::syscalls::threads::KernelSignalState,
+    sigchld: KernelSigset,
+) -> bool {
+    state.pending & state.interrupting(state.blocked) & sigchld != 0
+}
+
+/// Whether a sleep's own check (`sleep_signal`) asks the scheduler whether a
+/// committed `SIGCHLD` is pending for it (`PlacedPending`): it was woken for
+/// one (`held_woken`), or its private queue holds one. The latter is how a
+/// guest's thread-directed copy sent before the sleeper filed its request is
+/// not lost: the sender's turn found no sleep to wake, so only the sleeper's
+/// check before it parks sees it (https://github.com/rrnewton/hermit/issues/4132).
+fn asks_committed_sigchld(
+    held_woken: KernelSigset,
+    state: &crate::syscalls::threads::KernelSignalState,
+    sigchld: KernelSigset,
+) -> bool {
+    (held_woken | state.thread_pending) & sigchld != 0
+}
+
+/// What a committed `SIGCHLD` (`committed`, the scheduler's answer) makes of
+/// the sleep: it ends it if unblocked and caught or acted on by default, as
+/// the held signal the wake named (`Held`) or as one pending for it
+/// (`Pending`); `None` leaves the decision to the rest of the check.
+fn committed_sigchld_verdict(
+    state: &crate::syscalls::threads::KernelSignalState,
+    held_woken: KernelSigset,
+    committed: KernelSigset,
+) -> Option<SleepSignal> {
+    let verdict = if held_woken & committed != 0 {
+        SleepSignal::Held
+    } else {
+        SleepSignal::Pending
+    };
+    (state.interrupting(state.blocked) & committed != 0).then_some(verdict)
+}
+
+/// The size of a `struct signalfd_siginfo`, which has ssi_signo at 0,
+/// ssi_code at 8, ssi_pid at 12, ssi_uid at 16, ssi_status at 40, ssi_int at
+/// 44, ssi_utime at 56 and ssi_stime at 64.
+pub(crate) const SIGNALFD_RECORD: usize = 128;
+
+/// The signals signalfd `fd` of process `pid` reads, from its `sigmask:`
+/// line in `/proc/<pid>/fdinfo/<fd>` (a kernel sigset in hex), or `None`
+/// when it cannot be read.
+pub(crate) fn signalfd_mask(pid: i32, fd: i32) -> Option<u64> {
+    let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("sigmask:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+}
+
+fn signalfd_field(record: &[u8], at: usize) -> u32 {
+    u32::from_ne_bytes(record[at..at + 4].try_into().expect("four bytes"))
+}
+
+/// For each `signalfd_siginfo` record in `bytes`, the child-exit ledger
+/// question it raises (`Detcore::reconcile_signalfd_records`): a SIGCHLD with
+/// a child-exit code is the kernel's copy for that child, a SIGCHLD the
+/// scheduler sent (`is_own_sigchld_mark`) is its copy, and any other record
+/// raises none.
+fn signalfd_record_controls(
+    bytes: &[u8],
+    tracer: u32,
+) -> Vec<Option<crate::scheduler::child_exit_sigchld::ChildExitSigchldControl>> {
+    use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+    use crate::scheduler::child_exit_sigchld::DequeuedCopy;
+    bytes
+        .chunks(SIGNALFD_RECORD)
+        .map(|record| {
+            if signalfd_field(record, 0) != libc::SIGCHLD as u32 {
+                return None;
+            }
+            let code = signalfd_field(record, 8) as i32;
+            let pid = signalfd_field(record, 12);
+            let value = signalfd_field(record, 44) as i32;
+            let copy = if crate::scheduler::child_exit_sigchld::is_child_exit_code(code) {
+                DequeuedCopy::Kernel {
+                    child: DetPid::from_raw(pid as i32),
+                }
+            } else if crate::scheduler::child_exit_sigchld::is_own_sigchld_mark(
+                code, pid as i32, value, tracer,
+            ) {
+                DequeuedCopy::Scheduler
+            } else if code == libc::SI_TKILL {
+                DequeuedCopy::Thread
+            } else {
+                DequeuedCopy::Other
+            };
+            // Read, a kept record makes no `InboundSignal` request.
+            Some(ChildExitSigchldControl::Dequeue {
+                copy,
+                admits: false,
+            })
+        })
+        .collect()
+}
+
+/// The pieces of the guest buffers `extents` (address, length) that hold the
+/// first `len` bytes a vectored read scattered, in order; empty extents are
+/// skipped.
+pub(crate) fn signalfd_extent_pieces(
+    extents: &[(usize, usize)],
+    len: usize,
+) -> Vec<(usize, usize)> {
+    let mut left = len;
+    let mut pieces = Vec::new();
+    for (address, length) in extents {
+        if left == 0 {
+            break;
+        }
+        let take = (*length).min(left);
+        if take > 0 {
+            pieces.push((*address, take));
+            left -= take;
+        }
+    }
+    pieces
+}
+
+/// Signalfd records rewritten by the child-exit ledger's answers.
+#[derive(Debug, PartialEq, Eq)]
+struct RewrittenSignalfdRecords {
+    /// The buffer to write back: the kept records in order, then what the
+    /// buffer held before the read over the bytes of dropped ones, so no
+    /// dropped record stays readable.
+    bytes: Vec<u8>,
+    /// How many bytes the read returns.
+    kept: usize,
+}
+
+/// Apply the ledger's `answers`, one per record of `bytes`
+/// (`signalfd_record_controls`): a claimed duplicate or a duplicate scheduler
+/// copy is dropped, a copy that stands for an owned child is given that
+/// child's siginfo with zero CPU times, and every other record is kept as read.
+/// `Ok(None)` when no record changed. `Err(())` when a record is dropped but
+/// `before`, the buffer's bytes captured before the read
+/// (`capture_signalfd_buffer`), does not cover the bytes it leaves: they are
+/// never invented (the Codex re-check of
+/// https://github.com/rrnewton/hermit/pull/4351, P2-2).
+fn apply_signalfd_answers(
+    bytes: &[u8],
+    answers: &[Option<crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer>],
+    before: &[u8],
+) -> Result<Option<RewrittenSignalfdRecords>, ()> {
+    use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+    use crate::scheduler::child_exit_sigchld::OwnCopy;
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+    for (record, answer) in bytes.chunks(SIGNALFD_RECORD).zip(answers) {
+        let mut record = record.to_vec();
+        match answer {
+            Some(ChildExitSigchldAnswer::Claimed(true))
+            | Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate)) => {
+                changed = true;
+                continue;
+            }
+            Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own)))
+            | Some(ChildExitSigchldAnswer::ClaimedFor(own)) => {
+                // The record Linux writes for a child exit (SIL_CHLD) starts
+                // zeroed and fills in only these: nothing of the copy it
+                // replaces is kept, such as the own copy's SI_QUEUE mark in
+                // ssi_int and ssi_ptr. CPU times are 0 (natively, host time).
+                let signo = signalfd_field(&record, 0);
+                record.fill(0);
+                record[0..4].copy_from_slice(&signo.to_ne_bytes());
+                record[8..12].copy_from_slice(&own.code.to_ne_bytes());
+                record[12..16].copy_from_slice(&(own.pid as u32).to_ne_bytes());
+                record[16..20].copy_from_slice(&own.uid.to_ne_bytes());
+                record[40..44].copy_from_slice(&own.status.to_ne_bytes());
+                changed = true;
+            }
+            _ => {}
+        }
+        kept.extend_from_slice(&record);
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let kept_len = kept.len();
+    let len = bytes.len() - bytes.len() % SIGNALFD_RECORD;
+    // The bytes past the kept records are those the caller's buffer held
+    // before the read: a dropped record must leave the buffer as Linux, which
+    // never queued it, leaves it (https://github.com/rrnewton/hermit/issues/4293).
+    if before.len() < len {
+        return Err(());
+    }
+    kept.extend_from_slice(&before[kept_len..len]);
+    Ok(Some(RewrittenSignalfdRecords {
+        bytes: kept,
+        kept: kept_len,
+    }))
+}
+
+#[cfg(test)]
+mod signalfd_record_tests {
+    use super::*;
+    use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+    use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+    use crate::scheduler::child_exit_sigchld::ChildExitSiginfo;
+    use crate::scheduler::child_exit_sigchld::OwnCopy;
+
+    const TRACER: u32 = 4242;
+
+    /// `apply_signalfd_answers` with a captured buffer of zeros, so a dropped
+    /// record's bytes become zeros.
+    fn apply_without_capture(
+        bytes: &[u8],
+        answers: &[Option<ChildExitSigchldAnswer>],
+    ) -> Option<RewrittenSignalfdRecords> {
+        apply_signalfd_answers(bytes, answers, &vec![0; bytes.len()]).unwrap()
+    }
+
+    /// A record dropped where the capture does not reach (a buffer past
+    /// `SIGNALFD_CAPTURED`) is refused, never given invented bytes (the Codex
+    /// re-check of https://github.com/rrnewton/hermit/pull/4351, P2-2).
+    #[test]
+    fn a_dropped_record_past_the_capture_is_refused() {
+        let mut bytes = vec![0u8; 2 * SIGNALFD_RECORD];
+        bytes[0..4].copy_from_slice(&10u32.to_ne_bytes());
+        bytes[SIGNALFD_RECORD..SIGNALFD_RECORD + 4].copy_from_slice(&12u32.to_ne_bytes());
+        let before = vec![0xa5u8; SIGNALFD_RECORD];
+        assert_eq!(
+            apply_signalfd_answers(
+                &bytes,
+                &[Some(ChildExitSigchldAnswer::Claimed(true)), None],
+                &before,
+            ),
+            Err(())
+        );
+        // Nothing dropped needs no capture.
+        assert_eq!(apply_signalfd_answers(&bytes, &[None, None], &[]), Ok(None));
+    }
+
+    /// A dropped record's bytes get what the buffer held before the read.
+    #[test]
+    fn a_dropped_record_leaves_the_captured_bytes() {
+        let record = |signo: u32| {
+            let mut bytes = vec![0u8; SIGNALFD_RECORD];
+            bytes[0..4].copy_from_slice(&signo.to_ne_bytes());
+            bytes
+        };
+        let bytes = [record(10), record(12)].concat();
+        let before = vec![0xa5u8; 2 * SIGNALFD_RECORD];
+        let rewritten = apply_signalfd_answers(
+            &bytes,
+            &[Some(ChildExitSigchldAnswer::Claimed(true)), None],
+            &before,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rewritten.kept, SIGNALFD_RECORD);
+        assert_eq!(&rewritten.bytes[..SIGNALFD_RECORD], &record(12)[..]);
+        assert!(
+            rewritten.bytes[SIGNALFD_RECORD..]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+    }
+
+    fn record(signo: i32, code: i32, pid: u32, status: i32) -> Vec<u8> {
+        let mut record = vec![0u8; SIGNALFD_RECORD];
+        record[0..4].copy_from_slice(&(signo as u32).to_ne_bytes());
+        record[8..12].copy_from_slice(&code.to_ne_bytes());
+        record[12..16].copy_from_slice(&pid.to_ne_bytes());
+        record[40..44].copy_from_slice(&status.to_ne_bytes());
+        record[56..72].fill(7);
+        record
+    }
+
+    /// At a receiver in a nested PID namespace, a record of the scheduler's
+    /// marked `SI_QUEUE` copy (pid 0, `ssi_int` the mark) is its own copy; an
+    /// ancestor's `SI_USER` from pid 0 and an unmarked `SI_QUEUE` are another
+    /// (<https://github.com/rrnewton/hermit/issues/4155>).
+    #[test]
+    fn a_nested_receivers_marked_record_asks_for_the_own_copy() {
+        use crate::scheduler::child_exit_sigchld::DequeuedCopy;
+        let marked = |value: i32| {
+            let mut record = record(libc::SIGCHLD, libc::SI_QUEUE, 0, 0);
+            record[44..48].copy_from_slice(&value.to_ne_bytes());
+            record
+        };
+        let bytes = [
+            marked(crate::scheduler::child_exit_sigchld::OWN_SIGCHLD_MARK),
+            marked(7),
+            record(libc::SIGCHLD, libc::SI_USER, 0, 0),
+        ]
+        .concat();
+        let dequeue = |copy| {
+            Some(ChildExitSigchldControl::Dequeue {
+                copy,
+                admits: false,
+            })
+        };
+        assert_eq!(
+            signalfd_record_controls(&bytes, TRACER),
+            vec![
+                dequeue(DequeuedCopy::Scheduler),
+                dequeue(DequeuedCopy::Other),
+                dequeue(DequeuedCopy::Other),
+            ]
+        );
+    }
+
+    /// Each `SIGCHLD` record from the shared queue tells the ledger it was
+    /// taken, as which copy: a kernel child-exit copy names its child, the
+    /// scheduler's `SI_USER` copy is its own, a guest's `SI_USER` is another,
+    /// and a `SI_TKILL` copy is thread-directed; any other signal asks nothing.
+    /// A read makes no `InboundSignal` request (`admits` unset).
+    #[test]
+    fn each_record_asks_the_ledger_only_about_a_child_exit_copy() {
+        use crate::scheduler::child_exit_sigchld::DequeuedCopy;
+        let bytes = [
+            record(libc::SIGCHLD, libc::CLD_KILLED, 31, libc::SIGKILL),
+            record(libc::SIGCHLD, libc::SI_USER, TRACER, 0),
+            record(libc::SIGCHLD, libc::SI_USER, 77, 0),
+            record(libc::SIGCHLD, libc::SI_TKILL, 77, 0),
+            record(libc::SIGUSR1, libc::SI_USER, TRACER, 0),
+        ]
+        .concat();
+        let dequeue = |copy| {
+            Some(ChildExitSigchldControl::Dequeue {
+                copy,
+                admits: false,
+            })
+        };
+        assert_eq!(
+            signalfd_record_controls(&bytes, TRACER),
+            vec![
+                dequeue(DequeuedCopy::Kernel {
+                    child: DetPid::from_raw(31)
+                }),
+                dequeue(DequeuedCopy::Scheduler),
+                dequeue(DequeuedCopy::Other),
+                dequeue(DequeuedCopy::Thread),
+                None,
+            ]
+        );
+    }
+
+    /// A dropped record leaves the read, the records after it move up, and
+    /// zeros cover its old bytes; a standing copy gets its owned child's
+    /// siginfo, a cohort's lowest pid included (`ClaimedFor`), with zero CPU
+    /// times.
+    #[test]
+    fn dropped_records_leave_and_standing_ones_take_the_ledgers_siginfo() {
+        let own = |pid| ChildExitSiginfo {
+            code: libc::CLD_KILLED,
+            pid,
+            uid: 0,
+            status: libc::SIGKILL,
+        };
+        let first = record(libc::SIGCHLD, libc::CLD_KILLED, 31, libc::SIGKILL);
+        let second = record(libc::SIGCHLD, libc::SI_USER, TRACER, 0);
+        let third = record(libc::SIGCHLD, libc::CLD_KILLED, 33, libc::SIGKILL);
+        let bytes = [first, second, third].concat();
+        let rewritten = apply_without_capture(
+            &bytes,
+            &[
+                Some(ChildExitSigchldAnswer::Claimed(true)),
+                Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own(32)))),
+                Some(ChildExitSigchldAnswer::ClaimedFor(own(30))),
+            ],
+        )
+        .expect("records changed");
+        assert_eq!(rewritten.kept, 2 * SIGNALFD_RECORD);
+        assert_eq!(rewritten.bytes.len(), 3 * SIGNALFD_RECORD);
+        let expect = |pid: u32| {
+            let mut wanted = record(libc::SIGCHLD, libc::CLD_KILLED, pid, libc::SIGKILL);
+            wanted[56..72].fill(0);
+            wanted
+        };
+        assert_eq!(&rewritten.bytes[..SIGNALFD_RECORD], &expect(32)[..]);
+        assert_eq!(
+            &rewritten.bytes[SIGNALFD_RECORD..2 * SIGNALFD_RECORD],
+            &expect(30)[..]
+        );
+        assert!(
+            rewritten.bytes[2 * SIGNALFD_RECORD..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
+
+    /// The marked own copy a nested receiver reads is rewritten to the
+    /// record Linux writes for a child exit, which keeps nothing of the
+    /// copy: `ssi_int` and `ssi_ptr` (bytes 44..56), where the mark was, are
+    /// 0, like every field a child exit does not fill in (Codex re-check #2
+    /// of https://github.com/rrnewton/hermit/pull/4172).
+    #[test]
+    fn a_rewritten_own_copy_keeps_none_of_its_marked_record() {
+        let mut marked = record(libc::SIGCHLD, libc::SI_QUEUE, 0, 0);
+        marked[44..48]
+            .copy_from_slice(&crate::scheduler::child_exit_sigchld::OWN_SIGCHLD_MARK.to_ne_bytes());
+        marked[48..56].fill(9);
+        marked[20..40].fill(5);
+        marked[72..].fill(6);
+        let rewritten = apply_without_capture(
+            &marked,
+            &[Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(
+                ChildExitSiginfo {
+                    code: libc::CLD_KILLED,
+                    pid: 3,
+                    uid: 0,
+                    status: libc::SIGKILL,
+                },
+            )))],
+        )
+        .expect("records changed");
+        let mut wanted = vec![0u8; SIGNALFD_RECORD];
+        wanted[0..4].copy_from_slice(&(libc::SIGCHLD as u32).to_ne_bytes());
+        wanted[8..12].copy_from_slice(&libc::CLD_KILLED.to_ne_bytes());
+        wanted[12..16].copy_from_slice(&3u32.to_ne_bytes());
+        wanted[40..44].copy_from_slice(&libc::SIGKILL.to_ne_bytes());
+        assert_eq!(rewritten.bytes, wanted);
+        assert!(rewritten.bytes[44..56].iter().all(|byte| *byte == 0));
+    }
+
+    /// A vectored read's returned bytes are found across its buffers in
+    /// order, a record split between two buffers included, and only as far
+    /// as the read returned.
+    #[test]
+    fn a_vectored_reads_records_are_found_across_its_buffers() {
+        let extents = [(0x1000, 100), (0x2000, 0), (0x3000, 200), (0x4000, 128)];
+        assert_eq!(
+            signalfd_extent_pieces(&extents, 256),
+            vec![(0x1000, 100), (0x3000, 156)]
+        );
+        assert_eq!(
+            signalfd_extent_pieces(&extents, 428),
+            vec![(0x1000, 100), (0x3000, 200), (0x4000, 128)]
+        );
+        assert_eq!(signalfd_extent_pieces(&extents, 0), vec![]);
+    }
+
+    /// A read whose every record is dropped returns nothing and leaves only
+    /// zeros; a read the ledger leaves alone is not rewritten.
+    #[test]
+    fn a_fully_dropped_read_leaves_no_record_and_an_untouched_read_is_not_rewritten() {
+        let bytes = [
+            record(libc::SIGCHLD, libc::CLD_KILLED, 31, libc::SIGKILL),
+            record(libc::SIGCHLD, libc::SI_USER, TRACER, 0),
+        ]
+        .concat();
+        let rewritten = apply_without_capture(
+            &bytes,
+            &[
+                Some(ChildExitSigchldAnswer::Claimed(true)),
+                Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate)),
+            ],
+        )
+        .expect("records changed");
+        assert_eq!(rewritten.kept, 0);
+        assert!(rewritten.bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            apply_without_capture(
+                &bytes,
+                &[
+                    Some(ChildExitSigchldAnswer::Claimed(false)),
+                    Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Unowned)),
+                ],
+            ),
+            None
+        );
+    }
+}
+
+/// The signals a thread may send to its own multi-threaded process with `kill`
+/// or `rt_sigqueueinfo` (https://github.com/rrnewton/hermit/issues/4034): each
+/// is numbered below SIGCHLD, so a child-exit SIGCHLD, whenever the kernel
+/// posts it, is dequeued after it; none is in the kernel's synchronous set
+/// (`SYNCHRONOUS_MASK`); and none is a signal Reverie gives a meaning
+/// (SIGTRAP, its stop signal, and SIGSTKFLT, its timer marker).
+const OWN_PROCESS_SIGNALS: [libc::c_int; 7] = [
+    libc::SIGHUP,
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGPIPE,
+    libc::SIGTERM,
+];
+
+/// Why a process-directed signal a thread sends to its own multi-threaded
+/// process is refused, each a named refusal of the design for
+/// https://github.com/rrnewton/hermit/issues/4034.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnProcessSignalRefusal {
+    /// The signal is not one of `OWN_PROCESS_SIGNALS`.
+    SignalNotAdmitted,
+    /// The process leaves the signal at its default, fatal, disposition.
+    DefaultDisposition,
+    /// The run records or replays.
+    RecordReplay,
+    /// The run replays a recorded schedule (`--replay-schedule-from`).
+    ScheduleReplay,
+    /// A guest has sent SIGSTKFLT, which Reverie uses as its timer marker.
+    GuestMarkerSignal,
+    /// `--stacktrace-signal` is configured.
+    StacktraceSignal,
+    /// The sender blocks the signal.
+    SenderBlocks,
+    /// A thread of the process runs or sleeps outside the schedule.
+    OutOfSchedule(DetTid),
+    /// A thread of the process has an unknown mask.
+    UnknownMask(DetTid),
+    /// The sender is not the thread the call names, and a live thread does
+    /// not block the signal.
+    NotSoleReceiver(DetTid),
+    /// The sender's private queue holds these signals, which it does not block.
+    PrivatePending(u64),
+    /// These host-timed sources, which the sender does not block, are armed.
+    HostTimedSource(u64),
+    /// Unreaped children have these exit signals, which the sender does not block.
+    ForeignExitSignal(u64),
+    /// The scheduler sent these signals, at or below the one sent, and no
+    /// thread has taken them yet.
+    UndeliveredSchedulerSignal(u64),
+    /// A happens-before anchor is set on this call's completion.
+    PosthookAnchor,
+    /// The process holds a signalfd.
+    Signalfd,
+    /// An exec is in flight in the process.
+    ExecInFlight,
+}
+
+impl std::fmt::Display for OwnProcessSignalRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SignalNotAdmitted => write!(
+                f,
+                "only SIGHUP, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2, SIGPIPE and SIGTERM are delivered \
+                 deterministically to the sender"
+            ),
+            Self::DefaultDisposition => write!(
+                f,
+                "the signal has its default disposition, which ends the process"
+            ),
+            Self::RecordReplay => write!(f, "the run records or replays"),
+            Self::ScheduleReplay => write!(
+                f,
+                "the run replays a recorded schedule (--replay-schedule-from), whose trace turn \
+                 after the send can hand the turn to another thread"
+            ),
+            Self::GuestMarkerSignal => write!(
+                f,
+                "a guest sent SIGSTKFLT, which Reverie also uses as its timer marker, so a pending \
+                 copy cannot be told from Reverie's"
+            ),
+            Self::StacktraceSignal => write!(f, "--stacktrace-signal is configured"),
+            Self::SenderBlocks => write!(f, "the sending thread blocks the signal"),
+            Self::OutOfSchedule(tid) => write!(
+                f,
+                "thread {tid} runs or sleeps outside the schedule, at moments host timing sets"
+            ),
+            Self::UnknownMask(tid) => write!(f, "thread {tid}'s signal mask is unknown"),
+            Self::NotSoleReceiver(tid) => write!(
+                f,
+                "thread {tid} does not block the signal, so Linux could give it to either thread"
+            ),
+            Self::PrivatePending(set) => write!(
+                f,
+                "the sending thread has signals pending ({set:#x}) that it would take first"
+            ),
+            Self::HostTimedSource(set) => write!(
+                f,
+                "a source that sends signals {set:#x} at moments host timing sets is armed"
+            ),
+            Self::ForeignExitSignal(set) => write!(
+                f,
+                "a child with exit signal {set:#x} is unreaped, and the kernel sends that signal at \
+                 a moment host timing sets"
+            ),
+            Self::UndeliveredSchedulerSignal(set) => write!(
+                f,
+                "the scheduler sent signals {set:#x} that no thread has taken yet"
+            ),
+            Self::PosthookAnchor => {
+                write!(f, "a happens-before anchor is set on the call's completion")
+            }
+            Self::Signalfd => write!(f, "the process holds a signalfd"),
+            Self::ExecInFlight => write!(f, "an exec is in flight in the process"),
+        }
+    }
+}
+
+/// Everything a process-directed signal `sig` that a thread sends to its own
+/// multi-threaded process is decided from, all fixed by the schedule at the
+/// sender's turn (`own_process_signal_refusal`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OwnProcessSignal {
+    pub(crate) sig: libc::c_int,
+    /// Whether the call names the sender itself (S1 of the design).
+    pub(crate) names_sender: bool,
+    /// The sender's mask (`SigBlk`).
+    pub(crate) blocked: u64,
+    /// The sender's private queue (`SigPnd`).
+    pub(crate) thread_pending: u64,
+    /// The process's `SIG_IGN` dispositions (`SigIgn`).
+    pub(crate) ignored: u64,
+    /// The process's handlers (`SigCgt`).
+    pub(crate) caught: u64,
+    pub(crate) inputs: OwnProcessSignalInputs,
+    pub(crate) record_replay: bool,
+    pub(crate) schedule_replay: bool,
+    pub(crate) stacktrace_signal: bool,
+    pub(crate) posthook_anchor: bool,
+    pub(crate) signalfd: bool,
+}
+
+/// The refusal for `send`, or `None` when the kernel's choice of receiver and
+/// the sender's dequeue are forced: the sender takes the signal on its way back
+/// to user mode, before any other thread of the process can run
+/// (https://github.com/rrnewton/hermit/issues/4034).
+pub(crate) fn own_process_signal_refusal(
+    send: &OwnProcessSignal,
+) -> Option<OwnProcessSignalRefusal> {
+    use OwnProcessSignalRefusal as R;
+    let bit = kernel_sigset_bit(send.sig);
+    if !OWN_PROCESS_SIGNALS.contains(&send.sig) {
+        return Some(R::SignalNotAdmitted);
+    }
+    if (send.ignored | send.caught) & bit == 0 {
+        return Some(R::DefaultDisposition);
+    }
+    if send.record_replay {
+        return Some(R::RecordReplay);
+    }
+    if send.schedule_replay {
+        return Some(R::ScheduleReplay);
+    }
+    if send.stacktrace_signal {
+        return Some(R::StacktraceSignal);
+    }
+    if send.blocked & bit != 0 {
+        return Some(R::SenderBlocks);
+    }
+    for (tid, state) in &send.inputs.siblings {
+        if *state == SiblingSignalState::OutOfSchedule {
+            return Some(R::OutOfSchedule(*tid));
+        }
+    }
+    for (tid, state) in &send.inputs.siblings {
+        if *state == SiblingSignalState::InSchedule(None) {
+            return Some(R::UnknownMask(*tid));
+        }
+    }
+    if !send.names_sender {
+        for (tid, state) in &send.inputs.siblings {
+            if matches!(state, SiblingSignalState::InSchedule(Some(mask)) if mask & bit == 0) {
+                return Some(R::NotSoleReceiver(*tid));
+            }
+        }
+    }
+    let unblocked = !send.blocked;
+    let private = without_perf_event_signal(send.thread_pending) & unblocked;
+    if private != 0 {
+        return Some(R::PrivatePending(private));
+    }
+    let host_timed = send.inputs.host_timed & unblocked;
+    if host_timed != 0 {
+        return Some(R::HostTimedSource(host_timed));
+    }
+    let foreign = send.inputs.foreign_exit_signals & unblocked;
+    if foreign != 0 {
+        return Some(R::ForeignExitSignal(foreign));
+    }
+    // A signal numbered at or below `sig` is dequeued first or coalesces.
+    let at_or_below = bit | (bit - 1);
+    let undelivered = send.inputs.undelivered_scheduler_signals & unblocked & at_or_below;
+    if undelivered != 0 {
+        return Some(R::UndeliveredSchedulerSignal(undelivered));
+    }
+    if send.posthook_anchor {
+        return Some(R::PosthookAnchor);
+    }
+    if send.signalfd {
+        return Some(R::Signalfd);
+    }
+    if send.inputs.exec_in_flight {
+        return Some(R::ExecInFlight);
+    }
+    if send.inputs.guest_marker_signal {
+        return Some(R::GuestMarkerSignal);
+    }
+    None
+}
+
+/// What a send names, as `Detcore::refuse_reserved_signal_send` reads it.
+pub(crate) enum ReservedSendTarget {
+    /// The process a positive pid names (`kill`, `rt_sigqueueinfo`): any of
+    /// its live threads' ids names it, as in Linux's `kill_pid_info`. Not a
+    /// group: a non-positive pid takes the ordinary path.
+    Process(libc::pid_t),
+    /// A thread (`tkill`), and for `tgkill` and `rt_tgsigqueueinfo` the
+    /// thread group the call says it is in.
+    Thread {
+        tgid: Option<libc::pid_t>,
+        tid: libc::pid_t,
+    },
+    /// What a `pidfd_send_signal` descriptor names, already Detcore's id
+    /// (`None` for a descriptor with no recorded target), and whether the
+    /// call is thread-scoped (`PIDFD_SIGNAL_THREAD`).
+    Pidfd { named: Option<DetPid>, thread: bool },
+}
+
+/// The `siginfo` a send carries, as `Detcore::refuse_reserved_signal_send`
+/// checks it before a refusal: none (`kill`, `tkill`, `tgkill`); the
+/// address `rt_sigqueueinfo` and `rt_tgsigqueueinfo` copy (0 for a null
+/// pointer, which Linux's copy refuses too); or `pidfd_send_signal`'s,
+/// which may be absent.
+pub(crate) enum ReservedSendSiginfo {
+    None,
+    Queued(usize),
+    Pidfd(Option<usize>),
+}
+
+/// The size of Linux's `struct kernel_siginfo` on x86-64, the part of a
+/// `siginfo_t` every copy from user memory reads, and of the expansion after
+/// it (`SI_EXPANSION_SIZE`: `SI_MAX_SIZE`, 128, less that).
+const KERNEL_SIGINFO_SIZE: usize = 48;
+const SI_EXPANSION_SIZE: usize = 128 - KERNEL_SIGINFO_SIZE;
+
+/// Whether Linux knows the layout of a siginfo with signal `signo` and code
+/// `code`, so that it need not check the expansion bytes
+/// (`known_siginfo_layout`, kernel/signal.c:3320-3337 at v6.12, with
+/// `sig_sicodes` at :3304-3318 and the limits of
+/// include/uapi/asm-generic/siginfo.h).
+fn known_siginfo_layout(signo: i32, code: i32) -> bool {
+    const SI_KERNEL: i32 = 0x80;
+    const SI_DETHREAD: i32 = -7;
+    const SI_ASYNCNL: i32 = -60;
+    const NSIGPOLL: i32 = 6;
+    // `sig_specific_sicodes`: a signal below SIGRTMIN with its own codes.
+    let specific_limit = match signo {
+        libc::SIGILL => Some(11),
+        libc::SIGFPE => Some(15),
+        libc::SIGSEGV => Some(10),
+        libc::SIGBUS => Some(5),
+        libc::SIGTRAP => Some(6),
+        libc::SIGCHLD => Some(6),
+        libc::SIGPOLL => Some(NSIGPOLL),
+        libc::SIGSYS => Some(2),
+        _ => None,
+    };
+    if code == SI_KERNEL {
+        true
+    } else if code > 0 {
+        code <= specific_limit.unwrap_or(NSIGPOLL)
+    } else {
+        code >= SI_DETHREAD || code == SI_ASYNCNL
+    }
+}
+
+/// Linux's answer to the copy of a send's `siginfo` from user memory, which
+/// comes before any permission check (v6.12 kernel/signal.c): `head`, the
+/// first `KERNEL_SIGINFO_SIZE` bytes, `None` when the caller cannot read
+/// them, and `read_expansion`, which reads the rest (`None` when it cannot)
+/// and is called only when Linux reads it too. The head must be readable
+/// (EFAULT, `copy_siginfo_from_user`); only for a layout Linux does not know
+/// is the expansion read at all, and then it must be readable (EFAULT) and
+/// every byte of it 0 (E2BIG, `post_copy_siginfo_from_user`, :3394-3415), so
+/// a known layout whose expansion is unmapped copies. `rt_sigqueueinfo` and
+/// `rt_tgsigqueueinfo` judge the layout by the call's `signal`
+/// (`__copy_siginfo_from_user`, :3417-3424); `pidfd_send_signal` (`pidfd`)
+/// by the siginfo's own `si_signo`, which must then equal `signal` (EINVAL,
+/// :3959-3966).
+fn siginfo_copy_errno(
+    signal: i32,
+    pidfd: bool,
+    head: Option<[u8; KERNEL_SIGINFO_SIZE]>,
+    read_expansion: impl FnOnce() -> Option<[u8; SI_EXPANSION_SIZE]>,
+) -> Option<Errno> {
+    let Some(head) = head else {
+        return Some(Errno::EFAULT);
+    };
+    let field = |offset: usize| {
+        i32::from_ne_bytes(head[offset..offset + 4].try_into().expect("four bytes"))
+    };
+    let (si_signo, si_code) = (field(0), field(8));
+    let layout_signo = if pidfd { si_signo } else { signal };
+    if !known_siginfo_layout(layout_signo, si_code) {
+        match read_expansion() {
+            None => return Some(Errno::EFAULT),
+            Some(bytes) if bytes.iter().any(|byte| *byte != 0) => return Some(Errno::E2BIG),
+            Some(_) => {}
+        }
+    }
+    (pidfd && si_signo != signal).then_some(Errno::EINVAL)
+}
+
+/// Whether the thread group a `tgkill` or `rt_tgsigqueueinfo` names
+/// (`group`) is the named thread's own process (`leader`), as Linux requires
+/// (`task_tgid_vnr(p) == tgid` in `do_send_specific`, kernel/signal.c:3994 at
+/// v6.12); a tgid naming another thread of that process, or another process,
+/// is ESRCH there. Always true for a call that names no group.
+fn reserved_send_names_its_group(group: Option<DetPid>, leader: Option<DetPid>) -> bool {
+    group.is_none_or(|group| leader == Some(group))
+}
+
+/// Whether a reserved send (`Detcore::refuse_reserved_signal_send`) names the
+/// caller's own process by its ids alone, before any lookup: `named` is the
+/// caller's thread or its process's id, or `group`, the thread group a
+/// `tgkill` or `rt_tgsigqueueinfo` names, is the caller's process. Such a send
+/// keeps its ordinary path; a `group` that does not hold `named` is the
+/// kernel's ESRCH there.
+fn reserved_send_names_own(
+    own: DetPid,
+    caller: DetTid,
+    named: DetTid,
+    group: Option<DetPid>,
+) -> bool {
+    named == caller || named == own || group == Some(own)
+}
+
+/// Whether a reserved send is refused, given `targets`, the live threads of
+/// the process the send names in Detcore's model (`process_signal_targets`),
+/// and `thread`, the thread a thread-directed send names: only a process
+/// with a live thread, which is not the caller's own (the caller is a live
+/// thread of its own process), and for a thread-directed send only when the
+/// named thread is one of those live threads. Anything else keeps Linux's
+/// answer on the ordinary path: a zombie or a reaped process has no live
+/// thread (0 or ESRCH), and an exited thread, or one outside the group a
+/// `tgkill` names, is ESRCH.
+fn reserved_send_refuses(caller: DetTid, thread: Option<DetTid>, targets: &[DetTid]) -> bool {
+    !targets.is_empty()
+        && !targets.contains(&caller)
+        && thread.is_none_or(|thread| targets.contains(&thread))
+}
+
+/// How a process-directed signal the calling thread sends goes on
+/// (`Detcore::own_process_signal`).
+/// What a positive pid the calling thread names refers to
+/// (`Detcore::name_guest_pid`).
+enum NamedGuestPid {
+    /// This task, by its DetTid. `own_init_caught` is set when it belongs to
+    /// the caller's own PID namespace's init, to the signals that init catches.
+    Task {
+        task: DetTid,
+        own_init_caught: Option<u64>,
+    },
+    /// The call's answer, decided here: ESRCH for a pid no task of the
+    /// caller's namespace has, or a refusal by name.
+    Answer(Result<i64, Error>),
+}
+
+enum OwnProcessSend {
+    /// The call does not name the sender's own multi-threaded process: the
+    /// ordinary path decides.
+    NotOwn,
+    /// Admitted: forward the call unchanged, holding the sender's turn.
+    Admitted,
+    /// Refused by name, with the policy's answer.
+    Refused(Result<i64, Error>),
+}
+
+/// What `Detcore::rt_sigqueueinfo_precheck` found.
+enum RtSigqueueinfoPrecheck {
+    /// The kernel fails the call without sending (EPERM, or E2BIG, after a
+    /// complete copy): forward it unchanged.
+    KernelFails,
+    /// The kernel's copy certainly faults: Hermit answers EFAULT itself.
+    Efault,
+    /// The call goes on to admission.
+    Proceeds,
+    /// Hermit cannot read the whole `siginfo_t`, and cannot prove that the
+    /// kernel's copy faults: `[vvar]`, which neither tracer read reaches; a
+    /// tail running into a gap; a first 48 bytes in the gap below a grow-down
+    /// mapping, which the kernel's copy may grow into; or an unreadable
+    /// `/proc/<tid>/smaps`.
+    Unreadable,
+}
+
+/// One mapping of a `/proc/<pid>/smaps` listing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mapping {
+    start: usize,
+    end: usize,
+    /// Whether user mode can read it: on x86 any of read, write or execute
+    /// permission allows a read; none (`---`) faults.
+    user_readable: bool,
+    /// `VmFlags` `gd`: a fault just below it can grow it downwards.
+    growsdown: bool,
+}
+
+/// The mappings of a `/proc/<pid>/smaps` listing, in address order.
+fn parse_smaps(smaps: &str) -> Vec<Mapping> {
+    let mut mappings: Vec<Mapping> = Vec::new();
+    for line in smaps.lines() {
+        if let Some(flags) = line.strip_prefix("VmFlags:") {
+            if let Some(last) = mappings.last_mut() {
+                last.growsdown = flags.split_whitespace().any(|flag| flag == "gd");
+            }
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some((start, end)) = fields.next().and_then(|range| range.split_once('-')) else {
+            continue;
+        };
+        let (Ok(start), Ok(end), Some(perms)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(end, 16),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        if perms.len() < 4 {
+            continue;
+        }
+        mappings.push(Mapping {
+            start,
+            end,
+            user_readable: perms.chars().take(3).any(|perm| perm != '-'),
+            growsdown: false,
+        });
+    }
+    mappings.sort_by_key(|mapping| mapping.start);
+    mappings
+}
+
+/// Why a byte is not readable by user mode (`first_user_unreadable`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unreadable {
+    /// In a mapping without read, write or execute permission.
+    NoPermission,
+    /// In no mapping; `below_growsdown` when the next mapping above it can
+    /// grow down into it.
+    Hole { below_growsdown: bool },
+}
+
+/// Where the first byte of `[address, address + len)` that user mode cannot
+/// read lies, or `None` when user mode can read them all. A range that
+/// overflows the address space counts as a hole.
+fn first_user_unreadable(mappings: &[Mapping], address: usize, len: usize) -> Option<Unreadable> {
+    let Some(end) = address.checked_add(len) else {
+        return Some(Unreadable::Hole {
+            below_growsdown: false,
+        });
+    };
+    let mut next = address;
+    while next < end {
+        match mappings.iter().find(|mapping| mapping.end > next) {
+            Some(mapping) if mapping.start <= next => {
+                if !mapping.user_readable {
+                    return Some(Unreadable::NoPermission);
+                }
+                next = mapping.end;
+            }
+            above => {
+                return Some(Unreadable::Hole {
+                    below_growsdown: above.is_some_and(|mapping| mapping.growsdown),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The signals a send of `sig` lets Linux send later at a moment set by host
+/// timing, as a kernel sigset; 0 for every signal but the four that stop by
+/// default. A stopped member makes its process group one that an exit can
+/// orphan with a stopped job, and Linux then sends that whole group SIGHUP and
+/// SIGCONT at the exiting process's physical exit (`kill_orphaned_pgrp` in
+/// kernel/exit.c). Apart from a guest's send, only a terminal stops a guest
+/// process, and a terminal's signals, these two among them, are recorded with
+/// `terminal_signals`.
+fn orphaned_group_signals(sig: libc::c_int) -> u64 {
+    match sig {
+        libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU => {
+            kernel_sigset_bit(libc::SIGHUP) | kernel_sigset_bit(libc::SIGCONT)
+        }
+        _ => 0,
+    }
+}
+
+/// Whether a held signal the scheduler woke a sleep for (`held_woken`, a
+/// child-exit `SIGCHLD`) ends it: as Linux delivery would, only when this
+/// thread's mask leaves it unblocked and it is caught or acted on by default
+/// (`KernelSignalState::interrupting`). A blocked one stays pending, and a
+/// default-ignored one (`SIGCHLD` without a handler) is discarded, and either
+/// way the sleep goes on (https://github.com/rrnewton/hermit/issues/4126).
+///
+/// The caller has already removed a committed `SIGCHLD` that no longer counts:
+/// the scheduler sends it to the process, so the kernel gives it to whichever
+/// thread resumes first without blocking it, and a schedule may run a sibling
+/// first (`--chaos-target-races`). Taken by that sibling, it is gone from the
+/// child-exit ledger's send window (`ChildExitSigchldControl::PlacedPending`),
+/// and the sleep goes on to its original deadline, as a futex wait woken for a
+/// signal waits again (`futex_wait_held_after_wake`). Answering EINTR for it
+/// anyway was a result Linux cannot give: the call interrupted, the handler run
+/// in another thread (the Claude re-check of
+/// https://github.com/rrnewton/hermit/pull/4131). A held signal a host-timed
+/// source can also post is decided from the mask and dispositions alone.
+fn held_wake_ends_sleep(
+    state: &crate::syscalls::threads::KernelSignalState,
+    held_woken: KernelSigset,
+) -> bool {
+    state.interrupting(state.blocked) & held_woken != 0
+}
+
 #[cfg(test)]
 mod tests {
+    /// A first probe's not-run report restarts the call; any other result,
+    /// errno or value, passes through unchanged.
+    #[test]
+    fn a_first_probe_not_run_restarts_the_call() {
+        let restart = |result: Result<u64, Error>| restart_if_first_probe_not_run(result);
+        assert!(matches!(
+            restart(Err(Errno::ERESTARTSYS.into())),
+            Err(Error::Errno(Errno::ERESTARTNOINTR))
+        ));
+        for errno in [
+            Errno::EFAULT,
+            Errno::EINVAL,
+            Errno::EINTR,
+            Errno::ERESTARTNOHAND,
+        ] {
+            assert!(
+                matches!(restart(Err(errno.into())), Err(Error::Errno(e)) if e == errno),
+                "{errno} passes through"
+            );
+        }
+        assert!(matches!(restart(Ok(7)), Ok(7)));
+    }
+
+    /// A reserved send names the caller's own process by its ids when it names
+    /// the calling thread, the process's id, or the process as the thread
+    /// group; any other id needs a lookup (A5 step 3c slice 0a).
+    #[test]
+    fn a_reserved_send_to_the_callers_own_process_is_decided_by_its_ids() {
+        let own = DetPid::from_raw(3);
+        let caller = DetTid::from_raw(4);
+        let other = DetPid::from_raw(5);
+        assert!(reserved_send_names_own(own, caller, caller, None));
+        assert!(reserved_send_names_own(own, caller, own, None));
+        // tgkill(own, other): the group is the caller's; the kernel answers.
+        assert!(reserved_send_names_own(own, caller, other, Some(own)));
+        assert!(!reserved_send_names_own(own, caller, other, None));
+        assert!(!reserved_send_names_own(own, caller, other, Some(other)));
+    }
+
+    /// A `tgkill` or `rt_tgsigqueueinfo` is refused only when the tgid it
+    /// names is the thread's own process: a tgid naming another thread of
+    /// that process, or another process, is Linux's ESRCH
+    /// (`do_send_specific`), and a call that names no group always matches.
+    #[test]
+    fn a_reserved_thread_send_must_name_the_threads_own_group() {
+        let leader = DetPid::from_raw(5);
+        let sibling = DetPid::from_raw(6);
+        assert!(reserved_send_names_its_group(None, Some(leader)));
+        assert!(reserved_send_names_its_group(Some(leader), Some(leader)));
+        assert!(!reserved_send_names_its_group(Some(sibling), Some(leader)));
+        assert!(!reserved_send_names_its_group(Some(leader), None));
+    }
+
+    /// Linux's siginfo copy, which comes before any permission check: an
+    /// unreadable head is EFAULT; an unknown layout needs a readable, all-zero
+    /// expansion (EFAULT, E2BIG); `rt_*sigqueueinfo` judge the layout by the
+    /// call's signal and `pidfd_send_signal` by the siginfo's own, which must
+    /// equal the call's (EINVAL).
+    #[test]
+    fn a_reserved_send_checks_its_siginfo_as_linux_copies_it() {
+        let head = |signo: i32, code: i32| {
+            let mut bytes = [0u8; KERNEL_SIGINFO_SIZE];
+            bytes[0..4].copy_from_slice(&signo.to_ne_bytes());
+            bytes[8..12].copy_from_slice(&code.to_ne_bytes());
+            Some(bytes)
+        };
+        let zero = || Some([0u8; SI_EXPANSION_SIZE]);
+        let dirty = || {
+            let mut bytes = [0u8; SI_EXPANSION_SIZE];
+            bytes[SI_EXPANSION_SIZE - 1] = 1;
+            Some(bytes)
+        };
+        let unreadable = || None;
+        // A known layout never reads its expansion, as Linux does not.
+        let never = || -> Option<[u8; SI_EXPANSION_SIZE]> {
+            panic!("the expansion of a known layout must not be read")
+        };
+        let sys = libc::SIGSYS;
+        for pidfd in [false, true] {
+            assert_eq!(
+                siginfo_copy_errno(sys, pidfd, None, never),
+                Some(Errno::EFAULT)
+            );
+            // SI_QUEUE is a known layout: the expansion is not read, so an
+            // unreadable one copies.
+            assert_eq!(siginfo_copy_errno(sys, pidfd, head(sys, -1), never), None);
+            // -8 is below SI_DETHREAD and not SI_ASYNCNL: unknown.
+            assert_eq!(siginfo_copy_errno(sys, pidfd, head(sys, -8), zero), None);
+            assert_eq!(
+                siginfo_copy_errno(sys, pidfd, head(sys, -8), dirty),
+                Some(Errno::E2BIG)
+            );
+            assert_eq!(
+                siginfo_copy_errno(sys, pidfd, head(sys, -8), unreadable),
+                Some(Errno::EFAULT)
+            );
+        }
+        // A mismatched si_signo is EINVAL for pidfd_send_signal only.
+        let usr1 = head(libc::SIGUSR1, -1);
+        assert_eq!(
+            siginfo_copy_errno(sys, true, usr1, never),
+            Some(Errno::EINVAL)
+        );
+        assert_eq!(siginfo_copy_errno(sys, false, usr1, never), None);
+        // rt_*sigqueueinfo judge the layout by the call's signal: SIGSYS's
+        // code 2 (SYS_USER_DISPATCH) is known; code 3 is not.
+        assert_eq!(siginfo_copy_errno(sys, false, head(0, 2), never), None);
+        assert_eq!(
+            siginfo_copy_errno(sys, false, head(0, 3), dirty),
+            Some(Errno::E2BIG)
+        );
+    }
+
+    /// `known_siginfo_layout`'s table: SI_KERNEL, the codes down to
+    /// SI_DETHREAD and SI_ASYNCNL are known for every signal; a positive code
+    /// up to the signal's own limit, or NSIGPOLL for a signal without one.
+    #[test]
+    fn known_siginfo_layout_matches_linuxs_table() {
+        for signo in [
+            libc::SIGSYS,
+            libc::SIGSEGV,
+            libc::SIGTRAP,
+            libc::SIGUSR1,
+            40,
+        ] {
+            for code in [0x80, 0, -1, -6, -7, -60] {
+                assert!(known_siginfo_layout(signo, code), "{signo} {code}");
+            }
+            for code in [-8, -59, -61, 0x81] {
+                assert!(!known_siginfo_layout(signo, code), "{signo} {code}");
+            }
+        }
+        for (signo, limit) in [
+            (libc::SIGILL, 11),
+            (libc::SIGFPE, 15),
+            (libc::SIGSEGV, 10),
+            (libc::SIGBUS, 5),
+            (libc::SIGTRAP, 6),
+            (libc::SIGCHLD, 6),
+            (libc::SIGPOLL, 6),
+            (libc::SIGSYS, 2),
+            (libc::SIGUSR1, 6),
+        ] {
+            assert!(known_siginfo_layout(signo, limit), "{signo}");
+            assert!(!known_siginfo_layout(signo, limit + 1), "{signo}");
+        }
+    }
+
+    /// Only a send to a process with a live thread, other than the caller's
+    /// own, is refused, and a thread-directed one only when the named thread
+    /// is live in it: a zombie or reaped process (no live thread), an exited
+    /// thread and a thread outside the named group keep Linux's answer.
+    #[test]
+    fn a_reserved_send_is_refused_only_to_another_live_process() {
+        let caller = DetTid::from_raw(3);
+        let other = DetTid::from_raw(5);
+        let other_sibling = DetTid::from_raw(6);
+        let live_other = [other, other_sibling];
+        // kill(other): a live process that is not the caller's.
+        assert!(reserved_send_refuses(caller, None, &live_other));
+        // tkill/tgkill of a live thread of it.
+        assert!(reserved_send_refuses(
+            caller,
+            Some(other_sibling),
+            &live_other
+        ));
+        // The caller's own process.
+        assert!(!reserved_send_refuses(caller, None, &[caller, other]));
+        // A zombie or a reaped process: no live thread.
+        assert!(!reserved_send_refuses(caller, None, &[]));
+        assert!(!reserved_send_refuses(caller, Some(other), &[]));
+        // An exited thread, or one outside the group tgkill names.
+        assert!(!reserved_send_refuses(
+            caller,
+            Some(DetTid::from_raw(7)),
+            &live_other
+        ));
+    }
+
     use super::*;
 
     fn timeval(seconds: libc::time_t, micros: libc::suseconds_t) -> libc::timeval {
@@ -843,11 +5488,220 @@ mod tests {
         }
     }
 
+    /// Only KVM's `rt_sigsuspend` returns at once, so only there does the call
+    /// run in the caller's own turn (https://github.com/rrnewton/hermit/issues/4360).
+    /// Every other backend runs the kernel's sleeping call outside the
+    /// runnable set.
+    #[test]
+    fn rt_sigsuspend_never_sleeps_per_backend() {
+        use reverie::BackendCapabilities;
+        for (name, backend, never_sleeps) in [
+            ("ptrace", BackendCapabilities::PTRACE, false),
+            ("e9patch", BackendCapabilities::E9PATCH, false),
+            ("kvm", BackendCapabilities::KVM, true),
+            ("sabre", BackendCapabilities::SABRE, false),
+            ("dbt", BackendCapabilities::DBT, false),
+            (
+                "liteinst in-guest",
+                BackendCapabilities::LITEINST_IN_GUEST,
+                false,
+            ),
+        ] {
+            assert_eq!(rt_sigsuspend_never_sleeps(&backend), never_sleeps, "{name}");
+        }
+    }
+
+    /// A send of each of the four default-stop signals arms the orphaned
+    /// process group's SIGHUP and SIGCONT; no other signal arms anything.
+    #[test]
+    fn only_a_default_stop_signal_arms_the_orphaned_group_signals() {
+        let hup_cont = kernel_sigset_bit(libc::SIGHUP) | kernel_sigset_bit(libc::SIGCONT);
+        for sig in 0..=65 {
+            let stops = matches!(
+                sig,
+                libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
+            );
+            assert_eq!(
+                orphaned_group_signals(sig),
+                if stops { hup_cont } else { 0 },
+                "signal {sig}"
+            );
+        }
+    }
+
+    /// A child-exit `SIGCHLD` the scheduler woke a sleep for ends it only when
+    /// it is unblocked and caught: blocked, or with its default (ignore)
+    /// action, the sleep goes on, as on Linux
+    /// (https://github.com/rrnewton/hermit/issues/4126). Taken by a sibling
+    /// first, it is no longer among the held signals the wake counts, and the
+    /// sleep goes on too (the Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4131). A default-fatal held
+    /// signal (a host-timed `SIGALRM` without a handler) ends it.
+    #[test]
+    fn a_held_wake_ends_a_sleep_only_when_unblocked_and_caught_or_fatal() {
+        use crate::syscalls::threads::KernelSignalState;
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let alrm = kernel_sigset_bit(libc::SIGALRM);
+        let state = |caught: KernelSigset, blocked: KernelSigset| KernelSignalState {
+            caught,
+            blocked,
+            ..Default::default()
+        };
+        assert!(held_wake_ends_sleep(&state(chld, 0), chld));
+        assert!(!held_wake_ends_sleep(&state(chld, chld), chld));
+        assert!(!held_wake_ends_sleep(&state(0, 0), chld));
+        assert!(held_wake_ends_sleep(&state(0, 0), alrm));
+        assert!(!held_wake_ends_sleep(&state(0, alrm), alrm));
+        assert!(
+            !held_wake_ends_sleep(&state(chld, 0), 0),
+            "taken by a sibling"
+        );
+    }
+
+    /// In a process whose send window is unusable, a sleep woken for the
+    /// scheduler's `SIGCHLD` ends for it when the copy is still pending, in its
+    /// process's queue or its own, and unblocked and caught. It parks again
+    /// when another thread took the copy, its mask blocks it, or it is left at
+    /// its default action, which ignores it
+    /// (https://github.com/rrnewton/hermit/issues/4229).
+    #[test]
+    fn a_woken_sleep_counts_a_pending_sigchld_in_an_unusable_window() {
+        use crate::syscalls::threads::KernelSignalState;
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let state =
+            |caught: KernelSigset, blocked: KernelSigset, shared: KernelSigset| KernelSignalState {
+                caught,
+                blocked,
+                pending: shared,
+                shared_pending: shared,
+                ..Default::default()
+            };
+        assert!(woken_sigchld_pending(&state(chld, 0, chld), chld));
+        assert!(
+            !woken_sigchld_pending(&state(chld, 0, 0), chld),
+            "another thread took it"
+        );
+        assert!(
+            !woken_sigchld_pending(&state(chld, chld, chld), chld),
+            "blocked"
+        );
+        assert!(
+            !woken_sigchld_pending(&state(0, 0, chld), chld),
+            "default, ignored"
+        );
+        assert!(
+            !woken_sigchld_pending(&state(chld, 0, chld), 0),
+            "host-timed SIGCHLD keeps it held"
+        );
+        let private = KernelSignalState {
+            caught: chld,
+            pending: chld,
+            thread_pending: chld,
+            ..Default::default()
+        };
+        assert!(woken_sigchld_pending(&private, chld));
+    }
+
+    /// A claimed `SIGCHLD` stays claimed at a syscall while it is pending for
+    /// the thread, in either queue: among them the syscall a held SIGUSR1's
+    /// handler makes while its mask blocks SIGCHLD. It is forgotten once
+    /// SIGCHLD is not pending, or when the state cannot be read, and an
+    /// unclaimed thread reads nothing (the Codex review of the
+    /// claimed-delivery fix; https://github.com/rrnewton/hermit/issues/4346).
+    #[test]
+    fn a_claimed_sigchld_stays_claimed_while_pending() {
+        use crate::syscalls::threads::KernelSignalState;
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let state = |blocked: KernelSigset, thread_pending: KernelSigset, shared: KernelSigset| {
+            Ok::<_, Errno>(KernelSignalState {
+                caught: chld | usr1,
+                blocked,
+                pending: thread_pending | shared,
+                thread_pending,
+                shared_pending: shared,
+                ..Default::default()
+            })
+        };
+        assert!(claim_still_pending(true, || state(0, 0, chld)));
+        assert!(claim_still_pending(true, || state(0, chld, 0)));
+        assert!(
+            claim_still_pending(true, || state(chld | usr1, 0, chld)),
+            "inside the held SIGUSR1's handler, whose mask holds SIGCHLD"
+        );
+        assert!(
+            !claim_still_pending(true, || state(0, 0, usr1)),
+            "taken elsewhere"
+        );
+        assert!(
+            !claim_still_pending(true, || Err::<KernelSignalState, _>(Errno::ESRCH)),
+            "unreadable"
+        );
+        assert!(
+            !claim_still_pending(false, || -> Result<KernelSignalState, Errno> {
+                panic!("an unclaimed thread reads no state")
+            }),
+            "unclaimed"
+        );
+    }
+
+    /// Before it parks, a sleep whose private queue already holds a guest's
+    /// thread-directed `SIGCHLD` asks whether the copy is committed, and a
+    /// committed one that is unblocked and caught ends the sleep as pending
+    /// for it: the copy was sent before the sleeper filed its request, so the
+    /// sender's turn had no sleep to wake (the Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4177). Without one, or with no
+    /// wake and nothing private, it asks nothing; blocked, it does not end the
+    /// sleep.
+    #[test]
+    fn a_private_sigchld_sent_before_the_sleep_is_filed_ends_it_before_it_parks() {
+        use crate::syscalls::threads::KernelSignalState;
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let state = |blocked: KernelSigset, thread_pending: KernelSigset| KernelSignalState {
+            caught: chld,
+            blocked,
+            pending: thread_pending,
+            thread_pending,
+            ..Default::default()
+        };
+        // Before park: no wake named a signal (`held_woken` 0).
+        assert!(asks_committed_sigchld(0, &state(0, chld), chld));
+        assert!(!asks_committed_sigchld(0, &state(0, 0), chld));
+        assert!(
+            !asks_committed_sigchld(0, &state(0, chld), 0),
+            "a host-timed SIGCHLD source keeps it held"
+        );
+        assert_eq!(
+            committed_sigchld_verdict(&state(0, chld), 0, chld),
+            Some(SleepSignal::Pending)
+        );
+        assert_eq!(committed_sigchld_verdict(&state(chld, chld), 0, chld), None);
+        assert_eq!(committed_sigchld_verdict(&state(0, chld), 0, 0), None);
+        // After a wake for it, the same copy is the held signal it named.
+        assert!(asks_committed_sigchld(chld, &state(0, 0), chld));
+        assert_eq!(
+            committed_sigchld_verdict(&state(0, chld), chld, chld),
+            Some(SleepSignal::Held)
+        );
+    }
+
     #[test]
     fn raw_kernel_signal_masks_are_exactly_one_u64() {
         assert_eq!(KERNEL_SIGSET_SIZE, 8);
         assert_eq!(std::mem::size_of::<KernelSigset>(), 8);
         assert!(std::mem::size_of::<libc::sigset_t>() > KERNEL_SIGSET_SIZE);
+    }
+
+    /// The mask `rt_sigsuspend` (and the scheduler's record of it) sleeps
+    /// under can never block SIGKILL or SIGSTOP; every other bit is kept.
+    #[test]
+    fn the_installed_mask_cannot_block_kill_or_stop() {
+        let kill = 1_u64 << (libc::SIGKILL - 1);
+        let stop = 1_u64 << (libc::SIGSTOP - 1);
+        assert_eq!(kernel_installed_signal_mask(u64::MAX), !(kill | stop));
+        assert_eq!(kernel_installed_signal_mask(kill | stop), 0);
+        let alrm_and_rt64 = (1_u64 << (libc::SIGALRM - 1)) | (1_u64 << 63);
+        assert_eq!(kernel_installed_signal_mask(alrm_and_rt64), alrm_and_rt64);
     }
 
     #[test]
@@ -900,6 +5754,29 @@ mod tests {
     }
 
     #[test]
+    fn alarm_seconds_round_as_linux_does() {
+        assert_eq!(linux_alarm_seconds(LogicalTime::ZERO), 0);
+        assert_eq!(linux_alarm_seconds(LogicalTime::from_nanos(1)), 1);
+        assert_eq!(linux_alarm_seconds(LogicalTime::from_nanos(1_000)), 1);
+        assert_eq!(
+            linux_alarm_seconds(LogicalTime::from_nanos(1_000_000_000)),
+            1
+        );
+        assert_eq!(
+            linux_alarm_seconds(LogicalTime::from_nanos(1_499_999_999)),
+            1
+        );
+        assert_eq!(
+            linux_alarm_seconds(LogicalTime::from_nanos(1_500_000_000)),
+            2
+        );
+        assert_eq!(
+            linux_alarm_seconds(LogicalTime::from_nanos(2_000_000_001)),
+            2
+        );
+    }
+
+    #[test]
     fn alarm_remaining_seconds_round_up() {
         assert_eq!(logical_time_to_alarm_seconds(LogicalTime::ZERO), 0);
         assert_eq!(logical_time_to_alarm_seconds(LogicalTime::from_nanos(1)), 1);
@@ -922,18 +5799,29 @@ mod tests {
         let first = DetTid::from_raw(42);
         let second = DetTid::from_raw(43);
         assert_eq!(
-            deterministic_kill_target(&[], libc::SIGUSR1),
+            deterministic_kill_target(&[], None, libc::SIGUSR1),
             Err(Errno::ESRCH)
         );
         assert_eq!(
-            deterministic_kill_target(&[first], libc::SIGUSR1),
-            Ok(first)
+            deterministic_kill_target(&[], Some(true), libc::SIGUSR1),
+            Ok(None)
         );
         assert_eq!(
-            deterministic_kill_target(&[first, second], libc::SIGUSR1),
+            deterministic_kill_target(&[], Some(false), libc::SIGUSR1),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(
+            deterministic_kill_target(&[first], None, libc::SIGUSR1),
+            Ok(Some(first))
+        );
+        assert_eq!(
+            deterministic_kill_target(&[first, second], None, libc::SIGUSR1),
             Err(Errno::ENOSYS)
         );
-        assert_eq!(deterministic_kill_target(&[first, second], 0), Ok(first));
+        assert_eq!(
+            deterministic_kill_target(&[first, second], None, 0),
+            Ok(Some(first))
+        );
 
         let process = DetPid::from_raw(41);
         assert!(self_sigkill_targets_current_task(
@@ -1044,5 +5932,1110 @@ mod appropriated_signal_tests {
     /// mirrored copy would keep passing if `appropriated_reason` were gutted.
     fn reports(signum: i32, handler: u64) -> bool {
         appropriated_reason(signum, handler).is_some()
+    }
+}
+
+#[cfg(test)]
+mod rt_sigsuspend_tests {
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Pid;
+    use reverie::Tool;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::Syscall;
+    use reverie::syscalls::SyscallInfo;
+
+    use super::*;
+    use crate::Config;
+    use crate::GlobalState;
+    use crate::ThreadState;
+    use crate::syscalls::threads::kernel_sigset_bit;
+
+    /// The guest's stack, in this process's memory: `regs` reports a stack
+    /// pointer `STACK_WORD` words in, so the cells below its red zone are words
+    /// `COPY_WORD - 1` (the pending set) and `COPY_WORD` (the copy).
+    const ARENA_WORDS: usize = 64;
+    const STACK_WORD: usize = 48;
+    const COPY_WORD: usize = STACK_WORD - STACK_RED_ZONE / 8 - 1;
+
+    /// rt_sigsuspend writes its cells directly; it takes no scratch stack.
+    struct NoStack;
+
+    struct NoStackGuard;
+
+    impl Drop for NoStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for NoStack {
+        type StackGuard = NoStackGuard;
+
+        fn size(&self) -> usize {
+            panic!("rt_sigsuspend takes no scratch stack")
+        }
+        fn capacity(&self) -> usize {
+            panic!("rt_sigsuspend takes no scratch stack")
+        }
+        fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
+            panic!("rt_sigsuspend takes no scratch stack")
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("rt_sigsuspend takes no scratch stack")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("rt_sigsuspend takes no scratch stack")
+        }
+    }
+
+    /// A guest whose `rt_sigsuspend` caller's mask lives at `caller_mask`. The
+    /// call's `rt_sigpending` probe, which runs after Detcore read that mask
+    /// and before the real call, rewrites it to `rewritten` if one is given,
+    /// as another process sharing the buffer could while the call waits for
+    /// its turn. Every mask a real `rt_sigsuspend` is given is kept in
+    /// `suspended_under`.
+    struct SuspendGuest {
+        config: Config,
+        thread: ThreadState<()>,
+        arena: Box<[u64; ARENA_WORDS]>,
+        caller_mask: usize,
+        rewritten: Option<KernelSigset>,
+        suspended_under: Vec<KernelSigset>,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for SuspendGuest {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            panic!(
+                "an unsequentialized rt_sigsuspend sends no RPC: {:?}",
+                message.2
+            )
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for SuspendGuest {
+        type Memory = LocalMemory;
+        type Stack = NoStack;
+
+        fn tid(&self) -> Pid {
+            Pid::from_raw(1)
+        }
+        fn pid(&self) -> Pid {
+            Pid::from_raw(1)
+        }
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            LocalMemory::new()
+        }
+        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+            &mut self.thread
+        }
+        fn thread_state(&self) -> &ThreadState<()> {
+            &self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            // SAFETY: user_regs_struct is plain integers; all zeroes is valid.
+            let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+            regs.rsp = (self.arena.as_ptr() as usize + STACK_WORD * 8) as u64;
+            regs
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            NoStack
+        }
+        async fn daemonize(&mut self) {
+            panic!("rt_sigsuspend must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+            let (number, args) = syscall.into_parts();
+            match Syscall::from_raw(number, args) {
+                // read_kernel_sigset's validation probe.
+                Syscall::RtSigprocmask(call) if call.how() == -1 => Err(Errno::EINVAL),
+                Syscall::RtSigpending(call) => {
+                    let set = call.set().expect("rt_sigpending without a set");
+                    LocalMemory::new().write_value(set.cast::<KernelSigset>(), &0)?;
+                    if let Some(rewritten) = self.rewritten {
+                        // SAFETY: `caller_mask` is the test's live, aligned buffer.
+                        unsafe {
+                            std::ptr::write(self.caller_mask as *mut KernelSigset, rewritten)
+                        };
+                    }
+                    Ok(0)
+                }
+                Syscall::RtSigsuspend(call) => {
+                    let mask = call.mask().expect("rt_sigsuspend without a mask");
+                    self.suspended_under
+                        .push(LocalMemory::new().read_value(mask.cast::<KernelSigset>())?);
+                    Err(Errno::EINTR)
+                }
+                other => panic!("rt_sigsuspend injected {other:?}"),
+            }
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("rt_sigsuspend must not retire the guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("rt_sigsuspend must not set a timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("rt_sigsuspend must not set a timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("rt_sigsuspend must not read a clock")
+        }
+    }
+
+    /// The real `rt_sigsuspend` sleeps under the mask Detcore read when it
+    /// handled the call, the one the scheduler is given, even if the guest's
+    /// buffer changes before the call runs. Linux copies the mask when the call
+    /// starts, and from the guest's view it has started. Before, the call ran
+    /// with the guest's pointer: another process sharing the buffer could make
+    /// it block a signal the scheduler had counted on to end it, and the
+    /// scheduler would hold every other thread waiting for that wake.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rt_sigsuspend_sleeps_under_the_mask_detcore_read() {
+        let config = Config::default();
+        assert!(!config.sequentialize_threads);
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let unblocks_sigchld: KernelSigset = kernel_sigset_bit(libc::SIGUSR2);
+        let blocks_sigchld = unblocks_sigchld | kernel_sigset_bit(libc::SIGCHLD);
+        let mut caller_mask: Box<KernelSigset> = Box::new(unblocks_sigchld);
+        let caller_address = &mut *caller_mask as *mut KernelSigset as usize;
+        let mut guest = SuspendGuest {
+            thread: ThreadState::new(DetPid::from_raw(1), &config, ()),
+            config: config.clone(),
+            arena: Box::new([u64::MAX; ARENA_WORDS]),
+            caller_mask: caller_address,
+            rewritten: Some(blocks_sigchld),
+            suspended_under: Vec::new(),
+        };
+        let call = syscalls::RtSigsuspend::new()
+            .with_mask(Addr::from_raw(caller_address))
+            .with_sigsetsize(KERNEL_SIGSET_SIZE);
+
+        let result = tool.handle_rt_sigsuspend(&mut guest, call).await;
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::EINTR))),
+            "{result:?}"
+        );
+        assert_eq!(*caller_mask, blocks_sigchld, "the buffer was rewritten");
+        assert_eq!(guest.suspended_under, [unblocks_sigchld]);
+    }
+
+    /// A caller's mask that lies on the cells Detcore places below the red
+    /// zone, as a raw syscall may pass one there in a shared stack: the copy
+    /// must not be the caller's buffer, or a rewrite of the shared buffer
+    /// reaches the real call again, and the rt_sigpending cell must not
+    /// overwrite it. The cells move below the buffer, which keeps its own
+    /// contents. Before, the copy slot was the caller's buffer, and the
+    /// pending slot's buffer was overwritten with the pending set.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rt_sigsuspend_scratch_never_lands_on_the_callers_mask() {
+        let config = Config::default();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let original: KernelSigset = kernel_sigset_bit(libc::SIGUSR2);
+        let rewritten = original | kernel_sigset_bit(libc::SIGCHLD);
+        // The copy's slot, rewritten by a peer; then the pending cell's slot,
+        // which nobody rewrites.
+        for (slot, peer_rewrite) in [(COPY_WORD, Some(rewritten)), (COPY_WORD - 1, None)] {
+            let mut arena = Box::new([u64::MAX; ARENA_WORDS]);
+            arena[slot] = original;
+            let caller_address = &mut arena[slot] as *mut u64 as usize;
+            let mut guest = SuspendGuest {
+                thread: ThreadState::new(DetPid::from_raw(1), &config, ()),
+                config: config.clone(),
+                arena,
+                caller_mask: caller_address,
+                rewritten: peer_rewrite,
+                suspended_under: Vec::new(),
+            };
+            let call = syscalls::RtSigsuspend::new()
+                .with_mask(Addr::from_raw(caller_address))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE);
+
+            let result = tool.handle_rt_sigsuspend(&mut guest, call).await;
+            assert!(
+                matches!(result, Err(Error::Errno(Errno::EINTR))),
+                "slot {slot}: {result:?}"
+            );
+            assert_eq!(guest.suspended_under, [original], "slot {slot}");
+            assert_eq!(
+                guest.arena[slot],
+                peer_rewrite.unwrap_or(original),
+                "slot {slot}: the caller's buffer holds only what the guest wrote"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod before_park_tests {
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Pid;
+    use reverie::syscalls::SyscallInfo;
+
+    use super::*;
+    use crate::Config;
+    use crate::GlobalState;
+    use crate::ThreadState;
+    use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+
+    /// The before-park check takes no scratch stack.
+    struct NoStack;
+
+    struct NoStackGuard;
+
+    impl Drop for NoStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for NoStack {
+        type StackGuard = NoStackGuard;
+
+        fn size(&self) -> usize {
+            panic!("the before-park check takes no stack")
+        }
+        fn capacity(&self) -> usize {
+            panic!("the before-park check takes no stack")
+        }
+        fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
+            panic!("the before-park check takes no stack")
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("the before-park check takes no stack")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("the before-park check takes no stack")
+        }
+    }
+
+    /// A guest whose thread is a real stopped process, so `sleep_signal`
+    /// reads the kernel's signal state for it from `/proc`, and whose RPCs go
+    /// to a real `GlobalState`, so its questions reach the scheduler's ledger.
+    struct SleeperGuest<'a> {
+        state: &'a GlobalState,
+        config: Config,
+        thread: ThreadState<()>,
+        pid: Pid,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for SleeperGuest<'_> {
+        async fn send_rpc(
+            &self,
+            request: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            self.state.receive_rpc(self.pid, request).await
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for SleeperGuest<'_> {
+        type Memory = reverie::syscalls::LocalMemory;
+        type Stack = NoStack;
+
+        fn tid(&self) -> Pid {
+            self.pid
+        }
+        fn pid(&self) -> Pid {
+            self.pid
+        }
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            panic!("the before-park check reads no guest memory")
+        }
+        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+            &mut self.thread
+        }
+        fn thread_state(&self) -> &ThreadState<()> {
+            &self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("the before-park check reads no registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            panic!("the before-park check takes no stack")
+        }
+        async fn daemonize(&mut self) {
+            panic!("the before-park check must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, _: S) -> Result<i64, Errno> {
+            panic!("the before-park check injects no syscall")
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("the before-park check must not retire the guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("the before-park check sets no timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("the before-park check sets no timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("the before-park check reads no clock")
+        }
+    }
+
+    extern "C" fn caught(_: libc::c_int) {}
+
+    /// `waitpid` for exactly `child`, retried on EINTR: the pid and status
+    /// it reported, or the errno of its failure.
+    fn wait_for(
+        child: libc::pid_t,
+        options: libc::c_int,
+    ) -> Result<(libc::pid_t, libc::c_int), i32> {
+        let mut status = 0;
+        loop {
+            // SAFETY: waiting for our own child.
+            let waited = unsafe { libc::waitpid(child, &mut status, options) };
+            if waited != -1 {
+                return Ok((waited, status));
+            }
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                errno => return Err(errno.unwrap_or(0)),
+            }
+        }
+    }
+
+    /// The parent's ownership of the forked child: it is killed and reaped
+    /// when the owner is dropped, so a panic or a cancelled await in the test
+    /// leaves no process behind. `finish` does the same on the normal path
+    /// and checks that the child was reaped.
+    struct ChildOwner {
+        pid: libc::pid_t,
+        reaped: bool,
+    }
+
+    impl ChildOwner {
+        /// Wait for the child to stop. A wait that reports it exited or
+        /// killed reaped it, so the owner is disarmed before anything can
+        /// unwind: its pid may already belong to another process.
+        /// An ECHILD means the child is no longer ours to wait for (it was
+        /// reaped already), so it disarms the owner too.
+        fn wait_stopped(&mut self) -> Result<(), Result<(libc::pid_t, libc::c_int), i32>> {
+            let waited = wait_for(self.pid, libc::WUNTRACED);
+            match waited {
+                Ok((pid, status))
+                    if pid == self.pid
+                        && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)) =>
+                {
+                    self.reaped = true;
+                }
+                Err(libc::ECHILD) => self.reaped = true,
+                _ => {}
+            }
+            match waited {
+                Ok((pid, status)) if pid == self.pid && libc::WIFSTOPPED(status) => Ok(()),
+                other => Err(other),
+            }
+        }
+
+        /// Whether the owner had disarmed itself, read once the child is
+        /// known to be reaped. The owner is disarmed from here on whatever
+        /// the answer, so a failed check of it unwinds without signalling a
+        /// pid that may have been reused.
+        fn disarmed_after_reap(&mut self) -> bool {
+            std::mem::replace(&mut self.reaped, true)
+        }
+
+        fn kill_and_reap(&mut self) -> Result<(libc::pid_t, libc::c_int), i32> {
+            // SAFETY: killing our own child, which is not yet reaped.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            let reaped = wait_for(self.pid, 0);
+            self.reaped = true;
+            reaped
+        }
+
+        fn finish(mut self) {
+            let reaped = self.kill_and_reap();
+            assert!(
+                matches!(reaped, Ok((pid, status)) if pid == self.pid
+                    && libc::WIFSIGNALED(status)
+                    && libc::WTERMSIG(status) == libc::SIGKILL),
+                "the child was not reaped: {reaped:?}"
+            );
+        }
+    }
+
+    impl Drop for ChildOwner {
+        fn drop(&mut self) {
+            if !self.reaped {
+                // Unwinding already: the reap's outcome is not checked here.
+                let _ = self.kill_and_reap();
+            }
+        }
+    }
+
+    /// A forked child, owned by the parent from the moment `fork` returns,
+    /// that exits with status 7 at once if `exits`.
+    fn forked_child(exits: bool) -> ChildOwner {
+        // SAFETY: the child calls only async-signal-safe functions, with no
+        // allocation, lock or destructor, then stops until it is killed.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe {
+                if exits {
+                    libc::_exit(7);
+                }
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = caught as extern "C" fn(libc::c_int) as usize;
+                libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut());
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGCHLD);
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+                libc::raise(libc::SIGSTOP);
+                libc::_exit(0);
+            }
+        }
+        assert!(child > 0, "fork failed");
+        ChildOwner {
+            pid: child,
+            reaped: false,
+        }
+    }
+
+    /// A child stopped as a sleeper is when Detcore handles its call before
+    /// filing the sleep: SIGCHLD caught and unblocked, and SIGCHLD pending in
+    /// its private queue, sent to the thread while it was stopped.
+    fn stopped_child_with_a_private_sigchld() -> ChildOwner {
+        let mut owner = forked_child(false);
+        let child = owner.pid;
+        if let Err(waited) = owner.wait_stopped() {
+            panic!("the child did not stop: {waited:?}");
+        }
+        // SAFETY: the child is ours and stopped; SIGCHLD stays pending.
+        let sent = unsafe { libc::syscall(libc::SYS_tgkill, child, child, libc::SIGCHLD) };
+        assert_eq!(sent, 0, "tgkill failed");
+        owner
+    }
+
+    /// The before-park question through the production path: a guest's
+    /// thread-directed SIGCHLD, committed (`PrivateSent`, as the sender's turn
+    /// records it) while no sleep was filed, so that turn had no sleep to
+    /// wake, is found by `sleep_signal(BeforePark)`'s own query of the ledger,
+    /// and the sleep ends at once as pending for it. With no committed record
+    /// the same kernel state, which `/proc` cannot tell from a host-timed copy,
+    /// ends nothing (the Codex re-check of
+    /// https://github.com/rrnewton/hermit/pull/4177).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_private_sigchld_committed_before_the_sleep_is_filed_ends_it_through_the_ledger() {
+        // The fixture's owner: a child that exits instead of stopping is
+        // reaped by the wait, which disarms the owner, so an unwind then
+        // signals no pid that may have been reused.
+        let mut exited = forked_child(true);
+        let wait = exited.wait_stopped();
+        let exit_reaped = matches!(wait, Err(Ok((pid, status))) if pid == exited.pid
+            && libc::WIFEXITED(status)
+            && libc::WEXITSTATUS(status) == 7);
+        let disarmed = exit_reaped && exited.disarmed_after_reap();
+        assert!(exit_reaped, "{wait:?}");
+        assert!(disarmed, "a reaped child disarms its owner");
+        drop(exited);
+        // A child already reaped elsewhere answers ECHILD, which disarms the
+        // owner as well. The raw wait that reaps it disarms the owner before
+        // anything is checked; the owner is armed again only for the call
+        // under test.
+        let mut gone = forked_child(true);
+        let reaped_elsewhere = wait_for(gone.pid, 0);
+        gone.reaped = matches!(reaped_elsewhere, Ok((pid, _)) if pid == gone.pid)
+            || reaped_elsewhere == Err(libc::ECHILD);
+        assert!(
+            matches!(reaped_elsewhere, Ok((pid, _)) if pid == gone.pid),
+            "{reaped_elsewhere:?}"
+        );
+        gone.reaped = false;
+        let wait = gone.wait_stopped();
+        let disarmed = gone.disarmed_after_reap();
+        assert_eq!(wait, Err(Err(libc::ECHILD)));
+        assert!(disarmed, "an ECHILD disarms its owner");
+        drop(gone);
+
+        let owner = stopped_child_with_a_private_sigchld();
+        let child = owner.pid;
+        let state_of_child = crate::syscalls::threads::read_thread_wait_signal_state(
+            Pid::from_raw(child),
+            Pid::from_raw(child),
+        )
+        .expect("the child's signal state");
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        assert_eq!(
+            state_of_child.thread_pending & chld,
+            chld,
+            "pending, private"
+        );
+        assert_eq!(state_of_child.blocked & chld, 0, "unblocked");
+        assert_eq!(state_of_child.caught & chld, chld, "caught");
+        let mut verdicts = Vec::new();
+        for committed in [true, false] {
+            let config = Config {
+                sequentialize_threads: true,
+                ..Config::default()
+            }
+            .with_backend(|backend| {
+                detcore_model::config::set_kernel_signal_facts(backend, true);
+                backend.delivers_preemption_timer_events = false;
+                backend.runs_guest_code_between_injections = false;
+            });
+            let state = GlobalState::for_tests(&config);
+            let mut guest = SleeperGuest {
+                state: &state,
+                thread: ThreadState::new(DetPid::from_raw(child), &config, ()),
+                config,
+                pid: Pid::from_raw(child),
+            };
+            if committed {
+                let target = guest.thread_state().dettid;
+                crate::tool_global::child_exit_sigchld(
+                    &mut guest,
+                    ChildExitSigchldControl::PrivateSent { target },
+                )
+                .await;
+            }
+            verdicts.push(sleep_signal(&mut guest, SleepCheck::BeforePark, false).await);
+        }
+        owner.finish();
+        assert!(
+            matches!(verdicts[0], Ok(SleepSignal::Pending)),
+            "committed: {:?}",
+            verdicts[0]
+        );
+        assert!(
+            matches!(verdicts[1], Ok(SleepSignal::None)),
+            "not committed: {:?}",
+            verdicts[1]
+        );
+    }
+
+    /// The futex counterpart: a precise futex wait's own check before it
+    /// parks (`futex_wait_pending_signals`) finds a guest's thread-directed
+    /// SIGCHLD committed (`PrivateSent`) before the wait was filed, through
+    /// the production query of the ledger, and the wait ends with its restart
+    /// errno. With no record, or when a host-timed source can post SIGCHLD to
+    /// the process, the same kernel state ends nothing and the wait parks
+    /// (https://github.com/rrnewton/hermit/issues/4132).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_private_sigchld_committed_before_a_futex_wait_parks_ends_it_through_the_ledger() {
+        let owner = stopped_child_with_a_private_sigchld();
+        let child = owner.pid;
+        let state = crate::syscalls::threads::read_thread_wait_signal_state(
+            Pid::from_raw(child),
+            Pid::from_raw(child),
+        )
+        .expect("the child's signal state");
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let interrupting = state.pending_interrupting(state.blocked, false);
+        let mut pending = Vec::new();
+        for (committed, host_timed) in [(true, 0), (false, 0), (true, chld)] {
+            let config = Config {
+                sequentialize_threads: true,
+                ..Config::default()
+            }
+            .with_backend(|backend| {
+                detcore_model::config::set_kernel_signal_facts(backend, true);
+                backend.delivers_preemption_timer_events = false;
+                backend.runs_guest_code_between_injections = false;
+            });
+            let global = GlobalState::for_tests(&config);
+            let mut guest = SleeperGuest {
+                state: &global,
+                thread: ThreadState::new(DetPid::from_raw(child), &config, ()),
+                config,
+                pid: Pid::from_raw(child),
+            };
+            if committed {
+                let target = guest.thread_state().dettid;
+                crate::tool_global::child_exit_sigchld(
+                    &mut guest,
+                    ChildExitSigchldControl::PrivateSent { target },
+                )
+                .await;
+            }
+            let held = crate::syscalls::threads::futex_wait_held_after_wake(host_timed, 0);
+            pending.push(
+                crate::syscalls::threads::futex_wait_pending_signals(
+                    &mut guest,
+                    &state,
+                    interrupting,
+                    held,
+                    host_timed,
+                    0,
+                )
+                .await,
+            );
+        }
+        owner.finish();
+        assert_eq!(interrupting & chld, chld, "pending, unblocked and caught");
+        assert_eq!(
+            pending,
+            vec![chld, 0, 0],
+            "recorded, unrecorded, host-timed"
+        );
+    }
+
+    /// A futex wait's own check after a wake decides a held `SIGCHLD` from
+    /// the private queue and the schedule's record together: after a flush
+    /// cleared the record, a `SIGCHLD` only in the shared queue (which a
+    /// host-timed source may have posted) ends nothing, and neither does a
+    /// record whose copy is no longer in the private queue. Both waits park
+    /// again (the design check of https://github.com/rrnewton/hermit/issues/4132).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_futex_waits_check_after_a_wake_needs_the_private_copy_and_its_record() {
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let state = |thread: KernelSigset, shared: KernelSigset| {
+            crate::syscalls::threads::KernelSignalState {
+                pending: thread | shared,
+                thread_pending: thread,
+                shared_pending: shared,
+                caught: chld,
+                ..Default::default()
+            }
+        };
+        let mut answers = Vec::new();
+        for (name, kernel, recorded, flushed) in [
+            ("private, recorded", state(chld, 0), true, false),
+            ("flushed, shared only", state(0, chld), true, true),
+            ("recorded, shared only", state(0, chld), true, false),
+        ] {
+            let config = Config {
+                sequentialize_threads: true,
+                ..Config::default()
+            }
+            .with_backend(|backend| {
+                detcore_model::config::set_kernel_signal_facts(backend, true);
+                backend.delivers_preemption_timer_events = false;
+                backend.runs_guest_code_between_injections = false;
+            });
+            let global = GlobalState::for_tests(&config);
+            let mut guest = SleeperGuest {
+                state: &global,
+                thread: ThreadState::new(DetPid::from_raw(4242), &config, ()),
+                config,
+                pid: Pid::from_raw(4242),
+            };
+            let target = guest.thread_state().dettid;
+            if recorded {
+                crate::tool_global::child_exit_sigchld(
+                    &mut guest,
+                    ChildExitSigchldControl::PrivateSent { target },
+                )
+                .await;
+            }
+            if flushed {
+                crate::tool_global::child_exit_sigchld(
+                    &mut guest,
+                    ChildExitSigchldControl::Flushed,
+                )
+                .await;
+            }
+            let held = crate::syscalls::threads::futex_wait_held_after_wake(0, 0);
+            let interrupting = kernel.pending_interrupting(kernel.blocked, false);
+            let pending = crate::syscalls::threads::futex_wait_pending_signals(
+                &mut guest,
+                &kernel,
+                interrupting,
+                held,
+                0,
+                0,
+            )
+            .await;
+            answers.push((name, pending));
+        }
+        assert_eq!(
+            answers,
+            vec![
+                ("private, recorded", chld),
+                ("flushed, shared only", 0),
+                ("recorded, shared only", 0),
+            ]
+        );
+    }
+
+    /// After the drain woke a futex waiter for a guest's private `SIGCHLD`,
+    /// a sibling flushed it (`SIG_IGN`, then the handler again) and sent
+    /// `kill(getpid(), SIGCHLD)`, a copy in the shared queue. Here a forked
+    /// child, stopped with `SIGCHLD` caught and unblocked, is sent that shared
+    /// copy, so `/proc` shows it in `ShdPnd` only, and the ledger records the
+    /// private send and the flush. The waiter's check, as
+    /// `handle_futex_blocking` runs it with the drain's `SIGCHLD` left out of
+    /// the committed set (`drain_woken_waiters`), ends nothing, and the
+    /// wait parks again: a futex wait holds shared copies. Had the drain's
+    /// `SIGCHLD` been committed, as before the design check of
+    /// https://github.com/rrnewton/hermit/issues/4132, the shared copy, which
+    /// a host-timed child exit could equally have posted, would have ended it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_shared_sigchld_after_a_flush_does_not_end_a_drain_woken_futex_wait() {
+        let mut owner = forked_child(false);
+        let child = owner.pid;
+        if let Err(waited) = owner.wait_stopped() {
+            panic!("the child did not stop: {waited:?}");
+        }
+        // SAFETY: the child is ours and stopped; SIGCHLD stays pending.
+        assert_eq!(
+            unsafe { libc::kill(child, libc::SIGCHLD) },
+            0,
+            "kill failed"
+        );
+        let state = crate::syscalls::threads::read_thread_wait_signal_state(
+            Pid::from_raw(child),
+            Pid::from_raw(child),
+        )
+        .expect("the child's signal state");
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let mut pending = Vec::new();
+        for committed_wake in [0, chld] {
+            let config = Config {
+                sequentialize_threads: true,
+                ..Config::default()
+            }
+            .with_backend(|backend| {
+                detcore_model::config::set_kernel_signal_facts(backend, true);
+                backend.delivers_preemption_timer_events = false;
+                backend.runs_guest_code_between_injections = false;
+            });
+            let global = GlobalState::for_tests(&config);
+            let mut guest = SleeperGuest {
+                state: &global,
+                thread: ThreadState::new(DetPid::from_raw(child), &config, ()),
+                config,
+                pid: Pid::from_raw(child),
+            };
+            let target = guest.thread_state().dettid;
+            crate::tool_global::child_exit_sigchld(
+                &mut guest,
+                ChildExitSigchldControl::PrivateSent { target },
+            )
+            .await;
+            crate::tool_global::child_exit_sigchld(&mut guest, ChildExitSigchldControl::Flushed)
+                .await;
+            let held = crate::syscalls::threads::futex_wait_held_after_wake(0, committed_wake);
+            pending.push(
+                crate::syscalls::threads::futex_wait_pending_signals(
+                    &mut guest,
+                    &state,
+                    state.pending_interrupting(state.blocked, false),
+                    held,
+                    0,
+                    committed_wake,
+                )
+                .await,
+            );
+        }
+        owner.finish();
+        assert_eq!(
+            (state.thread_pending & chld, state.shared_pending & chld),
+            (0, chld),
+            "SIGCHLD pending in the shared queue only"
+        );
+        assert_eq!(pending, vec![0, chld], "stripped, then committed as before");
+    }
+}
+
+#[cfg(test)]
+mod own_process_signal_tests {
+    use super::*;
+
+    const SENDER_SIBLING: i32 = 11;
+
+    /// The main thread sends SIGUSR1, which it catches, to its own process
+    /// while one other thread is parked with an empty mask: admitted (S1).
+    fn admitted_s1() -> OwnProcessSignal {
+        OwnProcessSignal {
+            sig: libc::SIGUSR1,
+            names_sender: true,
+            caught: kernel_sigset_bit(libc::SIGUSR1),
+            inputs: OwnProcessSignalInputs {
+                siblings: vec![(
+                    DetTid::from_raw(SENDER_SIBLING),
+                    SiblingSignalState::InSchedule(Some(0)),
+                )],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn refusal(edit: impl FnOnce(&mut OwnProcessSignal)) -> Option<OwnProcessSignalRefusal> {
+        let mut send = admitted_s1();
+        edit(&mut send);
+        own_process_signal_refusal(&send)
+    }
+
+    /// The first byte user mode cannot read is found across contiguous
+    /// readable, write-only and execute-only mappings, and is a `PROT_NONE`
+    /// mapping, a hole, or a hole below a grow-down mapping.
+    #[test]
+    fn the_first_user_unreadable_byte_is_classified_by_its_mapping() {
+        let smaps = "1000-2000 r--p 0 0:0 0\nVmFlags: rd mr\n\
+                     2000-3000 -w-p 0 0:0 0\nVmFlags: wr mw\n\
+                     3000-4000 ---p 0 0:0 0\nVmFlags: mr\n\
+                     6000-7000 --xp 0 0:0 0 [vvar]\nVmFlags: ex\n\
+                     9000-a000 rw-p 0 0:0 0 [stack]\nVmFlags: rd wr gd\n";
+        let mappings = parse_smaps(smaps);
+        assert_eq!(mappings.len(), 5);
+        assert!(mappings[4].growsdown && !mappings[0].growsdown);
+        assert_eq!(
+            first_user_unreadable(&mappings, 0x1fc0, 128),
+            None,
+            "crosses from read-only into write-only"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0x6000, 128),
+            None,
+            "execute-only"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0x2fc0, 128),
+            Some(Unreadable::NoPermission),
+            "runs into PROT_NONE"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0x4000, 48),
+            Some(Unreadable::Hole {
+                below_growsdown: false
+            }),
+            "a hole below a fixed mapping"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0x8000, 48),
+            Some(Unreadable::Hole {
+                below_growsdown: true
+            }),
+            "a hole below the stack"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0xb000, 48),
+            Some(Unreadable::Hole {
+                below_growsdown: false
+            }),
+            "above every mapping"
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, 0, 48),
+            Some(Unreadable::Hole {
+                below_growsdown: false
+            })
+        );
+        assert_eq!(
+            first_user_unreadable(&mappings, usize::MAX - 10, 48),
+            Some(Unreadable::Hole {
+                below_growsdown: false
+            })
+        );
+    }
+
+    #[test]
+    fn the_sender_named_by_its_call_is_admitted_whatever_its_siblings_masks() {
+        assert_eq!(refusal(|_| {}), None);
+    }
+
+    /// S2: the call names the leader but another thread sends; admitted only
+    /// when every other live thread blocks the signal or has its exit granted.
+    #[test]
+    fn another_sender_is_admitted_only_when_every_live_sibling_blocks() {
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let leader = DetTid::from_raw(SENDER_SIBLING);
+        assert_eq!(
+            refusal(|send| send.names_sender = false),
+            Some(OwnProcessSignalRefusal::NotSoleReceiver(leader))
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.names_sender = false;
+                send.inputs.siblings = vec![(leader, SiblingSignalState::InSchedule(Some(usr1)))];
+            }),
+            None
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.names_sender = false;
+                send.inputs.siblings = vec![(leader, SiblingSignalState::ExitGranted)];
+            }),
+            None
+        );
+    }
+
+    /// Only the seven admitted signals pass; each other signal is refused
+    /// whatever its disposition.
+    #[test]
+    fn only_the_seven_signals_below_sigchld_are_admitted() {
+        for sig in 1..=64 {
+            let admitted = OWN_PROCESS_SIGNALS.contains(&sig);
+            let got = refusal(|send| {
+                send.sig = sig;
+                send.caught = kernel_sigset_bit(sig);
+            });
+            if admitted {
+                assert!(sig < libc::SIGCHLD, "signal {sig}");
+                assert_eq!(got, None, "signal {sig}");
+            } else {
+                assert_eq!(
+                    got,
+                    Some(OwnProcessSignalRefusal::SignalNotAdmitted),
+                    "signal {sig}"
+                );
+            }
+        }
+        for sig in [
+            libc::SIGCHLD,
+            libc::SIGCONT,
+            libc::SIGTSTP,
+            libc::SIGRTMIN(),
+            libc::SIGSEGV,
+            libc::SIGTRAP,
+            libc::SIGSTKFLT,
+            libc::SIGKILL,
+            libc::SIGALRM,
+        ] {
+            assert!(!OWN_PROCESS_SIGNALS.contains(&sig), "signal {sig}");
+        }
+    }
+
+    #[test]
+    fn a_default_disposition_is_refused_and_sig_ign_is_admitted() {
+        assert_eq!(
+            refusal(|send| send.caught = 0),
+            Some(OwnProcessSignalRefusal::DefaultDisposition)
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.caught = 0;
+                send.ignored = kernel_sigset_bit(libc::SIGUSR1);
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn each_mode_and_sender_state_refuses_by_name() {
+        use OwnProcessSignalRefusal as R;
+        let sibling = DetTid::from_raw(SENDER_SIBLING);
+        assert_eq!(
+            refusal(|send| send.record_replay = true),
+            Some(R::RecordReplay)
+        );
+        assert_eq!(
+            refusal(|send| send.schedule_replay = true),
+            Some(R::ScheduleReplay)
+        );
+        assert_eq!(
+            refusal(|send| send.inputs.guest_marker_signal = true),
+            Some(R::GuestMarkerSignal)
+        );
+        assert_eq!(
+            refusal(|send| send.stacktrace_signal = true),
+            Some(R::StacktraceSignal)
+        );
+        assert_eq!(
+            refusal(|send| send.blocked = kernel_sigset_bit(libc::SIGUSR1)),
+            Some(R::SenderBlocks)
+        );
+        assert_eq!(
+            refusal(|send| send.inputs.siblings[0].1 = SiblingSignalState::OutOfSchedule),
+            Some(R::OutOfSchedule(sibling))
+        );
+        assert_eq!(
+            refusal(|send| send.inputs.siblings[0].1 = SiblingSignalState::InSchedule(None)),
+            Some(R::UnknownMask(sibling))
+        );
+        assert_eq!(
+            refusal(|send| send.posthook_anchor = true),
+            Some(R::PosthookAnchor)
+        );
+        assert_eq!(refusal(|send| send.signalfd = true), Some(R::Signalfd));
+        assert_eq!(
+            refusal(|send| send.inputs.exec_in_flight = true),
+            Some(R::ExecInFlight)
+        );
+    }
+
+    /// The private queue refuses on any signal the sender does not block,
+    /// except Reverie's timer marker.
+    #[test]
+    fn a_private_pending_signal_refuses_unless_blocked_or_the_timer_marker() {
+        let hup = kernel_sigset_bit(libc::SIGHUP);
+        let marker = kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32);
+        assert_eq!(
+            refusal(|send| send.thread_pending = hup),
+            Some(OwnProcessSignalRefusal::PrivatePending(hup))
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.thread_pending = hup;
+                send.blocked = hup;
+            }),
+            None
+        );
+        assert_eq!(refusal(|send| send.thread_pending = marker), None);
+    }
+
+    /// An armed host-timed source or a foreign exit signal refuses whatever its
+    /// number, unless the sender blocks it.
+    #[test]
+    fn armed_sources_refuse_unless_the_sender_blocks_them() {
+        let io = kernel_sigset_bit(libc::SIGIO);
+        let usr2 = kernel_sigset_bit(libc::SIGUSR2);
+        assert_eq!(
+            refusal(|send| send.inputs.host_timed = io),
+            Some(OwnProcessSignalRefusal::HostTimedSource(io))
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.inputs.host_timed = io;
+                send.blocked = io;
+            }),
+            None
+        );
+        assert_eq!(
+            refusal(|send| send.inputs.foreign_exit_signals = usr2),
+            Some(OwnProcessSignalRefusal::ForeignExitSignal(usr2))
+        );
+        assert_eq!(
+            refusal(|send| {
+                send.inputs.foreign_exit_signals = usr2;
+                send.blocked = usr2;
+            }),
+            None
+        );
+    }
+
+    /// An undelivered scheduler signal refuses when numbered at or below the
+    /// one sent, which it would precede or coalesce with, and not above it.
+    #[test]
+    fn an_undelivered_scheduler_signal_refuses_only_at_or_below_the_sent_one() {
+        let term = libc::SIGTERM;
+        for (pending, refuses) in [
+            (libc::SIGHUP, true),
+            (libc::SIGALRM, true),
+            (libc::SIGTERM, true),
+            (libc::SIGSTKFLT, false),
+            (libc::SIGRTMIN(), false),
+        ] {
+            let bit = kernel_sigset_bit(pending);
+            let got = refusal(|send| {
+                send.sig = term;
+                send.caught = kernel_sigset_bit(term);
+                send.inputs.undelivered_scheduler_signals = bit;
+            });
+            assert_eq!(
+                got,
+                refuses.then_some(OwnProcessSignalRefusal::UndeliveredSchedulerSignal(bit)),
+                "pending {pending}"
+            );
+        }
     }
 }

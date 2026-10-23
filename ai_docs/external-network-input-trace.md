@@ -11,9 +11,9 @@ recorder or replayer:
 - strict validation admits exactly one outbound IPv4/IPv6 TCP client channel
   whose `OpenFileId` comes from the socket allocation domain and was allocated
   before competing guest threads;
-- the reader rejects truncation, trailing data, oversized payloads, unknown
-  versions, epochs outside `GlobalTime`'s unsigned nanosecond domain, unknown
-  channels, noncanonical offsets/releases, and events outside that envelope;
+- the reader rejects truncation, trailing data, unknown versions, epochs
+  outside `GlobalTime`'s unsigned nanosecond domain, unknown channels,
+  noncanonical offsets/releases, and events outside that envelope;
 - `Config::network_trace` defaults to `Off`, is not a CLI flag, and is not read
   by any syscall or scheduler path; and
 - `network_perturb_seed` is explicit and has no fallback to `seed` or
@@ -173,9 +173,13 @@ NetworkOutput {
 ```
 
 The payload uses bincode's standard configuration. Both writer and reader run
-semantic validation; the reader additionally requires exact payload
-consumption and EOF after the frame. The 64 MiB payload limit is checked before
-allocation. Epoch conversion is checked before constructing `GlobalTime` and
+semantic validation; the reader additionally requires exact payload consumption
+and EOF after the frame. There is no size limit: the reader grows the payload
+buffer only as bytes arrive, so a corrupt or hostile length header fails as
+truncation without allocating what it claims. Reader memory is bounded by the
+input's size, so a replay path that names an endless stream (a FIFO,
+`/dev/stdin`) behind a huge length header reads until memory runs out rather
+than refusing. Epoch conversion is checked before constructing `GlobalTime` and
 uses its exact microsecond-truncated, unsigned-nanosecond representation;
 pre-1970 timestamps and positive timestamps beyond that range are typed trace
 validation errors rather than panics.

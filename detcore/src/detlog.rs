@@ -11,7 +11,13 @@
 //! ['detlog_debug] can be use to write a deterministic log entry at DEBUG level
 
 use std::fmt;
+use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
+use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -104,31 +110,2113 @@ pub fn record_suffix(event: DetLogEvent) -> String {
     format!("{RECORD_SEPARATOR}{encoded}")
 }
 
-/// A process-local sink for deterministic INFO records.
-pub type DetlogForwarder = for<'a> fn(&str, fmt::Arguments<'a>);
+/// A process-local sink for deterministic INFO records: the emitting module's path (the
+/// target `tracing` would give the record), the record suffix, the record's index in its
+/// thread's current counted interval (1 for the first record after the thread's last
+/// counted request; see [`take_forwarded_since_request`]), and the message.
+pub type DetlogForwarder = for<'a> fn(&str, &str, u64, fmt::Arguments<'a>);
 
-static FORWARDER: OnceLock<DetlogForwarder> = OnceLock::new();
+/// Which emitting modules a forwarded process may send DETLOG records from.
+///
+/// WHY THIS IS NEEDED. In-process, `detlog!` asks `tracing` whether INFO is
+/// enabled at its own callsite, whose target is the emitting module's path, so
+/// a target-scoped filter such as `RUST_LOG=warn,detcore::random=info` keeps
+/// the `detcore::random` records and drops the rest. A tool running in another
+/// process (SaBRe's guest plugin) has no subscriber to ask, so the coordinator
+/// must hand it the same per-target answer. A single yes/no for the whole
+/// `detcore` target either drops the scoped records or emits records the
+/// coordinator's filter suppresses; both make the backends' logs disagree.
+///
+/// The policy holds the coordinator's answer at a default target that no
+/// directive names and at every target a directive names. Its answer for a
+/// record is the entry for the longest named target that is a string prefix of
+/// the record's target, else the default. That is `tracing-subscriber`'s rule
+/// for target directives: the most specific matching directive decides, and
+/// any target a directive could match through is itself an entry here.
+///
+/// Limit: directives that select by span (`[syscall.intercept]=info`, or a
+/// field filter with a value, which matches span fields) decide per record
+/// from the spans the emitting thread has entered. Those spans exist only in
+/// the process where the coordinator's subscriber runs (under ptrace,
+/// reverie-ptrace enters `syscall.intercept` around each Detcore callback); a
+/// forwarded process has none, so this per-target answer, taken once at
+/// launch, cannot reproduce them. Target directives and field-presence
+/// filters are reproduced exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardPolicy {
+    default: bool,
+    targets: Vec<(String, bool)>,
+}
+
+impl ForwardPolicy {
+    /// Forward every record. This is the policy the historical encoding `1`
+    /// denoted, and the one a coordinator logging all of Detcore at INFO sends.
+    pub fn all() -> Self {
+        Self {
+            default: true,
+            targets: Vec::new(),
+        }
+    }
+
+    /// Ask the current `tracing` subscriber which targets it takes INFO
+    /// records from.
+    ///
+    /// `directives` is the filter text the subscriber was built from (for the
+    /// CLI, `RUST_LOG`). Only the target names are read from it; whether each is
+    /// enabled is asked of the subscriber, so level overrides added after the
+    /// text (`--log`) are honoured. Unparseable or extra names are harmless:
+    /// probing a target no directive names returns that target's true answer.
+    pub fn from_current_subscriber(directives: &str) -> Self {
+        Self::from_probe(directives, info_enabled_for_target)
+    }
+
+    /// Build a policy from `directives`' target names and an INFO probe.
+    pub fn from_probe(directives: &str, info_enabled: impl Fn(&str) -> bool) -> Self {
+        let mut targets: Vec<(String, bool)> = Vec::new();
+        for directive in directives.split(',') {
+            let target = directive
+                .split(['[', '='])
+                .next()
+                .unwrap_or_default()
+                .trim();
+            if target.is_empty() || targets.iter().any(|(named, _)| named == target) {
+                continue;
+            }
+            targets.push((target.to_owned(), info_enabled(target)));
+        }
+        Self {
+            // No directive target is empty, so only directives that name no
+            // target (the default level) can match this one.
+            default: info_enabled(""),
+            targets,
+        }
+    }
+
+    /// Whether any record could be forwarded under this policy.
+    pub fn forwards_any(&self) -> bool {
+        self.default || self.targets.iter().any(|(_, enabled)| *enabled)
+    }
+
+    /// Whether a record emitted by module `target` is forwarded.
+    pub fn forwards(&self, target: &str) -> bool {
+        self.targets
+            .iter()
+            .filter(|(named, _)| target.starts_with(named.as_str()))
+            .max_by_key(|(named, _)| named.len())
+            .map_or(self.default, |(_, enabled)| *enabled)
+    }
+
+    /// Encode for an environment variable: the default (`1` or `0`) followed by
+    /// `,target=1` or `,target=0` per named target. Directive targets cannot
+    /// contain `,` or `=`. `1` alone is the historical forward-everything value.
+    pub fn encode(&self) -> String {
+        let mut encoded = String::from(if self.default { "1" } else { "0" });
+        for (target, enabled) in &self.targets {
+            encoded.push(',');
+            encoded.push_str(target);
+            encoded.push_str(if *enabled { "=1" } else { "=0" });
+        }
+        encoded
+    }
+
+    /// Decode [`ForwardPolicy::encode`]'s output, refusing anything else.
+    pub fn decode(encoded: &str) -> Result<Self, String> {
+        fn flag(text: &str) -> Option<bool> {
+            match text {
+                "1" => Some(true),
+                "0" => Some(false),
+                _ => None,
+            }
+        }
+        let mut entries = encoded.split(',');
+        let default = entries
+            .next()
+            .and_then(flag)
+            .ok_or_else(|| format!("DETLOG forwarding policy {encoded:?} lacks a 0/1 default"))?;
+        let mut targets = Vec::new();
+        for entry in entries {
+            let parsed = entry
+                .split_once('=')
+                .filter(|(target, _)| !target.is_empty())
+                .and_then(|(target, enabled)| Some((target.to_owned(), flag(enabled)?)));
+            let Some(parsed) = parsed else {
+                return Err(format!(
+                    "DETLOG forwarding policy {encoded:?} has malformed entry {entry:?}"
+                ));
+            };
+            targets.push(parsed);
+        }
+        Ok(Self { default, targets })
+    }
+}
+
+/// Whether the current subscriber would log a `detlog!` record emitted in the
+/// module `target`. In-process that record passes two checks: `detlog!`'s own
+/// `tracing::enabled!(INFO)`, a hint with no fields, and then the
+/// `tracing::info!` event itself, which carries one field, the message. A
+/// directive with a field filter (`detcore::random[{name}]=warn`) applies to
+/// the hint whatever its fields but to the event only when the event has that
+/// field, so the two checks can disagree; the record is logged only when both
+/// pass, and so this answers true only when both probes do.
+pub fn info_enabled_for_target(target: &str) -> bool {
+    use tracing::Metadata;
+    use tracing::callsite::DefaultCallsite;
+    use tracing::field::FieldSet;
+    use tracing::level_filters::LevelFilter;
+    use tracing::metadata::Kind;
+
+    // The hint `tracing::enabled!` builds: no fields.
+    static HINT_CALLSITE: DefaultCallsite = DefaultCallsite::new(&HINT_METADATA);
+    static HINT_METADATA: Metadata<'static> = Metadata::new(
+        "detlog forwarding hint probe",
+        "detcore::detlog",
+        tracing::Level::INFO,
+        None,
+        None,
+        None,
+        FieldSet::new(&[], tracing::callsite::Identifier(&HINT_CALLSITE)),
+        Kind::HINT,
+    );
+    // `detlog!` events carry exactly one field, the formatted message.
+    static PROBE_CALLSITE: DefaultCallsite = DefaultCallsite::new(&PROBE_METADATA);
+    static PROBE_METADATA: Metadata<'static> = Metadata::new(
+        "detlog forwarding probe",
+        "detcore::detlog",
+        tracing::Level::INFO,
+        None,
+        None,
+        None,
+        FieldSet::new(&["message"], tracing::callsite::Identifier(&PROBE_CALLSITE)),
+        Kind::EVENT,
+    );
+
+    if tracing::level_filters::STATIC_MAX_LEVEL < LevelFilter::INFO
+        || LevelFilter::current() < LevelFilter::INFO
+    {
+        return false;
+    }
+    let hint = Metadata::new(
+        "detlog forwarding hint probe",
+        target,
+        tracing::Level::INFO,
+        None,
+        None,
+        Some(target),
+        FieldSet::new(&[], tracing::callsite::Identifier(&HINT_CALLSITE)),
+        Kind::HINT,
+    );
+    let event = Metadata::new(
+        "detlog forwarding probe",
+        target,
+        tracing::Level::INFO,
+        None,
+        None,
+        Some(target),
+        FieldSet::new(&["message"], tracing::callsite::Identifier(&PROBE_CALLSITE)),
+        Kind::EVENT,
+    );
+    tracing::dispatcher::get_default(|dispatch| dispatch.enabled(&hint) && dispatch.enabled(&event))
+}
+
+static FORWARDER: OnceLock<(DetlogForwarder, ForwardPolicy)> = OnceLock::new();
 
 /// Installs a process-local sink for deterministic INFO records.
 ///
 /// Backends whose tool runs in another process can use this to transport the
 /// same records that are normally observed through the coordinator's tracing
-/// subscriber. Only the first sink installed in a process is retained.
-pub fn set_forwarder(forwarder: DetlogForwarder) -> Result<(), DetlogForwarder> {
-    FORWARDER.set(forwarder)
+/// subscriber. `policy` is the coordinator's per-target answer; records from
+/// other modules are not forwarded. Only the first sink installed in a process
+/// is retained.
+pub fn set_forwarder(
+    forwarder: DetlogForwarder,
+    policy: ForwardPolicy,
+) -> Result<(), (DetlogForwarder, ForwardPolicy)> {
+    FORWARDER.set((forwarder, policy))
 }
 
-/// Returns whether a process-local deterministic-record sink is installed.
+/// The line a forwarded record travels as: the record as the coordinator's tracing
+/// subscriber would print it, naming the module that emitted it (a forwarded
+/// `detcore::tool_local` record must not read as `detcore` and differ from the same
+/// record logged through tracing), then a newline.
 #[doc(hidden)]
-pub fn forwarding_enabled() -> bool {
-    FORWARDER.get().is_some()
+pub fn forwarded_line(target: &str, record_suffix: &str, message: fmt::Arguments<'_>) -> Vec<u8> {
+    format!("INFO {target}: DETLOG {message}{record_suffix}\n").into_bytes()
 }
 
-/// Emits one deterministic record through tracing and the process-local sink.
+/// Dedicated typed payload on the existing counted message socket. This is
+/// not a textual INFO acceptance rule and grants no execution authority.
+pub const PLAIN_INFO_MAGIC: &[u8; 8] = b"HINFO\0\0\0";
+const PLAIN_INFO_HEADER: usize = 20;
+const PLAIN_INFO_MAX: usize = 64 * 1024;
+
+fn plain_info_target(target: &str) -> bool {
+    if target == "detcore" || target == "reverie::guest" {
+        return true;
+    }
+    target.strip_prefix("detcore::").is_some_and(|rest| {
+        rest.split("::").all(|segment| {
+            let mut bytes = segment.bytes();
+            bytes
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    })
+}
+
+/// Refuses filters whose meaning cannot be reproduced by the existing
+/// target-only ForwardPolicy. Call before enabling the ordered INFO runtime.
+/// This does not alter the policy or guess answers for span/field directives.
+pub fn validate_plain_info_directives(directives: &str) -> Result<(), &'static str> {
+    for directive in directives
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let level =
+            |text: &str| matches!(text, "off" | "error" | "warn" | "info" | "debug" | "trace");
+        if level(directive) {
+            continue;
+        }
+        let (target, setting) = directive
+            .split_once('=')
+            .map_or((directive, None), |(t, l)| (t, Some(l)));
+        if target.is_empty()
+            || !target
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_:-.".contains(&byte))
+            || setting.is_some_and(|setting| !level(setting))
+        {
+            return Err("ordered plain INFO requires target-only log directives");
+        }
+    }
+    Ok(())
+}
+
+/// Encode only the message-only INFO class. Geometry/UTF-8 are checked again
+/// by the host; no raw INFO line can substitute for this envelope.
+pub fn encode_plain_info(target: &str, message: &str) -> Result<Vec<u8>, &'static str> {
+    if !plain_info_target(target) || target.len() > 4096 {
+        return Err("plain INFO target outside the Detcore module class");
+    }
+    // A line-oriented formatter cannot represent embedded control separators
+    // without additional fidelity work. Refuse, never sanitize or truncate.
+    if message
+        .bytes()
+        .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
+        return Err("plain INFO multiline/control message is unsupported");
+    }
+    let length = PLAIN_INFO_HEADER
+        .checked_add(target.len())
+        .and_then(|n| n.checked_add(message.len()))
+        .filter(|length| *length <= PLAIN_INFO_MAX)
+        .ok_or("plain INFO envelope too large")?;
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(PLAIN_INFO_MAGIC);
+    bytes.extend_from_slice(&[1, 1, 3, 0]); // version, message class, INFO, reserved
+    bytes.extend_from_slice(&(target.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&(message.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(target.as_bytes());
+    bytes.extend_from_slice(message.as_bytes());
+    Ok(bytes)
+}
+
+/// Decode the complete envelope, rejecting unsupported classes and trailing
+/// bytes. Returned slices borrow the exact counted datagram payload.
+pub fn decode_plain_info(bytes: &[u8]) -> Result<(&str, &str), &'static str> {
+    if bytes.len() < PLAIN_INFO_HEADER
+        || bytes.len() > PLAIN_INFO_MAX
+        || bytes.get(..8) != Some(PLAIN_INFO_MAGIC.as_slice())
+        || bytes.get(8..12) != Some(&[1, 1, 3, 0])
+    {
+        return Err("plain INFO header/class is invalid");
+    }
+    let target_len = u32::from_le_bytes(
+        bytes[12..16]
+            .try_into()
+            .map_err(|_| "plain INFO target length")?,
+    ) as usize;
+    let message_len = u32::from_le_bytes(
+        bytes[16..20]
+            .try_into()
+            .map_err(|_| "plain INFO message length")?,
+    ) as usize;
+    let split = PLAIN_INFO_HEADER
+        .checked_add(target_len)
+        .ok_or("plain INFO target overflow")?;
+    let end = split
+        .checked_add(message_len)
+        .ok_or("plain INFO message overflow")?;
+    if end != bytes.len() || target_len > 4096 {
+        return Err("plain INFO lengths mismatch");
+    }
+    let target = std::str::from_utf8(
+        bytes
+            .get(PLAIN_INFO_HEADER..split)
+            .ok_or("plain INFO target truncated")?,
+    )
+    .map_err(|_| "plain INFO target UTF-8")?;
+    let message = std::str::from_utf8(
+        bytes
+            .get(split..end)
+            .ok_or("plain INFO message truncated")?,
+    )
+    .map_err(|_| "plain INFO message UTF-8")?;
+    if !plain_info_target(target)
+        || message
+            .bytes()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
+        return Err("plain INFO target/message class is invalid");
+    }
+    Ok((target, message))
+}
+
+/// Explicitly selected only by the genuine InitialImage runtime. Existing
+/// preload/DBT callers never select this delivery mode merely by installing
+/// the historical DETLOG forwarder.
+pub type PlainInfoForwarder = for<'a> fn(&str, u64, fmt::Arguments<'a>);
+static PLAIN_INFO_FORWARDER: OnceLock<PlainInfoForwarder> = OnceLock::new();
+
+/// Select counted delivery for the two shared semantic INFO producers.
+/// Requires the actual existing DETLOG policy/channel to be installed first.
+pub fn set_plain_info_forwarder(forwarder: PlainInfoForwarder) -> Result<(), &'static str> {
+    if FORWARDER.get().is_none() {
+        return Err("plain INFO requires the existing counted forwarder");
+    }
+    PLAIN_INFO_FORWARDER
+        .set(forwarder)
+        .map_err(|_| "plain INFO forwarder installed twice")
+}
+
+/// Whether the explicit InitialImage mode was selected. This is a routing
+/// choice, not an assertion that arbitrary tracing fields/spans are forwarded.
 #[doc(hidden)]
-pub fn emit_forwarded(record_suffix: &str, message: fmt::Arguments<'_>) {
+pub fn plain_info_forwarding() -> bool {
+    PLAIN_INFO_FORWARDER.get().is_some()
+}
+
+/// Called by the two message-only producers after the target policy admits
+/// them. Count before invoking the authenticated transport callback, so a
+/// missing/replaced channel cannot erase a produced record from the cut.
+#[doc(hidden)]
+pub fn emit_plain_info(target: &str, message: fmt::Arguments<'_>) {
+    if !forwards_target(target) {
+        return;
+    }
+    let index = count_forwarded();
+    PLAIN_INFO_FORWARDER
+        .get()
+        .expect("plain INFO forwarder disappeared")(target, index, message);
+}
+
+/// The ordinary tracing arm retains the original tokens, callsite target,
+/// fields and subscriber context. Only explicit InitialImage opt-in selects
+/// the counted message-only arm; this does not capture arbitrary INFO events.
+#[macro_export]
+macro_rules! ordered_info {
+    ($format:literal $(, $argument:expr)* $(,)?) => {{
+        if $crate::detlog::plain_info_forwarding() {
+            if $crate::detlog::forwards_target(module_path!()) {
+                $crate::detlog::emit_plain_info(module_path!(), format_args!($format $(, $argument)*));
+            }
+        } else {
+            tracing::info!($format $(, $argument)*);
+        }
+    }};
+}
+
+/// Send the already counted record on its actual authenticated socket. None
+/// deliberately sends nothing; the produced index remains outstanding and
+/// the existing request/terminal cut must refuse the missing record.
+pub fn send_plain_info_record(
+    socket: Option<libc::c_int>,
+    target: &str,
+    index: u64,
+    message: fmt::Arguments<'_>,
+) {
+    if let Some(socket) = socket {
+        send_forwarded_payload(socket, index, || {
+            match encode_plain_info(target, &message.to_string()) {
+                Ok(bytes) => bytes,
+                Err(reason) => format!("{FORWARDING_LOSS_NOTICE} 0 0 {reason}\n").into_bytes(),
+            }
+        });
+    }
+}
+
+/// Calls `operation` and restores the calling thread's `errno` afterwards. An
+/// in-guest tool runs on the guest's own thread, so a failed forwarding write must
+/// not change what the guest reads there.
+fn preserving_errno(operation: impl FnOnce()) {
+    // SAFETY: `__errno_location` returns the calling thread's live errno slot.
+    let errno = unsafe { libc::__errno_location() };
+    // SAFETY: as above; the slot is valid for the life of the thread.
+    let saved = unsafe { *errno };
+    operation();
+    // SAFETY: as above.
+    unsafe { *errno = saved };
+}
+
+/// A [`DetlogForwarder`] for a tool that runs inside the guest process and shares the
+/// guest's standard error: it writes each record as one [`forwarded_line`] there, where
+/// Hermit's verification separates the records from the guest's own output by their
+/// text.
+///
+/// It uses one raw `write` per record, so records from several guest threads cannot
+/// interleave, and it avoids `tracing`'s thread-local dispatcher, which libc's final
+/// `exit_group` can reach after Rust thread-local destruction has begun. A write error
+/// drops the record. The calling thread's `errno` is preserved.
+pub fn forward_to_stderr(
+    target: &str,
+    record_suffix: &str,
+    _index: u64,
+    message: fmt::Arguments<'_>,
+) {
+    preserving_errno(|| {
+        let line = forwarded_line(target, record_suffix, message);
+        let mut rest = line.as_slice();
+        while !rest.is_empty() {
+            // SAFETY: `rest` is a live, initialized byte slice of the given length.
+            let written = unsafe {
+                libc::write(
+                    libc::STDERR_FILENO,
+                    rest.as_ptr().cast::<libc::c_void>(),
+                    rest.len(),
+                )
+            };
+            if written > 0 {
+                rest = &rest[written as usize..];
+            } else if written == 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                return;
+            }
+        }
+    });
+}
+
+/// Starts the line [`send_forwarded_record`] sends in place of a record it could not
+/// deliver, followed by the record's length and the error number. Its presence means
+/// the forwarded records are incomplete, so verification must not compare them.
+pub const FORWARDING_LOSS_NOTICE: &str = "HERMIT_DETLOG_RECORD_LOST";
+
+/// The message an in-guest runtime sends on the forwarding socket when it has to
+/// give the socket up (reverie-liteinst's `reserve_tool_output_fd` retirement
+/// message): a [`FORWARDING_LOSS_NOTICE`], since no later record can arrive.
+pub const FORWARDING_RETIRED_NOTICE: &[u8] = b"HERMIT_DETLOG_RECORD_LOST 0 0 socket retired\n";
+
+/// Losses whose notice could not be sent either; the next message that gets through
+/// is preceded by a notice for them, so a later record cannot hide them.
+static UNREPORTED_LOSSES: AtomicU64 = AtomicU64::new(0);
+
+/// Sends one record as one [`forwarded_line`] message on `socket`, a message-oriented
+/// socket (such as one end of a `SOCK_SEQPACKET` pair) that carries nothing but records,
+/// from which Hermit's verification moves them into the run's log.
+///
+/// It uses one raw `send` with `MSG_NOSIGNAL`, so a socket whose reader has gone never
+/// raises SIGPIPE in the guest. A record that cannot be sent (too large for the socket,
+/// or any other error) is replaced by a short [`FORWARDING_LOSS_NOTICE`] message, so the
+/// loss is visible rather than silent; if that notice cannot be sent either, a notice
+/// precedes the next message that can. The calling thread's `errno` is preserved.
+pub fn send_forwarded_record(
+    socket: libc::c_int,
+    target: &str,
+    record_suffix: &str,
+    index: u64,
+    message: fmt::Arguments<'_>,
+) {
+    send_forwarded_payload(socket, index, || {
+        forwarded_line(target, record_suffix, message)
+    });
+}
+
+fn send_forwarded_payload(socket: libc::c_int, index: u64, payload: impl FnOnce() -> Vec<u8>) {
+    let send = |bytes: &[u8]| loop {
+        // SAFETY: `bytes` is a live, initialized byte slice of the given length.
+        let sent = unsafe {
+            libc::send(
+                socket,
+                bytes.as_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent >= 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    };
+    let notice = |length: usize, errno: i32| format!("{FORWARDING_LOSS_NOTICE} {length} {errno}\n");
+    preserving_errno(|| {
+        let unreported = UNREPORTED_LOSSES.swap(0, Ordering::AcqRel);
+        if unreported > 0 && send(notice(0, 0).as_bytes()).is_err() {
+            UNREPORTED_LOSSES.fetch_add(unreported, Ordering::AcqRel);
+        }
+        let line = tagged_forwarded_message(current_tid(), index, &payload());
+        if let Err(error) = send(&line) {
+            let errno = error.raw_os_error().unwrap_or(0);
+            if send(notice(line.len(), errno).as_bytes()).is_err() {
+                UNREPORTED_LOSSES.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    });
+}
+
+/// The socket `fd` names, as (`st_dev`, `st_ino`); `None` when it names no
+/// socket.
+pub fn socket_identity(fd: libc::c_int) -> Option<(u64, u64)> {
+    // SAFETY: fstat writes only into `metadata`.
+    // The raw syscall: this runs inside the guest under in-guest LiteInst
+    // (see crate::util::raw_syscall).
+    let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        crate::util::raw_syscall(
+            libc::SYS_fstat,
+            [fd as u64, (&raw mut metadata) as u64, 0, 0, 0, 0],
+        )
+    };
+    (status == 0 && metadata.st_mode & libc::S_IFMT == libc::S_IFSOCK)
+        .then_some((metadata.st_dev, metadata.st_ino))
+}
+
+/// The value Hermit passes an in-guest Tool for its output socket `fd`
+/// (`reverie_sabre::TOOL_OUTPUT_ENV`, `detcore_liteinst::DETLOG_FORWARD_ENV`):
+/// `<fd>:<st_dev>:<st_ino>`, the identity in 16 hexadecimal digits each. Guest
+/// code can run before the Tool adopts the descriptor (an executable's
+/// `.preinit_array`) and close it or put a socket of its own at that number;
+/// the Tool adopts it only if it is still this socket
+/// ([`tool_output_env_target`]), so its records never reach the guest's socket.
+/// The fixed width keeps the value's length, which a scrubbed environment block
+/// keeps, independent of the host.
+pub fn tool_output_env_value(fd: libc::c_int) -> std::io::Result<String> {
+    let (dev, ino) = socket_identity(fd).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a Tool output descriptor must be a socket",
+        )
+    })?;
+    Ok(format!("{fd}:{dev:016x}:{ino:016x}"))
+}
+
+/// The descriptor and socket identity a [`tool_output_env_value`] names.
+pub fn parse_tool_output_env_value(value: &str) -> Option<(libc::c_int, (u64, u64))> {
+    let mut fields = value.split(':');
+    let fd = fields.next()?.parse::<libc::c_int>().ok()?;
+    let hex = |field: Option<&str>| {
+        field
+            .filter(|field| field.len() == 16)
+            .and_then(|field| u64::from_str_radix(field, 16).ok())
+    };
+    let identity = (hex(fields.next())?, hex(fields.next())?);
+    fields.next().is_none().then_some((fd, identity))
+}
+
+/// The descriptor a [`tool_output_env_value`] names, if it still names that
+/// socket in this process.
+pub fn tool_output_env_target(value: &str) -> Option<libc::c_int> {
+    let (fd, identity) = parse_tool_output_env_value(value)?;
+    (socket_identity(fd) == Some(identity)).then_some(fd)
+}
+
+/// The calling thread's kernel id, for [`tagged_forwarded_message`].
+fn current_tid() -> i32 {
+    // SAFETY: gettid has no arguments and cannot fail.
+    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+}
+
+/// Prefixes a forwarded record with the id of the guest thread that sent it and
+/// the record's index in that thread's counted interval, `T<tid>.<index> `, so
+/// the coordinator can write each thread's records at that thread's own
+/// scheduler turn ([`write_forwarded_for`]) and check that it holds exactly the
+/// records the thread produced, in order ([`check_forwarded_count`]). The
+/// coordinator strips the tag before the record reaches the log.
+pub fn tagged_forwarded_message(tid: i32, index: u64, line: &[u8]) -> Vec<u8> {
+    let mut message = format!("T{tid}.{index} ").into_bytes();
+    message.extend_from_slice(line);
+    message
+}
+
+/// The sender's thread id, the record's index and the record, for a message
+/// tagged by [`tagged_forwarded_message`]; `None` for an untagged message (a
+/// [`FORWARDING_LOSS_NOTICE`] or [`FORWARDING_RETIRED_NOTICE`] sent raw, or a
+/// record from a runtime older than the tag).
+pub fn split_forwarded_message(message: &[u8]) -> Option<(i32, u64, &[u8])> {
+    let rest = message.strip_prefix(b"T")?;
+    let space = rest.iter().position(|&byte| byte == b' ')?;
+    let tag = std::str::from_utf8(&rest[..space]).ok()?;
+    let (tid, index) = tag.split_once('.')?;
+    let decimal = |digits: &str| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+    if !decimal(tid) || !decimal(index) {
+        return None;
+    }
+    Some((tid.parse().ok()?, index.parse().ok()?, &rest[space + 1..]))
+}
+
+/// Receives each record the coordinator writes from a forwarding socket: a
+/// [`forwarded_line`] (its sender tag removed), or a [`FORWARDING_LOSS_NOTICE`].
+pub type ForwardedRecordSink = Box<dyn FnMut(&[u8]) + Send>;
+
+/// Where a thread's forwarded records may be written at its request
+/// ([`ForwardedOrder::at_request`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Runner {
+    /// No turn has been committed yet and no request has arrived.
+    NoTurnYet,
+    /// No turn has been committed yet; this thread sent the first request, so it
+    /// is the root.
+    Root(i32),
+    /// The thread of the last ordinary COMMIT, whose request ends that turn.
+    Exclusive(i32),
+    /// The last COMMIT was a BACKGROUND one: no request is a fixed point.
+    None,
+}
+
+/// The order rule's state ([`set_forwarded_source`]): the forwarded records taken
+/// from the socket but not yet written, by sending thread, and which thread's
+/// request is a point the schedule fixes. It decides what to write; the caller
+/// writes it.
+#[derive(Debug)]
+pub(crate) struct ForwardedOrder {
+    pending: std::collections::BTreeMap<i32, Vec<Vec<u8>>>,
+    runner: Runner,
+    /// A second root asked before any turn ([`ForwardedOrder::at_request`]).
+    ambiguous: bool,
+    /// An untagged ordinary record arrived ([`ForwardedOrder::untagged`]).
+    legacy: bool,
+    /// Records received from each thread since its last counted request
+    /// ([`ForwardedOrder::received_since_check`]).
+    received: std::collections::BTreeMap<i32, ReceivedInterval>,
+}
+
+/// What arrived from one thread since its last counted request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReceivedInterval {
+    /// How many records arrived.
+    pub(crate) count: u64,
+    /// The first record whose index was not the next one: `(expected, sent)`.
+    pub(crate) out_of_sequence: Option<(u64, u64)>,
+}
+
+/// The [`FORWARDING_LOSS_NOTICE`] the coordinator writes when a forwarded record
+/// arrives without a sender tag (a guest runtime older than the tag), so its place
+/// in the log would be the host's choice.
+pub const FORWARDING_UNTAGGED_RECORD_NOTICE: &[u8] =
+    b"HERMIT_DETLOG_RECORD_LOST 0 0 untagged forwarded record from an older runtime\n";
+
+/// The [`FORWARDING_LOSS_NOTICE`] the coordinator writes when more than one guest
+/// thread sends a request before the first turn, so the forwarded records' order
+/// would depend on the host.
+pub const FORWARDING_AMBIGUOUS_ORDER_NOTICE: &[u8] =
+    b"HERMIT_DETLOG_RECORD_LOST 0 0 forwarded order ambiguous: more than one root\n";
+
+impl ForwardedOrder {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: Default::default(),
+            runner: Runner::NoTurnYet,
+            ambiguous: false,
+            legacy: false,
+            received: Default::default(),
+        }
+    }
+
+    /// Queues a record thread `tid` sent.
+    pub(crate) fn queue(&mut self, tid: i32, record: Vec<u8>) {
+        self.pending.entry(tid).or_default().push(record);
+    }
+
+    /// Notes that the record with `index` in thread `tid`'s counted interval
+    /// arrived. A thread sends its records in order on one message socket, so
+    /// they arrive as 1, 2, 3, ...; the first index that is not the next one is
+    /// kept.
+    pub(crate) fn arrived(&mut self, tid: i32, index: u64) {
+        let interval = self.received.entry(tid).or_default();
+        interval.count += 1;
+        if index != interval.count && interval.out_of_sequence.is_none() {
+            interval.out_of_sequence = Some((interval.count, index));
+        }
+    }
+
+    /// What arrived from thread `tid` since its last counted request, and
+    /// starts its next interval.
+    pub(crate) fn received_since_check(&mut self, tid: i32) -> ReceivedInterval {
+        self.received.remove(&tid).unwrap_or_default()
+    }
+
+    /// The records to write when a request from `tid` arrives: `tid`'s queue if its
+    /// request is a point the schedule fixes, otherwise none.
+    pub(crate) fn at_request(&mut self, tid: i32) -> Vec<Vec<u8>> {
+        match self.runner {
+            Runner::NoTurnYet => {
+                self.runner = Runner::Root(tid);
+                self.pending.remove(&tid).unwrap_or_default()
+            }
+            Runner::Root(root) | Runner::Exclusive(root) if root == tid => {
+                self.pending.remove(&tid).unwrap_or_default()
+            }
+            Runner::Root(_) if !self.ambiguous => {
+                // A second thread asks before any turn: there is more than one root
+                // (for example a preload constructor that forked before the runtime
+                // was installed), so which root's records come first is decided by
+                // the host. Say so instead of writing a host-timed order: the loss
+                // notice makes verification refuse to compare the records.
+                self.ambiguous = true;
+                vec![FORWARDING_AMBIGUOUS_ORDER_NOTICE.to_vec()]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The records to write immediately before the scheduler commits a turn of
+    /// `tid` (all of `tid`'s queue); `exclusive` is false for a BACKGROUND turn.
+    pub(crate) fn at_commit(&mut self, tid: i32, exclusive: bool) -> Vec<Vec<u8>> {
+        self.runner = if exclusive {
+            Runner::Exclusive(tid)
+        } else {
+            Runner::None
+        };
+        self.pending.remove(&tid).unwrap_or_default()
+    }
+
+    /// What to write for a message without a sender tag, at once: a loss notice the
+    /// runtime sent as is; for an ordinary record (from a runtime older than the
+    /// tag), the record preceded, the first time, by
+    /// [`FORWARDING_UNTAGGED_RECORD_NOTICE`], so verification refuses to compare
+    /// records whose place the host chose.
+    pub(crate) fn untagged(&mut self, message: &[u8]) -> Vec<Vec<u8>> {
+        if message.starts_with(FORWARDING_LOSS_NOTICE.as_bytes()) {
+            return vec![message.to_vec()];
+        }
+        let mut out = Vec::new();
+        if !self.legacy {
+            self.legacy = true;
+            out.push(FORWARDING_UNTAGGED_RECORD_NOTICE.to_vec());
+        }
+        out.push(message.to_vec());
+        out
+    }
+
+    /// Everything still queued, thread by thread in thread-id order.
+    pub(crate) fn finish(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending)
+            .into_values()
+            .flatten()
+            .collect()
+    }
+}
+
+/// The receiving end of the socket an in-guest Tool sends its records on, where
+/// the coordinator writes them, and the order rule's state ([`set_forwarded_source`]).
+struct ForwardedSource {
+    socket: OwnedFd,
+    sink: ForwardedRecordSink,
+    order: ForwardedOrder,
+    // Ordinary drains retain their historical behavior; native cuts must not
+    // reinterpret a prior EOF/receive failure or loss notice as an empty source.
+    transport_failure: Option<ForwardedSourceError>,
+    loss_seen: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardedSourceError {
+    Closed,
+    Io(i32),
+    Poll(i16),
+    MessageChanged,
+}
+
+static FORWARDED_SOURCE: Mutex<Option<ForwardedSource>> = Mutex::new(None);
+
+/// The target of the evidence record that reports this process's
+/// [`determinism_loss`] where the verifier cannot read it: under the DBT
+/// backend Detcore runs in the guest's DynamoRIO client, so the client writes
+/// the reason into its protected evidence stream at process exit, and hermit's
+/// DBT adapter refuses the comparison when a run's evidence holds one.
+pub const DETERMINISM_LOSS_RECORD_TARGET: &str = "detcore::determinism_loss";
+
+/// Counts [`set_forwarded_source`] and [`clear_forwarded_source`] calls, so the
+/// receiver knows when the source it serves was replaced or cleared.
+static FORWARDED_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The generation whose receiver has been started ([`start_forwarded_receiver`]).
+static RECEIVER_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Stops the running receiver task: sent (or dropped) when its source is
+/// replaced or cleared.
+static RECEIVER_STOP: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
+
+/// The first determinism loss recorded in this process, never cleared: a run
+/// that recorded one must not be compared, whatever reached its log (see
+/// [`determinism_loss`]).
+static DETERMINISM_LOSS: Mutex<Option<String>> = Mutex::new(None);
+
+/// Records that this run's records can no longer be trusted to compare: a
+/// record was lost, or an event happened at a moment the host chose. The first
+/// reason is kept. Verification refuses to compare a run whose
+/// [`determinism_loss`] is set, independently of whether the corresponding
+/// loss notice reached the log.
+pub fn record_determinism_loss(reason: &str) {
+    let mut loss = DETERMINISM_LOSS.lock().unwrap();
+    if loss.is_none() {
+        *loss = Some(reason.to_owned());
+    }
+}
+
+static REPLAY_REFUSAL: Mutex<Option<String>> = Mutex::new(None);
+
+/// Records that a recording made by this process cannot be replayed
+/// faithfully, for the recorder to persist in its metadata (`replay_refused`),
+/// so that replay refuses before it starts the guest. The first reason is
+/// kept. It also records a determinism loss.
+pub fn record_replay_refusal(reason: &str) {
+    write_loss_notice(reason);
+    let mut refusal = REPLAY_REFUSAL.lock().unwrap();
+    if refusal.is_none() {
+        *refusal = Some(reason.to_owned());
+    }
+}
+
+/// The first replay refusal [`record_replay_refusal`] recorded in this
+/// process, if any.
+pub fn replay_refusal() -> Option<String> {
+    REPLAY_REFUSAL.lock().unwrap().clone()
+}
+
+/// The first determinism loss [`record_determinism_loss`] recorded in this
+/// process, if any.
+pub fn determinism_loss() -> Option<String> {
+    DETERMINISM_LOSS.lock().unwrap().clone()
+}
+
+/// Writes a [`FORWARDING_LOSS_NOTICE`] line with `reason` through the
+/// registered forwarding sink, the unfiltered raw path, and records the
+/// determinism loss. Without a registered source the loss is still recorded.
+pub fn write_loss_notice(reason: &str) {
+    let line = format!("{FORWARDING_LOSS_NOTICE} 0 0 {reason}\n");
+    record_determinism_loss(reason);
+    if let Some(source) = FORWARDED_SOURCE.lock().unwrap().as_mut() {
+        (source.sink)(line.as_bytes());
+    }
+}
+
+/// Writes one forwarded record through `source`'s sink, recording a
+/// determinism loss when the record is a loss notice.
+fn emit(source: &mut ForwardedSource, record: &[u8]) {
+    if record.starts_with(FORWARDING_LOSS_NOTICE.as_bytes()) {
+        source.loss_seen = true;
+        record_determinism_loss(&String::from_utf8_lossy(record));
+    }
+    (source.sink)(record);
+}
+
+/// Registers the receiving end of the socket an in-guest Tool sends its records on
+/// ([`send_forwarded_record`]) and the sink that writes them to the run's log.
+///
+/// THE ORDER RULE, one for every backend whose Tool runs in the guest. Each record
+/// carries its sending thread ([`tagged_forwarded_message`]). Before it handles any
+/// guest request the coordinator takes the records waiting on the socket into a
+/// queue per sending thread ([`drain_forwarded_at_request`] at the top of the
+/// request handler). A thread's queued records are written into the log:
+/// - when that thread's own request arrives, if it is the thread the scheduler last
+///   committed an ordinary turn to, or, before any turn, the thread whose request
+///   arrives first (the root; every other thread is created during some turn). That
+///   thread's request is the event that ends the turn the schedule gave it, so the
+///   request arrives at a point the schedule fixes, and its records land where a
+///   single-process (ptrace) run writes them, ahead of everything handling that
+///   request writes. (A thread still in background IO from an earlier BACKGROUND
+///   turn may run at the same time; its records wait for its own COMMIT, by the next
+///   rule. Coordinator lines its continuation writes below INFO verbosity, such as
+///   TRACE, are not ordered by this rule; the INFO DETLOG and COMMIT lines that
+///   verification compares are.)
+/// - otherwise immediately before the scheduler commits that thread's next turn
+///   ([`write_forwarded_for`], at both kinds of COMMIT): a thread that runs without
+///   holding the turn (a forked child doing its setup, a thread in background IO)
+///   sends its records while other threads' turns are being handled, so only its
+///   own next COMMIT is a point the schedule fixes;
+/// - and, for any still queued when the run ends, then, thread by thread in
+///   thread-id order.
+///
+/// If a second thread sends a request before the first turn, there is more than one
+/// root (a preload constructor that forked before the runtime was installed, say),
+/// and which root's records come first would be the host's choice. The coordinator
+/// then writes [`FORWARDING_AMBIGUOUS_ORDER_NOTICE`], so verification refuses to
+/// compare the records rather than compare a host-timed order.
+///
+/// A `send` on a message socket queues the record on the receiver before it returns,
+/// so a guest thread's records sent before a request are queued by the time that
+/// request is handled, and so before the turn it leads to is committed. Writing every
+/// thread's records at any request's arrival instead put a record wherever the host
+/// happened to deliver it: a forked child's records, sent while its parent's next
+/// request was being handled, landed before or after the scheduler's records for that
+/// request depending on timing.
+///
+/// The records are TAKEN off the socket continuously, by a receiver task that
+/// queues each one for its thread as soon as it arrives, so a guest never
+/// blocks on a full socket buffer waiting for a request the coordinator would
+/// drain at: a single `writev` of 1024 buffers sends 1024 records before its
+/// thread's next request. Taking a record only queues it; where it is written
+/// is still decided by the rule above. (A message without a sender tag is
+/// written as it is taken, which verification refuses to compare anyway: see
+/// `ForwardedOrder::untagged`.) The receiver is a task on the coordinator's
+/// tokio runtime, started at the first request (`start_forwarded_receiver`),
+/// not a thread of its own: inside Hermit's PID namespace a coordinator thread
+/// takes an ID from the same allocator as the guest's tasks, and one more
+/// thread shifted every guest ID by one (the root became DetPid 4).
+pub fn set_forwarded_source(socket: OwnedFd, sink: ForwardedRecordSink) {
+    let mut source = FORWARDED_SOURCE.lock().unwrap();
+    FORWARDED_GENERATION.fetch_add(1, Ordering::SeqCst);
+    stop_forwarded_receiver();
+    *source = Some(ForwardedSource {
+        socket,
+        sink,
+        order: ForwardedOrder::new(),
+        transport_failure: None,
+        loss_seen: false,
+    });
+}
+
+/// Starts the receiver task of the registered source on the current tokio
+/// runtime, once per [`set_forwarded_source`]. Called from the coordinator's
+/// request handling, which runs on that runtime; outside one it does nothing,
+/// and the request-time drains still take every record.
+fn start_forwarded_receiver() {
+    let generation = FORWARDED_GENERATION.load(Ordering::SeqCst);
+    if RECEIVER_GENERATION.load(Ordering::SeqCst) == generation {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    // The task watches its own duplicate of the socket, so closing the
+    // source's descriptor (and the number's reuse) never touches the task's
+    // registration.
+    let watched = match FORWARDED_SOURCE.lock().unwrap().as_ref() {
+        Some(source) => match source.socket.try_clone() {
+            Ok(watched) => watched,
+            Err(_) => return,
+        },
+        None => return,
+    };
+    if RECEIVER_GENERATION.swap(generation, Ordering::SeqCst) == generation {
+        return;
+    }
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    stop_forwarded_receiver();
+    *RECEIVER_STOP.lock().unwrap() = Some(stop);
+    runtime.spawn(receive_forwarded(watched, generation, stopped));
+}
+
+/// Stops the running receiver task, if any.
+fn stop_forwarded_receiver() {
+    if let Some(stop) = RECEIVER_STOP.lock().unwrap().take() {
+        let _ = stop.send(());
+    }
+}
+
+/// The receiver task of [`start_forwarded_receiver`]: waits until `watched`
+/// (its own duplicate of the registered socket) is readable and takes the
+/// socket's messages into their threads' queues, until a terminal transport
+/// failure is retained or the source of `generation` is replaced or cleared,
+/// which also sends `stopped`. Readiness is only a hint; the source lock and the
+/// generation decide whether the registered socket is still the one it serves.
+/// Retiring this task leaves the source, queued records and failure intact for
+/// the final checks; task completion does not accept a drain.
+async fn receive_forwarded(
+    watched: OwnedFd,
+    generation: u64,
+    mut stopped: tokio::sync::oneshot::Receiver<()>,
+) {
+    let Ok(readiness) =
+        tokio::io::unix::AsyncFd::with_interest(watched, tokio::io::Interest::READABLE)
+    else {
+        // The next request starts it again; until then request-time drains
+        // still take every record.
+        let _ =
+            RECEIVER_GENERATION.compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst);
+        return;
+    };
+    loop {
+        let ready = tokio::select! {
+            ready = readiness.readable() => ready,
+            _ = &mut stopped => return,
+        };
+        let Ok(mut ready) = ready else {
+            let _ = RECEIVER_GENERATION.compare_exchange(
+                generation,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            return;
+        };
+        {
+            let mut source = FORWARDED_SOURCE.lock().unwrap();
+            if FORWARDED_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            match source.as_mut() {
+                Some(source) => {
+                    collect_forwarded(source);
+                    if source.transport_failure.is_some() {
+                        return;
+                    }
+                }
+                None => return,
+            }
+        }
+        // collect_forwarded read until the socket had nothing waiting.
+        ready.clear_ready();
+    }
+}
+
+/// Unregisters the source set with [`set_forwarded_source`], after taking the last
+/// waiting records and writing every queued record, thread by thread in thread-id
+/// order, and closes its socket.
+pub fn clear_forwarded_source() {
+    let mut source = FORWARDED_SOURCE.lock().unwrap();
+    FORWARDED_GENERATION.fetch_add(1, Ordering::SeqCst);
+    stop_forwarded_receiver();
+    if let Some(source) = source.as_mut() {
+        collect_forwarded(source);
+        let records = source.order.finish();
+        write_records(source, records);
+    }
+    source.take();
+}
+
+/// Actual physical exit-watch completion carried by a private affine backend
+/// receipt, not a caller's assertion that an exit happened.
+///
+/// # Safety
+/// Implement only on a private type constructed after the real watched birth's
+/// PhysicalExitWatch drain completed, its one physical report was delivered,
+/// and all watch failures were excluded. Retain that same pidfs pidfd and IDs.
+/// Numerical PID equality, child wait alone, source EOF, or a bool cannot create
+/// this receipt. The host implementation additionally checks the actual fd below.
+pub unsafe trait NativePhysicalExitCompletion {
+    /// The same retained watched pidfd, owned by this affine receipt.
+    fn retained_pidfd(&self) -> std::os::fd::BorrowedFd<'_>;
+    /// Actual deterministic/physical root PID of the single-thread domain.
+    fn process_id(&self) -> i32;
+    /// Independently retained pidfs inode of that watched birth.
+    fn birth_identity(&self) -> u64;
+}
+
+/// Identity retained by the actual backend watch for this run's root process.
+///
+/// # Safety
+/// Implement only for a private owner constructed from a successful real watch
+/// registration. The pidfd and IDs must name that exact registration and remain
+/// immutable; `watch_is_healthy` must consult that retained watch's actual state.
+/// A numeric PID, a parsed packet, or a socketpair creator is not this authority.
+pub unsafe trait NativePhysicalWatchIdentity {
+    /// The actual registered birth, retained by this owner.
+    fn retained_pidfd(&self) -> std::os::fd::BorrowedFd<'_>;
+    /// Actual guest-visible root process ID from that registration.
+    fn process_id(&self) -> i32;
+    /// Actual pidfs inode of that birth.
+    fn birth_identity(&self) -> u64;
+    /// The retained watcher is still running without failure.
+    fn watch_is_healthy(&self) -> bool;
+}
+
+/// Coordinator-local source identity retained at native source registration.
+/// It does not authenticate an image or authorize any exec/lifecycle transition.
+#[derive(Debug)]
+pub struct NativeForwardedSourceReceipt {
+    generation: u64,
+    identity: (u64, u64),
+    owner: (i32, u64),
+}
+
+/// Bind the actual source to its living watched root before releasing guest
+/// startup. EOF later requires completion of this exact retained birth.
+pub fn retain_native_forwarded_source(
+    watch: &dyn NativePhysicalWatchIdentity,
+) -> Result<NativeForwardedSourceReceipt, CoordinatorForwardingCutError> {
+    use std::os::fd::AsRawFd;
+    let owner = (watch.process_id(), watch.birth_identity());
+    let fd = watch.retained_pidfd().as_raw_fd();
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if owner.0 <= 0
+        || owner.1 == 0
+        || !watch.watch_is_healthy()
+        || unsafe { libc::fstat(fd, &mut stat) } != 0
+        || unsafe { libc::fstatfs(fd, &mut fs) } != 0
+        || fs.f_type as i64 != 0x5049_4446
+        || stat.st_ino != owner.1
+        || unsafe { libc::poll(&mut poll, 1, 0) } != 0
+    {
+        return Err(CoordinatorForwardingCutError::InvalidOwner);
+    }
+    let mut source = FORWARDED_SOURCE.lock().unwrap();
+    let source = source
+        .as_mut()
+        .ok_or(CoordinatorForwardingCutError::MissingSource)?;
+    Ok(NativeForwardedSourceReceipt {
+        generation: FORWARDED_GENERATION.load(Ordering::SeqCst),
+        identity: source_identity_for_cut(source)?,
+        owner,
+    })
+}
+
+fn verify_native_physical_completion(
+    receipt: &dyn NativePhysicalExitCompletion,
+) -> Result<(), CoordinatorForwardingCutError> {
+    use std::os::fd::AsRawFd;
+    let fd = receipt.retained_pidfd().as_raw_fd();
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if receipt.process_id() <= 0
+        || receipt.birth_identity() == 0
+        || unsafe { libc::fstat(fd, &mut stat) } != 0
+        || unsafe { libc::fstatfs(fd, &mut fs) } != 0
+        || fs.f_type as i64 != 0x5049_4446
+        || stat.st_ino != receipt.birth_identity()
+    {
+        return Err(CoordinatorForwardingCutError::InvalidOwner);
+    }
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut poll, 1, 0) };
+    if result < 0 {
+        return Err(CoordinatorForwardingCutError::SourceIo(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        ));
+    }
+    if result != 1
+        || poll.revents & libc::POLLIN == 0
+        || poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+    {
+        return Err(CoordinatorForwardingCutError::InvalidOwner);
+    }
+    Ok(())
+}
+
+fn inspect_native_final_source(
+    source: &mut ForwardedSource,
+    identity: (u64, u64),
+    owner: (i32, u64),
+    completion: &dyn NativePhysicalExitCompletion,
+) -> Result<(), CoordinatorForwardingCutError> {
+    if (completion.process_id(), completion.birth_identity()) != owner {
+        return Err(CoordinatorForwardingCutError::InvalidOwner);
+    }
+    verify_native_physical_completion(completion)?;
+    if socket_identity(source.socket.as_raw_fd()) != Some(identity) {
+        return Err(CoordinatorForwardingCutError::SourceChanged);
+    }
+    collect_forwarded(source);
+    // EOF is interpreted only after actual physical-watch completion. Other
+    // retained transport failures are never erased or turned into healthy EOF.
+    match source.transport_failure {
+        Some(ForwardedSourceError::Closed) => {}
+        Some(error) => return Err(error.into()),
+        None => return Err(CoordinatorForwardingCutError::ClosedSource),
+    }
+    let mut poll = libc::pollfd {
+        fd: source.socket.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut poll, 1, 0) };
+    if result < 0 {
+        return Err(CoordinatorForwardingCutError::SourceIo(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        ));
+    }
+    if result != 1
+        || poll.revents & libc::POLLHUP == 0
+        || poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+    {
+        return Err(CoordinatorForwardingCutError::ClosedSource);
+    }
+    if source.loss_seen || source.order.legacy || source.order.ambiguous {
+        return Err(CoordinatorForwardingCutError::DeterminismLoss);
+    }
+    for (tid, interval) in &source.order.received {
+        if let Some((expected, sent)) = interval.out_of_sequence {
+            return Err(CoordinatorForwardingCutError::OutOfSequence { expected, sent });
+        }
+        if interval.count != 0 {
+            // No caller-supplied or guessed final produced count is accepted.
+            // The genuine final counted exit request must have consumed it.
+            return Err(CoordinatorForwardingCutError::OtherOwnerPending(*tid));
+        }
+    }
+    if let Some(tid) = source.order.pending.keys().next() {
+        return Err(CoordinatorForwardingCutError::OtherOwnerPending(*tid));
+    }
+    Ok(())
+}
+
+/// Complete native DETLOG teardown after an actual physical-watch receipt.
+/// The unchanged counted/order rules must have credited every final record;
+/// unchecked tail records, legacy/order/loss notices, receive/poll errors and
+/// a replaced source all remain errors. On failure the source is retained.
+/// The successful operation consumes this registered source once.
+pub fn finish_native_forwarded_source_after_exit(
+    expected: &NativeForwardedSourceReceipt,
+    completion: &dyn NativePhysicalExitCompletion,
+) -> Result<(), CoordinatorForwardingCutError> {
+    let mut registered = FORWARDED_SOURCE.lock().unwrap();
+    if FORWARDED_GENERATION.load(Ordering::SeqCst) != expected.generation {
+        return Err(CoordinatorForwardingCutError::SourceChanged);
+    }
+    let source = registered
+        .as_mut()
+        .ok_or(CoordinatorForwardingCutError::MissingSource)?;
+    if DETERMINISM_LOSS.lock().unwrap().is_some() {
+        return Err(CoordinatorForwardingCutError::DeterminismLoss);
+    }
+    inspect_native_final_source(source, expected.identity, expected.owner, completion)?;
+    FORWARDED_GENERATION.fetch_add(1, Ordering::SeqCst);
+    stop_forwarded_receiver();
+    registered.take();
+    Ok(())
+}
+
+/// Takes every message waiting on the registered forwarding socket into the queue of
+/// its sending thread, without blocking and without writing it. An untagged message is
+/// written at once as `ForwardedOrder::untagged` says. Without a registered source it
+/// does nothing.
+pub fn drain_forwarded() {
+    if let Some(source) = FORWARDED_SOURCE.lock().unwrap().as_mut() {
+        collect_forwarded(source);
+    }
+}
+
+/// Takes waiting messages as [`drain_forwarded`] does, then writes every queued record
+/// thread `tid` sent, in the order it sent them. The scheduler calls this immediately
+/// before it commits a turn of `tid`; `exclusive` is false for a BACKGROUND turn,
+/// which runs alongside later turns, and true for an ordinary one.
+pub fn write_forwarded_for(tid: i32, exclusive: bool) {
+    start_forwarded_receiver();
+    if let Some(source) = FORWARDED_SOURCE.lock().unwrap().as_mut() {
+        collect_forwarded(source);
+        let records = source.order.at_commit(tid, exclusive);
+        write_records(source, records);
+    }
+}
+
+/// Takes waiting messages as [`drain_forwarded`] does at the top of the handler of
+/// a request from thread `tid`, and writes `tid`'s queued records now when its
+/// request is a point the schedule fixes (the order rule at [`set_forwarded_source`]).
+pub fn drain_forwarded_at_request(tid: i32) {
+    start_forwarded_receiver();
+    if let Some(source) = FORWARDED_SOURCE.lock().unwrap().as_mut() {
+        collect_forwarded(source);
+        let records = source.order.at_request(tid);
+        write_records(source, records);
+    }
+}
+
+/// The COMPLETENESS RULE. A counted request from guest thread `tid` says it
+/// produced `produced` records for forwarding since its previous counted request
+/// ([`take_forwarded_since_request`]); it sent them before this request, and a
+/// `send` on a message socket queues a record on the receiver before it returns,
+/// so all of them have been received by now, as indexes 1 to `produced` in
+/// order. Anything else means the records the coordinator holds for that
+/// thread are not the ones it produced: fewer, or a skipped index, were lost on
+/// the way (the guest disturbed the socket, the Tool could not adopt it, or a
+/// stale descriptor was refused); more, or a repeated or earlier index, came
+/// from something other than the Tool. Either way the coordinator writes a loss
+/// notice and records the determinism loss, so verification refuses to compare
+/// the run. [`UNCOUNTED`] (a thread could not be counted) is refused the same
+/// way.
+/// Without a registered source it does nothing.
+pub fn check_forwarded_count(tid: i32, produced: u64) {
+    if let Some(source) = FORWARDED_SOURCE.lock().unwrap().as_mut() {
+        collect_forwarded(source);
+        let interval = source.order.received_since_check(tid);
+        if let Some(failure) = forwarded_count_failure(produced, interval) {
+            report_forwarded_count_failure(source, tid, failure);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardedCountFailure {
+    Uncounted,
+    Sequence { expected: u64, sent: u64 },
+    Count { produced: u64, received: u64 },
+}
+
+fn forwarded_count_failure(
+    produced: u64,
+    interval: ReceivedInterval,
+) -> Option<ForwardedCountFailure> {
+    if produced == UNCOUNTED {
+        Some(ForwardedCountFailure::Uncounted)
+    } else if let Some((expected, sent)) = interval.out_of_sequence {
+        Some(ForwardedCountFailure::Sequence { expected, sent })
+    } else if interval.count != produced {
+        Some(ForwardedCountFailure::Count {
+            produced,
+            received: interval.count,
+        })
+    } else {
+        None
+    }
+}
+
+fn report_forwarded_count_failure(
+    source: &mut ForwardedSource,
+    tid: i32,
+    failure: ForwardedCountFailure,
+) {
+    let reason = match failure {
+        ForwardedCountFailure::Uncounted => format!(
+            "forwarded records uncounted: a guest thread's records could not be counted (reported by thread {tid})"
+        ),
+        ForwardedCountFailure::Sequence { expected, sent } if sent > expected => format!(
+            "forwarded records lost: thread {tid} sent record {sent} of its interval where {expected} was next"
+        ),
+        ForwardedCountFailure::Sequence { expected, sent } => format!(
+            "forwarded records not the Tool's: thread {tid} sent record {sent} of its interval where {expected} was next"
+        ),
+        ForwardedCountFailure::Count { produced, received } if received < produced => format!(
+            "forwarded records lost: thread {tid} produced {produced} since its last counted request and {received} arrived"
+        ),
+        ForwardedCountFailure::Count { produced, received } => format!(
+            "forwarded records not the Tool's: thread {tid} produced {produced} since its last counted request and {received} arrived"
+        ),
+    };
+    record_determinism_loss(&reason);
+    source.loss_seen = true;
+    let line = format!("{FORWARDING_LOSS_NOTICE} 0 0 {reason}\n");
+    (source.sink)(line.as_bytes());
+}
+
+/// A coordinator-local observation of a checked forwarding boundary.
+///
+/// Private fields bind the owner, registered source generation and actual socket
+/// device/inode under the source lock. This is not an authenticated guest ACK,
+/// watched-birth identity, scheduler grant, or authorization to replace an image.
+/// Supply it to a later check to refuse replacement of this receiving source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoordinatorForwardingReceipt {
+    owner_tid: i32,
+    generation: u64,
+    socket_identity: (u64, u64),
+}
+
+/// Why the coordinator cannot establish a strict counted forwarding boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoordinatorForwardingCutError {
+    /// The caller supplied no positive physical thread ID.
+    InvalidOwner,
+    /// No genuine receiving socket and sink have been registered.
+    MissingSource,
+    /// The owner, source generation or actual socket differs from the prior receipt.
+    SourceChanged,
+    /// The descriptor is not a connected AF_UNIX SOCK_SEQPACKET source.
+    InvalidSource,
+    /// EOF, peer shutdown or a zero-length message prevents a healthy empty drain.
+    ClosedSource,
+    /// A socket operation failed with this actual errno.
+    SourceIo(i32),
+    /// Poll observed actual socket error flags (without consuming SO_ERROR).
+    SourcePoll(i16),
+    /// The peeked message changed before it was received.
+    MessageChanged,
+    /// A persistent process or source loss, legacy record or ambiguous order exists.
+    DeterminismLoss,
+    /// The producer could not assign its records to a counted interval.
+    Uncounted,
+    /// An interval's first incorrect record index.
+    OutOfSequence {
+        /// The next index required by the existing protocol.
+        expected: u64,
+        /// The index actually received.
+        sent: u64,
+    },
+    /// The actual received count differs from the supplied produced count, even zero.
+    CountMismatch {
+        /// The actual producer interval claimed by the caller's counted request.
+        produced: u64,
+        /// The records genuinely collected from the registered socket.
+        received: u64,
+    },
+    /// Another thread retains records or an unchecked received interval.
+    OtherOwnerPending(i32),
+    /// This owner's request is not a fixed point of the existing order rule.
+    NotOwnerBoundary,
+    /// More records arrived while the checked interval was being written.
+    PendingOwnerRecords,
+}
+
+impl From<ForwardedSourceError> for CoordinatorForwardingCutError {
+    fn from(error: ForwardedSourceError) -> Self {
+        match error {
+            ForwardedSourceError::Closed => Self::ClosedSource,
+            ForwardedSourceError::Io(errno) => Self::SourceIo(errno),
+            ForwardedSourceError::Poll(flags) => Self::SourcePoll(flags),
+            ForwardedSourceError::MessageChanged => Self::MessageChanged,
+        }
+    }
+}
+
+impl From<ForwardedCountFailure> for CoordinatorForwardingCutError {
+    fn from(error: ForwardedCountFailure) -> Self {
+        match error {
+            ForwardedCountFailure::Uncounted => Self::Uncounted,
+            ForwardedCountFailure::Sequence { expected, sent } => {
+                Self::OutOfSequence { expected, sent }
+            }
+            ForwardedCountFailure::Count { produced, received } => {
+                Self::CountMismatch { produced, received }
+            }
+        }
+    }
+}
+
+/// Collect, write and check one owner's actual counted interval, then require
+/// the registered forwarding source to have no unchecked or queued records.
+///
+/// Unlike [`check_forwarded_count`], this successor-only inspection refuses a
+/// missing or unhealthy message source and any persistent determinism loss; it
+/// checks zero too. It uses the unchanged request/COMMIT order rule and never
+/// substitutes captured line counts for actual socket records. A refusal retains
+/// all unchecked intervals and queues (records collected during the check remain
+/// queued); a success consumes only the interval that was actually validated.
+///
+/// The caller must bind `owner_tid` and `produced` through its authenticated
+/// counted request, exclude concurrent producers, and repeat this check with the
+/// returned receipt at the final cut. The sink must report write failures through
+/// [`record_determinism_loss`], as the existing sink interface returns no result.
+/// This coordinator-local receipt is not a guest acknowledgment, watched-birth
+/// authority, scheduler permission, or proof that a later exec edge is neutral.
+pub fn check_native_exec_forwarding_cut(
+    owner_tid: i32,
+    produced: u64,
+    previous: Option<&CoordinatorForwardingReceipt>,
+) -> Result<CoordinatorForwardingReceipt, CoordinatorForwardingCutError> {
+    let mut source = FORWARDED_SOURCE.lock().unwrap();
+    let generation = FORWARDED_GENERATION.load(Ordering::SeqCst);
+    inspect_coordinator_forwarding_cut(
+        source.as_mut(),
+        generation,
+        owner_tid,
+        produced,
+        previous,
+        || DETERMINISM_LOSS.lock().unwrap().is_some(),
+    )
+}
+
+fn source_identity_for_cut(
+    source: &mut ForwardedSource,
+) -> Result<(u64, u64), CoordinatorForwardingCutError> {
+    if let Some(error) = source.transport_failure {
+        return Err(error.into());
+    }
+    let fd = source.socket.as_raw_fd();
+    let identity = socket_identity(fd).ok_or(CoordinatorForwardingCutError::InvalidSource)?;
+    let mut kind = 0i32;
+    let mut length;
+    loop {
+        length = std::mem::size_of_val(&kind) as libc::socklen_t;
+        // SAFETY: the output and length pointers refer to initialized stack storage.
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                (&mut kind as *mut i32).cast(),
+                &mut length,
+            )
+        };
+        if result >= 0 {
+            break;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+        if errno == libc::EINTR {
+            continue;
+        }
+        let error = ForwardedSourceError::Io(errno);
+        source.transport_failure = Some(error);
+        return Err(error.into());
+    }
+    if length as usize != std::mem::size_of_val(&kind) || kind != libc::SOCK_SEQPACKET {
+        return Err(CoordinatorForwardingCutError::InvalidSource);
+    }
+    // SAFETY: sockaddr_storage is plain C storage, initialized before the query.
+    let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    loop {
+        length = std::mem::size_of_val(&peer) as libc::socklen_t;
+        // SAFETY: peer has the capacity reported in length and fd remains owned.
+        let result = unsafe {
+            libc::getpeername(
+                fd,
+                (&mut peer as *mut libc::sockaddr_storage).cast(),
+                &mut length,
+            )
+        };
+        if result >= 0 {
+            break;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+        if errno == libc::EINTR {
+            continue;
+        }
+        let error = ForwardedSourceError::Io(errno);
+        source.transport_failure = Some(error);
+        return Err(error.into());
+    }
+    if (length as usize) < std::mem::size_of_val(&peer.ss_family)
+        || i32::from(peer.ss_family) != libc::AF_UNIX
+    {
+        return Err(CoordinatorForwardingCutError::InvalidSource);
+    }
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLRDHUP,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one initialized pollfd is writable for this nonblocking query.
+        let result = unsafe { libc::poll(&mut poll, 1, 0) };
+        if result < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            if errno == libc::EINTR {
+                continue;
+            }
+            let error = ForwardedSourceError::Io(errno);
+            source.transport_failure = Some(error);
+            return Err(error.into());
+        }
+        let error = if poll.revents & (libc::POLLHUP | libc::POLLRDHUP) != 0 {
+            Some(ForwardedSourceError::Closed)
+        } else if poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            Some(ForwardedSourceError::Poll(poll.revents))
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            source.transport_failure = Some(error);
+            return Err(error.into());
+        }
+        return Ok(identity);
+    }
+}
+
+fn check_cut_state(
+    source: &ForwardedSource,
+    owner_tid: i32,
+    has_loss: &impl Fn() -> bool,
+) -> Result<(), CoordinatorForwardingCutError> {
+    if has_loss() || source.loss_seen || source.order.legacy || source.order.ambiguous {
+        return Err(CoordinatorForwardingCutError::DeterminismLoss);
+    }
+    if let Some((&tid, _)) = source
+        .order
+        .pending
+        .iter()
+        .find(|(tid, records)| **tid != owner_tid && !records.is_empty())
+    {
+        return Err(CoordinatorForwardingCutError::OtherOwnerPending(tid));
+    }
+    if let Some((&tid, _)) = source
+        .order
+        .received
+        .iter()
+        .find(|(tid, _)| **tid != owner_tid)
+    {
+        return Err(CoordinatorForwardingCutError::OtherOwnerPending(tid));
+    }
+    match source.order.runner {
+        Runner::NoTurnYet => Ok(()),
+        Runner::Root(tid) | Runner::Exclusive(tid) if tid == owner_tid => Ok(()),
+        _ => Err(CoordinatorForwardingCutError::NotOwnerBoundary),
+    }
+}
+
+fn inspect_coordinator_forwarding_cut(
+    source: Option<&mut ForwardedSource>,
+    generation: u64,
+    owner_tid: i32,
+    produced: u64,
+    previous: Option<&CoordinatorForwardingReceipt>,
+    has_loss: impl Fn() -> bool,
+) -> Result<CoordinatorForwardingReceipt, CoordinatorForwardingCutError> {
+    if owner_tid <= 0 {
+        return Err(CoordinatorForwardingCutError::InvalidOwner);
+    }
+    let source = source.ok_or(CoordinatorForwardingCutError::MissingSource)?;
+    let receipt = CoordinatorForwardingReceipt {
+        owner_tid,
+        generation,
+        socket_identity: source_identity_for_cut(source)?,
+    };
+    if previous.is_some_and(|previous| *previous != receipt) {
+        return Err(CoordinatorForwardingCutError::SourceChanged);
+    }
+    collect_forwarded(source);
+    source_identity_for_cut(source)?;
+    check_cut_state(source, owner_tid, &has_loss)?;
+    let interval = source
+        .order
+        .received
+        .get(&owner_tid)
+        .copied()
+        .unwrap_or_default();
+    if let Some(failure) = forwarded_count_failure(produced, interval) {
+        report_forwarded_count_failure(source, owner_tid, failure);
+        return Err(failure.into());
+    }
+    let records = source.order.at_request(owner_tid);
+    for record in &records {
+        emit(source, record);
+    }
+    // Sinks can expose a loss or peer closure while writing; do not consume an
+    // interval on that refusal. Excluded concurrent producers are checked too.
+    collect_forwarded(source);
+    let final_check = (|| {
+        if source_identity_for_cut(source)? != receipt.socket_identity {
+            return Err(CoordinatorForwardingCutError::SourceChanged);
+        }
+        check_cut_state(source, owner_tid, &has_loss)?;
+        let current = source
+            .order
+            .received
+            .get(&owner_tid)
+            .copied()
+            .unwrap_or_default();
+        if let Some(failure) = forwarded_count_failure(produced, current) {
+            report_forwarded_count_failure(source, owner_tid, failure);
+            return Err(failure.into());
+        }
+        if source
+            .order
+            .pending
+            .get(&owner_tid)
+            .is_some_and(|records| !records.is_empty())
+        {
+            return Err(CoordinatorForwardingCutError::PendingOwnerRecords);
+        }
+        Ok(())
+    })();
+    if let Err(error) = final_check {
+        // Preserve the original records ahead of any just-collected records.
+        // Some may already have reached the sink; this refused run gets no ACK.
+        if !records.is_empty() {
+            let mut retained = records;
+            if let Some(mut later) = source.order.pending.remove(&owner_tid) {
+                retained.append(&mut later);
+            }
+            source.order.pending.insert(owner_tid, retained);
+        }
+        return Err(error);
+    }
+    source.order.received_since_check(owner_tid);
+    Ok(receipt)
+}
+
+fn write_records(source: &mut ForwardedSource, records: Vec<Vec<u8>>) {
+    for record in records {
+        emit(source, &record);
+    }
+}
+
+fn collect_forwarded(source: &mut ForwardedSource) {
+    let fd = source.socket.as_raw_fd();
+    let mut buffer = Vec::new();
+    loop {
+        // The size of the next message, without taking it (a message socket reports
+        // the whole message's length with MSG_TRUNC).
+        // SAFETY: a zero-length peek writes nothing.
+        let size = unsafe {
+            libc::recv(
+                fd,
+                std::ptr::null_mut(),
+                0,
+                libc::MSG_PEEK | libc::MSG_TRUNC | libc::MSG_DONTWAIT,
+            )
+        };
+        if size < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            if errno == libc::EINTR {
+                continue;
+            }
+            if errno != libc::EAGAIN && errno != libc::EWOULDBLOCK {
+                source
+                    .transport_failure
+                    .get_or_insert(ForwardedSourceError::Io(errno));
+            }
+            return;
+        }
+        if size == 0 {
+            source
+                .transport_failure
+                .get_or_insert(ForwardedSourceError::Closed);
+            return;
+        }
+        buffer.resize(size as usize, 0);
+        // SAFETY: `buffer` has room for `size` bytes.
+        let received = loop {
+            let received = unsafe {
+                libc::recv(
+                    fd,
+                    buffer.as_mut_ptr().cast::<libc::c_void>(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                )
+            };
+            if received < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break received;
+        };
+        if received < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            let error = if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                ForwardedSourceError::MessageChanged
+            } else {
+                ForwardedSourceError::Io(errno)
+            };
+            source.transport_failure.get_or_insert(error);
+            return;
+        }
+        if received == 0 {
+            source
+                .transport_failure
+                .get_or_insert(ForwardedSourceError::Closed);
+            return;
+        }
+        if received != size {
+            source
+                .transport_failure
+                .get_or_insert(ForwardedSourceError::MessageChanged);
+        }
+        // MSG_TRUNC reports the real message length if a competing consumer
+        // changed the peeked packet. Preserve ordinary emitted bytes, but never
+        // let a truncated packet establish a healthy native cut.
+        let message = &buffer[..(received as usize).min(buffer.len())];
+        match split_forwarded_message(message) {
+            Some((tid, index, record)) => {
+                source.order.arrived(tid, index);
+                source.order.queue(tid, record.to_vec());
+            }
+            None => {
+                for record in source.order.untagged(message) {
+                    emit(source, &record);
+                }
+            }
+        }
+    }
+}
+
+/// Returns whether a record emitted by module `target` goes to the
+/// process-local deterministic-record sink.
+#[doc(hidden)]
+pub fn forwards_target(target: &str) -> bool {
+    FORWARDER
+        .get()
+        .is_some_and(|(_, policy)| policy.forwards(target))
+}
+
+/// Emits one deterministic record through tracing and the process-local sink. `target` is
+/// the emitting module's path, so a forwarded record names the same module a record observed
+/// through tracing does.
+#[doc(hidden)]
+pub fn emit_forwarded(target: &str, record_suffix: &str, message: fmt::Arguments<'_>) {
     tracing::info!("DETLOG {}{}", message, record_suffix);
-    FORWARDER.get().expect("forwarder disappeared")(record_suffix, message);
+    let index = count_forwarded();
+    FORWARDER.get().expect("forwarder disappeared").0(target, record_suffix, index, message);
+}
+
+/// One guest thread's count of records it produced for forwarding since its
+/// last counted request ([`take_forwarded_since_request`]).
+struct ForwardedCount {
+    tid: AtomicI32,
+    /// The process the slot's thread belongs to. A forked child, whose memory
+    /// is a copy, sees its parent's slots under another process id: stale.
+    pid: AtomicI32,
+    count: AtomicU64,
+}
+
+/// The per-thread counts, keyed by kernel thread id. Atomics rather than a
+/// thread-local: the in-guest Tool runs inside loaders (SaBRe) that do not
+/// promise the Tool working thread-local storage. A thread releases its slot
+/// when it deregisters ([`release_forwarded_count`]), and a forked child
+/// reclaims the slots its parent's threads held. A thread that still finds no
+/// slot is uncounted, and the next counted request of every thread reports
+/// [`UNCOUNTED`], so verification refuses the run instead of checking less.
+static FORWARDED_COUNTS: [ForwardedCount; 512] = [const {
+    ForwardedCount {
+        tid: AtomicI32::new(0),
+        pid: AtomicI32::new(0),
+        count: AtomicU64::new(0),
+    }
+}; 512];
+
+/// Set once a thread could not be counted ([`FORWARDED_COUNTS`]).
+static FORWARDING_UNCOUNTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the first record this image counts, before it claims a slot. Until
+/// then no slot holds a count (only [`count_forwarded`] adds to one), so taking
+/// or releasing a count has nothing to do. The usual case is a Tool image that
+/// never forwards records, such as Detcore under ptrace or KVM, where it saves
+/// a getpid, a gettid and a scan of [`FORWARDED_COUNTS`] on every request. A
+/// forked child inherits its parent's flag together with its parent's table.
+static FORWARDING_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Why the process-local forwarding state cannot cross an image replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForwardingCutError {
+    /// At least one record could not be assigned a counted interval.
+    Uncounted,
+    /// Loss notices are still waiting to be forwarded.
+    UnreportedLosses(u64),
+    /// A thread still has records in its current interval.
+    PendingRecords {
+        /// Physical process owning the counter slot.
+        pid: i32,
+        /// Physical thread owning the counter slot.
+        tid: i32,
+        /// Records that the existing completeness protocol must check.
+        count: u64,
+    },
+}
+
+/// Inspect an empty forwarding boundary without consuming or resetting it.
+///
+/// The caller must first complete an authenticated counted request through the
+/// existing completeness protocol. This inspection establishes only the local
+/// empty interval; it is not evidence of coordinator receipt or authorization
+/// to replace an image. A native handover must exclude concurrent producers
+/// and repeat this check immediately before its physical exec. No syscall,
+/// allocation, counter-slot claim, logging, or loss acknowledgment occurs here.
+/// Old slots are inspected too: a stale owner cannot make a retained record
+/// disappear at the boundary.
+pub fn check_empty_forwarding_cut() -> Result<(), ForwardingCutError> {
+    inspect_empty_forwarding_cut(
+        &FORWARDED_COUNTS,
+        FORWARDING_UNCOUNTED.load(Ordering::Acquire),
+        UNREPORTED_LOSSES.load(Ordering::Acquire),
+    )
+}
+
+fn inspect_empty_forwarding_cut(
+    slots: &[ForwardedCount],
+    uncounted: bool,
+    losses: u64,
+) -> Result<(), ForwardingCutError> {
+    if uncounted {
+        return Err(ForwardingCutError::Uncounted);
+    }
+    if losses != 0 {
+        return Err(ForwardingCutError::UnreportedLosses(losses));
+    }
+    for slot in slots {
+        let count = slot.count.load(Ordering::Acquire);
+        if count != 0 {
+            return Err(ForwardingCutError::PendingRecords {
+                pid: slot.pid.load(Ordering::Acquire),
+                tid: slot.tid.load(Ordering::Acquire),
+                count,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The count a request reports when some thread's records could not be
+/// counted.
+pub const UNCOUNTED: u64 = u64::MAX;
+
+fn current_pid() -> i32 {
+    // SAFETY: getpid has no arguments and cannot fail. The raw syscall, not
+    // libc's interposable getpid: this runs inside the guest under in-guest
+    // LiteInst (see crate::util::raw_syscall).
+    unsafe { crate::util::raw_syscall(libc::SYS_getpid, [0; 6]) as i32 }
+}
+
+fn forwarded_count_slot(tid: i32) -> Option<&'static ForwardedCount> {
+    let pid = current_pid();
+    let start = tid.unsigned_abs() as usize % FORWARDED_COUNTS.len();
+    let probe = || {
+        (0..FORWARDED_COUNTS.len())
+            .map(move |offset| &FORWARDED_COUNTS[(start + offset) % FORWARDED_COUNTS.len()])
+    };
+    let claim = |slot: &'static ForwardedCount, owner: i32| {
+        if slot
+            .tid
+            .compare_exchange(owner, tid, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            slot.pid.store(pid, Ordering::Release);
+            slot.count.store(0, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    };
+    // The thread's own slot first, wherever it is: a slot released before it
+    // on its probe path leaves a hole it must not claim a second slot in.
+    if let Some(slot) = FORWARDED_COUNTS.iter().find(|slot| {
+        slot.tid.load(Ordering::Acquire) == tid && slot.pid.load(Ordering::Acquire) == pid
+    }) {
+        return Some(slot);
+    }
+    for slot in probe() {
+        if slot.tid.load(Ordering::Acquire) == 0 && claim(slot, 0) {
+            return Some(slot);
+        }
+    }
+    // No free slot: take one only a private copy of this memory holds (a
+    // parent's thread before a fork, or a process that has exited). A process
+    // that shares this memory (a CLONE_VM child, such as a vfork child) still
+    // counts in it.
+    for slot in probe() {
+        let owner = slot.tid.load(Ordering::Acquire);
+        let owner_pid = slot.pid.load(Ordering::Acquire);
+        if owner != 0 && owner_pid != pid && private_copy(owner_pid, pid) && claim(slot, owner) {
+            return Some(slot);
+        }
+    }
+    None
+}
+
+/// Whether process `owner`'s slots in this memory are a private copy, so this
+/// process may reclaim them: `owner` has exited, or `kcmp` says it does not
+/// share this memory. An unanswerable question (kcmp unavailable or refused)
+/// is answered "no", so the slot is kept and a full table makes counts
+/// [`UNCOUNTED`] instead of erasing a live count.
+fn private_copy(owner: i32, pid: i32) -> bool {
+    const KCMP_VM: libc::c_int = 1;
+    // SAFETY: kcmp only compares the two processes' kernel resources.
+    let answer = unsafe { libc::syscall(libc::SYS_kcmp, owner, pid, KCMP_VM, 0, 0) };
+    answer > 0
+        || (answer < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+}
+
+/// Counts one record for this thread and returns its index in the thread's
+/// counted interval (0 when the thread could not be counted, which makes every
+/// later count [`UNCOUNTED`]).
+fn count_forwarded() -> u64 {
+    // Read first, so steady forwarding does not write the shared flag on every
+    // record. Once true it stays true, so this thread's later take sees it.
+    if !FORWARDING_STARTED.load(Ordering::Acquire) {
+        FORWARDING_STARTED.store(true, Ordering::Release);
+    }
+    match forwarded_count_slot(current_tid()) {
+        Some(slot) => slot.count.fetch_add(1, Ordering::AcqRel) + 1,
+        None => {
+            FORWARDING_UNCOUNTED.store(true, Ordering::Release);
+            0
+        }
+    }
+}
+
+/// How many records this guest thread produced for forwarding since its last
+/// counted request, and starts its next count. The in-guest Tool sends it with
+/// that request ([`check_forwarded_count`]), on its RPC connection, which does
+/// not depend on the forwarding socket. A forked child starts from zero: its
+/// thread id is new. [`UNCOUNTED`] once any thread could not be counted.
+pub fn take_forwarded_since_request() -> u64 {
+    if FORWARDING_UNCOUNTED.load(Ordering::Acquire) {
+        return UNCOUNTED;
+    }
+    // Each thread takes only the count it added to itself, so its own earlier
+    // store of the flag is the one that matters here.
+    if !FORWARDING_STARTED.load(Ordering::Acquire) {
+        return 0;
+    }
+    forwarded_count_slot(current_tid())
+        .map(|slot| slot.count.swap(0, Ordering::AcqRel))
+        .unwrap_or(0)
+}
+
+/// Called by a Tool image whose coordinator requires in-guest forwarding by
+/// the policy `expected` encodes (`Config::in_guest_detlog_forward_policy`).
+/// Without a forwarder in this image, or with one that forwards by another
+/// policy (records its policy drops are never counted), the records cannot be
+/// accounted for, so every later count is [`UNCOUNTED`] and the coordinator
+/// refuses the run ([`check_forwarded_count`]).
+pub fn require_forwarding(expected: &str) {
+    if FORWARDER
+        .get()
+        .is_none_or(|(_, policy)| policy.encode() != expected)
+    {
+        FORWARDING_UNCOUNTED.store(true, Ordering::Release);
+    }
+}
+
+/// Releases this thread's count slot, at its deregistration, after its last
+/// count was taken.
+pub fn release_forwarded_count() {
+    if FORWARDING_STARTED.load(Ordering::Acquire) {
+        release_count_slot(current_tid());
+    }
+}
+
+fn release_count_slot(tid: i32) {
+    let pid = current_pid();
+    for slot in &FORWARDED_COUNTS {
+        if slot.tid.load(Ordering::Acquire) == tid && slot.pid.load(Ordering::Acquire) == pid {
+            slot.count.store(0, Ordering::Release);
+            let _ = slot
+                .tid
+                .compare_exchange(tid, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+}
+
+/// The root's real ThreadState birth owns these two records. The TID passed
+/// by Tool::init_thread_state is kept explicitly; an ambient backend setup span
+/// does not own this shared semantic event. All other detlog! parents remain.
+pub(crate) fn root_seed_records(tid: i32, user_seed: u64, chaos_seed: u64) {
+    const TARGET: &str = "detcore::tool_local";
+    macro_rules! seed {
+        ($format:literal, $value:expr) => {{
+            if forwards_target(TARGET) {
+                let suffix = record_suffix(DetLogEvent::Other);
+                let index = count_forwarded();
+                FORWARDER.get().expect("forwarder disappeared").0(
+                    TARGET, &suffix, index, format_args!($format, $value, tid));
+            } else {
+                tracing::info!(target: "detcore::tool_local", parent: None,
+                    "DETLOG {}{}", format_args!($format, $value, tid),
+                    record_suffix(DetLogEvent::Other));
+            }
+        }};
+    }
+    seed!(
+        "USER RAND: seeding PRNG for root thread with seed {} (root tid {})",
+        user_seed
+    );
+    seed!(
+        "CHAOSRAND: seeding chaos scheduler with seed {} (root tid {})",
+        chaos_seed
+    );
+}
+
+/// Called only by the explicit InitialImage shared Reverie delivery hook.
+/// The existing policy/count/socket own delivery; this adds no logging owner.
+pub fn forward_tail_start(tid: reverie::Pid, number: reverie::syscalls::Sysno) {
+    emit_plain_info(
+        "reverie::guest",
+        format_args!("[tool] (tid {}) admitted tail syscall: {}", tid, number),
+    );
 }
 
 /// Macro used to encapsulate tracing should-be-deterministic information.
@@ -136,10 +2224,16 @@ pub fn emit_forwarded(record_suffix: &str, message: fmt::Arguments<'_>) {
 #[macro_export]
 macro_rules! detlog {
     (event = $event:expr; $($arg:tt)+) => {{
-        if $crate::detlog::forwarding_enabled() || ::tracing::enabled!(::tracing::Level::INFO) {
+        if $crate::detlog::forwards_target(::core::module_path!())
+            || ::tracing::enabled!(::tracing::Level::INFO)
+        {
             let record_suffix = $crate::detlog::record_suffix($event);
-            if $crate::detlog::forwarding_enabled() {
-                $crate::detlog::emit_forwarded(&record_suffix, format_args!($($arg)+));
+            if $crate::detlog::forwards_target(::core::module_path!()) {
+                $crate::detlog::emit_forwarded(
+                    ::core::module_path!(),
+                    &record_suffix,
+                    format_args!($($arg)+),
+                );
             } else {
                 ::tracing::info!("DETLOG {}{}", format_args!($($arg)+), record_suffix);
             }
@@ -154,8 +2248,8 @@ macro_rules! detlog {
 ///
 /// WHY THIS IS NEEDED, and why it is a macro rather than a function.
 ///
-/// `detlog!` routes to the process-local forwarder when one is installed and to
-/// `tracing::info!` otherwise. `tracing` does not evaluate a macro's value
+/// `detlog!` routes to the process-local forwarder when one is installed and its
+/// policy takes the calling module's records, and to `tracing::info!` otherwise. `tracing` does not evaluate a macro's value
 /// expressions when the level is disabled, so work done *inside* a `detlog!`
 /// argument is already free when nothing observes the record. Work done
 /// *before* the macro is not, and callers that must prepare something expensive
@@ -172,7 +2266,8 @@ macro_rules! detlog {
 #[macro_export]
 macro_rules! detlog_observed {
     () => {
-        $crate::detlog::forwarding_enabled() || ::tracing::enabled!(::tracing::Level::INFO)
+        $crate::detlog::forwards_target(::core::module_path!())
+            || ::tracing::enabled!(::tracing::Level::INFO)
     };
 }
 
@@ -194,14 +2289,1609 @@ macro_rules! detlog_debug {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use tracing::Metadata;
     use tracing::span;
     use tracing::subscriber::Interest;
 
     use super::DetLogEvent;
     use super::DetLogRecord;
+    use super::ForwardPolicy;
     use super::RECORD_SEPARATOR;
     use super::record_suffix;
+
+    #[test]
+    fn explicit_plain_emitter_preserves_default_tracing_and_shared_socket_counts() {
+        // The real global forwarders are intentionally process-local. Run the
+        // production transition in its own bounded test subprocess.
+        const NAME: &str = "detlog::tests::explicit_plain_emitter_preserves_default_tracing_and_shared_socket_counts";
+        const CHILD: &str = "HERMIT_TWO_SITE_INFO_TEST";
+        if std::env::var(CHILD).ok().as_deref() != Some(NAME) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME])
+                .env(CHILD, NAME)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .any(|line| line == format!("test {NAME} ... ok"))
+                    );
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("plain emitter control timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use tracing::Event;
+        use tracing::Metadata;
+        use tracing::Subscriber;
+        use tracing::span;
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                assert_eq!(field.name(), "message");
+                self.0 = format!("{value:?}");
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+        impl Subscriber for Capture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((event.metadata().target().to_owned(), message.0));
+            }
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+        static SOCKET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+        fn plain(target: &str, index: u64, message: std::fmt::Arguments<'_>) {
+            let fd = SOCKET.load(Ordering::Acquire);
+            super::send_plain_info_record((fd >= 0).then_some(fd), target, index, message);
+        }
+        fn legacy(target: &str, suffix: &str, index: u64, message: std::fmt::Arguments<'_>) {
+            super::send_forwarded_record(
+                SOCKET.load(Ordering::Acquire),
+                target,
+                suffix,
+                index,
+                message,
+            );
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        assert!(!super::plain_info_forwarding());
+        assert!(
+            super::set_plain_info_forwarder(plain).is_err(),
+            "must not activate without real counted policy"
+        );
+        tracing::subscriber::with_default(Capture(captured.clone()), || {
+            crate::ordered_info!(
+                "Injecting additional fstat to retrieve file metadata on fd {}.",
+                3
+            );
+        });
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![(
+                module_path!().to_owned(),
+                "Injecting additional fstat to retrieve file metadata on fd 3.".to_owned()
+            )]
+        );
+        assert_eq!(super::take_forwarded_since_request(), 0);
+        let mut fds = [-1; 2];
+        // SAFETY: fds is a valid two-element output; a successful socketpair
+        // transfers two fresh descriptors exactly once into OwnedFd.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let sender = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let receiver = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        SOCKET.store(sender.as_raw_fd(), Ordering::Release);
+        super::set_forwarder(
+            legacy,
+            ForwardPolicy::decode("1,detcore::blocked=0").unwrap(),
+        )
+        .unwrap();
+        // A historical DETLOG forwarder alone must not select plain delivery.
+        assert!(!super::plain_info_forwarding());
+        super::set_plain_info_forwarder(plain).unwrap();
+        assert!(super::set_plain_info_forwarder(plain).is_err());
+        tracing::subscriber::with_default(Capture(captured.clone()), || {
+            crate::ordered_info!("[dtid {}] inbound rdtsc, new logical time: {:?}", 3, 17);
+            super::emit_forwarded("detcore", "", format_args!("middle"));
+            crate::ordered_info!(
+                "Injecting additional fstat to retrieve file metadata on fd {}.",
+                3
+            );
+            super::emit_plain_info("detcore::blocked", format_args!("filtered"));
+        });
+        // Only the legacy DETLOG tracing side-event remains: the new emitter
+        // neither duplicates it nor modifies its existing behavior.
+        assert_eq!(captured.lock().unwrap().len(), 2);
+        fn receive(fd: i32, index: u64) -> Vec<u8> {
+            let mut bytes = [0; 65536];
+            // SAFETY: valid output buffer, actual owned socket, nonblocking.
+            let n = unsafe {
+                libc::recv(
+                    fd,
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            assert!(n > 0);
+            let (tid, got, payload) = super::split_forwarded_message(&bytes[..n as usize]).unwrap();
+            assert_eq!(tid, super::current_tid());
+            assert_eq!(got, index);
+            payload.to_vec()
+        }
+        assert_eq!(
+            super::decode_plain_info(&receive(receiver.as_raw_fd(), 1)).unwrap(),
+            (
+                module_path!(),
+                "[dtid 3] inbound rdtsc, new logical time: 17"
+            )
+        );
+        assert_eq!(
+            receive(receiver.as_raw_fd(), 2),
+            b"INFO detcore: DETLOG middle\n"
+        );
+        assert_eq!(
+            super::decode_plain_info(&receive(receiver.as_raw_fd(), 3)).unwrap(),
+            (
+                module_path!(),
+                "Injecting additional fstat to retrieve file metadata on fd 3."
+            )
+        );
+        assert_eq!(super::take_forwarded_since_request(), 3);
+        // Malformed representation is a counted loss, never truncation.
+        super::emit_plain_info(module_path!(), format_args!("bad\nline"));
+        assert!(
+            receive(receiver.as_raw_fd(), 1).starts_with(super::FORWARDING_LOSS_NOTICE.as_bytes())
+        );
+        assert_eq!(super::take_forwarded_since_request(), 1);
+        super::emit_plain_info(
+            module_path!(),
+            format_args!("{}", "x".repeat(super::PLAIN_INFO_MAX)),
+        );
+        assert!(
+            receive(receiver.as_raw_fd(), 1).starts_with(super::FORWARDING_LOSS_NOTICE.as_bytes())
+        );
+        assert_eq!(super::take_forwarded_since_request(), 1);
+        SOCKET.store(-1, Ordering::Release);
+        super::emit_plain_info(module_path!(), format_args!("identity missing"));
+        assert_eq!(
+            super::take_forwarded_since_request(),
+            1,
+            "missing socket cannot erase the produced index"
+        );
+        let mut byte = 0u8;
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    receiver.as_raw_fd(),
+                    (&raw mut byte).cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+    }
+
+    #[test]
+    fn plain_info_codec_preserves_the_original_target_and_message_only() {
+        let bytes = super::encode_plain_info(
+            "detcore::syscalls::files",
+            "Injecting additional fstat on fd 3.",
+        )
+        .unwrap();
+        assert!(bytes.starts_with(b"HINFO\0\0\0\x01\x01\x03\0"));
+        assert_eq!(
+            super::decode_plain_info(&bytes),
+            Ok((
+                "detcore::syscalls::files",
+                "Injecting additional fstat on fd 3."
+            ))
+        );
+        let ordinary =
+            super::encode_plain_info("detcore", "DETLOG is just this ordinary message").unwrap();
+        assert_eq!(
+            super::decode_plain_info(&ordinary).unwrap().1,
+            "DETLOG is just this ordinary message"
+        );
+    }
+
+    #[test]
+    fn plain_info_codec_rejects_classes_lengths_and_utf8_without_fallback() {
+        let valid = super::encode_plain_info("detcore", "message").unwrap();
+        for length in 0..valid.len() {
+            assert!(
+                super::decode_plain_info(&valid[..length]).is_err(),
+                "truncation {length}"
+            );
+        }
+        for offset in [0, 7, 8, 9, 10, 11] {
+            let mut changed = valid.clone();
+            changed[offset] ^= 0x80;
+            assert!(
+                super::decode_plain_info(&changed).is_err(),
+                "header {offset}"
+            );
+        }
+        for field in [12, 16] {
+            let mut changed = valid.clone();
+            changed[field..field + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(super::decode_plain_info(&changed).is_err());
+        }
+        let mut extra = valid.clone();
+        extra.push(0);
+        assert!(super::decode_plain_info(&extra).is_err());
+        let mut utf8 = valid;
+        *utf8.last_mut().unwrap() = 0xff;
+        assert!(super::decode_plain_info(&utf8).is_err());
+        assert!(super::decode_plain_info(b"INFO detcore: arbitrary raw text\n").is_err());
+    }
+
+    #[test]
+    fn plain_info_codec_limits_and_target_contract_are_exact() {
+        let allowed =
+            "x".repeat(super::PLAIN_INFO_MAX - super::PLAIN_INFO_HEADER - "detcore".len());
+        let encoded = super::encode_plain_info("detcore", &allowed).unwrap();
+        assert_eq!(encoded.len(), super::PLAIN_INFO_MAX);
+        assert_eq!(super::decode_plain_info(&encoded).unwrap().1, allowed);
+        assert!(super::encode_plain_info("detcore", &(allowed + "x")).is_err());
+        for target in [
+            "",
+            "other",
+            "detcore_bad",
+            "detcore::",
+            "detcore:::x",
+            "detcore::x::",
+            "detcore::x y",
+        ] {
+            assert!(
+                super::encode_plain_info(target, "text").is_err(),
+                "{target}"
+            );
+        }
+        for message in ["a\nb", "a\rb", "a\0b"] {
+            assert!(super::encode_plain_info("detcore", message).is_err());
+        }
+    }
+
+    #[test]
+    fn plain_info_admission_refuses_span_field_and_invalid_filter_directives() {
+        for directives in [
+            "",
+            "debug",
+            "warn,detcore::syscalls=info",
+            "off,detcore::a=trace",
+            "detcore",
+        ] {
+            assert_eq!(
+                super::validate_plain_info_directives(directives),
+                Ok(()),
+                "{directives}"
+            );
+        }
+        for directives in [
+            "[syscall.intercept]=info",
+            "detcore[{fd}]=info",
+            "detcore[span{fd=3}]=info",
+            "detcore=bogus",
+            "=info",
+            "detcore=info=debug",
+        ] {
+            assert!(
+                super::validate_plain_info_directives(directives).is_err(),
+                "{directives}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_exec_forwarding_cut_refuses_retained_records_and_loss_state_without_resetting() {
+        use std::sync::atomic::AtomicI32;
+        use std::sync::atomic::AtomicU64;
+
+        use super::ForwardedCount;
+        use super::ForwardingCutError;
+        use super::inspect_empty_forwarding_cut;
+
+        let slots = [ForwardedCount {
+            pid: AtomicI32::new(41),
+            tid: AtomicI32::new(43),
+            count: AtomicU64::new(0),
+        }];
+        assert_eq!(inspect_empty_forwarding_cut(&slots, false, 0), Ok(()));
+        slots[0].count.store(3, Ordering::Release);
+        for _ in 0..2 {
+            assert_eq!(
+                inspect_empty_forwarding_cut(&slots, false, 0),
+                Err(ForwardingCutError::PendingRecords {
+                    pid: 41,
+                    tid: 43,
+                    count: 3,
+                })
+            );
+            assert_eq!(slots[0].count.load(Ordering::Acquire), 3);
+        }
+        // Removing an owner does not waive an unconsumed record.
+        slots[0].tid.store(0, Ordering::Release);
+        assert!(matches!(
+            inspect_empty_forwarding_cut(&slots, false, 0),
+            Err(ForwardingCutError::PendingRecords {
+                tid: 0,
+                count: 3,
+                ..
+            })
+        ));
+        assert_eq!(
+            inspect_empty_forwarding_cut(&slots, true, 0),
+            Err(ForwardingCutError::Uncounted)
+        );
+        assert_eq!(
+            inspect_empty_forwarding_cut(&slots, false, 2),
+            Err(ForwardingCutError::UnreportedLosses(2))
+        );
+        assert_eq!(slots[0].count.load(Ordering::Acquire), 3);
+        slots[0].count.store(0, Ordering::Release);
+        assert_eq!(inspect_empty_forwarding_cut(&slots, false, 0), Ok(()));
+        // A producer after the first empty observation invalidates the later
+        // check; the earlier observation is not a reusable authorization.
+        slots[0].count.store(1, Ordering::Release);
+        assert!(matches!(
+            inspect_empty_forwarding_cut(&slots, false, 0),
+            Err(ForwardingCutError::PendingRecords { count: 1, .. })
+        ));
+    }
+
+    /// A thread that sends more records than the socket buffer holds before its
+    /// next request (a single writev's records, say) is not blocked: the
+    /// receiver task takes them off the socket as they arrive, queued for their
+    /// thread, and they are written only at the points the order rule names
+    /// (here the end of the run), in the order they were sent.
+    /// Serializes the tests that use the process-wide forwarding source, so
+    /// one's notices never land in another's sink.
+    fn global_source_test() -> std::sync::MutexGuard<'static, ()> {
+        static GLOBAL_SOURCE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GLOBAL_SOURCE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // Real, connected message sockets and an actual record sink. Local positive
+    // fixtures isolate the process's permanently sticky loss latch, which other
+    // loss tests intentionally set; the public helper's latch is tested separately.
+    // Every user still holds global_source_test: emit/report can set that latch.
+    struct NativeCutSource {
+        source: super::ForwardedSource,
+        sender: std::os::fd::OwnedFd,
+        written: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl NativeCutSource {
+        fn new() -> Self {
+            use std::os::fd::FromRawFd;
+            let mut fds = [-1; 2];
+            // SAFETY: fds has space for both descriptors; ownership is taken once.
+            assert_eq!(
+                unsafe {
+                    libc::socketpair(
+                        libc::AF_UNIX,
+                        libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                        0,
+                        fds.as_mut_ptr(),
+                    )
+                },
+                0
+            );
+            let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = written.clone();
+            Self {
+                source: super::ForwardedSource {
+                    socket: unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) },
+                    sink: Box::new(move |record| sink.lock().unwrap().push(record.to_vec())),
+                    order: super::ForwardedOrder::new(),
+                    transport_failure: None,
+                    loss_seen: false,
+                },
+                sender: unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) },
+                written,
+            }
+        }
+
+        fn send(&self, tid: i32, index: u64, record: &[u8]) {
+            use std::os::fd::AsRawFd;
+            let message = super::tagged_forwarded_message(tid, index, record);
+            // SAFETY: message is live for the complete message-oriented send.
+            assert_eq!(
+                unsafe {
+                    libc::send(
+                        self.sender.as_raw_fd(),
+                        message.as_ptr().cast(),
+                        message.len(),
+                        libc::MSG_NOSIGNAL,
+                    )
+                },
+                message.len() as isize
+            );
+        }
+
+        fn check(
+            &mut self,
+            produced: u64,
+        ) -> Result<super::CoordinatorForwardingReceipt, super::CoordinatorForwardingCutError>
+        {
+            super::inspect_coordinator_forwarding_cut(
+                Some(&mut self.source),
+                19,
+                41,
+                produced,
+                None,
+                || false,
+            )
+        }
+    }
+
+    #[test]
+    fn native_coordinator_cut_checks_zero_and_nonzero_real_socket_intervals() {
+        let _guard = global_source_test();
+        let mut fixture = NativeCutSource::new();
+        let first = fixture.check(0).unwrap();
+        assert!(fixture.written.lock().unwrap().is_empty());
+        assert!(fixture.source.order.received.is_empty());
+        assert_eq!(
+            fixture.source.transport_failure, None,
+            "empty EAGAIN is healthy"
+        );
+        fixture.send(41, 1, b"a\n");
+        fixture.send(41, 2, b"b\n");
+        let second = super::inspect_coordinator_forwarding_cut(
+            Some(&mut fixture.source),
+            19,
+            41,
+            2,
+            Some(&first),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            *fixture.written.lock().unwrap(),
+            vec![b"a\n".to_vec(), b"b\n".to_vec()]
+        );
+        assert!(fixture.source.order.pending.is_empty());
+        assert!(fixture.source.order.received.is_empty());
+        // Success consumes exactly this interval; the actual next one starts at1.
+        fixture.send(41, 1, b"c\n");
+        assert_eq!(fixture.check(1), Ok(first));
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(
+                Some(&mut fixture.source),
+                19,
+                41,
+                0,
+                Some(&first),
+                || false
+            ),
+            Ok(first)
+        );
+        assert_eq!(
+            *fixture.written.lock().unwrap(),
+            vec![b"a\n".to_vec(), b"b\n".to_vec(), b"c\n".to_vec()]
+        );
+        assert!(fixture.source.order.at_commit(41, true).is_empty());
+        assert_eq!(
+            fixture.check(0),
+            Ok(first),
+            "the actual owner's exclusive point is eligible too"
+        );
+    }
+
+    #[test]
+    fn native_coordinator_cut_refuses_unchecked_counts_without_consuming_them() {
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        for (indexes, produced, expected) in [
+            (
+                vec![],
+                1,
+                Error::CountMismatch {
+                    produced: 1,
+                    received: 0,
+                },
+            ),
+            (
+                vec![1],
+                0,
+                Error::CountMismatch {
+                    produced: 0,
+                    received: 1,
+                },
+            ),
+            (
+                vec![1],
+                2,
+                Error::CountMismatch {
+                    produced: 2,
+                    received: 1,
+                },
+            ),
+            (
+                vec![1, 2],
+                1,
+                Error::CountMismatch {
+                    produced: 1,
+                    received: 2,
+                },
+            ),
+            (
+                vec![2],
+                1,
+                Error::OutOfSequence {
+                    expected: 1,
+                    sent: 2,
+                },
+            ),
+            (
+                vec![1, 1],
+                2,
+                Error::OutOfSequence {
+                    expected: 2,
+                    sent: 1,
+                },
+            ),
+            (vec![1], super::UNCOUNTED, Error::Uncounted),
+        ] {
+            let mut fixture = NativeCutSource::new();
+            for &index in &indexes {
+                fixture.send(41, index, b"kept\n");
+            }
+            assert_eq!(fixture.check(produced), Err(expected));
+            assert_eq!(
+                fixture
+                    .source
+                    .order
+                    .received
+                    .get(&41)
+                    .copied()
+                    .unwrap_or_default()
+                    .count,
+                indexes.len() as u64
+            );
+            assert_eq!(
+                fixture.source.order.pending.get(&41).map_or(0, Vec::len),
+                indexes.len()
+            );
+            assert!(
+                fixture
+                    .written
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|record| record.starts_with(super::FORWARDING_LOSS_NOTICE.as_bytes()))
+            );
+            assert_eq!(
+                fixture.check(produced),
+                Err(Error::DeterminismLoss),
+                "a later check cannot clear the loss"
+            );
+            assert_eq!(
+                fixture
+                    .source
+                    .order
+                    .received
+                    .get(&41)
+                    .copied()
+                    .unwrap_or_default()
+                    .count,
+                indexes.len() as u64
+            );
+        }
+    }
+
+    #[test]
+    fn native_coordinator_cut_retains_other_owner_records_and_requires_order_point() {
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let mut fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"owner\n");
+        fixture.send(43, 1, b"other\n");
+        for _ in 0..2 {
+            assert_eq!(fixture.check(1), Err(Error::OtherOwnerPending(43)));
+            assert_eq!(fixture.source.order.pending[&41], vec![b"owner\n".to_vec()]);
+            assert_eq!(fixture.source.order.pending[&43], vec![b"other\n".to_vec()]);
+            assert_eq!(fixture.source.order.received[&41].count, 1);
+            assert_eq!(fixture.source.order.received[&43].count, 1);
+            assert!(fixture.written.lock().unwrap().is_empty());
+        }
+        // The other queue may already have been written at its ordinary COMMIT;
+        // its actual unchecked received interval still prevents this cut.
+        let other = fixture.source.order.at_commit(43, true);
+        super::write_records(&mut fixture.source, other);
+        assert_eq!(fixture.check(1), Err(Error::OtherOwnerPending(43)));
+        assert_eq!(fixture.source.order.received[&43].count, 1);
+
+        for runner in [
+            super::Runner::None,
+            super::Runner::Exclusive(43),
+            super::Runner::Root(43),
+        ] {
+            let mut fixture = NativeCutSource::new();
+            fixture.send(41, 1, b"kept\n");
+            fixture.source.order.runner = runner;
+            assert_eq!(fixture.check(1), Err(Error::NotOwnerBoundary));
+            assert_eq!(fixture.source.order.pending[&41], vec![b"kept\n".to_vec()]);
+            assert_eq!(fixture.source.order.received[&41].count, 1);
+            assert!(fixture.written.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn native_coordinator_cut_requires_a_healthy_actual_message_source() {
+        use std::os::fd::FromRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(None, 19, 41, 0, None, || false),
+            Err(Error::MissingSource)
+        );
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(None, 19, 0, 0, None, || false),
+            Err(Error::InvalidOwner)
+        );
+
+        let mut fixture = NativeCutSource::new();
+        fixture.source.socket = std::fs::File::open("/dev/null").unwrap().into();
+        assert_eq!(fixture.check(0), Err(Error::InvalidSource));
+        super::collect_forwarded(&mut fixture.source);
+        assert_eq!(
+            fixture.source.transport_failure,
+            Some(super::ForwardedSourceError::Io(libc::ENOTSOCK))
+        );
+        assert_eq!(fixture.check(0), Err(Error::SourceIo(libc::ENOTSOCK)));
+
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut fixture = NativeCutSource::new();
+        fixture.source.socket = stream.into();
+        assert_eq!(
+            fixture.check(0),
+            Err(Error::InvalidSource),
+            "a stream cannot stand in for the counted message transport"
+        );
+
+        let mut fixture = NativeCutSource::new();
+        // SAFETY: successful socket creation supplies one uniquely owned fd.
+        let fd =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+        assert!(fd >= 0);
+        fixture.source.socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        assert_eq!(fixture.check(0), Err(Error::SourceIo(libc::ENOTCONN)));
+
+        let fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"retained on closure\n");
+        let NativeCutSource {
+            mut source, sender, ..
+        } = fixture;
+        drop(sender);
+        // An ordinary drain remembers its EOF; the strict check cannot bless it
+        // later as a successful empty source, even with a matching real count.
+        super::collect_forwarded(&mut source);
+        assert_eq!(
+            source.transport_failure,
+            Some(super::ForwardedSourceError::Closed)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                super::inspect_coordinator_forwarding_cut(
+                    Some(&mut source),
+                    19,
+                    41,
+                    1,
+                    None,
+                    || false
+                ),
+                Err(Error::ClosedSource)
+            );
+            assert_eq!(source.order.received[&41].count, 1);
+            assert_eq!(
+                source.order.pending[&41],
+                vec![b"retained on closure\n".to_vec()]
+            );
+        }
+    }
+
+    #[test]
+    fn native_coordinator_cut_receipt_rechecks_generation_socket_and_owner() {
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let mut fixture = NativeCutSource::new();
+        let receipt = fixture.check(0).unwrap();
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(
+                Some(&mut fixture.source),
+                20,
+                41,
+                0,
+                Some(&receipt),
+                || false
+            ),
+            Err(Error::SourceChanged)
+        );
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(
+                Some(&mut fixture.source),
+                19,
+                43,
+                0,
+                Some(&receipt),
+                || false
+            ),
+            Err(Error::SourceChanged)
+        );
+        let mut replacement = NativeCutSource::new();
+        replacement.send(41, 1, b"new source\n");
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(
+                Some(&mut replacement.source),
+                19,
+                41,
+                1,
+                Some(&receipt),
+                || false
+            ),
+            Err(Error::SourceChanged)
+        );
+        super::collect_forwarded(&mut replacement.source);
+        assert_eq!(replacement.source.order.received[&41].count, 1);
+        assert_eq!(
+            replacement.source.order.pending[&41],
+            vec![b"new source\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn native_coordinator_cut_refuses_real_loss_notices_and_persistent_process_loss() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        for message in [
+            b"HERMIT_DETLOG_RECORD_LOST 0 1 actual forwarding loss\n".as_slice(),
+            b"untagged actual record\n".as_slice(),
+        ] {
+            let mut fixture = NativeCutSource::new();
+            // SAFETY: the complete message bytes stay live until send returns.
+            assert_eq!(
+                unsafe {
+                    libc::send(
+                        fixture.sender.as_raw_fd(),
+                        message.as_ptr().cast(),
+                        message.len(),
+                        libc::MSG_NOSIGNAL,
+                    )
+                },
+                message.len() as isize
+            );
+            assert_eq!(fixture.check(0), Err(Error::DeterminismLoss));
+            assert!(fixture.source.loss_seen);
+            assert!(
+                fixture
+                    .written
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|record| record.starts_with(super::FORWARDING_LOSS_NOTICE.as_bytes()))
+            );
+            assert_eq!(fixture.check(0), Err(Error::DeterminismLoss));
+        }
+        // No test resets the process latch. Even a fresh real registered source
+        // cannot waive a previous loss through the public production helper.
+        super::clear_forwarded_source();
+        super::record_determinism_loss("native cut test persistent loss");
+        let NativeCutSource { source, sender, .. } = NativeCutSource::new();
+        super::set_forwarded_source(source.socket, source.sink);
+        assert_eq!(
+            super::check_native_exec_forwarding_cut(41, 0, None),
+            Err(Error::DeterminismLoss)
+        );
+        super::clear_forwarded_source();
+        assert_eq!(
+            super::check_native_exec_forwarding_cut(41, 0, None),
+            Err(Error::MissingSource)
+        );
+        drop(sender);
+    }
+
+    #[test]
+    fn native_coordinator_cut_restores_unchecked_queue_after_sink_closure() {
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"written before closure\n");
+        let NativeCutSource {
+            mut source,
+            sender,
+            written,
+        } = fixture;
+        let mut peer = Some(sender);
+        let sink = written.clone();
+        source.sink = Box::new(move |record| {
+            sink.lock().unwrap().push(record.to_vec());
+            drop(peer.take());
+        });
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(Some(&mut source), 19, 41, 1, None, || false),
+            Err(Error::ClosedSource)
+        );
+        assert_eq!(
+            *written.lock().unwrap(),
+            vec![b"written before closure\n".to_vec()]
+        );
+        assert_eq!(source.order.received[&41].count, 1);
+        assert_eq!(
+            source.order.pending[&41],
+            vec![b"written before closure\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn native_coordinator_cut_rechecks_loss_reported_by_the_record_sink() {
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"sink failure\n");
+        let NativeCutSource {
+            mut source,
+            sender,
+            written,
+        } = fixture;
+        let local_loss = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loss_from_sink = local_loss.clone();
+        let sink = written.clone();
+        source.sink = Box::new(move |record| {
+            sink.lock().unwrap().push(record.to_vec());
+            // The sink interface has no Result; this is its real required loss
+            // report, plus a local fixture view to isolate older process losses.
+            super::record_determinism_loss("native cut test sink failure");
+            loss_from_sink.store(true, Ordering::Release);
+        });
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(Some(&mut source), 19, 41, 1, None, || {
+                local_loss.load(Ordering::Acquire)
+            }),
+            Err(Error::DeterminismLoss)
+        );
+        assert!(super::determinism_loss().is_some());
+        assert_eq!(*written.lock().unwrap(), vec![b"sink failure\n".to_vec()]);
+        assert_eq!(source.order.received[&41].count, 1);
+        assert_eq!(source.order.pending[&41], vec![b"sink failure\n".to_vec()]);
+        drop(sender);
+    }
+
+    #[test]
+    fn native_coordinator_cut_retains_actual_packet_that_arrives_during_sink_write() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"first\n");
+        let NativeCutSource {
+            mut source,
+            sender,
+            written,
+        } = fixture;
+        let sink = written.clone();
+        let mut sent = false;
+        source.sink = Box::new(move |record| {
+            sink.lock().unwrap().push(record.to_vec());
+            if !sent {
+                sent = true;
+                let message = super::tagged_forwarded_message(41, 2, b"late\n");
+                // SAFETY: this actual second message is complete during the send.
+                assert_eq!(
+                    unsafe {
+                        libc::send(
+                            sender.as_raw_fd(),
+                            message.as_ptr().cast(),
+                            message.len(),
+                            libc::MSG_NOSIGNAL,
+                        )
+                    },
+                    message.len() as isize
+                );
+            }
+        });
+        assert_eq!(
+            super::inspect_coordinator_forwarding_cut(Some(&mut source), 19, 41, 1, None, || false),
+            Err(Error::CountMismatch {
+                produced: 1,
+                received: 2
+            })
+        );
+        assert_eq!(source.order.received[&41].count, 2);
+        assert_eq!(
+            source.order.pending[&41],
+            vec![b"first\n".to_vec(), b"late\n".to_vec()]
+        );
+        assert_eq!(written.lock().unwrap()[0], b"first\n".to_vec());
+        assert!(source.loss_seen);
+    }
+
+    /// Each thread counts the records it produced for forwarding since its
+    /// last counted request; taking the count starts the next one.
+    #[test]
+    fn forwarded_records_are_counted_per_thread_until_taken() {
+        std::thread::spawn(|| {
+            assert_eq!(super::take_forwarded_since_request(), 0);
+            super::count_forwarded();
+            super::count_forwarded();
+            assert_eq!(super::take_forwarded_since_request(), 2);
+            assert_eq!(super::take_forwarded_since_request(), 0);
+            super::count_forwarded();
+            // Another thread's records are its own.
+            let other = std::thread::spawn(|| {
+                super::count_forwarded();
+                super::take_forwarded_since_request()
+            });
+            assert_eq!(other.join().unwrap(), 1);
+            assert_eq!(super::take_forwarded_since_request(), 1);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A thread that deregistered frees its slot, so sequential thread churn
+    /// never exhausts the table; a thread that finds no slot at all makes every
+    /// later count [`super::UNCOUNTED`] (checked in a forked child, since that
+    /// latch is process-wide and a fork inherits the table).
+    #[test]
+    fn count_slots_are_released_and_an_uncounted_thread_is_reported() {
+        let _source = global_source_test();
+        for _ in 0..(super::FORWARDED_COUNTS.len() * 2) {
+            std::thread::spawn(|| {
+                super::count_forwarded();
+                assert_eq!(super::take_forwarded_since_request(), 1);
+                super::release_forwarded_count();
+            })
+            .join()
+            .unwrap();
+        }
+        assert!(!super::FORWARDING_UNCOUNTED.load(Ordering::Acquire));
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe { libc::alarm(20) };
+            // Threads that never release fill the table; the next is uncounted.
+            for _ in 0..=super::FORWARDED_COUNTS.len() {
+                std::thread::spawn(super::count_forwarded).join().unwrap();
+            }
+            let reported = super::take_forwarded_since_request();
+            unsafe { libc::_exit(if reported == super::UNCOUNTED { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "{status:#x}"
+        );
+    }
+
+    /// Until the image counts its first record, taking and releasing counts
+    /// touch no slot (the fast path for Tools that never forward), and the
+    /// first record then counts exactly as before. Checked in a forked child
+    /// with the process-wide flag and table reset, since other tests set them.
+    #[test]
+    fn counts_are_untouched_until_the_first_record() {
+        let _source = global_source_test();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe { libc::alarm(20) };
+            for slot in &super::FORWARDED_COUNTS {
+                slot.tid.store(0, Ordering::Release);
+                slot.count.store(0, Ordering::Release);
+            }
+            super::FORWARDING_STARTED.store(false, Ordering::Release);
+            let me = super::current_tid();
+            let claimed = || {
+                super::FORWARDED_COUNTS
+                    .iter()
+                    .any(|slot| slot.tid.load(Ordering::Acquire) != 0)
+            };
+            let ok = super::take_forwarded_since_request() == 0
+                && !claimed()
+                && {
+                    super::release_forwarded_count();
+                    !claimed()
+                }
+                && super::count_forwarded() == 1
+                && super::FORWARDING_STARTED.load(Ordering::Acquire)
+                && super::FORWARDED_COUNTS
+                    .iter()
+                    .any(|slot| slot.tid.load(Ordering::Acquire) == me)
+                && super::count_forwarded() == 2
+                && super::take_forwarded_since_request() == 2
+                && super::take_forwarded_since_request() == 0;
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "{status:#x}"
+        );
+    }
+
+    /// A thread whose probe path had a slot released before its own finds its
+    /// own slot again instead of claiming the hole (tids chosen to collide).
+    /// Another process that shares this memory keeps its slots; a forked copy
+    /// and an exited process do not.
+    #[test]
+    fn a_released_slot_on_the_probe_path_is_not_claimed_twice() {
+        let _source = global_source_test();
+        let buckets = super::FORWARDED_COUNTS.len() as i32;
+        let base = 0x3f00_0000 - 0x3f00_0000 % buckets + 7;
+        let (first, second, third) = (base, base + buckets, base + 2 * buckets);
+        let slot = |tid| super::forwarded_count_slot(tid).map(|slot| slot as *const _);
+        let first_slot = slot(first).unwrap();
+        let second_slot = slot(second).unwrap();
+        let third_slot = slot(third).unwrap();
+        assert_ne!(second_slot, third_slot);
+        super::release_count_slot(second);
+        assert_eq!(
+            slot(third),
+            Some(third_slot),
+            "the hole is not a second slot"
+        );
+        assert_eq!(slot(first), Some(first_slot));
+        for tid in [first, third] {
+            super::release_count_slot(tid);
+        }
+
+        let me = super::current_pid();
+        assert!(!super::private_copy(me, me));
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        assert!(
+            super::private_copy(child, me),
+            "a forked child's memory is its own"
+        );
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            super::private_copy(child, me),
+            "an exited process holds nothing"
+        );
+        // A process that shares this memory (CLONE_VM, its own descriptor
+        // table, as a vfork child), on a stack of its own.
+        extern "C" fn shared_child(parent: *mut libc::c_void) -> libc::c_int {
+            let own = unsafe { libc::syscall(libc::SYS_getpid) } as i32;
+            i32::from(super::private_copy(parent as usize as i32, own))
+        }
+        let mut stack = vec![0u8; 256 * 1024];
+        let top = (stack.as_mut_ptr() as usize + stack.len()) & !15;
+        let shared = unsafe {
+            libc::clone(
+                shared_child,
+                top as *mut libc::c_void,
+                libc::CLONE_VM | libc::SIGCHLD,
+                me as usize as *mut libc::c_void,
+            )
+        };
+        assert!(shared > 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(unsafe { libc::waitpid(shared, &mut status, 0) }, shared);
+        drop(stack);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "a CLONE_VM child shares this memory: {status:#x}"
+        );
+    }
+
+    /// A Tool image the coordinator requires to forward by a policy reports
+    /// every count as UNCOUNTED when it has no forwarder, or one with another
+    /// policy (records that policy drops would never be counted); with exactly
+    /// that policy it counts normally. Each case in a forked child: the latch
+    /// and the forwarder are process-wide.
+    #[test]
+    fn a_required_forwarder_that_is_missing_or_narrowed_makes_counts_uncounted() {
+        let _source = global_source_test();
+        let in_child = |install: Option<&str>, expected: &str| -> bool {
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0);
+            if child == 0 {
+                unsafe { libc::alarm(20) };
+                // The parent has none (the test process installs no
+                // forwarder), so the child's is the one installed here.
+                let ok = super::FORWARDER.get().is_none()
+                    && install.is_none_or(|policy| {
+                        let policy = ForwardPolicy::decode(policy).unwrap();
+                        super::set_forwarder(|_, _, _, _| {}, policy).is_ok()
+                    });
+                super::require_forwarding(expected);
+                let uncounted = super::take_forwarded_since_request() == super::UNCOUNTED;
+                unsafe {
+                    libc::_exit(if !ok {
+                        2
+                    } else if uncounted {
+                        1
+                    } else {
+                        0
+                    })
+                };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) != 2,
+                "{status:#x}"
+            );
+            libc::WEXITSTATUS(status) == 1
+        };
+        let required = "1,detcore::tool_local=1";
+        assert!(in_child(None, required), "no forwarder: uncounted");
+        assert!(
+            in_child(Some("1,detcore::tool_local=0"), required),
+            "a narrowed policy: uncounted"
+        );
+        assert!(
+            !in_child(Some(required), required),
+            "the required policy: counted"
+        );
+    }
+
+    /// THE COMPLETENESS RULE: a counted request that says its thread produced
+    /// more records than arrived from it writes a loss notice and records the
+    /// determinism loss, so verification refuses the run; so does one that
+    /// says fewer (records that were not the Tool's) or [`super::UNCOUNTED`].
+    #[test]
+    fn a_counted_request_with_missing_records_is_a_loss() {
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        let _source = global_source_test();
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let written = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = Arc::clone(&written);
+        super::set_forwarded_source(
+            unsafe { OwnedFd::from_raw_fd(fds[0]) },
+            Box::new(move |record| sink.lock().unwrap().push(record.to_vec())),
+        );
+        let send = |tid: i32, index: u64, line: &str| {
+            let message = super::tagged_forwarded_message(tid, index, line.as_bytes());
+            let sent = unsafe { libc::send(fds[1], message.as_ptr().cast(), message.len(), 0) };
+            assert_eq!(sent, message.len() as isize);
+        };
+        // This thread's notices only: another test may write a global loss
+        // notice into the registered sink meanwhile.
+        let notices = |written: &Arc<Mutex<Vec<Vec<u8>>>>| -> Vec<String> {
+            written
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|record| record.starts_with(super::FORWARDING_LOSS_NOTICE.as_bytes()))
+                .map(|record| String::from_utf8_lossy(record).into_owned())
+                .filter(|notice| notice.contains("thread 41 ") || notice.contains("thread 41)"))
+                .collect()
+        };
+        send(41, 1, "a\n");
+        send(41, 2, "b\n");
+        super::check_forwarded_count(41, 2);
+        assert_eq!(notices(&written).len(), 0, "as many records as produced");
+        send(41, 1, "c\n");
+        super::check_forwarded_count(41, 3);
+        assert_eq!(notices(&written).len(), 1, "a deficit is a loss");
+        assert!(
+            notices(&written)[0].contains(
+                "lost: thread 41 produced 3 since its last counted request and 1 arrived"
+            ),
+            "{:?}",
+            notices(&written)
+        );
+        // More than produced: records that were not the Tool's (a guest that
+        // wrote to the socket around the Tool) cannot stand in for lost ones.
+        send(41, 1, "d\n");
+        send(41, 2, "e\n");
+        super::check_forwarded_count(41, 1);
+        assert_eq!(notices(&written).len(), 2, "a surplus is refused too");
+        assert!(
+            notices(&written)[1].contains("not the Tool's: thread 41 produced 1"),
+            "{:?}",
+            notices(&written)
+        );
+        super::check_forwarded_count(41, super::UNCOUNTED);
+        assert_eq!(notices(&written).len(), 3, "an uncounted thread is refused");
+        assert!(
+            notices(&written)[2].contains("uncounted"),
+            "{:?}",
+            notices(&written)
+        );
+        // As many records as produced, but one index skipped: a record was lost
+        // and another stood in for it.
+        send(41, 1, "f\n");
+        send(41, 3, "g\n");
+        super::check_forwarded_count(41, 2);
+        assert_eq!(notices(&written).len(), 4, "a skipped index is a loss");
+        assert!(
+            notices(&written)[3]
+                .contains("lost: thread 41 sent record 3 of its interval where 2 was next"),
+            "{:?}",
+            notices(&written)
+        );
+        // As many records as produced, but one index repeated: a record that
+        // was not the Tool's stood in for a lost one.
+        send(41, 1, "h\n");
+        send(41, 1, "padding\n");
+        super::check_forwarded_count(41, 2);
+        assert_eq!(notices(&written).len(), 5, "a repeated index is refused");
+        assert!(
+            notices(&written)[4].contains(
+                "not the Tool's: thread 41 sent record 1 of its interval where 2 was next"
+            ),
+            "{:?}",
+            notices(&written)
+        );
+        // The interval restarts after each counted request.
+        send(41, 1, "i\n");
+        super::check_forwarded_count(41, 1);
+        assert_eq!(notices(&written).len(), 5, "a new interval starts at 1");
+        assert!(super::determinism_loss().is_some());
+        super::clear_forwarded_source();
+        unsafe { libc::close(fds[1]) };
+    }
+
+    #[test]
+    fn a_full_socket_buffer_does_not_wait_for_a_request() {
+        let _source = global_source_test();
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        const RECORDS: usize = 2000;
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let small: libc::c_int = 4096;
+        for fd in fds {
+            for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        option,
+                        (&raw const small).cast(),
+                        std::mem::size_of_val(&small) as libc::socklen_t,
+                    )
+                };
+            }
+        }
+        let written = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = Arc::clone(&written);
+        super::set_forwarded_source(
+            unsafe { OwnedFd::from_raw_fd(fds[0]) },
+            Box::new(move |record| sink.lock().unwrap().push(record.to_vec())),
+        );
+        // The coordinator's runtime, and its first request: from the root,
+        // thread 1, so thread 7's records stay queued until the end.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async { super::drain_forwarded_at_request(1) });
+        let sender = fds[1];
+        let started = Instant::now();
+        let sending = std::thread::spawn(move || {
+            for index in 0..RECORDS {
+                let message = super::tagged_forwarded_message(
+                    7,
+                    index as u64 + 1,
+                    format!("record {index:04}\n").as_bytes(),
+                );
+                let sent = unsafe {
+                    libc::send(
+                        sender,
+                        message.as_ptr().cast(),
+                        message.len(),
+                        libc::MSG_NOSIGNAL,
+                    )
+                };
+                assert_eq!(sent, message.len() as isize);
+            }
+        });
+        while !sending.is_finished() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the sender stayed blocked on a full socket buffer"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        sending.join().unwrap();
+        // This test's records only: another test may write a global loss
+        // notice into the registered sink meanwhile.
+        let own = |written: &Arc<Mutex<Vec<Vec<u8>>>>| -> Vec<Vec<u8>> {
+            written
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|record| record.starts_with(b"record "))
+                .cloned()
+                .collect()
+        };
+        assert!(
+            own(&written).is_empty(),
+            "records were written before their point"
+        );
+        super::clear_forwarded_source();
+        let written = own(&written);
+        assert_eq!(written.len(), RECORDS);
+        for (index, record) in written.iter().enumerate() {
+            assert_eq!(record, format!("record {index:04}\n").as_bytes());
+        }
+        unsafe { libc::close(sender) };
+    }
+
+    #[test]
+    fn forwarded_line_names_the_emitting_module() {
+        assert_eq!(
+            super::forwarded_line(
+                "detcore::tool_local",
+                " DETLOG_RECORD={}",
+                format_args!("USER RAND: seeding PRNG for root thread with seed {}", 0)
+            ),
+            b"INFO detcore::tool_local: DETLOG USER RAND: seeding PRNG for root thread with seed 0 DETLOG_RECORD={}\n"
+                .to_vec()
+        );
+    }
+
+    /// Forwarding failures are never silent, and never change the guest's errno.
+    /// One sequential test, because the unreported-loss count is process-wide:
+    /// - a record sent on an invalid descriptor fails, and so does its notice,
+    ///   and errno is left as it was;
+    /// - the next record that gets through is preceded by a loss notice for it;
+    /// - a record too large for the socket arrives as a loss notice, and the next
+    ///   small record intact.
+    #[test]
+    fn forwarding_failures_become_loss_notices() {
+        let mut pair = [-1; 2];
+        // SAFETY: socketpair writes two descriptors on success.
+        let created = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            )
+        };
+        assert_eq!(created, 0);
+        let [sender, receiver] = pair;
+        let mut buffer = vec![0u8; 2 << 20];
+        let mut receive = || {
+            // SAFETY: `buffer` is a live, writable byte slice.
+            let received = unsafe {
+                libc::recv(
+                    receiver,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            assert!(received > 0, "{}", std::io::Error::last_os_error());
+            String::from_utf8_lossy(&buffer[..received as usize]).into_owned()
+        };
+        let is_notice =
+            |text: &str| text.starts_with(&format!("{} ", super::FORWARDING_LOSS_NOTICE));
+
+        // SAFETY: errno is this thread's own.
+        unsafe {
+            *libc::__errno_location() = libc::EAGAIN;
+            super::send_forwarded_record(-1, "detcore", "", 1, format_args!("lost"));
+            assert_eq!(*libc::__errno_location(), libc::EAGAIN);
+        }
+        let tag = |index: u64| format!("T{}.{index} ", super::current_tid());
+        super::send_forwarded_record(sender, "detcore", "", 2, format_args!("after"));
+        let notice = receive();
+        assert!(is_notice(&notice), "{notice}");
+        assert_eq!(receive(), format!("{}INFO detcore: DETLOG after\n", tag(2)));
+
+        let small: libc::c_int = 4096;
+        // SAFETY: a valid socket and an int option value.
+        unsafe {
+            libc::setsockopt(
+                sender,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const small).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        let huge = "x".repeat(1 << 20);
+        super::send_forwarded_record(sender, "detcore", "", 1, format_args!("{huge}"));
+        super::send_forwarded_record(sender, "detcore", "", 2, format_args!("small"));
+        let notice = receive();
+        assert!(is_notice(&notice), "{notice}");
+        assert_eq!(receive(), format!("{}INFO detcore: DETLOG small\n", tag(2)));
+        // SAFETY: closing the two descriptors this test created.
+        unsafe {
+            libc::close(sender);
+            libc::close(receiver);
+        }
+    }
+
+    /// The order rule at `set_forwarded_source`, on its own state (no process-wide
+    /// source, so no other test's scheduler commits can interfere): records are
+    /// written at the sender's own request only before any turn or when it is the
+    /// thread of the last ordinary COMMIT, otherwise at its own next COMMIT, and the
+    /// rest at the end in thread-id order.
+    #[test]
+    fn forwarded_records_are_written_at_points_the_schedule_fixes() {
+        let mut order = super::ForwardedOrder::new();
+        let text = |records: Vec<Vec<u8>>| -> Vec<String> {
+            records
+                .into_iter()
+                .map(|record| String::from_utf8(record).unwrap())
+                .collect()
+        };
+        let none: Vec<String> = Vec::new();
+
+        // Before any turn only the root thread exists: its records go out at its
+        // request. Its turn 0 makes it the exclusive runner.
+        order.queue(3, b"root-1".to_vec());
+        assert_eq!(text(order.at_request(3)), ["root-1"]);
+        assert_eq!(text(order.at_commit(3, true)), none);
+        // A forked child that does not hold the turn: queued until its own COMMIT,
+        // even when its request arrives first.
+        order.queue(9, b"child-1".to_vec());
+        assert_eq!(text(order.at_request(9)), none);
+        assert_eq!(text(order.at_commit(9, true)), ["child-1"]);
+        // Thread 9 now holds the turn: its records go out at its request; thread 3's
+        // records sent meanwhile wait for 3's COMMIT.
+        order.queue(3, b"root-2".to_vec());
+        order.queue(9, b"child-2".to_vec());
+        assert_eq!(text(order.at_request(9)), ["child-2"]);
+        assert_eq!(text(order.at_request(3)), none);
+        // A BACKGROUND commit writes its thread's records but leaves no exclusive
+        // runner, so a later request writes nothing.
+        assert_eq!(text(order.at_commit(3, false)), ["root-2"]);
+        order.queue(3, b"root-3".to_vec());
+        assert_eq!(text(order.at_request(3)), none);
+        // At the end, every queued record, thread by thread in thread-id order.
+        order.queue(12, b"late-12".to_vec());
+        order.queue(5, b"late-5".to_vec());
+        assert_eq!(text(order.finish()), ["root-3", "late-5", "late-12"]);
+        assert_eq!(text(order.finish()), none);
+
+        // Two roots before any turn: the second request yields one ambiguity notice
+        // (and only one), and the second root's records wait for its COMMIT.
+        let mut order = super::ForwardedOrder::new();
+        order.queue(3, b"first-root".to_vec());
+        order.queue(4, b"second-root".to_vec());
+        assert_eq!(text(order.at_request(3)), ["first-root"]);
+        let notice = String::from_utf8(super::FORWARDING_AMBIGUOUS_ORDER_NOTICE.to_vec()).unwrap();
+        assert!(notice.starts_with(&format!("{} ", super::FORWARDING_LOSS_NOTICE)));
+        assert_eq!(text(order.at_request(4)), [notice]);
+        assert_eq!(text(order.at_request(4)), none);
+        assert_eq!(text(order.at_commit(4, true)), ["second-root"]);
+
+        // Untagged messages: a loss notice passes as is; an ordinary record from an
+        // older runtime is written with one untagged-record notice before it.
+        let mut order = super::ForwardedOrder::new();
+        let retired = String::from_utf8(super::FORWARDING_RETIRED_NOTICE.to_vec()).unwrap();
+        assert_eq!(
+            text(order.untagged(super::FORWARDING_RETIRED_NOTICE)),
+            [retired]
+        );
+        let untagged =
+            String::from_utf8(super::FORWARDING_UNTAGGED_RECORD_NOTICE.to_vec()).unwrap();
+        assert!(untagged.starts_with(&format!("{} ", super::FORWARDING_LOSS_NOTICE)));
+        assert_eq!(
+            text(order.untagged(b"INFO detcore: DETLOG legacy-1\n")),
+            [untagged, "INFO detcore: DETLOG legacy-1\n".to_string()]
+        );
+        assert_eq!(
+            text(order.untagged(b"INFO detcore: DETLOG legacy-2\n")),
+            ["INFO detcore: DETLOG legacy-2\n"]
+        );
+    }
+
+    #[test]
+    fn a_loss_notice_records_the_determinism_loss_latch() {
+        let _source = global_source_test();
+        // The latch is the verification safeguard, independent of whether the
+        // notice line reaches a log: it is set even with no registered source.
+        super::write_loss_notice("test: an unscheduled exit");
+        let loss = super::determinism_loss().expect("the latch must be set");
+        assert!(!loss.is_empty());
+        // It keeps the first reason and is never cleared by later ones.
+        super::record_determinism_loss("test: a later reason");
+        assert_eq!(super::determinism_loss(), Some(loss));
+    }
+
+    #[test]
+    fn split_forwarded_message_reads_the_sender_tag() {
+        assert_eq!(
+            super::split_forwarded_message(b"T42.7 INFO detcore: x\n"),
+            Some((42, 7, &b"INFO detcore: x\n"[..]))
+        );
+        // A tag without an index is a runtime older than the index.
+        assert_eq!(
+            super::split_forwarded_message(b"T42 INFO detcore: x\n"),
+            None
+        );
+        assert_eq!(super::split_forwarded_message(b"T42. INFO"), None);
+        assert_eq!(super::split_forwarded_message(b"T42.x INFO"), None);
+        assert_eq!(
+            super::split_forwarded_message(super::FORWARDING_RETIRED_NOTICE),
+            None
+        );
+        assert_eq!(super::split_forwarded_message(b"T INFO"), None);
+        assert_eq!(super::split_forwarded_message(b"Tx1 INFO"), None);
+        assert_eq!(super::split_forwarded_message(b"INFO detcore"), None);
+    }
 
     #[test]
     fn test_detlog() {
@@ -284,5 +3974,821 @@ mod tests {
         tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
             assert!(!detlog_observed!());
         });
+    }
+
+    /// Takes WARN from everywhere and INFO only from `detcore::random` and its
+    /// submodules, as `RUST_LOG=warn,detcore::random=info` does.
+    struct RandomAtInfo;
+
+    impl tracing::Subscriber for RandomAtInfo {
+        fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+            Interest::sometimes()
+        }
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+                || (*metadata.level() <= tracing::Level::INFO
+                    && metadata.target().starts_with("detcore::random"))
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::INFO)
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    /// A forwarded process must emit exactly the records the coordinator's
+    /// subscriber would take in-process. A target-scoped filter used to yield
+    /// no forwarding at all, because the coordinator asked only about the
+    /// generic `detcore` target, so SaBRe silently dropped the scoped records.
+    #[test]
+    fn forward_policy_answers_per_target_as_the_subscriber_does() {
+        let policy = tracing::subscriber::with_default(RandomAtInfo, || {
+            ForwardPolicy::from_current_subscriber("warn,detcore::random=info")
+        });
+        assert!(policy.forwards_any());
+        assert!(policy.forwards("detcore::random"));
+        assert!(policy.forwards("detcore::random::inner"));
+        assert!(!policy.forwards("detcore"));
+        assert!(!policy.forwards("detcore::tool_local"));
+        assert!(!policy.forwards("detcore::scheduler::runqueue"));
+        assert_eq!(policy.encode(), "0,warn=0,detcore::random=1");
+
+        let everything = tracing::subscriber::with_default(AlwaysEnabled, || {
+            ForwardPolicy::from_current_subscriber("")
+        });
+        assert_eq!(everything, ForwardPolicy::all());
+
+        let nothing =
+            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+                ForwardPolicy::from_current_subscriber("warn,detcore::random=info")
+            });
+        assert!(!nothing.forwards_any());
+    }
+
+    /// The longest named target that prefixes the record's target decides, by
+    /// string prefix as `tracing-subscriber` matches directives.
+    #[test]
+    fn forward_policy_most_specific_target_decides() {
+        let policy = ForwardPolicy::decode("1,detcore=0,detcore::random=1").unwrap();
+        assert!(policy.forwards("hermit"));
+        assert!(!policy.forwards("detcore"));
+        assert!(!policy.forwards("detcore::tool_local"));
+        assert!(policy.forwards("detcore::random"));
+        assert!(policy.forwards("detcore::randomness"));
+    }
+
+    #[test]
+    fn forward_policy_encoding_round_trips_and_refuses_malformed_values() {
+        assert_eq!(ForwardPolicy::decode("1").unwrap(), ForwardPolicy::all());
+        let policy = ForwardPolicy::decode("0,warn=0,detcore::random=1").unwrap();
+        assert_eq!(ForwardPolicy::decode(&policy.encode()).unwrap(), policy);
+        for malformed in ["", "2", "1,detcore", "1,=1", "1,detcore=2", "1,detcore=1=0"] {
+            assert!(
+                ForwardPolicy::decode(malformed).is_err(),
+                "{malformed:?} must be refused"
+            );
+        }
+    }
+    struct ModelPhysicalCompletion {
+        fd: std::os::fd::OwnedFd,
+        pid: i32,
+        identity: u64,
+    }
+    // SAFETY: test-only watch authority model. The pidfds and socket EOF below
+    // are real, but this fixture DOES NOT claim a real PhysicalExitWatch drain.
+    unsafe impl super::NativePhysicalExitCompletion for ModelPhysicalCompletion {
+        fn retained_pidfd(&self) -> std::os::fd::BorrowedFd<'_> {
+            use std::os::fd::AsFd;
+            self.fd.as_fd()
+        }
+        fn process_id(&self) -> i32 {
+            self.pid
+        }
+        fn birth_identity(&self) -> u64 {
+            self.identity
+        }
+    }
+    fn model_completion(dead: bool) -> ModelPhysicalCompletion {
+        use std::os::fd::FromRawFd;
+        let mut child = dead.then(|| std::process::Command::new("true").spawn().unwrap());
+        let pid = child
+            .as_ref()
+            .map_or(std::process::id(), std::process::Child::id);
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(raw >= 0);
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        use std::os::fd::AsRawFd;
+        assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) }, 0);
+        if let Some(child) = child.as_mut() {
+            assert!(child.wait().unwrap().success());
+        }
+        ModelPhysicalCompletion {
+            fd,
+            pid: pid as i32,
+            identity: stat.st_ino,
+        }
+    }
+    #[test]
+    fn model_native_final_drain_requires_actual_death_and_credited_real_source() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let mut fixture = NativeCutSource::new();
+        fixture.send(41, 1, b"credited\n");
+        fixture.check(1).unwrap();
+        let identity = super::socket_identity(fixture.source.socket.as_raw_fd()).unwrap();
+        drop(fixture.sender);
+        let live = model_completion(false);
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut fixture.source,
+                identity,
+                (live.pid, live.identity),
+                &live
+            ),
+            Err(Error::InvalidOwner)
+        );
+        let dead = model_completion(true);
+        assert!(
+            super::inspect_native_final_source(
+                &mut fixture.source,
+                identity,
+                (dead.pid, dead.identity),
+                &dead
+            )
+            .is_ok()
+        );
+        assert_eq!(*fixture.written.lock().unwrap(), [b"credited\n".to_vec()]);
+    }
+    #[test]
+    fn model_native_final_drain_retains_transport_loss_tail_and_identity_failures() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        use super::ForwardedSourceError;
+        let dead = model_completion(true);
+        let mut fixture = NativeCutSource::new();
+        fixture.check(0).unwrap();
+        let identity = super::socket_identity(fixture.source.socket.as_raw_fd()).unwrap();
+        drop(fixture.sender);
+        fixture.source.transport_failure = Some(ForwardedSourceError::Io(libc::EIO));
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut fixture.source,
+                identity,
+                (dead.pid, dead.identity),
+                &dead
+            ),
+            Err(Error::SourceIo(libc::EIO))
+        );
+        assert_eq!(
+            fixture.source.transport_failure,
+            Some(ForwardedSourceError::Io(libc::EIO))
+        );
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut fixture.source,
+                (identity.0, identity.1 ^ 1),
+                (dead.pid, dead.identity),
+                &dead
+            ),
+            Err(Error::SourceChanged)
+        );
+        let mut tail = NativeCutSource::new();
+        tail.check(0).unwrap();
+        tail.send(41, 1, b"uncredited\n");
+        let identity = super::socket_identity(tail.source.socket.as_raw_fd()).unwrap();
+        drop(tail.sender);
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut tail.source,
+                identity,
+                (dead.pid, dead.identity),
+                &dead
+            ),
+            Err(Error::OtherOwnerPending(41))
+        );
+        assert_eq!(tail.source.order.received[&41].count, 1);
+        assert!(tail.written.lock().unwrap().is_empty());
+        tail.source.loss_seen = true;
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut tail.source,
+                identity,
+                (dead.pid, dead.identity),
+                &dead
+            ),
+            Err(Error::DeterminismLoss)
+        );
+    }
+
+    #[test]
+    fn model_native_final_drain_refuses_another_births_completion_without_consuming_source() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let owner = model_completion(false);
+        let unrelated = model_completion(true);
+        assert_ne!(owner.identity, unrelated.identity);
+        let mut fixture = NativeCutSource::new();
+        fixture.check(0).unwrap();
+        let identity = super::socket_identity(fixture.source.socket.as_raw_fd()).unwrap();
+        drop(fixture.sender);
+        assert_eq!(
+            super::inspect_native_final_source(
+                &mut fixture.source,
+                identity,
+                (owner.pid, owner.identity),
+                &unrelated
+            ),
+            Err(Error::InvalidOwner)
+        );
+        // A mismatched completion cannot reinterpret or consume this EOF.
+        assert_eq!(fixture.source.transport_failure, None);
+        assert!(fixture.written.lock().unwrap().is_empty());
+    }
+
+    // Test-owned task handles expose natural completion without adding a
+    // production status API. The independent watchdog stops a spinning old
+    // receiver even if a Tokio timer cannot obtain a poll. Drop also stops and
+    // joins on assertion unwinding; neither path counts as natural completion.
+    type ForwardedReceiverStop =
+        std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
+
+    struct ForwardedReceiverTask {
+        runtime: tokio::runtime::Runtime,
+        task: Option<tokio::task::JoinHandle<()>>,
+        stop: ForwardedReceiverStop,
+        done: Option<std::sync::mpsc::Sender<()>>,
+        watchdog: Option<std::thread::JoinHandle<()>>,
+        watchdog_fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ForwardedReceiverTask {
+        fn spawn(watched: std::os::fd::OwnedFd, generation: u64) -> Self {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let stop = std::sync::Arc::new(std::sync::Mutex::new(Some(stop)));
+            let watchdog_stop = stop.clone();
+            let watchdog_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fired = watchdog_fired.clone();
+            let (done, completed) = std::sync::mpsc::channel();
+            let watchdog = std::thread::spawn(move || {
+                if completed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_err()
+                {
+                    fired.store(true, Ordering::SeqCst);
+                    if let Some(stop) = watchdog_stop.lock().unwrap().take() {
+                        let _ = stop.send(());
+                    }
+                }
+            });
+            let task = runtime.spawn(super::receive_forwarded(watched, generation, stopped));
+            Self {
+                runtime,
+                task: Some(task),
+                stop,
+                done: Some(done),
+                watchdog: Some(watchdog),
+                watchdog_fired,
+            }
+        }
+
+        fn request_stop(&self) {
+            if let Some(stop) = self.stop.lock().unwrap().take() {
+                let _ = stop.send(());
+            }
+        }
+
+        fn join(&mut self) -> (Result<(), tokio::task::JoinError>, bool) {
+            let result = self.runtime.block_on(self.task.take().unwrap());
+            let _ = self.done.take().unwrap().send(());
+            let watchdog_ok = self.watchdog.take().unwrap().join().is_ok();
+            (
+                result,
+                self.watchdog_fired.load(Ordering::SeqCst) || !watchdog_ok,
+            )
+        }
+
+        fn is_finished(&self) -> bool {
+            self.task.as_ref().unwrap().is_finished()
+        }
+    }
+
+    impl Drop for ForwardedReceiverTask {
+        fn drop(&mut self) {
+            if self.task.is_some() {
+                self.request_stop();
+                let _ = self.join();
+            }
+        }
+    }
+
+    struct ForwardedReceiverSourceCleanup;
+    impl Drop for ForwardedReceiverSourceCleanup {
+        fn drop(&mut self) {
+            super::clear_forwarded_source();
+        }
+    }
+
+    struct ReceiverSource {
+        sender: std::os::fd::OwnedFd,
+        written: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        generation: u64,
+        identity: (u64, u64),
+    }
+
+    fn install_receiver_source() -> ReceiverSource {
+        use std::os::fd::AsRawFd;
+        let NativeCutSource {
+            source,
+            sender,
+            written,
+        } = NativeCutSource::new();
+        let identity = super::socket_identity(source.socket.as_raw_fd()).unwrap();
+        super::set_forwarded_source(source.socket, source.sink);
+        let generation = super::FORWARDED_GENERATION.load(Ordering::SeqCst);
+        ReceiverSource {
+            sender,
+            written,
+            generation,
+            identity,
+        }
+    }
+
+    fn send_receiver_record(sender: &std::os::fd::OwnedFd, record: &[u8]) {
+        use std::os::fd::AsRawFd;
+        let message = super::tagged_forwarded_message(41, 1, record);
+        // SAFETY: the live message buffer is valid for the complete packet.
+        let sent = unsafe {
+            libc::send(
+                sender.as_raw_fd(),
+                message.as_ptr().cast(),
+                message.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(sent, message.len() as isize);
+    }
+
+    fn receiver_watched_socket() -> std::os::fd::OwnedFd {
+        super::FORWARDED_SOURCE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .socket
+            .try_clone()
+            .unwrap()
+    }
+
+    fn wait_for_receiver_record() -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let received = super::FORWARDED_SOURCE
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .order
+                .received
+                .get(&41)
+                .is_some_and(|interval| interval.count == 1);
+            if received {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    }
+
+    #[test]
+    fn forwarded_receiver_retires_after_real_eof_without_rearming() {
+        use std::os::fd::AsRawFd;
+        let _guard = global_source_test();
+        let _cleanup = ForwardedReceiverSourceCleanup;
+        let ReceiverSource {
+            sender,
+            written,
+            generation,
+            identity,
+        } = install_receiver_source();
+        super::RECEIVER_GENERATION.store(generation, Ordering::SeqCst);
+        // A marker for the existing global stop owner: terminal return must
+        // leave it intact, and starting the same generation must not replace it.
+        let (marker, mut marker_receiver) = tokio::sync::oneshot::channel();
+        *super::RECEIVER_STOP.lock().unwrap() = Some(marker);
+        let mut receiver = ForwardedReceiverTask::spawn(receiver_watched_socket(), generation);
+        send_receiver_record(&sender, b"credited before EOF\n");
+        assert!(wait_for_receiver_record(), "actual async task must collect");
+        assert!(!receiver.is_finished(), "live EAGAIN must keep waiting");
+        let credited = {
+            let mut source = super::FORWARDED_SOURCE.lock().unwrap();
+            super::inspect_coordinator_forwarding_cut(
+                source.as_mut(),
+                generation,
+                41,
+                1,
+                None,
+                || false,
+            )
+        };
+        assert!(credited.is_ok());
+        assert_eq!(
+            *written.lock().unwrap(),
+            [b"credited before EOF\n".to_vec()]
+        );
+        drop(sender);
+        let (joined, watchdog_fired) = receiver.join();
+        assert!(joined.is_ok(), "actual receiver task must join");
+        assert!(!watchdog_fired, "EOF must retire without stop or abort");
+        let retained = {
+            let source = super::FORWARDED_SOURCE.lock().unwrap();
+            let source = source.as_ref().unwrap();
+            (
+                source.transport_failure,
+                super::socket_identity(source.socket.as_raw_fd()).unwrap(),
+                source.order.pending.values().all(Vec::is_empty),
+                source.order.received.is_empty(),
+            )
+        };
+        assert_eq!(
+            retained,
+            (
+                Some(super::ForwardedSourceError::Closed),
+                identity,
+                true,
+                true
+            )
+        );
+        assert_eq!(
+            super::FORWARDED_GENERATION.load(Ordering::SeqCst),
+            generation
+        );
+        assert_eq!(
+            super::RECEIVER_GENERATION.load(Ordering::SeqCst),
+            generation
+        );
+        assert!(matches!(
+            marker_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        receiver
+            .runtime
+            .block_on(async { super::start_forwarded_receiver() });
+        assert!(matches!(
+            marker_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn forwarded_receiver_replacement_preserves_new_generation() {
+        let _guard = global_source_test();
+        let _cleanup = ForwardedReceiverSourceCleanup;
+        let ReceiverSource {
+            sender: old_sender,
+            written: old_written,
+            generation: old_generation,
+            ..
+        } = install_receiver_source();
+        let old_watched = receiver_watched_socket();
+        send_receiver_record(&old_sender, b"old queued packet\n");
+        let ReceiverSource {
+            sender,
+            written,
+            generation,
+            ..
+        } = install_receiver_source();
+        assert_ne!(old_generation, generation);
+        super::RECEIVER_GENERATION.store(generation, Ordering::SeqCst);
+        let (marker, mut marker_receiver) = tokio::sync::oneshot::channel();
+        *super::RECEIVER_STOP.lock().unwrap() = Some(marker);
+        send_receiver_record(&sender, b"fresh queued packet\n");
+        let mut stale = ForwardedReceiverTask::spawn(old_watched, old_generation);
+        let (joined, watchdog_fired) = stale.join();
+        assert!(joined.is_ok());
+        assert!(!watchdog_fired, "stale generation must return naturally");
+        let untouched = {
+            let source = super::FORWARDED_SOURCE.lock().unwrap();
+            let source = source.as_ref().unwrap();
+            source.order.received.is_empty() && source.order.pending.is_empty()
+        };
+        assert!(
+            untouched,
+            "stale task cannot consume the fresh source packet"
+        );
+        assert!(old_written.lock().unwrap().is_empty());
+        assert!(written.lock().unwrap().is_empty());
+        assert_eq!(
+            super::RECEIVER_GENERATION.load(Ordering::SeqCst),
+            generation
+        );
+        assert!(matches!(
+            marker_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let mut fresh = ForwardedReceiverTask::spawn(receiver_watched_socket(), generation);
+        assert!(wait_for_receiver_record());
+        let queued = {
+            let source = super::FORWARDED_SOURCE.lock().unwrap();
+            let source = source.as_ref().unwrap();
+            (source.transport_failure, source.order.pending[&41].clone())
+        };
+        assert_eq!(queued, (None, vec![b"fresh queued packet\n".to_vec()]));
+        assert!(!fresh.is_finished(), "healthy open peer must keep waiting");
+        fresh.request_stop();
+        let (joined, watchdog_fired) = fresh.join();
+        assert!(joined.is_ok());
+        assert!(!watchdog_fired, "explicit healthy-source stop must join");
+        assert!(written.lock().unwrap().is_empty());
+        assert_eq!(
+            super::RECEIVER_GENERATION.load(Ordering::SeqCst),
+            generation
+        );
+        drop(sender);
+        drop(old_sender);
+    }
+
+    #[test]
+    fn forwarded_receiver_retirement_preserves_uncredited_tail_refusal() {
+        use std::os::fd::AsRawFd;
+
+        use super::CoordinatorForwardingCutError as Error;
+        let _guard = global_source_test();
+        let _cleanup = ForwardedReceiverSourceCleanup;
+        let ReceiverSource {
+            sender,
+            written,
+            generation,
+            identity,
+        } = install_receiver_source();
+        super::RECEIVER_GENERATION.store(generation, Ordering::SeqCst);
+        let mut receiver = ForwardedReceiverTask::spawn(receiver_watched_socket(), generation);
+        send_receiver_record(&sender, b"uncredited tail\n");
+        drop(sender);
+        let (joined, watchdog_fired) = receiver.join();
+        assert!(joined.is_ok());
+        assert!(!watchdog_fired, "EOF must retire without stop or abort");
+        // Existing fixture models watch authority; pidfd death and transport
+        // are real. Task completion itself grants no final-drain acceptance.
+        let dead = model_completion(true);
+        let refusal = {
+            let mut source = super::FORWARDED_SOURCE.lock().unwrap();
+            super::inspect_native_final_source(
+                source.as_mut().unwrap(),
+                identity,
+                (dead.pid, dead.identity),
+                &dead,
+            )
+        };
+        assert_eq!(refusal, Err(Error::OtherOwnerPending(41)));
+        let retained = {
+            let source = super::FORWARDED_SOURCE.lock().unwrap();
+            let source = source.as_ref().unwrap();
+            (
+                source.transport_failure,
+                super::socket_identity(source.socket.as_raw_fd()).unwrap(),
+                source.order.received[&41].count,
+                source.order.pending[&41].clone(),
+            )
+        };
+        assert_eq!(
+            retained,
+            (
+                Some(super::ForwardedSourceError::Closed),
+                identity,
+                1,
+                vec![b"uncredited tail\n".to_vec()]
+            )
+        );
+        assert!(written.lock().unwrap().is_empty());
+        assert_eq!(
+            super::FORWARDED_GENERATION.load(Ordering::SeqCst),
+            generation
+        );
+    }
+}
+
+#[cfg(test)]
+mod root_lifecycle_record_tests {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn root_seed_parent_and_counted_shared_tail_are_real_production_routes() {
+        const TEST: &str = "detlog::root_lifecycle_record_tests::root_seed_parent_and_counted_shared_tail_are_real_production_routes";
+        const CHILD: &str = "HERMIT_ROOT_LIFECYCLE_RECORD_CHILD";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(TEST)) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, TEST)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
+        let output = Writer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(output.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        root_seed_records(3, 17, 29);
+        let expected = output.0.lock().unwrap().clone();
+        output.0.lock().unwrap().clear();
+        {
+            let span =
+                tracing::debug_span!(target: "reverie_ptrace::lifecycle", "tracee.attach", pid = 3);
+            let _entered = span.enter();
+            root_seed_records(3, 17, 29);
+        }
+        assert_eq!(*output.0.lock().unwrap(), expected);
+        let text = String::from_utf8(expected.clone()).unwrap();
+        assert!(!text.contains("tracee.attach"));
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("INFO detcore::tool_local: DETLOG USER RAND: seeding PRNG for root thread with seed 17 (root tid 3)"));
+        assert!(text.contains("INFO detcore::tool_local: DETLOG CHAOSRAND: seeding chaos scheduler with seed 29 (root tid 3)"));
+        assert_eq!(text.matches(RECORD_SEPARATOR).count(), 2);
+        // General detlog! still inherits its genuine ambient scope.
+        output.0.lock().unwrap().clear();
+        {
+            let span = tracing::debug_span!("ordinary_parent", real = 7);
+            let _entered = span.enter();
+            crate::detlog!("ordinary event");
+        }
+        assert!(
+            String::from_utf8(output.0.lock().unwrap().clone())
+                .unwrap()
+                .contains("ordinary_parent{real=7}")
+        );
+        output.0.lock().unwrap().clear();
+        {
+            let span = tracing::debug_span!("backend_setup", pid = 3);
+            let _entered = span.enter();
+            reverie::observe_tail_start(
+                reverie::Pid::from_raw(3),
+                reverie::syscalls::Sysno::exit_group,
+            );
+        }
+        let native_tail = output.0.lock().unwrap().clone();
+        assert!(
+            !String::from_utf8(native_tail.clone())
+                .unwrap()
+                .contains("backend_setup")
+        );
+        assert!(
+            String::from_utf8(native_tail.clone())
+                .unwrap()
+                .contains("INFO reverie::guest: [tool] (tid 3) admitted tail syscall: exit_group")
+        );
+        output.0.lock().unwrap().clear();
+
+        static SOCKET: AtomicI32 = AtomicI32::new(-1);
+        fn records(target: &str, suffix: &str, index: u64, message: fmt::Arguments<'_>) {
+            send_forwarded_record(
+                SOCKET.load(Ordering::Acquire),
+                target,
+                suffix,
+                index,
+                message,
+            );
+        }
+        fn plain(target: &str, index: u64, message: fmt::Arguments<'_>) {
+            send_plain_info_record(Some(SOCKET.load(Ordering::Acquire)), target, index, message);
+        }
+        let mut fds = [-1; 2];
+        // SAFETY: two valid output slots; success transfers fresh descriptors.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        // SAFETY: successful socketpair returned two independently owned FDs.
+        let sender = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let receiver = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        SOCKET.store(sender.as_raw_fd(), Ordering::Release);
+        assert_eq!(take_forwarded_since_request(), 0);
+        set_forwarder(records, ForwardPolicy::decode("1").unwrap()).unwrap();
+        set_plain_info_forwarder(plain).unwrap();
+        reverie::set_tail_start_forwarder(forward_tail_start).unwrap();
+        assert!(reverie::set_tail_start_forwarder(forward_tail_start).is_err());
+        {
+            let span = tracing::debug_span!("backend_setup", pid = 3);
+            let _entered = span.enter();
+            root_seed_records(3, 17, 29);
+            reverie::observe_tail_start(
+                reverie::Pid::from_raw(3),
+                reverie::syscalls::Sysno::exit_group,
+            );
+        }
+        let mut rendered = Vec::new();
+        for index in 1..=3 {
+            let mut bytes = [0_u8; 65536];
+            // SAFETY: owned datagram socket and a valid bounded output buffer.
+            let n = unsafe {
+                libc::recv(
+                    receiver.as_raw_fd(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            assert!(n > 0);
+            let (tid, got, payload) = split_forwarded_message(&bytes[..n as usize]).unwrap();
+            assert_eq!(tid, current_tid());
+            assert_eq!(got, index);
+            if index < 3 {
+                rendered.push(b' ');
+                rendered.extend_from_slice(payload);
+            } else {
+                let (target, message) = decode_plain_info(payload).unwrap();
+                assert_eq!(target, "reverie::guest");
+                let full = format!(" INFO {target}: {message}\n");
+                assert_eq!(full.as_bytes(), native_tail);
+            }
+        }
+        assert_eq!(rendered, expected);
+        assert_eq!(take_forwarded_since_request(), 3);
+        assert!(
+            output.0.lock().unwrap().is_empty(),
+            "forwarded branch must not duplicate tracing"
+        );
+        let mut byte = [0];
+        // SAFETY: same owned socket; verify no duplicate datagram remains.
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    receiver.as_raw_fd(),
+                    byte.as_mut_ptr().cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+        // The exact shared target participates in the ordinary target policy;
+        // allowing its closed wire class does not override launch admission.
+        let blocked = ForwardPolicy::decode("1,reverie::guest=0").unwrap();
+        assert!(!blocked.forwards("reverie::guest"));
+        assert!(blocked.forwards("detcore::tool_local"));
+        for target in ["reverie", "reverie::guest::extra", "reverie_ptrace::task"] {
+            assert!(
+                encode_plain_info(target, "not admitted").is_err(),
+                "{target}"
+            );
+        }
     }
 }

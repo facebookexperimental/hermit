@@ -20,6 +20,9 @@
 //! *canonical* (exit 0 -> the trampoline leak is closed) and *deterministic*
 //! (identical stdout across repeated runs).
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -130,9 +133,7 @@ fn run_under_hermit_strict() -> Output {
         ]);
     configure_execution_root(&mut command);
     command.arg("--").arg(guest);
-    command
-        .output()
-        .expect("failed to launch hermit run for rcx canonicalization guest")
+    hermit_test::hermit_output(&format!("{command:?}"), &mut command)
 }
 
 #[test]

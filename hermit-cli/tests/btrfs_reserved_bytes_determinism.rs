@@ -8,6 +8,9 @@
 
 //! End-to-end coverage for live Btrfs block reservations.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -76,9 +79,7 @@ fn assert_l2(case: &ProgramCase) {
         .args(&case.args);
 
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -117,9 +118,7 @@ fn read_reserved_bytes(path: &Path) -> Vec<u8> {
         .arg(program)
         .arg(path);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "Btrfs bytes_reserved read failed ({rendered})\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /* output-hygiene: readlink(/proc/self/exe) must resolve to the ORIGINAL guest
  * binary path, not the rewritten e9patch temp image. The absolute path is
  * tempdir-dependent, so the corpus asserts only golden==e9patch parity

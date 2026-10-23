@@ -1,10 +1,8 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
 
 use std::fs;
 use std::process::ExitCode;
@@ -20,22 +18,36 @@ use hermit_manifest_plan::validation_dag::repo_root;
 fn usage() -> &'static str {
     "Usage: generate-parity-cells [--check | --write]\n\
      Derive every cross-backend parity cell (each manifest test's verify mode on\n\
-     kvm, liteinst, sabre and dbt, against ptrace) from tests/e2e/manifests and\n\
-     tests/e2e/parity-selection.yaml, and compare it with, or write it to,\n\
-     ci/compat-envelope/parity-cells.json.\n\
+     kvm, liteinst, in-guest-trap, sabre and dbt, against ptrace) and the parity\n\
+     population (every test whose ptrace verify cell full validation selects,\n\
+     on every candidate backend) from tests/e2e/manifests, and compare it with, or write\n\
+     it to, ci/compat-envelope/parity-cells.json.\n\
      --check is the default. It refuses a stale snapshot and prints the counts."
 }
 
 fn summary(snapshot: &ParityCells) -> String {
     let all = &snapshot.counts.all;
     let mut text = format!(
-        "{} cells, {} applicable, {} selectable, {} selected ({} of them selectable)",
-        all.cells, all.applicable, all.selectable, all.selected, all.selected_selectable
+        "{} cells, {} applicable, {} selectable; population {} ({} candidate selected, {} \
+         candidate not selected, {} candidate disabled)",
+        all.cells,
+        all.applicable,
+        all.selectable,
+        all.population,
+        all.population_candidate_selected,
+        all.population_candidate_not_selected,
+        all.population_candidate_disabled
     );
     for (backend, count) in &snapshot.counts.by_backend {
         text.push_str(&format!(
-            "\n  {backend}: {} applicable, {} selectable, {} selected ({} selectable)",
-            count.applicable, count.selectable, count.selected, count.selected_selectable
+            "\n  {backend}: {} applicable, {} selectable; population {} ({} candidate selected, \
+             {} not selected, {} disabled)",
+            count.applicable,
+            count.selectable,
+            count.population,
+            count.population_candidate_selected,
+            count.population_candidate_not_selected,
+            count.population_candidate_disabled
         ));
     }
     text

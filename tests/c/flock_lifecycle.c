@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Backend-parity contract: flock(2) advisory-lock lifecycle on one descriptor.
 //
 // Exercises the flock(2) operation sequence on a single open file description

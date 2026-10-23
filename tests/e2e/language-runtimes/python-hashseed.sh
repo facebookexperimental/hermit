@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # CPython randomizes string/bytes hashing per interpreter start (PYTHONHASHSEED),
 # seeding _Py_HashSecret from the kernel CSPRNG (getrandom(2), /dev/urandom
 # fallback) at init. This is the canonical Python reproducibility pitfall: the

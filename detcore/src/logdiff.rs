@@ -50,11 +50,18 @@ pub const TRUNCATION_MARKER: &str = "=== HERMIT LOG TRUNCATED: reached the confi
      (HERMIT_LOG_MAX_BYTES). Output beyond this point was DISCARDED. The run itself continued and \
      was NOT affected. ===";
 
-/// Versioned policy token for the only prefix removed by `BitwiseInfoV1`.
-pub const STRIP_WALL_CLOCK_PREFIX_V1: &str = "real-wall-clock-prefix/v1";
+/// The last line hermit's `--max-log-bytes` cap writes before it ends the run
+/// with exit 123 (the class line of its stop message, without the newline).
+///
+/// A log that ends with this line stopped at the cap: whatever the run would
+/// have logged after it was never written, exactly as after
+/// [`TRUNCATION_MARKER`]. The cap's writer in `hermit-cli` composes the line
+/// itself; its unit test runs the real stop message through
+/// [`log_was_truncated`], which binds the two texts.
+pub const LOG_CAP_STOP_LINE: &str = "HERMIT_LOG_CAP class=log-cap";
 
-/// Versioned policy token for lossless host-address ordinalization.
-pub const CANON_ADDRESS_ORDINAL_V1: &str = "host-address-to-first-appearance-ordinal/v1";
+pub use detcore_model::logdiff_policy::CANON_ADDRESS_ORDINAL_V1;
+pub use detcore_model::logdiff_policy::STRIP_WALL_CLOCK_PREFIX_V1;
 
 /// Whether `log_text` is the output of a writer that hit its size bound.
 ///
@@ -79,14 +86,27 @@ pub const CANON_ADDRESS_ORDINAL_V1: &str = "host-address-to-first-appearance-ord
 ///
 /// A genuinely truncated log still satisfies both, so this narrows the
 /// predicate to the real condition without weakening it.
+///
+/// The same two anchors also accept [`LOG_CAP_STOP_LINE`]: a run stopped by
+/// `--max-log-bytes` loses its tail just as surely, and its log ends with that
+/// line when the stop message reached the file. A capped log whose stop message
+/// was NOT written (the cap writes it without waiting and omits it when the
+/// file cannot take it at once) ends abruptly and is not recognized here; the
+/// run's exit status 123 is then the only record of the cap.
 pub fn log_was_truncated(log_text: &str) -> bool {
     let trimmed = log_text.trim_end_matches(['\n', '\r']);
-    if !trimmed.ends_with(TRUNCATION_MARKER) {
+    ends_with_whole_line(trimmed, TRUNCATION_MARKER)
+        || ends_with_whole_line(trimmed, LOG_CAP_STOP_LINE)
+}
+
+/// Whether `text` ends with `line` and `line` starts at a line boundary.
+fn ends_with_whole_line(text: &str, line: &str) -> bool {
+    if !text.ends_with(line) {
         return false;
     }
     // `ends_with` matched, so this offset is on a character boundary.
-    let marker_start = trimmed.len() - TRUNCATION_MARKER.len();
-    marker_start == 0 || trimmed.as_bytes()[marker_start - 1] == b'\n'
+    let line_start = text.len() - line.len();
+    line_start == 0 || text.as_bytes()[line_start - 1] == b'\n'
 }
 
 /// Selects the set of log messages compared for determinism.
@@ -720,6 +740,18 @@ fn extract_log_messages(contents: &str) -> std::io::Result<Vec<LogMessage<'_>>> 
         .collect()
 }
 
+/// Each record of a Hermit log with its position, as the comparator counts
+/// positions ([`LogDiffSummary::first_divergent_record_positions`]): the
+/// record's human text and its structured DETLOG event, if any.
+pub fn log_record_events(
+    contents: &str,
+) -> std::io::Result<Vec<(usize, &str, Option<DetLogEvent>)>> {
+    Ok(extract_log_messages(contents)?
+        .into_iter()
+        .map(|message| (message.index, message.text, message.event))
+        .collect())
+}
+
 fn is_info(message: &LogMessage<'_>) -> bool {
     message.text.starts_with("INFO ")
 }
@@ -765,26 +797,18 @@ fn is_detlog(message: &LogMessage<'_>) -> bool {
 /// comparison consistent and focused on guest-observable events (the actual syscall
 /// results, still compared via their DETLOG entries).
 ///
-/// SaBRe's inherited stdio pipes emit an outer device-resource turn before the inner polling
-/// turn. The scheduler tags that outer turn with `[sabre-internal-pipe-io]`; it is the same
-/// host-timing-sensitive operation and is normalized here as well. A SaBRe task with a loopback
-/// peer similarly tags the strong yield before each zero-timeout poll with
-/// `[sabre-loopback-poll-zero-timeout]`. The scheduler additionally suppresses the per-retry
-/// "advance global time for scheduler turn" DETLOG line for these turns at the source (see
-/// `Scheduler::bump_global_time`), so the two mechanisms together make the deterministic
-/// comparison insensitive to host-timing-dependent polling-loop counts.
+/// Only these grants are excluded. SaBRe's outer device-resource turn for an inherited stdio
+/// pipe, and the strong yield a SaBRe task with a loopback peer takes before each zero-timeout
+/// poll, were once tagged `[sabre-internal-pipe-io]` and `[sabre-loopback-poll-zero-timeout]`
+/// and excluded too, which hid how many of them a run took. They are compared like any other
+/// turn now: a SaBRe run whose count of them depends on host timing shows it as a divergence.
 fn is_internal_io_poll_commit(message: &LogMessage<'_>) -> bool {
     match message.event {
         Some(DetLogEvent::SchedulerCommit {
             internal_io_poll, ..
         }) => internal_io_poll,
         Some(_) => false,
-        None => {
-            historical_is_commit(message.text)
-                && (message.text.contains("{InternalIOPolling: ")
-                    || message.text.contains(" [sabre-internal-pipe-io]")
-                    || message.text.contains(" [sabre-loopback-poll-zero-timeout]"))
-        }
+        None => historical_is_commit(message.text) && message.text.contains("{InternalIOPolling: "),
     }
 }
 
@@ -1548,6 +1572,10 @@ pub struct LogDiffSummary {
     /// the first N records" is a bound, not a location, and on a long run the
     /// two are far apart; this is the location.
     pub first_divergent_record: Option<usize>,
+    /// The position of that first different record in each log, as
+    /// [`log_record_events`] counts records, or `None` for a log that ended
+    /// before it. `None` when no difference was found.
+    pub first_divergent_record_positions: Option<(Option<usize>, Option<usize>)>,
     /// Number of leading COMPARED messages that are equal on both sides, in
     /// the same units as [`Self::compared_left`] and [`Self::compared_right`].
     ///
@@ -2024,6 +2052,35 @@ pub fn compare_complete_prefix_with_filter(
     })
 }
 
+/// Whether `line` is one `unobserved` recvmsg buffer-digest record, as Detcore's
+/// `detlog_io_buffers` writes it when a receive's buffers cannot be observed
+/// after the call. The whole record is matched from the level onwards, with
+/// its producer module and structured kind, so text elsewhere (a pathname in
+/// a syscall record, say) cannot be counted. Tracing span context
+/// (`name{fields}:` groups, present under `--verify-verbose` or a trace log
+/// level) may sit between the level and the module.
+pub fn is_unobserved_receive(line: &str) -> bool {
+    static RECORD: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"^\S+\s+INFO (?:[\w.]+(?:\{.*?\})?:)*\s?detcore::io_buffers: DETLOG \[iobuf\]\[dtid \d+\] recvmsg in fd=\S+ unobserved ret=\d+ reason=[a-z-]+(?: [a-z]+=\S+)? DETLOG_RECORD=\{"schema":1,"event":\{"kind":"other"\}\}$"#,
+        )
+        .unwrap()
+    });
+    RECORD.is_match(line)
+}
+
+/// The number of [`is_unobserved_receive`] records in the log at `path`.
+pub fn count_unobserved_receives(path: &Path) -> std::io::Result<usize> {
+    use std::io::BufRead;
+    let mut count = 0;
+    for line in std::io::BufReader::new(std::fs::File::open(path)?).split(b'\n') {
+        if is_unobserved_receive(&String::from_utf8_lossy(&line?)) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// Boolean-only wrapper retained for tests that only ask "did it differ?".
 /// Prefer [`log_diff_summary_from_strs`] where the counts matter.
 #[cfg(test)]
@@ -2079,7 +2136,7 @@ pub fn log_diff_summary_from_strs_with_filter(
             (false, false) => unreachable!("guarded by the condition above"),
         };
         let refusal_reason = format!(
-            "{which_side} truncated at the configured size bound (the log ends with the bounded writer's truncation marker). The discarded tail was never written, so no comparison of these files can establish that the runs agree past that point. Re-run with a larger HERMIT_LOG_MAX_BYTES, or 0 to disable the bound."
+            "{which_side} truncated at the configured size bound (the log ends with the bounded writer's truncation marker, or with the stop line of hermit's --max-log-bytes cap). The discarded tail was never written, so no comparison of these files can establish that the runs agree past that point. Re-run with a larger HERMIT_LOG_MAX_BYTES (or 0 to disable that bound), or a larger --max-log-bytes."
         );
         writeln!(
             w,
@@ -2092,6 +2149,7 @@ pub fn log_diff_summary_from_strs_with_filter(
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            first_divergent_record_positions: None,
             matched_prefix_messages: None,
             first_divergent_syscall: None,
             first_divergent_left_message: None,
@@ -2239,6 +2297,7 @@ pub fn log_diff_summary_from_strs_with_filter(
             .then_some(first_position_candidate)
             .flatten()
             .map(|(turn, _)| turn),
+        first_divergent_record_positions: diff_found.then_some(first_different).flatten(),
         first_divergent_virtual_nanoseconds: diff_found
             .then_some(first_position_candidate)
             .flatten()
@@ -3242,6 +3301,69 @@ mod test {
         Ok(())
     }
 
+    /// A log that ends with the `--max-log-bytes` stop line lost its tail like
+    /// a log that ends with the truncation marker, and is refused the same way
+    /// on the same matching content (round-2 review finding 5 on
+    /// <https://github.com/rrnewton/hermit/pull/3686>). The stop line must be a
+    /// whole line at end of file: guest-controlled text that merely contains
+    /// it, or a stop line followed by more log, is compared as usual.
+    #[test]
+    fn a_log_stopped_by_the_cap_is_refused_like_a_truncated_one() -> std::io::Result<()> {
+        let body = "2022-09-06T14:15:47.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: read(3, 0x1000, 1) = Ok(1)\n2022-09-06T14:15:48.000000Z INFO detcore: DETLOG [syscall] finish syscall #2: write(1, 0x2000, 1) = Ok(1)";
+        let stop = format!(
+            "hermit: log output exceeded --max-log-bytes=64K (65536 bytes); aborting the run and \
+             killing the guest process tree (exit 123). Lower --log / RUST_LOG verbosity, or raise \
+             --max-log-bytes, to let the run finish.\n{}\n",
+            super::LOG_CAP_STOP_LINE
+        );
+        let stopped = format!("{body}\n{stop}");
+        let marked_then_stopped = format!("{body}\n{}\n{stop}", super::TRUNCATION_MARKER);
+        let options = super::LogDiffOpts {
+            no_color: true,
+            ..Default::default()
+        };
+        for (label, left, right) in [
+            ("left", stopped.as_str(), body),
+            ("right", body, stopped.as_str()),
+            ("both", stopped.as_str(), stopped.as_str()),
+            ("marker then stop", marked_then_stopped.as_str(), body),
+        ] {
+            let mut out = Vec::new();
+            let summary = super::log_diff_summary_from_strs(left, right, &options, &mut out)?;
+            assert!(summary.diff_found, "{label}: {summary:?}");
+            assert_eq!((summary.compared_left, summary.compared_right), (0, 0));
+            assert!(
+                summary
+                    .refusal_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("truncated at the configured size bound")),
+                "{label}: {summary:?}"
+            );
+            assert!(!summary.matched_with_evidence(), "{label}");
+        }
+
+        let line = super::LOG_CAP_STOP_LINE;
+        for (label, text) in [
+            (
+                "stop line inside the final DETLOG line",
+                format!(
+                    "{body}\n2022-09-06T14:15:49.000000Z INFO detcore: DETLOG [syscall] inbound \
+                     syscall: statx(-100, 0x7fff -> \"/tmp/{line}\", AtFlags(0x0), 2, 0x7fff) = ?"
+                ),
+            ),
+            ("stop line followed by more log", format!("{line}\n{body}")),
+            (
+                "stop line at end of file but mid-line",
+                format!("{body}\nx {line}"),
+            ),
+        ] {
+            assert!(!super::log_was_truncated(&text), "{label}");
+        }
+        assert!(super::log_was_truncated(&stopped));
+        assert!(super::log_was_truncated(&marked_then_stopped));
+        Ok(())
+    }
+
     /// The refusal must fire on "this log was truncated", never on "this log
     /// mentions the marker".
     ///
@@ -3333,6 +3455,65 @@ mod test {
         );
 
         Ok(())
+    }
+
+    const UNOBSERVED: &str = r#"2026-10-07T08:56:08.497110Z  INFO detcore::io_buffers: DETLOG [iobuf][dtid 3] recvmsg in fd=4 unobserved ret=16 reason=iovec-short covered=1 DETLOG_RECORD={"schema":1,"event":{"kind":"other"}}"#;
+    const HASHED: &str = r#"2026-10-07T08:56:08.497000Z  INFO detcore::io_buffers: DETLOG [iobuf][dtid 3] write out fd=1 0x404070+3->4e7f92057ff4026cb921ad4502638b3392880999758f79640cb2043686104341 DETLOG_RECORD={"schema":1,"event":{"kind":"other"}}"#;
+
+    /// Only a whole `unobserved` record counts; a syscall record whose
+    /// pathname contains the same words does not.
+    #[test]
+    fn only_whole_unobserved_receive_records_are_counted() {
+        assert!(super::is_unobserved_receive(UNOBSERVED));
+        let forwarded = UNOBSERVED.replace(
+            "2026-10-07T08:56:08.497110Z  ",
+            "1970-01-01T00:00:00.000000Z ",
+        );
+        assert!(super::is_unobserved_receive(&forwarded));
+        let decoy = r#"2026-10-07T08:56:08.497110Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #3: openat(-100, "/tmp/DETLOG [iobuf][dtid 3] recvmsg in fd=4 unobserved ret=16 reason=x", 0) = Ok(3) DETLOG_RECORD={"schema":1,"event":{"kind":"other"}}"#;
+        assert!(!super::is_unobserved_receive(decoy));
+        assert!(!super::is_unobserved_receive(HASHED));
+        // With span context, as under --verify-verbose.
+        let spanned = UNOBSERVED.replace(
+            "  INFO detcore::io_buffers:",
+            "  INFO syscall.intercept{tid=3 syscall=recvmsg args=SyscallArgs { arg0: 4, arg5: 0 }}: detcore::io_buffers:",
+        );
+        assert!(super::is_unobserved_receive(&spanned));
+        let spanned_decoy = decoy.replace(
+            "  INFO detcore:",
+            "  INFO syscall.intercept{tid=3 syscall=openat}: detcore:",
+        );
+        assert!(!super::is_unobserved_receive(&spanned_decoy));
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("log");
+        std::fs::write(
+            &log,
+            format!("{HASHED}\n{UNOBSERVED}\n{decoy}\n{UNOBSERVED}\n"),
+        )
+        .unwrap();
+        assert_eq!(super::count_unobserved_receives(&log).unwrap(), 2);
+    }
+
+    /// Ordinary `--verify` (the Stripped comparator over the deterministic
+    /// records, with the default DETLOG kinds) compares `unobserved` records:
+    /// one present in only one run is a difference, and the same record in
+    /// both is not.
+    #[test]
+    fn ordinary_verify_compares_unobserved_receive_records() {
+        let opts = super::LogDiffOpts {
+            strip_lines: true,
+            canonicalize_addresses: false,
+            comparison: super::LogComparisonMode::Deterministic,
+            require_structured_events: true,
+            ..Default::default()
+        };
+        let compare = |a: &str, b: &str| {
+            let mut output = Vec::new();
+            super::log_diff_from_strs(a, b, &opts, &mut output).unwrap()
+        };
+        let both = format!("{HASHED}\n{UNOBSERVED}\n");
+        assert!(!compare(&both, &both));
+        assert!(compare(&format!("{HASHED}\n"), &both));
     }
 
     #[test]
@@ -3923,55 +4104,29 @@ mod test {
     }
 
     #[test]
-    fn test_filter_deterministic_drops_sabre_internal_pipe_resource_turn() {
+    /// A SaBRe turn once tagged `[sabre-internal-pipe-io]` is compared like any other turn:
+    /// the comparison no longer hides how many of them a run took.
+    fn test_filter_deterministic_keeps_sabre_internal_pipe_resource_turns() {
         let opts = super::LogDiffOpts::default();
-        let v = opts.filter_deterministic(&[
-            historical(
-                0,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 1s [sabre-internal-pipe-io]",
-            ),
-            historical(
-                1,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s",
-            ),
-        ]);
+        let tagged = "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 1s [sabre-internal-pipe-io]";
+        let untagged = "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s";
+        let v = opts.filter_deterministic(&[historical(0, tagged), historical(1, untagged)]);
 
-        assert_eq!(
-            indexed_text(&v),
-            vec![(
-                1,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s"
-            )]
-        );
+        assert_eq!(indexed_text(&v), vec![(0, tagged), (1, untagged)]);
     }
 
     #[test]
-    fn test_filter_deterministic_drops_sabre_loopback_poll_yield() {
+    /// A SaBRe turn once tagged `[sabre-loopback-poll-zero-timeout]` is compared like any other turn:
+    /// the comparison no longer hides how many of them a run took.
+    fn test_filter_deterministic_keeps_sabre_loopback_poll_yields() {
         let opts = super::LogDiffOpts::default();
-        let v = opts.filter_deterministic(&[
-            historical(
-                0,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {SchedYield: W}, on previously committed 1s [sabre-loopback-poll-zero-timeout]",
-            ),
-            historical(
-                1,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {SchedYield: W}, on previously committed 2s",
-            ),
-        ]);
+        let tagged = "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {SchedYield: W}, on previously committed 1s [sabre-loopback-poll-zero-timeout]";
+        let untagged = "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {SchedYield: W}, on previously committed 2s";
+        let v = opts.filter_deterministic(&[historical(0, tagged), historical(1, untagged)]);
 
-        assert_eq!(
-            indexed_text(&v),
-            vec![(
-                1,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {SchedYield: W}, on previously committed 2s"
-            )]
-        );
+        assert_eq!(indexed_text(&v), vec![(0, tagged), (1, untagged)]);
     }
 
-    /// Regression: two runs that differ only in how many nonblocking-IO poll retries occurred
-    /// must compare as deterministic, while a genuine guest-observable divergence must still be
-    /// reported. `run_b` below performs one extra poll retry (an extra InternalIOPolling COMMIT
-    /// plus its committed_time advance) but the guest syscalls are identical.
     #[test]
     fn test_log_diff_ignores_extra_io_poll_retries() -> std::io::Result<()> {
         let common_head = "2022-09-06T14:15:47.000000Z  INFO detcore: DETLOG [syscall][detcore, dtid 5] inbound syscall: poll(0x1000, 1, -1) = ?";

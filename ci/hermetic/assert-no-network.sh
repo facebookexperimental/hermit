@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Assert that the calling environment has NO network, or (with --expect-network)
 # that it HAS one. Both directions matter: a probe that only ever runs where the
 # answer is "no network" cannot distinguish a genuinely isolated environment

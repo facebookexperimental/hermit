@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Demos 5 and 6 stop what Hermit leaves running and keep the log cap after it exits.
 
 Demos 5 and 6 start Hermit, which runs QEMU, as the leader of a process group
@@ -43,6 +37,7 @@ Run directly (``python3 demos/tests/test_qemu_output_drain.py``) or via
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -75,12 +70,15 @@ import demo_common as dc  # noqa: E402
 # directory that the demo binds at FAKE_HERMIT_BIND_TARGET in the guest.
 #
 # The two processes that write start only once the fake Hermit has exited (their
-# parent PID changes when it does), so everything they write arrives after the
-# demo's wait for Hermit has ended, however slowly a busy machine runs the
-# fake Hermit.
-FAKE_HERMIT = r"""
+# parent PID changes when it does) and the demo's wait for it has returned (the
+# test then creates the file FAKE_HERMIT_WAIT_ENDED), so everything they write
+# arrives after the demo's wait for Hermit has ended, however slowly a busy
+# machine runs the fake Hermit or the demo. That wait checks the log once more
+# after Hermit exits, so output written before it returned could be found
+# past the cap there instead of in the drain these tests are about.
+FAKE_HERMIT = r'''
 import json, os, shutil, subprocess, sys, time
-AFTER_EXIT = "import os, sys, time\nwhile os.getppid() == int(sys.argv[1]):\n    time.sleep(0.01)\n"
+AFTER_EXIT = "import os, sys, time\nwhile os.getppid() == int(sys.argv[1]) or not os.path.exists(os.environ['FAKE_HERMIT_WAIT_ENDED']):\n    time.sleep(0.01)\n"
 DESCENDANTS = {
     # Keeps writing to the output it inherited, 1 KiB about every millisecond.
     "orphan-writer": [sys.executable, "-c", AFTER_EXIT + "try:\n    while True:\n        os.write(1, b'x' * 1024)\n        time.sleep(0.001)\nexcept BrokenPipeError:\n    pass\n", str(os.getpid())],
@@ -114,7 +112,7 @@ os.rename(pids + ".tmp", pids)
 while mode == "hung":
     os.write(1, b"y" * 1024)
     time.sleep(0.01)
-"""
+'''
 
 # What the late-output process writes.
 LATE_OUTPUT = b"late output\n" * 125
@@ -138,9 +136,7 @@ class ReachedTheNextStep(Exception):
 def _gone(pid: int) -> bool:
     """Whether ``pid`` has exited (a zombie awaiting its reaper counts)."""
     try:
-        state = (
-            Path("/proc/{}/stat".format(pid)).read_text().rsplit(")", 1)[1].split()[0]
-        )
+        state = Path("/proc/{}/stat".format(pid)).read_text().rsplit(")", 1)[1].split()[0]
     except (FileNotFoundError, ProcessLookupError, IndexError):
         return True
     return state in ("Z", "X")
@@ -213,20 +209,26 @@ class _OutputDrainScenarios:
         fake Hermit had started (it had recorded its PIDs) until then.
         """
         real_wait = self.namespace["wait_for_process"]
+        wait_ended = self.directory / "wait-ended"
 
         def wait_when_ready(process, timeout, **keywords):
             # Start the clock once the fake Hermit is up, so that a slow start
-            # on a busy machine does not count against QEMU_TIMEOUT.
+            # on a busy machine does not count against QEMU_TIMEOUT. Asked
+            # without reaping it: the demo's drain_output and
+            # stop_process_group need it unreaped.
             self.log_path = Path(keywords["log_path"])
             deadline = time.monotonic() + READY_TIMEOUT
             while (
                 not self.pids_file.is_file()
-                and process.poll() is None
+                and dc._exit_status_without_reaping(process) is None
                 and time.monotonic() < deadline
             ):
                 time.sleep(0.01)
             self.ready_at = time.monotonic()
-            return real_wait(process, timeout, **keywords)
+            status = real_wait(process, timeout, **keywords)
+            # Only now may the processes the fake Hermit left start writing.
+            wait_ended.touch()
+            return status
 
         replacements = self.replacements()
         replacements.update(
@@ -244,24 +246,21 @@ class _OutputDrainScenarios:
         environment = {
             "FAKE_HERMIT_MODE": mode,
             "FAKE_HERMIT_PIDS": str(self.pids_file),
+            "FAKE_HERMIT_WAIT_ENDED": str(wait_ended),
         }
         environment.update(self.fake_environment(mode))
         environment.update(extra_environment or {})
         function = self.namespace[self.function_name]
         printed = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", write_through=True)
-        with (
-            mock.patch.dict(function.__globals__, replacements),
-            mock.patch.dict(os.environ, environment),
-            contextlib.redirect_stdout(printed),
-        ):
+        with mock.patch.dict(function.__globals__, replacements), mock.patch.dict(
+            os.environ, environment
+        ), contextlib.redirect_stdout(printed):
             try:
                 outcome = self.call(function)
             except Exception as error:  # noqa: BLE001 - the outcome under test
                 outcome = error
         finished = time.monotonic()
-        self.assertIsNotNone(
-            self.ready_at, "the demo never waited for Hermit: {!r}".format(outcome)
-        )
+        self.assertIsNotNone(self.ready_at, "the demo never waited for Hermit: {!r}".format(outcome))
         self.assertTrue(self.pids_file.is_file(), "the fake Hermit never started")
         return outcome, finished - self.ready_at
 
@@ -306,8 +305,8 @@ class _OutputDrainScenarios:
         self._assert_stopped("descendant")
         self.assertEqual(
             str(outcome),
-            "Hermit's output was still open 1s after it exited, so the processes "
-            "still holding it were stopped",
+            "Hermit's output was still open 1s after it exited, so processes still "
+            "held it; the demo then signalled Hermit's process group",
         )
         self.assertIs(type(outcome), RuntimeError)
 
@@ -318,9 +317,7 @@ class _OutputDrainScenarios:
         self.assertLess(
             elapsed,
             10,
-            "the demo took {:.1f}s to report a 1s QEMU_TIMEOUT: {!r}".format(
-                elapsed, outcome
-            ),
+            "the demo took {:.1f}s to report a 1s QEMU_TIMEOUT: {!r}".format(elapsed, outcome),
         )
         self.assert_timeout_reported(outcome)
         self._assert_stopped("hermit")
@@ -366,6 +363,18 @@ class Demo5OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
     function_name = "boot_once"
 
     def replacements(self) -> dict:
+        # Demo 5 records the initramfs it boots before it starts Hermit: it
+        # boots copies of the kernel and initramfs, and records the version
+        # that qemu-assets.sh's build record names for the copy's SHA-256.
+        initramfs = b"stand-in for the initramfs"
+        (self.assets / "initramfs.cpio.gz").write_bytes(initramfs)
+        (self.assets / "bzImage").write_bytes(b"stand-in for the kernel")
+        (self.assets / ".initramfs-build").write_text(
+            "{} {}\n".format(
+                dc.current_initramfs_version(self.namespace["ROOT"]),
+                hashlib.sha256(initramfs).hexdigest(),
+            )
+        )
         return {
             "check_qemu_dependencies": lambda root: "QEMU dependency check replaced by the test",
             "check_dependencies": lambda root: "dependency check replaced by the test",
@@ -391,8 +400,10 @@ class Demo5OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
     def cap_message(self, cap: dc.LogCapExceeded) -> str:
         return (
             "{} grew to {} bytes, past the {}-byte log cap, after the launched "
-            "process exited with status 0; the processes still writing to it were "
-            "stopped".format(cap.log_path, cap.log_size, SMALL_CAP)
+            "process exited with status 0, while processes still wrote to it; the "
+            "demo then signalled the launched process's process group".format(
+                cap.log_path, cap.log_size, SMALL_CAP
+            )
         )
 
     def assert_timeout_reported(self, outcome) -> None:
@@ -440,7 +451,9 @@ class Demo5OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
 
 
 # The frame /init writes around a command that printed "done" and exited 0.
-FINISHED_FRAME = b"__HERMIT_COMMAND_BEGIN__ format=3\r\n| done\r\n__HERMIT_COMMAND_END__\x01status=0\r\n"
+FINISHED_FRAME = (
+    b"__HERMIT_COMMAND_BEGIN__ format=3\r\n| done\r\n__HERMIT_COMMAND_END__\x01status=0\r\n"
+)
 
 
 class Demo6OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
@@ -450,8 +463,16 @@ class Demo6OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
     function_name = "resume_once"
 
     def replacements(self) -> dict:
+        # The stand-in for demo 5's snapshot, with the record demo 5 writes for
+        # a snapshot of the current initramfs.
         boot_disk = self.assets / "hermit-boot.qcow2"
         boot_disk.write_bytes(b"stand-in for the demo 5 boot snapshot")
+        (self.assets / "initramfs.cpio.gz").write_bytes(b"stand-in for the initramfs")
+        dc.write_boot_snapshot_record(
+            boot_disk,
+            dc.hash_file(boot_disk),
+            dc.initramfs_producer(self.namespace["ROOT"], self.assets),
+        )
         return {
             "SNAPSHOT_DISK": self.assets / "hermit-snapshot.qcow2",
             "BOOT_SNAPSHOT_DISK": boot_disk,
@@ -487,7 +508,8 @@ class Demo6OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
             "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
             "(QEMU_MAX_LOG_BYTES), {:.1f}s into the resume, after Hermit had exited "
             "with status 0: processes it left running still wrote to its output, and "
-            "were stopped; the guest command had finished with exit status 0".format(
+            "the demo then signalled Hermit's process group; the guest command had "
+            "finished with exit status 0".format(
                 cap.log_path, cap.log_size, SMALL_CAP, cap.elapsed
             )
         )

@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # coreutils `mktemp -u` fills the XXXXXX template with a random suffix that
 # glibc's __gen_tempname draws from the kernel CSPRNG (getrandom(2), falling
 # back to /dev/urandom), so the emitted name varies natively run to run but is

@@ -1,12 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/*
  * Minimal statically linked glibc userspace program for the QEMU-under-Hermit
  * "run a real userspace program" test. Prints a deterministic marker plus its
  * (virtualized) pid and exits with a fixed nonzero status so the launcher init

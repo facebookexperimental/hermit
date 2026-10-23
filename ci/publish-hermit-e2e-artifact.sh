@@ -64,45 +64,53 @@ function require_runtime_closure {
         fail "runtime bundle contains files outside the exact unwind closure: $runtime"
 }
 
-# The SaBRe plugin is loaded by each guest's own dynamic loader, against the
-# libc that guest already has (https://github.com/rrnewton/hermit/issues/3652).
-# It may need only libraries every glibc provides, may name no build-root
-# directory to find them in, and may require no glibc symbol version newer than
-# the oldest supported host's: glibc 2.34, measured on the host recorded for
-# SABRE_PLUGIN_GLIBC_MINOR_FLOOR in docs/TESTING_ENVIRONMENTS.md under "Named
-# measurement hosts". detcore-sabre/build.rs and
-# detcore-sabre/src/glibc_compat.rs build it that way.
-SABRE_PLUGIN_GLIBC_MINOR_FLOOR=34
+# The SaBRe plugin (https://github.com/rrnewton/hermit/issues/3652) and the
+# in-guest LiteInst runtime (https://github.com/rrnewton/hermit/issues/3967) are
+# guest preloads: each guest's own dynamic loader loads them, against the libc
+# that guest already has. The bundle also ships Reverie's plain LiteInst preload
+# (https://github.com/rrnewton/reverie/issues/980), which no Hermit run path has
+# preloaded since 2d8bada7e9 (2026-10-04); Reverie's own strace tool and tests
+# preload it, and it is checked the same way so that every shipped preload keeps
+# the contract. Each may need only libraries every glibc provides, may name no
+# build-root directory to find them in, and may require no glibc symbol version
+# newer than the oldest supported host's: glibc 2.34, measured on the host
+# recorded for GUEST_PRELOAD_GLIBC_MINOR_FLOOR in docs/TESTING_ENVIRONMENTS.md
+# under "Named measurement hosts". detcore-sabre/build.rs,
+# detcore-liteinst/build.rs, detcore-sabre/src/glibc_compat.rs and Reverie's
+# reverie-liteinst/build.rs build them that way. ci/test_guest_preload_gate.py
+# runs this gate on real ELF files and checks that both scripts apply it to all
+# three.
+GUEST_PRELOAD_GLIBC_MINOR_FLOOR=34
 
-function require_portable_sabre_plugin {
-    local plugin=$1 magic dynamic library versions version
+function require_portable_guest_preload {
+    local label=$1 preload=$2 magic dynamic library versions version
     # Like the Hermit binary above, the publication fixtures use scripts in
     # place of ELF files; a script carries no loader contract to check.
-    magic=$(od -An -t x1 -N4 "$plugin" | tr -d ' \n') ||
-        fail "cannot inspect SaBRe plugin file type: $plugin"
+    magic=$(od -An -t x1 -N4 "$preload" | tr -d ' \n') ||
+        fail "cannot inspect $label file type: $preload"
     [[ $magic == 7f454c46 ]] || return 0
-    dynamic=$(readelf -d "$plugin") || fail "cannot read SaBRe plugin dynamic section: $plugin"
+    dynamic=$(readelf -d "$preload") || fail "cannot read $label dynamic section: $preload"
     if grep -Eq '\((RPATH|RUNPATH)\)' <<<"$dynamic"; then
-        fail "SaBRe plugin records a library search path, so a guest would load the build root's libraries: $plugin"
+        fail "$label records a library search path, so a guest would load the build root's libraries: $preload"
     fi
     while IFS= read -r library; do
         case $library in
             ld-linux-x86-64.so.2 | libc.so.6 | libm.so.6 | libdl.so.2 | libpthread.so.0 | librt.so.1 | libutil.so.1) ;;
-            *) fail "SaBRe plugin needs $library, which not every guest's glibc provides: $plugin" ;;
+            *) fail "$label needs $library, which not every guest's glibc provides: $preload" ;;
         esac
     done < <(sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p' <<<"$dynamic")
-    versions=$(readelf -V --wide "$plugin") || fail "cannot read SaBRe plugin symbol versions: $plugin"
+    versions=$(readelf -V --wide "$preload") || fail "cannot read $label symbol versions: $preload"
     while IFS= read -r version; do
         [[ $version =~ ^GLIBC_2\.([0-9]+)(\.[0-9]+)?$ ]] &&
-            ((BASH_REMATCH[1] <= SABRE_PLUGIN_GLIBC_MINOR_FLOOR)) ||
-            fail "SaBRe plugin requires symbol version $version; only glibc's up to GLIBC_2.$SABRE_PLUGIN_GLIBC_MINOR_FLOOR load in every guest: $plugin"
+            ((BASH_REMATCH[1] <= GUEST_PRELOAD_GLIBC_MINOR_FLOOR)) ||
+            fail "$label requires symbol version $version; only glibc's up to GLIBC_2.$GUEST_PRELOAD_GLIBC_MINOR_FLOOR load in every guest: $preload"
     done < <(sed -n 's/.*Name: \([^ ]*\) *Flags:.*/\1/p' <<<"$versions")
 }
 
 function require_complete_resources {
     local install=$1 require_runtime=$2 path
     [[ -d $install/rsrcs ]] || fail "resource bundle has no rsrcs directory: $install"
-    for path in libdetcore_dbt.so libdetcore_sabre.so libreverie_dbt_client.so libreverie_liteinst.so; do
+    for path in libdetcore_dbt.so libdetcore_sabre.so libdetcore_liteinst.so libreverie_dbt_client.so libreverie_liteinst.so; do
         [[ -f $install/rsrcs/$path && -s $install/rsrcs/$path ]] ||
             fail "resource bundle is missing or empty: $install/rsrcs/$path"
     done
@@ -110,7 +118,10 @@ function require_complete_resources {
         [[ -f $install/rsrcs/$path && -s $install/rsrcs/$path && -x $install/rsrcs/$path ]] ||
             fail "resource bundle executable is missing, empty, or non-executable: $install/rsrcs/$path"
     done
-    require_portable_sabre_plugin "$install/rsrcs/libdetcore_sabre.so"
+    require_portable_guest_preload "SaBRe plugin" "$install/rsrcs/libdetcore_sabre.so"
+    require_portable_guest_preload "In-guest LiteInst runtime" "$install/rsrcs/libdetcore_liteinst.so"
+    require_portable_guest_preload "LiteInst preload" "$install/rsrcs/libreverie_liteinst.so"
+    "$ROOT_DIR/ci/verify-packaged-detcore.py" "$install" || fail "ordinary Detcore packaging qualification is missing or stale"
     if [[ $require_runtime == true ]]; then
         require_runtime_closure "$install/rsrcs/hermit-runtime"
     elif [[ -e $install/rsrcs/hermit-runtime ]]; then

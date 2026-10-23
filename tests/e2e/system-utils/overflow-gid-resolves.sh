@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Defends the frozen /etc/group control in hermit-cli/src/bin/hermit/container.rs.
 #
 # WHAT THE CONTROL DOES. `frozen_group_file()` reads the host /etc/group and, if

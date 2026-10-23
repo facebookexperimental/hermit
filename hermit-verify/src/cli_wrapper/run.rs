@@ -6,20 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-
-/// Resolve a guest program the way `execvp(3)` does, against this process's
-/// working directory: a name without a path separator stays a guest PATH
-/// lookup, while any other relative path becomes absolute, because the
-/// container replaces the working directory it would otherwise resolve against.
-fn absolutize_guest_program(guest_program: &Path, current_dir: &Path) -> PathBuf {
-    if guest_program.is_absolute() || guest_program.parent() == Some(Path::new("")) {
-        guest_program.to_owned()
-    } else {
-        current_dir.join(guest_program)
-    }
-}
 
 #[derive(Default)]
 pub struct HermitRunBuilder {
@@ -220,14 +208,19 @@ impl HermitRunBuilder {
 
         command_args.push(String::from("--"));
 
-        command_args.push(
-            match std::env::current_dir() {
-                Ok(current_dir) => absolutize_guest_program(&guest_program, &current_dir),
-                Err(_) => guest_program,
-            }
-            .display()
-            .to_string(),
-        );
+        // The verifier changes the guest's cwd for each run. Resolve paths
+        // containing a slash against the caller first, including a trailing
+        // slash; bare names must remain guest PATH lookups, as with execvp.
+        let guest_program = if guest_program.is_relative()
+            && guest_program.as_os_str().as_bytes().contains(&b'/')
+        {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&guest_program))
+                .unwrap_or(guest_program)
+        } else {
+            guest_program
+        };
+        command_args.push(guest_program.display().to_string());
 
         for guest_arg in guest_args.into_iter() {
             command_args.push(guest_arg);
@@ -239,6 +232,72 @@ impl HermitRunBuilder {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn guest_program_keeps_path_lookup_and_slash_semantics() {
+        let caller = std::env::current_dir().unwrap();
+        for (program, expected) in [
+            ("guest", "guest".to_owned()),
+            ("guest/", format!("{}/guest/", caller.display())),
+            ("./guest", format!("{}/./guest", caller.display())),
+            ("sub/guest", format!("{}/sub/guest", caller.display())),
+            ("/bin/guest", "/bin/guest".to_owned()),
+            ("/bin/guest/", "/bin/guest/".to_owned()),
+        ] {
+            let args = HermitRunBuilder::new(PathBuf::from(program), vec![])
+                .workdir_isolate(PathBuf::from("/different/workdir"), true)
+                .into_args();
+            let guest = args.iter().position(|arg| arg == "--").unwrap() + 1;
+            assert_eq!(&args[guest], &expected, "program: {program}");
+        }
+    }
+
+    #[test]
+    fn relative_guest_runs_after_builder_changes_workdir() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let caller = std::env::current_dir().unwrap();
+        let fixture = tempfile::Builder::new()
+            .prefix("guest-path-")
+            .tempdir_in(&caller)
+            .unwrap();
+        let script = fixture.path().join("guest");
+        fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let workdir = fixture.path().join("run-workdir");
+        fs::create_dir(&workdir).unwrap();
+        let relative = script.strip_prefix(&caller).unwrap();
+
+        for program in [
+            relative.to_path_buf(),
+            PathBuf::from(".").join(relative),
+            script.clone(),
+            PathBuf::from("guest"),
+        ] {
+            let args = HermitRunBuilder::new(program.clone(), vec!["guest argument".to_owned()])
+                .workdir_isolate(workdir.clone(), false)
+                .into_args();
+            let guest = args.iter().position(|arg| arg == "--").unwrap() + 1;
+            let cwd = args
+                .iter()
+                .find_map(|arg| arg.strip_prefix("--workdir="))
+                .unwrap();
+            assert_eq!(PathBuf::from(cwd), workdir);
+            // Execute only the builder's guest command, natively, with the
+            // same cwd change. This needs no Hermit binary or host PMU.
+            let output = Command::new(&args[guest])
+                .args(&args[guest + 1..])
+                .current_dir(cwd)
+                .env("PATH", fixture.path())
+                .output()
+                .unwrap_or_else(|error| panic!("could not launch {program:?}: {error}"));
+            assert!(output.status.success(), "{program:?}: {output:?}");
+            assert_eq!(output.stdout, b"guest argument\n");
+            assert!(output.stderr.is_empty(), "{program:?}: {output:?}");
+        }
+    }
+
     #[test]
     fn temp_root_bind_follows_tmp_overlay_without_changing_workdir_mount() {
         for (root, needs_bind) in [
@@ -283,25 +342,6 @@ mod test {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn relative_guest_path_is_absolutized_while_bare_name_stays_a_path_lookup() {
-        let current_dir = Path::new("/re/workdir");
-        for (guest_program, expected) in [
-            ("hexdump", "hexdump"),
-            ("/bin/true", "/bin/true"),
-            (
-                "fbcode/hermetic_infra/hermit/tests/shell/devrand.sh",
-                "/re/workdir/fbcode/hermetic_infra/hermit/tests/shell/devrand.sh",
-            ),
-            ("./devrand.sh", "/re/workdir/./devrand.sh"),
-        ] {
-            assert_eq!(
-                absolutize_guest_program(Path::new(guest_program), current_dir),
-                PathBuf::from(expected)
-            );
-        }
     }
 
     #[test]

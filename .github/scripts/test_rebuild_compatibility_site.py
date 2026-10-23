@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Contract tests for the hosted adapter; no GitHub write or website build."""
 
 import contextlib
@@ -16,6 +10,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,13 +40,65 @@ class HostedAdapterTests(unittest.TestCase):
             ("hermit_commit", "abc"),
             ("parent_repository", "foreign/source"),
             ("extra", True),
-            ("schema", 2),
+            ("schema", 1),
+            ("schema", 3),
+            ("retention", None),
         ):
             wrong = dict(self.config)
             wrong[key] = value
             path.write_text(json.dumps(wrong))
-            with self.subTest(key=key), self.assertRaises(ValueError):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 ADAPTER.configuration(path)
+        missing = dict(self.config)
+        del missing["retention"]
+        path.write_text(json.dumps(missing))
+        with self.subTest(key="retention", value="missing"), self.assertRaises(
+            ValueError
+        ):
+            ADAPTER.configuration(path)
+        for key, value in (
+            ("budget_bytes", 0),
+            ("budget_bytes", "1000000000"),
+            ("max_builds", True),
+            ("max_builds", -1),
+            ("not_before", "2026-10-04"),
+            ("not_before", "2030-02-30T00:00:00Z"),
+            ("rule", ""),
+            ("rule", "Keep the newest 5 builds."),
+            ("extra", 1),
+        ):
+            wrong = copy.deepcopy(self.config)
+            wrong["retention"][key] = value
+            path.write_text(json.dumps(wrong))
+            with self.subTest(retention=key, value=value), self.assertRaisesRegex(
+                ValueError, "refused by the publisher: compatibility website refused: "
+            ):
+                ADAPTER.configuration(path)
+
+    def test_config_retention_is_decided_by_the_publisher(self):
+        # The adapter asks the publisher's own check, so a rule the publisher
+        # does not apply, an impossible date, or a duplicated key is refused
+        # before a rebuild, with the publisher's reason.
+        path = self.root / "config.json"
+        retention = json.dumps(self.config["retention"])
+        body = json.dumps(self.config)
+        duplicated = body[:-1] + ', "retention": ' + retention + "}"
+        self.assertEqual(json.loads(duplicated), self.config)
+        path.write_text(duplicated)
+        with self.assertRaisesRegex(ValueError, "duplicate object key 'retention'"):
+            ADAPTER.configuration(path)
+        wrong = copy.deepcopy(self.config)
+        wrong["retention"]["rule"] = "Keep the newest 5 builds."
+        path.write_text(json.dumps(wrong))
+        with self.assertRaisesRegex(
+            ValueError, "not the rule this publisher applies"
+        ):
+            ADAPTER.configuration(path)
+        wrong = copy.deepcopy(self.config)
+        wrong["retention"]["not_before"] = "2030-02-30T00:00:00Z"
+        path.write_text(json.dumps(wrong))
+        with self.assertRaisesRegex(ValueError, "not a valid UTC timestamp"):
+            ADAPTER.configuration(path)
 
     def source_git(self, root, *args):
         if args == ("rev-parse", "HEAD^{commit}"):
@@ -212,7 +259,8 @@ class HostedAdapterTests(unittest.TestCase):
         args = request.call_args.args
         self.assertEqual(args[:3], ("release", "create", pin["tag"]))
         self.assertIn("--latest=false", args)
-        self.assertEqual(args[args.index("--target") + 1], self.config["hermit_commit"])
+        self.assertEqual(args[args.index("--target") + 1], "main")
+        self.assertIn(self.config["hermit_commit"], args[args.index("--notes") + 1])
         for forbidden in ("--draft", "--prerelease", "--clobber"):
             self.assertNotIn(forbidden, args)
         with (
@@ -236,6 +284,135 @@ class HostedAdapterTests(unittest.TestCase):
                 pin, archive, registry, "a" * 40, self.config["hermit_commit"]
             )
         request.assert_not_called()
+
+    def _release_fixture(self):
+        archive, registry = self.root / self.pin["asset"], self.root / "registry.json"
+        archive.write_bytes(b"archive")
+        registry.write_bytes(b"registry")
+        pin = {
+            **self.pin,
+            "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "archive_bytes": archive.stat().st_size,
+        }
+
+        def asset(path, ident, state="uploaded"):
+            return {
+                "name": path.name,
+                "size": path.stat().st_size,
+                "state": state,
+                "id": ident,
+                "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+
+        def release(*assets):
+            return {
+                "tag_name": pin["tag"],
+                "name": pin["release_title"],
+                "draft": False,
+                "prerelease": False,
+                "assets": list(assets),
+            }
+
+        return pin, archive, registry, asset, release
+
+    def test_release_upload_timeout_grows_with_the_asset(self):
+        self.assertEqual(ADAPTER.upload_timeout(0), 300)
+        # The archive the self-hosted run lost to the 120 s bound was hundreds
+        # of MB; 590 MB gets 300 s plus 2,950 s.
+        self.assertEqual(ADAPTER.upload_timeout(590_000_000), 3250)
+
+    def test_timed_out_create_then_assets_upload_separately_with_sized_timeouts(self):
+        pin, archive, registry, asset, release = self._release_fixture()
+        lookups = [
+            None,
+            release(),
+            release(asset(archive, 20)),
+            release(asset(archive, 20), asset(registry, 21)),
+        ]
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if argv[1:3] == ["release", "create"]:
+                raise subprocess.TimeoutExpired(argv, 120)
+            return b""
+
+        with (
+            patch.object(ADAPTER, "release_by_tag", side_effect=lookups),
+            patch.object(ADAPTER, "run", side_effect=run),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(
+                ADAPTER.publish_release(
+                    pin, archive, registry, "a" * 40, self.config["hermit_commit"]
+                ),
+                21,
+            )
+        create, upload_archive, upload_registry = (argv for argv, _ in calls)
+        self.assertEqual(create[1:4], ["release", "create", pin["tag"]])
+        self.assertNotIn(archive, create)
+        self.assertNotIn(registry, create)
+        self.assertEqual(upload_archive[1:4], ["release", "upload", pin["tag"]])
+        self.assertIn(archive, upload_archive)
+        self.assertIn(registry, upload_registry)
+        for argv in (upload_archive, upload_registry):
+            self.assertNotIn("--clobber", argv)
+        self.assertEqual(
+            calls[1][1]["timeout"], ADAPTER.upload_timeout(archive.stat().st_size)
+        )
+
+    def test_only_an_interrupted_asset_is_replaced(self):
+        pin, archive, registry, asset, release = self._release_fixture()
+        lookups = [
+            release(asset(archive, 20, state="open"), asset(registry, 21)),
+            release(asset(archive, 22), asset(registry, 21)),
+        ]
+        with (
+            patch.object(ADAPTER, "release_by_tag", side_effect=lookups),
+            patch.object(ADAPTER, "run", return_value=b"") as request,
+        ):
+            self.assertEqual(
+                ADAPTER.publish_release(
+                    pin, archive, registry, "a" * 40, self.config["hermit_commit"]
+                ),
+                21,
+            )
+        (argv,), _ = request.call_args
+        self.assertIn("--clobber", argv)
+        self.assertIn(archive, argv)
+        self.assertEqual(request.call_count, 1)
+
+    def test_upload_that_never_lands_is_refused_after_bounded_attempts(self):
+        pin, archive, registry, asset, release = self._release_fixture()
+        with (
+            patch.object(ADAPTER, "release_by_tag", return_value=release()),
+            patch.object(
+                ADAPTER, "run", side_effect=subprocess.TimeoutExpired(["gh"], 1)
+            ) as request,
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaisesRegex(ValueError, "did not upload"),
+        ):
+            ADAPTER.publish_release(
+                pin, archive, registry, "a" * 40, self.config["hermit_commit"]
+            )
+        self.assertEqual(request.call_count, ADAPTER.UPLOAD_ATTEMPTS)
+
+    def test_failed_create_with_no_release_is_refused(self):
+        pin, archive, registry, asset, release = self._release_fixture()
+        with (
+            patch.object(ADAPTER, "release_by_tag", return_value=None),
+            patch.object(
+                ADAPTER,
+                "run",
+                side_effect=subprocess.CalledProcessError(1, ["gh"]),
+            ) as request,
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaisesRegex(ValueError, "release creation failed"),
+        ):
+            ADAPTER.publish_release(
+                pin, archive, registry, "a" * 40, self.config["hermit_commit"]
+            )
+        self.assertEqual(request.call_count, 1)
 
     def test_runtime_fetch_is_captured_once_and_builder_failure_cannot_reuse_old_archive(
         self,
@@ -294,23 +471,96 @@ class HostedAdapterTests(unittest.TestCase):
                 ledger_commit=captured,
                 validation_history_commit=history,
             )
+        ledger = self.root / "hermit_test_ledger"
         self.assertEqual(
             calls,
             [
                 [
                     "git",
                     "-C",
-                    self.root / "hermit_test_ledger",
+                    ledger,
                     "fetch",
                     "--no-tags",
                     "--no-recurse-submodules",
+                    "--depth",
+                    "1",
                     "origin",
                     captured,
-                ]
+                ],
+                # The parity summary is read at the captured commit; with no
+                # readable summary there is nothing to deepen toward.
+                ["git", "--no-replace-objects", "-C", ledger, "show",
+                 f"{captured}:scorecard/parity.json"],
+                # The fetched commit is kept for the next run's cached fetch.
+                ["git", "-C", ledger, "update-ref", "refs/cache/published", captured],
             ],
         )
         publish.assert_not_called()
         self.assertFalse((self.root / "receipt.json").exists())
+
+    def test_ledger_fetch_is_shallow_and_deepens_only_to_the_parity_summary(self):
+        # https://github.com/rrnewton/hermit/actions/runs/38167459473: the
+        # full-history ledger clone ran past its step timeout. The builder
+        # reads one commit plus the parity summary's ancestry, so the fetch
+        # takes depth 1 and deepens only until that commit is an ancestor.
+        env = {**os.environ, "GIT_CONFIG_COUNT": "1",
+               "GIT_CONFIG_KEY_0": "protocol.file.allow", "GIT_CONFIG_VALUE_0": "always",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+
+        def sh(cwd, *args):
+            return subprocess.run(["git", *args], cwd=cwd, env=env, check=True,
+                                  stdout=subprocess.PIPE).stdout.decode().strip()
+
+        origin = self.root / "origin"
+        origin.mkdir()
+        sh(origin, "init", "-q", "-b", "main")
+        commits = []
+        for index in range(120):
+            (origin / "series.jsonl").write_text(f"{index}\n" * (index + 1))
+            sh(origin, "add", "series.jsonl")
+            sh(origin, "commit", "-q", "-m", f"append {index}")
+            commits.append(sh(origin, "rev-parse", "HEAD"))
+        summarized = commits[-70]  # 69 commits before the head
+        (origin / "scorecard").mkdir()
+        (origin / "scorecard/parity.json").write_text(
+            json.dumps({"generated_from": {"series_commit": summarized}}))
+        sh(origin, "add", "scorecard/parity.json")
+        sh(origin, "commit", "-q", "-m", "generate scorecard")
+        head = sh(origin, "rev-parse", "HEAD")
+
+        ledger = self.root / "ledger"
+        sh(self.root, "clone", "-q", "--depth", "1", f"file://{origin}", str(ledger))
+        with patch.dict(os.environ, env):
+            depth = ADAPTER.fetch_ledger(ledger, head)
+        self.assertEqual(depth, 101)  # 1, then 51 (summary 70 back), then 101
+        self.assertEqual(sh(ledger, "rev-parse", "--is-shallow-repository"), "true")
+        # The workflow caches the ledger; the next run's fetch offers this commit.
+        self.assertEqual(sh(ledger, "rev-parse", "refs/cache/published"), head)
+        sh(ledger, "merge-base", "--is-ancestor", summarized, head)
+        self.assertLess(int(sh(ledger, "rev-list", "--count", head)), len(commits) + 1)
+
+        # A summary of the head itself needs no history at all.
+        (origin / "scorecard/parity.json").write_text(
+            json.dumps({"generated_from": {"series_commit": None}}))
+        sh(origin, "commit", "-q", "-am", "scorecard of the head")
+        newest = sh(origin, "rev-parse", "HEAD")
+        with patch.dict(os.environ, env):
+            self.assertEqual(ADAPTER.fetch_ledger(ledger, newest), 1)
+
+        # After a squash (https://github.com/rrnewton/dev-hermit/issues/562)
+        # main is a new root, and a summary written before it names a commit
+        # no deeper fetch reaches: the fetch stops once it has the whole
+        # history instead of deepening to the limit.
+        snapshot = sh(origin, "commit-tree", newest + "^{tree}", "-m", "ledger snapshot")
+        sh(origin, "checkout", "-q", "--detach", snapshot)
+        (origin / "scorecard/parity.json").write_text(
+            json.dumps({"generated_from": {"series_commit": summarized}}))
+        sh(origin, "commit", "-q", "-am", "scorecard after the squash")
+        squashed = sh(origin, "rev-parse", "HEAD")
+        sh(origin, "update-ref", "refs/heads/main", squashed)
+        with patch.dict(os.environ, env):
+            self.assertEqual(ADAPTER.fetch_ledger(ledger, squashed), 51)
 
     def test_ledger_capture_is_exact_and_invocation_failures_refuse(self):
         captured = "a" * 40
@@ -440,7 +690,22 @@ class HostedAdapterTests(unittest.TestCase):
 
         with patch.object(ADAPTER.urllib.request, "urlopen", side_effect=read):
             self.assertTrue(ADAPTER.verify_public(receipt)["deployed"])
-        self.assertEqual(len(calls), 9)
+        # build.json records the digest of every other published file, so
+        # these six identify which build Pages serves.
+        self.assertEqual(
+            calls,
+            [
+                ADAPTER.PUBLIC + name
+                for name in (
+                    "build.json",
+                    "index.html",
+                    "assets/site.css",
+                    "assets/site.js",
+                    "data/site-manifest.json.gz",
+                    "data/site-summary.json.gz",
+                )
+            ],
+        )
         self.assertTrue(all("?" not in url for url in calls))
         receipt.write_text(json.dumps({"website": str(tree), "deployed": False}))
         with (

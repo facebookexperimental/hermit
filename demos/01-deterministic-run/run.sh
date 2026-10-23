@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 #
 # Demo 1: deterministic run.
 #
@@ -44,9 +38,10 @@ cmp "$DEMO_TMP/urandom-hermit-1.txt" "$DEMO_TMP/urandom-hermit-2.txt"
 demo_banner "Virtual wall-clock time is stable across runs"
 # The virtual clock starts at an epoch and then advances with the guest's own
 # progress, not with real time. By default `hermit run` takes the epoch from
-# one reading of the host clock and prints it on stderr ("hermit: virtual-time
-# epoch=... reproduce with --epoch=..."), so two default runs start from
-# different instants. Pinning the epoch makes the clock readings identical.
+# one reading of the host clock and warns on stderr that it did ("WARN
+# hermit::controller: this run drew its epoch from the host; ... rerun it with:
+# hermit replay ..."), so two default runs start from different instants.
+# Pinning the epoch makes the clock readings identical.
 DEMO_EPOCH=2026-01-01T00:00:00Z
 echo "-- both runs use --epoch=$DEMO_EPOCH --"
 for attempt in 1 2; do

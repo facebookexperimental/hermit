@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Bracket `run_hermit_verify`'s verdict reading from BOTH sides.
 #
 # The bug this guards against is not "verification fails"; it is verification

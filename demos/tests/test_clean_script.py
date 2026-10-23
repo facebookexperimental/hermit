@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Tests that demos/clean.sh removes only files under the QEMU asset directory.
 
 clean.sh removes the temporary files an interrupted QEMU demo run can leave in
@@ -37,9 +31,12 @@ DEMO_DIR = Path(__file__).resolve().parent.parent
 TRANSIENT_FILES = (
     "run-metadata.json.tmp.456",
     "hermit-boot.qcow2.tmp.789",
+    "hermit-boot.qcow2.producer.json.tmp.321",
+    "hermit-snapshot.qcow2.producer.json.tmp.654",
     ".bzImage.123",
     ".initramfs.cpio.gz.1",
     ".initramfs-version.2",
+    ".initramfs-build.5",
     ".vmlinux.3",
     ".vmlinux-types.4",
 )
@@ -50,6 +47,7 @@ KEPT_ASSET_FILES = (
     "bzImage",
     "initramfs.cpio.gz",
     ".initramfs-version",
+    ".initramfs-build",
     "vmlinux",
     "notes.txt",
 )
@@ -91,9 +89,7 @@ class CleanTransientGlobTest(unittest.TestCase):
         (self.root / "demos/lib").mkdir(parents=True)
         self.script = self.root / "demos/clean.sh"
         shutil.copy2(DEMO_DIR / "clean.sh", self.script)
-        shutil.copy2(
-            DEMO_DIR / "lib/qemu-paths.sh", self.root / "demos/lib/qemu-paths.sh"
-        )
+        shutil.copy2(DEMO_DIR / "lib/qemu-paths.sh", self.root / "demos/lib/qemu-paths.sh")
 
         self.assets = base / "assets"
         self.assets.mkdir()
@@ -154,6 +150,26 @@ class CleanTransientGlobTest(unittest.TestCase):
             sorted(TRANSIENT_FILES + KEPT_ASSET_FILES),
         )
 
+    def test_the_boot_snapshot_and_its_record_are_removed(self):
+        # Demo 5 writes a record of the initramfs next to each boot snapshot it
+        # saves; demo 6 restores the snapshot only with a matching record.
+        computed = (
+            "hermit-boot.qcow2",
+            "hermit-boot.qcow2.producer.json",
+            "hermit-snapshot.qcow2",
+            "hermit-snapshot.qcow2.id",
+            "hermit-snapshot.qcow2.producer.json",
+        )
+        for name in computed:
+            (self.assets / name).write_text(name + "\n")
+        completed = self._clean()
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        self.assertEqual(
+            sorted(path.name for path in self.assets.iterdir()),
+            sorted(KEPT_ASSET_FILES),
+            completed.stdout,
+        )
+
     def test_matching_files_are_removed_when_the_caller_has_none(self):
         # Positive control: with no matching names in the caller's directory,
         # the patterns reach the asset directory with or without the quoting.
@@ -202,9 +218,7 @@ class CleanMovedResultsTest(unittest.TestCase):
         (self.root / "demos/lib").mkdir(parents=True)
         self.script = self.root / "demos/clean.sh"
         shutil.copy2(DEMO_DIR / "clean.sh", self.script)
-        shutil.copy2(
-            DEMO_DIR / "lib/qemu-paths.sh", self.root / "demos/lib/qemu-paths.sh"
-        )
+        shutil.copy2(DEMO_DIR / "lib/qemu-paths.sh", self.root / "demos/lib/qemu-paths.sh")
 
         self.assets = self.base / "assets"
         self.assets.mkdir()
@@ -241,9 +255,7 @@ class CleanMovedResultsTest(unittest.TestCase):
 
     @staticmethod
     def _not_removed_lines(output):
-        return [
-            line for line in output.splitlines() if line.startswith("  not removed: ")
-        ]
+        return [line for line in output.splitlines() if line.startswith("  not removed: ")]
 
     def test_a_moved_results_directory_is_kept_and_named(self):
         for variable, default in RESULT_OVERRIDES:
@@ -267,20 +279,13 @@ class CleanMovedResultsTest(unittest.TestCase):
 
     def test_every_moved_directory_is_named(self):
         self._make_default_results()
-        moved = {
-            variable: self._make_moved_results(variable)
-            for variable, _ in RESULT_OVERRIDES
-        }
-        completed = self._clean(
-            **{variable: str(path) for variable, path in moved.items()}
-        )
+        moved = {variable: self._make_moved_results(variable) for variable, _ in RESULT_OVERRIDES}
+        completed = self._clean(**{variable: str(path) for variable, path in moved.items()})
         self.assertEqual(completed.returncode, 0, completed.stdout)
         named = self._not_removed_lines(completed.stdout)
         self.assertEqual(len(named), len(RESULT_OVERRIDES), completed.stdout)
         for (variable, _), line in zip(RESULT_OVERRIDES, named):
-            self.assertTrue(
-                line.startswith(f"  not removed: {variable}={moved[variable]} "), line
-            )
+            self.assertTrue(line.startswith(f"  not removed: {variable}={moved[variable]} "), line)
 
     def test_the_dry_run_names_a_moved_directory_and_deletes_nothing(self):
         self._make_default_results()
@@ -315,12 +320,8 @@ class CleanMovedResultsTest(unittest.TestCase):
                 self._make_default_results()
                 completed = self._clean(DEMO07_ARTIFACTS=spelling)
                 self.assertEqual(completed.returncode, 0, completed.stdout)
-                self.assertEqual(
-                    self._not_removed_lines(completed.stdout), [], completed.stdout
-                )
-                self.assertIn(
-                    "  removed target/demos/07-drgn-kernel\n", completed.stdout
-                )
+                self.assertEqual(self._not_removed_lines(completed.stdout), [], completed.stdout)
+                self.assertIn("  removed target/demos/07-drgn-kernel\n", completed.stdout)
                 self.assertFalse((self.root / "target/demos/07-drgn-kernel").exists())
 
     def test_an_empty_override_is_not_reported(self):
@@ -328,9 +329,7 @@ class CleanMovedResultsTest(unittest.TestCase):
         self._make_default_results()
         completed = self._clean(DEMO07_ARTIFACTS="")
         self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertEqual(
-            self._not_removed_lines(completed.stdout), [], completed.stdout
-        )
+        self.assertEqual(self._not_removed_lines(completed.stdout), [], completed.stdout)
         self.assertFalse((self.root / "target/demos/07-drgn-kernel").exists())
 
     def test_the_help_says_that_moved_directories_are_not_removed(self):
@@ -343,9 +342,7 @@ class CleanMovedResultsTest(unittest.TestCase):
             help_text,
         )
         # The help is the script's header comment and nothing after it.
-        self.assertTrue(
-            help_text.endswith("so that you can remove it yourself."), help_text
-        )
+        self.assertTrue(help_text.endswith("so that you can remove it yourself."), help_text)
         self.assertNotIn("set -euo pipefail", completed.stdout)
 
 

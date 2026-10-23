@@ -3,7 +3,9 @@
 #
 # Demos 6 and 7 restore the Linux boot snapshot that demo 5 saves. The snapshot
 # is a real file target: when it exists they restore it without rebooting, and
-# when it is missing Make runs demo 5 once to produce it.
+# when it is missing Make runs demo 5 once to produce it. Demo 6 also runs demo 5
+# again itself when the snapshot was booted from another initramfs than the one
+# lib/qemu-assets.sh builds now (demo 5 records that initramfs next to it).
 
 DEMO_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 ROOT := $(abspath $(DEMO_DIR)..)

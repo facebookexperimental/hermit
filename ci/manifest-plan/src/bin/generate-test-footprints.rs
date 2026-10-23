@@ -827,13 +827,13 @@ mod tests {
         use hermit_manifest_plan::nextest_binaries::SELECTION_ENV;
         let mut graph = dagrun::io::dag_from_json(&json!({"steps": [
             {"group": "test", "job": "modes", "cmd": "true", "labels": ["portable"],
-             "env": {REQUIRED_ENV: "1", SELECTION_ENV: "[\"-p\",\"hermit\",\"--test\",\"hermit_modes\"]"}},
+             "env": {REQUIRED_ENV: "1", SELECTION_ENV: "[\"-p\",\"hermit-run\",\"--test\",\"hermit_modes\"]"}},
             {"group": "test", "job": "unit", "cmd": "true", "labels": ["quick"],
              "env": {REQUIRED_ENV: "1", SELECTION_ENV: "[\"-p\",\"hermit-detcore\",\"--lib\"]"}}
         ]}).to_string()).unwrap();
         let all = BTreeSet::from(
             [
-                "hermit",
+                "hermit-run",
                 "hermit-detcore",
                 "hermetic_infra_hermit_tests",
                 "other",
@@ -849,7 +849,7 @@ mod tests {
                 &defaults
             )
             .unwrap(),
-            BTreeSet::from(["hermit".into(), "hermetic_infra_hermit_tests".into()])
+            BTreeSet::from(["hermit-run".into(), "hermetic_infra_hermit_tests".into()])
         );
         assert_eq!(
             prepared_command_packages(

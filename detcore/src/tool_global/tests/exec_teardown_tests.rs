@@ -1,7 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
- *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
@@ -20,9 +19,11 @@ const WORKER: DetTid = DetTid::from_raw(19);
 fn state(tids: &[DetTid]) -> (GlobalState, DetTime) {
     let config = Config {
         sequentialize_threads: true,
-        cancel_killed_thread_rpcs: false,
         ..Config::default()
-    };
+    }
+    .with_backend(|backend| {
+        backend.needs_killed_thread_rpc_cancellation = false;
+    });
     let state = GlobalState::initialize(&config, false);
     {
         let mut sched = state.sched.lock().unwrap();
@@ -81,7 +82,7 @@ async fn subsequent_leader_exec_cancellation_consumes_prepared_incarnation() {
         ),
         (
             mm1,
-            GlobalRequest::MarkPastFirstExecve(LEADER, None),
+            GlobalRequest::MarkPastFirstExecve(LEADER, None, None, None),
             GlobalResponse::MarkPastFirstExecve(Default::default()),
         ),
         (
@@ -282,4 +283,63 @@ async fn cancelled_transferred_exec_retires_unobserved_peer_before_late_callback
         4
     );
     assert_eq!(sched.turn, 0);
+}
+
+#[tokio::test]
+async fn inherited_terminal_initialization_is_once_only_across_failed_exec_retry() {
+    let (mut state, time) = state(&[LEADER]);
+    state.cfg.backend.tool_shares_guest_descriptor_table = true;
+    let sender = Tid::from_raw(LEADER.as_raw());
+    let mm0 = MmId::initial(LEADER);
+    // The pre-exec logging flag is not authority to initialize descriptors.
+    state
+        .past_first_execve
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let first = state
+        .receive_rpc(
+            sender,
+            (
+                time.clone(),
+                mm0,
+                GlobalRequest::MarkPastFirstExecve(LEADER, None, None, None),
+            ),
+        )
+        .await;
+    let GlobalResponse::MarkPastFirstExecve(first) = first.1 else {
+        panic!("first image completion refused")
+    };
+    assert!(first.initialize_inherited_stdio);
+    let mm1 = mm0.for_exec(LEADER);
+    for (mm, request, expected) in [
+        (
+            mm0,
+            GlobalRequest::PrepareExec(LEADER, mm0, Default::default()),
+            GlobalResponse::PrepareExec(()),
+        ),
+        (
+            mm1,
+            GlobalRequest::CancelExec(LEADER),
+            GlobalResponse::CancelExec(()),
+        ),
+        (
+            mm0,
+            GlobalRequest::PrepareExec(LEADER, mm0, Default::default()),
+            GlobalResponse::PrepareExec(()),
+        ),
+        (
+            mm1,
+            GlobalRequest::MarkPastFirstExecve(LEADER, None, None, None),
+            GlobalResponse::MarkPastFirstExecve(Default::default()),
+        ),
+    ] {
+        assert_eq!(
+            state
+                .receive_rpc(sender, (time.clone(), mm, request))
+                .await
+                .1,
+            expected
+        );
+    }
+    assert!(state.pending_exec_states.lock().unwrap().is_empty());
+    assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
 }

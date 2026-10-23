@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 set -euo pipefail
 
 export LC_ALL=C
@@ -169,7 +163,7 @@ unset HERMIT_BACKEND || true
 
 for target in "${targets[@]}"; do
   printf '\n==> Inventorying %s\n' "$target"
-  list_output=$(run_cargo test -p hermit --test "$target" "${cargo_args[@]}" -- --list)
+  list_output=$(run_cargo test -p hermit-run --test "$target" "${cargo_args[@]}" -- --list)
   mapfile -t tests < <(printf '%s\n' "$list_output" | sed -n 's/: test$//p')
 
   if [[ -n "${mode_na_targets[$target]+set}" ]]; then
@@ -179,7 +173,7 @@ for target in "${targets[@]}"; do
     continue
   fi
 
-  ignored_output=$(run_cargo test -p hermit --test "$target" "${cargo_args[@]}" -- --list --ignored)
+  ignored_output=$(run_cargo test -p hermit-run --test "$target" "${cargo_args[@]}" -- --list --ignored)
   declare -A target_ignored=()
   while IFS= read -r test; do
     [[ -z "$test" ]] && continue
@@ -216,7 +210,7 @@ for target in "${targets[@]}"; do
     current_test=$key
     executed=$((executed + 1))
     run_command timeout --kill-after=10s "${test_timeout_seconds}s" \
-      "$cargo_bin" test -p hermit --test "$target" "${cargo_args[@]}" "$test" \
+      "$cargo_bin" test -p hermit-run --test "$target" "${cargo_args[@]}" "$test" \
       -- --exact --test-threads=1
     passed=$((passed + 1))
     test_results+=("$key" pass 1)

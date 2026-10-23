@@ -1,0 +1,14 @@
+oncall("open_source")
+
+# cmake for build scripts that drive CMake (reverie-dbt builds DynamoRIO with it).
+# `CMAKE = "$(location //third-party/cmake:cmake-dir)/bin/cmake"` in a fixup's
+# buildscript.run.env selects it.
+#
+# RE workers have no cmake. Under the RE modes (hermit.rust_sysroot is set) this is the
+# self-contained cmake from PyPI's manylinux cmake wheel, staged into ./staged by
+# shim/modes/stage-re-inputs; otherwise ./host/bin/cmake runs the host's cmake.
+export_file(
+    name = "cmake-dir",
+    src = "staged" if read_config("hermit", "rust_sysroot", "") else "host",
+    visibility = ["PUBLIC"],
+)

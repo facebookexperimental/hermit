@@ -138,3 +138,95 @@ fn schedule_print_filters_thread_and_strips_times() {
         assert!(line.contains("(tid3"), "unexpected thread in line: {line}");
     }
 }
+
+/// A stand-in for Hermit whose Nth run ends as the Nth word of OUTCOMES says:
+/// the guest passing or failing, the guest killed by a signal, or one of
+/// Hermit's own outcomes with the stderr line Hermit prints for it.
+const SCRIPTED_HERMIT: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+n=$(($(cat "$dir/runs" 2>/dev/null || echo 0) + 1))
+echo "$n" > "$dir/runs"
+set -- $OUTCOMES
+eval "outcome=\${$n:-pass}"
+case $outcome in
+pass) exit 0 ;;
+fail) exit 1 ;;
+killed) kill -KILL $$ ;;
+skid)
+  echo 'HERMIT_SKID_OVERSHOOT rcb_actual=240935 rcb_target=240682 skid_margin=1000 overshoot=253' >&2
+  echo 'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=1' >&2
+  exit 122 ;;
+internal)
+  echo 'HERMIT_INTERNAL_FAILURE class=container-child-panic' >&2
+  exit 125 ;;
+esac
+"#;
+
+/// `hermit-verify chaos-stress` of `/bin/true` against [`SCRIPTED_HERMIT`]
+/// with OUTCOMES, and the number of Hermit runs it made.
+fn chaos_stress_with(outcomes: &str) -> (Output, u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().expect("failed to create a directory for the stand-in");
+    let hermit = directory.path().join("hermit");
+    std::fs::write(&hermit, SCRIPTED_HERMIT).unwrap();
+    std::fs::set_permissions(&hermit, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit-verify"))
+        .arg("--hermit-bin")
+        .arg(&hermit)
+        .args(["chaos-stress", "--max-iterations-count", "5", "/bin/true"])
+        .env("OUTCOMES", outcomes)
+        .output()
+        .expect("failed to run hermit-verify chaos-stress");
+    let runs = std::fs::read_to_string(directory.path().join("runs"))
+        .map_or(0, |runs| runs.trim().parse().expect("run count"));
+    (output, runs)
+}
+
+#[test]
+fn chaos_stress_retries_a_skid_refusal_instead_of_counting_it() {
+    let (output, runs) = chaos_stress_with("pass skid skid pass");
+    assert!(
+        !output.status.success(),
+        "a refusal counted as a failing guest:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(runs, 7, "5 iterations and 2 retries");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("5 passing and 0 failing runs; 2 skid refusals retried"),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SKID-RETRY run #2 attempt 2: HERMIT_POLICY_REFUSAL"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn chaos_stress_finds_a_race_between_guest_outcomes() {
+    let (output, runs) = chaos_stress_with("skid pass killed");
+    assert_success(&output, "hermit-verify chaos-stress");
+    assert_eq!(runs, 3);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Found a passing and a failing run; 1 skid refusals retried"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn chaos_stress_stops_when_hermit_itself_fails() {
+    let (output, runs) = chaos_stress_with("pass internal fail");
+    assert!(
+        !output.status.success(),
+        "an internal failure counted as a failing guest"
+    );
+    assert_eq!(runs, 2);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Hermit itself ended the run with status 125")
+            && stderr.contains("HERMIT_INTERNAL_FAILURE class=container-child-panic"),
+        "{stderr}"
+    );
+}

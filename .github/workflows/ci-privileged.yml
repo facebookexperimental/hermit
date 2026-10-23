@@ -46,15 +46,15 @@ jobs:
     # This is a WALL, not an expected duration: a green run of this job measured
     # 126s end to end on 2026-08-08 (run 31282467953). The wall must still cover
     # the case where every budgeted step spends its whole allowance, which is
-    # 2160s (DAG launcher) + 450s (30s locks + 60s submodule init + 30s hardware
-    # capabilities + 120s boxing probe + 210s occasional KVM probes) = 2610s.
-    # The 3000s job bound leaves 390s for steps without their own `timeout`
+    # 2460s (DAG launcher) + 450s (30s locks + 60s submodule init + 30s hardware
+    # capabilities + 120s boxing probe + 210s occasional KVM probes) = 2910s.
+    # The 3300s job bound leaves 390s for steps without their own `timeout`
     # (job setup, checkout, and the two artifact uploads). target/debug/test-harness reads the
     # privileged launcher and DAG budgets from their deployed files and fails
     # closed on their ordering drift, so
     # raise the step budgets and rerun `target/debug/test-harness validate` rather
     # than guessing here.
-    timeout-minutes: 50
+    timeout-minutes: 55
     env:
       DETCORE_TEST_RUST_LOG: "off"
 
@@ -115,8 +115,9 @@ jobs:
       # execution only in that exact context. A copied/local invocation, or any
       # boxing failure outside Actions, must fail closed instead of silently
       # downgrading through --allow-cgroup-failure.
-      # 2160s exceeds the selected graph's audited 2100s critical path plus 30s
-      # runner teardown. A warm exact-tree build measured 77s; the first
+      # 2460s exceeds the selected graph's audited 2400s critical path plus 30s
+      # runner teardown (2160s over 2100s until build.rust_scripts_on_host's
+      # wall cap went from 900 to 1200). A warm exact-tree build measured 77s; the first
       # canonical cold-cache run exceeded 180s before completing.
       # This number is the SINGLE AUTHOR
       # of the inner DAG budget: target/debug/test-harness reads it back out of this
@@ -129,13 +130,17 @@ jobs:
           echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2
           exit 2
         fi
-        timeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+        timeout --foreground --kill-after=10s 2460s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true
+      # Like the DAG step above, these probes run without cgroups on purpose.
+      # The marker lets a budgeted cell whose invocation cgroup cannot be
+      # created here measure its CPU with the process-group scan, which its
+      # row names as the CPU source, instead of stopping.
       run: |
         timeout --foreground --kill-after=10s 210s \
-          env HERMIT_BIN="$PWD/target/debug/hermit" \
+          env HERMIT_BIN="$PWD/target/debug/hermit" HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1 \
           bash -euo pipefail -c '
             target/debug/test-harness build --lane privileged --category applications \
               --ci-only --include-occasional

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
@@ -25,6 +17,7 @@ use dagrun::TestAttemptOutcome;
 use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
+use hermit_manifest_plan::bundle_record;
 use hermit_manifest_plan::cli_help::is_help_flag;
 use hermit_manifest_plan::imported_results;
 use hermit_manifest_plan::imported_results::IMPORT_RESULTS_ENV;
@@ -36,29 +29,38 @@ use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
+use hermit_manifest_plan::runner::RELAXED_LEVEL_ARGS;
 use hermit_manifest_plan::runner::RunContext;
+use hermit_manifest_plan::runner::STRICTNESS_LEVEL_ENV;
 use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::SelectedCell;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::backend_capability;
+use hermit_manifest_plan::runner::cell_declared_stdout;
+use hermit_manifest_plan::runner::cell_expected_guest_exit;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
 use hermit_manifest_plan::runner::diagnostic_failure_reason;
 use hermit_manifest_plan::runner::host_inapplicable_result;
+use hermit_manifest_plan::runner::host_input_change_only;
+use hermit_manifest_plan::runner::host_strictness;
 use hermit_manifest_plan::runner::is_diagnostic_cell;
 use hermit_manifest_plan::runner::prepare_result_path;
+use hermit_manifest_plan::runner::ptrace_cell_capability;
+use hermit_manifest_plan::runner::refused_on_an_inexact_branch_counter;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::retries_product_failures;
+use hermit_manifest_plan::runner::row_records_cell_relaxations;
 use hermit_manifest_plan::runner::run_cell;
+use hermit_manifest_plan::runner::skid_overshoot_only_reports;
 use hermit_manifest_plan::runner::validate_source_snapshot;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::self_test_selection;
 use hermit_manifest_plan::stress_series::HostCapabilities;
 #[cfg(test)]
 use hermit_manifest_plan::stress_series::HostCapability;
-#[cfg(test)]
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
 use hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD;
 use hermit_manifest_plan::validation_dag::TOOL_SELF_TESTS;
@@ -67,6 +69,8 @@ use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
 const EXPECTED_PLAN_SCHEMA: u64 = 1;
+const EXPECTED_PLAN_PATH: &str = "ci/expected-e2e-plan.json";
+const OPTIONAL_CELLS_PATH: &str = "ci/optional-e2e-cells.txt";
 const DEFAULT_BUILD_JOBS: usize = 16;
 const DEFAULT_VALIDATE_AUDIT_JOBS: usize = 2;
 const PREBUILT_RUST_SCRIPTS_REQUIRED: &str = "HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED";
@@ -90,6 +94,7 @@ Commands:
   audit-compile                    Compile selected C test programs
   run                              Execute selected cells
   parity <compare|export>          Measure parity from retained logs, or export ledger rows
+  sync-cells <--check|--write>     Regenerate the expected plan and optional cells
   selftest <NAME>                  Run one repository tool's self-test
 
 Selection options:
@@ -143,6 +148,7 @@ const PUBLIC_EXECUTION_ENVIRONMENT: &str =
                                          repository root (default: target/debug/hermit)
   HERMIT_E2E_EMPTY_WORKDIR=/test         Use the isolated /test working directory
   E2E_KEEP_VERIFY_LOGS=1                 Retain verify logs (one golden log after a match)
+  E2E_CAPTURE_CUSTOM_RUNS=1             Opt in to canonical single-run custom captures (changes invocation)
   HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER=<N> Positive finite CPU-time multiplier
   HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=<N> Positive finite wall-time multiplier";
 
@@ -152,11 +158,46 @@ const RUN_ENVIRONMENT: &str =
   E2E_PARITY_POST_PASS=0                 Skip the parity post-pass (default: 1)
   E2E_IMPORT_RESULTS=<ROOT>              Run no cell: publish the rows another run left in
                                          ROOT/<lane>/manifest_<category>/; a selected cell
-                                         with no row is an ERROR";
+                                         with no row is an ERROR. The parity post-pass
+                                         reads the verify logs restored in
+                                         ROOT/retained-verify-logs/";
+
+const SYNC_CELLS_HELP: &str = "\
+Usage: test-harness sync-cells <--check|--write> [--repo-root <DIR>]
+
+Regenerate the manifest-derived files that the scorecard is generated from,
+and the inventory of optional cells:
+
+  ci/expected-e2e-plan.json        the required plan, rows in their committed order
+  ci/optional-e2e-cells.txt        enabled cells that are not required (ci: false)
+
+The parity population needs no file: it is derived from the manifests (every
+test whose ptrace verify cell full validation selects, on every candidate
+backend), and generate-parity-cells snapshots it.
+
+A cell flip makes one existing manifest cell required: its backend joins the
+mode's `backends_enabled` and `ci`, or its `ci: false` becomes true. The diff of
+ci/expected-e2e-plan.json is the record of every change to the required cells.
+`test-harness validate` refuses a tree where any of these files differs from
+this output.
+
+ci/sync-cell-config.sh runs this and then every generator downstream of it;
+run that rather than this alone.
+
+Options:
+  --check                          Exit 1 naming each stale file; write nothing
+  --write                          Rewrite the stale files
+  --repo-root <DIR>                Read and write DIR (default: the checkout this
+                                   binary was built in)
+  -h, --help                       Print this help
+
+Exit status: 0 when the files match (--check) or were written (--write), 1 when
+--check finds a stale file, 2 for an unreadable input or a usage error.";
 
 const PARITY_HELP: &str = "\
 Usage: test-harness parity compare --artifacts <DIR> --cell <TEST@BACKEND> [OPTIONS]
        test-harness parity export --e2e-root <DIR> [--expected-scope <FILE>]
+       test-harness parity outcomes --e2e-root <DIR> [--backend <B>]... [--json] [--baseline <FILE>] [--repo-root <DIR>]
 
 Measure parity cells from the logs a finished `run` retained, as its own
 post-pass does, without running any guest. Each cell compares TEST's verify
@@ -169,7 +210,9 @@ It writes only below DIR/parity-compare: parity.jsonl, parity.status.json
 the goldens and log-diff reports under DIR/parity-compare/parity/. The run's
 results.jsonl, JUnit, summary.json, parity.jsonl, parity.status.json and
 parity/ are only read. A golden the run wrote is reused once the reference's
-retained log is gone.
+retained log is gone, except in an imported run, whose summary.json names its
+import ROOT: each log is read only from the directory the ingest restored it
+into below ROOT/retained-verify-logs/, and no golden is reused.
 
 Options:
   --artifacts <DIR>                The directory holding the run's results.jsonl
@@ -198,7 +241,31 @@ record-missing row for each cell the refused node's expected scope owed.
 
 Export options:
   --e2e-root <DIR>                 The run's e2e result root, holding <lane>/<node>/
-  --expected-scope <FILE>          The cells each planned node owed (see above)";
+  --expected-scope <FILE>          The cells each planned node owed (see above)
+
+`parity outcomes` prints, per candidate backend, every manifest cell whose
+outcome differs from ptrace's in one finished run. A cell's outcome is its
+final row's outcome in the run's results.jsonl files (PASS, FAIL, ERROR, ...),
+or with no row the manifest's own status, with its reason: disabled,
+not-selected (enabled, but full validation does not run it), no-mode, or
+not-run (full validation selects it, but the run has no row). The cells
+considered are every test and mode whose ptrace cell full validation selects,
+plus every test and mode with a row on any candidate. It runs no guest and
+writes nothing. With --baseline it exits 1 when a cell that matched ptrace in
+the baseline no longer does, and lists the cells that started matching and
+the new cells (tests or modes the baseline did not consider), which never
+matched and do not fail the gate.
+
+Outcomes options:
+  --e2e-root <DIR>                 The run's e2e result root, holding <lane>/<node>/results.jsonl
+  --backend <B>                    A candidate backend (dbt, in-guest-trap, kvm, liteinst,
+                                   sabre); may repeat (default: all five)
+  --json                           Print the differences, then every considered test/mode,
+                                   as JSONL: the baseline format
+  --baseline <FILE>                Gate against an earlier run's --json output
+  --repo-root <DIR>                Read the manifests (tests/e2e/manifests) from DIR, which
+                                   should hold the run's own commit (default: the checkout
+                                   this test-harness was built in)";
 
 const FILTER_OPTIONS: &str = "  --lane <portable|privileged>
   --category <CATEGORY>
@@ -306,6 +373,9 @@ fn print_command_help(command: &str) -> bool {
              --include-occasional             Include occasional cells\n  \
              --include-manual                 Include manual cells; requires exact test and mode\n  \
              --probe-disabled                 Run one disabled cell; requires exact test/mode/backend\n  \
+             --parity-inputs                  With --probe-disabled on a verify cell: run it on ptrace's guest\n  \
+                                              arguments (and --max-timeslice=disabled on liteinst and\n  \
+                                              in-guest-trap), so parity can compare it\n  \
              --prebuilt                       Reuse prepared test programs\n  \
              --allow-empty                    Permit an empty CI selection; requires --ci-only and category\n  \
              --results <PATH>                 Write JSONL cell results to PATH\n  \
@@ -316,6 +386,10 @@ fn print_command_help(command: &str) -> bool {
         ),
         "parity" => {
             println!("{PARITY_HELP}");
+            return true;
+        }
+        "sync-cells" => {
+            println!("{SYNC_CELLS_HELP}");
             return true;
         }
         "selftest" => {
@@ -481,6 +555,7 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
                 args.probe_disabled = true;
                 args.selection.population = Some(Population::Disabled);
             }
+            "--parity-inputs" => args.selection.parity_inputs = true,
             "--parity-reference" => fail(REMOVED_PARITY_REFERENCE),
             "--prebuilt" => args.prebuilt = true,
             "--diagnostic-results" => args.diagnostic_results = true,
@@ -680,12 +755,36 @@ fn accumulate_cell_cpu_usage(
     }
 }
 
+/// [`host_inapplicable_reason`] for `cell`. The hermit binary's
+/// `exact_branch_counter` verdict counts only for a cell the binary refuses on
+/// an inexact counter (see [`refused_on_an_inexact_branch_counter`]); a custom
+/// cell without `--strict` still runs.
+fn cell_host_inapplicable_reason(
+    cell: &SelectedCell,
+    verdicts: &HostCapabilities,
+    exact_branch_counter: Option<&HostCapabilityVerdict>,
+) -> Option<(Vec<String>, String)> {
+    let mut requires = cell.test.requires.clone();
+    if ptrace_cell_capability(cell).is_some() {
+        requires.push("cpuid".into());
+    }
+    host_inapplicable_reason(
+        &requires,
+        cell.id.backend.as_deref(),
+        verdicts,
+        exact_branch_counter.filter(|_| refused_on_an_inexact_branch_counter(cell)),
+    )
+}
+
 /// Why a cell cannot run on this machine, if it cannot: a capability its
-/// `requires` tokens or its backend need is proven absent.
+/// `requires` tokens or its backend need is proven absent, or the hermit
+/// binary's `exact_branch_counter` verdict, passed only for a cell the binary
+/// refuses without it, is absent. `None` withholds nothing.
 fn host_inapplicable_reason(
     requires: &[String],
     backend: Option<&str>,
     verdicts: &HostCapabilities,
+    exact_branch_counter: Option<&HostCapabilityVerdict>,
 ) -> Option<(Vec<String>, String)> {
     let mut absent = requires
         .iter()
@@ -697,6 +796,11 @@ fn host_inapplicable_reason(
                 .filter(|verdict| !verdict.present)
                 .map(|verdict| (capability.value().to_string(), verdict.evidence.clone()))
         })
+        .chain(
+            exact_branch_counter
+                .filter(|verdict| !verdict.present)
+                .map(|verdict| ("exact-branch-counter".to_string(), verdict.evidence.clone())),
+        )
         .collect::<Vec<_>>();
     absent.sort();
     absent.dedup();
@@ -796,18 +900,18 @@ fn validate_args(command: &str, args: &Args) {
     {
         fail("--mode must be verify, chaos, replay, naked, or custom");
     }
-    if args
-        .selection
-        .backend
-        .as_deref()
-        .is_some_and(|backend| !matches!(backend, "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst"))
-    {
+    if args.selection.backend.as_deref().is_some_and(|backend| {
+        !matches!(
+            backend,
+            "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst" | "in-guest-trap"
+        )
+    }) {
         fail("--backend must name a Hermit backend");
     }
     if args.selection.exclude_backends.iter().any(|backend| {
         !matches!(
             backend.as_str(),
-            "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst"
+            "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst" | "in-guest-trap"
         )
     }) {
         fail("--exclude-backend must name a Hermit backend");
@@ -872,6 +976,11 @@ fn validate_args(command: &str, args: &Args) {
             );
         }
     }
+    if args.selection.parity_inputs
+        && (!args.probe_disabled || args.selection.mode.as_deref() != Some("verify"))
+    {
+        fail("--parity-inputs requires --probe-disabled on a verify cell");
+    }
     if args.allow_empty {
         if !args.ci_only {
             fail("--allow-empty requires --ci-only");
@@ -902,10 +1011,18 @@ fn main() -> ExitCode {
         .next()
         .unwrap_or_else(|| fail("missing command; try `test-harness --help`"));
     let values = values.collect::<Vec<_>>();
+    if command == "sync-cells" {
+        return sync_cells(&values);
+    }
     if command == "parity" {
         let request = match parse_parity(values) {
             ParityRequest::Compare(request) => request,
             ParityRequest::Export(request) => return parity_export(&request),
+            ParityRequest::Outcomes(request) => {
+                let manifests = ManifestSet::load(&root(request.repo_root.as_deref()))
+                    .unwrap_or_else(|error| fail(error));
+                return parity_outcomes(&manifests, &request);
+            }
         };
         let root = root(None);
         let manifests = ManifestSet::load(&root).unwrap_or_else(|error| fail(error));
@@ -987,6 +1104,16 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     );
     audit_cli_brackets(root);
     let cells = audit_expected_plan(root, manifests);
+    // Byte for byte, so a hand edit that `sync-cells` would undo is refused
+    // here rather than at the next flip.
+    let synced = synced_cell_files(root).unwrap_or_else(|error| fail(error));
+    let stale = stale_files(root, &synced);
+    if !stale.is_empty() {
+        fail(format!(
+            "not what the manifests derive: {}; run ci/sync-cell-config.sh",
+            stale.join(", ")
+        ));
+    }
     println!(
         "PASS: {} YAML manifests, {} required cells",
         manifests.documents.len(),
@@ -1161,9 +1288,35 @@ fn audit_cli_brackets(root: &Path) {
 /// Run the canonical manifest planner over `root`. A `source_sha` means the
 /// root is a source snapshot, so the planner takes the test population from the
 /// files present instead of from Git.
+///
+/// A Buck e2e cell's bundle record may already carry this planner's
+/// acceptance of this snapshot (hermit_manifest_plan::bundle_record); the
+/// verdict is taken from it only when it names this source SHA and this
+/// planner binary, and otherwise the planner runs here as always.
 fn run_manifest_plan(root: &Path, source_sha: Option<&str>) {
     let manifest_plan =
         sibling_manifest_plan().unwrap_or_else(|| root.join("target/debug/hermit-manifest-plan"));
+    if let Some(sha) = source_sha {
+        match bundle_record::record_from_env() {
+            Err(error) => fail(error),
+            Ok(None) => {}
+            Ok(Some((path, record))) => {
+                match bundle_record::manifest_plan_accepted(
+                    &path,
+                    &record,
+                    root,
+                    &manifest_plan,
+                    sha,
+                ) {
+                    Ok(()) => return,
+                    Err(why) => eprintln!(
+                        "test-harness: running {} because the bundle record's verdict does not apply: {why}",
+                        manifest_plan.display()
+                    ),
+                }
+            }
+        }
+    }
     let mut command = Command::new(&manifest_plan);
     command.args(["--format", "json", "--root"]).arg(root);
     if source_sha.is_some() {
@@ -1266,6 +1419,7 @@ fn required_plan_rows(manifests: &ManifestSet) -> (usize, Vec<JsonValue>) {
                 // `requires` token does (see `host_inapplicable_reason`), so a
                 // consumer routing from this file must see it too.
                 .chain(cell.id.backend.as_deref().and_then(backend_capability))
+                .chain(ptrace_cell_capability(cell))
                 .collect::<BTreeSet<_>>();
             // `requires` and the base (unmultiplied) timeouts let a consumer that
             // cannot load the manifests, such as a Buck cell generator, route
@@ -1360,9 +1514,116 @@ fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
     let expected =
         unique_plan_rows("ci/expected-e2e-plan.json", expected).unwrap_or_else(|error| fail(error));
     if actual != expected {
-        fail("required E2E plan changed; update ci/expected-e2e-plan.json in the same review");
+        fail(
+            "required E2E plan changed; regenerate ci/expected-e2e-plan.json with \
+             ci/sync-cell-config.sh and commit it in the same review",
+        );
     }
     cell_count
+}
+
+/// Every enabled cell that is not required (a `ci: false` cell), one
+/// `<test> <mode> <backend>` line each, sorted. No other derived file names
+/// these cells, so this inventory is what makes disabling one show up as a
+/// diff (<https://github.com/rrnewton/hermit/issues/3606>).
+fn optional_cells_document(manifests: &ManifestSet) -> Result<String, String> {
+    let select = |population| {
+        manifests.select(&Selection {
+            population: Some(population),
+            ..Selection::default()
+        })
+    };
+    let required = select(Population::Required)?
+        .into_iter()
+        .map(|cell| cell.id)
+        .collect::<BTreeSet<_>>();
+    let lines = select(Population::Enabled)?
+        .into_iter()
+        .filter(|cell| !required.contains(&cell.id))
+        .map(|cell| {
+            format!(
+                "{} {} {}\n",
+                cell.id.test,
+                cell.id.mode,
+                cell.id.backend.as_deref().unwrap_or("-")
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    Ok(format!(
+        "# Enabled E2E cells that are not required (ci: false): <test> <mode> <backend>.\n\
+         # Generated from tests/e2e/manifests by ci/sync-cell-config.sh; do not edit.\n{}",
+        lines.into_iter().collect::<String>()
+    ))
+}
+
+/// The files `sync-cells` derives, each with the text the manifests now give
+/// it, in the order it reports them.
+fn synced_cell_files(root: &Path) -> Result<Vec<(&'static str, String)>, String> {
+    let manifests = ManifestSet::load(root)?;
+    let generated = expected_plan_document(root, &manifests);
+    // `expected-plan` prints the same document with println!.
+    let plan = serde_json::to_string_pretty(&generated).map_err(|error| error.to_string())? + "\n";
+    Ok(vec![
+        (EXPECTED_PLAN_PATH, plan),
+        (OPTIONAL_CELLS_PATH, optional_cells_document(&manifests)?),
+    ])
+}
+
+/// The files whose committed bytes differ from `files`.
+fn stale_files(root: &Path, files: &[(&'static str, String)]) -> Vec<&'static str> {
+    files
+        .iter()
+        .filter(|(relative, text)| {
+            fs::read(root.join(relative)).ok().as_deref() != Some(text.as_bytes())
+        })
+        .map(|(relative, _)| *relative)
+        .collect()
+}
+
+fn sync_cells(values: &[String]) -> ExitCode {
+    let mut write = None;
+    let mut repo_root = None;
+    let mut values = values.iter();
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--check" | "--write" if write.is_none() => write = Some(flag == "--write"),
+            "--check" | "--write" => fail("sync-cells takes one of --check and --write, once"),
+            "--repo-root" => {
+                let dir = values
+                    .next()
+                    .unwrap_or_else(|| fail("--repo-root needs a directory"));
+                repo_root = Some(PathBuf::from(dir));
+            }
+            other => fail(format!(
+                "sync-cells does not accept {other}; see `test-harness sync-cells --help`"
+            )),
+        }
+    }
+    let Some(write) = write else {
+        fail("sync-cells needs --check or --write; see `test-harness sync-cells --help`")
+    };
+    let root = root(repo_root.as_deref());
+    let files = synced_cell_files(&root)
+        .unwrap_or_else(|error| fail(format!("sync-cells: {error}; nothing was written")));
+    let stale = stale_files(&root, &files);
+    if write {
+        for (relative, text) in files.iter().filter(|(path, _)| stale.contains(path)) {
+            fs::write(root.join(relative), text)
+                .unwrap_or_else(|error| fail(format!("cannot write {relative}: {error}")));
+        }
+    }
+    match (stale.is_empty(), write) {
+        (true, _) => println!("sync-cells: the expected plan and optional cells are current"),
+        (false, true) => println!("sync-cells: wrote {}", stale.join(", ")),
+        (false, false) => {
+            eprintln!(
+                "sync-cells: stale: {}; run ci/sync-cell-config.sh to regenerate them",
+                stale.join(", ")
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Read by ci/compat-envelope/scorecard.rs: a prepared `hermit-manifest-plan`
@@ -1836,8 +2097,34 @@ fn portable_shard_step<'a>(
         .ok_or_else(|| format!("portable shard names missing DAG node {node}"))
 }
 
-// 3900 = 3780 plus the 120 seconds setup.manifest_plan's wall cap grew (180 to
-// 300) in https://github.com/rrnewton/hermit/issues/3381.
+// The same exact-name-first resolution for the preflight and check job
+// populations, which ci/run-node.sh hands to validate's hosted selector
+// (map_hosted_portable_tags in scripts/validate.rs). A name with neither an
+// exact node nor a hosted twin is kept, so the selection still rejects it.
+fn resolve_portable_selectors(portable: &dagrun::DagConfig, nodes: Vec<String>) -> Vec<String> {
+    let available = portable
+        .steps
+        .iter()
+        .map(dagrun::Step::tag)
+        .collect::<BTreeSet<_>>();
+    nodes
+        .into_iter()
+        .map(|node| {
+            let hosted = format!("{node}_on_host");
+            if !available.contains(&node) && available.contains(&hosted) {
+                hosted
+            } else {
+                node
+            }
+        })
+        .collect()
+}
+
+// 4200 = 3780 plus the 120 seconds setup.manifest_plan's wall cap grew (180 to
+// 300) in https://github.com/rrnewton/hermit/issues/3381, plus the 300 seconds
+// build.rust_scripts' wall cap grew (900 to 1200) to keep 1.5 times its
+// largest observed wall. 3900 = 4200 minus setup.manifest_plan's 300 seconds,
+// which since 2026-10-16 runs beside build.rust_scripts instead of after it.
 const PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS: u64 = 3900;
 const PORTABLE_PREFLIGHT_OVERHEAD_SECONDS: u64 = 420;
 const PORTABLE_CHECKS_CRITICAL_PATH_SECONDS: u64 = 2400;
@@ -1859,6 +2146,7 @@ fn audit_portable_preflight_budget(
                 .ok_or_else(|| "portable preflight_nodes contains a non-string node".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let preflight_nodes = resolve_portable_selectors(portable, preflight_nodes);
     // ci/run-node.sh passes --ignore-selected-deps: dependencies outside the
     // declared preflight population are supplied by the workflow, while edges
     // among these five selected nodes remain load-bearing.
@@ -1897,6 +2185,7 @@ fn audit_portable_checks_budget(
                 .ok_or_else(|| "portable check_nodes contains a non-string node".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let check_nodes = resolve_portable_selectors(portable, check_nodes);
     let selected = dagrun::select_steps_by_tags(portable, &check_nodes, true)
         .map_err(|error| format!("cannot select portable checks closure: {error}"))?;
     let critical_path = dag_critical_path(&selected)?;
@@ -2132,8 +2421,11 @@ fn audit_run_dag_workflow_runner(label: &str, workflow: &YamlValue) -> Result<()
     const PORTABLE: &str = "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v";
     const DAG_PRIVILEGED: &str =
         "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 -v";
-    const VALIDATION_PRIVILEGED: &str = "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
-    const STANDALONE_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
+    // Both launches are pinned: the boxing-capable one whenever the step's
+    // environment carries any cgroup input the runner reads, and the explicit
+    // unboxed one only when it carries none.
+    const VALIDATION_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\nif [[ -n ${DAGRUN_DELEGATED_CGROUP+set}${DAGRUN_IN_SCOPE+set}${DAGRUN_SCOPE_UNIT+set}${DAGRUN_DIRECT_CGROUP+set}${DAGRUN_DELEGATED_UNBOXED+set}${DAGRUN_FORCE_SCOPE_ATTEMPT+set} ]]; then\n  env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\nelse\n  env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\nfi";
+    const STANDALONE_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 2460s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
     const FIXTURES: &[&str] = &[
         "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v",
         "timeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
@@ -2500,6 +2792,7 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
             enabled: false,
             timeout_seconds,
             cpu_timeout_seconds,
+            host_level: hermit_manifest_plan::runner::HostLevel::default(),
         };
         checked += 1;
         let dir = context
@@ -2622,13 +2915,238 @@ enum Retries {
     Off,
 }
 
-/// Whether this finished attempt of `cell` is retried: a retryable product
-/// failure of a cell that has not declared `no_retry_reason`, in a run that
-/// has not turned retries off.
+/// Why a finished attempt is retried.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryCause {
+    /// A measured product failure ([`cell_result_is_retryable`]).
+    ProductFailure,
+    /// A verify cell whose only failure is Hermit's typed precise-timer
+    /// overshoot ([`skid_overshoot_only_reports`]), carrying the number of
+    /// `HERMIT_SKID_OVERSHOOT` reports. It is counted and reported as a
+    /// SKID-RETRY (<https://github.com/rrnewton/hermit/issues/1845>).
+    SkidOvershoot { reports: u64 },
+    /// A verify cell whose only failure is a divergence that a host file
+    /// changing during one run explains ([`host_input_change_only`]). It is
+    /// retried even when the cell declares `no_retry_reason`, which keeps
+    /// only a product failure final, and reported as a HOST-INPUT-RETRY.
+    HostInputChanged,
+}
+
+/// Why this finished attempt of `cell` is retried, or `None` when it is not.
+///
+/// Retries apply only in a run that has not turned them off, and only to a
+/// cell that has not declared `no_retry_reason`, so `--no-retry` measurements
+/// and the single-attempt compatibility corpus keep exactly one attempt. The
+/// shared [`MAX_ATTEMPTS_PER_CELL`] caps both causes together. Every other
+/// failure, including a divergence, timeout or no-result that coincides with
+/// an overshoot report, has no cause and is final.
+fn attempt_retry_cause(
+    retries: Retries,
+    cell: &SelectedCell,
+    result: &CellResult,
+) -> Option<RetryCause> {
+    if retries != Retries::Framework {
+        return None;
+    }
+    // The host-input and skid rules check the stdout assertions the row
+    // records, and the skid rule also admits the guest disposition and applies
+    // the comparator it records, so the row must record exactly what this
+    // cell's manifest declares; an imported row recorded under another
+    // declaration or recipe does not choose its own. An executed row either
+    // rule can admit always records its cell's declarations.
+    // The level relaxations are the producing host's
+    // ([`row_records_cell_relaxations`]).
+    let records_this_cell = || {
+        result.expected_guest_exit == cell_expected_guest_exit(cell)
+            && result.declared_stdout.as_ref() == Some(&cell_declared_stdout(cell))
+            && row_records_cell_relaxations(cell, result)
+    };
+    if host_input_change_only(result) && records_this_cell() {
+        return Some(RetryCause::HostInputChanged);
+    }
+    if !retries_product_failures(cell) {
+        return None;
+    }
+    if cell_result_is_retryable(result.outcome.as_str(), result.failure_class) {
+        return Some(RetryCause::ProductFailure);
+    }
+    if !records_this_cell() {
+        return None;
+    }
+    skid_overshoot_only_reports(result).map(|reports| RetryCause::SkidOvershoot { reports })
+}
+
+/// Whether this finished attempt of `cell` is retried; see
+/// [`attempt_retry_cause`].
 fn attempt_earns_retry(retries: Retries, cell: &SelectedCell, result: &CellResult) -> bool {
-    retries == Retries::Framework
-        && retries_product_failures(cell)
-        && cell_result_is_retryable(result.outcome.as_str(), result.failure_class)
+    attempt_retry_cause(retries, cell, result).is_some()
+}
+
+/// One SKID-RETRY of a cell's history: the retried attempt, its overshoot
+/// report count, and the outcome the cell's complete history selected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SkidRetry {
+    test: String,
+    mode: String,
+    backend: Option<String>,
+    attempt: u64,
+    reports: u64,
+    final_outcome: String,
+}
+
+/// One retried attempt of a cell's history, whatever its cause, and the
+/// outcome the cell's complete history selected.
+#[derive(Clone, Debug)]
+struct RetriedAttempt<'a> {
+    row: &'a CellResult,
+    cause: RetryCause,
+    final_outcome: String,
+}
+
+/// Every retried attempt in `histories`, with its cause.
+///
+/// Every row but the last of a history is an attempt the harness retried (or,
+/// for imported rows, one this run's policy would have retried), so the cause
+/// is recomputed from that row with the same rule that launched the retry. An
+/// imported history continues past an attempt exactly when that rule retries
+/// it ([`imported_results`]), so an imported retried attempt followed by its
+/// producer's next attempt is counted as an executed one is.
+fn retried_attempts<'a>(
+    retries: Retries,
+    cells: &[SelectedCell],
+    histories: &'a [Vec<CellResult>],
+) -> Vec<RetriedAttempt<'a>> {
+    let mut found = Vec::new();
+    for (cell, history) in cells.iter().zip(histories) {
+        let Some((_, retried)) = history.split_last() else {
+            continue;
+        };
+        let final_outcome = match cell_result_after_retries(history) {
+            Ok(result) => result.outcome.clone(),
+            Err(_) => "ERROR".into(),
+        };
+        for row in retried {
+            if let Some(cause) = attempt_retry_cause(retries, cell, row) {
+                found.push(RetriedAttempt {
+                    row,
+                    cause,
+                    final_outcome: final_outcome.clone(),
+                });
+            }
+        }
+    }
+    found
+}
+
+/// Every SKID-RETRY in `histories`; see [`retried_attempts`].
+fn skid_retries(
+    retries: Retries,
+    cells: &[SelectedCell],
+    histories: &[Vec<CellResult>],
+) -> Vec<SkidRetry> {
+    retried_attempts(retries, cells, histories)
+        .into_iter()
+        .filter_map(|retried| match retried.cause {
+            RetryCause::SkidOvershoot { reports } => Some(SkidRetry {
+                test: retried.row.test.clone(),
+                mode: retried.row.mode.clone(),
+                backend: retried.row.backend.clone(),
+                attempt: retried.row.attempt,
+                reports,
+                final_outcome: retried.final_outcome,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The summary.json entry for a PRODUCT-RETRY or HOST-INPUT-RETRY: the
+/// retried attempt, what it observed and where its first divergence was, and
+/// the outcome the cell's complete history selected. A final PASS here is a
+/// failure the retry turned into a pass.
+fn retried_attempt_json(retried: &RetriedAttempt<'_>) -> serde_json::Value {
+    let row = retried.row;
+    serde_json::json!({
+        "test": row.test,
+        "mode": row.mode,
+        "backend": row.backend,
+        "attempt": row.attempt,
+        "outcome": row.outcome,
+        "result": row.result,
+        "first_divergent_scheduler_turn": row.first_divergent_scheduler_turn,
+        "first_divergent_record": row.first_divergent_record,
+        "first_divergent_syscall": row.first_divergent_syscall,
+        "final_outcome": retried.final_outcome,
+    })
+}
+
+/// The line printed for each PRODUCT-RETRY or HOST-INPUT-RETRY.
+fn retried_attempt_line(label: &str, retried: &RetriedAttempt<'_>) -> String {
+    let row = retried.row;
+    let coords = [
+        ("turn", row.first_divergent_scheduler_turn),
+        ("rec", row.first_divergent_record),
+        ("sys", row.first_divergent_syscall),
+    ]
+    .iter()
+    .filter_map(|(key, value)| value.map(|value| format!(" {key}={value}")))
+    .collect::<String>();
+    let observed = row
+        .result
+        .and_then(|result| serde_json::to_value(result).ok())
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unrecorded".into());
+    format!(
+        "test-harness: {label} {} ({}/{}): attempt {} was {} ({observed}{coords}) and was retried; final outcome {}",
+        row.test,
+        row.mode,
+        row.backend.as_deref().unwrap_or("native"),
+        row.attempt,
+        row.outcome,
+        retried.final_outcome
+    )
+}
+
+/// The line printed for a typed skid attempt that is not followed by a retry.
+///
+/// `history` is the cell's history ending with that attempt, and `imported`
+/// says whether its rows were imported (`E2E_IMPORT_RESULTS`). At the shared
+/// cap the line is `SKID-RETRY LIMIT`; below it the line is
+/// `SKID-RETRY NOT MADE`, which says why. An imported skid attempt continues
+/// to its producer's next attempt as an executed one would be retried
+/// ([`imported_results`]), so it is the last one only when its producer
+/// recorded no later attempt of the cell; an executed one is retried unless
+/// its row could not be published. Either way it names the outcome
+/// [`cell_result_after_retries`] selects from the whole history, which is not
+/// always ERROR: a product failure earlier in the history outranks a final
+/// infrastructure error.
+fn unretried_skid_line(
+    test: &str,
+    mode: &str,
+    backend: Option<&str>,
+    attempt: u64,
+    reports: u64,
+    history: &[CellResult],
+    imported: bool,
+) -> String {
+    let selected = match cell_result_after_retries(history) {
+        Ok(result) => format!("{} (attempt {})", result.outcome, result.attempt),
+        Err(error) => format!("ERROR (the history is inconsistent: {error})"),
+    };
+    let backend = backend.unwrap_or("native");
+    if attempt >= MAX_ATTEMPTS_PER_CELL {
+        format!(
+            "SKID-RETRY LIMIT {test} ({mode}/{backend}): attempt {attempt} of at most {MAX_ATTEMPTS_PER_CELL} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)); the attempt cap is reached, no further retry is made, and the cell's selected outcome is {selected}"
+        )
+    } else if imported {
+        format!(
+            "SKID-RETRY NOT MADE {test} ({mode}/{backend}): attempt {attempt} of at most {MAX_ATTEMPTS_PER_CELL} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)), but it is an imported attempt and its producer recorded no later attempt of the cell; the cell's selected outcome is {selected}"
+        )
+    } else {
+        format!(
+            "SKID-RETRY NOT MADE {test} ({mode}/{backend}): attempt {attempt} of at most {MAX_ATTEMPTS_PER_CELL} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)), but this run has no later attempt of the cell; the cell's selected outcome is {selected}"
+        )
+    }
 }
 
 /// The selection `run` applies for `args`: its filters, over the required
@@ -2652,7 +3170,7 @@ fn run_cells(manifests: &ManifestSet, args: &Args) -> Result<Vec<SelectedCell>, 
 }
 
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
-    let cells = run_cells(manifests, args).unwrap_or_else(|e| fail(e));
+    let mut cells = run_cells(manifests, args).unwrap_or_else(|e| fail(e));
     if !args.selection.exclude_backends.is_empty() {
         let unfiltered = manifests
             .select(&Selection {
@@ -2680,19 +3198,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let capacity = scheduled_worker_capacity(args);
     let import_root = std::env::var_os(IMPORT_RESULTS_ENV).map(PathBuf::from);
     let planned_verify = planned_verify(&cells);
-    // An imported run has no verify logs of its own to compare.
-    let parity_scope = if import_root.is_some() {
-        if std::env::var_os("E2E_PARITY_SELECT").is_some()
-            || std::env::var_os("E2E_PARITY_POST_PASS").is_some()
-        {
-            eprintln!(
-                "test-harness: {IMPORT_RESULTS_ENV} is set: the parity post-pass and E2E_PARITY_SELECT are ignored"
-            );
-        }
-        BTreeSet::new()
-    } else {
-        parity_scope(root, manifests, &planned_verify)
-    };
+    // An imported run measures the same scope from the verify logs its
+    // producer retained, which the ingest restored below the import root
+    // (`parity::ImportedLogs`).
+    let parity_scope = parity_scope(manifests, &planned_verify);
     let context = if import_root.is_some() {
         RunContext::for_import(root.to_path_buf(), args.source_sha.as_deref())
     } else {
@@ -2704,7 +3213,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     }
     .unwrap_or_else(|e| fail(e))
     .with_scheduled_worker_capacity(capacity)
-    .with_parity_retained(parity::retention_closure(&parity_scope, &planned_verify));
+    .with_parity_retained(parity::retention_closure(
+        &parity_scope.cells,
+        &planned_verify,
+    ));
     for (capability, verdict) in &context.host_capabilities {
         eprintln!(
             "Host capability {}: {} — {}",
@@ -2712,6 +3224,34 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             if verdict.present { "PRESENT" } else { "ABSENT" },
             verdict.evidence
         );
+    }
+    // One run per test, at the deepest level this host supports; a verify cell
+    // that caps itself runs relaxed everywhere. The level is the host's, so it
+    // is set only here, where the cells run, and never in a plan. An import
+    // runs nothing: its rows ran at their producer's level, and the host checks
+    // it applies to them are the producer's, as before.
+    if import_root.is_none() {
+        let host_level = host_strictness(
+            &context.host_capabilities,
+            context.exact_branch_counter.as_ref(),
+            std::env::var(STRICTNESS_LEVEL_ENV).ok().as_deref(),
+        )
+        .unwrap_or_else(|e| fail(e));
+        eprintln!(
+            "Strictness level: {}{}",
+            host_level.level.as_str().to_uppercase(),
+            host_level
+                .reason
+                .as_deref()
+                .map(|reason| format!(
+                    " — {reason}; verify cells on ptrace and e9patch add {}",
+                    RELAXED_LEVEL_ARGS.join(" ")
+                ))
+                .unwrap_or_default()
+        );
+        for cell in &mut cells {
+            cell.host_level = host_level.clone();
+        }
     }
     let results_path = args.results.clone().unwrap_or_else(|| {
         context
@@ -2729,16 +3269,16 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             results_path.display()
         ))
     });
-    mark_parity_running(&parity_scope, &context, &results_path);
+    mark_parity_running(&parity_scope.cells, &context, &results_path);
     let imported = import_root.as_deref().map(|import_root| {
         let earns_retry = |cell: &SelectedCell, row: &CellResult| {
             attempt_earns_retry(args.retries, cell, row)
         };
         let host_inapplicable = |cell: &SelectedCell| {
-            host_inapplicable_reason(
-                &cell.test.requires,
-                cell.id.backend.as_deref(),
+            cell_host_inapplicable_reason(
+                cell,
                 &context.host_capabilities,
+                context.exact_branch_counter.as_ref(),
             )
             .map(|(_, reason)| reason)
         };
@@ -2782,10 +3322,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 }
                 return;
             }
-            if let Some((_, reason)) = host_inapplicable_reason(
-                &cell.test.requires,
-                cell.id.backend.as_deref(),
+            if let Some((_, reason)) = cell_host_inapplicable_reason(
+                cell,
                 &context.host_capabilities,
+                context.exact_branch_counter.as_ref(),
             ) {
                 let _ = emit(host_inapplicable_result(&context, cell, reason), false);
                 return;
@@ -2869,13 +3409,21 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 suffix
             };
             let effective_will_retry = published && will_retry;
-            let retry_note = if effective_will_retry {
-                format!(
+            let retry_cause = attempt_retry_cause(args.retries, &cells[index], &result);
+            let retry_note = match (effective_will_retry, retry_cause) {
+                (true, Some(RetryCause::SkidOvershoot { reports })) => format!(
+                    " [SKID-RETRY: attempt {} of at most {} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)) and nothing else; retrying this cell only]",
+                    result.attempt, MAX_ATTEMPTS_PER_CELL
+                ),
+                (true, Some(RetryCause::HostInputChanged)) => format!(
+                    " [HOST-INPUT-RETRY: attempt {} of at most {} diverged because a host file changed during a run, which is not a product failure; retrying this cell once, and a second divergence stays a failure]",
+                    result.attempt, MAX_ATTEMPTS_PER_CELL
+                ),
+                (true, _) => format!(
                     " [attempt {} of at most {}; retrying this cell only]",
                     result.attempt, MAX_ATTEMPTS_PER_CELL
-                )
-            } else {
-                String::new()
+                ),
+                (false, _) => String::new(),
             };
             println!(
                 "{} {} ({}/{}){}{}",
@@ -2886,8 +3434,34 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 retry_note,
                 located
             );
+            let unretried_skid = match (effective_will_retry, retry_cause) {
+                (false, Some(RetryCause::SkidOvershoot { reports })) => Some((
+                    reports,
+                    result.test.clone(),
+                    result.mode.clone(),
+                    result.backend.clone(),
+                    result.attempt,
+                )),
+                _ => None,
+            };
 
             attempt_results[index].push(result);
+            if let Some((reports, test, mode, backend, attempt)) = unretried_skid {
+                // A skid attempt that is not retried: say why, and which outcome
+                // the cell's whole history selected, where the cell finishes.
+                println!(
+                    "{}",
+                    unretried_skid_line(
+                        &test,
+                        &mode,
+                        backend.as_deref(),
+                        attempt,
+                        reports,
+                        &attempt_results[index],
+                        imported.is_some(),
+                    )
+                );
+            }
             if !effective_will_retry {
                 let result = match cell_result_after_retries(&attempt_results[index]) {
                     Ok(result) => result.clone(),
@@ -2965,12 +3539,58 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .into_iter()
         .map(|(_, result)| result)
         .collect::<Vec<_>>();
+    // Every SKID-RETRY stays visible: a count on the summary line, one line
+    // per retry, and both in summary.json. Each retried attempt's row is also
+    // kept in results.jsonl.
+    let skid_retried = skid_retries(args.retries, &cells, &attempt_results);
     if expected > 0 {
         println!(
-            "test-harness: completed {} cell(s) with up to {} concurrent worker(s)",
+            "test-harness: completed {} cell(s) with up to {} concurrent worker(s); SKID-RETRY count {}",
             results.len(),
-            capacity.workers_for(expected)
+            capacity.workers_for(expected),
+            skid_retried.len()
         );
+    }
+    for retry in &skid_retried {
+        println!(
+            "test-harness: SKID-RETRY {} ({}/{}): attempt {} recorded {} HERMIT_SKID_OVERSHOOT report(s) and was retried; final outcome {}",
+            retry.test,
+            retry.mode,
+            retry.backend.as_deref().unwrap_or("native"),
+            retry.attempt,
+            retry.reports,
+            retry.final_outcome
+        );
+    }
+    // The other retries are counted the same way: a PRODUCT-RETRY follows a
+    // measured product failure, including a verify divergence without an
+    // overshoot marker, and a final PASS selected after one is a failure the
+    // retry turned into a pass (https://github.com/rrnewton/hermit/issues/1845).
+    let retried = retried_attempts(args.retries, &cells, &attempt_results);
+    let product_retried = retried
+        .iter()
+        .filter(|retried| retried.cause == RetryCause::ProductFailure)
+        .collect::<Vec<_>>();
+    let host_input_retried = retried
+        .iter()
+        .filter(|retried| retried.cause == RetryCause::HostInputChanged)
+        .collect::<Vec<_>>();
+    if expected > 0 {
+        println!(
+            "test-harness: PRODUCT-RETRY count {} ({} final PASS); HOST-INPUT-RETRY count {}",
+            product_retried.len(),
+            product_retried
+                .iter()
+                .filter(|retried| retried.final_outcome == "PASS")
+                .count(),
+            host_input_retried.len()
+        );
+    }
+    for retried in &product_retried {
+        println!("{}", retried_attempt_line("PRODUCT-RETRY", retried));
+    }
+    for retried in &host_input_retried {
+        println!("{}", retried_attempt_line("HOST-INPUT-RETRY", retried));
     }
     let host_inapplicable = results
         .iter()
@@ -3011,6 +3631,32 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         // not fail the run. Counted and named separately so they stay visible.
         "diagnostic_failures": diagnostic_cells.len(),
         "diagnostic_failure_cells": diagnostic_cells,
+        // Retries of a verify attempt whose only failure was Hermit's typed
+        // precise-timer overshoot (https://github.com/rrnewton/hermit/issues/1845).
+        "skid_retries": skid_retried.len(),
+        "skid_retry_cells": skid_retried
+            .iter()
+            .map(|retry| serde_json::json!({
+                "test": retry.test,
+                "mode": retry.mode,
+                "backend": retry.backend,
+                "attempt": retry.attempt,
+                "overshoot_reports": retry.reports,
+                "final_outcome": retry.final_outcome,
+            }))
+            .collect::<Vec<_>>(),
+        // Retries of a measured product failure, and of a divergence a host
+        // file changing explains; see the PRODUCT-RETRY lines above.
+        "product_retries": product_retried.len(),
+        "product_retry_cells": product_retried
+            .iter()
+            .map(|retried| retried_attempt_json(retried))
+            .collect::<Vec<_>>(),
+        "host_input_retries": host_input_retried.len(),
+        "host_input_retry_cells": host_input_retried
+            .iter()
+            .map(|retried| retried_attempt_json(retried))
+            .collect::<Vec<_>>(),
         "host_inapplicable": host_inapplicable,
         "cell_cpu_usage_usec": cell_cpu_usage_usec,
         "host_inapplicable_cells": results
@@ -3026,7 +3672,9 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     });
     if let (Some(import_root), Some(imported)) = (&import_root, &imported) {
         summary["imported"] = serde_json::json!({
-            "root": import_root,
+            // Absolute, so `parity compare` finds the restored logs from any
+            // directory (`recorded_import_root`).
+            "root": std::path::absolute(import_root).unwrap_or_else(|_| import_root.clone()),
             "source_run_ids": imported.source_run_ids,
             "missing_cells": imported.missing,
             "dropped_retries": imported.dropped_retries,
@@ -3056,6 +3704,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         &results_path,
         capacity,
         &attempt_results,
+        import_root.as_deref(),
     );
     exit
 }
@@ -3177,23 +3826,23 @@ fn planned_verify(cells: &[SelectedCell]) -> BTreeSet<(String, String)> {
         .collect()
 }
 
-/// The parity cells this run reports on: the committed selection and
+/// The parity cells this run reports on: the parity population and
 /// `E2E_PARITY_SELECT`, resolved by [`parity::resolve_scope`], the same rule
-/// the pressure test uses: the cells with a verify side planned here. An
-/// explicit cell with neither side planned is dropped with a warning.
-/// `E2E_PARITY_POST_PASS=0` turns the post-pass off. A selection file that
-/// cannot be read only warns, because the parity report must never stop the
+/// the pressure test uses: the cells with a verify side planned here, with
+/// why each candidate full validation does not run has no log. An explicit
+/// cell with neither side planned is dropped with a warning.
+/// `E2E_PARITY_POST_PASS=0` turns the post-pass off. A matrix that cannot be
+/// derived only warns, because the parity report must never stop the
 /// determinism cells. An invalid `E2E_PARITY_SELECT` or `E2E_PARITY_POST_PASS`
 /// is a usage error, refused before any cell runs or any output is created.
 fn parity_scope(
-    root: &Path,
     manifests: &ManifestSet,
     planned: &BTreeSet<(String, String)>,
-) -> BTreeSet<ParityCellId> {
+) -> parity::ResolvedScope {
     match std::env::var(parity::PARITY_POST_PASS_ENV) {
         Err(std::env::VarError::NotPresent) => {}
         Ok(value) if value == "1" => {}
-        Ok(value) if value == "0" => return BTreeSet::new(),
+        Ok(value) if value == "0" => return parity::ResolvedScope::default(),
         Ok(value) => fail(format!(
             "{} must be 0 or 1, got {value:?}",
             parity::PARITY_POST_PASS_ENV
@@ -3203,12 +3852,12 @@ fn parity_scope(
         }
     }
     let explicit = std::env::var(parity::PARITY_SELECT_ENV).ok();
-    match parity::resolve_scope(root, manifests, explicit.as_deref(), planned) {
+    match parity::resolve_scope(manifests, explicit.as_deref(), planned) {
         Ok(scope) => {
             for warning in &scope.warnings {
                 eprintln!("test-harness: {warning}");
             }
-            scope.cells
+            scope
         }
         Err(error) => fail(format!("{}: {error}", parity::PARITY_SELECT_ENV)),
     }
@@ -3248,26 +3897,33 @@ fn mark_parity_running(scope: &BTreeSet<ParityCellId>, context: &RunContext, res
 /// `parity.status.json` and `parity/` beside them, inside the enclosing
 /// dagrun step's wall bound, and returns nothing: an error, or even a panic,
 /// is reported and the exit status stays what determinism made it. With no
-/// cell in scope it only removes an earlier run's parity outputs.
+/// cell in scope it only removes an earlier run's parity outputs. For an
+/// imported run (`import_root`) the logs are the ones the ingest restored
+/// below that root ([`parity::ImportedLogs`]).
 fn report_parity(
-    scope: &BTreeSet<ParityCellId>,
+    resolved: &parity::ResolvedScope,
     context: &RunContext,
     results_path: &Path,
     capacity: ScheduledWorkerCapacity,
     attempt_results: &[Vec<CellResult>],
+    import_root: Option<&Path>,
 ) {
     let Some(artifacts) = results_path.parent() else {
         eprintln!("test-harness: parity post-pass skipped: results path has no directory");
         return;
     };
+    let scope = &resolved.cells;
     let mut config = parity::PostPassConfig::new(
         artifacts,
         &context.hermit_bin,
         &context.run_id,
         &context.source_sha,
-    );
+    )
+    .naming_roots(&context.result_root, &context.root);
     config.jobs = capacity.workers_for(scope.len());
     config.outer_deadline = parity::dagrun_step_deadline();
+    config.imported_logs = import_root.map(parity::ImportedLogs::load);
+    config.candidate_not_run = resolved.candidate_not_run.clone();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
         if std::env::var_os("HERMIT_PARITY_POST_PASS_PANIC").is_some() {
@@ -3314,9 +3970,18 @@ struct ParityExportRequest {
     expected_scope: Option<PathBuf>,
 }
 
+struct ParityOutcomesRequest {
+    e2e_root: PathBuf,
+    repo_root: Option<PathBuf>,
+    backends: Vec<parity::ParityBackend>,
+    json: bool,
+    baseline: Option<PathBuf>,
+}
+
 enum ParityRequest {
     Compare(ParityCompareRequest),
     Export(ParityExportRequest),
+    Outcomes(ParityOutcomesRequest),
 }
 
 fn parse_parity(values: Vec<String>) -> ParityRequest {
@@ -3328,8 +3993,10 @@ fn parse_parity(values: Vec<String>) -> ParityRequest {
     match values.next().as_deref() {
         Some("compare") => ParityRequest::Compare(parse_parity_compare(values)),
         Some("export") => ParityRequest::Export(parse_parity_export(values)),
+        Some("outcomes") => ParityRequest::Outcomes(parse_parity_outcomes(values)),
         Some(other) => fail(format!(
-            "unknown parity command {other:?}; expected `parity compare` or `parity export`"
+            "unknown parity command {other:?}; expected `parity compare`, `parity export` or \
+             `parity outcomes`"
         )),
         None => fail("parity requires a command; try `test-harness parity --help`"),
     }
@@ -3356,6 +4023,209 @@ fn parse_parity_export(mut values: impl Iterator<Item = String>) -> ParityExport
         })),
         expected_scope: expected_scope.map(PathBuf::from),
     }
+}
+
+fn parse_parity_outcomes(mut values: impl Iterator<Item = String>) -> ParityOutcomesRequest {
+    let mut e2e_root = None;
+    let mut repo_root = None;
+    let mut baseline = None;
+    let mut backends = Vec::new();
+    let mut json = false;
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--e2e-root" => set_once(&mut e2e_root, &mut values, "--e2e-root"),
+            "--baseline" => set_once(&mut baseline, &mut values, "--baseline"),
+            "--repo-root" => set_once(&mut repo_root, &mut values, "--repo-root"),
+            "--backend" => {
+                let value = required_value(&mut values, "--backend");
+                let backend =
+                    parity::ParityBackend::parse(&value).unwrap_or_else(|error| fail(error));
+                if backends.contains(&backend) {
+                    fail(format!("--backend {value} is repeated"));
+                }
+                backends.push(backend);
+            }
+            "--json" => json = true,
+            other => fail(format!(
+                "unknown option {other} for parity outcomes; try `test-harness parity --help`"
+            )),
+        }
+    }
+    if backends.is_empty() {
+        backends = parity::ParityBackend::ALL.to_vec();
+    }
+    ParityOutcomesRequest {
+        e2e_root: PathBuf::from(e2e_root.unwrap_or_else(|| {
+            fail("parity outcomes requires --e2e-root <DIR>, the run's e2e result root")
+        })),
+        repo_root: repo_root.map(PathBuf::from),
+        backends,
+        json,
+        baseline: baseline.map(PathBuf::from),
+    }
+}
+
+/// `test-harness parity outcomes`: per candidate backend, the cells whose
+/// outcome differs from ptrace's, and with a baseline the ones that stopped
+/// matching.
+fn parity_outcomes(manifests: &ManifestSet, request: &ParityOutcomesRequest) -> ExitCode {
+    use hermit_manifest_plan::parity_outcomes;
+    let report = parity_outcomes::compare(manifests, &request.e2e_root, &request.backends)
+        .unwrap_or_else(|error| fail(format!("parity outcomes: {error}")));
+    let mut out = std::io::stdout().lock();
+    let mut lines = Vec::new();
+    if request.json {
+        for row in &report.differences {
+            lines.push(serde_json::to_string(row).expect("a difference serializes"));
+        }
+        for cell in &report.considered {
+            let line = parity_outcomes::ConsideredLine {
+                considered: cell.clone(),
+            };
+            lines.push(serde_json::to_string(&line).expect("a considered cell serializes"));
+        }
+    } else {
+        lines.push(format!(
+            "parity outcomes against ptrace: {} result rows in {} results.jsonl files under {} \
+             (Hermit {}); {} test/mode cells considered, {} with a ptrace row; {} final row(s) \
+             name a test and mode these manifests do not declare and are not compared",
+            report.rows,
+            report.results_files.len(),
+            request.e2e_root.display(),
+            report
+                .hermit_shas
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            report.considered.len(),
+            report.reference_rows,
+            report.undeclared_rows,
+        ));
+        for backend in &request.backends {
+            let rows = report
+                .differences
+                .iter()
+                .filter(|row| row.backend == backend.as_str())
+                .collect::<Vec<_>>();
+            let mut by_outcome: BTreeMap<String, usize> = BTreeMap::new();
+            for row in &rows {
+                *by_outcome
+                    .entry(format!("ptrace {} -> {}", row.reference, row.candidate))
+                    .or_default() += 1;
+            }
+            lines.push(format!(
+                "{backend}: {} of {} cells differ from ptrace ({})",
+                rows.len(),
+                report.considered.len(),
+                by_outcome
+                    .iter()
+                    .map(|(outcome, count)| format!("{outcome}: {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            for row in rows {
+                let mut reason = row.reason.clone().unwrap_or_default();
+                if reason.len() > 160 {
+                    let mut end = 160;
+                    while !reason.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    reason.truncate(end);
+                    reason.push_str("...");
+                }
+                lines.push(format!(
+                    "  {} {}: ptrace={} {backend}={}{}",
+                    row.test,
+                    row.mode,
+                    row.reference,
+                    row.candidate,
+                    if reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({reason})")
+                    }
+                ));
+            }
+        }
+    }
+    let mut code = ExitCode::SUCCESS;
+    if let Some(path) = &request.baseline {
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|error| fail(format!("cannot read {}: {error}", path.display())));
+        let baseline = parity_outcomes::parse_baseline(&text)
+            .unwrap_or_else(|error| fail(format!("{}: {error}", path.display())));
+        let gate = parity_outcomes::gate(&baseline, &report.differences, &request.backends);
+        let cell = |row: &parity_outcomes::OutcomeDifference| {
+            format!("{}@{}/{}", row.test, row.backend, row.mode)
+        };
+        let mut gate_lines = vec![format!(
+            "baseline {}: {} cell(s) stopped matching ptrace, {} started matching, {} changed \
+             outcome, {} new cell(s) differ{}",
+            path.display(),
+            gate.regressions.len(),
+            gate.newly_matching.len(),
+            gate.changed.len(),
+            gate.new_cells.len(),
+            if baseline.considered.is_some() {
+                " (tests or modes the baseline did not consider)"
+            } else {
+                " (this baseline does not record the cells it considered, so new cells count as \
+                 stopped matching)"
+            }
+        )];
+        for row in &gate.regressions {
+            gate_lines.push(format!(
+                "  STOPPED MATCHING {}: ptrace={} candidate={}",
+                cell(row),
+                row.reference,
+                row.candidate
+            ));
+        }
+        for row in &gate.newly_matching {
+            gate_lines.push(format!(
+                "  started matching {} (was ptrace={} candidate={})",
+                cell(row),
+                row.reference,
+                row.candidate
+            ));
+        }
+        for row in &gate.new_cells {
+            gate_lines.push(format!(
+                "  new cell {}: ptrace={} candidate={}",
+                cell(row),
+                row.reference,
+                row.candidate
+            ));
+        }
+        for (before, now) in &gate.changed {
+            gate_lines.push(format!(
+                "  changed {}: ptrace={} candidate={} -> ptrace={} candidate={}",
+                cell(now),
+                before.reference,
+                before.candidate,
+                now.reference,
+                now.candidate
+            ));
+        }
+        // JSONL stays the only thing on stdout, so the gate goes to stderr.
+        for line in gate_lines {
+            if request.json {
+                eprintln!("{line}");
+            } else {
+                lines.push(line);
+            }
+        }
+        if !gate.regressions.is_empty() {
+            code = ExitCode::FAILURE;
+        }
+    }
+    for line in lines {
+        if let Err(error) = writeln!(out, "{line}") {
+            fail(format!("cannot write parity outcomes: {error}"));
+        }
+    }
+    code
 }
 
 /// `test-harness parity export`: the ledger source rows of a finished run's
@@ -3466,16 +4336,9 @@ fn parity_compare(
         rows.iter().map(|row| row.hermit_sha.as_str()).collect(),
         "hermit_sha",
     );
-    let hermit_bin =
-        hermit_manifest_plan::runner::resolve_hermit_bin(root, std::env::var_os("HERMIT_BIN"));
-    let mut config =
-        parity::PostPassConfig::new(&request.artifacts, &hermit_bin, &run_id, &hermit_sha)
-            .writing_below(&request.artifacts.join(PARITY_COMPARE_DIR));
-    if let Some(output) = &request.output {
-        config.output = output.clone();
-    }
-    config.jobs = request.jobs;
-    config.outer_deadline = parity::dagrun_step_deadline();
+    let mut config = parity_compare_config(root, request, &run_id, &hermit_sha)
+        .unwrap_or_else(|error| fail(error));
+    config.candidate_not_run = matrix.candidates_not_run(&scope);
     let report = parity::post_pass(&config, &scope, &rows).unwrap_or_else(|error| fail(error));
     for record in &report.records {
         println!(
@@ -3485,6 +4348,74 @@ fn parity_compare(
     }
     eprintln!("test-harness: {}", report.summary_line());
     ExitCode::SUCCESS
+}
+
+/// The post-pass configuration `parity compare` measures the finished run in
+/// `request.artifacts` with: its outputs below that run's
+/// `PARITY_COMPARE_DIR`, and an imported run's logs read from where its
+/// ingest restored them (`recorded_import_root`).
+fn parity_compare_config(
+    root: &Path,
+    request: &ParityCompareRequest,
+    run_id: &str,
+    hermit_sha: &str,
+) -> Result<parity::PostPassConfig, String> {
+    let import_root = recorded_import_root(&request.artifacts)?;
+    // An imported run's logs are compared with the Hermit its Buck cells ran, as its own
+    // post-pass compares them (`RunContext::for_import`).
+    let hermit_bin = if import_root.is_some() {
+        hermit_manifest_plan::runner::resolve_import_hermit_bin(
+            root,
+            std::env::var_os("HERMIT_BIN"),
+        )
+    } else {
+        hermit_manifest_plan::runner::resolve_hermit_bin(root, std::env::var_os("HERMIT_BIN"))
+    };
+    let mut config =
+        parity::PostPassConfig::new(&request.artifacts, &hermit_bin, run_id, hermit_sha)
+            .writing_below(&request.artifacts.join(PARITY_COMPARE_DIR));
+    if let Some(output) = &request.output {
+        config.output = output.clone();
+    }
+    config.jobs = request.jobs;
+    config.outer_deadline = parity::dagrun_step_deadline();
+    config.imported_logs = import_root.map(|root| parity::ImportedLogs::load(&root));
+    Ok(config)
+}
+
+/// The import root the finished run in `artifacts` recorded in its
+/// summary.json, or None when it imported nothing. Its rows record verify-log
+/// directories on the machines that ran the cells, so `parity compare` must
+/// read an imported run's logs from where the ingest restored them, as the
+/// run's own post-pass does (`report_parity`); without its summary, whether
+/// the run imported is unknown, so the comparison is refused.
+fn recorded_import_root(artifacts: &Path) -> Result<Option<PathBuf>, String> {
+    let path = artifacts.join("summary.json");
+    let text = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "cannot read {}, so whether the run imported its rows is unknown: {error}",
+            path.display()
+        )
+    })?;
+    let summary: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let Some(summary) = summary.as_object() else {
+        return Err(format!(
+            "{} is not a JSON object, so whether the run imported its rows is unknown",
+            path.display()
+        ));
+    };
+    let Some(imported) = summary.get("imported") else {
+        return Ok(None);
+    };
+    match imported.get("root").and_then(serde_json::Value::as_str) {
+        Some(root) if Path::new(root).is_absolute() => Ok(Some(PathBuf::from(root))),
+        _ => Err(format!(
+            "{} records an import with no absolute \"root\", so the verify logs it restored \
+             cannot be found",
+            path.display()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -3497,6 +4428,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use hermit_manifest_plan::parity;
     use hermit_manifest_plan::runner::FailureClass;
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
@@ -3507,16 +4439,19 @@ mod tests {
     use super::EXPECTED_PLAN_SCHEMA;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
+    use super::JsonValue;
     use super::PINNED_COMMAND_PREFIX;
     use super::PINNED_COMMAND_SEPARATOR;
     use super::PREBUILT_COMMAND_PREFIX;
     use super::SelectedCell;
     use super::TestResults;
+    use super::YamlValue;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
     use super::audit_run_dag_workflow_runner;
     use super::audit_validation_levels_policy;
     use super::build_worker_capacity;
+    use super::cell_host_inapplicable_reason;
     use super::cell_result_is_retryable;
     use super::command_jobs;
     use super::command_runs_exactly;
@@ -3528,6 +4463,7 @@ mod tests {
     use super::parse;
     use super::planned_verify;
     use super::print_best_effort;
+    use super::required_plan_rows;
     use super::run_cells;
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
@@ -3558,11 +4494,21 @@ mod tests {
             "tests::production_mixed_selection_runs_each_verify_cell_on_its_own_backend";
         if let Some(fixture) = std::env::var_os(CHILD) {
             let fixture = PathBuf::from(fixture);
+            // Run against the fixture as a Git-less source snapshot
+            // (`--repo-root` plus `--source-sha`), as the skid test does, not
+            // against this checkout: describing the checkout runs `git status`
+            // over every tracked file, which rehashes the whole tree in the
+            // validation container (https://github.com/rrnewton/hermit/issues/1845).
+            // No assertion here reads the source identity.
             let values = vec![
                 "--category".into(),
                 "parity".into(),
                 "--ci-only".into(),
                 "--prebuilt".into(),
+                "--repo-root".into(),
+                fixture.display().to_string(),
+                "--source-sha".into(),
+                "0123456789abcdef0123456789abcdef01234567".into(),
                 "--jobs".into(),
                 "1".into(),
                 "--results".into(),
@@ -3573,11 +4519,7 @@ mod tests {
             let args = parse(values.into_iter());
             validate_args("run", &args);
             let manifests = ManifestSet::load(&fixture).unwrap();
-            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .canonicalize()
-                .unwrap();
-            assert_eq!(super::run(&root, &manifests, &args), ExitCode::SUCCESS);
+            assert_eq!(super::run(&fixture, &manifests, &args), ExitCode::SUCCESS);
             return;
         }
 
@@ -3600,7 +4542,8 @@ mod tests {
             let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
                 "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
                 "kvm": "Not selected by this control", "sabre": "Not selected by this control",
-                "liteinst": "Not selected by this control"
+                "liteinst": "Not selected by this control",
+                "in-guest-trap": "Not selected by this control"
             }});
             fs::write(manifests.join("parity.yaml"), serde_json::to_vec(&json!({
                 "schema": 3, "bucket": "parity", "test": [{
@@ -3609,12 +4552,12 @@ mod tests {
                     "observation": {"status": true, "stdout": true, "stderr": true},
                     "modes": {
                         "verify": {"ci": true, "backends_enabled": ["ptrace", "kvm"],
-                            "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"}},
+                            "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"}},
                         "naked": {"ci": false, "backends_enabled": [],
                             "backends_disabled": {"native": "Not selected by this CI control"}},
                         "chaos": disabled, "replay": disabled,
                         "custom": {"ci": true, "backends_enabled": ["kvm"],
-                            "backends_disabled": {"ptrace": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"},
+                            "backends_disabled": {"ptrace": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"},
                             "assert": {"runs": 1}}
                     }
                 }]
@@ -3667,23 +4610,32 @@ scenario=(root/'scenario').read_text()
 def record(value):
  with (root/'invocations').open('a') as f:f.write(json.dumps(value)+'\n')
 if a[0]=='log-diff':
+ if '--verify-json' in a:
+  # The comparison of a verify cell's two runs, which plays the scenario.
+  run1=pathlib.Path(a[-2])
+  backend=json.loads((run1/'verify-run.json').read_text())['backend']
+  report=pathlib.Path(a[a.index('--verify-json')+1])
+  logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
+  record({'kind':'verify-compare','backend':backend,'argv':a})
+  logdir.mkdir(parents=True,exist_ok=True)
+  value='different' if scenario=='diverged' and backend=='kvm' else 'shared'
+  (logdir/'run1_log_fixture.log').write_text('INFO detcore: '+value+'\nINFO detcore: complete\n')
+  report.write_bytes((root/'verification.json').read_bytes())
+  sys.exit(0)
  if len(a)==2:
   record({'kind':'normalize','argv':a});sys.stdout.buffer.write(pathlib.Path(a[1]).read_bytes());sys.exit(0)
  record({'kind':'compare','argv':a});sys.exit(3)
 # `--backend` is a global option, so it precedes `run`.
 backend=full[full.index('--backend')+1]
-if '--verify-json' not in a:
+if '--verify-run' not in a:
  assert '--verify' not in a and '--verify-strict' not in a,a
  record({'kind':'custom','backend':backend,'argv':a});sys.exit(0)
-report=pathlib.Path(a[a.index('--verify-json')+1])
-logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
-reference='parity-reference' in str(logdir)
+rundir=pathlib.Path(a[a.index('--verify-run')+1])
+reference='parity-reference' in str(rundir)
 record({'kind':'run','backend':backend,'reference':reference,'argv':a})
-assert '--verify-strict' in a and '--verify' in a,a
-logdir.mkdir(parents=True,exist_ok=True)
-value='different' if scenario=='diverged' and backend=='kvm' else 'shared'
-(logdir/'run1_log_fixture.log').write_text('INFO detcore: '+value+'\nINFO detcore: complete\n')
-report.write_bytes((root/'verification.json').read_bytes())
+assert '--verify-strict' in a and '--verify' not in a,a
+rundir.mkdir()
+(rundir/'verify-run.json').write_text(json.dumps({'backend':backend}))
 "#,
             )
             .unwrap();
@@ -3702,6 +4654,13 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .env("E2E_MACHINE_SHORTNAME", "native-control")
                 .env("E2E_KERNEL_VERSION", "native-control")
                 .env("E2E_KEEP_VERIFY_LOGS", "1")
+                // parity/mixed's ptrace verify cell is required, so its kvm
+                // cell is in the parity population and the post-pass would
+                // compare it. This control is about routing and log
+                // retention, which launch no `log-diff`; the post-pass has
+                // its own test
+                // (the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest).
+                .env("E2E_PARITY_POST_PASS", "0")
                 .env("DAGRUN_TEST_COUNTS_PATH", path.join("counts.json"))
                 .output()
                 .unwrap();
@@ -3713,8 +4672,10 @@ report.write_bytes((root/'verification.json').read_bytes())
                 String::from_utf8_lossy(&result.stdout),
                 String::from_utf8_lossy(&result.stderr)
             );
-            let rows = fs::read_to_string(path.join("results.jsonl"))
-                .unwrap()
+            let results = fs::read_to_string(path.join("results.jsonl")).unwrap();
+            // No row carries the retired cross-backend report.
+            assert!(!results.contains("\"backend_parity\""), "{scenario}");
+            let rows = results
                 .lines()
                 .map(|line| {
                     serde_json::from_str::<hermit_manifest_plan::runner::CellResult>(line).unwrap()
@@ -3734,7 +4695,6 @@ report.write_bytes((root/'verification.json').read_bytes())
                 assert_eq!(row.execution_wall_timeout_seconds, Some(10));
                 assert_eq!(row.outcome, "PASS", "{scenario}: {row:#?}");
                 assert_eq!(row.result, Some(ObservedResult::Pass), "{scenario}");
-                assert!(row.backend_parity.is_none(), "{scenario}");
                 assert_eq!(row.attempts.len(), 1, "{scenario}: {row:#?}");
             }
             for (mode, backend) in [("verify", "ptrace"), ("verify", "kvm"), ("custom", "kvm")] {
@@ -3763,13 +4723,17 @@ report.write_bytes((root/'verification.json').read_bytes())
             // removed: parity canonicalizes run 1's log when it compares. The
             // fake still records a single-log call as "normalize" and a
             // two-log comparison as "compare", so either would fail this.
-            assert_eq!(calls.len(), 3, "{scenario}: {calls:#?}");
+            // Each verify cell runs its guest twice and compares the two
+            // runs (`VERIFY_PAIR_SCRIPT`); the custom cell runs once.
+            assert_eq!(calls.len(), 7, "{scenario}: {calls:#?}");
             assert_eq!(
                 kinds,
                 BTreeSet::from([
                     "custom:kvm:false".to_string(),
                     "run:kvm:false".to_string(),
                     "run:ptrace:false".to_string(),
+                    "verify-compare:kvm:false".to_string(),
+                    "verify-compare:ptrace:false".to_string(),
                 ]),
                 "{scenario}: no ptrace reference run and no log-diff comparison"
             );
@@ -3779,6 +4743,1211 @@ report.write_bytes((root/'verification.json').read_bytes())
                     .all(|call| call["kind"] != "normalize" && call["kind"] != "compare"),
                 "{scenario}: E2E_KEEP_VERIFY_LOGS launched a log-diff: {calls:#?}"
             );
+        }
+    }
+
+    /// A verify attempt whose only failure is Hermit's typed precise-timer
+    /// overshoot earns one SKID-RETRY, which is counted on the summary line,
+    /// named in summary.json and kept as a row; a second overshoot fails the
+    /// cell loudly (<https://github.com/rrnewton/hermit/issues/1845>). An
+    /// overshoot report without its stderr markers, a run with `--no-retry`,
+    /// a divergence that merely prints the markers, and an overshoot beside a
+    /// rejected guest disposition (run 1 exited 1 so Hermit wrote its skid
+    /// report without a comparison, or a compared run 2 died from a signal)
+    /// are never SKID-RETRIES. Neither is an overshoot whose compared runs
+    /// printed something other than the cell's declared `expected_stdout`:
+    /// that attempt keeps the skid infrastructure ERROR, with a reason naming
+    /// both, is never retried, and the cell stays red.
+    /// The cap line names the outcome the whole history selects: after a
+    /// divergence and then an overshoot, that is the divergence's FAIL.
+    /// Imported (`E2E_IMPORT_RESULTS`), the skid-then-pass history earns the
+    /// same counted SKID-RETRY and selects the same PASS as executed, with no
+    /// producer retry dropped. So does one whose producer ran at the relaxed level
+    /// (as a Buck RE worker without CPUID faulting does) and recorded that
+    /// level's flag, imported at this host's level. An imported skid row its retained evidence does
+    /// not decide as typed skid-only (a report that does not match its digest,
+    /// another stdout declaration, a vacuous comparison, other relaxations, an
+    /// undecided SaBRe path), and an imported ERROR that is not a skid at all,
+    /// ends the history: that ERROR is the cell's verdict and the PASS after
+    /// it is dropped.
+    #[test]
+    fn a_skid_overshoot_only_verify_attempt_earns_one_counted_skid_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::process::ExitCode;
+
+        use hermit_manifest_plan::runner::Selection;
+        use serde_json::json;
+
+        const CHILD: &str = "HERMIT_SKID_RETRY_FIXTURE";
+        // Where an import-mode child publishes, beside the executed run's
+        // output it imports.
+        const IMPORT_OUT: &str = "HERMIT_SKID_RETRY_FIXTURE_IMPORT_OUT";
+        const TEST: &str =
+            "tests::a_skid_overshoot_only_verify_attempt_earns_one_counted_skid_retry";
+        // The commit the fixture snapshot names. Each child runs against the
+        // fixture as a Git-less source snapshot (`--repo-root` plus
+        // `--source-sha`), never against this checkout: describing the
+        // checkout runs `git status` over every tracked file, and in the
+        // validation container (files owned by another uid, Git metadata
+        // mounted read-only) that rehashes the whole tree in each of this
+        // test's 28 child runs. That alone exhausted the test's 22 s CPU
+        // budget (https://github.com/rrnewton/hermit/issues/1845).
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        if let Some(fixture) = std::env::var_os(CHILD) {
+            let fixture = PathBuf::from(fixture);
+            let out = std::env::var_os(IMPORT_OUT).map_or_else(|| fixture.clone(), PathBuf::from);
+            let mut values = vec![
+                "--category".to_string(),
+                "parity".into(),
+                "--ci-only".into(),
+                "--prebuilt".into(),
+                "--repo-root".into(),
+                fixture.display().to_string(),
+                "--source-sha".into(),
+                SHA.into(),
+                "--jobs".into(),
+                "1".into(),
+                "--results".into(),
+                out.join("results.jsonl").display().to_string(),
+                "--junit".into(),
+                out.join("junit.xml").display().to_string(),
+            ];
+            if fs::read_to_string(fixture.join("scenario")).unwrap() == "skid-no-retry" {
+                values.push("--no-retry".into());
+            }
+            let args = parse(values.into_iter());
+            validate_args("run", &args);
+            let manifests = ManifestSet::load(&fixture).unwrap();
+            let code = super::run(&fixture, &manifests, &args);
+            std::process::exit(if code == ExitCode::SUCCESS { 0 } else { 1 });
+        }
+
+        let output = json!({"exit_code": 0, "signal": null,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stdout_bytes": 0, "stderr_bytes": 0});
+        let matched = json!({
+            "verified": true, "bitwise_parity": true, "verdict": "matched",
+            "no_result_reason": null, "infrastructure_error": null,
+            "comparison": {"strictness": "canonical", "display_name": "BitwiseInfoV1",
+                "compare_logs": true, "compare_io_buffers": true, "log_scope": "info",
+                "record_envelope": "all_records_v1", "virtualize_time": true,
+                "strip_lines": false, "canonicalize_addresses": true, "full_trace": true,
+                "exact_remainder": true, "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+                "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+                "ignore_lines": false, "skip_commit": false, "skip_detlog": false},
+            "compared_log_messages": {"left": 2, "right": 2},
+            "compared_outputs": {"left": output, "right": output},
+            "guest_exit_code": 0, "guest_signal": null,
+            "first_divergent_scheduler_turn": null, "first_divergent_virtual_nanoseconds": null,
+            "first_divergent_record": null, "first_divergent_syscall": null,
+            "first_divergent_left_message": null, "first_divergent_right_message": null
+        });
+        let mut skid = matched.clone();
+        skid["verified"] = json!(false);
+        skid["bitwise_parity"] = json!(false);
+        skid["verdict"] = json!("infrastructure_error");
+        skid["infrastructure_error"] = json!({"kind": "skid_overshoot", "count": 2});
+        let mut diverged = matched.clone();
+        diverged["verified"] = json!(false);
+        diverged["bitwise_parity"] = json!(false);
+        diverged["verdict"] = json!("diverged");
+        diverged["first_divergent_scheduler_turn"] = json!(4);
+        diverged["first_divergent_virtual_nanoseconds"] = json!(7);
+        diverged["first_divergent_record"] = json!(9);
+        diverged["first_divergent_syscall"] = json!(2);
+        diverged["first_divergent_left_message"] = json!("left");
+        diverged["first_divergent_right_message"] = json!("right");
+        // Hermit's skid report when run 1 exited 1, which the verify policy
+        // rejects: no comparison, and run 1's rejected status.
+        let rejected = json!({
+            "verified": false, "bitwise_parity": false, "verdict": "infrastructure_error",
+            "no_result_reason": null,
+            "infrastructure_error": {"kind": "skid_overshoot", "count": 2},
+            "comparison": null, "compared_log_messages": null, "compared_outputs": null,
+            "runtime": null, "guest_exit_code": 1, "guest_signal": null,
+            "first_divergent_scheduler_turn": null, "first_divergent_virtual_nanoseconds": null,
+            "first_divergent_record": null, "first_divergent_syscall": null,
+            "first_divergent_left_message": null, "first_divergent_right_message": null
+        });
+        // A completed comparison whose run 2 died from SIGSEGV.
+        let mut crashed = skid.clone();
+        crashed["compared_outputs"]["right"]["exit_code"] = json!(null);
+        crashed["compared_outputs"]["right"]["signal"] = json!(11);
+        for report in [&matched, &skid, &diverged, &rejected, &crashed] {
+            hermit_manifest_plan::canonical_verdict::VerificationReport::from_current_json_slice(
+                &serde_json::to_vec(report).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let real_cell = |test: &str| {
+            manifests
+                .select(&Selection {
+                    test: Some(test.into()),
+                    mode: Some("verify".into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..Selection::default()
+                })
+                .unwrap()
+                .remove(0)
+        };
+
+        // (scenario, harness exit success, attempts launched, SKID-RETRY
+        // count, PRODUCT-RETRY count)
+        for (scenario, succeeds, launched, skid_retries, product_retries) in [
+            ("skid-then-match", true, 2, 1, 0),
+            ("skid-then-match-sabre", true, 2, 1, 0),
+            ("skid-then-match-relaxed-producer", true, 2, 1, 0),
+            ("skid-twice", false, 2, 1, 0),
+            ("skid-no-retry", false, 1, 0, 0),
+            ("unmarked-skid", false, 1, 0, 0),
+            ("diverged-marked", false, 2, 0, 1),
+            ("diverged-then-skid", false, 2, 0, 1),
+            ("unmarked-diverged-then-match", true, 2, 0, 1),
+            ("rejected-guest-skid", false, 1, 0, 0),
+            ("crashed-operand-skid", false, 1, 0, 0),
+            ("skid-wrong-stdout", false, 1, 0, 0),
+        ] {
+            let fixture = std::env::temp_dir().join(format!(
+                "hermit-harness-skid-retry-{}-{:?}-{scenario}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(&fixture);
+            fs::create_dir(&fixture).unwrap();
+            let path = fixture.as_path();
+            // The SaBRe scenario runs the same history on the one backend
+            // whose rows carry execution-path evidence.
+            let backend = if scenario == "skid-then-match-sabre" {
+                "sabre"
+            } else {
+                "ptrace"
+            };
+            fs::write(path.join("scenario"), scenario).unwrap();
+            for (name, report) in [
+                ("matched", &matched),
+                ("skid", &skid),
+                ("diverged", &diverged),
+                ("rejected", &rejected),
+                ("crashed", &crashed),
+            ] {
+                fs::write(
+                    path.join(format!("{name}.json")),
+                    serde_json::to_vec(report).unwrap(),
+                )
+                .unwrap();
+            }
+            let manifests_dir = path.join("tests/e2e/manifests");
+            fs::create_dir_all(&manifests_dir).unwrap();
+            fs::write(
+                manifests_dir.join("defaults.yaml"),
+                "schema: 3\ntimeout_seconds: 10\ncpu_timeout_seconds: 5\n",
+            )
+            .unwrap();
+            let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
+                "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
+                "kvm": "Not selected by this control", "sabre": "Not selected by this control",
+                "liteinst": "Not selected by this control",
+                "in-guest-trap": "Not selected by this control"
+            }});
+            let mut verify = if backend == "sabre" {
+                json!({"ci": true, "backends_enabled": ["sabre"],
+                    "backends_disabled": {"ptrace": "Not selected", "kvm": "Not selected", "dbt": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"}})
+            } else {
+                json!({"ci": true, "backends_enabled": ["ptrace"],
+                    "backends_disabled": {"kvm": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"}})
+            };
+            if scenario == "skid-wrong-stdout" {
+                // Every fixture report records empty stdout from both runs, so
+                // the skid attempt violates this declaration; no retry follows.
+                verify["expected_stdout"] = json!({"ptrace": "skid-control-ok\n"});
+            }
+            fs::write(
+                manifests_dir.join("parity.yaml"),
+                serde_json::to_vec(&json!({
+                    "schema": 3, "bucket": "parity", "test": [{
+                        "id": "parity/skid", "description": "Precise-timer overshoot retry control",
+                        "lane": "portable", "occasional": false, "direct": ["/bin/true"],
+                        "observation": {"status": true, "stdout": true, "stderr": true},
+                        "modes": {
+                            "verify": verify,
+                            "naked": {"ci": false, "backends_enabled": [],
+                                "backends_disabled": {"native": "Not selected by this CI control"}},
+                            "chaos": disabled, "replay": disabled, "custom": disabled
+                        }
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let hermit = path.join("fake-hermit");
+            fs::write(
+                &hermit,
+                r#"#!/usr/bin/python3
+import json,os,pathlib,sys
+root=pathlib.Path(__file__).parent
+a=sys.argv[1:]
+if '--help' in a:
+ print('--verify-strict');sys.exit(0)
+evidence=os.environ.get('HERMIT_SABRE_PATH_EVIDENCE')
+if 'run' in a and '--verify-run' in a:
+ # One run of the pair: its record; the comparison below plays the scenario.
+ d=pathlib.Path(a[a.index('--verify-run')+1]);d.mkdir();(d/'verify-run.json').write_text('{}\n')
+ if evidence:
+  with open(evidence,'a') as f:f.write('{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}\n')
+ sys.exit(0)
+if 'log-diff' not in a:sys.exit(0)
+a=a[a.index('log-diff'):]
+calls=root/'invocations'
+n=len(calls.read_text().splitlines()) if calls.exists() else 0
+with calls.open('a') as f:f.write(json.dumps(a)+'\n')
+plan={'skid-then-match':['skid','matched'],'skid-then-match-sabre':['skid','matched'],
+ 'skid-then-match-relaxed-producer':['skid','matched'],
+ 'skid-twice':['skid','skid'],
+ 'skid-no-retry':['skid'],'unmarked-skid':['unmarked'],'diverged-marked':['diverged','diverged'],
+ 'diverged-then-skid':['diverged','skid'],'rejected-guest-skid':['rejected'],
+ 'crashed-operand-skid':['crashed'],'skid-wrong-stdout':['skid','matched'],
+ 'unmarked-diverged-then-match':['unmarked-diverged','matched']}
+kind=plan[(root/'scenario').read_text()][n]
+report=pathlib.Path(a[a.index('--verify-json')+1])
+logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
+logdir.mkdir(parents=True,exist_ok=True)
+(logdir/'run1_log_fixture.log').write_text('INFO detcore: shared\nINFO detcore: complete\n')
+report.write_bytes((root/({'unmarked':'skid','unmarked-diverged':'diverged'}.get(kind,kind)+'.json')).read_bytes())
+if kind in ('skid','diverged','rejected','crashed'):
+ sys.stderr.write('HERMIT_SKID_OVERSHOOT rcb_actual=39951476 rcb_target=39950647 skid_margin=1000 overshoot=829\n'
+  'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2\n')
+sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'diverged':1,'unmarked-diverged':1}[kind])
+"#,
+            )
+            .unwrap();
+            fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+            let result = Command::new("timeout")
+                .args(["--kill-after=2s", "60s"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env(CHILD, path)
+                .env("HERMIT_BIN", &hermit)
+                .env("E2E_RESULT_ROOT", path.join("artifacts"))
+                .env("E2E_BUILD_ROOT", path.join("build"))
+                .env("E2E_RUN_ID", "skid-retry-control")
+                .env("E2E_MACHINE_SHORTNAME", "skid-control")
+                .env("E2E_KERNEL_VERSION", "skid-control")
+                .env("E2E_KEEP_VERIFY_LOGS", "1")
+                .env("DAGRUN_TEST_COUNTS_PATH", path.join("counts.json"))
+                // A producer at the relaxed level, as a Buck RE worker without
+                // CPUID faulting is; its rows are imported below by a child at
+                // this host's level.
+                .envs(
+                    (scenario == "skid-then-match-relaxed-producer")
+                        .then_some(("E2E_STRICTNESS_LEVEL", "relaxed")),
+                )
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+            assert_eq!(
+                result.status.code(),
+                Some(if succeeds { 0 } else { 1 }),
+                "{scenario}: {stdout}\n{stderr}"
+            );
+            let calls = fs::read_to_string(path.join("invocations")).unwrap();
+            assert_eq!(calls.lines().count(), launched, "{scenario}: {calls}");
+            let rows = fs::read_to_string(path.join("results.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<hermit_manifest_plan::runner::CellResult>(line).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), launched, "{scenario}: {rows:#?}");
+            for (position, row) in rows.iter().enumerate() {
+                assert_eq!(row.attempt, position as u64 + 1, "{scenario}");
+                row.require_current_classification().unwrap();
+                // The child described the fixture snapshot, not this checkout.
+                assert_eq!(
+                    (row.hermit_sha.as_str(), row.source_tree_dirty),
+                    (SHA, false),
+                    "{scenario}"
+                );
+            }
+            let summary: serde_json::Value =
+                serde_json::from_slice(&fs::read(path.join("summary.json")).unwrap()).unwrap();
+            assert_eq!(summary["skid_retries"], json!(skid_retries), "{scenario}");
+            assert!(
+                stdout.contains(&format!("; SKID-RETRY count {skid_retries}\n")),
+                "{scenario}: the summary line must carry the SKID-RETRY count: {stdout}"
+            );
+            // Every retry is counted, not only a SKID-RETRY.
+            assert_eq!(
+                summary["product_retries"],
+                json!(product_retries),
+                "{scenario}"
+            );
+            assert_eq!(summary["host_input_retries"], json!(0), "{scenario}");
+            assert!(
+                stdout.contains(&format!(
+                    "test-harness: PRODUCT-RETRY count {product_retries} ({} final PASS); HOST-INPUT-RETRY count 0\n",
+                    usize::from(scenario == "unmarked-diverged-then-match")
+                )),
+                "{scenario}: the summary must carry the PRODUCT-RETRY count: {stdout}"
+            );
+            let first = &rows[0];
+            match scenario {
+                "skid-then-match"
+                | "skid-then-match-sabre"
+                | "skid-then-match-relaxed-producer"
+                | "skid-twice" => {
+                    let final_outcome = if succeeds { "PASS" } else { "ERROR" };
+                    assert_eq!(first.outcome, "ERROR", "{scenario}");
+                    assert_eq!(rows[1].outcome, final_outcome, "{scenario}");
+                    assert_eq!(
+                        summary["skid_retry_cells"],
+                        json!([{
+                            "test": "parity/skid", "mode": "verify", "backend": backend,
+                            "attempt": 1, "overshoot_reports": 2, "final_outcome": final_outcome,
+                        }]),
+                        "{scenario}"
+                    );
+                    assert!(
+                        stdout.contains(&format!(
+                            "ERROR parity/skid (verify/{backend}) [SKID-RETRY: attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)) and nothing else; retrying this cell only]"
+                        )),
+                        "{scenario}: {stdout}"
+                    );
+                    assert!(
+                        stdout.contains(&format!(
+                            "test-harness: SKID-RETRY parity/skid (verify/{backend}): attempt 1 recorded 2 HERMIT_SKID_OVERSHOOT report(s) and was retried; final outcome {final_outcome}"
+                        )),
+                        "{scenario}: {stdout}"
+                    );
+                    assert_eq!(
+                        stdout.contains(&format!(
+                            "SKID-RETRY LIMIT parity/skid (verify/{backend}): attempt 2 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)); the attempt cap is reached, no further retry is made, and the cell's selected outcome is ERROR (attempt 2)\n"
+                        )),
+                        !succeeds,
+                        "{scenario}: the cap must be loud exactly when it is reached: {stdout}"
+                    );
+                    assert!(
+                        !stdout.contains("SKID-RETRY NOT MADE"),
+                        "{scenario}: {stdout}"
+                    );
+                    assert_eq!(
+                        summary["errors"],
+                        json!(usize::from(!succeeds)),
+                        "{scenario}"
+                    );
+                    // A history that ends at a skid attempt below the cap
+                    // names the missing retry, and why, without claiming the
+                    // cap was reached.
+                    assert_eq!(
+                        super::unretried_skid_line(
+                            "parity/skid",
+                            "verify",
+                            Some(backend),
+                            1,
+                            2,
+                            &rows[..1],
+                            false
+                        ),
+                        format!(
+                            "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but this run has no later attempt of the cell; the cell's selected outcome is ERROR (attempt 1)"
+                        ),
+                        "{scenario}"
+                    );
+                    assert_eq!(
+                        super::unretried_skid_line(
+                            "parity/skid",
+                            "verify",
+                            Some(backend),
+                            1,
+                            2,
+                            &rows[..1],
+                            true
+                        ),
+                        format!(
+                            "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but it is an imported attempt and its producer recorded no later attempt of the cell; the cell's selected outcome is ERROR (attempt 1)"
+                        ),
+                        "{scenario}"
+                    );
+                }
+                "diverged-then-skid" => {
+                    // The retry was earned by the product failure, so it is
+                    // not a SKID-RETRY; the capped skid attempt is still named,
+                    // and the selected outcome is the earlier FAIL, not ERROR.
+                    assert_eq!(first.outcome, "FAIL", "{scenario}");
+                    assert_eq!(rows[1].outcome, "ERROR", "{scenario}");
+                    assert_eq!(summary["skid_retry_cells"], json!([]), "{scenario}");
+                    assert!(!stdout.contains("SKID-RETRY:"), "{scenario}: {stdout}");
+                    assert!(
+                        stdout.contains("[attempt 1 of at most 2; retrying this cell only]"),
+                        "{scenario}: {stdout}"
+                    );
+                    assert!(
+                        stdout.contains(
+                            "SKID-RETRY LIMIT parity/skid (verify/ptrace): attempt 2 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)); the attempt cap is reached, no further retry is made, and the cell's selected outcome is FAIL (attempt 1)\n"
+                        ),
+                        "{scenario}: {stdout}"
+                    );
+                    assert!(
+                        !stdout.contains("test-harness: SKID-RETRY "),
+                        "{scenario}: {stdout}"
+                    );
+                }
+                _ => {
+                    assert_eq!(summary["skid_retry_cells"], json!([]), "{scenario}");
+                    assert!(!stdout.contains("SKID-RETRY:"), "{scenario}: {stdout}");
+                    assert!(!stdout.contains("SKID-RETRY LIMIT"), "{scenario}: {stdout}");
+                    assert!(
+                        !stdout.contains("SKID-RETRY NOT MADE"),
+                        "{scenario}: {stdout}"
+                    );
+                    assert!(
+                        !stdout.contains("test-harness: SKID-RETRY "),
+                        "{scenario}: {stdout}"
+                    );
+                }
+            }
+            match scenario {
+                "skid-no-retry" => {
+                    // The same row would have earned a retry in a framework run.
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Framework,
+                            &real_cell("c-programs/getrusage-self-accounting"),
+                            first
+                        ),
+                        Some(super::RetryCause::SkidOvershoot { reports: 2 })
+                    );
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Off,
+                            &real_cell("c-programs/getrusage-self-accounting"),
+                            first
+                        ),
+                        None
+                    );
+                    // A row that declares exit 7 and whose compared runs both
+                    // exited 7 is skid-only by its own declaration, but the
+                    // real cell declares no expected exit, so it chooses none.
+                    let mut sevens = skid.clone();
+                    sevens["guest_exit_code"] = json!(7);
+                    sevens["compared_outputs"]["left"]["exit_code"] = json!(7);
+                    sevens["compared_outputs"]["right"]["exit_code"] = json!(7);
+                    let mut redeclared = first.clone();
+                    redeclared.expected_guest_exit =
+                        Some(hermit_manifest_plan::runner::ExpectedGuestExit {
+                            code: Some(7),
+                            signal: None,
+                            reason: "an imported row's own declaration".into(),
+                        });
+                    let sevens = serde_json::to_string(&sevens).unwrap();
+                    redeclared.attempts[0].verification_report_sha256 = Some({
+                        use sha2::Digest;
+                        format!("{:x}", sha2::Sha256::digest(sevens.as_bytes()))
+                    });
+                    redeclared.attempts[0].verification_report = Some(sevens);
+                    // The executor writes `--verify-allow=failure` after
+                    // the comparison's report path for a cell that declares
+                    // an expected exit, and records the shell command and the
+                    // row's copies from that argv; without it the command
+                    // line is not one a declaring cell runs.
+                    assert_eq!(
+                        super::skid_overshoot_only_reports(&redeclared),
+                        None,
+                        "{redeclared:#?}"
+                    );
+                    for attempt in &mut redeclared.attempts {
+                        let report = attempt
+                            .argv
+                            .iter()
+                            .position(|arg| arg == "--verify-json")
+                            .unwrap();
+                        attempt
+                            .argv
+                            .insert(report + 2, "--verify-allow=failure".into());
+                        attempt.shell_command = hermit_manifest_plan::runner::shell_command(
+                            &attempt.cwd,
+                            &attempt.env,
+                            &attempt.argv,
+                        );
+                    }
+                    redeclared.argv = redeclared.attempts[0].argv.clone();
+                    redeclared.shell_command = redeclared.attempts[0].shell_command.clone();
+                    redeclared.effective_args = redeclared.argv[1..].to_vec();
+                    assert_eq!(
+                        hermit_manifest_plan::runner::retained_verify_invocation_error(&redeclared),
+                        None
+                    );
+                    assert_eq!(
+                        super::skid_overshoot_only_reports(&redeclared),
+                        Some(2),
+                        "{redeclared:#?}"
+                    );
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Framework,
+                            &real_cell("c-programs/getrusage-self-accounting"),
+                            &redeclared
+                        ),
+                        None
+                    );
+                    // Likewise a row recorded under a stdout declaration the
+                    // real cell does not make: its compared runs meet its own
+                    // (an empty exact stdout), so the skid rule accepts it,
+                    // but the real cell declares no stdout assertion.
+                    let mut restated = first.clone();
+                    restated.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
+                        exact: Some(String::new()),
+                        contains: None,
+                    });
+                    assert_eq!(
+                        super::skid_overshoot_only_reports(&restated),
+                        Some(2),
+                        "{restated:#?}"
+                    );
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Framework,
+                            &real_cell("c-programs/getrusage-self-accounting"),
+                            &restated
+                        ),
+                        None
+                    );
+                    // A row whose report is not the bytes its recorded digest
+                    // names (an imported or edited row) earns no retry: the
+                    // skid rule decides nothing from such a report.
+                    for (label, digest) in [("missing", None), ("mismatched", Some("0".repeat(64)))]
+                    {
+                        let mut undigested = first.clone();
+                        undigested.attempts[0].verification_report_sha256 = digest;
+                        assert_eq!(
+                            super::attempt_retry_cause(
+                                super::Retries::Framework,
+                                &real_cell("c-programs/getrusage-self-accounting"),
+                                &undigested
+                            ),
+                            None,
+                            "a {label} report digest: {undigested:#?}"
+                        );
+                    }
+                    // A single-attempt compatibility cell keeps one attempt.
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Framework,
+                            &real_cell("compat/cat"),
+                            first
+                        ),
+                        None
+                    );
+                }
+                "unmarked-skid" => {
+                    assert_eq!(first.outcome, "ERROR", "{scenario}");
+                    assert_eq!(first.error_kind.as_deref(), Some("infrastructure"));
+                }
+                "rejected-guest-skid" | "crashed-operand-skid" => {
+                    // The same typed skid ERROR as an earned retry, refused
+                    // only for its guest disposition, and the real cell would
+                    // refuse it too.
+                    assert_eq!(first.outcome, "ERROR", "{scenario}");
+                    assert_eq!(first.error_kind.as_deref(), Some("infrastructure"));
+                    assert_eq!(
+                        first.reason.as_deref(),
+                        Some("verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)"),
+                        "{scenario}"
+                    );
+                    assert_eq!(summary["errors"], json!(1), "{scenario}");
+                    assert_eq!(
+                        super::attempt_retry_cause(
+                            super::Retries::Framework,
+                            &real_cell("c-programs/getrusage-self-accounting"),
+                            first
+                        ),
+                        None,
+                        "{scenario}"
+                    );
+                }
+                "diverged-marked" => {
+                    // The ordinary product-failure retry, never a SKID-RETRY.
+                    assert!(rows.iter().all(|row| row.outcome == "FAIL"), "{rows:#?}");
+                    assert!(
+                        stdout.contains("[attempt 1 of at most 2; retrying this cell only]"),
+                        "{stdout}"
+                    );
+                    // Counted and located, though the overshoot marker it
+                    // also carries is not what retried it.
+                    assert_eq!(
+                        summary["product_retry_cells"],
+                        json!([{
+                            "test": "parity/skid", "mode": "verify", "backend": "ptrace",
+                            "attempt": 1, "outcome": "FAIL", "result": "determinism-failure",
+                            "first_divergent_scheduler_turn": 4,
+                            "first_divergent_record": 9, "first_divergent_syscall": 2,
+                            "final_outcome": "FAIL",
+                        }]),
+                        "{scenario}"
+                    );
+                    assert!(
+                        stdout.contains(
+                            "test-harness: PRODUCT-RETRY parity/skid (verify/ptrace): attempt 1 was FAIL (determinism-failure turn=4 rec=9 sys=2) and was retried; final outcome FAIL\n"
+                        ),
+                        "{stdout}"
+                    );
+                }
+                "skid-wrong-stdout" => {
+                    // A typed, marked overshoot whose compared runs both
+                    // printed something other than the declared stdout: the
+                    // skid infrastructure ERROR every row reader accepts, with
+                    // a reason that names the overshoot and the violated
+                    // assertion, never retried and never a SKID-RETRY. The row
+                    // records the declaration it was decided under.
+                    let reason = format!(
+                        "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s), and its compared runs violate a declared stdout assertion: {}",
+                        hermit_manifest_plan::runner::expected_stdout_mismatch_reason(
+                            "first",
+                            0,
+                            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                            16,
+                            "4aab145057a66c842ce881dbe313e2caf4bf7e5e57c8bf60b07ffc097e59f20a",
+                        )
+                    );
+                    assert_eq!(
+                        (
+                            first.outcome.as_str(),
+                            first.error_kind.as_deref(),
+                            first.reason.as_deref(),
+                            first.failure_class,
+                        ),
+                        (
+                            "ERROR",
+                            Some("infrastructure"),
+                            Some(reason.as_str()),
+                            Some(
+                                hermit_manifest_plan::runner::FailureClass::UnderstoodInfrastructureFailure
+                            ),
+                        ),
+                        "{rows:#?}"
+                    );
+                    assert_eq!(first.attempts.len(), 1, "{rows:#?}");
+                    assert_eq!(
+                        first.declared_stdout,
+                        Some(hermit_manifest_plan::runner::DeclaredStdout {
+                            exact: Some("skid-control-ok\n".into()),
+                            contains: None,
+                        }),
+                        "{rows:#?}"
+                    );
+                    assert_eq!(summary["errors"], json!(1), "{scenario}");
+                    assert_eq!(super::skid_overshoot_only_reports(first), None);
+                    // The same attempt with the plain skid reason, as an older
+                    // producer would have labelled it, is still refused: the
+                    // row's recorded declaration is re-decided against the
+                    // report's digests.
+                    let mut relabelled = first.clone();
+                    let skid_reason = "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)";
+                    relabelled.reason = Some(skid_reason.into());
+                    relabelled.attempts[0].reason = Some(skid_reason.into());
+                    assert_eq!(
+                        super::skid_overshoot_only_reports(&relabelled),
+                        None,
+                        "{relabelled:#?}"
+                    );
+                    let mut undeclared = relabelled.clone();
+                    undeclared.declared_stdout =
+                        Some(hermit_manifest_plan::runner::DeclaredStdout::default());
+                    assert_eq!(
+                        super::skid_overshoot_only_reports(&undeclared),
+                        Some(2),
+                        "the relabelled row differs from a qualifying one only in its declaration"
+                    );
+                    assert!(!stdout.contains("retrying this cell only"), "{stdout}");
+                }
+                "unmarked-diverged-then-match" => {
+                    // A divergence with no overshoot marker, then a match: the
+                    // framework retry selects PASS, and the count says so.
+                    assert_eq!(first.outcome, "FAIL", "{scenario}");
+                    assert_eq!(rows[1].outcome, "PASS", "{scenario}");
+                    assert_eq!(summary["passed"], json!(1), "{scenario}");
+                    assert_eq!(
+                        summary["product_retry_cells"],
+                        json!([{
+                            "test": "parity/skid", "mode": "verify", "backend": "ptrace",
+                            "attempt": 1, "outcome": "FAIL", "result": "determinism-failure",
+                            "first_divergent_scheduler_turn": 4,
+                            "first_divergent_record": 9, "first_divergent_syscall": 2,
+                            "final_outcome": "PASS",
+                        }]),
+                        "{scenario}"
+                    );
+                    assert!(
+                        stdout.contains(
+                            "test-harness: PRODUCT-RETRY parity/skid (verify/ptrace): attempt 1 was FAIL (determinism-failure turn=4 rec=9 sys=2) and was retried; final outcome PASS\n"
+                        ),
+                        "{stdout}"
+                    );
+                    assert!(!stdout.contains("SKID-RETRY:"), "{scenario}: {stdout}");
+                }
+                _ => {}
+            }
+            if scenario.starts_with("skid-then-match") {
+                // The same history imported (`E2E_IMPORT_RESULTS`) as a Buck
+                // run leaves it: each attempt is its own producer execution
+                // with its own run id and CPU observations bound to that
+                // execution's outer attempt 1, from a clean tree, and each has
+                // an evidence-complete record. The importer keeps a producer's
+                // later attempt exactly when this run's retry decision
+                // (`attempt_retry_cause`, the one an executed run applies to
+                // its own attempt) retries the attempt before it, and that
+                // decision re-decides a skid row from the report bytes it
+                // retains. So the intact history earns the same counted
+                // SKID-RETRY as executed, publishes both of its producer's
+                // rows and selects the PASS, with no producer retry dropped.
+                //
+                // A skid row whose own evidence does not decide it as typed
+                // skid-only earns no retry: a report that does not match its
+                // digest, a stdout declaration other than the cell's, a
+                // comparison that compared no log messages, relaxations the
+                // cell's recipe does not select, or a SaBRe path its retained
+                // evidence does not decide. Neither does an infrastructure
+                // ERROR that is no skid at all. Each ends the history: that
+                // ERROR is the cell's verdict, the producer's PASS is dropped
+                // and counted, and no line names a retry. A skid row whose
+                // producer recorded no later attempt is the verdict as well,
+                // and its line says why.
+                //
+                // The importer re-decides the retried row, never a PASS: a
+                // PASS is published under the same rules at any attempt. So a
+                // PASS after the retried skid row that its retained evidence
+                // contradicts (a missing or wrong report digest, no report, a
+                // correctly hashed diverged report, relaxations the cell's
+                // recipe does not select, or SaBRe path evidence that is
+                // missing, wrong, or names a ptrace fallback or a ptrace
+                // command line) is imported a second time alone, as its
+                // producer's only attempt, and must end exactly as it does
+                // there: a history that recovered from a skid ends no better
+                // than one that never overshot.
+                enum Expect {
+                    /// The skid row earns its retry, and the producer's PASS
+                    /// after it is the verdict.
+                    Retried,
+                    /// The skid row earns no retry: it ends the history.
+                    Ended,
+                    /// The producer recorded only the skid attempt.
+                    Unretried,
+                }
+                let sha256 = |text: &str| {
+                    use sha2::Digest;
+                    format!("{:x}", sha2::Sha256::digest(text.as_bytes()))
+                };
+                let diverged_raw = serde_json::to_string(&diverged).unwrap();
+                let mut vacuous = skid.clone();
+                vacuous["compared_log_messages"] = json!({"left": 0, "right": 0});
+                let vacuous_raw = serde_json::to_string(&vacuous).unwrap();
+                let clean_path = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+                let fallback_path = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+                let fallback_evidence = format!("{clean_path}\n{fallback_path}\n");
+                if backend == "sabre" {
+                    // The executed history is a genuine SaBRe one: each row's
+                    // recorded path is the eligible summary of the two clean
+                    // records its attempt retained.
+                    for row in &rows {
+                        assert_eq!(
+                            row.execution_path.as_ref().map(|path| &path["eligible"]),
+                            Some(&json!(true)),
+                            "{rows:#?}"
+                        );
+                        assert_eq!(
+                            hermit_manifest_plan::runner::retained_execution_path_error(row),
+                            None
+                        );
+                    }
+                }
+                // Import `imported` as the producer rows of a bucket and run
+                // this test's child on it; the consumer's run id is
+                // `skid-import-consumer`.
+                let import = |name: &str, imported: &[CellResult]| {
+                    let import = path.join(name).join("import");
+                    let bucket = hermit_manifest_plan::imported_results::bucket_dir(
+                        &import, "portable", "parity",
+                    );
+                    fs::create_dir_all(&bucket).unwrap();
+                    fs::write(
+                        bucket.join("results.jsonl"),
+                        imported
+                            .iter()
+                            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                            .collect::<String>(),
+                    )
+                    .unwrap();
+                    let evidence = imported
+                        .iter()
+                        .map(|row| {
+                            json!({"test": row.test, "mode": row.mode,
+                                "backend": row.backend, "run_id": row.run_id})
+                        })
+                        .collect::<Vec<_>>();
+                    fs::write(
+                        bucket.join("summary.json"),
+                        serde_json::to_vec(&json!({"evidence_complete_executions": evidence}))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let out = path.join(name).join("out");
+                    fs::create_dir_all(&out).unwrap();
+                    let result = Command::new("timeout")
+                        .args(["--kill-after=2s", "60s"])
+                        .arg(std::env::current_exe().unwrap())
+                        .args(["--exact", TEST, "--nocapture"])
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .env(CHILD, path)
+                        .env(IMPORT_OUT, &out)
+                        .env("E2E_IMPORT_RESULTS", &import)
+                        .env("HERMIT_BIN", &hermit)
+                        .env("E2E_RESULT_ROOT", path.join(name).join("artifacts"))
+                        .env("E2E_BUILD_ROOT", path.join("build"))
+                        .env("E2E_RUN_ID", "skid-import-consumer")
+                        .env("E2E_MACHINE_SHORTNAME", "skid-control")
+                        .env("E2E_KERNEL_VERSION", "skid-control")
+                        .env("DAGRUN_TEST_COUNTS_PATH", out.join("counts.json"))
+                        .output()
+                        .unwrap();
+                    let context = format!(
+                        "{scenario} {name}: {}\n{}",
+                        String::from_utf8_lossy(&result.stdout),
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    // Import mode runs no cell. The log records `hermit run`
+                    // alone, so the import's `host-capabilities --json`
+                    // question adds no line to the producer's launches.
+                    let calls = fs::read_to_string(path.join("invocations")).unwrap();
+                    assert_eq!(calls.lines().count(), launched, "{context}");
+                    let published = fs::read_to_string(out.join("results.jsonl"))
+                        .unwrap()
+                        .lines()
+                        .map(|line| {
+                            serde_json::from_str::<hermit_manifest_plan::runner::CellResult>(line)
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let summary: serde_json::Value =
+                        serde_json::from_slice(&fs::read(out.join("summary.json")).unwrap())
+                            .unwrap();
+                    (result, published, summary, context)
+                };
+                // A producer row as this run republishes it.
+                let rebound = |row: &CellResult| {
+                    let mut row = row.clone();
+                    row.run_id = "skid-import-consumer".into();
+                    let observations = row.cpu_observations.as_mut().unwrap();
+                    observations.binding.run_id = row.run_id.clone();
+                    observations.binding.outer_attempt = row.attempt;
+                    serde_json::to_value(row).unwrap()
+                };
+                if scenario == "skid-then-match-relaxed-producer" {
+                    // The producer recorded the relaxed level and its flag.
+                    assert_eq!(
+                        first.strictness.as_ref().map(|strictness| strictness.level),
+                        Some(hermit_manifest_plan::runner::StrictnessLevel::Relaxed),
+                        "{rows:#?}"
+                    );
+                    assert!(
+                        first
+                            .relaxations
+                            .iter()
+                            .any(|relaxation| relaxation.starts_with("--no-virtualize-cpuid: ")),
+                        "{rows:#?}"
+                    );
+                }
+                let variants = if scenario == "skid-then-match-relaxed-producer" {
+                    // Imported by a child at this host's level, the skid row
+                    // still earns its retry: its level relaxations are its
+                    // producer's. The other variants are the plain history's.
+                    vec![("import-control", Expect::Retried)]
+                } else if backend == "sabre" {
+                    vec![
+                        ("import-control", Expect::Retried),
+                        ("import-pathless-pass", Expect::Retried),
+                        ("import-pathless-recomputed-pass", Expect::Retried),
+                        ("import-fallback-pass", Expect::Retried),
+                        ("import-fallback-recomputed-pass", Expect::Retried),
+                        ("import-misdigested-path-pass", Expect::Retried),
+                        ("import-unselected-pass", Expect::Retried),
+                        ("import-pathless-skid", Expect::Ended),
+                        ("import-fallback-recomputed-skid", Expect::Ended),
+                        ("import-misdigested-path-skid", Expect::Ended),
+                        ("import-lone-skid", Expect::Unretried),
+                    ]
+                } else {
+                    vec![
+                        ("import-control", Expect::Retried),
+                        ("import-undigested-pass", Expect::Retried),
+                        ("import-misdigested-pass", Expect::Retried),
+                        ("import-reportless-pass", Expect::Retried),
+                        ("import-diverged-pass", Expect::Retried),
+                        ("import-relaxed-pass", Expect::Retried),
+                        ("import-misdigested-skid", Expect::Ended),
+                        ("import-undigested-skid", Expect::Ended),
+                        ("import-redeclared-skid", Expect::Ended),
+                        ("import-vacuous-skid", Expect::Ended),
+                        ("import-relaxed-skid", Expect::Ended),
+                        ("import-plain-error-skid", Expect::Ended),
+                        ("import-lone-skid", Expect::Unretried),
+                    ]
+                };
+                for (variant, expect) in variants {
+                    let mut imported = rows.clone();
+                    for (number, row) in imported.iter_mut().enumerate() {
+                        row.run_id = format!("skid-producer-{}", number + 1);
+                        row.source_tree_dirty = false;
+                        let observations = row
+                            .cpu_observations
+                            .as_mut()
+                            .expect("an executed row carries CPU observations");
+                        observations.binding.run_id = row.run_id.clone();
+                        observations.binding.outer_attempt = 1;
+                    }
+                    // A `-skid` variant edits the skid row, every other one
+                    // the PASS after it.
+                    let row = &mut imported[usize::from(!variant.ends_with("-skid"))];
+                    match variant {
+                        "import-undigested-pass" | "import-undigested-skid" => {
+                            row.attempts[0].verification_report_sha256 = None;
+                        }
+                        "import-misdigested-pass" | "import-misdigested-skid" => {
+                            row.attempts[0].verification_report_sha256 = Some("0".repeat(64));
+                        }
+                        "import-reportless-pass" => {
+                            row.attempts[0].verification_report = None;
+                            row.attempts[0].verification_report_sha256 = None;
+                        }
+                        "import-diverged-pass" => {
+                            row.attempts[0].verification_report_sha256 =
+                                Some(sha256(&diverged_raw));
+                            row.attempts[0].verification_report = Some(diverged_raw.clone());
+                        }
+                        "import-vacuous-skid" => {
+                            row.attempts[0].verification_report_sha256 = Some(sha256(&vacuous_raw));
+                            row.attempts[0].verification_report = Some(vacuous_raw.clone());
+                        }
+                        "import-redeclared-skid" => {
+                            // A stdout declaration the row's own evidence
+                            // meets, which is not the cell's: only the check
+                            // that the row records its cell's declaration
+                            // refuses it.
+                            let redeclared = hermit_manifest_plan::runner::DeclaredStdout {
+                                exact: None,
+                                contains: Some(String::new()),
+                            };
+                            assert_ne!(row.declared_stdout.as_ref(), Some(&redeclared));
+                            row.declared_stdout = Some(redeclared);
+                            assert_eq!(
+                                super::skid_overshoot_only_reports(row),
+                                Some(2),
+                                "{rows:#?}"
+                            );
+                        }
+                        "import-plain-error-skid" => {
+                            // An infrastructure ERROR with no verification
+                            // report and no skid in its reason or stderr.
+                            let reason = "producer infrastructure error";
+                            row.reason = Some(reason.into());
+                            row.attempts[0].reason = Some(reason.into());
+                            row.attempts[0].verification_report = None;
+                            row.attempts[0].verification_report_sha256 = None;
+                            row.attempts[0].stderr = String::new();
+                            assert_eq!(super::skid_overshoot_only_reports(row), None);
+                        }
+                        "import-relaxed-pass" | "import-relaxed-skid" => {
+                            row.relaxations.push("--no-rcb-time: fixture reason".into());
+                        }
+                        "import-pathless-pass"
+                        | "import-pathless-recomputed-pass"
+                        | "import-pathless-skid" => {
+                            row.attempts[0].sabre_path_evidence = None;
+                            row.attempts[0].sabre_path_evidence_sha256 = None;
+                            if variant == "import-pathless-recomputed-pass" {
+                                // The summary of no records.
+                                let path = row.execution_path.as_mut().unwrap();
+                                path["complete"] = json!(false);
+                                path["execution_count"] = json!(0);
+                                path["guest_rpc_observed"] = json!(false);
+                                path["eligible"] = json!(false);
+                                path["executions"] = json!([]);
+                            }
+                        }
+                        "import-fallback-pass"
+                        | "import-fallback-recomputed-pass"
+                        | "import-fallback-recomputed-skid" => {
+                            row.attempts[0].sabre_path_evidence_sha256 =
+                                Some(sha256(&fallback_evidence));
+                            row.attempts[0].sabre_path_evidence = Some(fallback_evidence.clone());
+                            if variant != "import-fallback-pass" {
+                                // The summary of a run that used one ptrace
+                                // fallback site.
+                                let path = row.execution_path.as_mut().unwrap();
+                                path["ptrace_fallback_sites"] = json!(1);
+                                path["eligible"] = json!(false);
+                                path["executions"][1]["ptrace_fallback_sites"] = json!(1);
+                            }
+                        }
+                        "import-misdigested-path-pass" | "import-misdigested-path-skid" => {
+                            row.attempts[0].sabre_path_evidence_sha256 = Some("0".repeat(64));
+                        }
+                        "import-unselected-pass" => {
+                            // The attempt ran ptrace, and its CPU observations
+                            // record the same command, so only the backend
+                            // the row claims is wrong.
+                            let selected = row.attempts[0].argv.clone();
+                            let mut unselected = selected.clone();
+                            let at = unselected
+                                .iter()
+                                .position(|arg| arg == "--backend")
+                                .unwrap();
+                            unselected[at + 1] = "ptrace".into();
+                            row.attempts[0].argv = unselected.clone();
+                            let observations = row.cpu_observations.as_mut().unwrap();
+                            let mut rebound = 0;
+                            for invocation in &mut observations.invocations {
+                                if invocation.command.argv == selected {
+                                    invocation.command.argv = unselected.clone();
+                                    rebound += 1;
+                                }
+                            }
+                            assert_eq!(rebound, 1, "{rows:#?}");
+                        }
+                        "import-control" | "import-lone-skid" => {}
+                        _ => unreachable!("{variant}"),
+                    }
+                    if variant == "import-lone-skid" {
+                        imported.truncate(1);
+                    }
+                    let (result, published, summary, context) = import(variant, &imported);
+                    let stdout = String::from_utf8_lossy(&result.stdout);
+                    let dropped = usize::from(matches!(expect, Expect::Ended));
+                    assert!(
+                        String::from_utf8_lossy(&result.stderr).contains(&format!(
+                            "0 have no result; {dropped} producer retr(ies) this run would not have made were dropped"
+                        )),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        summary["imported"]["dropped_retries"],
+                        json!(dropped),
+                        "{context}"
+                    );
+                    let skid_line = format!(
+                        "ERROR parity/skid (verify/{backend}) [SKID-RETRY: attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)) and nothing else; retrying this cell only]"
+                    );
+                    let not_made = format!(
+                        "SKID-RETRY NOT MADE parity/skid (verify/{backend}): attempt 1 of at most 2 is a typed HERMIT_SKID_OVERSHOOT infrastructure error (2 report(s)), but it is an imported attempt and its producer recorded no later attempt of the cell; the cell's selected outcome is ERROR (attempt 1)\n"
+                    );
+                    assert_eq!(
+                        stdout.contains("SKID-RETRY NOT MADE"),
+                        matches!(expect, Expect::Unretried),
+                        "{context}"
+                    );
+                    match expect {
+                        Expect::Retried => {
+                            // Both producer rows, each as its producer wrote
+                            // it apart from this run's binding, and the
+                            // retry counted as an executed run counts it.
+                            assert_eq!(
+                                published.iter().map(rebound).collect::<Vec<_>>(),
+                                imported.iter().map(rebound).collect::<Vec<_>>(),
+                                "{context}"
+                            );
+                            assert_eq!(
+                                published
+                                    .iter()
+                                    .map(|row| (
+                                        row.attempt,
+                                        row.outcome.as_str(),
+                                        row.error_kind.as_deref()
+                                    ))
+                                    .collect::<Vec<_>>(),
+                                vec![(1, "ERROR", Some("infrastructure")), (2, "PASS", None)],
+                                "{context}"
+                            );
+                            assert_eq!(result.status.code(), Some(0), "{context}");
+                            assert_eq!(summary["passed"], json!(1), "{context}");
+                            assert_eq!(summary["errors"], json!(0), "{context}");
+                            assert_eq!(summary["skid_retries"], json!(1), "{context}");
+                            assert_eq!(
+                                summary["skid_retry_cells"],
+                                json!([{
+                                    "test": "parity/skid", "mode": "verify", "backend": backend,
+                                    "attempt": 1, "overshoot_reports": 2, "final_outcome": "PASS",
+                                }]),
+                                "{context}"
+                            );
+                            assert!(stdout.contains("; SKID-RETRY count 1\n"), "{context}");
+                            assert!(stdout.contains(&skid_line), "{context}");
+                            assert!(
+                                stdout.contains(&format!(
+                                    "test-harness: SKID-RETRY parity/skid (verify/{backend}): attempt 1 recorded 2 HERMIT_SKID_OVERSHOOT report(s) and was retried; final outcome PASS"
+                                )),
+                                "{context}"
+                            );
+                            if variant != "import-control" {
+                                // The same PASS as its producer's only
+                                // attempt ends the same way.
+                                let mut alone = imported[1].clone();
+                                alone.attempt = 1;
+                                let (lone, lone_published, lone_summary, lone_context) =
+                                    import(&format!("{variant}-alone"), &[alone]);
+                                assert_eq!(lone.status.code(), Some(0), "{lone_context}");
+                                assert_eq!(
+                                    lone_published
+                                        .iter()
+                                        .map(|row| (
+                                            row.outcome.as_str(),
+                                            row.error_kind.as_deref()
+                                        ))
+                                        .collect::<Vec<_>>(),
+                                    vec![("PASS", None)],
+                                    "{lone_context}"
+                                );
+                                assert_eq!(lone_summary["passed"], json!(1), "{lone_context}");
+                            }
+                        }
+                        Expect::Ended | Expect::Unretried => {
+                            // The skid row itself, as its producer wrote it,
+                            // and nothing after it; its ERROR fails the run.
+                            assert_eq!(
+                                published.iter().map(rebound).collect::<Vec<_>>(),
+                                vec![rebound(&imported[0])],
+                                "{context}"
+                            );
+                            let row = &published[0];
+                            assert_eq!(
+                                (row.attempt, row.outcome.as_str(), row.error_kind.as_deref()),
+                                (1, "ERROR", Some("infrastructure")),
+                                "{context}"
+                            );
+                            assert_eq!(result.status.code(), Some(1), "{context}");
+                            assert_eq!(summary["errors"], json!(1), "{context}");
+                            assert_eq!(summary["skid_retries"], json!(0), "{context}");
+                            assert_eq!(summary["skid_retry_cells"], json!([]), "{context}");
+                            assert!(stdout.contains("; SKID-RETRY count 0\n"), "{context}");
+                            assert!(!stdout.contains("SKID-RETRY:"), "{context}");
+                            assert_eq!(
+                                stdout.contains(&not_made),
+                                matches!(expect, Expect::Unretried),
+                                "{context}"
+                            );
+                        }
+                    }
+                }
+            }
+            fs::remove_dir_all(&fixture).unwrap();
         }
     }
 
@@ -3797,7 +5966,8 @@ report.write_bytes((root/'verification.json').read_bytes())
         let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
             "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
             "kvm": "Not selected by this control", "sabre": "Not selected by this control",
-            "liteinst": "Not selected by this control"
+            "liteinst": "Not selected by this control",
+            "in-guest-trap": "Not selected by this control"
         }});
         fs::write(manifests_dir.join("imported.yaml"), serde_json::to_vec(&json!({
             "schema": 3, "bucket": "imported", "test": [{
@@ -3806,12 +5976,12 @@ report.write_bytes((root/'verification.json').read_bytes())
                 "observation": {"status": true, "stdout": true, "stderr": true},
                 "modes": {
                     "verify": {"ci": true, "backends_enabled": ["ptrace", "kvm"],
-                        "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"}},
+                        "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"}},
                     "naked": {"ci": false, "backends_enabled": [],
                         "backends_disabled": {"native": "Not selected by this CI control"}},
                     "chaos": disabled, "replay": disabled,
                     "custom": {"ci": true, "backends_enabled": ["kvm"],
-                        "backends_disabled": {"ptrace": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"},
+                        "backends_disabled": {"ptrace": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"},
                         "assert": {"runs": 1}}
                 }
             }]
@@ -3869,6 +6039,42 @@ report.write_bytes((root/'verification.json').read_bytes())
         serde_json::json!({"test": "imported/control", "mode": mode, "backend": backend})
     }
 
+    /// The evidence [`host_capabilities_hermit`] reports for its
+    /// `exact_branch_counter` verdict.
+    const PLANTED_COUNTER_EVIDENCE: &str = "planted: Reverie performance-counter validation failed";
+
+    /// A Hermit in `dir` that answers only `host-capabilities --json`, with a
+    /// complete report whose `exact_branch_counter` verdict is `present`.
+    fn host_capabilities_hermit(dir: &std::path::Path, present: bool) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        use hermit_manifest_plan::host_capability::HostCapabilitiesReport;
+
+        let verdict = |present| HostCapabilityVerdict {
+            present,
+            evidence: PLANTED_COUNTER_EVIDENCE.into(),
+        };
+        let report = HostCapabilitiesReport {
+            schema: HostCapabilitiesReport::SCHEMA,
+            host_capabilities: HostCapability::ALL
+                .into_iter()
+                .map(|capability| (capability, verdict(true)))
+                .collect(),
+            exact_branch_counter: verdict(present),
+        };
+        let hermit = dir.join("hermit");
+        fs::write(
+            &hermit,
+            format!(
+                "#!/bin/sh\ntest \"$*\" = 'host-capabilities --json' || exit 2\ncat <<'EOF'\n{}\nEOF\n",
+                serde_json::to_string(&report).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+        hermit
+    }
+
     /// The `evidence_complete_executions` entry of the execution that wrote
     /// `row`.
     fn import_execution(row: &CellResult) -> serde_json::Value {
@@ -3889,9 +6095,12 @@ report.write_bytes((root/'verification.json').read_bytes())
     /// run would not have made, after an infrastructure ERROR or under
     /// `--no-retry`; a host-inapplicable claim this machine does not confirm,
     /// or one alongside rows; and a PASS whose own execution has no
-    /// evidence-complete record.
+    /// evidence-complete record. A claim that a strict ptrace cell cannot run
+    /// stands when this machine's Hermit reports an inexact branch counter,
+    /// and not when it reports an exact one or cannot be asked.
     #[test]
     fn import_mode_republishes_rows_and_a_missing_cell_is_an_error() {
+        const ROWLESS_CAUSE: &str = "Tpx RERUN (unmanaged), details 'No details found', after 26.1 s; the command's status Success, exit code 0, after 26.1 s of wall time";
         use std::path::PathBuf;
         use std::process::Command;
         use std::process::ExitCode;
@@ -3956,9 +6165,13 @@ report.write_bytes((root/'verification.json').read_bytes())
             "host-inapplicable-row",
             "unconfirmed",
             "conflict",
+            "counter-confirmed",
+            "counter-unconfirmed",
+            "counter-unprobed",
             "evidence",
             "evidence-elsewhere",
         ] {
+            let counter_claim = scenario.starts_with("counter-");
             let fixture = std::env::temp_dir().join(format!(
                 "hermit-harness-import-{}-{:?}-{scenario}",
                 std::process::id(),
@@ -3987,6 +6200,9 @@ report.write_bytes((root/'verification.json').read_bytes())
                 let ptrace = cell.id.backend.as_deref() == Some("ptrace");
                 let verify_kvm = cell.id.mode == "verify" && !ptrace;
                 if verify_kvm && matches!(scenario, "missing" | "unconfirmed") {
+                    continue;
+                }
+                if ptrace && counter_claim {
                     continue;
                 }
                 // (attempt, outcome), in file order.
@@ -4062,17 +6278,38 @@ report.write_bytes((root/'verification.json').read_bytes())
             let bucket = bucket_dir(&import, "portable", "imported");
             fs::create_dir_all(&bucket).unwrap();
             fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
+            // The ingest's record of why the rowless first execution wrote no
+            // row: diagnostics the refusal quotes, never what decides it.
+            if scenario == "rowless-first-execution" {
+                let mut entry = import_summary_cell("custom", "kvm");
+                entry["schema"] = "hermit-buck-e2e-no-row-execution/v1".into();
+                entry["attempt"] = 1.into();
+                entry["cause"] = ROWLESS_CAUSE.into();
+                fs::write(bucket.join("no-row-executions.jsonl"), format!("{entry}\n")).unwrap();
+            }
             let host_inapplicable_cells = match scenario {
-                "unconfirmed" => vec![import_summary_cell("verify", "kvm")],
-                "conflict" => vec![import_summary_cell("verify", "ptrace")],
+                "unconfirmed" => vec![("verify", "kvm", "kvm")],
+                "conflict" => vec![("verify", "ptrace", "kvm")],
+                // The producer reran verify@ptrace on a host whose retired-
+                // branch counter is inexact, where the binary refuses --strict.
+                _ if counter_claim => vec![("verify", "ptrace", "exact-branch-counter")],
                 _ => vec![],
             }
             .into_iter()
-            .map(|mut cell| {
-                cell["reason"] = "producer: this machine lacks kvm".into();
+            .map(|(mode, backend, capability)| {
+                let mut cell = import_summary_cell(mode, backend);
+                cell["reason"] = format!("producer: this machine lacks {capability}").into();
                 cell
             })
             .collect::<Vec<_>>();
+            // No cell launches Hermit: the import asks it only for this
+            // machine's exact_branch_counter verdict, which the counter
+            // scenarios plant and an absent binary cannot give.
+            let hermit = match scenario {
+                "counter-confirmed" => host_capabilities_hermit(path, false),
+                "counter-unconfirmed" => host_capabilities_hermit(path, true),
+                _ => path.join("absent-hermit"),
+            };
             fs::write(
                 bucket.join("summary.json"),
                 serde_json::to_vec(&json!({
@@ -4094,7 +6331,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .env("E2E_IMPORT_RESULTS", &import)
                 // This machine can run every fixture cell, whatever the host.
                 .env("HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT", "kvm")
-                .env("HERMIT_BIN", path.join("no-hermit-is-launched"))
+                .env("HERMIT_BIN", &hermit)
                 .env("E2E_RESULT_ROOT", path.join("artifacts"))
                 .env("E2E_BUILD_ROOT", path.join("build"))
                 .env("E2E_RUN_ID", "import-consumer")
@@ -4110,9 +6347,11 @@ report.write_bytes((root/'verification.json').read_bytes())
                 String::from_utf8_lossy(&result.stdout),
                 String::from_utf8_lossy(&result.stderr)
             );
+            let confirmed = scenario == "counter-confirmed";
+            let succeeds = scenario == "complete" || confirmed;
             assert_eq!(
                 result.status.code(),
-                Some(if scenario == "complete" { 0 } else { 1 }),
+                Some(if succeeds { 0 } else { 1 }),
                 "{context}"
             );
             let published = fs::read_to_string(path.join("out/results.jsonl"))
@@ -4170,6 +6409,12 @@ report.write_bytes((root/'verification.json').read_bytes())
                     Some("import-host-inapplicable-unconfirmed"),
                 )),
                 "conflict" => Some(("verify", Some("ptrace"), Some("import-conflict"))),
+                "counter-confirmed" => None,
+                "counter-unconfirmed" | "counter-unprobed" => Some((
+                    "verify",
+                    Some("ptrace"),
+                    Some("import-host-inapplicable-unconfirmed"),
+                )),
                 "evidence" => Some(("verify", Some("kvm"), Some("import-evidence-incomplete"))),
                 "evidence-elsewhere" => {
                     Some(("custom", Some("kvm"), Some("import-evidence-incomplete")))
@@ -4205,6 +6450,19 @@ report.write_bytes((root/'verification.json').read_bytes())
                     .and_then(|row| row.reason.as_deref())
                     .unwrap_or_default();
                 assert!(reason.contains(expected), "{reason}\n{context}");
+                // The refusal quotes the ingest's cause for the rowless
+                // attempt when it has one, and adds nothing when it has none.
+                let quoted = format!("; attempt 1 wrote no row: {ROWLESS_CAUSE}");
+                assert_eq!(
+                    reason.contains(&quoted),
+                    scenario == "rowless-first-execution",
+                    "{reason}\n{context}"
+                );
+                assert_eq!(
+                    reason.contains("wrote no row"),
+                    scenario == "rowless-first-execution",
+                    "{reason}\n{context}"
+                );
             }
             // Every row is checked, not only the one that decides the cell.
             if scenario == "stale-first-row" {
@@ -4249,13 +6507,50 @@ report.write_bytes((root/'verification.json').read_bytes())
                 // Both custom@kvm attempts are published, in order.
                 _ => assert_eq!(custom, vec![(1, "FAIL"), (2, "PASS")], "{context}"),
             }
+            // A confirmed claim publishes no row, since the cell did not run:
+            // the summary names it with this machine's reason, which quotes
+            // the evidence of this machine's Hermit, not the producer's words.
+            let did_not_run = summary["host_inapplicable_cells"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|claim| {
+                    (
+                        claim["mode"].as_str().unwrap(),
+                        claim["backend"].as_str(),
+                        claim["reason"].as_str().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if confirmed {
+                let [(mode, backend, reason)] = did_not_run[..] else {
+                    panic!("one cell did not run: {did_not_run:?}\n{context}");
+                };
+                assert_eq!((mode, backend), ("verify", Some("ptrace")), "{context}");
+                assert!(
+                    reason.contains(&format!(
+                        "lacks exact-branch-counter ({PLANTED_COUNTER_EVIDENCE})"
+                    )) && !reason.contains("producer:"),
+                    "{reason}\n{context}"
+                );
+                assert!(
+                    published
+                        .iter()
+                        .all(|row| row.backend.as_deref() != Some("ptrace")),
+                    "{context}"
+                );
+            } else {
+                assert_eq!(did_not_run, Vec::new(), "{context}");
+            }
+            let host_inapplicable = u64::from(confirmed);
+            assert_eq!(summary["host_inapplicable"], host_inapplicable, "{context}");
             // JUnit and the dagrun counts report the same final outcomes, and
-            // the counts each cell's published attempts.
+            // the counts each executed cell's published attempts.
             let failed = u64::from(scenario == "no-retry");
             assert_eq!(summary["failed"], failed, "{context}");
             let junit = fs::read_to_string(path.join("out/junit.xml")).unwrap();
             let header = format!(
-                "tests=\"3\" failures=\"{failed}\" errors=\"{}\" skipped=\"0\"",
+                "tests=\"3\" failures=\"{failed}\" errors=\"{}\" skipped=\"{host_inapplicable}\"",
                 u64::from(expected_error.is_some())
             );
             assert!(junit.contains(&header), "{junit}\n{context}");
@@ -4268,6 +6563,12 @@ report.write_bytes((root/'verification.json').read_bytes())
             };
             let expected_counts = cells
                 .iter()
+                // A cell that did not run is no executed test.
+                .filter(|cell| {
+                    !did_not_run.iter().any(|&(mode, backend, _)| {
+                        (mode, backend) == (cell.id.mode.as_str(), cell.id.backend.as_deref())
+                    })
+                })
                 .map(|cell| {
                     let history = published
                         .iter()
@@ -4285,7 +6586,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                 })
                 .collect::<serde_json::Value>();
             assert_eq!(counts["schema"], 2, "{context}");
-            assert_eq!(counts["executed_tests"], 3, "{context}");
+            assert_eq!(counts["executed_tests"], 3 - host_inapplicable, "{context}");
             assert_eq!(
                 by_id(&counts["results"]),
                 by_id(&expected_counts),
@@ -4321,6 +6622,123 @@ report.write_bytes((root/'verification.json').read_bytes())
     /// machine's reason, not the producer's. No environment can make a host
     /// capability absent, so this drives `imported_results::load` with the
     /// policy the harness would build on such a machine.
+    /// A Buck remote-execution worker decides its own strictness level: one
+    /// whose branch counter miscounts runs a ptrace verify cell at the relaxed
+    /// level, and its row says so. The import keeps that row as the producer
+    /// wrote it, a PASS at the relaxed level, rather than judging it by this
+    /// machine's level (https://github.com/rrnewton/hermit/issues/4291).
+    #[test]
+    fn import_mode_keeps_a_relaxed_row_from_a_worker_whose_counter_miscounts() {
+        use hermit_manifest_plan::imported_results;
+        use hermit_manifest_plan::imported_results::bucket_dir;
+        use hermit_manifest_plan::runner::HostLevel;
+        use hermit_manifest_plan::runner::RELAXED_LEVEL_ARGS;
+        use hermit_manifest_plan::runner::RunContext;
+        use hermit_manifest_plan::runner::StrictnessLevel;
+        use hermit_manifest_plan::runner::host_strictness;
+        use serde_json::json;
+
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-import-relaxed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        write_import_fixture(&fixture);
+        let manifests = ManifestSet::load(&fixture).unwrap();
+        let selection = parse(
+            ["--category", "imported", "--backend", "ptrace", "--ci-only"]
+                .into_iter()
+                .map(String::from),
+        );
+        let cells = run_cells(&manifests, &selection).unwrap();
+        let context = RunContext::for_import(fixture.clone(), Some(SHA)).unwrap();
+
+        // The worker: no CPUID faulting, and a counter that fails Reverie's
+        // validation, as the AMD EPYC 9D64 of the issue does.
+        let mut worker = context.clone();
+        worker.exact_branch_counter =
+            Some(hermit_manifest_plan::host_capability::CapabilityVerdict {
+                present: false,
+                evidence:
+                    "Reverie performance-counter validation failed (AmdSpecLockMapShouldBeDisabled)"
+                        .into(),
+            });
+        let worker_level = host_strictness(
+            &worker.host_capabilities,
+            worker.exact_branch_counter.as_ref(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(worker_level.level, StrictnessLevel::Relaxed);
+        let import = fixture.join("import");
+        let bucket = bucket_dir(&import, "portable", "imported");
+        fs::create_dir_all(&bucket).unwrap();
+        let (rows, evidence): (Vec<_>, Vec<_>) = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let mut ran = cell.clone();
+                ran.host_level = HostLevel::clone(&worker_level);
+                let row =
+                    import_producer_row(&worker, &ran, format!("buck-worker-{index}"), 1, "PASS");
+                (serde_json::to_string(&row).unwrap(), import_execution(&row))
+            })
+            .unzip();
+        assert!(!rows.is_empty());
+        fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
+        fs::write(
+            bucket.join("summary.json"),
+            serde_json::to_vec(&json!({"evidence_complete_executions": evidence})).unwrap(),
+        )
+        .unwrap();
+
+        // This machine runs every cell.
+        let earns_retry = |_: &SelectedCell, _: &CellResult| true;
+        let host_inapplicable = |_: &SelectedCell| None;
+        let policy = imported_results::ImportPolicy {
+            earns_retry: &earns_retry,
+            host_inapplicable: &host_inapplicable,
+        };
+        let imported = imported_results::load(
+            &import,
+            &cells,
+            &context,
+            &fixture.join("out/results.jsonl"),
+            &policy,
+        )
+        .unwrap();
+        for (cell, imported) in cells.iter().zip(&imported.cells) {
+            let [row] = imported.rows.as_slice() else {
+                panic!("one row per cell: {:?}", imported.rows);
+            };
+            assert_eq!(row.outcome, "PASS", "{:?}", cell.id);
+            let strictness = row.strictness.expect("the worker records its level");
+            if cell.id.mode == "verify" {
+                assert_eq!(strictness.level, StrictnessLevel::Relaxed, "{:?}", cell.id);
+                assert!(!strictness.virtualize_cpuid);
+                for flag in RELAXED_LEVEL_ARGS {
+                    assert!(
+                        row.relaxations
+                            .iter()
+                            .any(|relaxation| relaxation.starts_with(&format!("{flag}: "))),
+                        "{flag}: {:?}",
+                        row.relaxations
+                    );
+                }
+            }
+            assert_eq!(
+                row.exact_branch_counter
+                    .as_ref()
+                    .map(|verdict| verdict.present),
+                Some(false)
+            );
+        }
+        assert_eq!(imported.missing, 0);
+        fs::remove_dir_all(&fixture).unwrap();
+    }
+
     #[test]
     fn import_mode_host_inapplicable_claim_needs_this_machines_confirmation() {
         use hermit_manifest_plan::imported_results;
@@ -4344,6 +6762,14 @@ report.write_bytes((root/'verification.json').read_bytes())
         );
         let cells = run_cells(&manifests, &selection).unwrap();
         let context = RunContext::for_import(fixture.clone(), Some(SHA)).unwrap();
+        // The import's parity post-pass runs `hermit log-diff` with the Hermit the Buck cells
+        // ran, never the target/debug/hermit a Buck run does not build.
+        if std::env::var_os("HERMIT_BIN").is_none() {
+            assert_eq!(
+                context.hermit_bin,
+                fixture.join("ci/buck-e2e/staged/hermit")
+            );
+        }
         let import = fixture.join("import");
         let bucket = bucket_dir(&import, "portable", "imported");
         fs::create_dir_all(&bucket).unwrap();
@@ -4519,12 +6945,15 @@ report.write_bytes((root/'verification.json').read_bytes())
     }
 
     /// The parity post-pass of <https://github.com/rrnewton/hermit/issues/3301>
-    /// reads only what determinism left behind. With no parity cell, with
-    /// five, and with a planted mutation that makes every compared candidate
-    /// diverge from ptrace, the harness exits the same way and writes the same
-    /// `results.jsonl`, JUnit and `summary.json` (apart from wall and CPU
-    /// timings), and it runs the same guest executions: the only extra
-    /// processes are one `hermit log-diff` per measurable cell. That holds
+    /// reads only what determinism left behind. With the post-pass off
+    /// (`E2E_PARITY_POST_PASS=0`), with it on over the fixture's parity
+    /// population (both tests' ptrace verify cells are required, so all
+    /// eight candidate cells, the three disabled ones included; the explicit
+    /// five add nothing to it), and with a planted mutation that makes every
+    /// compared candidate diverge from ptrace, the harness exits the same way
+    /// and writes the same `results.jsonl`, JUnit and `summary.json` (apart
+    /// from wall and CPU timings), and it runs the same guest executions: the
+    /// only extra processes are one `hermit log-diff` per measurable cell. That holds
     /// for a run that exits 1 and for one that exits 0, and when the
     /// post-pass fails, panics or finds the enclosing step's bound already
     /// spent. Without `E2E_KEEP_VERIFY_LOGS`, the rows differ from a
@@ -4645,7 +7074,8 @@ report.write_bytes((root/'verification.json').read_bytes())
         let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
             "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
             "kvm": "Not selected by this control", "sabre": "Not selected by this control",
-            "liteinst": "Not selected by this control"
+            "liteinst": "Not selected by this control",
+            "in-guest-trap": "Not selected by this control"
         }});
         let naked = json!({"ci": false, "backends_enabled": [],
             "backends_disabled": {"native": "Not selected by this CI control"}});
@@ -4665,9 +7095,10 @@ report.write_bytes((root/'verification.json').read_bytes())
             manifests.join("parity.yaml"),
             serde_json::to_vec(&json!({"schema": 3, "bucket": "parity", "test": [
                 test("parity/alpha", json!(["ptrace", "kvm", "liteinst", "dbt"]),
-                    json!({"sabre": "Not selected"})),
+                    json!({"sabre": "Not selected", "in-guest-trap": "Not selected"})),
                 test("parity/beta", json!(["ptrace", "kvm", "liteinst"]),
-                    json!({"dbt": "Not selected", "sabre": "Not selected"})),
+                    json!({"dbt": "Not selected", "sabre": "Not selected",
+                        "in-guest-trap": "Not selected"})),
             ]}))
             .unwrap(),
         )
@@ -4712,7 +7143,8 @@ report.write_bytes((root/'verification.json').read_bytes())
             include_str!("../../tests/fixtures/fake-parity-log-diff.py"),
         )
         .unwrap();
-        // One fake hermit: `run` is a guest execution and is counted; a
+        // One fake hermit: the comparison of a verify cell's two runs
+        // (`log-diff --verify-json`) is its guest execution and is counted; a
         // single-log `log-diff`, the ptrace golden normalization removed for
         // https://github.com/rrnewton/hermit/issues/3301, is counted so that
         // its return fails the test; a two-log `log-diff` is a parity
@@ -4742,18 +7174,24 @@ import os
 root=os.path.dirname(os.path.realpath(__file__))
 def record(line):
  with open(os.path.join(root,'invocations'),'a') as f:f.write(line+'\n')
-if a[0]=='log-diff':
+if a[0]=='run':
+ # One run of a verify cell's pair: its record, naming its backend. The
+ # comparison of the pair below is the cell's guest execution.
+ assert '--verify-strict' in a and '--verify' not in a,a
+ rundir=a[a.index('--verify-run')+1]
+ os.mkdir(rundir)
+ with open(os.path.join(rundir,'verify-run.json'),'w') as f:f.write(full[full.index('--backend')+1])
+ sys.exit(0)
+if '--verify-json' not in a:
  if len(a)==2:
   record('{"kind": "normalize"}');sys.stdout.buffer.write(open(a[1],'rb').read());sys.exit(0)
  record('{"kind": "compare"}')
  os.execv(sys.executable,[sys.executable,'-IS',os.path.join(root,'fake-parity-log-diff.py')]+a)
-# `--backend` is a global option, so it precedes `run`.
-backend=full[full.index('--backend')+1]
+backend=open(os.path.join(a[-2],'verify-run.json')).read()
 report=a[a.index('--verify-json')+1]
 cell=os.path.basename(os.path.dirname(report))
 record('{"kind": "run", "cell": "%s"}'%cell)
 scenario=open(os.path.join(root,'scenario')).read().split()
-assert '--verify-strict' in a and '--verify' in a,a
 if '--verify-log-dir' in a:
  logdir=a[a.index('--verify-log-dir')+1]
  os.makedirs(logdir,exist_ok=True)
@@ -4802,7 +7240,15 @@ sys.exit(1 if failed else 0)
                 // row's environment is the same across runs.
                 .env("HERMIT_EPOCH", "2021-12-31T23:59:59Z")
                 .env("E2E_MACHINE_SHORTNAME", "native-control")
-                .env("E2E_KERNEL_VERSION", "native-control");
+                .env("E2E_KERNEL_VERSION", "native-control")
+                // The fixture's cells name backends that need KVM or CPUID
+                // faulting; without this a host lacking either reports them
+                // HOST-INAPPLICABLE and the exit status this test pins changes.
+                // The child runs no guest, so forcing them present is safe.
+                .env(
+                    "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
+                    "kvm,cpuid-faulting",
+                );
             if keep {
                 command.env("E2E_KEEP_VERIFY_LOGS", "1");
             }
@@ -4902,51 +7348,42 @@ sys.exit(1 if failed else 0)
                 .map(|record| format!("{}@{}={:?}", record.test_id, record.backend, record.verdict))
                 .collect::<Vec<_>>()
         };
-        // `without_timings` output with exactly the `--keep-logs
-        // --verify-log-dir <dir>` that retains a cell's logs removed from each
-        // row's argv, effective_args and shell_command, and from each
-        // attempt's argv and shell_command, and the number of rows that had it.
+        // `without_timings` output with exactly the `--verify-log-dir <dir>`
+        // that retains a cell's logs removed from each row's argv,
+        // effective_args and shell_command, and from each attempt's argv and
+        // shell_command, and the number of rows that had it.
         fn drop_kept_logs(value: &mut Value, rows: &mut usize) {
-            const KEEP: [&str; 2] = ["--keep-logs", "--verify-log-dir"];
-            fn drop_triple(args: &mut Vec<Value>) -> Option<String> {
-                let at = args.iter().position(|arg| arg == KEEP[0])?;
-                assert_eq!(args.get(at + 1).and_then(Value::as_str), Some(KEEP[1]));
-                let dir = args[at + 2].as_str().unwrap().to_string();
-                args.drain(at..at + 3);
-                assert!(
-                    !args
-                        .iter()
-                        .any(|arg| KEEP.contains(&arg.as_str().unwrap_or("")))
-                );
+            const KEEP: &str = "--verify-log-dir";
+            fn drop_pair(args: &mut Vec<Value>) -> Option<String> {
+                let at = args.iter().position(|arg| arg == KEEP)?;
+                let dir = args[at + 1].as_str().unwrap().to_string();
+                args.drain(at..at + 2);
+                assert!(!args.iter().any(|arg| arg == KEEP));
                 Some(dir)
             }
             if let Value::Object(map) = value {
                 let dir = map
                     .get_mut("argv")
                     .and_then(Value::as_array_mut)
-                    .and_then(drop_triple);
+                    .and_then(drop_pair);
                 if let Some(dir) = dir {
                     let quoted = hermit_manifest_plan::runner::shell_command(
                         ".",
                         &BTreeMap::new(),
                         std::slice::from_ref(&dir),
                     );
-                    let segment = format!(
-                        " {} {} {}",
-                        KEEP[0],
-                        KEEP[1],
-                        quoted.strip_prefix("cd . && env ").unwrap()
-                    );
+                    let segment =
+                        format!(" {KEEP} {}", quoted.strip_prefix("cd . && env ").unwrap());
                     let command = map["shell_command"].as_str().unwrap();
                     assert_eq!(command.matches(&segment).count(), 1, "{command}");
                     map["shell_command"] = Value::String(command.replacen(&segment, "", 1));
                     if let Some(args) = map.get_mut("effective_args") {
                         *rows += 1;
-                        let effective = drop_triple(args.as_array_mut().unwrap());
+                        let effective = drop_pair(args.as_array_mut().unwrap());
                         assert_eq!(effective.as_deref(), Some(dir.as_str()));
                     }
                 } else if let Some(command) = map.get("shell_command").and_then(Value::as_str) {
-                    assert!(!command.contains(KEEP[1]), "{command}");
+                    assert!(!command.contains(KEEP), "{command}");
                 }
                 map.values_mut()
                     .for_each(|value| drop_kept_logs(value, rows));
@@ -5008,7 +7445,9 @@ sys.exit(1 if failed else 0)
             runs
         };
 
-        let (none, _, none_stdout, _, none_calls) = child("none", "shared", true, None, None, &[]);
+        // The post-pass off: the harness reports no parity cell at all.
+        let off: &[(&str, &str)] = &[("E2E_PARITY_POST_PASS", "0")];
+        let (none, _, none_stdout, _, none_calls) = child("none", "shared", true, None, None, off);
         let (five, _, five_stdout, _, five_calls) =
             child("five", "shared", true, Some(SELECT), None, &[]);
         let five_records = records(&five.join("parity.jsonl"));
@@ -5067,63 +7506,102 @@ sys.exit(1 if failed else 0)
             !none_stdout.contains("test-harness: parity:"),
             "{none_stdout}"
         );
-        // alpha@kvm, alpha@liteinst and beta@kvm are measurable; dbt and a
-        // candidate that failed determinism are not compared.
-        assert_eq!(count(&five_calls, "compare"), 3);
-        assert_eq!(count(&mutated_calls, "compare"), 3);
+        // alpha@dbt, alpha@kvm, alpha@liteinst and beta@kvm are measurable; a
+        // candidate that failed determinism is not compared, and neither is a
+        // disabled one (alpha@in-guest-trap, alpha@sabre, beta@dbt,
+        // beta@in-guest-trap, beta@sabre), which full validation never runs.
+        assert_eq!(count(&five_calls, "compare"), 4);
+        assert_eq!(count(&mutated_calls, "compare"), 4);
         assert!(
-            five_stdout.contains("test-harness: parity: 5 cell(s)"),
+            five_stdout.contains("test-harness: parity: 10 cell(s)"),
             "{five_stdout}"
         );
+        // Every one of the 10 is in the population: the 4 measured matches
+        // score 1, the nondeterministic candidate and the 5 disabled ones 0.
         assert!(
             five_stdout.contains(
-                "measured 3; no golden 1 (determinism-mismatch 1); not compared 1; unmeasured 0; \
-                 mean credit 1.0000 over 3 measured with equal inputs; none measured with \
-                 unequal inputs"
+                "population 10: mean credit 0.4000 over 10 (4 full, 0 partial, 6 zero); 0 excluded \
+                 (ptrace reference left no golden)"
             ),
             "{five_stdout}"
         );
         assert!(
-            mutated_stdout.contains("3 log-diff comparison(s), 0 guest runs"),
+            five_stdout.contains(
+                "measured 4; no golden 1 (determinism-mismatch 1); not compared 0; unmeasured 0; \
+                 candidate not run 5 (candidate-not-enabled 5); mean credit 1.0000 over 4 \
+                 measured with equal inputs; none measured with unequal inputs"
+            ),
+            "{five_stdout}"
+        );
+        assert!(
+            mutated_stdout.contains("4 log-diff comparison(s), 0 guest runs"),
             "{mutated_stdout}"
         );
         assert_eq!(
             verdicts(&five_records),
             [
-                "parity/alpha@dbt=InputsNotEqualized",
+                "parity/alpha@dbt=Matched",
+                "parity/alpha@in-guest-trap=CandidateMissing",
                 "parity/alpha@kvm=Matched",
                 "parity/alpha@liteinst=Matched",
+                "parity/alpha@sabre=CandidateMissing",
+                "parity/beta@dbt=CandidateMissing",
+                "parity/beta@in-guest-trap=CandidateMissing",
                 "parity/beta@kvm=Matched",
                 "parity/beta@liteinst=Nondeterministic",
+                "parity/beta@sabre=CandidateMissing",
             ]
         );
         assert!(
-            five_records[4]
+            five_records[8]
                 .reason
                 .as_deref()
                 .unwrap()
                 .contains("failed determinism"),
             "{:?}",
-            five_records[4]
+            five_records[8]
         );
+        // A disabled candidate carries its typed class and the manifest's
+        // own disabled reason.
+        for index in [1, 4, 5, 6, 9] {
+            let record = &five_records[index];
+            assert_eq!(
+                record.unavailable_class,
+                Some(hermit_manifest_plan::parity::UnavailableClass::CandidateNotEnabled),
+                "{record:?}"
+            );
+            assert!(
+                record.reason.as_deref().unwrap().ends_with(
+                    "is not enabled in the manifest, so it has no log to compare: \
+                                Not selected"
+                ),
+                "{record:?}"
+            );
+        }
         assert_eq!(
             verdicts(&mutated_records),
             [
-                "parity/alpha@dbt=InputsNotEqualized",
+                "parity/alpha@dbt=Diverged",
+                "parity/alpha@in-guest-trap=CandidateMissing",
                 "parity/alpha@kvm=Diverged",
                 "parity/alpha@liteinst=Diverged",
+                "parity/alpha@sabre=CandidateMissing",
+                "parity/beta@dbt=CandidateMissing",
+                "parity/beta@in-guest-trap=CandidateMissing",
                 "parity/beta@kvm=Diverged",
                 "parity/beta@liteinst=Nondeterministic",
+                "parity/beta@sabre=CandidateMissing",
             ]
         );
-        // The harness launched every kvm and liteinst verify cell, and their
-        // ptrace reference, with the equalized guest inputs, so each measured
-        // comparison is clean credit. dbt cannot be given them, and a cell
-        // refused before comparing is not shown to have them.
+        // The harness launched every candidate verify cell, dbt included, and
+        // their ptrace reference, with the equalized guest inputs, so each
+        // measured comparison is clean credit. A cell refused before
+        // comparing is not shown to have them.
         for records in [&five_records, &mutated_records] {
             for (index, record) in records.iter().enumerate() {
                 record.validate().unwrap();
-                let measured = (1..4).contains(&index);
+                let measured = [0, 2, 3, 7].contains(&index);
+                assert_eq!(record.verdict.is_measured(), measured, "{record:?}");
                 assert_eq!(record.inputs_equalized, measured, "{record:?}");
                 assert_eq!(record.unequalized_credit, None, "{record:?}");
                 if !measured {
@@ -5131,10 +7609,16 @@ sys.exit(1 if failed else 0)
                 }
             }
         }
-        for record in &five_records[1..4] {
+        for record in five_records
+            .iter()
+            .filter(|record| record.verdict.is_measured())
+        {
             assert_eq!(record.credit, Some(1.0), "{record:?}");
         }
-        for record in &mutated_records[1..4] {
+        for record in mutated_records
+            .iter()
+            .filter(|record| record.verdict.is_measured())
+        {
             assert_eq!(record.matched_prefix, Some(1), "{record:?}");
             assert_eq!(record.first_divergent_record, Some(2), "{record:?}");
             assert_eq!(record.credit, Some(1.0 / 3.0), "{record:?}");
@@ -5154,9 +7638,9 @@ sys.exit(1 if failed else 0)
         let five_status: PostPassStatus =
             serde_json::from_slice(&fs::read(five.join("parity.status.json")).unwrap()).unwrap();
         assert_eq!(five_status.state, PostPassState::Complete);
-        assert_eq!(five_status.cells, 5);
+        assert_eq!(five_status.cells, 10);
         assert!(five.join("parity/logdiff").is_dir());
-        let (again, _, _, _, again_calls) = child("five", "shared", true, None, None, &[]);
+        let (again, _, _, _, again_calls) = child("five", "shared", true, None, None, off);
         assert_eq!(count(&again_calls, "compare"), 0);
         for stale in ["parity.jsonl", "parity.status.json", "parity/logdiff"] {
             assert!(!again.join(stale).exists(), "{stale} survived");
@@ -5170,7 +7654,7 @@ sys.exit(1 if failed else 0)
             .cloned()
             .collect::<Vec<_>>();
         let (pass_off, _, pass_off_stdout, _, pass_off_calls) =
-            child("pass-off", "pass", true, None, None, &[]);
+            child("pass-off", "pass", true, None, None, off);
         let pass_baseline = without_timings(&pass_off);
         assert_eq!(
             pass_baseline.3, "ExitCode(unix_exit_status(0))",
@@ -5192,15 +7676,20 @@ sys.exit(1 if failed else 0)
                 "no additional guest execution"
             );
         }
-        assert_eq!(count(&pass_calls, "compare"), 4);
+        assert_eq!(count(&pass_calls, "compare"), 5);
         assert_eq!(
             verdicts(&records(&pass.join("parity.jsonl"))),
             [
-                "parity/alpha@dbt=InputsNotEqualized",
+                "parity/alpha@dbt=Diverged",
+                "parity/alpha@in-guest-trap=CandidateMissing",
                 "parity/alpha@kvm=Diverged",
                 "parity/alpha@liteinst=Diverged",
+                "parity/alpha@sabre=CandidateMissing",
+                "parity/beta@dbt=CandidateMissing",
+                "parity/beta@in-guest-trap=CandidateMissing",
                 "parity/beta@kvm=Diverged",
                 "parity/beta@liteinst=Diverged",
+                "parity/beta@sabre=CandidateMissing",
             ]
         );
 
@@ -5264,17 +7753,27 @@ sys.exit(1 if failed else 0)
         assert_eq!(guest_runs(&expired_calls), passing_runs);
         assert_eq!(count(&expired_calls, "compare"), 0);
         let expired_records = records(&expired.join("parity.jsonl"));
+        // A disabled candidate is decided before any comparison, so the spent
+        // bound leaves it candidate-missing; every comparison is unavailable.
         assert_eq!(
             verdicts(&expired_records),
             [
-                "parity/alpha@dbt=InputsNotEqualized",
+                "parity/alpha@dbt=Unavailable",
+                "parity/alpha@in-guest-trap=CandidateMissing",
                 "parity/alpha@kvm=Unavailable",
                 "parity/alpha@liteinst=Unavailable",
+                "parity/alpha@sabre=CandidateMissing",
+                "parity/beta@dbt=CandidateMissing",
+                "parity/beta@in-guest-trap=CandidateMissing",
                 "parity/beta@kvm=Unavailable",
                 "parity/beta@liteinst=Unavailable",
+                "parity/beta@sabre=CandidateMissing",
             ]
         );
-        for record in &expired_records[1..] {
+        for record in expired_records
+            .iter()
+            .filter(|record| record.verdict == ParityVerdict::Unavailable)
+        {
             let reason = record.reason.as_deref().unwrap();
             assert!(
                 reason.contains("the enclosing dagrun step's unknown wall bound")
@@ -5283,7 +7782,7 @@ sys.exit(1 if failed else 0)
             );
         }
 
-        // Without E2E_KEEP_VERIFY_LOGS, the selection closure's logs are
+        // Without E2E_KEEP_VERIFY_LOGS, the population closure's logs are
         // still retained, the golden and its sidecar are written, and nothing
         // is normalized. Against the same run with parity off, every row is
         // the same apart from timings and the `--keep-logs --verify-log-dir
@@ -5291,7 +7790,7 @@ sys.exit(1 if failed else 0)
         // effective_args and shell_command and in each attempt's argv and
         // shell_command.
         let (retained_off, _, retained_off_stdout, _, retained_off_calls) =
-            child("retained-off", "shared", false, None, None, &[]);
+            child("retained-off", "shared", false, None, None, off);
         let (retained, _, _, _, retained_calls) =
             child("retained", "shared", false, Some(SELECT), None, &[]);
         for calls in [&retained_off_calls, &retained_calls] {
@@ -5299,15 +7798,14 @@ sys.exit(1 if failed else 0)
             assert_eq!(count(calls, "normalize"), 0);
         }
         assert_eq!(count(&retained_off_calls, "compare"), 0);
-        assert_eq!(count(&retained_calls, "compare"), 3);
+        assert_eq!(count(&retained_calls, "compare"), 4);
         assert!(!retained_off.join("parity.jsonl").exists());
         let retained_off_outputs = without_timings(&retained_off);
         assert_eq!(retained_off_outputs.3, baseline.3, "{retained_off_stdout}");
         assert_eq!(without_kept_logs(retained_off_outputs.clone()).1, 0);
         let (retained_outputs, kept_rows) = without_kept_logs(without_timings(&retained));
-        // Seven rows keep logs: every row but alpha@dbt's, beta@liteinst's
-        // twice.
-        assert_eq!(kept_rows, 7);
+        // Eight rows keep logs: every row, beta@liteinst's twice.
+        assert_eq!(kept_rows, 8);
         assert_eq!(
             retained_outputs, retained_off_outputs,
             "retaining the parity closure's logs changed a determinism output"
@@ -5315,13 +7813,7 @@ sys.exit(1 if failed else 0)
         for row in rows(&retained) {
             let kept = row.argv.iter().any(|arg| arg == "--verify-log-dir");
             let backend = row.backend.as_deref().unwrap();
-            assert_eq!(
-                kept,
-                backend != "dbt",
-                "{} {backend}: {:?}",
-                row.test,
-                row.argv
-            );
+            assert!(kept, "{} {backend}: {:?}", row.test, row.argv);
         }
         assert_eq!(
             verdicts(&records(&retained.join("parity.jsonl"))),
@@ -5501,6 +7993,106 @@ sys.exit(1 if failed else 0)
         assert_eq!(written, b"test-harness: parity: 1 cell(s)\n");
     }
 
+    /// `parity compare` reads an imported run's logs from the import root its
+    /// summary.json records (<https://github.com/rrnewton/hermit/issues/3687>):
+    /// the configuration it measures with loads that root's log index. A run
+    /// that imported nothing has none; a summary that cannot be read, is not a
+    /// JSON object, or records an import without an absolute root, is refused
+    /// rather than read as a run that imported nothing.
+    #[test]
+    fn parity_compare_finds_an_imported_runs_logs_through_its_summary() {
+        let artifacts = std::env::temp_dir().join(format!(
+            "hermit-harness-import-root-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&artifacts).unwrap();
+        let recorded = |summary: Option<serde_json::Value>| {
+            let path = artifacts.join("summary.json");
+            match summary {
+                Some(summary) => fs::write(&path, summary.to_string()).unwrap(),
+                None => fs::remove_file(&path).unwrap(),
+            }
+            super::recorded_import_root(&artifacts)
+        };
+
+        assert_eq!(recorded(Some(serde_json::json!({"cells": 1}))), Ok(None));
+        assert_eq!(
+            recorded(Some(
+                serde_json::json!({"imported": {"root": "/srv/import", "missing_cells": []}})
+            )),
+            Ok(Some(std::path::PathBuf::from("/srv/import")))
+        );
+        for summary in [
+            serde_json::json!({"imported": {"root": "relative/import"}}),
+            serde_json::json!({"imported": {"missing_cells": []}}),
+            serde_json::json!({"imported": null}),
+        ] {
+            let error = recorded(Some(summary.clone())).unwrap_err();
+            assert!(error.contains("no absolute \"root\""), "{summary}: {error}");
+        }
+        for summary in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!(3),
+            serde_json::json!("imported"),
+        ] {
+            let error = recorded(Some(summary.clone())).unwrap_err();
+            assert!(error.contains("is not a JSON object"), "{summary}: {error}");
+        }
+        let error = recorded(None).unwrap_err();
+        assert!(
+            error.contains("whether the run imported its rows is unknown"),
+            "{error}"
+        );
+        fs::write(artifacts.join("summary.json"), "{").unwrap();
+        assert!(super::recorded_import_root(&artifacts).is_err());
+
+        // The configuration reads each recorded verify-log directory from
+        // where the index below the recorded root restored it.
+        let import_root = artifacts.join("import");
+        let index_dir = import_root.join(parity::IMPORTED_LOGS_DIR);
+        fs::create_dir_all(&index_dir).unwrap();
+        let entry = serde_json::json!({
+            "schema": parity::IMPORTED_LOGS_SCHEMA,
+            "verify_log_dir": "/tmp/cell/verify-logs",
+            "restored": format!("{}/r1", parity::IMPORTED_LOGS_DIR),
+            "reason": null,
+            "route": "local",
+            "container": "",
+            "re_platform": "local",
+        });
+        fs::write(
+            index_dir.join(parity::IMPORTED_LOGS_INDEX),
+            format!("{entry}\n"),
+        )
+        .unwrap();
+        let request = super::ParityCompareRequest {
+            artifacts: artifacts.clone(),
+            cells: Vec::new(),
+            output: None,
+            jobs: 1,
+        };
+        let configured = |summary: serde_json::Value| {
+            fs::write(artifacts.join("summary.json"), summary.to_string()).unwrap();
+            super::parity_compare_config(&artifacts, &request, "run", "sha")
+        };
+        let config = configured(serde_json::json!({
+            "imported": {"root": import_root.to_str().unwrap()}
+        }))
+        .unwrap();
+        let imported = config.imported_logs.as_ref().expect("the import's logs");
+        assert_eq!(
+            imported.restored("/tmp/cell/verify-logs"),
+            Ok(index_dir.join("r1").as_path())
+        );
+        assert!(imported.restored("/tmp/other/verify-logs").is_err());
+        let config = configured(serde_json::json!({"cells": 1})).unwrap();
+        assert!(config.imported_logs.is_none());
+        assert!(configured(serde_json::json!({"imported": {"root": "import"}})).is_err());
+        fs::remove_dir_all(&artifacts).unwrap();
+    }
+
     /// The `test-harness run` arguments of a committed DAG step up to its
     /// output paths, or `None` when the step runs no harness.
     fn harness_run_args(cmd: &str) -> Option<Vec<String>> {
@@ -5521,15 +8113,19 @@ sys.exit(1 if failed else 0)
     /// Every committed hosted-portable `test-harness run` command parses and
     /// validates as the harness itself reads it, and names each
     /// hosted-portable excluded backend exactly once; the local steps name
-    /// none. `parse` exits the process on a repeated `--exclude-backend`, so
-    /// the flag is counted before parsing to name the offending step.
+    /// none, except the portable-strict-compat-only compat step, which names
+    /// exactly the backends its release build cannot run. `parse` exits the
+    /// process on a repeated `--exclude-backend`, so the flag is counted
+    /// before parsing to name the offending step.
     #[test]
     fn committed_hosted_portable_harness_commands_exclude_each_backend_once() {
         use hermit_manifest_plan::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS;
+        use hermit_manifest_plan::validation_dag::PORTABLE_FOCUSED_EXCLUDED_BACKENDS;
         let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
             .expect("actual committed graph");
         let mut hosted = 0;
         let mut local = 0;
+        let mut portable_focused = 0;
         for step in &committed.steps {
             let Some(values) = harness_run_args(&step.cmd) else {
                 continue;
@@ -5553,6 +8149,14 @@ sys.exit(1 if failed else 0)
                     "{}: {values:?}",
                     step.tag()
                 );
+            } else if step.tag() == "portablecompat.manifest_compat" {
+                portable_focused += 1;
+                assert_eq!(
+                    args.selection.exclude_backends,
+                    PORTABLE_FOCUSED_EXCLUDED_BACKENDS,
+                    "{}: {values:?}",
+                    step.tag()
+                );
             } else {
                 local += 1;
                 assert!(
@@ -5567,6 +8171,7 @@ sys.exit(1 if failed else 0)
         // (https://github.com/rrnewton/hermit/issues/3301), plus compat since
         // fold 1 of https://github.com/rrnewton/hermit/issues/3448.
         assert_eq!(hosted, 13, "hosted-portable harness steps");
+        assert_eq!(portable_focused, 1, "portable-strict-compat-only steps");
         assert!(local > hosted, "local harness steps: {local}");
     }
 
@@ -5626,18 +8231,26 @@ sys.exit(1 if failed else 0)
         // type's bucket, which also runs on the host, and +1 for
         // sabrecompat.manifest_compat, the SaBRe run type's host bucket, and
         // +1 for strictcompat.manifest_compat, the strict run type's, and +1
-        // for rrcompat.manifest_compat, the rr run type's.
-        assert_eq!((pinned, direct), (19, 21));
+        // for rrcompat.manifest_compat, the rr run type's. +16 direct for
+        // the full-buck-e2e import twins (<bucket>_buck), which import the
+        // rows e2e.buck_cells wrote on the host and so run outside the root.
+        // -1 direct when strictcompat.manifest_compat was retired with the
+        // compat/strict-<row> tests (https://github.com/rrnewton/hermit/issues/4276),
+        // and +1 for supercompat.manifest_compat, the super run type's host
+        // bucket of the corpus's heavy rows (same issue).
+        assert_eq!((pinned, direct), (19, 37));
     }
 
-    /// With the committed parity selection, the full profile's harness
-    /// nodes together report each selected cell exactly once: a node reports
-    /// a cell when it plans either verify side, and exactly one node plans
-    /// each side. An `E2E_PARITY_SELECT` naming every applicable cell is
-    /// reported the same way, apart from the cells no full node plans a side
-    /// of, which every node drops with a warning.
+    /// The full profile's harness nodes together report each cell of the
+    /// parity population exactly once: a node reports a cell when it plans
+    /// either verify side, and exactly one node plans each side. Every
+    /// population cell's ptrace side is selected by full validation, so no
+    /// population cell goes unreported, whether or not its candidate runs.
+    /// An `E2E_PARITY_SELECT` naming every applicable cell is reported the
+    /// same way, apart from the cells no full node plans a side of, which
+    /// every node drops with a warning.
     #[test]
-    fn the_full_profile_reports_each_selected_parity_cell_exactly_once() {
+    fn the_full_profile_reports_each_population_parity_cell_exactly_once() {
         use hermit_manifest_plan::parity;
         let root = super::root(None);
         let manifests = ManifestSet::load(&root).unwrap();
@@ -5646,7 +8259,7 @@ sys.exit(1 if failed else 0)
         let full = dagrun::select_steps_by_labels(&committed, &["full".into()])
             .expect("actual full selection");
         let matrix = parity::ParityMatrix::derive(&manifests).unwrap();
-        let selection = parity::ParitySelection::load(&root, &matrix).unwrap().cells;
+        let selection = matrix.population();
         let applicable = matrix
             .cells()
             .filter(|(_, availability)| availability.applicable())
@@ -5690,23 +8303,12 @@ sys.exit(1 if failed else 0)
         // https://github.com/rrnewton/hermit/issues/3448); it plans no parity
         // cell, so the selected cells and their reports are unchanged.
         assert_eq!(nodes, 16);
+        // The size of the population is not pinned here: parity.rs derives it
+        // from the manifests and parity-cells.json snapshots it. This pins
+        // what no generator checks: each population cell is reported by
+        // exactly one full node.
         let lines = reported.values().map(Vec::len).sum::<usize>();
-        // Six earlier and three socket KVM verify candidates satisfy the unchanged selection rule.
-        // https://github.com/rrnewton/reverie/issues/891
-        // So does the poll-readiness KVM candidate: https://github.com/rrnewton/reverie/issues/620
-        // The epoll-pwait2 candidate adds one: https://github.com/rrnewton/reverie/issues/905
-        // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-        // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*)
-        // selects 89 folded SaBRe verify candidates under the same rule.
-        assert_eq!(
-            (selection.len(), lines),
-            (
-                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89,
-                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89
-            )
-        );
+        assert_eq!(lines, selection.len());
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);
         let duplicated = reported
             .iter()
@@ -5723,38 +8325,38 @@ sys.exit(1 if failed else 0)
             .filter(|cell| !explicitly.contains_key(*cell))
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        // 628 applicable, 624 reported and 4 not until fold 3 of
+        // 4 applicable cells were unreported until fold 3 of
         // https://github.com/rrnewton/hermit/issues/3448 gave 212 compat rows a
         // SaBRe verify cell, which makes their SaBRe parity cell applicable.
         // e2e.manifest_compat plans the ptrace side of 185 of them. The other
         // 27 are the rows only the SaBRe run type runs, so no full node plans
         // either side of their cell; so are the 3 single-image rows
         // lua-direct, perl-direct and df-direct.
-        assert_eq!(
-            (applicable.len(), explicitly.len(), unreported.len()),
-            // The six earlier and three socket KVM verify enables add nine
-            // applicable cells, all reported.
-            // https://github.com/rrnewton/reverie/issues/891
-            // The poll-readiness KVM cell is reported too: https://github.com/rrnewton/reverie/issues/620
-            // The epoll-pwait2 candidate is reported too: https://github.com/rrnewton/reverie/issues/905
-            // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-            // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-            // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-            // The 2026-10-03 SaBRe promotion makes 120 more cells applicable,
-            // each reported by the node that plans its ptrace side; its 8
-            // red-to-green cells were already applicable and reported.
-            (
-                628 + 6 + 3 + 1 + 215 + 1 + 1 + 1 + 1 + 120,
-                624 + 6 + 3 + 1 + 185 + 1 + 1 + 1 + 1 + 120,
-                4 + 30,
-            ),
-            "{unreported:?}"
-        );
+        // How many cells are applicable is the parity census's count, which
+        // ci/compat-envelope/parity-cells.json records and a test keeps
+        // current. This pins what the census does not show: which applicable
+        // cells no full node reports.
+        // 4 + 30 until the LiteInst reset
+        // (https://github.com/rrnewton/hermit/issues/3745) switched off the
+        // LiteInst cells of applications/example-timed-progress-bar and
+        // c-programs/socket-timestamp-edge-cases. Both were enabled but not
+        // run by full, and full planned neither side of their parity cell, so
+        // they were unreported; switched off, they are no longer applicable.
+        // The 2 left are example-timed-progress-bar's DBT and KVM cells.
+        // 2 + 5 since https://github.com/rrnewton/hermit/issues/4269 moved 25
+        // of the 30 SaBRe-run-type-only rows' ptrace cells into full: the 5
+        // left are rustc, javac, java and node, whose ptrace cells are the
+        // super suite's, and timeout, whose ptrace cell is unselected.
+        // 1 + 5 after example-timed-progress-bar's complete DBT fixture
+        // qualified 20/20 and joined full; its KVM parity cell stayed
+        // unreported until its ptrace verify cell, the reference, joined full
+        // after two clean nightly pressure sweeps (2026-10-19 and 2026-10-20).
+        assert_eq!(unreported.len(), 5, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
             .count();
-        assert_eq!(sabre_only, 30, "{unreported:?}");
+        assert_eq!(sabre_only, 5, "{unreported:?}");
     }
 
     #[test]
@@ -5793,15 +8395,9 @@ sys.exit(1 if failed else 0)
             .iter()
             .filter(|row| row["backend"] == "kvm")
             .collect::<Vec<_>>();
-        // Six additional KVM verify selections retain the same host-capability contract.
-        // https://github.com/rrnewton/reverie/issues/891
-        // Three socket selections: https://github.com/rrnewton/reverie/issues/891.
-        // One poll-readiness selection: https://github.com/rrnewton/reverie/issues/620.
-        // One epoll-pwait2 selection: https://github.com/rrnewton/reverie/issues/905.
-        // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-        assert_eq!(kvm.len(), 244 + 6 + 3 + 1 + 1 + 1 + 1 + 1);
+        // How many there are is the plan's to say; ci/expected-e2e-plan.json
+        // records it and `validate` refuses a stale copy.
+        assert!(!kvm.is_empty());
         let missing = kvm
             .iter()
             .filter(|row| !capabilities(row).contains(&"kvm".to_string()))
@@ -6132,13 +8728,13 @@ sys.exit(1 if failed else 0)
         )]);
         let requires = vec!["linux".to_string(), "cpuid".to_string()];
         let (capabilities, reason) =
-            host_inapplicable_reason(&requires, Some("ptrace"), &absent).unwrap();
+            host_inapplicable_reason(&requires, Some("ptrace"), &absent, None).unwrap();
         assert_eq!(capabilities, ["cpuid-faulting"]);
         assert!(reason.contains("NOT RUN, NOT a pass, no coverage"));
         assert!(reason.contains("planted absence"));
 
         let undeclared = vec!["linux".to_string(), "ptrace".to_string()];
-        assert!(host_inapplicable_reason(&undeclared, Some("ptrace"), &absent).is_none());
+        assert!(host_inapplicable_reason(&undeclared, Some("ptrace"), &absent, None).is_none());
 
         let present = BTreeMap::from([(
             HostCapability::CpuidFaulting,
@@ -6147,7 +8743,7 @@ sys.exit(1 if failed else 0)
                 evidence: "planted presence".into(),
             },
         )]);
-        assert!(host_inapplicable_reason(&requires, Some("ptrace"), &present).is_none());
+        assert!(host_inapplicable_reason(&requires, Some("ptrace"), &present, None).is_none());
     }
 
     /// A kvm cell needs KVM whatever its `requires` say (the kvm backend cells do
@@ -6170,12 +8766,245 @@ sys.exit(1 if failed else 0)
             "ptrace".to_string(),
         ];
         let (capabilities, reason) =
-            host_inapplicable_reason(&requires, Some("kvm"), &verdicts(false)).unwrap();
+            host_inapplicable_reason(&requires, Some("kvm"), &verdicts(false), None).unwrap();
         assert_eq!(capabilities, ["kvm"]);
         assert!(reason.contains("errno=2"), "{reason}");
-        assert!(host_inapplicable_reason(&requires, Some("ptrace"), &verdicts(false)).is_none());
-        assert!(host_inapplicable_reason(&requires, None, &verdicts(false)).is_none());
-        assert!(host_inapplicable_reason(&requires, Some("kvm"), &verdicts(true)).is_none());
+        assert!(
+            host_inapplicable_reason(&requires, Some("ptrace"), &verdicts(false), None).is_none()
+        );
+        assert!(host_inapplicable_reason(&requires, None, &verdicts(false), None).is_none());
+        assert!(host_inapplicable_reason(&requires, Some("kvm"), &verdicts(true), None).is_none());
+    }
+
+    /// The in-guest LiteInst runtime, behind both the liteinst and in-guest-trap
+    /// backends, needs CPUID faulting whatever a cell's `requires` say, so
+    /// proven absence withholds those cells and no other backend's. Their
+    /// required plan rows name the capability too, which is what keeps the Buck
+    /// cell generator from sending them to remote execution workers, where CPUID
+    /// faulting may be absent (a validate of d60c6e78 sent 251 cells of each
+    /// backend there and every one that landed on such a worker failed).
+    #[test]
+    fn an_in_guest_liteinst_cell_needs_cpuid_faulting() {
+        let verdicts = |present| {
+            BTreeMap::from([(
+                HostCapability::CpuidFaulting,
+                HostCapabilityVerdict {
+                    present,
+                    evidence: "arch_prctl(ARCH_SET_CPUID, 0) = -1 errno=19".into(),
+                },
+            )])
+        };
+        let requires = vec!["linux".to_string(), "x86_64".to_string()];
+        for backend in ["liteinst", "in-guest-trap"] {
+            let (capabilities, reason) =
+                host_inapplicable_reason(&requires, Some(backend), &verdicts(false), None)
+                    .unwrap_or_else(|| panic!("{backend} ran without CPUID faulting"));
+            assert_eq!(capabilities, ["cpuid-faulting"], "{backend}");
+            assert!(reason.contains("errno=19"), "{reason}");
+            assert!(
+                host_inapplicable_reason(&requires, Some(backend), &verdicts(true), None).is_none(),
+                "{backend}"
+            );
+        }
+        for backend in ["ptrace", "kvm", "dbt", "sabre", "e9patch"] {
+            assert!(
+                host_inapplicable_reason(&requires, Some(backend), &verdicts(false), None)
+                    .is_none(),
+                "{backend}"
+            );
+        }
+
+        let (_, rows) = required_plan_rows(&ManifestSet::load(&super::root(None)).unwrap());
+        let mut in_guest = 0;
+        for row in &rows {
+            let backend = row["backend"].as_str().unwrap();
+            let capabilities = row
+                .get("requires_host_capabilities")
+                .and_then(JsonValue::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(JsonValue::as_str)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if matches!(backend, "liteinst" | "in-guest-trap") {
+                in_guest += 1;
+                assert!(capabilities.contains(&"cpuid-faulting"), "{row}");
+            }
+        }
+        assert!(
+            in_guest > 0,
+            "the required plan has no in-guest LiteInst cell"
+        );
+    }
+
+    #[test]
+    fn required_plan_routes_ptrace_cpuid_cells_to_capable_hosts() {
+        let (_, rows) = required_plan_rows(&ManifestSet::load(&super::root(None)).unwrap());
+        for (test, mode, required) in [
+            ("system-utils/record-getpid", "replay", true),
+            ("chaos-c/lock-granularity", "chaos", true),
+            ("determinism-stress/thread-interleaving", "chaos", true),
+            ("c-programs/io-uring-fallback", "custom", true),
+            ("system-utils/clock-determinism", "custom", false),
+            ("chaos-c/lock-granularity", "verify", false),
+        ] {
+            let row = rows
+                .iter()
+                .find(|row| {
+                    row["test"] == test && row["mode"] == mode && row["backend"] == "ptrace"
+                })
+                .unwrap_or_else(|| panic!("missing required cell {test}/{mode}/ptrace"));
+            let cpuid = row
+                .get("requires_host_capabilities")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|values| values.iter().any(|value| value == "cpuid-faulting"));
+            assert_eq!(cpuid, required, "{row}");
+        }
+    }
+
+    #[test]
+    fn ptrace_cpuid_cells_are_not_run_where_faulting_is_absent() {
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        for (test, mode, required) in [
+            ("system-utils/record-getpid", "replay", true),
+            ("chaos-c/lock-granularity", "chaos", true),
+            ("c-programs/io-uring-fallback", "custom", true),
+            ("system-utils/clock-determinism", "custom", false),
+            ("chaos-c/lock-granularity", "verify", false),
+        ] {
+            let mut cell = manifests
+                .select(&hermit_manifest_plan::runner::Selection {
+                    test: Some(test.into()),
+                    mode: Some(mode.into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..hermit_manifest_plan::runner::Selection::default()
+                })
+                .unwrap()
+                .remove(0);
+            for backend in ["ptrace", "e9patch"] {
+                cell.id.backend = Some(backend.into());
+                for present in [false, true] {
+                    let verdicts = BTreeMap::from([(
+                        HostCapability::CpuidFaulting,
+                        HostCapabilityVerdict {
+                            present,
+                            evidence: "fixture ARCH_SET_CPUID qualification".into(),
+                        },
+                    )]);
+                    let reason = cell_host_inapplicable_reason(&cell, &verdicts, None);
+                    assert_eq!(
+                        reason.is_some(),
+                        required && !present,
+                        "{test}/{mode}/{backend}"
+                    );
+                    if let Some((capabilities, reason)) = reason {
+                        assert_eq!(capabilities, ["cpuid-faulting"]);
+                        assert!(
+                            reason.contains("NOT RUN, NOT a pass, no coverage"),
+                            "{reason}"
+                        );
+                        assert!(
+                            reason.contains("fixture ARCH_SET_CPUID qualification"),
+                            "{reason}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Where the hermit binary reports an inexact branch counter it refuses
+    /// `hermit run --strict` and `hermit record start --strict` on ptrace and
+    /// e9patch, so exactly the cells that run those are withheld, with the
+    /// binary's evidence. A replay cell runs `record start --strict`
+    /// (https://github.com/rrnewton/hermit/issues/3810). A custom cell without
+    /// `--strict` runs plain `run`, which the binary runs, so it still runs
+    /// here. An unprobed binary withholds nothing.
+    #[test]
+    fn strict_run_pmu_clock_cells_are_withheld_where_the_binary_reports_an_inexact_counter() {
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let cell = |test: &str, mode: &str| {
+            manifests
+                .select(&hermit_manifest_plan::runner::Selection {
+                    test: Some(test.into()),
+                    mode: Some(mode.into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..hermit_manifest_plan::runner::Selection::default()
+                })
+                .unwrap()
+                .remove(0)
+        };
+        let present = BTreeMap::from([(
+            HostCapability::Kvm,
+            HostCapabilityVerdict {
+                present: true,
+                evidence: "planted presence".into(),
+            },
+        )]);
+        let counter = |present| HostCapabilityVerdict {
+            present,
+            evidence: "CPU fixture: Reverie performance-counter validation failed".into(),
+        };
+        let withheld = |cell: &SelectedCell| {
+            cell_host_inapplicable_reason(cell, &present, Some(&counter(false)))
+        };
+
+        let strict_runs = [
+            cell("c-programs/random-readv-stream", "verify"),
+            cell("c-programs/ipc-determinism", "chaos"),
+            cell("c-programs/environment-and-workdir", "custom"),
+            cell("c-programs/random-readv-stream", "replay"),
+        ];
+        for mut strict_run in strict_runs {
+            for backend in ["ptrace", "e9patch"] {
+                strict_run.id.backend = Some(backend.into());
+                let (capabilities, reason) = withheld(&strict_run).unwrap();
+                assert_eq!(capabilities, ["exact-branch-counter"]);
+                assert!(
+                    reason.contains("NOT RUN, NOT a pass, no coverage"),
+                    "{reason}"
+                );
+                assert!(reason.contains("validation failed"), "{reason}");
+                assert!(
+                    cell_host_inapplicable_reason(&strict_run, &present, Some(&counter(true)))
+                        .is_none()
+                );
+                assert!(cell_host_inapplicable_reason(&strict_run, &present, None).is_none());
+            }
+            for backend in [
+                Some("kvm"),
+                Some("dbt"),
+                Some("sabre"),
+                Some("liteinst"),
+                None,
+            ] {
+                strict_run.id.backend = backend.map(Into::into);
+                assert!(withheld(&strict_run).is_none(), "{:?}", strict_run.id);
+            }
+        }
+
+        let custom = cell("system-utils/clock-determinism", "custom");
+        assert!(
+            !custom.test.modes["custom"]
+                .args
+                .iter()
+                .any(|arg| arg == "--strict")
+        );
+        // `--namespace-only` arms no branch counter, so the binary does not
+        // refuse it for the counter even with `--strict` (with the harness's
+        // explicit `--backend` it is a usage error, which must fail visibly).
+        let mut namespace_only = cell("c-programs/environment-and-workdir", "custom");
+        for flag in ["--namespace-only", "--lite"] {
+            let args = &mut namespace_only.test.modes.get_mut("custom").unwrap().args;
+            args.retain(|arg| arg != "--namespace-only" && arg != "--lite");
+            args.push(flag.into());
+            assert!(withheld(&namespace_only).is_none(), "{flag}");
+        }
+        assert!(withheld(&custom).is_none(), "{:?}", custom.id);
     }
 
     const GUARDED_WORKFLOW: &str = r#"    # --allow-cgroup-failure is documented here but not executed.
@@ -6221,6 +9050,33 @@ sys.exit(1 if failed else 0)
             ),
             "{error}"
         );
+        // The check job's public selector check.script_unit_tests resolves to
+        // its hosted twin, whose own wall the audit reads; an unknown selector
+        // still refuses.
+        let mut longer_twin = portable.clone();
+        longer_twin
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "check.script_unit_tests_on_host")
+            .unwrap()
+            .timeout = 2401;
+        let error = super::audit_portable_checks_budget(&portable_workflow, &longer_twin, &shards)
+            .unwrap_err();
+        assert!(
+            error.contains("portable checks critical path changed from 2400s to 2401s"),
+            "{error}"
+        );
+        let mut unknown = shards.clone();
+        unknown["check_nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push("check.no_such_node".into());
+        let error = super::audit_portable_checks_budget(&portable_workflow, &portable, &unknown)
+            .unwrap_err();
+        assert!(
+            error.contains("cannot select portable checks closure"),
+            "{error}"
+        );
 
         let mut missing_reducer_tools = portable_workflow.clone();
         missing_reducer_tools["jobs"]["regular"]["steps"]
@@ -6243,7 +9099,7 @@ sys.exit(1 if failed else 0)
         let error = super::audit_privileged_workflow_overhead(&privileged_workflow).unwrap_err();
         assert!(
             error.contains(
-                "privileged job 2640s must cover 2610s of explicit inner step budgets plus at least 300s"
+                "privileged job 2640s must cover 2910s of explicit inner step budgets plus at least 300s"
             ),
             "{error}"
         );
@@ -6284,7 +9140,6 @@ sys.exit(1 if failed else 0)
             "test.envelope_levels",
             "test.rr_suite_contract",
             "test.sabre_examples",
-            "test.liteinst_strict",
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -6326,9 +9181,11 @@ sys.exit(1 if failed else 0)
         // the dbt-parity shard (23 to 22; the shard is now dbt-runtime-abi) and
         // check.backend_parity_suites left the integration shard when
         // tests/backend-parity was retired (22 to 21). test.detcore_time joined
-        // the unit shard when it was enrolled (21 to 22).
-        assert_eq!(physical_rows, 22);
-        assert_eq!(resolved.len(), 22);
+        // the unit shard when it was enrolled (21 to 22). test.liteinst_strict
+        // left with its liteinst shard when LiteInst became in-guest only
+        // (https://github.com/rrnewton/hermit/issues/3520; 22 to 21).
+        assert_eq!(physical_rows, 21);
+        assert_eq!(resolved.len(), 21);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.
@@ -6377,6 +9234,266 @@ sys.exit(1 if failed else 0)
             let error = audit_validation_levels_policy(&changed).unwrap_err();
             assert!(
                 error.contains(planted.split(':').next().unwrap()),
+                "{error}"
+            );
+        }
+    }
+
+    /// Runs the committed validation-levels privileged DAG step through the
+    /// real public launcher, against a runner that records only its arguments
+    /// and the process-group CPU scan marker it inherits. Under
+    /// `--allow-cgroup-failure` the pinned runner reads each of these
+    /// variables before it settles on running unboxed, so a step whose
+    /// environment carries any of them keeps that boxing-capable launch, which
+    /// never carries the marker. Only an Actions step carrying none of them,
+    /// where that launch was certainly unboxed, selects `--unsafe-no-cgroups`,
+    /// and only that launch hands its cells the marker. Outside Actions the
+    /// step refuses before launching anything.
+    #[test]
+    fn validation_levels_privileged_dag_keeps_available_boxing_and_marks_only_the_unboxed_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        const MARKER: &str = "HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN";
+        const BOXING_INPUTS: [(&str, &str); 6] = [
+            (
+                "DAGRUN_DELEGATED_CGROUP",
+                "/sys/fs/cgroup/delegated-by-an-outer-scheduler",
+            ),
+            ("DAGRUN_DELEGATED_UNBOXED", "1"),
+            ("DAGRUN_IN_SCOPE", "1"),
+            ("DAGRUN_SCOPE_UNIT", "dagrun-outer.scope"),
+            ("DAGRUN_DIRECT_CGROUP", "1"),
+            ("DAGRUN_FORCE_SCOPE_ATTEMPT", "1"),
+        ];
+
+        let workflow: YamlValue = serde_yaml::from_str(include_str!(
+            "../../../../.github/workflows/validation-levels.yml"
+        ))
+        .unwrap();
+        let step_script = workflow["jobs"]["full"]["steps"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Privileged PMU and CPUID test DAG"))
+            .and_then(|step| step["run"].as_str())
+            .expect("the validation-levels full job runs the privileged DAG step")
+            .to_string();
+
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "hermit-validation-levels-privileged-dag-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        let fixture = scratch.0.clone();
+        let _ = fs::remove_dir_all(&fixture);
+        for directory in ["ci", "agent-utils/common/bin", "bin", "runner-temp"] {
+            fs::create_dir_all(fixture.join(directory)).unwrap();
+        }
+        let repo = super::root(None);
+        for relative in ["ci/run-dag.sh", "ci/configure-build-jobs.sh"] {
+            fs::copy(repo.join(relative), fixture.join(relative)).unwrap();
+        }
+        let write_executable = |path: PathBuf, body: String| {
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // The launcher looks here when DAGRUN_BIN is unset, which the step
+        // guarantees with `env -u DAGRUN_BIN`.
+        write_executable(
+            fixture.join("agent-utils/common/bin/dagrun"),
+            format!(
+                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" \"${{{MARKER}-unset}}\" >\"$VALIDATION_LEVELS_DAG_CAPTURE\"\n"
+            ),
+        );
+        // The launcher only resolves rust-script; nothing here executes it.
+        write_executable(
+            fixture.join("bin/rust-script"),
+            "#!/bin/sh\nexit 97\n".into(),
+        );
+        let script = fixture.join("privileged-dag-step.sh");
+        fs::write(&script, &step_script).unwrap();
+        let capture = fixture.join("captured-launch");
+        let path = format!(
+            "{}:{}",
+            fixture.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let run_step = |actions: bool, inputs: &[(&str, &str)], caller_marker: Option<&str>| {
+            match fs::remove_file(&capture) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot reset the captured launch: {error}"),
+            }
+            let mut command = Command::new("bash");
+            command
+                .arg("-e")
+                .arg(&script)
+                .current_dir(&fixture)
+                .env("PATH", &path)
+                .env("RUNNER_TEMP", fixture.join("runner-temp"))
+                .env("VALIDATION_LEVELS_DAG_CAPTURE", &capture)
+                .env(
+                    "DAGRUN_BIN",
+                    fixture.join("a-caller-runner-the-step-must-drop"),
+                )
+                .env_remove("CI_DAG_BUILD_JOBS")
+                .env_remove("RUN_DAG_FILE_OVERRIDE")
+                .env_remove("VALIDATE_RUN_STATE")
+                .env_remove("E2E_RESULT_ROOT")
+                .env_remove("E2E_BUILD_ROOT");
+            for (name, _) in BOXING_INPUTS {
+                command.env_remove(name);
+            }
+            for (name, value) in inputs {
+                command.env(name, value);
+            }
+            if actions {
+                command.env("GITHUB_ACTIONS", "true");
+            } else {
+                command.env_remove("GITHUB_ACTIONS");
+            }
+            match caller_marker {
+                Some(value) => command.env(MARKER, value),
+                None => command.env_remove(MARKER),
+            };
+            let output = command.output().unwrap();
+            let launch = match fs::read_to_string(&capture) {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("cannot read the captured launch: {error}"),
+            };
+            (output, launch)
+        };
+        let launched = |label: &str,
+                        (output, launch): (std::process::Output, Option<String>)|
+         -> (String, String) {
+            assert!(
+                output.status.success(),
+                "{label}: the step failed with {}: {}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let launch =
+                launch.unwrap_or_else(|| panic!("{label}: the step never reached the runner"));
+            let mut lines = launch.lines();
+            let arguments = lines.next().unwrap_or_default().to_string();
+            let marker = lines.next().unwrap_or_default().to_string();
+            assert!(
+                arguments.starts_with("run --dag ")
+                    && arguments.contains(" --labels hosted-privileged -j 2 ")
+                    && arguments.ends_with(" -v"),
+                "{label}: unexpected runner arguments {arguments:?}"
+            );
+            (arguments, marker)
+        };
+
+        // Actions with no boxing input: the old launch was certainly unboxed,
+        // so the step opts out by flag and its cells get the scan marker.
+        for caller_marker in [None, Some("0")] {
+            let label = format!("unboxed Actions step, caller marker {caller_marker:?}");
+            let (arguments, marker) = launched(&label, run_step(true, &[], caller_marker));
+            assert!(
+                arguments.contains(" --unsafe-no-cgroups ")
+                    && !arguments.contains("--allow-cgroup-failure"),
+                "{label}: expected the explicit unboxed launch, got {arguments:?}"
+            );
+            assert_eq!(
+                marker, "1",
+                "{label}: the unboxed launch must hand its cells the marker"
+            );
+        }
+
+        // Any boxing input keeps the launch that lets the runner box the DAG,
+        // and that launch never carries the marker, even a caller's.
+        for input in BOXING_INPUTS {
+            for caller_marker in [None, Some("1")] {
+                let label = format!(
+                    "Actions step with {}, caller marker {caller_marker:?}",
+                    input.0
+                );
+                let (arguments, marker) = launched(&label, run_step(true, &[input], caller_marker));
+                assert!(
+                    arguments.contains(" --allow-cgroup-failure ")
+                        && !arguments.contains("--unsafe-no-cgroups"),
+                    "{label}: available boxing was bypassed: {arguments:?}"
+                );
+                assert_eq!(
+                    marker, "unset",
+                    "{label}: a launch that may be boxed handed its cells the scan marker"
+                );
+            }
+        }
+
+        // Outside Actions the step refuses, whatever the environment says.
+        for inputs in [&[][..], &BOXING_INPUTS[..1]] {
+            let (output, launch) = run_step(false, inputs, Some("1"));
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "outside Actions with {inputs:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(
+                    "privileged DAG: refusing explicit unboxed execution outside GitHub Actions"
+                ),
+                "outside Actions with {inputs:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                launch, None,
+                "outside Actions with {inputs:?}: the runner was launched"
+            );
+        }
+    }
+
+    /// The exact-command audit pins both launches of the validation-levels
+    /// privileged DAG step: dropping either one is a different command.
+    #[test]
+    fn validation_levels_run_dag_audit_pins_both_privileged_launches() {
+        let mut workflow: YamlValue = serde_yaml::from_str(include_str!(
+            "../../../../.github/workflows/validation-levels.yml"
+        ))
+        .unwrap();
+        const LABEL: &str = ".github/workflows/validation-levels.yml";
+        audit_run_dag_workflow_runner(LABEL, &workflow).unwrap();
+        let index = workflow["jobs"]["full"]["steps"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .position(|step| step["name"].as_str() == Some("Privileged PMU and CPUID test DAG"))
+            .expect("the validation-levels full job runs the privileged DAG step");
+        let committed = workflow["jobs"]["full"]["steps"][index]["run"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let guard = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\n";
+        let launch = |flag: &str| {
+            format!(
+                "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 {flag} --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\n"
+            )
+        };
+        for single in [
+            format!("{guard}{}", launch("--unsafe-no-cgroups")),
+            format!("{guard}{}", launch("--allow-cgroup-failure")),
+        ] {
+            assert_ne!(single, committed);
+            workflow["jobs"]["full"]["steps"][index]["run"] = YamlValue::String(single.clone());
+            let error = audit_run_dag_workflow_runner(LABEL, &workflow)
+                .expect_err("a single-launch privileged step must not pass the exact audit");
+            assert!(
+                error.contains("differ from the exact Rust-runner commands"),
                 "{error}"
             );
         }
@@ -6864,13 +9981,14 @@ sys.exit(1 if failed else 0)
                     .collect::<serde_json::Map<_, _>>(),
             })
         };
-        let all = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+        let all = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
         let test = |id: &str, diagnostic: bool| {
             let mut verify = json!({
                 "ci": true,
                 "backends_enabled": ["ptrace"],
                 "backends_disabled": {
-                    "dbt": "fixture", "kvm": "fixture", "sabre": "fixture", "liteinst": "fixture"
+                    "dbt": "fixture", "kvm": "fixture", "sabre": "fixture", "liteinst": "fixture",
+                    "in-guest-trap": "fixture"
                 },
                 "comparator": "stripped",
                 "comparator_reason": "The fixture corpus uses the stripped comparison",
@@ -6944,12 +10062,19 @@ sys.exit(1 if failed else 0)
         const TEST_NAME: &str = "tests::production_run_retries_only_product_failures";
         if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
             let fixture = PathBuf::from(fixture);
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .canonicalize()
-                .unwrap();
+            // Run against the fixture as a Git-less source snapshot
+            // (`--repo-root` plus `--source-sha`), as the skid test does, not
+            // against this checkout: describing the checkout runs `git status`
+            // over every tracked file, which rehashes the whole tree in the
+            // validation container (https://github.com/rrnewton/hermit/issues/1845).
+            // No assertion here reads the source identity.
+            let root = fixture.clone();
             let manifests = ManifestSet::load(&fixture).unwrap();
             let mut argv: Vec<String> = vec![
+                "--repo-root".into(),
+                fixture.to_string_lossy().into_owned(),
+                "--source-sha".into(),
+                "0123456789abcdef0123456789abcdef01234567".into(),
                 "--mode".into(),
                 "naked".into(),
                 "--jobs".into(),
@@ -6993,7 +10118,8 @@ sys.exit(1 if failed else 0)
                 "dbt": "This control executes native commands only",
                 "kvm": "This control executes native commands only",
                 "sabre": "This control executes native commands only",
-                "liteinst": "This control executes native commands only"
+                "liteinst": "This control executes native commands only",
+                "in-guest-trap": "This control executes native commands only"
             }
         });
         let modes = json!({
@@ -7348,6 +10474,246 @@ sys.exit(1 if failed else 0)
         ));
     }
 
+    /// A verify attempt whose only failure is a divergence Hermit attributes to
+    /// a host file changing during one run earns one retry, even on a
+    /// strict-compatibility row (no_retry_reason), whose product failures are
+    /// final. `--no-retry` still turns it off, and a plain divergence of the
+    /// same row stays final, as does the same row recording a stdout
+    /// declaration or relaxations other than its cell's, retaining a
+    /// comparison the cell's comparator does not accept, or retaining a stderr
+    /// whose first line is a failure class the executor decides before it
+    /// reads any report.
+    #[test]
+    fn a_host_input_change_earns_one_retry_even_on_a_no_retry_cell() {
+        use sha2::Digest;
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let compat_cat = manifests
+            .select(&hermit_manifest_plan::runner::Selection {
+                test: Some("compat/cat".into()),
+                mode: Some("verify".into()),
+                backend: Some("ptrace".into()),
+                population: Some(hermit_manifest_plan::runner::Population::Required),
+                ..hermit_manifest_plan::runner::Selection::default()
+            })
+            .unwrap()
+            .remove(0);
+        let output = serde_json::json!({"exit_code": 0, "signal": null,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stdout_bytes": 0, "stderr_bytes": 0});
+        let identity = |ino: u64| {
+            serde_json::json!({"dev": 33, "ino": ino, "size": 100,
+            "mtime_sec": 1_700_000_000_i64, "mtime_nsec": 0})
+        };
+        // The comparisons Hermit records: compat/cat's verify cell selects the
+        // strict comparator, so a host-input report of it records a canonical
+        // comparison of non-vacuous logs; the stripped one is another
+        // comparator's.
+        let stripped = serde_json::json!({"strictness": "stripped", "display_name": "Stripped",
+            "compare_logs": true, "compare_io_buffers": true, "log_scope": "deterministic",
+            "record_envelope": "all_records_v1", "virtualize_time": true,
+            "strip_lines": true, "canonicalize_addresses": false, "full_trace": false,
+            "exact_remainder": false,
+            "stripped_prefixes": ["real-wall-clock-prefix/v1",
+                "unsafe-numeric-address-and-path-normalization/v1"],
+            "canonicalizations": [], "ignore_lines": false, "skip_commit": false,
+            "skip_detlog": false});
+        let canonical = serde_json::json!({"strictness": "canonical",
+            "display_name": "BitwiseInfoV1",
+            "compare_logs": true, "compare_io_buffers": true, "log_scope": "info",
+            "record_envelope": "all_records_v1", "virtualize_time": true,
+            "strip_lines": false, "canonicalize_addresses": true, "full_trace": true,
+            "exact_remainder": true, "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+            "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+            "ignore_lines": false, "skip_commit": false, "skip_detlog": false});
+        let report_of = |comparison: &serde_json::Value, messages: u64| {
+            serde_json::to_string(&serde_json::json!({
+                "verified": false, "bitwise_parity": false, "verdict": "infrastructure_error",
+                "no_result_reason": null,
+                "infrastructure_error": {"kind": "host_input_changed", "run": "run1",
+                    "path": "/etc/ld.so.cache", "before": identity(57_899_095),
+                    "after": identity(57_907_831)},
+                "comparison": comparison,
+                "compared_log_messages": {"left": messages, "right": messages},
+                "compared_outputs": {"left": output, "right": output},
+                "guest_exit_code": 0, "guest_signal": null,
+                "first_divergent_scheduler_turn": 4, "first_divergent_virtual_nanoseconds": 7,
+                "first_divergent_record": 9, "first_divergent_syscall": 2,
+                "first_divergent_left_message": "left", "first_divergent_right_message": "right"
+            }))
+            .unwrap()
+        };
+        let bytes = report_of(&canonical, 2);
+        let parsed =
+            hermit_manifest_plan::canonical_verdict::VerificationReport::from_current_json_slice(
+                bytes.as_bytes(),
+            )
+            .unwrap();
+        let reason = hermit_manifest_plan::runner::host_input_changed_reason(
+            parsed.infrastructure_error.as_ref().unwrap(),
+        );
+        let row = |reason: &str, report: &str| -> CellResult {
+            let digest = format!("{:x}", sha2::Sha256::digest(report.as_bytes()));
+            let attempt = serde_json::json!({"index": "1", "outcome": "ERROR",
+                "error_kind": "infrastructure", "status": 1, "signal": null,
+                "timed_out": false, "duration_ms": 1, "argv": [], "guest_argv": [],
+                "env": {}, "cwd": "/repo", "shell_command": "", "stdout": "", "stderr": "",
+                "reason": reason, "verification_report": report,
+                "verification_report_sha256": digest});
+            let mut row = serde_json::json!({
+                "schema": 4, "run_id": "fixture", "hermit_sha": "sha", "source_tree_dirty": false,
+                "test": "compat/cat", "category": "compat", "lane": "portable", "mode": "verify",
+                "backend": "ptrace", "classification": "required", "outcome": "ERROR",
+                "failure_class": "understood_infrastructure_failure",
+                "error_kind": "infrastructure", "attempt": 1,
+                "reason": reason, "argv": [], "guest_argv": [], "env": {}, "cwd": "/repo",
+                "shell_command": "", "artifact_dir": "/repo/a",
+                "declared_stdout": {"exact": null, "contains": null}
+            });
+            // The cell's relaxations, as an executed row of it records them.
+            row["relaxations"] =
+                serde_json::json!(hermit_manifest_plan::runner::cell_relaxations(&compat_cat));
+            row["attempts"] = serde_json::json!([attempt]);
+            serde_json::from_value(row).unwrap()
+        };
+        let changed = row(&reason, &bytes);
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &changed),
+            Some(super::RetryCause::HostInputChanged)
+        );
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Off, &compat_cat, &changed),
+            None
+        );
+        // The same row with a reason its report does not produce, or labelled
+        // a product failure, is not a host input change and stays final on
+        // this cell.
+        let relabelled = row("host input changed", &bytes);
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &relabelled),
+            None
+        );
+        let mut product = changed.clone();
+        product.outcome = "FAIL".into();
+        product.failure_class = Some(hermit_manifest_plan::runner::FailureClass::ProductFailure);
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &product),
+            None
+        );
+        // The rule checks the stdout assertions the row records, so a row
+        // recording another stdout declaration or other relaxations than its
+        // cell's (an imported row written under another manifest) earns no
+        // retry, though the rule alone would admit it.
+        let mut redeclared = changed.clone();
+        redeclared.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
+            exact: None,
+            contains: Some(String::new()),
+        });
+        let mut relaxed = changed.clone();
+        relaxed
+            .relaxations
+            .push("--no-rcb-time: fixture reason".into());
+        for row in [&redeclared, &relaxed] {
+            assert!(super::host_input_change_only(row), "{row:#?}");
+            assert_eq!(
+                super::attempt_retry_cause(super::Retries::Framework, &compat_cat, row),
+                None,
+                "{row:#?}"
+            );
+        }
+        // A report whose comparison the cell's comparator does not accept (one
+        // that compared no log messages, or another comparator's comparison),
+        // correctly hashed and with the plain host-input reason, is not a host
+        // input change either: the classifier calls such an attempt
+        // incomplete verification evidence, so a row it did not classify must
+        // not claim the retry by its labels.
+        for report in [report_of(&canonical, 0), report_of(&stripped, 2)] {
+            let incomplete = row(&reason, &report);
+            assert!(
+                !super::host_input_change_only(&incomplete),
+                "{incomplete:#?}"
+            );
+            assert_eq!(
+                super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &incomplete),
+                None,
+                "{incomplete:#?}"
+            );
+        }
+        // The host-input line Hermit itself writes to stderr does not
+        // disqualify the attempt.
+        let mut announced = changed.clone();
+        announced.attempts[0].stderr =
+            "HERMIT_HOST_INPUT_CHANGED /etc/ld.so.cache changed during run1\n".into();
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &announced),
+            Some(super::RetryCause::HostInputChanged)
+        );
+        // A retained stderr whose first line is a failure class the executor
+        // decides before it reads any report (a refused launch, the cell's
+        // backend unavailable, an unavailable-backend line naming another
+        // backend, an unclassified internal failure) is not a host input
+        // change, though the report and reason are unchanged: the executor
+        // classifies such an attempt by that line, so a row it did not
+        // classify, such as an imported one, must not claim the retry by its
+        // report.
+        for line in [
+            "HERMIT_INTERNAL_FAILURE class=guest-program-not-found",
+            "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=ptrace",
+            "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=kvm",
+            "HERMIT_INTERNAL_FAILURE class=cli-error",
+        ] {
+            let mut refused = changed.clone();
+            refused.attempts[0].stderr = format!("{line}\n");
+            assert!(!super::host_input_change_only(&refused), "{line}");
+            assert_eq!(
+                super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &refused),
+                None,
+                "{line}"
+            );
+        }
+    }
+
+    /// The production retry decision for a replay cell: its product FAIL (a
+    /// replay that diverged from its recording) is final, as the retired rr
+    /// lane ran each program once, while the same FAIL of the same test's
+    /// verify cell earns its retry.
+    #[test]
+    fn a_replay_cell_is_not_retried_after_a_product_failure() {
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let cell = |mode: &str| {
+            manifests
+                .select(&hermit_manifest_plan::runner::Selection {
+                    test: Some("c-programs/random-readv-stream".into()),
+                    mode: Some(mode.into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..hermit_manifest_plan::runner::Selection::default()
+                })
+                .unwrap()
+                .remove(0)
+        };
+        let failed = attempt_row(
+            "fixture/t",
+            1,
+            "FAIL",
+            Some("product_failure"),
+            "required",
+            &[],
+            None,
+        );
+        let replay = cell("replay");
+        assert_eq!(replay.id.mode, "replay");
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &replay, &failed),
+            None
+        );
+        assert!(super::attempt_earns_retry(
+            super::Retries::Framework,
+            &cell("verify"),
+            &failed
+        ));
+    }
+
     #[test]
     fn no_retry_flag_turns_framework_retries_off() {
         assert_eq!(
@@ -7604,7 +10970,6 @@ sys.exit(1 if failed else 0)
     /// a failed run-verdict record, not just a passed cell.
     #[test]
     fn an_unwritable_count_file_fails_the_run_in_tpx_too() {
-        use std::path::Path;
         use std::path::PathBuf;
         use std::process::Command;
         use std::process::ExitCode;
@@ -7615,12 +10980,19 @@ sys.exit(1 if failed else 0)
         const TEST_NAME: &str = "tests::an_unwritable_count_file_fails_the_run_in_tpx_too";
         if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
             let fixture = PathBuf::from(fixture);
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .canonicalize()
-                .unwrap();
+            // Run against the fixture as a Git-less source snapshot
+            // (`--repo-root` plus `--source-sha`), as the skid test does, not
+            // against this checkout: describing the checkout runs `git status`
+            // over every tracked file, which rehashes the whole tree in the
+            // validation container (https://github.com/rrnewton/hermit/issues/1845).
+            // No assertion here reads the source identity.
+            let root = fixture.clone();
             let manifests = ManifestSet::load(&fixture).unwrap();
             let argv: Vec<String> = vec![
+                "--repo-root".into(),
+                fixture.to_string_lossy().into_owned(),
+                "--source-sha".into(),
+                "0123456789abcdef0123456789abcdef01234567".into(),
                 "--mode".into(),
                 "naked".into(),
                 "--results".into(),
@@ -7655,7 +11027,8 @@ sys.exit(1 if failed else 0)
                 "dbt": "This control executes native commands only",
                 "kvm": "This control executes native commands only",
                 "sabre": "This control executes native commands only",
-                "liteinst": "This control executes native commands only"
+                "liteinst": "This control executes native commands only",
+                "in-guest-trap": "This control executes native commands only"
             }
         });
         let manifest = json!({
@@ -7892,5 +11265,335 @@ sys.exit(1 if failed else 0)
         ] {
             assert!(command_jobs(command).is_err(), "accepted {command}");
         }
+    }
+
+    /// A fresh temporary root holding a copy of tests/e2e, the expected plan
+    /// and the optional-cell inventory, the files `sync-cells` reads and writes, with every other entry of
+    /// the checkout, tests and ci linked in for the programs the manifests name.
+    fn sync_cells_fixture(label: &str) -> std::path::PathBuf {
+        fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), &target).unwrap();
+                }
+            }
+        }
+        let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-sync-cells-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&fixture);
+        let link_except = |dir: &str, own: &[&str]| {
+            fs::create_dir_all(fixture.join(dir)).unwrap();
+            for entry in fs::read_dir(checkout.join(dir)).unwrap() {
+                let name = entry.unwrap().file_name();
+                if !own.iter().any(|own| name == *own) {
+                    std::os::unix::fs::symlink(
+                        checkout.join(dir).join(&name),
+                        fixture.join(dir).join(&name),
+                    )
+                    .unwrap();
+                }
+            }
+        };
+        // Not .git: the fixture is no checkout.
+        link_except("", &["tests", ".git"]);
+        fs::remove_file(fixture.join("ci")).unwrap();
+        link_except("ci", &["expected-e2e-plan.json", "optional-e2e-cells.txt"]);
+        link_except("tests", &["e2e"]);
+        copy_tree(&checkout.join("tests/e2e"), &fixture.join("tests/e2e"));
+        for relative in [super::EXPECTED_PLAN_PATH, super::OPTIONAL_CELLS_PATH] {
+            // A missing inventory is copied as missing, and `sync` reports it stale.
+            if checkout.join(relative).exists() {
+                fs::copy(checkout.join(relative), fixture.join(relative)).unwrap();
+            }
+        }
+        fixture
+    }
+
+    /// `source`, a manifest file, with `backend` taken out of `test`'s `mode`:
+    /// the reverse of a cell flip. Returns the edited YAML.
+    fn unflip(source: &str, test: &str, mode: &str, backend: &str) -> String {
+        use serde_yaml::Value;
+        let mut manifest: Value = serde_yaml::from_str(source).unwrap();
+        if manifest.get("corpus").is_some() {
+            return unflip_corpus(manifest, test, mode, backend);
+        }
+        let entry = manifest["test"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["id"].as_str() == Some(test))
+            .unwrap_or_else(|| panic!("{test} is not in its manifest"));
+        let mode = entry["modes"][mode].as_mapping_mut().unwrap();
+        let enabled = mode
+            .get_mut("backends_enabled")
+            .and_then(Value::as_sequence_mut)
+            .unwrap();
+        let before = enabled.len();
+        enabled.retain(|name| name.as_str() != Some(backend));
+        assert_eq!(
+            enabled.len() + 1,
+            before,
+            "{test} does not enable {backend}"
+        );
+        let emptied = enabled.is_empty();
+        // `ci` is one flag for the mode or a map of its backends.
+        let required = match mode.get("ci") {
+            Some(Value::Bool(ci)) => *ci,
+            Some(Value::Mapping(ci)) => ci.get(backend).and_then(Value::as_bool) == Some(true),
+            _ => false,
+        };
+        // A per-backend hermit_args_reason is keyed like hermit_args, and a
+        // per-backend budget like the cell it bounds.
+        for per_backend in [
+            "ci",
+            "expected_stdout",
+            "expected_stdout_contains",
+            "hermit_args",
+            "hermit_args_reason",
+            "env_by_backend",
+            "timeout_seconds",
+            "cpu_timeout_seconds",
+            "slow_reason",
+        ] {
+            if let Some(map) = mode.get_mut(per_backend).and_then(Value::as_mapping_mut) {
+                map.remove(backend);
+            }
+        }
+        // Hermit flags may name only enabled backends, and their reason may
+        // not outlive the last of them.
+        if mode
+            .get("hermit_args")
+            .and_then(Value::as_mapping)
+            .is_some_and(serde_yaml::Mapping::is_empty)
+        {
+            mode.remove("hermit_args");
+            mode.remove("hermit_args_reason");
+        }
+        let disabled = mode
+            .entry("backends_disabled".into())
+            .or_insert_with(|| Value::Mapping(Default::default()));
+        disabled.as_mapping_mut().unwrap().insert(
+            backend.into(),
+            "un-flipped by the sync-cells round-trip test".into(),
+        );
+        for budget in ["timeout_seconds", "cpu_timeout_seconds", "slow_reason"] {
+            if mode
+                .get(budget)
+                .and_then(Value::as_mapping)
+                .is_some_and(serde_yaml::Mapping::is_empty)
+            {
+                mode.remove(budget);
+            }
+        }
+        // A required mode with no enabled backend is refused, so taking its
+        // last backend also makes it optional, with a reason, as a real
+        // un-flip of a single-backend mode (a ptrace replay cell, or the KVM
+        // cell of applications/kvm-python-examples, whose `ci` and budgets are
+        // maps of that one backend) would.
+        if emptied && required {
+            mode.insert("ci".into(), false.into());
+            mode.insert(
+                "ci_disabled_reason".into(),
+                "un-flipped by the sync-cells round-trip test".into(),
+            );
+        }
+        serde_yaml::to_string(&manifest).unwrap()
+    }
+
+    /// A corpus manifest's cell flip on an additional backend is the row's
+    /// label in that backend's `additional` entry, so the reverse takes the
+    /// label out of it, and the entry out of the list once it names no row.
+    fn unflip_corpus(
+        mut manifest: serde_yaml::Value,
+        test: &str,
+        mode: &str,
+        backend: &str,
+    ) -> String {
+        use serde_yaml::Value;
+        assert!(
+            mode == "verify" || mode == "replay",
+            "{test}: a corpus flip is a verify or replay cell"
+        );
+        let suffix = test.split_once('/').map_or(test, |(_, suffix)| suffix);
+        let label = manifest["corpus"]["rows"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| row["label"].as_str().unwrap())
+                    == suffix
+            })
+            .unwrap_or_else(|| panic!("{test} is no corpus row"))["label"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // A replay cell is full's while the replay section says `full: true`.
+        // The section has no per-row run type, so excepting the row takes its
+        // one cell out of the plan, which is all the round trip observes.
+        if mode == "replay" {
+            let replay = manifest["corpus"]["replay"].as_mapping_mut().unwrap();
+            assert_eq!(
+                replay.get("full").and_then(Value::as_bool),
+                Some(true),
+                "{test}: the replay cells are not full's"
+            );
+            let mut group = serde_yaml::Mapping::new();
+            group.insert(
+                Value::from("reason"),
+                Value::from("un-flipped by the sync-cells round-trip test"),
+            );
+            group.insert(
+                Value::from("rows"),
+                Value::Sequence(vec![Value::from(label.as_str())]),
+            );
+            replay
+                .entry(Value::from("except"))
+                .or_insert_with(|| Value::Sequence(Vec::new()))
+                .as_sequence_mut()
+                .unwrap()
+                .push(Value::Mapping(group));
+            return serde_yaml::to_string(&manifest).unwrap();
+        }
+        // A row's cell on the corpus's own backend is full's while the row
+        // names no run type; naming a focused one takes it out of full, as
+        // https://github.com/rrnewton/hermit/issues/4269 put it in by removing
+        // that label.
+        if manifest["corpus"]["backend"].as_str() == Some(backend) {
+            let row = manifest["corpus"]["rows"]
+                .as_sequence_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row["label"].as_str() == Some(label.as_str()))
+                .unwrap();
+            assert!(row.get("labels").is_none(), "{test} is not full's");
+            row.as_mapping_mut().unwrap().insert(
+                Value::from("labels"),
+                Value::Sequence(vec![Value::from("sabre-compat-only")]),
+            );
+            return serde_yaml::to_string(&manifest).unwrap();
+        }
+        let entries = manifest["corpus"]["additional"]
+            .as_sequence_mut()
+            .unwrap_or_else(|| panic!("{test}: the corpus has no additional backend"));
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry["backend"].as_str() == Some(backend))
+            .unwrap_or_else(|| panic!("{test}: {backend} is no additional backend"));
+        let rows = entry["rows"].as_sequence_mut().unwrap();
+        let before = rows.len();
+        rows.retain(|row| row.as_str() != Some(label.as_str()));
+        assert_eq!(rows.len() + 1, before, "{test} does not enable {backend}");
+        let no_rows_left = rows.is_empty();
+        if let Some(env) = entry.get_mut("row_env").and_then(Value::as_mapping_mut) {
+            env.remove(label.as_str());
+        }
+        if no_rows_left {
+            entries.retain(|entry| entry["backend"].as_str() != Some(backend));
+        }
+        serde_yaml::to_string(&manifest).unwrap()
+    }
+
+    fn sync(root: &std::path::Path) -> Vec<&'static str> {
+        let files = super::synced_cell_files(root).unwrap();
+        let stale = super::stale_files(root, &files);
+        for (relative, text) in &files {
+            fs::write(root.join(relative), text).unwrap();
+        }
+        stale
+    }
+
+    /// Un-flipping a required cell and flipping it back with `sync-cells`
+    /// gives back the committed files byte for byte
+    /// (https://github.com/rrnewton/hermit/issues/3606).
+    ///
+    /// The subject is the plan's last row because the generator keeps the
+    /// committed order and appends new rows, so a re-flipped row returns to the
+    /// end of the plan: the order a hand flip by the generator gives too. Only
+    /// the plan changes: the parity population has no file of its own.
+    #[test]
+    fn sync_cells_round_trips_an_unflip_and_reflip_byte_for_byte() {
+        let root = sync_cells_fixture("tail");
+        let committed_plan = fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap();
+        assert!(
+            sync(&root).is_empty(),
+            "the committed plan is stale; run ci/sync-cell-config.sh"
+        );
+
+        let plan: serde_json::Value = serde_json::from_slice(&committed_plan).unwrap();
+        let tail = plan["cells"].as_array().unwrap().last().unwrap().clone();
+        let field = |name: &str| tail[name].as_str().unwrap().to_owned();
+        let (test, mode, backend) = (field("test"), field("mode"), field("backend"));
+        let manifest = root.join(format!("tests/e2e/manifests/{}.yaml", field("category")));
+        let original = fs::read_to_string(&manifest).unwrap();
+
+        fs::write(&manifest, unflip(&original, &test, &mode, &backend)).unwrap();
+        assert_eq!(sync(&root), [super::EXPECTED_PLAN_PATH]);
+        let unflipped: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap())
+                .unwrap();
+        let cells = unflipped["cells"].as_array().unwrap();
+        assert_eq!(cells.len() + 1, plan["cells"].as_array().unwrap().len());
+        assert!(
+            !cells.contains(&tail),
+            "the un-flipped row stayed in the plan"
+        );
+
+        fs::write(&manifest, &original).unwrap();
+        assert_eq!(sync(&root), [super::EXPECTED_PLAN_PATH]);
+        assert_eq!(
+            fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap(),
+            committed_plan
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Disabling an optional (`ci: false`) cell changes no required plan row,
+    /// parity cell or scorecard row, so only the optional-cell inventory
+    /// records it; re-enabling it gives the inventory back byte for byte.
+    #[test]
+    fn sync_cells_records_disabling_an_optional_cell() {
+        let root = sync_cells_fixture("optional");
+        let committed = fs::read_to_string(root.join(super::OPTIONAL_CELLS_PATH)).unwrap();
+        let line = "c-programs/writev-determinism custom ptrace";
+        assert!(
+            committed.lines().any(|entry| entry == line),
+            "{line} is not optional"
+        );
+        let manifest = root.join("tests/e2e/manifests/c-programs.yaml");
+        let original = fs::read_to_string(&manifest).unwrap();
+
+        fs::write(
+            &manifest,
+            unflip(
+                &original,
+                "c-programs/writev-determinism",
+                "custom",
+                "ptrace",
+            ),
+        )
+        .unwrap();
+        assert_eq!(sync(&root), [super::OPTIONAL_CELLS_PATH]);
+        let disabled = fs::read_to_string(root.join(super::OPTIONAL_CELLS_PATH)).unwrap();
+        assert_eq!(disabled.lines().count() + 1, committed.lines().count());
+        assert!(!disabled.lines().any(|entry| entry == line));
+
+        fs::write(&manifest, &original).unwrap();
+        assert_eq!(sync(&root), [super::OPTIONAL_CELLS_PATH]);
+        assert_eq!(
+            fs::read_to_string(root.join(super::OPTIONAL_CELLS_PATH)).unwrap(),
+            committed
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 }

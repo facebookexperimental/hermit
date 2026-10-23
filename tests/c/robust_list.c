@@ -23,9 +23,13 @@
  * no scheduling decision, and no host-derived state. This contract asserts the
  * process-local round trip only -- after the fixture registers its own head,
  * get_robust_list must hand back the exact pointer and length it just set. It
- * never asserts the glibc-registered initial head (an address the runtime
- * chooses), so the row is deterministic without depending on cross-run address
- * stability, and it prints only a check count.
+ * never asserts the glibc-registered initial head's address (the runtime
+ * chooses it), so the row is deterministic without depending on cross-run
+ * address stability, and it prints only a check count. It does assert that
+ * head's shape: present, with the kernel's head length. That check carried the
+ * former c-programs/get-robust-list-self row, merged here by the 2026-10-17
+ * test audit; tests/c/get_robust_list_self.c stays for
+ * hermit-cli/tests/robust_list_queries.rs.
  */
 
 struct robust_head {
@@ -35,11 +39,11 @@ struct robust_head {
 };
 
 int main(void) {
-  enum { EXPECTED_CHECKS = 5 };
+  enum { EXPECTED_CHECKS = 6 };
   int ok = 0;
 
-  /* The initial query (glibc has already registered a head) must succeed; its
-   * value is not asserted. */
+  /* The initial query (glibc has already registered a head) must succeed and
+   * report a head of the kernel's length; its address is not asserted. */
   void* head0 = NULL;
   size_t len0 = 0;
   errno = 0;
@@ -54,6 +58,16 @@ int main(void) {
         errno,
         strerror(errno));
     return 1;
+  }
+  if (head0 != NULL && len0 == sizeof(struct robust_head)) {
+    ok++;
+  } else {
+    fprintf(
+        stderr,
+        "initial robust-list head %s, length %zu (expected %zu)\n",
+        head0 == NULL ? "missing" : "present",
+        len0,
+        sizeof(struct robust_head));
   }
 
   /* Register our own head; len must equal sizeof(struct robust_list_head) or

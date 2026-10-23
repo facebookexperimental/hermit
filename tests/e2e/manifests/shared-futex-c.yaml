@@ -44,6 +44,7 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
       naked:
@@ -60,6 +61,7 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
         backends_enabled: []
@@ -69,6 +71,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
         backends_enabled: []
@@ -78,6 +81,7 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: shared-futex-c/qemu-hello
     description: Strict verification for tests/shared-futex-verify/qemu_hello.c
     lane: portable
@@ -98,16 +102,27 @@ test:
       verify:
         ci:
           ptrace: true
+          kvm: true
+          dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
+          - kvm
+          - dbt
+          - liteinst
+          - in-guest-trap
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         expected_guest_exit:
           code: 7
           reason: The guest returns 7 on purpose so the QEMU launcher test can prove it captured an exact nonzero exit status across both verify runs.
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -122,6 +137,7 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
         backends_enabled: []
@@ -131,6 +147,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
         backends_enabled: []
@@ -140,6 +157,7 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: shared-futex-c/qemu-init
     description: Strict verification for tests/shared-futex-verify/qemu_init.c
     lane: portable
@@ -183,6 +201,7 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
       naked:
@@ -199,6 +218,7 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
         backends_enabled: []
@@ -208,6 +228,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
         backends_enabled: []
@@ -217,6 +238,7 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: shared-futex-c/qemu-net-init
     description: Strict verification for tests/shared-futex-verify/qemu_net_init.c
     lane: portable
@@ -260,6 +282,7 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
       naked:
@@ -276,6 +299,7 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
         backends_enabled: []
@@ -285,6 +309,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
         backends_enabled: []
@@ -294,3 +319,4 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap

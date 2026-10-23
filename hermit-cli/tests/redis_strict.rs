@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
@@ -17,6 +20,11 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::thread;
 use std::time::Duration;
+
+// Separately run Hermit processes are compared, so they share one epoch: a
+// host-drawn one differs per run, and Hermit then reports the recording it
+// saved on stderr (https://github.com/rrnewton/hermit/issues/4321).
+const EPOCH: &str = "--epoch=2026-01-01T00:00:00Z";
 
 static HERMIT_REDIS_LOCK: Mutex<()> = Mutex::new(());
 
@@ -56,9 +64,7 @@ fn executable(candidates: &[&str]) -> Option<PathBuf> {
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -85,10 +91,19 @@ fn unused_loopback_port() -> u16 {
 }
 
 fn system_redis() -> (PathBuf, PathBuf) {
-    let redis_server = executable(&["/usr/bin/redis-server", "/usr/local/bin/redis-server"])
-        .expect("redis-server is required; the portable CI job installs it");
-    let redis_cli = executable(&["/usr/bin/redis-cli", "/usr/local/bin/redis-cli"])
-        .expect("redis-cli is required; the portable CI job installs it");
+    // The pinned root has redis at /bin only.
+    let redis_server = executable(&[
+        "/usr/bin/redis-server",
+        "/usr/local/bin/redis-server",
+        "/bin/redis-server",
+    ])
+    .expect("redis-server is required; the portable CI job installs it");
+    let redis_cli = executable(&[
+        "/usr/bin/redis-cli",
+        "/usr/local/bin/redis-cli",
+        "/bin/redis-cli",
+    ])
+    .expect("redis-cli is required; the portable CI job installs it");
     (redis_server, redis_cli)
 }
 
@@ -115,7 +130,7 @@ fn run_deterministic_workload(
     command
         .arg("90")
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "off", "run", "--", "/bin/sh"])
+        .args(["--log", "off", "run", EPOCH, "--", "/bin/sh"])
         .arg(workload)
         .arg(redis_server)
         .arg(redis_cli)

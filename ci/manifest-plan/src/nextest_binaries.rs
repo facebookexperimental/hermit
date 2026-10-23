@@ -1,10 +1,8 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
 
 //! Prepare and verify the Cargo test executables consumed by validation.
 
@@ -28,14 +26,23 @@ use sha2::Sha256;
 
 pub const SELECTION_ENV: &str = "NEXTEST_PREPARED_BUILD_SELECTION";
 pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
-const RECORD_SCHEMA: u32 = 3;
+const RECORD_SCHEMA: u32 = 4;
 pub const GUESTS_ENV: &str = "HERMIT_PREPARED_CARGO_GUESTS";
+pub const LIT_GUESTS_ENV: &str = "HERMIT_PREPARED_LIT_GUESTS";
 pub const CPU_WRAPPER_ENV: &str = "HERMIT_NEXTEST_CPU_WRAPPER_BIN";
 const CPU_WRAPPER_PACKAGE: &str = "hermit-manifest-plan";
 const CPU_WRAPPER_TARGET: &str = "nextest-cpu-wrapper";
+/// Graph profiles whose CPU wrapper comes from the producer's unified build
+/// (`prepare_cpu_wrapper`). Not hosted-portable: .github/workflows/ci-portable.yml
+/// carries the wrapper between jobs at target/debug/nextest-cpu-wrapper, and
+/// ci/check-shard-coverage.sh pins that path.
+const UNIFIED_CPU_WRAPPER_PROFILES: &[&str] = &["full"];
 
 #[path = "../../cargo-guest-binaries.rs"]
 mod cargo_guests;
+
+#[path = "../../lit-guest-binaries.rs"]
+mod lit_guests;
 
 #[path = "../../record-replay-workloads.rs"]
 pub mod record_workloads;
@@ -165,6 +172,48 @@ struct FileIdentity {
     sha256: String,
 }
 
+/// Each identity field that differs between two observations of one path, as
+/// `name before -> after`.
+///
+/// The link count is reported but never compared on its own: adding or
+/// removing a hard link also changes ctime, which is compared. Naming it tells
+/// a writer that only linked or unlinked the inode apart from one that wrote
+/// its bytes. A 2026-10-07 validation refused /src/target/validate/hermit as
+/// "changed while hashing" without saying which field moved, which left
+/// nothing to identify the writer with.
+fn metadata_changes(before: &fs::Metadata, after: &fs::Metadata) -> Vec<String> {
+    let time = |seconds: i64, nanoseconds: i64| format!("{seconds}.{nanoseconds:09}");
+    let fields = [
+        ("dev", before.dev().to_string(), after.dev().to_string()),
+        ("ino", before.ino().to_string(), after.ino().to_string()),
+        ("size", before.len().to_string(), after.len().to_string()),
+        (
+            "mode",
+            format!("{:o}", before.mode()),
+            format!("{:o}", after.mode()),
+        ),
+        (
+            "mtime",
+            time(before.mtime(), before.mtime_nsec()),
+            time(after.mtime(), after.mtime_nsec()),
+        ),
+        (
+            "ctime",
+            time(before.ctime(), before.ctime_nsec()),
+            time(after.ctime(), after.ctime_nsec()),
+        ),
+    ];
+    let mut changed: Vec<String> = fields
+        .into_iter()
+        .filter(|(_, old, new)| old != new)
+        .map(|(name, old, new)| format!("{name} {old} -> {new}"))
+        .collect();
+    if !changed.is_empty() {
+        changed.push(format!("nlink {} -> {}", before.nlink(), after.nlink()));
+    }
+    changed
+}
+
 fn file_identity(path: &Path, executable: bool) -> Result<FileIdentity, String> {
     let before = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect prepared input {}: {error}", path.display()))?;
@@ -199,18 +248,12 @@ fn file_identity(path: &Path, executable: bool) -> Result<FileIdentity, String> 
     }
     let after = fs::symlink_metadata(path)
         .map_err(|error| format!("prepared input disappeared {}: {error}", path.display()))?;
-    if before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.mode() != after.mode()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
-        || before.ctime() != after.ctime()
-        || before.ctime_nsec() != after.ctime_nsec()
-    {
+    let changed = metadata_changes(&before, &after);
+    if !changed.is_empty() {
         return Err(format!(
-            "prepared input changed while hashing {}",
-            path.display()
+            "prepared input changed while hashing {}: {}",
+            path.display(),
+            changed.join(", ")
         ));
     }
     Ok(FileIdentity {
@@ -351,6 +394,8 @@ struct PreparedRecord {
     cargo_metadata: FileIdentity,
     selections: BTreeMap<String, SelectionRecord>,
     guests: Vec<FileIdentity>,
+    /// detcore/tests/lit-guests' programs, for a selection that runs lit.
+    lit_guests: Vec<FileIdentity>,
     record_workloads: Option<RecordWorkloads>,
     cpu_wrapper: CpuWrapperRecord,
 }
@@ -412,6 +457,13 @@ fn cpu_wrapper_artifact(
         if event["reason"] != "compiler-artifact" || event["target"]["name"] != CPU_WRAPPER_TARGET {
             continue;
         }
+        // An all-targets build (the unified selection, see prepare_cpu_wrapper)
+        // also compiles the bin's own unit tests under the same target name.
+        // That is not the wrapper; a build that reports no normal artifact
+        // still fails below.
+        if event["profile"]["test"] == true && event["package_id"] == package_id {
+            continue;
+        }
         if event["package_id"] != package_id
             || event["target"]["kind"] != serde_json::json!(["bin"])
             || event["profile"]["test"] != false
@@ -441,10 +493,31 @@ fn verify_cpu_wrapper(record: &PreparedRecord, cargo: &Value) -> Result<(), Stri
     Ok(())
 }
 
-fn prepare_cpu_wrapper(root: &Path, destination: &Path) -> Result<(), PreparationError> {
-    cargo_output(
-        root,
-        &[
+/// Build the nextest CPU wrapper, reporting its artifact in DESTINATION.
+///
+/// With UNIFIED (the Cargo profile and unified selection of a graph profile in
+/// UNIFIED_CPU_WRAPPER_PROFILES) the wrapper is built by the very command its
+/// producer already ran, so every unit is fresh and Cargo only reports them. Built on its own,
+/// `-p hermit-manifest-plan --bin nextest-cpu-wrapper` resolved features by
+/// itself in the dev profile and recompiled the package and its Reverie
+/// dependencies whenever the Reverie pin had moved, which is most runs: 25.96 s
+/// of build.workspace_in_pinned_root on the critical path of dfce652d
+/// (2026-10-15). See `unified_selection` for why separate selections rebuild.
+fn prepare_cpu_wrapper(
+    root: &Path,
+    destination: &Path,
+    unified: Option<(&str, &[String])>,
+) -> Result<(), PreparationError> {
+    let args = match unified {
+        Some((cargo_profile, selection)) => {
+            let mut args = ["build", "--locked", "--profile", cargo_profile]
+                .map(String::from)
+                .to_vec();
+            args.extend(selection.iter().cloned());
+            args.push("--message-format=json-render-diagnostics".into());
+            args
+        }
+        None => [
             "build",
             "--locked",
             "--message-format=json-render-diagnostics",
@@ -453,9 +526,10 @@ fn prepare_cpu_wrapper(root: &Path, destination: &Path) -> Result<(), Preparatio
             "--bin",
             CPU_WRAPPER_TARGET,
         ]
-        .map(String::from),
-        destination,
-    )
+        .map(String::from)
+        .to_vec(),
+    };
+    cargo_output(root, &args, destination)
 }
 
 /// Explicit standalone preparation. Official test consumers never call this.
@@ -473,7 +547,7 @@ pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
     )?;
     let cargo = read_json(&cargo_path)?;
     let events = artifacts.root.join("standalone-cpu-wrapper.jsonl");
-    prepare_cpu_wrapper(&root, &events)?;
+    prepare_cpu_wrapper(&root, &events, None)?;
     Ok(cpu_wrapper_artifact(
         &fs::read_to_string(events).map_err(|e| e.to_string())?,
         &cargo,
@@ -507,7 +581,9 @@ pub fn budget_context(
         "--exclude",
         "hermit-detcore",
         "--exclude",
-        "hermit",
+        "hermit-detcore-tests",
+        "--exclude",
+        "hermit-run",
         "--exclude",
         "hermetic_infra_hermit_flaky-tests",
     ];
@@ -974,6 +1050,77 @@ fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), 
     Ok(())
 }
 
+/// Runs each `program` (Cargo) command of `listings` (arguments, output file), which
+/// must compile nothing, such as `nextest list` given both metadata files, up
+/// to [`preparation_build_jobs`] at a time and without
+/// ci/run-with-reverie-dbt-budget.sh. That wrapper binds the Reverie DBT build
+/// budget to its pin with a pin check of about 0.8 s a call, and a command
+/// that builds nothing has no budget to bind; `run` already starts its
+/// `nextest` this way. Twenty such listings ran one at a time through it in
+/// build.workspace_in_pinned_root, about 16 s of pin checks on the critical
+/// path of every validation. The first failure is returned once every started
+/// listing has finished.
+fn listing_outputs(
+    root: &Path,
+    program: &std::ffi::OsStr,
+    listings: &[(Vec<String>, PathBuf)],
+) -> Result<(), PreparationError> {
+    let jobs = preparation_build_jobs()
+        .parse::<usize>()
+        .unwrap_or(1)
+        .max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failures = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.min(listings.len()) {
+            scope.spawn(|| {
+                while let Some((args, destination)) =
+                    listings.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
+                    if let Err(error) = listing_output(root, program, args, destination) {
+                        failures
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(error);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    match failures
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .into_iter()
+        .next()
+    {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn listing_output(
+    root: &Path,
+    program: &std::ffi::OsStr,
+    args: &[String],
+    destination: &Path,
+) -> Result<(), PreparationError> {
+    let output = fs::File::create(destination).map_err(|e| e.to_string())?;
+    let status = Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .stdout(output)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(PreparationError {
+            message: format!("Cargo listing failed ({status}): {args:?}"),
+            status: u8::try_from(exit_code(status)).unwrap_or(1),
+        });
+    }
+    Ok(())
+}
+
 fn check_identity(expected: &FileIdentity, executable: bool) -> Result<(), String> {
     let actual = file_identity(&expected.path, executable)?;
     if &actual != expected {
@@ -1030,21 +1177,50 @@ fn verify_selection(
 }
 
 fn verify_guests(record: &PreparedRecord) -> Result<BTreeMap<String, String>, String> {
+    verify_guest_population(
+        record,
+        &record.guests,
+        "hermit_modes",
+        &cargo_guests::CARGO_GUEST_BINARIES,
+        "Cargo guest",
+    )
+}
+
+fn verify_lit_guests(record: &PreparedRecord) -> Result<BTreeMap<String, String>, String> {
+    verify_guest_population(
+        record,
+        &record.lit_guests,
+        "lit",
+        &lit_guests::LIT_GUEST_BINARIES,
+        "lit guest",
+    )
+}
+
+/// GUESTS, the prepared population of the test binary TEST, by name: exactly
+/// NAMES, each inside the target, when a selection runs TEST, and none when
+/// none does.
+fn verify_guest_population(
+    record: &PreparedRecord,
+    guests: &[FileIdentity],
+    test: &str,
+    names: &[&str],
+    what: &str,
+) -> Result<BTreeMap<String, String>, String> {
     if !record.selections.values().any(|selection| {
         selection
             .build_args
             .windows(2)
-            .any(|args| args == ["--test", "hermit_modes"])
+            .any(|args| args == ["--test", test])
     }) {
-        if !record.guests.is_empty() {
-            return Err(
-                "unexpected Cargo guest records for a selection without hermit_modes".into(),
-            );
+        if !guests.is_empty() {
+            return Err(format!(
+                "unexpected {what} records for a selection without {test}"
+            ));
         }
         return Ok(BTreeMap::new());
     }
     let mut result = BTreeMap::new();
-    for guest in &record.guests {
+    for guest in guests {
         check_identity(guest, true)?;
         let name = guest
             .path
@@ -1056,13 +1232,16 @@ fn verify_guests(record: &PreparedRecord) -> Result<BTreeMap<String, String>, St
                 .insert(name.into(), guest.path.to_string_lossy().into())
                 .is_some()
         {
-            return Err("prepared guest identities are outside the target or ambiguous".into());
+            return Err(format!(
+                "prepared {what} identities are outside the target or ambiguous"
+            ));
         }
     }
-    if result.keys().map(String::as_str).collect::<BTreeSet<_>>()
-        != cargo_guests::CARGO_GUEST_BINARIES.into_iter().collect()
+    if result.keys().map(String::as_str).collect::<BTreeSet<_>>() != names.iter().copied().collect()
     {
-        return Err("prepared Cargo guest population differs from hermit_modes fixtures".into());
+        return Err(format!(
+            "prepared {what} population differs from the {test} fixtures"
+        ));
     }
     Ok(result)
 }
@@ -1072,14 +1251,34 @@ fn guest_executables(
     cargo: &Value,
     target: &Path,
 ) -> Result<Vec<FileIdentity>, String> {
+    package_executables(
+        events,
+        cargo,
+        target,
+        "hermetic_infra_hermit_tests",
+        &cargo_guests::CARGO_GUEST_BINARIES,
+    )
+}
+
+/// The executables of NAMES, binaries of PACKAGE, from Cargo's JSON EVENTS:
+/// each reported exactly once, as a non-test bin inside TARGET.
+fn package_executables(
+    events: &str,
+    cargo: &Value,
+    target: &Path,
+    package_name: &str,
+    names: &[&str],
+) -> Result<Vec<FileIdentity>, String> {
     let package = cargo["packages"]
         .as_array()
         .ok_or("missing Cargo packages")?
         .iter()
-        .filter(|package| package["name"].as_str() == Some("hermetic_infra_hermit_tests"))
+        .filter(|package| package["name"].as_str() == Some(package_name))
         .collect::<Vec<_>>();
     if package.len() != 1 {
-        return Err("Cargo guest package is missing or ambiguous".into());
+        return Err(format!(
+            "guest package {package_name} is missing or ambiguous"
+        ));
     }
     let package = string(package[0], "id")?;
     let mut by_name = BTreeMap::<String, PathBuf>::new();
@@ -1093,7 +1292,7 @@ fn guest_executables(
             continue;
         }
         let name = string(&event["target"], "name")?;
-        if !cargo_guests::CARGO_GUEST_BINARIES.contains(&name) {
+        if !names.contains(&name) {
             continue;
         }
         if event["target"]["kind"] != serde_json::json!(["bin"])
@@ -1107,9 +1306,12 @@ fn guest_executables(
         }
     }
     if by_name.keys().map(String::as_str).collect::<BTreeSet<_>>()
-        != cargo_guests::CARGO_GUEST_BINARIES.into_iter().collect()
+        != names.iter().copied().collect()
     {
-        return Err("Cargo did not report all 21 hermit_modes guest executables".into());
+        return Err(format!(
+            "Cargo did not report all {} {package_name} guest executables",
+            names.len()
+        ));
     }
     by_name
         .values()
@@ -1267,7 +1469,7 @@ pub fn cargo_profile_for(graph_profile: &str) -> Option<&'static str> {
 ///
 /// Only the validate-profile graph profiles do: their producers build the whole
 /// workspace with the unified features first, so the listing compiles nothing.
-/// The other profiles' producers build far less (a dev `-p hermit --bin hermit`
+/// The other profiles' producers build far less (a dev `-p hermit-run --bin hermit`
 /// in the privileged lane, under a 120-second cap), and a whole-workspace
 /// listing there would compile every test target of every member; they keep
 /// one listing per selection.
@@ -1359,7 +1561,7 @@ pub fn unified_prebuild_command(
         .map(|name| format!(" --profile {name}"))
         .unwrap_or_default();
     Ok(format!(
-        "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile}",
+        "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile} && target/validate/stage-detcore-liteinst --git target",
         unified.join(" ")
     ))
 }
@@ -1695,11 +1897,50 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         );
         cargo_output(&root, &args, &guest_path)?;
     }
+    let needs_lit_guests = has_test_selection(selections.values(), "lit");
+    let lit_guest_path = generation.join("lit-guests.jsonl");
+    if needs_lit_guests {
+        let mut args = ["build", "--locked"].map(String::from).to_vec();
+        if let Some(cargo_profile) = cargo_profile {
+            args.extend(["--profile".into(), cargo_profile.into()]);
+        }
+        args.extend(
+            [
+                "-p",
+                lit_guests::LIT_GUEST_PACKAGE,
+                "--bins",
+                "--message-format=json",
+            ]
+            .map(String::from),
+        );
+        cargo_output(&root, &args, &lit_guest_path)?;
+    }
     let cpu_wrapper_path = generation.join("cpu-wrapper.jsonl");
-    prepare_cpu_wrapper(&root, &cpu_wrapper_path)?;
+    // Only a whole-workspace unified selection builds the wrapper's bin; a
+    // profile with a single selection is its own union and may not.
+    let unified = match cargo_profile {
+        Some(cargo_profile)
+            if unifies(profile) && UNIFIED_CPU_WRAPPER_PROFILES.contains(&profile) =>
+        {
+            let selection = unified_selection(&selections)?;
+            selection
+                .iter()
+                .any(|arg| arg == "--workspace")
+                .then_some((cargo_profile, selection))
+        }
+        _ => None,
+    };
+    prepare_cpu_wrapper(
+        &root,
+        &cpu_wrapper_path,
+        unified
+            .as_ref()
+            .map(|(cargo_profile, selection)| (*cargo_profile, selection.as_slice())),
+    )?;
     // Hash only after every Cargo selection has completed. Shared paths may be
     // rebuilt by another selection; every published record names the final files.
     let mut recorded_selections = BTreeMap::new();
+    let mut listings = Vec::new();
     for (key, build_args) in selections {
         let path = generation.join(format!("{key}.json"));
         let (binaries, runtime_files) = metadata_binaries(&read_json(&path)?, &cargo, &target)?;
@@ -1715,9 +1956,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             "json",
         ]
         .map(String::from);
-        // Nextest itself must accept every complete metadata pair after the
-        // final build; this enumerates tests and never invokes the compiler.
-        cargo_output(&root, &args, &generation.join(format!("{key}.tests.json")))?;
+        listings.push((args.to_vec(), generation.join(format!("{key}.tests.json"))));
         recorded_selections.insert(
             key,
             SelectionRecord {
@@ -1728,11 +1967,25 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             },
         );
     }
+    // Nextest itself must accept every complete metadata pair after the final
+    // build; this enumerates tests and never invokes the compiler.
+    listing_outputs(&root, "cargo".as_ref(), &listings)?;
     let guests = if needs_guests {
         guest_executables(
             &fs::read_to_string(&guest_path).map_err(|e| e.to_string())?,
             &cargo,
             &target,
+        )?
+    } else {
+        vec![]
+    };
+    let lit_guests = if needs_lit_guests {
+        package_executables(
+            &fs::read_to_string(&lit_guest_path).map_err(|e| e.to_string())?,
+            &cargo,
+            &target,
+            lit_guests::LIT_GUEST_PACKAGE,
+            &lit_guests::LIT_GUEST_BINARIES,
         )?
     } else {
         vec![]
@@ -1758,6 +2011,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         cargo_metadata: file_identity(&cargo_path, false)?,
         selections: recorded_selections,
         guests,
+        lit_guests,
         record_workloads,
         cpu_wrapper: CpuWrapperRecord {
             executable: cpu_wrapper_artifact(
@@ -1773,6 +2027,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         verify_selection(&record, &checked_cargo, &selection.build_args)?;
     }
     verify_guests(&record)?;
+    verify_lit_guests(&record)?;
     verify_record_workloads(&record, &checked_cargo)?;
     let staging = generation.join("record.json");
     fs::write(
@@ -1785,9 +2040,10 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     // inputs still match, since earlier Cargo commands may have changed them.
     fs::rename(staging, artifacts.root.join("current.json")).map_err(|e| e.to_string())?;
     eprintln!(
-        "prepared-nextest: published {} selections, {} hermit_modes Cargo guests and {} record workloads for {profile}",
+        "prepared-nextest: published {} selections, {} hermit_modes Cargo guests, {} lit guests and {} record workloads for {profile}",
         record.selections.len(),
         record.guests.len(),
+        record.lit_guests.len(),
         record
             .record_workloads
             .as_ref()
@@ -1823,6 +2079,7 @@ pub fn run(
     let cargo = verify_record(&root, &record)?;
     let selection = verify_selection(&record, &cargo, &parsed.build)?;
     let guests = verify_guests(&record)?;
+    let lit_guests = verify_lit_guests(&record)?;
     let record_workloads = verify_record_workloads(&record, &cargo)?;
     if budget_map.is_none() {
         if let Some(path) = launch {
@@ -1871,6 +2128,10 @@ pub fn run(
             GUESTS_ENV,
             serde_json::to_string(&guests).map_err(|e| e.to_string())?,
         )
+        .env(
+            LIT_GUESTS_ENV,
+            serde_json::to_string(&lit_guests).map_err(|e| e.to_string())?,
+        )
         .current_dir(&root);
     // Never inherit an unverified population from the caller's environment.
     command.env_remove(record_workloads::PREPARED_ENV);
@@ -1895,6 +2156,7 @@ pub fn assert_profile(root: &Path, profile: &str) -> Result<(), String> {
         verify_selection(&record, &cargo, args)?;
     }
     verify_guests(&record)?;
+    verify_lit_guests(&record)?;
     verify_record_workloads(&record, &cargo)?;
     Ok(())
 }
@@ -1971,6 +2233,91 @@ mod tests {
     }
 
     #[test]
+    fn listings_run_concurrently_without_the_budget_wrapper_and_report_a_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-prepared-listings-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        // A stand-in for Cargo: it records how many listings overlap, prints
+        // its arguments as the listing, and fails on request.
+        let program = root.join("cargo");
+        fs::write(
+            &program,
+            "#!/bin/sh\n\
+             mkdir \"$PWD/running.$$\"\n\
+             sleep 0.3\n\
+             ls -d \"$PWD\"/running.* | wc -l >> \"$PWD/overlap\"\n\
+             rmdir \"$PWD/running.$$\"\n\
+             echo \"$@\"\n\
+             [ \"$1\" != fail ]\n",
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let listings: Vec<_> = (0..4)
+            .map(|index| {
+                (
+                    args(&format!("nextest list {index}")),
+                    root.join(format!("{index}.json")),
+                )
+            })
+            .collect();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("CARGO_BUILD_JOBS", "4") };
+        listing_outputs(&root, program.as_os_str(), &listings).unwrap();
+        for index in 0..4 {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("{index}.json"))).unwrap(),
+                format!("nextest list {index}\n")
+            );
+        }
+        let overlap = fs::read_to_string(root.join("overlap")).unwrap();
+        assert!(
+            overlap
+                .lines()
+                .any(|line| line.trim().parse::<u32>().unwrap() > 1),
+            "the listings never overlapped: {overlap:?}"
+        );
+        let failing = vec![(args("fail now"), root.join("fail.json"))];
+        let error = listing_outputs(&root, program.as_os_str(), &failing).unwrap_err();
+        assert!(
+            error.message.contains("Cargo listing failed"),
+            "{}",
+            error.message
+        );
+        assert_eq!(error.status, 1);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_changed_prepared_input_names_each_field_that_moved() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-prepared-input-change-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("one"), "1").unwrap();
+        fs::write(root.join("two"), "22").unwrap();
+        let one = fs::symlink_metadata(root.join("one")).unwrap();
+        let two = fs::symlink_metadata(root.join("two")).unwrap();
+
+        assert!(metadata_changes(&one, &one).is_empty());
+        let changed = metadata_changes(&one, &two);
+        assert_eq!(
+            changed[..2],
+            [
+                format!("ino {} -> {}", one.ino(), two.ino()),
+                "size 1 -> 2".to_string(),
+            ]
+        );
+        assert!(!changed.iter().any(|field| field.starts_with("mode ")));
+        assert_eq!(changed.last().unwrap(), "nlink 1 -> 1");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn one_selection_is_its_own_union() {
         let only = selections(&["-p hermit-detcore --lib"]);
         assert_eq!(
@@ -1982,15 +2329,15 @@ mod tests {
     #[test]
     fn several_selections_unify_to_the_workspace_with_qualified_features() {
         let several = selections(&[
-            "-p hermit --features third-party-backends,kvm-native-test-support --lib --bins",
-            "-p hermit-detcore --test tests_misc",
-            "-p hermit --features third-party-backends,kvm-execution-tests --lib --test cli",
-            "--workspace --exclude hermit",
+            "-p hermit-run --features third-party-backends,kvm-native-test-support --lib --bins",
+            "-p hermit-detcore-tests --test tests_misc",
+            "-p hermit-run --features third-party-backends,kvm-execution-tests --lib --test cli",
+            "--workspace --exclude hermit-run",
         ]);
         assert_eq!(
             unified_selection(&several).unwrap(),
             args(
-                "--workspace --all-targets --features hermit/kvm-execution-tests,hermit/kvm-native-test-support,hermit/third-party-backends"
+                "--workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/third-party-backends"
             )
         );
         let unfeatured = selections(&["-p a --lib", "-p b --test t"]);
@@ -2003,8 +2350,8 @@ mod tests {
     #[test]
     fn only_validate_profile_profiles_unify_their_listing() {
         let several = selections(&[
-            "-p hermit-detcore --test tests_misc",
-            "-p hermit --features third-party-backends --test hermit_modes",
+            "-p hermit-detcore-tests --test tests_misc",
+            "-p hermit-run --features third-party-backends --test hermit_modes",
         ]);
         for profile in ["full", "hosted-portable"] {
             let plan = listings(profile, &several).unwrap();
@@ -2014,7 +2361,7 @@ mod tests {
         }
         // The dev-profile producers build far less than the workspace, so
         // each of their selections keeps a listing of its own.
-        for profile in ["privileged", "super", "quick", "liteinst-compat-only"] {
+        for profile in ["privileged", "super", "quick"] {
             let plan = listings(profile, &several).unwrap();
             assert_eq!(plan.len(), 2, "{profile}");
             for (listing, keys) in plan {
@@ -2247,6 +2594,7 @@ mod tests {
                     cargo_metadata: file_identity(&cargo, false).unwrap(),
                     selections: BTreeMap::from([(selection_key(&args), selected)]),
                     guests: vec![],
+                    lit_guests: vec![],
                     record_workloads: None,
                     cpu_wrapper,
                 },
@@ -2299,7 +2647,7 @@ mod tests {
     fn record_fixture(fixture: &Fixture) -> (PreparedRecord, Value) {
         let (mut record, _) = fixture.selection();
         record.selections.values_mut().next().unwrap().build_args =
-            argv(&["-p", "hermit", "--test", "record_replay"]);
+            argv(&["-p", "hermit-run", "--test", "record_replay"]);
         let directory = fixture.root.join("record-workloads");
         fs::create_dir(&directory).unwrap();
         let mut targets = Vec::new();
@@ -2368,7 +2716,7 @@ mod tests {
         let population = record_workloads::consume_prepared(true, Some(&raw))
             .unwrap()
             .unwrap();
-        assert_eq!(population.len(), 46);
+        assert_eq!(population.len(), 73);
         assert_eq!(
             population.iter().map(|w| w.name).collect::<BTreeSet<_>>(),
             record_workloads::names().collect()
@@ -2507,7 +2855,7 @@ mod tests {
             "--profile",
             "ci",
             "-p",
-            "hermit",
+            "hermit-run",
             "--features",
             "third-party-backends",
             "--test",
@@ -2526,7 +2874,7 @@ mod tests {
             parsed.build,
             argv(&[
                 "-p",
-                "hermit",
+                "hermit-run",
                 "--features",
                 "third-party-backends",
                 "--test",
@@ -2585,6 +2933,21 @@ mod tests {
         ] {
             assert!(cpu_wrapper_artifact(&bad, &cargo, &f.target).is_err());
         }
+        // An all-targets build also reports the bin's own unit-test build
+        // under the target name; the normal executable is still the one taken.
+        let mut unit_test: Value = serde_json::from_str(&events).unwrap();
+        unit_test["profile"] = serde_json::json!({"test": true});
+        unit_test["executable"] = serde_json::json!(f.target.join("deps/nextest_cpu_wrapper-0123"));
+        for listing in [
+            format!("{unit_test}\n{events}\n"),
+            format!("{events}\n{unit_test}\n"),
+        ] {
+            assert_eq!(
+                cpu_wrapper_artifact(&listing, &cargo, &f.target).unwrap(),
+                wrapper.executable
+            );
+        }
+        assert!(cpu_wrapper_artifact(&unit_test.to_string(), &cargo, &f.target).is_err());
         let mut ambiguous = cargo.clone();
         ambiguous["packages"]
             .as_array_mut()

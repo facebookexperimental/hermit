@@ -1,5 +1,5 @@
 {
- "generated_by": "derive_re_exclusions.py m2-local-1 m3-hybrid-pmu-1",
+ "generated_by": "derive_re_exclusions.py m2-local-1 m3-hybrid-pmu-1; compat/ranlib added by hand from full validations ccccde5f65d6 and 66db685c5279",
  "schema": 1,
  "tests": {
   "c-programs/proc-locks": {
@@ -154,6 +154,28 @@
     }
    ],
    "reason": "/usr/bin/pidstat is not installed on RE (guest-program-not-found)"
+  },
+  "compat/ranlib": {
+   "cells": [
+    "compat/ranlib/verify@ptrace"
+   ],
+   "evidence": [
+    {
+     "cell": "compat/ranlib/verify@ptrace",
+     "local_run": "validate-ops-tick-20d49d84ec23-914f280b5537",
+     "re_error_kind": null,
+     "re_reason": "stripped verification did not match: verified=false verdict=diverged (first divergence: read of /proc/self/maps, syscall #74)",
+     "re_runs": [
+      "validate-buck-re-3-ccccde5f65d6-1791044441627223683-4139778-3d0a278f",
+      "validate-buck-re-3-66db685c5279-1791099824835735230-1153730-3be6996b"
+     ],
+     "re_verdicts": [
+      "FAIL",
+      "FAIL"
+     ]
+    }
+   ],
+   "reason": "the two verify runs read different /proc/self/maps bytes on some RE workers (2 of 9 RE attempts; 45 of 45 local attempts pass)"
   },
   "compat/sar-resource-tables": {
    "cells": [

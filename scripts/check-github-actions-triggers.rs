@@ -6,7 +6,6 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-
 //! Enforce the repository's GitHub Actions trigger policy.
 //!
 //! Local exact-head validation is the landing authority. The portable workflow
@@ -231,7 +230,10 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
 fn approved_schedule(name: &str) -> Option<&'static [&'static str]> {
     match name {
         "buck2-oss-nightly.yml" => Some(&["17 10 * * *"]),
-        "docs.yml" => Some(&["23 8 * * *"]),
+        // Daily at 08:23 UTC, as before; "0-6" instead of "*" so the commit
+        // that wrote it re-attributed the schedule to its pusher (see the
+        // comment on the cron line in docs.yml).
+        "docs.yml" => Some(&["23 8 * * 0-6"]),
         _ => None,
     }
 }
@@ -998,7 +1000,7 @@ mod tests {
     fn exact_approved_schedules_are_allowed() {
         for (name, cron) in [
             ("buck2-oss-nightly.yml", "17 10 * * *"),
-            ("docs.yml", "23 8 * * *"),
+            ("docs.yml", "23 8 * * 0-6"),
         ] {
             let triggers = parsed(&format!(
                 "on:\n  schedule:\n    - cron: \"{cron}\"\n  workflow_dispatch:\njobs:\n"
@@ -1029,6 +1031,7 @@ mod tests {
             ("other.yml", "17 10 * * *"),
             ("buck2-oss-nightly.yml", "18 10 * * *"),
             ("docs.yml", "23 8 * * 1"),
+            ("docs.yml", "23 8 * * *"),
         ] {
             let triggers = parsed(&format!(
                 "on:\n  schedule:\n    - cron: \"{cron}\"\n  workflow_dispatch:\njobs:\n"

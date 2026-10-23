@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # `openssl passwd -6` computes a crypt(3) SHA-512 password hash. With no -salt
 # given, openssl draws a random 16-character salt from libcrypto's userspace
 # DRBG, which is seeded from the kernel CSPRNG (getrandom(2), /dev/urandom

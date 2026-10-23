@@ -1,12 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/*
  * cachestat_refusal: cross-backend all-refuse contract for cachestat(2).
  *
  * cachestat(2) (Linux 6.5+) reports page-cache residency for a file

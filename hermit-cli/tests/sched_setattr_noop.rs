@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -13,9 +16,7 @@ use std::process::Output;
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -31,7 +32,8 @@ fn scheduler_policy_setters_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sched-setattr-noop");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sched-setattr-noop-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     for policy in ["other", "batch", "idle"] {

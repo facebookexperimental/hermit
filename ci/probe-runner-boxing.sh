@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Can THIS machine box a CI step, and does a cgroup kill reach a setsid escapee?
 #
 # DIAGNOSTIC ONLY. Never fails its caller, never changes a default, never gates a lane. It answers

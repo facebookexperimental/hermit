@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Fail closed when a Hermit integration-test binary is absent from CI accounting.
 
 Cargo discovers every top-level ``hermit-cli/tests/*.rs`` file as a test binary.
@@ -53,7 +47,7 @@ DAG_GLOB = "ci/dag/*.json"
 # hermit-detcore is not evidence that the hermit-cli binary ran.
 _HERMIT_INVOCATION_RE = re.compile(
     r"(?:cargo (?:test|nextest run)|\./ci/run-nextest-counted\.sh)"
-    r"[^\"\n]*?-p hermit(?!-)[^\"\n]*"
+    r"[^\"\n]*?-p hermit-run(?!-)[^\"\n]*"
 )
 _TEST_FLAG_RE = re.compile(r"--test(?:=|\s+)([A-Za-z0-9_]+)")
 _TOP_LEVEL_TEST_RE = re.compile(r"^hermit-cli/tests/([^/]+)\.rs$")
@@ -62,7 +56,7 @@ _TOP_LEVEL_TEST_RE = re.compile(r"^hermit-cli/tests/([^/]+)\.rs$")
 #
 # The audit used to regex the whole DAG document, so any string that merely looked
 # like an invocation registered a binary: a `desc` field mentioning one, or the
-# literal command `echo cargo test -p hermit --test zz_probe`, both counted. A
+# literal command `echo cargo test -p hermit-run --test zz_probe`, both counted. A
 # binary excused by text that never runs is exactly the blindness this file exists
 # to remove, one level up.
 #
@@ -318,7 +312,7 @@ def audit(root: Path, *, json_output: bool = False) -> int:
         for name in sorted(undeclared):
             print(f"    hermit-cli/tests/{name}.rs", file=sys.stderr)
         print(
-            "Either register each binary with `./ci/run-nextest-counted.sh -p hermit --test <name>` "
+            "Either register each binary with `./ci/run-nextest-counted.sh -p hermit-run --test <name>` "
             "in ci/dag/*.json, or add a ledger row naming why it is not run. "
             "Use `none-recorded` only for an honest unknown; it is debt, not approval.",
             file=sys.stderr,

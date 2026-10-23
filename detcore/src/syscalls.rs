@@ -8,22 +8,57 @@
 
 //! This module just aggregates submodules.
 
+mod accept_in_turn;
 mod files;
+pub(crate) mod guest_siginfo;
 pub mod helpers;
 
 /// Re-exported so `procfs` can report the SAME ceiling that `F_SETPIPE_SZ`
 /// enforces. Two constants that must agree are one constant.
 pub(crate) use files::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+pub(crate) use files::read_guest_exact;
+pub(crate) use files::read_guest_prefix;
+pub(crate) use files::rendered_procfs;
+pub(crate) use threads::VIRTUAL_CPUSET_BYTES;
 mod io;
-mod memory;
+pub(crate) mod memory;
 mod misc;
 mod namespace;
+pub(crate) use namespace::anonymous_object_devices;
+pub(crate) use namespace::guest_task_procfs;
+pub(crate) use network_trace::received_descriptors;
+mod network_trace;
 pub(crate) mod robust_list;
 mod signal;
+pub(crate) mod signal_shadow;
+/// The guest's virtual SIGALRM blocked bit (signal phase 1).
+pub(crate) use signal::ClaimFault;
+pub(crate) use signal::claim_still_pending;
+pub(crate) use signal::take_claim_fault;
+pub(crate) use signal::take_pending_signal;
+pub(crate) use signal::virtual_sigalrm_blocked;
 pub(crate) mod socket_timestamp_ioctl;
-mod sysinfo;
+pub(crate) mod sysinfo;
 mod threads;
+/// Where a futex wait takes its deadline from; a `restart_syscall` resumes an
+/// interrupted wait with the deadline it kept.
+pub(crate) use threads::FutexDeadline;
+/// The kernel's view of a guest thread's signals, which the scheduler reads when
+/// it commits a wake for a parked precise-mode futex waiter or an emulated sleep.
+pub(crate) use threads::KernelSignalState;
+pub(crate) use threads::default_action_ends_process;
+pub(crate) use threads::host_signal_state_reads_refused;
+pub(crate) use threads::ignored_at_generation;
+pub(crate) use threads::kernel_sigset_bit;
+pub(crate) use threads::read_kernel_signal_state;
+pub(crate) use threads::read_thread_signal_state;
+pub(crate) use threads::real_uid;
+pub(crate) use threads::refuse_host_signal_state_reads;
+#[cfg(test)]
+pub(crate) use threads::signal_state_read_seam;
+pub(crate) use threads::thread_is_gone;
 pub(crate) mod time;
+pub(crate) mod timerfd;
 
 use crate::consts::DET_SPECIAL_INODE_OFFSET;
 use crate::resources::Device;

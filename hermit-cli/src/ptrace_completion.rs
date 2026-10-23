@@ -1,9 +1,7 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
+ * This source code is licensed under the BSD-style license found in LICENSE.
  */
 
 //! Same-thread ownership of a complete ordinary-ptrace operation.
@@ -242,8 +240,22 @@ impl HermitCleanupUnconfirmed {
     /// already-expired timeout is published; no normal guest completion is
     /// claimed from this recovery. Do not call resume expecting cancellation of
     /// an operation that has not yet established its owned termination handle.
-    pub fn resume<T: 'static>(&self) -> Result<T, Error> {
+    ///
+    /// An operation a public launch function started lives on the calling
+    /// thread's tracer thread (`crate::tracer_thread`); resuming it from that
+    /// caller continues it there.
+    pub fn resume<T: Send + 'static>(&self) -> Result<T, Error> {
         reject_nested_runtime()?;
+        let this = self.clone();
+        if let Some(resumed) =
+            crate::tracer_thread::execute_on(self.origin.thread, move || this.resume_here::<T>())
+        {
+            return resumed?;
+        }
+        self.resume_here()
+    }
+
+    fn resume_here<T: 'static>(&self) -> Result<T, Error> {
         self.origin.check()?;
         let entry = OWNERS
             .try_with(|owners| owners.borrow().get(&self.key).cloned())
@@ -416,8 +428,11 @@ impl Control {
             handle.terminate(reverie::Error::Tool(Error::new(GuestTimedOut { limit })));
         }
     }
-    fn expire_if_due(&self) {
-        if !self.expired.get() && self.timeout.is_some_and(|(at, _)| Instant::now() >= at) {
+    /// Mark the run timed out if `now` is at or past its deadline. The caller
+    /// passes the same `now` it then compares deadlines against, so a deadline
+    /// can never be seen as passed while the timeout is still unexpired.
+    fn expire_if_due(&self, now: Instant) {
+        if !self.expired.get() && self.timeout.is_some_and(|(at, _)| now >= at) {
             self.expired.set(true);
             if !self.received_failure.get() {
                 let mut snapshot = self.snapshot.borrow_mut();
@@ -489,6 +504,23 @@ fn reject_nested_runtime() -> Result<(), RecoveryRefusal> {
     } else {
         Ok(())
     }
+}
+
+/// [`run`] on the calling thread's tracer thread (`crate::tracer_thread`), with
+/// its explicit stack, so that a library launch needs no particular stack from
+/// its caller. A nested runtime on the calling thread is refused here, before
+/// anything moves to the tracer thread.
+pub(crate) fn run_on_tracer_thread<T, F, Make>(
+    timeout: Option<Duration>,
+    make: Make,
+) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, Error>> + 'static,
+    Make: FnOnce(Rc<Control>) -> F + Send + 'static,
+{
+    reject_nested_runtime()?;
+    crate::tracer_thread::execute(move || run(timeout, make))?
 }
 
 /// Installs the whole operation before its first poll. `make` must only construct
@@ -566,7 +598,7 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
         runtime.block_on(async {
             let mut timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
             poll_fn(|cx| {
-                control.expire_if_due();
+                control.expire_if_due(Instant::now());
                 if !recovery
                     && control.expired.get()
                     && control.stage.get() == HermitCleanupStage::Startup
@@ -575,8 +607,14 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
                 }
                 let polled = future.as_mut().poll(cx);
                 // A synchronous poll can cross the absolute deadline. Observe
-                // that fact on its return without claiming preemption.
-                control.expire_if_due();
+                // that fact on its return without claiming preemption. This one
+                // reading of the clock also decides the deadline check below:
+                // with a second reading, the timeout could pass between the two,
+                // and the check would end the poll with the timeout unexpired,
+                // reporting HermitCleanupUnconfirmed with the startup snapshot
+                // instead of a run timeout (dh-4s1xh).
+                let now = Instant::now();
+                control.expire_if_due(now);
                 if let Poll::Ready(result) = polled {
                     let result = match (result, control.timeout) {
                         (Ok(_), Some((_, limit))) if control.expired.get() => {
@@ -605,7 +643,7 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
                     .min()
                 };
                 if let Some(deadline) = deadline {
-                    if Instant::now() >= deadline {
+                    if now >= deadline {
                         return Poll::Ready(None);
                     }
                     let at = tokio::time::Instant::from_std(deadline);

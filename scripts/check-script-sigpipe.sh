@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Regression guard for shared SIGPIPE handling and the rust-script entrypoint
 # contract. ci/prepare-rust-scripts.sh owns compilation in one named DAG node;
 # this checker proves that every tracked entrypoint uses the freshness-preserving

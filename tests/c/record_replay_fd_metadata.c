@@ -42,11 +42,7 @@ static const struct {
     uint16_t perm;
     uint32_t id;
   } entries[3];
-} acl = {
-    2,
-    {{0x01, 7, (uint32_t)-1},
-     {0x04, 0, (uint32_t)-1},
-     {0x20, 0, (uint32_t)-1}}};
+} acl = {2, {{0x01, 7, (uint32_t)-1}, {0x04, 0, (uint32_t)-1}, {0x20, 0, (uint32_t)-1}}};
 
 static int failures;
 
@@ -132,11 +128,13 @@ int main(int argc, char** argv) {
   expect_value(
       "fgetxattr-size", fgetxattr(fd, NAME, NULL, 0), (long)strlen(VALUE));
   memset(buf, 0, sizeof(buf));
-  expect_xattr_value("fgetxattr", fgetxattr(fd, NAME, buf, sizeof(buf)), buf);
+  expect_xattr_value(
+      "fgetxattr", fgetxattr(fd, NAME, buf, sizeof(buf)), buf);
   memset(buf, 0, sizeof(buf));
   expect_xattr_value("getxattr", getxattr(path, NAME, buf, sizeof(buf)), buf);
   memset(buf, 0, sizeof(buf));
-  expect_xattr_value("lgetxattr", lgetxattr(path, NAME, buf, sizeof(buf)), buf);
+  expect_xattr_value(
+      "lgetxattr", lgetxattr(path, NAME, buf, sizeof(buf)), buf);
   expect("fgetxattr-small", fgetxattr(fd, NAME, buf, 1), ERANGE);
   expect("fgetxattr-missing", fgetxattr(fd, "user.absent", buf, 8), ENODATA);
 
@@ -174,8 +172,7 @@ int main(int argc, char** argv) {
       "fsetxattr-acl-placeholder",
       fsetxattr(fd, "system.posix_acl_access", &acl, sizeof(acl), 0),
       0);
-  struct vfs_cap_data cap = {
-      VFS_CAP_REVISION_2, {{1u << CAP_NET_RAW, 0}, {0, 0}}};
+  struct vfs_cap_data cap = {VFS_CAP_REVISION_2, {{1u << CAP_NET_RAW, 0}, {0, 0}}};
   expect_value(
       "fsetxattr-cap-placeholder",
       fsetxattr(fd, "security.capability", &cap, XATTR_CAPS_SZ_2, 0),

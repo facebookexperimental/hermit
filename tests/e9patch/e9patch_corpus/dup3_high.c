@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /* fd-hygiene: dup3(stdout, 10) forces an explicit high descriptor number and
  * writes through it. Regresses that a caller-chosen fd number is honored
  * identically under e9patch preprocessing and plain ptrace. */

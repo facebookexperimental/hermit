@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -33,7 +36,8 @@ fn compile_guest(output: &Path) {
 }
 
 fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
         .args([
             "run",
             "--base-env=minimal",
@@ -41,9 +45,9 @@ fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
             "--max-timeslice=disabled",
         ])
         .arg(format!("--rng-seed={seed}"))
-        .arg(guest)
-        .output()
-        .expect("failed to run random guest under Hermit");
+        .arg(guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(
         output.status.success(),
         "random guest failed for seed {seed}:\nstdout:\n{}\nstderr:\n{}",
@@ -57,13 +61,13 @@ fn assert_guest_l2(guest: &Path, backend: Option<&str>) {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", "60s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .arg("--log=info");
     if let Some(backend) = backend {
         command.args(["--backend", backend]);
     }
     command.arg("run");
-    let output = command
+    command
         .args([
             "--strict",
             "--verify",
@@ -71,9 +75,9 @@ fn assert_guest_l2(guest: &Path, backend: Option<&str>) {
             "--preemption-timeout=disabled",
             "--",
         ])
-        .arg(guest)
-        .output()
-        .expect("failed to run random guest under strict verification");
+        .arg(guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -90,7 +94,10 @@ fn assert_guest_l2(guest: &Path, backend: Option<&str>) {
 
 #[test]
 fn random_sources_repeat_across_runs_and_change_with_seed() {
-    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join("random-determinism/random-sources");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "random-determinism/random-sources-{}",
+        std::process::id()
+    ));
     compile_guest(&guest);
 
     let expected = run_guest(&guest, 17);
@@ -104,8 +111,10 @@ fn random_sources_repeat_across_runs_and_change_with_seed() {
 #[test]
 #[ignore = "e2e: requires hermit + mount namespaces"]
 fn random_sources_are_deterministic_under_strict_verify() {
-    let guest =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("random-determinism/random-sources-strict");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "random-determinism/random-sources-strict-{}",
+        std::process::id()
+    ));
     compile_guest(&guest);
     assert_guest_l2(&guest, None);
 }
@@ -114,8 +123,10 @@ fn random_sources_are_deterministic_under_strict_verify() {
 // TODO-HUMAN-REVIEW(PR-1060): Review DBT child identity and RNG lifecycle coverage.
 #[test]
 fn dbt_random_sources_are_deterministic_under_strict_verify() {
-    let guest =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("random-determinism/dbt-random-sources");
+    let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "random-determinism/dbt-random-sources-{}",
+        std::process::id()
+    ));
     compile_guest(&guest);
     assert_guest_l2(&guest, Some("dbt"));
 }

@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # End-to-end m4 (macro processor) determinism fixture.
 #
 # m4 is the macro language underpinning autoconf/automake. Its `mkstemp`

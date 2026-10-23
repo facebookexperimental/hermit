@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 /* fd-hygiene: count entries in /proc/self/fd (excluding . and ..). The absolute
  * count is environment-dependent, so the corpus asserts only golden==e9patch
  * parity (expected_stdout=None): e9patch preprocessing must not leave an extra

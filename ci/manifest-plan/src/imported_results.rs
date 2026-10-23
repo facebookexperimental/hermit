@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! `test-harness run` import mode: re-publish cell rows another runner wrote.
 //!
 //! With `E2E_IMPORT_RESULTS=<root>` the harness executes no cell. It reads the
@@ -22,18 +14,31 @@
 //! an executed run:
 //!
 //! - Every row must describe this commit's clean source, this checkout's test
-//!   source, the current timeout policy, and (when the binary was stamped) a
-//!   binary built from this commit. Otherwise the cell is one `import-stale`
-//!   ERROR.
+//!   source, the current timeout policy, the `/proc` level the cell's test
+//!   declares, and (when the binary was stamped) a binary built from this
+//!   commit. Otherwise the cell is one `import-stale` ERROR.
 //! - The cell's rows, in file order, must be a history a producer writes:
 //!   attempts 1, 2, ... within the shared attempt cap, nothing after a PASS,
 //!   and no HOST-INAPPLICABLE row (a producer reports host inapplicability
 //!   only in `summary.json`). Otherwise the cell is one `import-history`
 //!   ERROR. This is checked on the whole history, before anything is dropped.
 //! - The producer retries every failure; this run's retry policy decides which
-//!   of those retries it would have made. History after a failed attempt that
-//!   does not earn a retry here is dropped, so that attempt is the cell's
-//!   verdict.
+//!   of those retries it would have made. History after a failed attempt (a
+//!   FAIL or an ERROR) that does not earn a retry here is dropped, so that
+//!   attempt is the cell's verdict.
+//! - The policy is the decision an executed run applies to its own attempt
+//!   (`attempt_retry_cause` in `test-harness`), applied to the imported row.
+//!   For an ERROR that is the skid-overshoot retry
+//!   (`skid_overshoot_only_reports`,
+//!   <https://github.com/rrnewton/hermit/issues/1845>) or the host-input
+//!   retry (`host_input_change_only`). Neither trusts the row's labels: each
+//!   re-decides the attempt from the report bytes the row retains, which must
+//!   match the row's `verification_report_sha256`, and the row must record
+//!   the exit, stdout and relaxation declarations of this checkout's cell. So
+//!   an imported skid-overshoot ERROR whose retained evidence decides it
+//!   continues to its producer's next attempt, as an executed one would, and
+//!   any other ERROR (an untyped one, a report that does not match its digest,
+//!   another declaration) ends the history.
 //! - A PASS counts only if the producer recorded complete evidence for the
 //!   execution that passed: that row's run id in `evidence_complete_executions`
 //!   in the bucket's `summary.json`. Evidence from another execution of the
@@ -64,6 +69,7 @@ use crate::runner::cell_timeouts;
 use crate::runner::host_inapplicable_result;
 use crate::runner::infrastructure_error_result;
 use crate::runner::outcome_after_retries;
+use crate::runner::proc_level_mismatch;
 use crate::runner::test_digest;
 
 pub const IMPORT_RESULTS_ENV: &str = "E2E_IMPORT_RESULTS";
@@ -76,8 +82,11 @@ pub fn bucket_dir(root: &Path, lane: &str, category: &str) -> PathBuf {
 
 /// The decisions an executed run makes for itself, applied to imported rows.
 pub struct ImportPolicy<'a> {
-    /// Whether this run would retry after `row` (its retry setting and the
-    /// cell's `no_retry_reason`).
+    /// Whether this run would retry after `row`, by the rule an executed run
+    /// applies to its own attempt: its retry setting, the cell's
+    /// `no_retry_reason`, and for an ERROR the skid-overshoot and host-input
+    /// rules, which re-decide the attempt from its retained report bytes. It
+    /// is consulted for every FAIL and ERROR row; a PASS ends the history.
     pub earns_retry: &'a dyn Fn(&SelectedCell, &CellResult) -> bool,
     /// Why this machine cannot run the cell, if it cannot.
     pub host_inapplicable: &'a dyn Fn(&SelectedCell) -> Option<String>,
@@ -128,6 +137,21 @@ struct SummaryExecution {
 }
 
 type Key = (String, String, String, String, Option<String>);
+
+/// Per bucket, ci/buck-e2e/ingest.py's record of each producer execution that
+/// wrote no row: its attempt number and, in Tpx's and Buck's own words, why
+/// (`no_row_cause`). Diagnostics only: a history with a gap is refused with or
+/// without it, and the refusal quotes it.
+const NO_ROW_FILE: &str = "no-row-executions.jsonl";
+
+#[derive(Deserialize)]
+struct NoRowExecution {
+    test: String,
+    mode: String,
+    backend: Option<String>,
+    attempt: u64,
+    cause: String,
+}
 
 fn key(lane: &str, category: &str, test: &str, mode: &str, backend: Option<&str>) -> Key {
     (
@@ -194,6 +218,11 @@ fn stale_reason(context: &RunContext, cell: &SelectedCell, row: &CellResult) -> 
             ));
         }
     }
+    if let Some(mismatch) = proc_level_mismatch(row, cell) {
+        return Some(format!(
+            "imported row is not at this cell's /proc level: {mismatch}"
+        ));
+    }
     match cell_timeouts(context, cell) {
         Ok(policy)
             if row.execution_cpu_timeout_seconds == Some(policy.cpu_seconds)
@@ -227,8 +256,10 @@ fn stale_reason(context: &RunContext, cell: &SelectedCell, row: &CellResult) -> 
 
 /// Why `rows`, in file order, are not a history a producer writes, if they
 /// are not. The executed path's own rule decides (`outcome_after_retries`),
-/// and a producer never writes a HOST-INAPPLICABLE row.
-fn history_error(rows: &[CellResult]) -> Option<String> {
+/// and a producer never writes a HOST-INAPPLICABLE row. `no_rows` names, by
+/// attempt, the cause the producer recorded for each execution that wrote no
+/// row; it only words the refusal and never decides it.
+fn history_error(rows: &[CellResult], no_rows: Option<&BTreeMap<u64, String>>) -> Option<String> {
     if let Some(row) = rows.iter().find(|row| row.outcome == "HOST-INAPPLICABLE") {
         return Some(format!(
             "imported attempt {} is a HOST-INAPPLICABLE row; a producer reports host inapplicability only in summary.json's host_inapplicable_cells",
@@ -237,7 +268,14 @@ fn history_error(rows: &[CellResult]) -> Option<String> {
     }
     outcome_after_retries(rows.iter().map(|row| (row.attempt, row.outcome.as_str())))
         .err()
-        .map(|error| format!("imported rows are not one producer history: {error}"))
+        .map(|error| {
+            let causes = no_rows
+                .into_iter()
+                .flatten()
+                .map(|(attempt, cause)| format!("; attempt {attempt} wrote no row: {cause}"))
+                .collect::<String>();
+            format!("imported rows are not one producer history: {error}{causes}")
+        })
 }
 
 /// Read the import root for `cells`. `results_path` is where this run
@@ -259,6 +297,7 @@ pub fn load(
     let mut rows = BTreeMap::<Key, Vec<CellResult>>::new();
     let mut inapplicable = BTreeMap::<Key, String>::new();
     let mut evidence_complete = BTreeSet::<(Key, String)>::new();
+    let mut no_rows = BTreeMap::<Key, BTreeMap<u64, String>>::new();
     for (lane, category) in &buckets {
         let dir = bucket_dir(root, lane, category);
         let results = dir.join("results.jsonl");
@@ -294,6 +333,32 @@ pub fn load(
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("{}: {error}", results.display())),
+        }
+        let no_row_path = dir.join(NO_ROW_FILE);
+        match fs::read_to_string(&no_row_path) {
+            Ok(text) => {
+                for (number, line) in text.lines().enumerate() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let entry: NoRowExecution = serde_json::from_str(line).map_err(|error| {
+                        format!("{}:{}: {error}", no_row_path.display(), number + 1)
+                    })?;
+                    let id = key(
+                        lane,
+                        category,
+                        &entry.test,
+                        &entry.mode,
+                        entry.backend.as_deref(),
+                    );
+                    no_rows
+                        .entry(id)
+                        .or_default()
+                        .insert(entry.attempt, entry.cause);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", no_row_path.display())),
         }
         let summary = dir.join("summary.json");
         match fs::read(&summary) {
@@ -374,15 +439,20 @@ pub fn load(
                 (Some(mut found), None) => {
                     if let Some(reason) = found.iter().find_map(|row| stale_reason(context, cell, row)) {
                         vec![error_row(context, cell, "import-stale", reason)]
-                    } else if let Some(reason) = history_error(&found) {
+                    } else if let Some(reason) = history_error(&found, no_rows.get(&id)) {
                         vec![error_row(context, cell, "import-history", reason)]
                     } else {
                         // Keep the history up to the first attempt this run
                         // would not have retried. A PASS is already the last
-                        // row, so only a failed attempt can drop later ones.
+                        // row (`history_error`), so only a failed attempt can
+                        // drop later ones. A FAIL or an ERROR continues it
+                        // exactly when the policy retries it: a typed skid
+                        // overshoot does, as it would had this run executed
+                        // the attempt, because the policy re-decides it from
+                        // the report bytes the row retains.
                         let kept = found
                             .iter()
-                            .position(|row| !(policy.earns_retry)(cell, row))
+                            .position(|row| row.outcome == "PASS" || !(policy.earns_retry)(cell, row))
                             .map_or(found.len(), |terminal| terminal + 1);
                         dropped_retries += found.len() - kept;
                         found.truncate(kept);

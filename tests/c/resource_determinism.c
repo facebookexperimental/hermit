@@ -536,9 +536,8 @@ static void check_sysinfo_memory_matches_configured_memory(void) {
 // immediately after the work starts while the elapsed clock is still early in
 // its own tick: less than 10ms of time has then passed and neither clock is
 // required to have crossed a boundary. Two system ticks mean more than 10ms of
-// system time was spent, and for a single thread elapsed time is at least
-// system time, so the elapsed clock must also have crossed at least one
-// boundary.
+// system time was spent, and for a single thread elapsed time is at least system
+// time, so the elapsed clock must also have crossed at least one boundary.
 //
 // The bound only turns a clock that never advances into a named failure; it is
 // not a threshold the test is judged by. Reaching two ticks took 362 (parent)

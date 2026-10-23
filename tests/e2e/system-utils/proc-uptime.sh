@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # `/proc/uptime` exposes two host time quantities as procfs file content: seconds
 # since boot and cumulative idle-CPU seconds (summed across cores). Both advance
 # in real time, so reading the file natively yields a different line on every

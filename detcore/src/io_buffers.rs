@@ -52,8 +52,12 @@ use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::linux_abi::Mmsghdr;
+use reverie::syscalls::linux_abi::Msghdr;
 
 use crate::digest::Digest;
+use crate::dirents::DirentFormat;
+use crate::syscalls::helpers::poll_nfds;
 use crate::types::DetTid;
 
 /// One contiguous run of guest bytes a completed syscall moved.
@@ -174,6 +178,12 @@ fn whole(addr: Option<u64>, len: u64) -> Vec<BufferExtent> {
     }
 }
 
+/// The bytes of the `pollfd` array a call with `nfds` reads, counted as Linux
+/// counts its entries (see [`poll_nfds`]). Cannot overflow.
+fn pollfd_array_len(nfds: libc::nfds_t) -> u64 {
+    u64::from(poll_nfds(nfds)) * std::mem::size_of::<libc::pollfd>() as u64
+}
+
 /// Walk an `iovec` array and return the segments the syscall actually filled,
 /// bounded by `moved`.
 ///
@@ -234,21 +244,40 @@ fn iovec_extents_from_slice(iovecs: &[libc::iovec], moved: i64) -> Vec<BufferExt
 /// log direction without also making its complete, return-value-bounded iovec
 /// prefix available to [`extents`].
 fn iovec_extent_arguments(call: &Syscall) -> Option<(usize, usize)> {
+    let count = |count: u64| linux_iovec_count(count);
     match call {
-        Syscall::Readv(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.len())),
-        Syscall::Preadv(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.iov_len())),
-        Syscall::Preadv2(call) => Some((
+        Syscall::Readv(call) => Some((
             call.iov().map_or(0, |p| p.as_raw()),
-            usize::try_from(call.iov_len()).unwrap_or(usize::MAX),
+            count(call.len() as u64),
         )),
-        Syscall::Writev(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.len())),
-        Syscall::Pwritev(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.iov_len())),
-        Syscall::Pwritev2(call) => Some((
+        Syscall::Preadv(call) => Some((
             call.iov().map_or(0, |p| p.as_raw()),
-            usize::try_from(call.iov_len()).unwrap_or(usize::MAX),
+            count(call.iov_len() as u64),
         )),
+        Syscall::Preadv2(call) => {
+            Some((call.iov().map_or(0, |p| p.as_raw()), count(call.iov_len())))
+        }
+        Syscall::Writev(call) => Some((
+            call.iov().map_or(0, |p| p.as_raw()),
+            count(call.len() as u64),
+        )),
+        Syscall::Pwritev(call) => Some((
+            call.iov().map_or(0, |p| p.as_raw()),
+            count(call.iov_len() as u64),
+        )),
+        Syscall::Pwritev2(call) => {
+            Some((call.iov().map_or(0, |p| p.as_raw()), count(call.iov_len())))
+        }
         _ => None,
     }
+}
+
+/// The iovec count Linux uses for a vectored read or write: the system calls
+/// pass it on to `import_iovec` as an `unsigned int` (`nr_segs`), so only its
+/// low 32 bits count (Codex re-check #7 of
+/// https://github.com/rrnewton/hermit/pull/4031).
+pub(crate) fn linux_iovec_count(count: u64) -> usize {
+    count as u32 as usize
 }
 
 /// Read a `msghdr` out of the guest and walk the iovecs it points at.
@@ -260,8 +289,8 @@ fn msghdr_extents<M: MemoryAccess>(
     if msg_addr == 0 {
         return Ok(Vec::new());
     }
-    let address: AddrMut<'_, libc::msghdr> = AddrMut::from_raw(msg_addr).ok_or(Errno::EFAULT)?;
-    let message: libc::msghdr = memory.read_value(address)?;
+    let address: AddrMut<'_, Msghdr> = AddrMut::from_raw(msg_addr).ok_or(Errno::EFAULT)?;
+    let message: Msghdr = memory.read_value(address)?;
     iovec_extents(memory, message.msg_iov as usize, message.msg_iovlen, moved)
 }
 
@@ -291,11 +320,10 @@ fn mmsghdr_extents<M: MemoryAccess>(
     if mmsg_addr == 0 || count == 0 {
         return Ok(Vec::new());
     }
-    let address: AddrMut<'_, libc::mmsghdr> = AddrMut::from_raw(mmsg_addr).ok_or(Errno::EFAULT)?;
+    let address: AddrMut<'_, Mmsghdr> = AddrMut::from_raw(mmsg_addr).ok_or(Errno::EFAULT)?;
     // SAFETY: `mmsghdr` is a plain C record; an all-zero value is a valid
     // staging value that `read_values` immediately overwrites.
-    let mut headers: Vec<libc::mmsghdr> =
-        (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let mut headers: Vec<Mmsghdr> = (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
     memory.read_values(address.into(), &mut headers)?;
 
     let mut out = Vec::new();
@@ -362,18 +390,96 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
     // Rewritten in place across the whole array.
     reverie::syscalls::Sysno::poll,
     reverie::syscalls::Sysno::ppoll,
+    // A structure the kernel (and Detcore) fills whole (`stat_buffer`).
+    reverie::syscalls::Sysno::stat,
+    reverie::syscalls::Sysno::lstat,
+    reverie::syscalls::Sysno::fstat,
+    reverie::syscalls::Sysno::newfstatat,
+    reverie::syscalls::Sysno::statx,
 ];
 
 fn ret_gates_output(call: &Syscall) -> bool {
     !matches!(call, Syscall::Poll(_) | Syscall::Ppoll(_))
 }
 
+/// The structure a stat-family call fills: its guest address and size.
+///
+/// WHY THESE ARE HASHED. The INFO record shows a stat result as
+/// `{st_mode=..., st_size=..., ...}`, so two runs whose stat calls returned
+/// different devices, inodes, link counts or times produce identical records,
+/// and the first divergence a comparison can report is wherever that hidden
+/// value later changed the guest's behaviour. Measured 2026-10-21 on a dnf
+/// transaction run twice with the Python driver's directory on another
+/// subvolume: `hermit log-diff` first reported a heap pointer 32 bytes apart
+/// in rpm's `newfstatat("/etc/DIR_COLORS")`, and the run later opened
+/// `/sys/dev/block/0:7` instead of `0:6`; no record named the stat call that
+/// returned the other device. The structure is what Detcore left in guest
+/// memory, after it determinized the result.
+fn stat_buffer(call: &Syscall) -> Option<(Option<u64>, u64)> {
+    let stat = |p: Option<reverie::syscalls::StatPtr<'_>>| p.map(|p| p.0.as_raw() as u64);
+    let stat_len = std::mem::size_of::<libc::stat>() as u64;
+    Some(match call {
+        Syscall::Stat(c) => (stat(c.stat()), stat_len),
+        Syscall::Lstat(c) => (stat(c.stat()), stat_len),
+        Syscall::Fstat(c) => (stat(c.stat()), stat_len),
+        Syscall::Newfstatat(c) => (stat(c.stat()), stat_len),
+        Syscall::Statx(c) => (
+            c.statx().map(|p| p.0.as_raw() as u64),
+            std::mem::size_of::<reverie::syscalls::linux_abi::Statx>() as u64,
+        ),
+        _ => return None,
+    })
+}
+
+/// The fields of a stat-family result, decoded from the structure the guest
+/// received, so that a record that differs names the field that differs.
+/// `None` for any other call or a failed one.
+fn stat_fields<M: MemoryAccess>(memory: &M, call: &Syscall, ret: i64) -> Option<String> {
+    if ret != 0 {
+        return None;
+    }
+    let stat: crate::stat::DetStat = match call {
+        Syscall::Statx(c) => {
+            let addr = c.statx()?.0;
+            (&memory.read_value(addr).ok()?).into()
+        }
+        _ => {
+            let (addr, _) = stat_buffer(call)?;
+            let addr = AddrMut::<libc::stat>::from_raw(addr? as usize)?;
+            (&memory.read_value(addr).ok()?).into()
+        }
+    };
+    let time = |t: &reverie::syscalls::Timespec| format!("{}.{:09}", t.tv_sec, t.tv_nsec);
+    Some(format!(
+        "mask={:#x} dev={:#x} ino={} mode={:#o} nlink={} uid={} gid={} rdev={:#x} size={} blksize={} blocks={} atime={} mtime={} ctime={} btime={}",
+        stat.mask.bits(),
+        stat.dev,
+        stat.inode,
+        stat.mode,
+        stat.nlink,
+        stat.uid,
+        stat.gid,
+        stat.rdev,
+        stat.size,
+        stat.blksize,
+        stat.blocks,
+        time(&stat.atime),
+        time(&stat.mtime),
+        time(&stat.ctime),
+        time(&stat.btime),
+    ))
+}
+
 /// The extents a completed syscall moved, or `None` when this syscall has no
 /// output buffer worth hashing.
 ///
 /// Only syscalls whose buffer CONTENT the INFO record does not already show are
-/// listed. `clock_gettime` and `newfstatat`, for instance, are absent because
-/// Reverie's typed display already dereferences and prints their output.
+/// listed. `clock_gettime`, for instance, is absent because Reverie's typed
+/// display already dereferences and prints its output. The stat family is
+/// listed although its display dereferences the buffer too: that display
+/// prints only `st_mode` and `st_size` and then `...`, so a different device,
+/// inode, link count, block count or time is invisible in the record (see
+/// [`stat_buffer`]).
 fn extents<M: MemoryAccess>(
     memory: &M,
     call: &Syscall,
@@ -383,6 +489,15 @@ fn extents<M: MemoryAccess>(
     // return value is a byte count. `ret_gates_output` is what keeps the poll
     // family out of this, and it is a predicate rather than an arm placed above
     // so the exclusion cannot be undone by moving code.
+    // A stat-family call returns 0, not a byte count, and fills its whole
+    // structure, so the byte-count gate below does not apply to it.
+    if let Some((addr, len)) = stat_buffer(call) {
+        return Ok(if ret == 0 {
+            whole(addr, len)
+        } else {
+            Vec::new()
+        });
+    }
     if ret <= 0 && ret_gates_output(call) {
         return Ok(Vec::new());
     }
@@ -429,14 +544,17 @@ fn extents<M: MemoryAccess>(
         // Rewritten in place across the WHOLE array: `poll` sets `revents` on
         // every entry, not just on the `ret` that were ready, so the extent is
         // the array and not a prefix of it -- and it is reached even when
-        // `ret == 0`, via `ret_gates_output`.
+        // `ret == 0`, via `ret_gates_output`. Linux takes `nfds` as an
+        // `unsigned int`, so only its low 32 bits count: a guest that sets the
+        // high word gets the low word's array, and the observer must not read
+        // more.
         Syscall::Poll(c) => whole(
             c.fds().map(|p| p.as_raw() as u64),
-            c.nfds() * std::mem::size_of::<libc::pollfd>() as u64,
+            pollfd_array_len(c.nfds()),
         ),
         Syscall::Ppoll(c) => whole(
             c.fds().map(|p| p.as_raw() as u64),
-            c.nfds() * std::mem::size_of::<libc::pollfd>() as u64,
+            pollfd_array_len(c.nfds()),
         ),
 
         _ => Vec::new(),
@@ -487,26 +605,126 @@ fn extent_digests<G, T>(
     addr: u64,
     len: u64,
     rng_output: bool,
-) -> Result<(Digest, usize, Vec<String>), Error>
+    records: bool,
+) -> Result<(Digest, usize, Vec<String>, usize), Error>
 where
     G: Guest<T>,
     T: Tool,
 {
-    let size = len as usize;
-    let mut buf = if rng_output {
+    let (buf, unread) = if rng_output {
+        // RNG output was written by Detcore itself after the output commit:
+        // reserving the payload and reading it back are both fatal, with no
+        // substitute digest (see `rng_observation_vec`). The read back is
+        // `read_written`, as in `read_extent`, so a destination that ends just
+        // before an unmapped page, or is write-only, is still read; only when
+        // no method can read it is the failure fatal.
+        let size = len as usize;
         let mut buf = rng_observation_vec(size, "digest payload")?;
         buf.resize(size, 0u8);
-        buf
+        if size > 0 {
+            let start = AddrMut::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
+            read_written(&guest.memory(), start, buf.as_mut_slice())?;
+        }
+        (buf, 0)
     } else {
-        vec![0u8; size]
+        read_extent(&guest.memory(), addr, len, records)?
     };
-    if size > 0 {
-        let start = Addr::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
-        guest.memory().read_values(start, buf.as_mut_slice())?;
-    }
     let whole = Digest::new(buf.as_slice());
     let (chunk, chunks) = chunk_digests(buf.as_slice());
-    Ok((whole, chunk, chunks))
+    Ok((whole, chunk, chunks, unread))
+}
+
+/// Read the `len` bytes at `addr` that a completed syscall moved, and return
+/// them with how many bytes at their end were not read.
+///
+/// An extent that the guest cannot read is an error, which replaces the
+/// syscall's result. The one exception is `getdents64` records, when
+/// `records` is set: Linux does not write the padding after the last
+/// record's name, which may lie in a page the guest cannot access. When every
+/// byte before that padding can be read, the padding the guest cannot read is
+/// hashed as zeros, and how long it is is reported. Which pages can be read
+/// follows the guest's page protection, so it is the same in every run.
+fn read_extent<M: MemoryAccess>(
+    memory: &M,
+    addr: u64,
+    len: u64,
+    records: bool,
+) -> Result<(Vec<u8>, usize), Error> {
+    let size = len as usize;
+    let mut buf = vec![0u8; size];
+    if size == 0 {
+        return Ok((buf, 0));
+    }
+    let start = AddrMut::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
+    let Err(error) = read_written(memory, start, buf.as_mut_slice()) else {
+        return Ok((buf, 0));
+    };
+    if !records {
+        return Err(error.into());
+    }
+    let readable = crate::syscalls::read_guest_prefix(memory, start, &mut buf)?;
+    // Zeroes what was not read, and checks that it is only that padding.
+    if DirentFormat::Dirent64
+        .parse_written(&mut buf, readable)
+        .is_err()
+    {
+        return Err(error.into());
+    }
+    Ok((buf, size - readable))
+}
+
+/// Read the bytes a completed syscall wrote at `start`, filling all of `buf`,
+/// or return the first method's error if no method can read them.
+///
+/// Three methods, because each fails where another works on ptrace:
+///
+/// 1. `read_values`. Up to eight bytes are one eight-byte `PTRACE_PEEKDATA`,
+///    which fails for an extent that ends less than eight bytes before an
+///    unmapped page; more are `process_vm_readv`, which cannot read a page
+///    without `PROT_READ`.
+/// 2. [`read_guest_exact`](crate::syscalls::read_guest_exact): one
+///    `process_vm_readv` of exactly the extent, so it reaches no other page,
+///    but it too needs `PROT_READ`.
+/// 3. Aligned eight-byte words, each one `PTRACE_PEEKDATA`, which reads a
+///    write-only page. An aligned word never spans two pages, and every word
+///    read holds at least one byte of the extent, so it lies in a page the
+///    syscall wrote to. Only the extent's bytes are kept.
+///
+/// A later method runs only if the earlier ones failed. Which one succeeds
+/// depends only on the guest's page protections, so it is the same in every
+/// run. The words are a fallback, not the first choice, because they cost one
+/// trap per eight bytes.
+fn read_written<M: MemoryAccess>(
+    memory: &M,
+    start: AddrMut<'_, u8>,
+    buf: &mut [u8],
+) -> Result<(), Errno> {
+    let Err(error) = memory.read_values(Addr::from(start), buf) else {
+        return Ok(());
+    };
+    if crate::syscalls::read_guest_exact(memory, start, buf).is_ok()
+        || read_words(memory, start.as_raw(), buf).is_ok()
+    {
+        return Ok(());
+    }
+    Err(error)
+}
+
+/// Method 3 of [`read_written`].
+fn read_words<M: MemoryAccess>(memory: &M, addr: usize, buf: &mut [u8]) -> Result<(), Errno> {
+    const WORD: usize = std::mem::size_of::<u64>();
+    let end = addr.checked_add(buf.len()).ok_or(Errno::EFAULT)?;
+    let mut word_addr = addr & !(WORD - 1);
+    while word_addr < end {
+        let word = memory
+            .read_value(Addr::<u64>::from_raw(word_addr).ok_or(Errno::EFAULT)?)?
+            .to_ne_bytes();
+        let low = addr.max(word_addr);
+        let high = end.min(word_addr + WORD);
+        buf[low - addr..high - addr].copy_from_slice(&word[low - word_addr..high - word_addr]);
+        word_addr += WORD;
+    }
+    Ok(())
 }
 
 /// The locating half, split out from the guest read so it can be bracketed.
@@ -583,31 +801,89 @@ where
         Some(fd) => fd.to_string(),
         None => "-".to_string(),
     };
+    // A recvmsg's buffers are found by re-reading its msghdr after the call,
+    // and Linux lets the receive's own output overwrite that header. When the
+    // re-read, a buffer read, or the re-read iovec's coverage of the returned
+    // length fails, the call's bytes cannot be (fully) observed. That is
+    // recorded as an explicit, compared `unobserved` entry after whatever was
+    // hashed, as before, from the re-read; and the guest still gets the
+    // kernel's result: the instrumentation must never change the guest's
+    // execution. Other calls keep failing on an observation error.
+    let unobserved = |reason: String| {
+        crate::detlog!(
+            "[iobuf][dtid {}] {} {} fd={} unobserved ret={} reason={}",
+            dettid,
+            name,
+            dir,
+            fd,
+            ret,
+            reason
+        );
+    };
+    let receive = match call {
+        Syscall::Recvmsg(receive) => Some(*receive),
+        _ => None,
+    };
     let moved_extents = {
         let memory = guest.memory();
-        observed_extents(&memory, call, ret, rng_output)?
+        match observed_extents(&memory, call, ret, rng_output) {
+            Ok(extents) => extents,
+            Err(_) if receive.is_some() => {
+                unobserved("header-or-iovec-unreadable".to_string());
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
     };
+    // Without MSG_TRUNC, Linux returns at most what the iovec it imported
+    // holds, so a re-read iovec that holds less was overwritten; its extents
+    // are still hashed below, as before, and the entry follows them. With
+    // MSG_TRUNC a datagram returns its full length, so the check cannot be
+    // made.
+    let covered: u64 = moved_extents.iter().map(|extent| extent.len).sum();
+    let short = receive
+        .is_some_and(|receive| receive.flags() & libc::MSG_TRUNC == 0 && covered < ret as u64);
+    let records = matches!(call, Syscall::Getdents64(_));
+    // A stat result's fields go on its record, so a comparison names the field.
+    let fields = stat_fields(&guest.memory(), call, ret)
+        .map_or_else(String::new, |fields| format!(" {fields}"));
     for extent in moved_extents {
-        let (whole, chunk, chunks) =
-            extent_digests(guest, extent.addr, extent.len, rng_output.is_some()).map_err(
-                |error| {
-                    if rng_output.is_some() {
-                        Error::Tool(anyhow::Error::new(error).context(format!(
-                            "RNG vector observation after output commit: digest read at {:#x}+{}",
-                            extent.addr, extent.len
-                        )))
-                    } else {
-                        error
-                    }
-                },
-            )?;
+        let digests = extent_digests(
+            guest,
+            extent.addr,
+            extent.len,
+            rng_output.is_some(),
+            records,
+        );
+        if digests.is_err() && receive.is_some() {
+            unobserved(format!(
+                "buffer-unreadable at={:#x}+{}",
+                extent.addr, extent.len
+            ));
+            return Ok(());
+        }
+        let (whole, chunk, chunks, unread) = digests.map_err(|error| {
+            if rng_output.is_some() {
+                Error::Tool(anyhow::Error::new(error).context(format!(
+                    "RNG vector observation after output commit: digest read at {:#x}+{}",
+                    extent.addr, extent.len
+                )))
+            } else {
+                error
+            }
+        })?;
         let located = if chunks.is_empty() {
             String::new()
         } else {
             format!(" chunks={}:{}", chunk, chunks.join(","))
         };
+        let unread = if unread == 0 {
+            String::new()
+        } else {
+            format!(" unread_padding={unread}")
+        };
         crate::detlog!(
-            "[iobuf][dtid {}] {} {} fd={} {:#x}+{}->{}{}",
+            "[iobuf][dtid {}] {} {} fd={} {:#x}+{}->{}{}{}{}",
             dettid,
             name,
             dir,
@@ -615,8 +891,13 @@ where
             extent.addr,
             extent.len,
             whole,
-            located
+            located,
+            unread,
+            fields
         );
+    }
+    if short {
+        unobserved(format!("iovec-short covered={covered}"));
     }
     Ok(())
 }
@@ -629,6 +910,8 @@ mod event_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use detcore_model::happens_before::HappensBeforeProgram;
+    use detcore_model::happens_before::HappensBeforeSpec;
     use nix::fcntl::OFlag;
     use reverie::GlobalRPC;
     use reverie::GlobalTool;
@@ -648,6 +931,7 @@ mod event_tests {
     use crate::Config;
     use crate::Detcore;
     use crate::GlobalState;
+    use crate::Sysno;
     use crate::ThreadState;
     use crate::fd::DetFd;
     use crate::fd::FdType;
@@ -680,6 +964,13 @@ mod event_tests {
         after_import_error: Vec<&'static str>,
         observer_reads: Vec<(usize, usize)>,
         digest_error: Option<Errno>,
+        /// Spare the digest's aligned eight-byte word reads from
+        /// `digest_error`, so that only the wider read at `FIRST_DEST` fails.
+        digest_error_spares_words: bool,
+        /// Exact (`read_vectored`) reads, which the digest makes only after a
+        /// scalar read fails, and the error they return at `FIRST_DEST`.
+        exact_reads: Vec<(usize, usize)>,
+        exact_error: Option<Errno>,
         user_copy_audit: bool,
         copy_done: bool,
         copy_actions: std::collections::VecDeque<(usize, Result<usize, Errno>)>,
@@ -752,12 +1043,36 @@ mod event_tests {
             outcome
         }
 
+        /// Only the digest's exact read of one extent, after its scalar read
+        /// failed; any other vectored read is still a fixture violation. It is
+        /// audited like a scalar read, so a phase that forbids memory reads
+        /// also forbids this one.
         fn read_vectored(
             &self,
-            _remote: &[IoSlice],
-            _local: &mut [IoSliceMut],
+            remote: &[IoSlice],
+            local: &mut [IoSliceMut],
         ) -> Result<usize, Errno> {
-            panic!("event fixture must use its scalar memory override")
+            let ([remote], [local]) = (remote, local) else {
+                panic!("event fixture must use its scalar memory override")
+            };
+            let start = remote.as_ptr() as usize;
+            assert_eq!(remote.len(), local.len());
+            let mut reads = self.1.lock().unwrap();
+            reads.exact_reads.push((start, remote.len()));
+            if reads.import_failed {
+                reads.after_import_error.push("exact-read");
+            }
+            if reads.user_copy_audit && reads.copy_done {
+                reads.after_copy.push("exact-read");
+            }
+            if start == FIRST_DEST
+                && let Some(error) = reads.exact_error
+            {
+                return Err(error);
+            }
+            drop(reads);
+            self.copy_read(start, local)?;
+            Ok(local.len())
         }
 
         fn write_vectored(
@@ -783,6 +1098,7 @@ mod event_tests {
             }
             if start == FIRST_DEST
                 && let Some(error) = reads.digest_error
+                && !(reads.digest_error_spares_words && buf.len() == 8)
             {
                 return Err(error);
             }
@@ -838,6 +1154,10 @@ mod event_tests {
         memory: EventMemory,
         injected_iovecs: Vec<(usize, usize)>,
         injected_zero_reads: usize,
+        // Enabled only by the io_uring refusal control. Count the actual Guest
+        // injection boundary while returning the same ENOSYS as the handler:
+        // errno alone must not hide a forwarding regression.
+        io_uring_injections: Option<usize>,
         polls: Mutex<Vec<u32>>,
         /// `Resources::backend_runtime_bootstrap` of each resource request,
         /// in the order the requests arrive.
@@ -847,6 +1167,14 @@ mod event_tests {
         /// What this fake backend answers to
         /// `Guest::is_backend_runtime_bootstrap`.
         backend_runtime_bootstrap: bool,
+        /// Whether this fake backend's `Guest::user_address_limit` query
+        /// fails, and how many times it has been asked.
+        user_address_limit_fails: bool,
+        user_address_limit_queries: Mutex<usize>,
+        /// The happens-before checkpoints requested, in order.
+        hb_requests: Mutex<Vec<ResourceID>>,
+        /// Report the fixture's memory regions without the user-copy audit.
+        report_memory_regions: bool,
     }
 
     impl EventGuest {
@@ -900,6 +1228,21 @@ mod event_tests {
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
             let response = match message.2 {
+                GlobalRequest::RequestResources(request, _)
+                    if request.resources.keys().any(|resource| {
+                        matches!(
+                            resource,
+                            ResourceID::HappensBeforeSyscallCheckpoint { .. }
+                                | ResourceID::HappensBeforePosthookInterrupted { .. }
+                        )
+                    }) =>
+                {
+                    self.hb_requests
+                        .lock()
+                        .unwrap()
+                        .extend(request.resources.keys().cloned());
+                    GlobalResponse::RequestResources(ResumeStatus::Normal)
+                }
                 GlobalRequest::RequestResources(request, _) => {
                     assert_eq!(request.resources.len(), 1);
                     assert_eq!(
@@ -988,7 +1331,7 @@ mod event_tests {
         }
 
         fn detlog_memory_regions(&self) -> Option<Vec<reverie::DetlogMemoryRegion>> {
-            if !self.audit_call("memory-regions") {
+            if !self.audit_call("memory-regions") && !self.report_memory_regions {
                 return None;
             }
             Some(vec![
@@ -1015,6 +1358,19 @@ mod event_tests {
 
         async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
             let (number, args) = syscall.into_parts();
+            if matches!(
+                number,
+                Sysno::io_uring_setup | Sysno::io_uring_enter | Sysno::io_uring_register
+            ) {
+                let calls = self
+                    .io_uring_injections
+                    .as_mut()
+                    .expect("unexpected io_uring injection outside its refusal control");
+                *calls += 1;
+                // No host syscall: this fake backend records the invocation
+                // boundary even when the reported errno remains unchanged.
+                return Err(Errno::ENOSYS);
+            }
             if let Syscall::Read(call) = Syscall::from_raw(number, args) {
                 assert_eq!(call.len(), 0);
                 self.injected_zero_reads += 1;
@@ -1079,6 +1435,21 @@ mod event_tests {
             }
             panic!("event fixture must not read a host clock")
         }
+
+        fn user_address_limit(&self) -> Result<reverie::UserAddressLimit, Error> {
+            *self.user_address_limit_queries.lock().unwrap() += 1;
+            if self.user_address_limit_fails {
+                // A failure that carries the errno a bad range would get, so
+                // a guest result cannot pass for the tool's failure.
+                return Err(Errno::EFAULT.into());
+            }
+            // The KVM guest's report, as the fixture's capabilities describe
+            // a KVM backend.
+            Ok(reverie::UserAddressLimit {
+                max_end: reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT,
+                caps_single_vector: true,
+            })
+        }
     }
 
     fn event_guest(ty: FdType, retry_gate: Option<RetryGate>) -> (Detcore, EventGuest) {
@@ -1087,15 +1458,21 @@ mod event_tests {
             rng_seed: Some(0),
             sequentialize_threads: true,
             recordreplay_modes: false,
+            replaying: false,
             record_preemptions: false,
             max_timeslice: None,
             detlog_io_buffers: true,
             detlog_heap: false,
             detlog_stack: false,
             detlog_regs: false,
-            backend_is_kvm: true,
-            syscall_clobbers_virtualized_by_backend: true,
-            ..Config::default()
+            ..Config::default().with_backend(|backend| {
+                // The two behaviours the old `backend_is_kvm` identity flag
+                // selected that remain capabilities. The third, KVM's user
+                // address limit, is the guest's `user_address_limit` answer.
+                backend.provides_process_signal_control = true;
+                backend.emulates_child_waits = true;
+                backend.virtualizes_syscall_clobbers = true;
+            })
         };
         let pid = DetPid::from_raw(1);
         let mut thread = ThreadState::new(pid, &config, ());
@@ -1117,13 +1494,66 @@ mod event_tests {
             memory: EventMemory::new(),
             injected_iovecs: Vec::new(),
             injected_zero_reads: 0,
+            io_uring_injections: None,
             polls: Mutex::new(Vec::new()),
             request_marks: Mutex::new(Vec::new()),
             releases: Mutex::new(0),
             retry_gate: Mutex::new(retry_gate),
             backend_runtime_bootstrap: false,
+            user_address_limit_fails: false,
+            user_address_limit_queries: Mutex::new(0),
+            hb_requests: Mutex::new(Vec::new()),
+            report_memory_regions: false,
         };
         (tool, guest)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn io_uring_refusal_never_reaches_guest_injection() {
+        for passthru_opt in [false, true] {
+            for call in [
+                Syscall::from(reverie::syscalls::IoUringSetup::new()),
+                Syscall::from(reverie::syscalls::IoUringEnter::new()),
+                Syscall::from(reverie::syscalls::IoUringRegister::new()),
+            ] {
+                let (_tool, mut guest) = event_guest(FdType::Regular, None);
+                guest.config.passthru_opt = passthru_opt;
+                guest.io_uring_injections = Some(0);
+                let tool = <Detcore as Tool>::new(guest.pid(), &guest.config);
+                let number = call.number();
+                assert!(
+                    <Detcore as Tool>::subscriptions(&guest.config)
+                        .iter_syscalls()
+                        .any(|subscribed| subscribed == number),
+                    "{number}: passthru_opt={passthru_opt} bypassed the handler"
+                );
+                let result = tool.handle_syscall_event(&mut guest, call).await;
+                assert_eq!(
+                    guest.io_uring_injections,
+                    Some(0),
+                    "{number}: passthru_opt={passthru_opt} reached injection"
+                );
+                assert!(
+                    matches!(result, Err(Error::Errno(Errno::ENOSYS))),
+                    "{number}: passthru_opt={passthru_opt}: {result:?}"
+                );
+                // EventGuest::tail_inject already panics unconditionally, so
+                // forwarding through that other kernel boundary also fails.
+            }
+        }
+    }
+
+    /// A happens-before program with one posthook anchor, `p`, on the
+    /// thread's first `syscall` (https://github.com/rrnewton/hermit/issues/3929).
+    fn posthook_program(guest: &EventGuest, syscall: &str) -> HappensBeforeProgram {
+        HappensBeforeSpec::from_json(&format!(
+            r#"{{"version": 1, "events": {{"p": {{"thread": "{}", "syscall": "{syscall}",
+                                                 "phase": "posthook"}}}}}}"#,
+            guest.thread.dettid.as_raw()
+        ))
+        .unwrap()
+        .normalize()
+        .unwrap()
     }
 
     /// Collects the INFO messages that contain the second field.
@@ -1626,6 +2056,80 @@ mod event_tests {
         assert_extent(&messages[0], RETRY_DEST, PIPE_BYTES);
     }
 
+    /// An ordinary readv whose observation fails after the call returns that
+    /// errno to the guest as the call's final result, so a posthook anchor on
+    /// the call fires, as it does for the same readv observed successfully
+    /// (the Codex review of https://github.com/rrnewton/hermit/pull/4048).
+    /// Both observers are covered: the I/O-buffer digest, and the memory-map
+    /// digest (`--detlog-stack`) that runs before it. Only a terminal tool
+    /// failure publishes nothing
+    /// (`rng_readv_event_digest_failure_is_terminal_after_bytes_and_cursor_commit`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_posthook_anchor_fires_on_an_observer_errno_like_a_success() {
+        for (fault, memory_maps) in [
+            (None, false),
+            (Some(Errno::EFAULT), false),
+            (None, true),
+            (Some(Errno::EFAULT), true),
+        ] {
+            // The observers run only while their INFO records are collected.
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(logs.clone());
+            let (parked_tx, parked_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = oneshot::channel();
+            let (mut tool, mut guest) = event_guest(FdType::Pipe, Some((parked_tx, resume_rx)));
+            guest.config.happens_before = Some(posthook_program(&guest, "readv"));
+            if memory_maps {
+                // The stack region is FIRST_DEST..+8, the readv's destination.
+                guest.config.detlog_stack = true;
+                guest.config.detlog_io_buffers = false;
+                guest.report_memory_regions = true;
+                tool.cfg = guest.config.clone();
+            }
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, FIRST_DEST, 8);
+            if let Some(fault) = fault {
+                let mut reads = memory.1.lock().unwrap();
+                reads.digest_error = Some(fault);
+                reads.exact_error = Some(fault);
+            }
+            let event = tool.handle_syscall_event(&mut guest, readv(1));
+            let resume = async {
+                parked_rx.await.unwrap();
+                resume_tx.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(event, resume)
+            })
+            .await
+            .expect("readv did not cross its retry resource wait");
+            let case = format!("fault {fault:?}, memory maps {memory_maps}");
+            match fault {
+                None => assert_eq!(result.unwrap(), 4, "{case}"),
+                Some(fault) => assert!(
+                    matches!(result, Err(Error::Errno(error)) if error == fault),
+                    "{case}: {result:?}"
+                ),
+            }
+            assert_eq!(
+                memory.bytes(FIRST_DEST, 4).as_slice(),
+                PIPE_BYTES.as_slice()
+            );
+            assert!(
+                !memory.1.lock().unwrap().observer_reads.is_empty(),
+                "{case}: the observer never ran"
+            );
+            assert_eq!(
+                *guest.hb_requests.lock().unwrap(),
+                [ResourceID::HappensBeforeSyscallCheckpoint {
+                    count: 1,
+                    anchors: vec!["p".to_owned()],
+                }],
+                "{case}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn rng_readv_event_observes_imported_array_after_output_overwrites_it() {
         for (name, call, advances) in rng_vector_calls(2) {
@@ -1681,10 +2185,18 @@ mod event_tests {
                 let logs = BufferLog::default();
                 let _subscriber = tracing::subscriber::set_default(logs.clone());
                 let (tool, mut guest) = event_guest(FdType::Rng, None);
+                // A posthook anchor on the call must not fire: the result the
+                // guest would get is replaced by the terminal observer error
+                // (https://github.com/rrnewton/hermit/issues/3929).
+                guest.config.happens_before = Some(posthook_program(&guest, name));
                 let memory = guest.memory.clone();
                 memory.put_iovec(0, RETRY_DEST, 3);
                 memory.put_iovec(1, FIRST_DEST, 5);
-                memory.1.lock().unwrap().digest_error = Some(fault);
+                {
+                    let mut reads = memory.1.lock().unwrap();
+                    reads.digest_error = Some(fault);
+                    reads.exact_error = Some(fault);
+                }
 
                 let result = tool.handle_syscall_event(&mut guest, call).await;
                 let Err(Error::Tool(error)) = result else {
@@ -1718,11 +2230,114 @@ mod event_tests {
                 assert!(guest.injected_iovecs.is_empty());
                 let reads = memory.1.lock().unwrap();
                 assert_eq!(reads.imported_entries, 2);
-                assert_eq!(reads.observer_reads, [(RETRY_DEST, 3), (FIRST_DEST, 5)]);
+                // The wide read, then the aligned word read of the failing
+                // extent, both fail with `fault`.
+                assert_eq!(
+                    reads.observer_reads,
+                    [(RETRY_DEST, 3), (FIRST_DEST, 5), (FIRST_DEST, 8)]
+                );
+                assert_eq!(reads.exact_reads, [(FIRST_DEST, 5)]);
                 let messages = logs.0.lock().unwrap();
                 assert_eq!(messages.len(), 1);
                 assert_named_extent(&messages[0], name, RETRY_DEST, &expected[..3]);
+                assert!(
+                    guest.hb_requests.lock().unwrap().is_empty(),
+                    "{name}: a posthook anchor fired on a terminal observer failure"
+                );
             }
+        }
+    }
+
+    /// On ptrace a read of up to eight bytes is one eight-byte
+    /// `PTRACE_PEEKDATA`, which fails for an extent that ends less than eight
+    /// bytes before an unmapped page although every byte of it is readable.
+    /// The digest then reads the extent exactly, logs it, and the guest keeps
+    /// its result (https://github.com/rrnewton/hermit/issues/3823).
+    #[tokio::test(flavor = "current_thread")]
+    async fn rng_readv_event_digest_reads_exactly_when_the_wide_read_fails() {
+        for (name, call, advances) in rng_vector_calls(2) {
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(logs.clone());
+            let (tool, mut guest) = event_guest(FdType::Rng, None);
+            // The control for the terminal-observer case: a call whose
+            // observers succeed fires its posthook anchor once
+            // (https://github.com/rrnewton/hermit/issues/3929).
+            guest.config.happens_before = Some(posthook_program(&guest, name));
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, RETRY_DEST, 3);
+            memory.put_iovec(1, FIRST_DEST, 5);
+            memory.1.lock().unwrap().digest_error = Some(Errno::EIO);
+
+            let result = tool.handle_syscall_event(&mut guest, call).await;
+            assert_eq!(result.unwrap(), 8, "{name}");
+            assert_eq!(
+                *guest.hb_requests.lock().unwrap(),
+                [ResourceID::HappensBeforeSyscallCheckpoint {
+                    count: 1,
+                    anchors: vec!["p".to_owned()],
+                }],
+                "{name}"
+            );
+            let expected = if advances {
+                [41, 114, 187, 4, 77, 150, 223, 40]
+            } else {
+                [148, 221, 38, 111, 184, 1, 74, 147]
+            };
+            assert_eq!(memory.bytes(RETRY_DEST, 3), expected[..3]);
+            assert_eq!(memory.bytes(FIRST_DEST, 5), expected[3..]);
+            assert_eq!(memory.bytes(FIRST_DEST + 5, 1), [CANARY]);
+            let reads = memory.1.lock().unwrap();
+            assert_eq!(reads.observer_reads, [(RETRY_DEST, 3), (FIRST_DEST, 5)]);
+            assert_eq!(reads.exact_reads, [(FIRST_DEST, 5)]);
+            let messages = logs.0.lock().unwrap();
+            assert_eq!(messages.len(), 2, "{messages:?}");
+            assert_named_extent(&messages[0], name, RETRY_DEST, &expected[..3]);
+            assert_named_extent(&messages[1], name, FIRST_DEST, &expected[3..]);
+        }
+    }
+
+    /// A write-only destination defeats both the wide read when it is more
+    /// than eight bytes (`process_vm_readv`) and the exact read. The digest
+    /// then reads the aligned eight-byte words holding the extent, each one
+    /// `PTRACE_PEEKDATA` on ptrace, keeps only the extent's bytes, logs it,
+    /// and the guest keeps its result.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rng_readv_event_digest_reads_words_when_wide_and_exact_reads_fail() {
+        for (name, call, advances) in rng_vector_calls(2) {
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(logs.clone());
+            let (tool, mut guest) = event_guest(FdType::Rng, None);
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, RETRY_DEST, 3);
+            memory.put_iovec(1, FIRST_DEST, 5);
+            {
+                let mut reads = memory.1.lock().unwrap();
+                reads.digest_error = Some(Errno::EFAULT);
+                reads.exact_error = Some(Errno::EFAULT);
+                reads.digest_error_spares_words = true;
+            }
+
+            let result = tool.handle_syscall_event(&mut guest, call).await;
+            assert_eq!(result.unwrap(), 8, "{name}");
+            let expected = if advances {
+                [41, 114, 187, 4, 77, 150, 223, 40]
+            } else {
+                [148, 221, 38, 111, 184, 1, 74, 147]
+            };
+            assert_eq!(memory.bytes(RETRY_DEST, 3), expected[..3]);
+            assert_eq!(memory.bytes(FIRST_DEST, 5), expected[3..]);
+            assert_eq!(memory.bytes(FIRST_DEST + 5, 1), [CANARY]);
+            let reads = memory.1.lock().unwrap();
+            assert_eq!(
+                reads.observer_reads,
+                [(RETRY_DEST, 3), (FIRST_DEST, 5), (FIRST_DEST, 8)]
+            );
+            assert_eq!(reads.exact_reads, [(FIRST_DEST, 5)]);
+            let messages = logs.0.lock().unwrap();
+            assert_eq!(messages.len(), 2, "{messages:?}");
+            assert_named_extent(&messages[0], name, RETRY_DEST, &expected[..3]);
+            // The word's three bytes after the extent are not hashed.
+            assert_named_extent(&messages[1], name, FIRST_DEST, &expected[3..]);
         }
     }
 
@@ -1787,35 +2402,50 @@ mod event_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn rng_readv_event_zero_and_malformed_requests_have_no_observer_effects() {
-        for (count, length, expected, imports) in [
-            (0, 3, Ok(0), 0),
-            (1025, 3, Err(Errno::EINVAL), 0),
-            (1, usize::MAX, Err(Errno::EINVAL), 1),
-        ] {
-            for (_, call, _) in rng_vector_calls(count) {
-                let logs = BufferLog::default();
-                let _subscriber = tracing::subscriber::set_default(logs.clone());
-                let (tool, mut guest) = event_guest(FdType::Rng, None);
-                let memory = guest.memory.clone();
-                memory.put_iovec(0, FIRST_DEST, length);
-                let result = tool.handle_syscall_event(&mut guest, call).await;
-                assert_eq!(
-                    result.map_err(|error| error.into_errno().unwrap()),
-                    expected
-                );
-                assert_eq!(memory.bytes(FIRST_DEST, 8), [CANARY; 8]);
-                assert_eq!(
-                    guest
-                        .thread
-                        .with_detfd(FD, |fd| fd.random_device_offset())
-                        .unwrap(),
-                    0
-                );
-                assert_eq!(*guest.releases.lock().unwrap(), 1);
-                let reads = memory.1.lock().unwrap();
-                assert_eq!(reads.imported_entries, imports);
-                assert!(reads.observer_reads.is_empty());
-                assert!(logs.0.lock().unwrap().is_empty());
+        // A failing user address limit query changes only the requests that
+        // need a range checked, as Linux checks the count before any range.
+        for query_fails in [false, true] {
+            for (count, length, expected, imports) in [
+                (0, 3, Ok(0), 0),
+                (1025, 3, Err(Errno::EINVAL), 0),
+                (1, usize::MAX, Err(Errno::EINVAL), 1),
+            ] {
+                let queries = usize::from(count == 1);
+                let (expected, imports) = if query_fails && queries == 1 {
+                    (None, 0)
+                } else {
+                    (Some(expected), imports)
+                };
+                for (_, call, _) in rng_vector_calls(count) {
+                    let logs = BufferLog::default();
+                    let _subscriber = tracing::subscriber::set_default(logs.clone());
+                    let (tool, mut guest) = event_guest(FdType::Rng, None);
+                    guest.user_address_limit_fails = query_fails;
+                    let memory = guest.memory.clone();
+                    memory.put_iovec(0, FIRST_DEST, length);
+                    let result = tool.handle_syscall_event(&mut guest, call).await;
+                    match expected {
+                        Some(expected) => assert_eq!(
+                            result.map_err(|error| error.into_errno().unwrap()),
+                            expected
+                        ),
+                        None => assert!(matches!(result, Err(Error::Tool(_))), "{result:?}"),
+                    }
+                    assert_eq!(*guest.user_address_limit_queries.lock().unwrap(), queries);
+                    assert_eq!(memory.bytes(FIRST_DEST, 8), [CANARY; 8]);
+                    assert_eq!(
+                        guest
+                            .thread
+                            .with_detfd(FD, |fd| fd.random_device_offset())
+                            .unwrap(),
+                        0
+                    );
+                    assert_eq!(*guest.releases.lock().unwrap(), 1);
+                    let reads = memory.1.lock().unwrap();
+                    assert_eq!(reads.imported_entries, imports);
+                    assert!(reads.observer_reads.is_empty());
+                    assert!(logs.0.lock().unwrap().is_empty());
+                }
             }
         }
     }
@@ -1829,10 +2459,11 @@ mod event_tests {
             OFlag::O_ACCMODE,
             OFlag::O_PATH,
         ] {
-            for address in [0, usize::MAX] {
+            for (address, query_fails) in [(0, false), (usize::MAX, false), (0, true)] {
                 let logs = BufferLog::default();
                 let _subscriber = tracing::subscriber::set_default(logs.clone());
                 let (tool, mut guest) = event_guest(FdType::Rng, None);
+                guest.user_address_limit_fails = query_fails;
                 let fd = DetFd::new(
                     FD,
                     mode,
@@ -1852,18 +2483,28 @@ mod event_tests {
                     .with_buf(AddrMut::from_raw(address))
                     .with_len(0);
                 let result = tool.handle_syscall_event(&mut guest, call.into()).await;
-                let expected = if mode == OFlag::O_RDONLY || mode == OFlag::O_RDWR {
-                    if address == 0 {
+                // The access mode is checked before the range, so only a
+                // readable descriptor asks for the user address limit, and
+                // only there can the query's failure surface, as the tool's.
+                let readable = mode == OFlag::O_RDONLY || mode == OFlag::O_RDWR;
+                if readable && query_fails {
+                    assert!(matches!(result, Err(Error::Tool(_))), "{result:?}");
+                } else {
+                    let expected = if !readable {
+                        Err(Errno::EBADF)
+                    } else if address == 0 {
                         Ok(0)
                     } else {
                         Err(Errno::EFAULT)
-                    }
-                } else {
-                    Err(Errno::EBADF)
-                };
+                    };
+                    assert_eq!(
+                        result.map_err(|error| error.into_errno().unwrap()),
+                        expected
+                    );
+                }
                 assert_eq!(
-                    result.map_err(|error| error.into_errno().unwrap()),
-                    expected
+                    *guest.user_address_limit_queries.lock().unwrap(),
+                    usize::from(readable)
                 );
                 assert_eq!(
                     guest
@@ -1896,12 +2537,498 @@ mod event_tests {
             assert!(guest.memory.1.lock().unwrap().observer_reads.is_empty());
         }
     }
+
+    /// The guest's msghdr for the recvmsg digest tests: one iovec array at
+    /// `iov` with `count` entries.
+    const MSG: usize = 0x3800;
+    /// Outside the event arena, so a read there fails.
+    const UNMAPPED: usize = 0x9000;
+
+    fn recvmsg_with_iov(memory: &EventMemory, iov: usize, count: usize, flags: i32) -> Syscall {
+        let mut bytes = memory.0.lock().unwrap();
+        bytes[MSG..MSG + 56].fill(0);
+        bytes[MSG + 16..MSG + 24].copy_from_slice(&iov.to_ne_bytes());
+        bytes[MSG + 24..MSG + 32].copy_from_slice(&count.to_ne_bytes());
+        drop(bytes);
+        reverie::syscalls::Recvmsg::new()
+            .with_sockfd(FD)
+            .with_msg(AddrMut::from_raw(MSG))
+            .with_flags(flags)
+            .into()
+    }
+
+    fn digest(guest: &mut EventGuest, call: &Syscall, ret: i64) -> Result<(), Error> {
+        detlog_io_buffers::<EventGuest, Detcore>(guest, call, ret, DetTid::from_raw(1), None)
+    }
+
+    fn assert_unobserved(message: &str, ret: i64, reason: &str) {
+        let expected =
+            format!("[iobuf][dtid 1] recvmsg in fd={FD} unobserved ret={ret} reason={reason}");
+        assert!(
+            message.contains(&expected),
+            "expected {expected}, got {message}"
+        );
+    }
+
+    /// Writes `stat` into guest memory at `FIRST_DEST` and returns its bytes.
+    fn put_stat(memory: &EventMemory, stat: &libc::stat) -> Vec<u8> {
+        // SAFETY: `libc::stat` is plain old data; viewing it as bytes is sound.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (stat as *const libc::stat).cast::<u8>(),
+                std::mem::size_of::<libc::stat>(),
+            )
+        }
+        .to_vec();
+        memory.0.lock().unwrap()[FIRST_DEST..FIRST_DEST + bytes.len()].copy_from_slice(&bytes);
+        bytes
+    }
+
+    fn zeroed_stat() -> libc::stat {
+        // SAFETY: an all-zero `libc::stat` is a valid value.
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// Every decoded field of a `struct stat` result names its own field: each
+    /// field holds a distinct value, so a decoder that read one field for
+    /// another, or `statx`'s layout for `stat`'s, prints a different line.
+    #[test]
+    fn every_field_of_a_stat_result_is_decoded_from_its_own_place() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Regular, None);
+        let mut stat = zeroed_stat();
+        stat.st_dev = 0x1234;
+        stat.st_ino = 1001;
+        stat.st_mode = libc::S_IFREG | 0o640;
+        stat.st_nlink = 3;
+        stat.st_uid = 11;
+        stat.st_gid = 22;
+        stat.st_rdev = 0x5678;
+        stat.st_size = 4444;
+        stat.st_blksize = 512;
+        stat.st_blocks = 9;
+        stat.st_atime = 101;
+        stat.st_atime_nsec = 1;
+        stat.st_mtime = 202;
+        stat.st_mtime_nsec = 2;
+        stat.st_ctime = 303;
+        stat.st_ctime_nsec = 3;
+        put_stat(&guest.memory, &stat);
+        let call: Syscall = reverie::syscalls::Fstat::new()
+            .with_fd(FD)
+            .with_stat(Some(reverie::syscalls::StatPtr(
+                AddrMut::from_raw(FIRST_DEST).unwrap(),
+            )))
+            .into();
+        digest(&mut guest, &call, 0).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        let expected = " mask=0x7ff dev=0x1234 ino=1001 mode=0o100640 nlink=3 uid=11 gid=22 \
+                        rdev=0x5678 size=4444 blksize=512 blocks=9 atime=101.000000001 \
+                        mtime=202.000000002 ctime=303.000000003 btime=0.000000000";
+        assert!(
+            messages[0].contains(expected),
+            "expected {expected}, got {}",
+            messages[0]
+        );
+    }
+
+    /// The same for a `statx` result, whose layout differs from `stat`'s and
+    /// which also carries a mask, a birth time and split device numbers.
+    #[test]
+    fn every_field_of_a_statx_result_is_decoded_from_its_own_place() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Regular, None);
+        // SAFETY: an all-zero statx is a valid value.
+        let mut statx: reverie::syscalls::linux_abi::Statx = unsafe { std::mem::zeroed() };
+        statx.stx_mask = 0xfff;
+        statx.stx_blksize = 512;
+        statx.stx_nlink = 3;
+        statx.stx_uid = 11;
+        statx.stx_gid = 22;
+        statx.stx_mode = (libc::S_IFREG | 0o640) as u16;
+        statx.stx_ino = 1001;
+        statx.stx_size = 4444;
+        statx.stx_blocks = 9;
+        statx.stx_atime.tv_sec = 101;
+        statx.stx_atime.tv_nsec = 1;
+        statx.stx_btime.tv_sec = 404;
+        statx.stx_btime.tv_nsec = 4;
+        statx.stx_ctime.tv_sec = 303;
+        statx.stx_ctime.tv_nsec = 3;
+        statx.stx_mtime.tv_sec = 202;
+        statx.stx_mtime.tv_nsec = 2;
+        statx.stx_rdev_major = 0x56;
+        statx.stx_rdev_minor = 0x78;
+        statx.stx_dev_major = 0x12;
+        statx.stx_dev_minor = 0x34;
+        // SAFETY: Statx is plain old data; viewing it as bytes is sound.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&statx as *const reverie::syscalls::linux_abi::Statx).cast::<u8>(),
+                std::mem::size_of::<reverie::syscalls::linux_abi::Statx>(),
+            )
+        };
+        guest.memory.0.lock().unwrap()[FIRST_DEST..FIRST_DEST + bytes.len()].copy_from_slice(bytes);
+        let call: Syscall = reverie::syscalls::Statx::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_statx(Some(reverie::syscalls::StatxPtr(
+                AddrMut::from_raw(FIRST_DEST).unwrap(),
+            )))
+            .into();
+        digest(&mut guest, &call, 0).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        let dev = libc::makedev(0x12, 0x34);
+        let rdev = libc::makedev(0x56, 0x78);
+        let expected = format!(
+            " mask=0xfff dev={dev:#x} ino=1001 mode=0o100640 nlink=3 uid=11 gid=22 \
+             rdev={rdev:#x} size=4444 blksize=512 blocks=9 atime=101.000000001 \
+             mtime=202.000000002 ctime=303.000000003 btime=404.000000004"
+        );
+        assert!(
+            messages[0].contains(&expected),
+            "expected {expected}, got {}",
+            messages[0]
+        );
+    }
+
+    /// The INFO record shows a stat result only as `st_mode` and `st_size`.
+    /// Two results that differ in their device alone must still produce
+    /// different `[iobuf]` records, and the record must name the device.
+    #[test]
+    fn a_stat_result_is_hashed_and_its_fields_are_named() {
+        let call: Syscall = reverie::syscalls::Newfstatat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_stat(Some(reverie::syscalls::StatPtr(
+                AddrMut::from_raw(FIRST_DEST).unwrap(),
+            )))
+            .into();
+        let mut records = Vec::new();
+        for dev in [0x6, 0x7] {
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(logs.clone());
+            let (_tool, mut guest) = event_guest(FdType::Regular, None);
+            let mut stat = zeroed_stat();
+            stat.st_dev = dev;
+            stat.st_ino = 11;
+            stat.st_mode = libc::S_IFDIR | 0o755;
+            stat.st_size = 4096;
+            let bytes = put_stat(&guest.memory, &stat);
+            digest(&mut guest, &call, 0).unwrap();
+            let messages = logs.0.lock().unwrap();
+            assert_eq!(messages.len(), 1, "{messages:?}");
+            let expected = format!(
+                "[iobuf][dtid 1] newfstatat in fd=-100 {FIRST_DEST:#x}+{}->{}",
+                bytes.len(),
+                Digest::new(&bytes)
+            );
+            assert!(
+                messages[0].contains(&expected),
+                "expected {expected}, got {}",
+                messages[0]
+            );
+            assert!(
+                messages[0].contains(&format!(" dev={dev:#x} ino=11 mode=0o40755 ")),
+                "{}",
+                messages[0]
+            );
+            records.push(messages[0].clone());
+        }
+        assert_ne!(
+            records[0], records[1],
+            "a different device must change the record"
+        );
+    }
+
+    /// A failed stat call wrote nothing, so nothing is hashed; `fstat` names
+    /// its descriptor; `statx` hashes its own, larger structure.
+    #[test]
+    fn stat_family_extents_follow_success_and_structure_size() {
+        let memory = EventMemory::new();
+        let stat_ptr = || {
+            Some(reverie::syscalls::StatPtr(
+                AddrMut::from_raw(FIRST_DEST).unwrap(),
+            ))
+        };
+        let stat_len = std::mem::size_of::<libc::stat>() as u64;
+        let calls: [(Syscall, u64); 5] = [
+            (
+                reverie::syscalls::Stat::new().with_stat(stat_ptr()).into(),
+                stat_len,
+            ),
+            (
+                reverie::syscalls::Lstat::new().with_stat(stat_ptr()).into(),
+                stat_len,
+            ),
+            (
+                reverie::syscalls::Fstat::new()
+                    .with_fd(FD)
+                    .with_stat(stat_ptr())
+                    .into(),
+                stat_len,
+            ),
+            (
+                reverie::syscalls::Newfstatat::new()
+                    .with_stat(stat_ptr())
+                    .into(),
+                stat_len,
+            ),
+            (
+                reverie::syscalls::Statx::new()
+                    .with_statx(Some(reverie::syscalls::StatxPtr(
+                        AddrMut::from_raw(FIRST_DEST).unwrap(),
+                    )))
+                    .into(),
+                std::mem::size_of::<reverie::syscalls::linux_abi::Statx>() as u64,
+            ),
+        ];
+        for (call, len) in calls {
+            assert_eq!(
+                extents(&memory, &call, 0).unwrap(),
+                vec![BufferExtent {
+                    addr: FIRST_DEST as u64,
+                    len
+                }],
+                "{}",
+                call.name()
+            );
+            assert!(
+                extents(&memory, &call, -2).unwrap().is_empty(),
+                "{}",
+                call.name()
+            );
+        }
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Regular, None);
+        put_stat(&guest.memory, &zeroed_stat());
+        let fstat: Syscall = reverie::syscalls::Fstat::new()
+            .with_fd(FD)
+            .with_stat(stat_ptr())
+            .into();
+        digest(&mut guest, &fstat, 0).unwrap();
+        digest(&mut guest, &fstat, -9).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains(&format!("fstat in fd={FD} ")),
+            "{}",
+            messages[0]
+        );
+    }
+
+    /// A recvmsg whose header (here its iovec array) cannot be re-read after
+    /// the call records an `unobserved` entry and does not fail: the guest
+    /// keeps the kernel's result.
+    #[test]
+    fn an_unreadable_recvmsg_header_is_recorded_as_unobserved() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Socket, None);
+        let memory = guest.memory.clone();
+        let call = recvmsg_with_iov(&memory, UNMAPPED, 1, 0);
+        digest(&mut guest, &call, 4).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_unobserved(&messages[0], 4, "header-or-iovec-unreadable");
+    }
+
+    /// Without MSG_TRUNC, a re-read iovec that holds fewer bytes than the
+    /// call returned was overwritten: what it names is hashed, as before, and
+    /// an `unobserved` entry follows. With MSG_TRUNC a datagram returns its
+    /// full length, so the copied prefix is hashed with no entry.
+    #[test]
+    fn a_recvmsg_iovec_short_of_the_return_is_unobserved_unless_msg_trunc() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Socket, None);
+        let memory = guest.memory.clone();
+        memory.put_iovec(0, FIRST_DEST, 1);
+        let call = recvmsg_with_iov(&memory, IOV, 1, 0);
+        digest(&mut guest, &call, 16).unwrap();
+        {
+            let messages = logs.0.lock().unwrap();
+            assert_eq!(messages.len(), 2, "{messages:?}");
+            assert_named_extent(&messages[0], "recvmsg", FIRST_DEST, &[CANARY; 1]);
+            assert_unobserved(&messages[1], 16, "iovec-short covered=1");
+        }
+        logs.0.lock().unwrap().clear();
+        let call = recvmsg_with_iov(&memory, IOV, 1, libc::MSG_TRUNC);
+        digest(&mut guest, &call, 16).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_named_extent(&messages[0], "recvmsg", FIRST_DEST, &[CANARY; 1]);
+    }
+
+    /// A buffer that cannot be read keeps the lines hashed before it and ends
+    /// with an `unobserved` entry naming it.
+    #[test]
+    fn an_unreadable_recvmsg_buffer_ends_its_digest_with_unobserved() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Socket, None);
+        let memory = guest.memory.clone();
+        memory.put_iovec(0, FIRST_DEST, 2);
+        memory.put_iovec(1, UNMAPPED, 8);
+        let call = recvmsg_with_iov(&memory, IOV, 2, 0);
+        digest(&mut guest, &call, 6).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_named_extent(&messages[0], "recvmsg", FIRST_DEST, &[CANARY; 2]);
+        assert_unobserved(
+            &messages[1],
+            6,
+            &format!("buffer-unreadable at={UNMAPPED:#x}+4"),
+        );
+    }
+
+    /// Only recvmsg is recorded as unobserved; another call's observation
+    /// error still fails, as before.
+    #[test]
+    fn other_observation_errors_still_fail() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Socket, None);
+        let call: Syscall = reverie::syscalls::Readv::new()
+            .with_fd(FD)
+            .with_iov(Addr::from_raw(UNMAPPED))
+            .with_len(1)
+            .into();
+        assert!(digest(&mut guest, &call, 4).is_err());
+        assert!(logs.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn procfs_reads_refuse_an_impossible_count_before_asking_the_user_address_limit() {
+        // A procfs snapshot read checks the caller's range itself, as
+        // `vfs_read`'s `access_ok` would. A count above isize::MAX is EFAULT
+        // under every limit, so it is refused before the guest is asked for
+        // its limit; a count that fits needs the guest's answer, and a failed
+        // query is the tool's failure, never the guest's EFAULT. Both cases
+        // end before a snapshot is taken.
+        let beyond_limit = reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT as usize;
+        for pread in [false, true] {
+            for query_fails in [false, true] {
+                for (address, len) in [(FIRST_DEST, isize::MAX as usize + 1), (beyond_limit, 8)] {
+                    let (tool, mut guest) = event_guest(FdType::Regular, None);
+                    guest.user_address_limit_fails = query_fails;
+                    let fd = DetFd::new(
+                        FD,
+                        OFlag::O_RDONLY,
+                        FdType::Regular,
+                        OpenFileId::new(DetPid::from_raw(1), 99),
+                    );
+                    fd.set_procfs(
+                        crate::procfs::ProcfsFile::from_path(std::path::Path::new(
+                            "/proc/sys/fs/file-nr",
+                        ))
+                        .unwrap(),
+                    );
+                    guest
+                        .thread
+                        .file_metadata
+                        .lock()
+                        .unwrap()
+                        .file_handles
+                        .insert(FD, fd);
+                    let buf = AddrMut::from_raw(address);
+                    let call: Syscall = if pread {
+                        reverie::syscalls::Pread64::new()
+                            .with_fd(FD)
+                            .with_buf(buf)
+                            .with_len(len)
+                            .with_offset(0)
+                            .into()
+                    } else {
+                        reverie::syscalls::Read::new()
+                            .with_fd(FD)
+                            .with_buf(buf)
+                            .with_len(len)
+                            .into()
+                    };
+                    let result = tool.handle_syscall_event(&mut guest, call).await;
+                    let asks = len <= isize::MAX as usize;
+                    if asks && query_fails {
+                        assert!(matches!(result, Err(Error::Tool(_))), "{result:?}");
+                    } else {
+                        assert!(
+                            matches!(result, Err(Error::Errno(Errno::EFAULT))),
+                            "{result:?}"
+                        );
+                    }
+                    assert_eq!(
+                        *guest.user_address_limit_queries.lock().unwrap(),
+                        usize::from(asks)
+                    );
+                    assert!(
+                        guest
+                            .thread
+                            .with_detfd(FD, |fd| fd.procfs_needs_snapshot())
+                            .unwrap()
+                    );
+                    assert_eq!(guest.injected_zero_reads, 0);
+                    assert!(guest.injected_iovecs.is_empty());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use reverie::syscalls;
     use reverie::syscalls::LocalMemory;
+
+    #[test]
+    fn socket_extents_keep_full_kernel_iovec_count_before_existing_bound() {
+        let first = [0u8; 1];
+        let second = [0u8; 1];
+        let mut iovecs: Vec<libc::iovec> = (0..libc::UIO_MAXIOV)
+            .map(|_| libc::iovec {
+                iov_base: core::ptr::null_mut(),
+                iov_len: 0,
+            })
+            .collect();
+        iovecs[0] = libc::iovec {
+            iov_base: first.as_ptr().cast_mut().cast(),
+            iov_len: 1,
+        };
+        iovecs[1] = libc::iovec {
+            iov_base: second.as_ptr().cast_mut().cast(),
+            iov_len: 1,
+        };
+        // Explicit initialized guest bytes, including dirty header padding.
+        // No padded by-value struct is reinterpreted as bytes.
+        let mut guarded = [0x5au8; 88];
+        guarded[16..72].fill(0);
+        let header = &mut guarded[16..72];
+        header[12..16].fill(0xa5);
+        header[52..56].fill(0xa5);
+        header[16..24].copy_from_slice(&(iovecs.as_ptr() as usize).to_ne_bytes());
+        header[24..32].copy_from_slice(&((1usize << 32) + 1).to_ne_bytes());
+        let before = guarded;
+        let call = Syscall::Recvmsg(
+            syscalls::Recvmsg::new()
+                .with_msg(AddrMut::from_ptr(guarded[16..].as_ptr().cast::<Msghdr>())),
+        );
+        assert_eq!(
+            extents(&LocalMemory::new(), &call, 2).unwrap(),
+            vec![
+                BufferExtent {
+                    addr: first.as_ptr() as u64,
+                    len: 1
+                },
+                BufferExtent {
+                    addr: second.as_ptr() as u64,
+                    len: 1
+                },
+            ],
+        );
+        assert_eq!(guarded, before);
+    }
 
     #[test]
     fn rng_observation_capacity_failure_is_a_tool_error() {
@@ -2018,6 +3145,37 @@ mod tests {
         );
         assert!(whole(None, 24).is_empty());
         assert!(whole(Some(0x2000), 0).is_empty());
+    }
+
+    /// Linux reads `nfds` as an `unsigned int`; a high word set by the guest
+    /// must not grow the observed array (2^32 + 1 entries would be a 32 GiB
+    /// read for a one-descriptor call).
+    #[test]
+    fn poll_family_extents_use_the_low_32_bits_of_nfds() {
+        let memory = LocalMemory::new();
+        let nfds = (1_u64 << 32) | 1;
+        for call in [
+            Syscall::Poll(
+                syscalls::Poll::new()
+                    .with_fds(AddrMut::from_raw(0x2000))
+                    .with_nfds(nfds as _),
+            ),
+            Syscall::Ppoll(
+                syscalls::Ppoll::new()
+                    .with_fds(AddrMut::from_raw(0x2000))
+                    .with_nfds(nfds as _),
+            ),
+        ] {
+            assert_eq!(
+                extents(&memory, &call, 1).unwrap(),
+                vec![BufferExtent {
+                    addr: 0x2000,
+                    len: std::mem::size_of::<libc::pollfd>() as u64,
+                }],
+                "{}",
+                call.name()
+            );
+        }
     }
 
     /// The gap this file had: `poll(...) = 0` produced no record at all,
@@ -2141,6 +3299,82 @@ mod tests {
         }
     }
 
+    /// Linux passes a vectored call's count on as an `unsigned int`, so a count
+    /// with high bits set names only its low 32 bits' entries (Codex re-check
+    /// #8 of https://github.com/rrnewton/hermit/pull/4031). The one `iovec`
+    /// here ends where an inaccessible page begins, so decoding the full
+    /// 64-bit count would read past it and fail.
+    #[test]
+    fn vectored_calls_decode_only_the_low_32_bits_of_their_iovec_count() {
+        let page = 4096;
+        // SAFETY: a fresh private anonymous mapping, unmapped below.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        // SAFETY: the second page lies inside the mapping.
+        let guard = unsafe { base.cast::<u8>().add(page) };
+        assert_eq!(
+            unsafe { libc::mprotect(guard.cast(), page, libc::PROT_NONE) },
+            0
+        );
+        let data = [0_u8; 8];
+        let slot = unsafe { guard.sub(std::mem::size_of::<libc::iovec>()) }.cast::<libc::iovec>();
+        // SAFETY: `slot` is the last `iovec` of the writable first page.
+        unsafe {
+            slot.write(libc::iovec {
+                iov_base: data.as_ptr() as *mut libc::c_void,
+                iov_len: data.len(),
+            })
+        };
+        let iov = Addr::from_ptr(slot.cast_const());
+        let count = (1_u64 << 32) | 1;
+        let calls = [
+            Syscall::Readv(
+                syscalls::Readv::new()
+                    .with_iov(iov)
+                    .with_len(count as usize),
+            ),
+            Syscall::Writev(
+                syscalls::Writev::new()
+                    .with_iov(iov)
+                    .with_len(count as usize),
+            ),
+            Syscall::Preadv(
+                syscalls::Preadv::new()
+                    .with_iov(iov)
+                    .with_iov_len(count as usize),
+            ),
+            Syscall::Pwritev(
+                syscalls::Pwritev::new()
+                    .with_iov(iov)
+                    .with_iov_len(count as usize),
+            ),
+            Syscall::Preadv2(syscalls::Preadv2::new().with_iov(iov).with_iov_len(count)),
+            Syscall::Pwritev2(syscalls::Pwritev2::new().with_iov(iov).with_iov_len(count)),
+        ];
+        let memory = LocalMemory::new();
+        for call in calls {
+            assert_eq!(iovec_extent_arguments(&call), Some((slot as usize, 1)));
+            assert_eq!(
+                extents(&memory, &call, 8).unwrap(),
+                vec![BufferExtent {
+                    addr: data.as_ptr() as u64,
+                    len: 8,
+                }]
+            );
+        }
+        // SAFETY: the mapping made above, no longer referenced.
+        assert_eq!(unsafe { libc::munmap(base, 2 * page) }, 0);
+    }
+
     #[test]
     fn vectored_io_extents_stop_at_the_completed_byte_count() {
         let iovecs = [
@@ -2211,7 +3445,7 @@ mod tests {
 
         // SAFETY: `mmsghdr` is a plain C record and every field consumed by
         // `extents` is initialized below before LocalMemory reads it.
-        let mut headers: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
+        let mut headers: [Mmsghdr; 2] = unsafe { std::mem::zeroed() };
         headers[0].msg_hdr.msg_iov = first_iovecs.as_ptr() as *mut libc::iovec;
         headers[0].msg_hdr.msg_iovlen = first_iovecs.len();
         headers[0].msg_len = 6;
@@ -2221,7 +3455,7 @@ mod tests {
 
         let call = Syscall::Sendmmsg(
             syscalls::Sendmmsg::new()
-                .with_msgvec(Addr::from_ptr(headers.as_ptr().cast::<libc::msghdr>()))
+                .with_msgvec(Addr::from_ptr(headers.as_ptr().cast::<Msghdr>()))
                 .with_vlen(2),
         );
         let memory = LocalMemory::new();
@@ -2259,5 +3493,217 @@ mod tests {
         assert!(extents(&memory, &call, 0).unwrap().is_empty());
         assert!(extents(&memory, &call, -1).unwrap().is_empty());
         assert_eq!(completed_mmsghdr_count(1, 2), 1);
+    }
+
+    const WORDS_BASE: usize = 0x10000;
+
+    /// The ptrace backend's reads at the locked Reverie, over one mapping at
+    /// `WORDS_BASE` that is write-only unless `readable`. A scalar read of up
+    /// to eight bytes is one eight-byte `PTRACE_PEEKDATA` at its address,
+    /// which reads any mapped byte and fails `EIO` past the mapping; any other
+    /// read is `process_vm_readv`, which fails `EFAULT` without `PROT_READ`.
+    struct PeekModel {
+        data: Vec<u8>,
+        readable: bool,
+        peeks: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl PeekModel {
+        fn new(data: &[u8], readable: bool) -> Self {
+            Self {
+                data: data.to_vec(),
+                readable,
+                peeks: Default::default(),
+            }
+        }
+
+        fn copy(&self, start: usize, buf: &mut [u8]) -> Result<usize, Errno> {
+            let offset = start.checked_sub(WORDS_BASE).ok_or(Errno::EIO)?;
+            let end = offset.checked_add(buf.len()).ok_or(Errno::EIO)?;
+            buf.copy_from_slice(self.data.get(offset..end).ok_or(Errno::EIO)?);
+            Ok(buf.len())
+        }
+
+        fn readv(&self, start: usize, buf: &mut [u8]) -> Result<usize, Errno> {
+            if !self.readable {
+                return Err(Errno::EFAULT);
+            }
+            self.copy(start, buf).map_err(|_| Errno::EFAULT)
+        }
+    }
+
+    impl MemoryAccess for PeekModel {
+        fn read_vectored(
+            &self,
+            remote: &[std::io::IoSlice],
+            local: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            let ([remote], [local]) = (remote, local) else {
+                panic!("one extent per vectored read")
+            };
+            self.readv(remote.as_ptr() as usize, local)
+        }
+
+        fn write_vectored(
+            &mut self,
+            _local: &[std::io::IoSlice],
+            _remote: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            unreachable!("the digest does not write")
+        }
+
+        fn read<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<usize, Errno>
+        where
+            A: Into<Addr<'a, u8>>,
+        {
+            let start = addr.into().as_raw();
+            if buf.len() > 8 {
+                return self.readv(start, buf);
+            }
+            self.peeks.lock().unwrap().push(start);
+            let mut word = [0u8; 8];
+            self.copy(start, &mut word)?;
+            buf.copy_from_slice(&word[..buf.len()]);
+            Ok(buf.len())
+        }
+    }
+
+    /// Every placement of every extent in a write-only or readable 40-byte
+    /// mapping, including flush against either end, is read exactly
+    /// (https://github.com/rrnewton/hermit/issues/3823). The word method
+    /// reads only aligned words inside the mapping, one per eight-byte slot
+    /// the extent touches.
+    #[test]
+    fn read_written_reads_every_extent_of_a_write_only_mapping() {
+        const LEN: usize = 40;
+        let data: Vec<u8> = (1..=LEN as u8).collect();
+        for len in 1..=LEN {
+            for offset in 0..=LEN - len {
+                let start = WORDS_BASE + offset;
+                for readable in [false, true] {
+                    let memory = PeekModel::new(&data, readable);
+                    let mut buf = vec![0u8; len];
+                    let at = AddrMut::<u8>::from_raw(start).unwrap();
+                    super::read_written(&memory, at, &mut buf).unwrap();
+                    assert_eq!(buf, data[offset..offset + len], "{readable} {len} {offset}");
+                }
+
+                let memory = PeekModel::new(&data, false);
+                let mut buf = vec![0u8; len];
+                super::read_words(&memory, start, &mut buf).unwrap();
+                assert_eq!(buf, data[offset..offset + len], "words {len} {offset}");
+                let first = start & !7;
+                let expected: Vec<usize> = (first..start + len).step_by(8).collect();
+                assert_eq!(*memory.peeks.lock().unwrap(), expected, "{len} {offset}");
+            }
+        }
+    }
+
+    /// An extent that is not all mapped still fails, with the first method's
+    /// error: a peek's `EIO` up to eight bytes, `process_vm_readv`'s `EFAULT`
+    /// beyond.
+    #[test]
+    fn read_written_fails_with_the_wide_error_when_no_method_can_read() {
+        const LEN: usize = 40;
+        let data = [7u8; LEN];
+        for readable in [false, true] {
+            for len in [1, 4, 8, 9, 16] {
+                let memory = PeekModel::new(&data, readable);
+                let mut buf = vec![0u8; len];
+                let at = AddrMut::<u8>::from_raw(WORDS_BASE + LEN - len + 1).unwrap();
+                let expected = if len <= 8 { Errno::EIO } else { Errno::EFAULT };
+                assert_eq!(
+                    super::read_written(&memory, at, &mut buf),
+                    Err(expected),
+                    "{readable} {len}"
+                );
+            }
+        }
+    }
+
+    /// What the observer read from an extent, and the bytes actually there.
+    type ReadAndContents = (Result<(Vec<u8>, usize), super::Error>, Vec<u8>);
+
+    /// Write `bytes` at `offset` into pages protected as `prot`, where the
+    /// guest can write them, and read the extent back as the observer does.
+    fn read_extent_in(prot: &[i32], offset: usize, bytes: &[u8], records: bool) -> ReadAndContents {
+        use reverie::syscalls::MemoryAccess;
+
+        use crate::test_pages::PAGE;
+        use crate::test_pages::Pages;
+
+        let pages = Pages::new(prot);
+        let mut memory = LocalMemory::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let len = (PAGE - (offset + at) % PAGE).min(bytes.len() - at);
+            // A page the guest cannot write keeps its fill.
+            let _ = memory.write_exact(pages.address(offset + at), &bytes[at..at + len]);
+            at += len;
+        }
+        let addr = pages.address(offset).as_raw() as u64;
+        let read = super::read_extent(&memory, addr, bytes.len() as u64, records);
+        let contents = pages.contents();
+        (read, contents[offset..offset + bytes.len()].to_vec())
+    }
+
+    /// Two `getdents64` records of one-byte names: 24 bytes each, of which
+    /// Linux writes the first 21.
+    fn two_records() -> Vec<u8> {
+        let mut records = Vec::new();
+        for (name, off) in [(b'a', 1), (b'b', 2)] {
+            let entry = crate::dirents::DirEntry {
+                name: vec![name],
+                ino: 0x1111_1111_1111_1111,
+                off: 0,
+                ty: 8,
+            };
+            DirentFormat::Dirent64.encode(&entry, entry.ino, off, &mut records);
+        }
+        records
+    }
+
+    /// An extent the guest can read is hashed from what it holds. Of
+    /// `getdents64` records, only the padding after the last name, which
+    /// Linux does not write and which is at most 7 bytes, may be unreadable;
+    /// it is hashed as zeros and
+    /// reported. Every other byte hashed is what the guest holds. Any other
+    /// unreadable byte, or any unreadable byte of another syscall's extent,
+    /// is an error, whatever the guest's buffer holds.
+    #[test]
+    fn only_unwritten_directory_padding_may_be_unread() {
+        use crate::test_pages::PAGE;
+
+        const RW: i32 = libc::PROT_READ | libc::PROT_WRITE;
+        let records = two_records();
+        assert_eq!(records.len(), 48);
+
+        for flag in [false, true] {
+            let (read, held) = read_extent_in(&[RW, RW], PAGE - 45, &records, flag);
+            assert_eq!(read.unwrap(), (held, 0), "records {flag}");
+        }
+
+        // The last three bytes, padding, in a page the guest cannot access.
+        let (read, held) = read_extent_in(&[RW, libc::PROT_NONE], PAGE - 45, &records, true);
+        let (bytes, unread) = read.unwrap();
+        assert_eq!(unread, 3);
+        assert_eq!(bytes[..45], held[..45]);
+        assert_eq!(bytes[..45], records[..45]);
+        assert_eq!(bytes[45..], [0; 3]);
+
+        // Not records; the last name; a write-only buffer; a write-only page
+        // before a readable one. `LocalMemory` reads only with
+        // `process_vm_readv`, so no method of `read_written` can read a
+        // write-only page here; on ptrace the word read can (see
+        // `read_written_reads_every_extent_of_a_write_only_mapping`).
+        for (prot, offset, flag) in [
+            ([RW, libc::PROT_NONE], PAGE - 45, false),
+            ([RW, libc::PROT_NONE], PAGE - 44, true),
+            ([libc::PROT_WRITE, libc::PROT_WRITE], 0, true),
+            ([libc::PROT_WRITE, RW], PAGE - 24, true),
+        ] {
+            let (read, _) = read_extent_in(&prot, offset, &records, flag);
+            assert!(read.is_err(), "{prot:?} at {offset}, records {flag}");
+        }
     }
 }

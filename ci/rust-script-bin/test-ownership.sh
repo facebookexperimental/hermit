@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Exercise the actual dispatcher against independent Git fixture repositories.
 set -euo pipefail
 # Git exports its repository-location variables to hooks and `git rebase
@@ -93,6 +87,19 @@ cmp "$scratch/expected-stderr" "$scratch/stderr"
 : > "$scratch/stderr"
 expect_output prepared-test --exact 'test name'
 [[ ! -s "$HERMIT_TEST_RUST_SCRIPT_CALLS" ]]
+
+# A release-only publication (ci/prepare-rust-scripts.sh --release-only, the
+# pinned-root producer) still runs the prepared executable, and refuses a test
+# request by name rather than resolving it to some path or to the compiler.
+case_label='release-only publication'
+cp "$published/manifest.tsv" "$published/manifest.full"
+printf 'scripts/listed source.rs\trun\trelease-only\n' > "$published/manifest.tsv"
+invoke --force "$listed" 'two words'
+expect_output prepared 'two words'
+invoke --test "$listed" --exact 'test name'
+expect_refusal 'was published release-only (ci/prepare-rust-scripts.sh --release-only'
+mv "$published/manifest.full" "$published/manifest.tsv"
+case_label='external and prepared sources'
 ln -s "$listed" "$root/scripts/listed-link.rs"
 invoke --force "$root/scripts/listed-link.rs" -- fixture
 expect_output prepared -- fixture

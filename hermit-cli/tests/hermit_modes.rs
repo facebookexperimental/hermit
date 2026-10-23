@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -27,7 +30,6 @@ use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
 use hermit::Verdict;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
-static WORKLOADS: OnceLock<Workloads> = OnceLock::new();
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
 
@@ -36,14 +38,6 @@ struct Workload {
     name: &'static str,
     path: PathBuf,
     args: &'static [&'static str],
-}
-
-struct Workloads {
-    stable: Vec<Workload>,
-    default_only: Vec<Workload>,
-    hello_race: Workload,
-    resource_determinism: Workload,
-    sabre_exit_group_parked: Workload,
 }
 
 #[derive(Clone, Copy)]
@@ -67,9 +61,7 @@ impl RunMode {
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -140,29 +132,7 @@ fn compile_c_without_libc(source: &Path, output: &Path) {
     command_output(command, "C workload compilation without libc");
 }
 
-/// Repository-relative Rust guest source -> prebuilt binary, for builds that
-/// supply Rust guests instead of a host `rustc` (fbsource's Buck build).
-fn prepared_rust_guest(source: &Path) -> Option<PathBuf> {
-    let raw = std::env::var("HERMIT_PREPARED_RUST_GUESTS").ok()?;
-    let guests: std::collections::BTreeMap<String, PathBuf> =
-        serde_json::from_str(&raw).expect("prepared Rust guest paths must be a JSON object");
-    let (_, path) = guests
-        .into_iter()
-        .find(|(relative, _)| source.ends_with(relative))
-        .unwrap_or_else(|| panic!("no prepared Rust guest for {}", source.display()));
-    Some(path)
-}
-
 fn compile_rust(source: &Path, output: &Path) {
-    if let Some(prepared) = prepared_rust_guest(source) {
-        fs::copy(&prepared, output).unwrap_or_else(|error| {
-            panic!(
-                "failed to copy prepared Rust guest {}: {error}",
-                prepared.display()
-            )
-        });
-        return;
-    }
     let mut command = Command::new("rustc");
     command
         .args(["--edition=2024", "-C", "debuginfo=1"])
@@ -212,163 +182,219 @@ fn workload(name: &'static str, path: PathBuf) -> Workload {
     }
 }
 
-fn workloads() -> &'static Workloads {
-    WORKLOADS.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hermit-wave1-workloads");
-        fs::create_dir_all(&build_root).expect("failed to create workload build directory");
+/// How a workload is built. Each is built the first time a test asks for it,
+/// with the same compiler, flags and source as before: the 2026-10-17 test
+/// audit measured about 8.7 s per test in the `-j 1` test.hermit_modes node
+/// spent compiling all ~30 workloads in every test process, most of them for
+/// `default_*` tests that the node skips.
+#[derive(Clone, Copy)]
+enum Build {
+    /// A repository-relative C source, built by [`compile_c`].
+    C(&'static str),
+    /// A repository-relative C source, built by [`compile_c_without_libc`].
+    CWithoutLibc(&'static str),
+    /// A repository-relative Rust source, built by [`compile_rust`].
+    Rust(&'static str),
+    /// A repository-relative script, run in place.
+    Script(&'static str),
+}
 
-        let stable_c_sources = [
-            ("getpid", "getpid.c"),
-            ("io_uring_fallback", "io_uring_fallback.c"),
-            ("uname", "uname.c"),
-            ("sysinfo", "sysinfo.c"),
-            ("wait_on_child", "wait_on_child.c"),
-            ("nanosleep_parallel", "nanosleep-par.c"),
-        ];
-        let stable = stable_c_sources
-            .into_iter()
-            .map(|(name, source_name)| {
-                let path = build_root.join(name);
-                compile_c(&repository.join("tests/c").join(source_name), &path);
-                workload(name, path)
-            })
-            .collect();
+struct Spec {
+    name: &'static str,
+    /// The build output's file name; workloads sharing one binary name it.
+    binary: &'static str,
+    build: Build,
+    args: &'static [&'static str],
+}
 
-        let default_c_sources = [
-            ("clone", "tests/c/clone.c"),
-            ("getcpu", "tests/c/getCpu.c"),
-            ("hello_alarm", "tests/c/hello_alarm.c"),
-            ("hello_signals", "tests/c/hello_signals.c"),
-            ("just_spin", "tests/c/just_spin.c"),
-            ("memory_pressure", "tests/c/memoryPress.c"),
-            ("print_memaddrs", "tests/c/print_memaddrs.c"),
-            ("printf_with_threads", "tests/c/printf_with_threads.c"),
-            (
-                "sigtimedwait_no_timeout",
-                "tests/c/sigtimedwait-no-timeout.c",
-            ),
-            (
-                "sigtimedwait_timeout_0s",
-                "tests/c/sigtimedwait-timeout-0s.c",
-            ),
-            (
-                "sigtimedwait_timeout_1s",
-                "tests/c/sigtimedwait-timeout-1s.c",
-            ),
-            ("sysinfo_uptime", "tests/c/sysinfo_uptime.c"),
-            ("thread_exhaustion", "tests/c/threadExhaustion.c"),
-            (
-                "lit_hello_world_c",
-                "detcore/tests/lit/hello_world_c/main.c",
-            ),
-            ("lit_rt_sigaction", "detcore/tests/lit/rt_sigaction/main.c"),
-            (
-                "lit_rt_sigprocmask",
-                "detcore/tests/lit/rt_sigprocmask/main.c",
-            ),
-            ("lit_networking", "detcore/tests/lit/networking/main.c"),
-        ];
-        let mut default_only: Vec<_> = default_c_sources
-            .into_iter()
-            .map(|(name, source)| {
-                let path = build_root.join(name);
-                compile_c(&repository.join(source), &path);
-                workload(name, path)
-            })
-            .collect();
+const fn spec(name: &'static str, build: Build) -> Spec {
+    Spec {
+        name,
+        binary: name,
+        build,
+        args: &[],
+    }
+}
 
-        let rust_sources = [
-            ("network_bind", "tests/standalone/network_bind.rs"),
-            (
-                "lit_hello_world_rust",
-                "detcore/tests/lit/hello_world_rs/main.rs",
-            ),
-            ("rust_stack_ptr", "tests/rust/stack_ptr.rs"),
-            ("rust_heap_ptrs", "tests/rust/heap_ptrs.rs"),
-            ("rust_rdtsc", "tests/rust/rdtsc.rs"),
-            ("rust_mem_race", "tests/rust/mem_race.rs"),
-        ];
-        default_only.extend(rust_sources.into_iter().map(|(name, source)| {
-            let path = build_root.join(name);
-            compile_rust(&repository.join(source), &path);
-            workload(name, path)
-        }));
+const STABLE_WORKLOADS: [Spec; 6] = [
+    spec("getpid", Build::C("tests/c/getpid.c")),
+    spec("io_uring_fallback", Build::C("tests/c/io_uring_fallback.c")),
+    spec("uname", Build::C("tests/c/uname.c")),
+    spec("sysinfo", Build::C("tests/c/sysinfo.c")),
+    spec("wait_on_child", Build::C("tests/c/wait_on_child.c")),
+    spec("nanosleep_parallel", Build::C("tests/c/nanosleep-par.c")),
+];
 
-        let minimal_hello = build_root.join("minimal_hello");
-        compile_c_without_libc(
-            &repository.join("tests/c/simple/hello_nostdlib.c"),
-            &minimal_hello,
-        );
-        default_only.push(workload("minimal_hello", minimal_hello));
+const DEFAULT_ONLY_WORKLOADS: [Spec; 29] = [
+    spec("clone", Build::C("tests/c/clone.c")),
+    spec("getcpu", Build::C("tests/c/getCpu.c")),
+    spec("hello_alarm", Build::C("tests/c/hello_alarm.c")),
+    spec("hello_signals", Build::C("tests/c/hello_signals.c")),
+    spec("just_spin", Build::C("tests/c/just_spin.c")),
+    spec("memory_pressure", Build::C("tests/c/memoryPress.c")),
+    spec("print_memaddrs", Build::C("tests/c/print_memaddrs.c")),
+    spec(
+        "printf_with_threads",
+        Build::C("tests/c/printf_with_threads.c"),
+    ),
+    spec(
+        "sigtimedwait_no_timeout",
+        Build::C("tests/c/sigtimedwait-no-timeout.c"),
+    ),
+    spec(
+        "sigtimedwait_timeout_0s",
+        Build::C("tests/c/sigtimedwait-timeout-0s.c"),
+    ),
+    spec(
+        "sigtimedwait_timeout_1s",
+        Build::C("tests/c/sigtimedwait-timeout-1s.c"),
+    ),
+    spec("sysinfo_uptime", Build::C("tests/c/sysinfo_uptime.c")),
+    spec("thread_exhaustion", Build::C("tests/c/threadExhaustion.c")),
+    spec(
+        "lit_hello_world_c",
+        Build::C("detcore/tests/lit/hello_world_c/main.c"),
+    ),
+    spec(
+        "lit_rt_sigaction",
+        Build::C("detcore/tests/lit/rt_sigaction/main.c"),
+    ),
+    spec(
+        "lit_rt_sigprocmask",
+        Build::C("detcore/tests/lit/rt_sigprocmask/main.c"),
+    ),
+    spec(
+        "lit_networking",
+        Build::C("detcore/tests/lit/networking/main.c"),
+    ),
+    spec(
+        "network_bind",
+        Build::Rust("tests/standalone/network_bind.rs"),
+    ),
+    spec(
+        "lit_hello_world_rust",
+        Build::Rust("detcore/tests/lit/hello_world_rs/main.rs"),
+    ),
+    spec("rust_stack_ptr", Build::Rust("tests/rust/stack_ptr.rs")),
+    spec("rust_heap_ptrs", Build::Rust("tests/rust/heap_ptrs.rs")),
+    spec("rust_rdtsc", Build::Rust("tests/rust/rdtsc.rs")),
+    spec("rust_mem_race", Build::Rust("tests/rust/mem_race.rs")),
+    spec(
+        "minimal_hello",
+        Build::CWithoutLibc("tests/c/simple/hello_nostdlib.c"),
+    ),
+    spec(
+        "pread64_nostdlib",
+        Build::CWithoutLibc("tests/c/simple/pread64_nostdlib.c"),
+    ),
+    Spec {
+        name: "lit_rt_sigprocmask_mask",
+        binary: "lit_rt_sigprocmask",
+        build: Build::C("detcore/tests/lit/rt_sigprocmask/main.c"),
+        args: &["mask"],
+    },
+    Spec {
+        name: "lit_rt_sigprocmask_block",
+        binary: "lit_rt_sigprocmask",
+        build: Build::C("detcore/tests/lit/rt_sigprocmask/main.c"),
+        args: &["block"],
+    },
+    spec(
+        "shell_parallel_work",
+        Build::Script("tests/shell/par_work.sh"),
+    ),
+    spec("shell_taskset", Build::Script("tests/shell/taskset.sh")),
+];
 
-        let pread64_nostdlib = build_root.join("pread64_nostdlib");
-        compile_c_without_libc(
-            &repository.join("tests/c/simple/pread64_nostdlib.c"),
-            &pread64_nostdlib,
-        );
-        default_only.push(workload("pread64_nostdlib", pread64_nostdlib));
+const RESOURCE_DETERMINISM: Spec = spec(
+    "resource_determinism",
+    Build::C("tests/c/resource_determinism.c"),
+);
 
-        let lit_sigprocmask = build_root.join("lit_rt_sigprocmask");
-        default_only.extend([
-            Workload {
-                name: "lit_rt_sigprocmask_mask",
-                path: lit_sigprocmask.clone(),
-                args: &["mask"],
-            },
-            Workload {
-                name: "lit_rt_sigprocmask_block",
-                path: lit_sigprocmask,
-                args: &["block"],
-            },
-        ]);
+const HELLO_RACE: Spec = spec("hello_race", Build::Rust("flaky-tests/hello_race.rs"));
 
-        let script_sources = [
-            ("shell_parallel_work", "tests/shell/par_work.sh"),
-            ("shell_taskset", "tests/shell/taskset.sh"),
-        ];
-        default_only.extend(
-            script_sources
-                .into_iter()
-                .map(|(name, source)| workload(name, repository.join(source))),
-        );
+const SABRE_EXIT_GROUP_PARKED: Spec = spec(
+    "sabre_exit_group_parked",
+    Build::C("tests/c/sabre_exit_group_parked.c"),
+);
 
-        default_only.extend(cargo_guest_workloads(repository));
+fn repository() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository")
+}
 
-        let resource_determinism = workload(
-            "resource_determinism",
-            build_root.join("resource_determinism"),
-        );
-        compile_c(
-            &repository.join("tests/c/resource_determinism.c"),
-            &resource_determinism.path,
-        );
+/// The prepared Cargo guests, checked once per test process: their identities
+/// must match every hermit_modes fixture, and every path must exist.
+fn cargo_guests() -> &'static [Workload] {
+    static GUESTS: OnceLock<Vec<Workload>> = OnceLock::new();
+    GUESTS.get_or_init(|| cargo_guest_workloads(repository()))
+}
 
-        let hello_race = workload("hello_race", build_root.join("hello_race"));
-        compile_rust(
-            &repository.join("flaky-tests/hello_race.rs"),
-            &hello_race.path,
-        );
-
-        let sabre_exit_group_parked = workload(
-            "sabre_exit_group_parked",
-            build_root.join("sabre_exit_group_parked"),
-        );
-        compile_c(
-            &repository.join("tests/c/sabre_exit_group_parked.c"),
-            &sabre_exit_group_parked.path,
-        );
-
-        Workloads {
-            stable,
-            default_only,
-            hello_race,
-            resource_determinism,
-            sabre_exit_group_parked,
+/// Builds `spec` on first use and returns its workload. A build writes a
+/// per-process temporary file and renames it into place, so test processes
+/// that build the same workload at once never see a partly written binary.
+fn built(spec: &Spec) -> Workload {
+    static BUILT: Mutex<std::collections::BTreeMap<&'static str, PathBuf>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    // Every workload request checks the prepared Cargo guests, as building
+    // the whole set used to.
+    cargo_guests();
+    let source = |relative: &str| repository().join(relative);
+    let path = match spec.build {
+        Build::Script(script) => source(script),
+        build => {
+            let mut built = BUILT.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(path) = built.get(spec.binary) {
+                path.clone()
+            } else {
+                let build_root =
+                    Path::new(env!("CARGO_TARGET_TMPDIR")).join("hermit-wave1-workloads");
+                fs::create_dir_all(&build_root).expect("failed to create workload build directory");
+                let path = build_root.join(spec.binary);
+                let partial =
+                    build_root.join(format!(".{}.{}.partial", spec.binary, std::process::id()));
+                match build {
+                    Build::C(relative) => compile_c(&source(relative), &partial),
+                    Build::CWithoutLibc(relative) => {
+                        compile_c_without_libc(&source(relative), &partial)
+                    }
+                    Build::Rust(relative) => compile_rust(&source(relative), &partial),
+                    Build::Script(_) => unreachable!("scripts are not built"),
+                }
+                fs::rename(&partial, &path).unwrap_or_else(|error| {
+                    panic!("failed to install workload {}: {error}", path.display())
+                });
+                built.insert(spec.binary, path.clone());
+                path
+            }
         }
-    })
+    };
+    Workload {
+        name: spec.name,
+        path,
+        args: spec.args,
+    }
+}
+
+fn stable_workloads() -> Vec<Workload> {
+    STABLE_WORKLOADS.iter().map(built).collect()
+}
+
+/// A default-mode workload by name: a built one, or a prepared Cargo guest.
+fn default_workload(name: &str) -> Workload {
+    if let Some(spec) = DEFAULT_ONLY_WORKLOADS.iter().find(|spec| spec.name == name) {
+        return built(spec);
+    }
+    let guest = cargo_guests()
+        .iter()
+        .find(|workload| workload.name == name)
+        .unwrap_or_else(|| panic!("unknown default-mode workload: {name}"));
+    Workload {
+        name: guest.name,
+        path: guest.path.clone(),
+        args: guest.args,
+    }
 }
 
 fn hermit_command(base_env: &str) -> Command {
@@ -483,18 +509,22 @@ fn hermit_run(mode: RunMode, workload: &Workload) {
 
 fn run_stable_matrix(mode: RunMode) {
     let _guard = hermit_run_lock();
-    for workload in &workloads().stable {
+    for workload in &stable_workloads() {
         hermit_run(mode, workload);
     }
 }
 
 fn run_buck_chaos_workload(name: &str) {
     let _guard = hermit_run_lock();
-    let workload = workloads()
-        .stable
+    let workload = STABLE_WORKLOADS
         .iter()
-        .chain(&workloads().default_only)
-        .find(|workload| workload.name == name)
+        .find(|spec| spec.name == name)
+        .map(built)
+        .or_else(|| {
+            let known = DEFAULT_ONLY_WORKLOADS.iter().any(|spec| spec.name == name)
+                || cargo_guests().iter().any(|workload| workload.name == name);
+            known.then(|| default_workload(name))
+        })
         .unwrap_or_else(|| panic!("unknown Buck chaos workload: {name}"));
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
@@ -600,7 +630,7 @@ fn default_mode_matrix() {
 #[test]
 fn resource_syscalls_are_deterministic_across_five_runs() {
     let _guard = hermit_run_lock();
-    let workload = &workloads().resource_determinism;
+    let workload = &built(&RESOURCE_DETERMINISM);
     let mut baseline = None;
 
     for run in 1..=5 {
@@ -647,7 +677,7 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
 #[test]
 fn resource_syscalls_are_independent_of_epoch_fraction() {
     let _guard = hermit_run_lock();
-    let workload = &workloads().resource_determinism;
+    let workload = &built(&RESOURCE_DETERMINISM);
     let mut baseline = None;
 
     for epoch in [
@@ -683,11 +713,7 @@ fn resource_syscalls_are_independent_of_epoch_fraction() {
 #[test]
 fn sysinfo_uptime_follows_thread_join_and_exec() {
     let _guard = hermit_run_lock();
-    let workload = workloads()
-        .default_only
-        .iter()
-        .find(|workload| workload.name == "sysinfo_uptime")
-        .expect("sysinfo_uptime workload must be compiled");
+    let workload = &default_workload("sysinfo_uptime");
     let mut baseline = None;
     for run in 1..=2 {
         let mut command = hermit_command("minimal");
@@ -725,11 +751,7 @@ fn sysinfo_uptime_follows_thread_join_and_exec() {
 
 fn run_default_workload(name: &str) {
     let _guard = hermit_run_lock();
-    let workload = workloads()
-        .default_only
-        .iter()
-        .find(|workload| workload.name == name)
-        .unwrap_or_else(|| panic!("unknown default-mode workload: {name}"));
+    let workload = &default_workload(name);
     hermit_run(RunMode::Default, workload);
 }
 
@@ -815,7 +837,7 @@ fn run_bounded_sabre_strict_verify(program: &Path, args: &[&str], label: &str) {
 
 #[test]
 fn sabre_exit_group_cancels_parked_futex_thread() {
-    let workload = &workloads().sabre_exit_group_parked;
+    let workload = &built(&SABRE_EXIT_GROUP_PARKED);
     run_bounded_sabre_strict_verify(
         &workload.path,
         workload.args,
@@ -958,11 +980,7 @@ fn default_minimal_hello() {
 #[test]
 fn default_lit_networking() {
     let _guard = hermit_run_lock();
-    let workload = workloads()
-        .default_only
-        .iter()
-        .find(|workload| workload.name == "lit_networking")
-        .expect("missing lit networking workload");
+    let workload = &default_workload("lit_networking");
     let mut command = default_hermit_command("minimal");
     command
         .args(["--analyze-networking", "--"])
@@ -988,9 +1006,7 @@ fn default_exit_codes() {
         let mut command = default_hermit_command("minimal");
         command.arg("--").arg(program).args(args);
         let rendered = format!("{command:?}");
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start exit-code check: {rendered}: {error}"));
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         assert_eq!(
             output.status.code(),
             Some(expected),
@@ -1091,11 +1107,7 @@ fn default_environment_selection() {
 #[test]
 fn no_hardware_minimal_hello_backtraces() {
     let _guard = hermit_run_lock();
-    let workload = workloads()
-        .default_only
-        .iter()
-        .find(|workload| workload.name == "minimal_hello")
-        .expect("missing minimal hello workload");
+    let workload = &default_workload("minimal_hello");
 
     let mut first = hermit_command("minimal");
     first
@@ -1148,9 +1160,7 @@ fn no_hardware_stacktrace_signal() {
     configure_execution_root(&mut command);
     command.args(["--", "/bin/date"]);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start stacktrace signal: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.signal(),
@@ -1184,16 +1194,16 @@ fn verify_mode_matrix() {
 fn verify_rejects_explicit_log_levels_below_info() {
     let _guard = hermit_run_lock();
     for level in ["off", "error", "warn"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-            .args([
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            Command::new(env!("CARGO_BIN_EXE_hermit")).args([
                 &format!("--log={level}"),
                 "run",
                 "--verify",
                 "--",
                 "/bin/true",
-            ])
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start verify with {level} logs: {error}"));
+            ]),
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success(),
@@ -1218,7 +1228,7 @@ fn verify_reports_stdout_divergence() {
         &[],
     );
 
-    let output = command.output().expect("failed to run stdout verification");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
@@ -1252,9 +1262,7 @@ fn verify_reports_exit_status_divergence() {
         &["--verify-allow=both"],
     );
 
-    let output = command
-        .output()
-        .expect("failed to run exit-status verification");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
@@ -1286,9 +1294,7 @@ fn verify_verbose_compares_the_full_trace() {
         .arg(report.path())
         .args(["--", "/bin/true"]);
 
-    let output = command
-        .output()
-        .expect("failed to run verbose verification");
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
@@ -1350,11 +1356,7 @@ fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
             "--max-timeslice=disabled",
         ]);
     configure_execution_root(&mut command);
-    let output = command
-        .arg("--")
-        .arg(&guest)
-        .output()
-        .expect("failed to run strict INFO verification");
+    let output = hermit_test::hermit_output("hermit run", command.arg("--").arg(&guest));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -1456,7 +1458,7 @@ int main(void) {
 #[test]
 fn hello_race_chaos_verify() {
     let _guard = hermit_run_lock();
-    let workload = &workloads().hello_race;
+    let workload = &built(&HELLO_RACE);
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.args([
         "run",
@@ -1471,9 +1473,7 @@ fn hello_race_chaos_verify() {
     configure_execution_root(&mut command);
     command.arg("--").arg(&workload.path);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // Hermit propagates the guest status even when --verify-allow=both accepts it.

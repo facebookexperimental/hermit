@@ -10,6 +10,8 @@
 
 pub mod backend_engagement;
 pub mod build_info;
+pub mod canonical_test_epoch;
+pub mod cpu_profile;
 pub mod host_capability;
 
 /// Exit status for a run HERMIT DELIBERATELY REFUSED, as distinct from one
@@ -31,11 +33,12 @@ pub mod host_capability;
 /// status, so it cannot distinguish "hermit refused" from "your program
 /// returned 1".
 ///
-/// ⚠️ WHY 122. It sits immediately below the reserved band (123 safehermit log
-/// cap, 124 deadline, 125 hermit broke, 126/127 GNU exec-level), keeping the
-/// reserved codes contiguous, and it is the cheapest possible narrowing of the
-/// guest range. See the full allocation above the constants in
-/// `hermit-cli/src/lib.rs`.
+/// ⚠️ WHY 122. It sits immediately below the reserved band (123 log byte cap --
+/// hermit's `--max-log-bytes`, and the value reserved for `bin/safehermit`'s
+/// log-cap kill, which still exits 125 -- then 124 deadline, 125 hermit broke,
+/// 126/127 GNU exec-level), keeping the reserved codes contiguous, and it is
+/// the cheapest possible narrowing of the guest range. See the full allocation
+/// above the constants in `hermit-cli/src/lib.rs`.
 ///
 /// ⚠️ IT LIVES IN `detcore-model` BECAUSE BOTH SIDES NEED IT. `detcore` emits it
 /// and `hermit-cli` recognises it; `detcore-model` is the only crate both
@@ -162,9 +165,20 @@ const _: () = assert!(
 
 pub mod collections;
 pub mod config;
+pub mod container_mounts;
 pub mod fd;
 pub mod futex;
 pub mod happens_before;
+pub mod host_input;
+pub mod liteinst_initial_image;
+/// Bounded sealed native target catalog data, without admission authority.
+#[cfg(feature = "native-exec")]
+pub mod liteinst_native_exec_catalog;
+pub mod liteinst_native_exec_input;
+/// Exact versioned neutral cut envelope outside opaque Tool state.
+pub mod liteinst_native_exec_state;
+pub mod logdiff_policy;
+pub mod network_engine;
 pub mod network_trace;
 pub mod pedigree;
 pub mod pid;
@@ -172,3 +186,9 @@ pub mod procfs;
 pub mod schedule;
 pub mod summary;
 pub mod time;
+
+/// Exact native runtime/dispatch-sequence envelope, separate from admission.
+pub mod liteinst_native_exec_runtime;
+
+#[cfg(feature = "native-exec")]
+pub mod liteinst_native_exec_sources;

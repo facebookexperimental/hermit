@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Ratchet e9patch preprocessing parity against the golden ptrace backend.
 
 e9patch is binary-rewriting *preprocessing* for the ptrace backend, not a
@@ -47,7 +41,7 @@ guest-visible parity. This harness makes no claim of strict detlog identity.
 
 Prerequisites (absent in CI, hence BLOCKED there):
   * a hermit built with the `e9patch` cargo feature
-    (`cargo build -p hermit --features e9patch`);
+    (`cargo build -p hermit-run --features e9patch`);
   * HERMIT_E9TOOL and HERMIT_E9PATCH_BACKEND pointing at a built e9tool/e9patch
     pair (the reverie checkout vendors them under
     `third-party/e9patch/{e9tool,e9patch}`);
@@ -263,7 +257,7 @@ def prerequisites(hermit: Path) -> str | None:
     if not report_bin.is_file() or not os.access(report_bin, os.X_OK):
         return (
             f"typed verification-report reader unavailable: {report_bin} "
-            "(build it with cargo build -p hermit --bin verification-report)"
+            "(build it with cargo build -p hermit-run --bin verification-report)"
         )
     for var in ("HERMIT_E9TOOL", "HERMIT_E9PATCH_BACKEND"):
         path = os.environ.get(var)

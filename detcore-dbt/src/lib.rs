@@ -13,7 +13,12 @@
 
 #![deny(missing_docs)]
 
+#[cfg(test)]
+mod first_instruction_observer;
+mod ofd_channel;
+
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::ffi::c_void;
 use std::fs;
 use std::future::Future;
@@ -41,11 +46,13 @@ use detcore::DetTid;
 use detcore::Detcore;
 use detcore::GlobalState;
 use detcore::UnsupportedSyscallError;
+use detcore::cancel_exec;
 use detcore::prepare_exec;
 use rand::RngExt as _;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::Pid;
+use reverie::Signal;
 use reverie::Tid;
 use reverie::Tool;
 use reverie::syscalls::CloneFlags;
@@ -55,6 +62,8 @@ use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie_dbt::DbtGuest;
+use reverie_dbt::DbtSignalEvent;
+use reverie_dbt::DbtSignalOutcome;
 use reverie_dbt::DbtSyscallOutcome;
 use reverie_dbt::MemoryReader;
 use reverie_dbt::MemoryWriter;
@@ -62,11 +71,8 @@ use reverie_dbt::RegisterReader;
 use reverie_dbt::RegisterWriter;
 use reverie_dbt::SyscallInvoker;
 use tracing::Event;
-use tracing::Metadata;
-use tracing::Subscriber;
 use tracing::field::Field;
 use tracing::field::Visit;
-use tracing::span;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -74,8 +80,25 @@ const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 4;
-const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 48;
+/// Version 6 adds the initialized native mode and returned startup status.
+/// Version 7 adds `reverie_dbt_runtime_signal_event`. Version 8 appends the
+/// native client's atomic guest-word compare-and-exchange to the callbacks,
+/// growing them from 48 to 56 bytes; the version-5 RDTSC entry is unchanged.
+/// This runtime accepts the version-8 layout but does not install the
+/// exchange, and no capability advertises it, so nothing calls it. Version 9
+/// adds `reverie_dbt_runtime_cpuid`: the native client keeps no CPUID table and
+/// asks this runtime, which answers from Detcore. Version 11 preserves the
+/// controller-capture callback at offset 56 and appends private-memory facts
+/// at offset 64. The incompatible historical version-10 tables are refused.
+/// Version 12 appends optional internal branch facts at offset72.
+/// Version 13 adds the syscall invoker's fourth injection-purpose argument;
+/// the callback table remains 80 bytes, but version 12 is incompatible.
+/// Version 14 grows the private-memory snapshot pointee from 96 to 176 bytes
+/// for authenticated bootstrap LOAD pages; the callback table remains 80 bytes.
+/// Installing the callback does not enable instrumentation or shared time.
+// Version 15 appends the cooperative mapping-capture callback at offset 80.
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 15;
+const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 88;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
@@ -106,7 +129,68 @@ fn upgrade_runtime_callbacks_v1(
         emit_stdout: callbacks.emit_stdout,
         emit_evidence: callbacks.emit,
         evidence_log_level: 0,
+        compare_exchange_u32: unsupported_compare_exchange,
+        controller_capture_control: unsupported_controller_capture,
+        runtime_private_memory: unavailable_private_memory,
+        branch_fact: unavailable_branch_fact,
+        mapping_capture: unavailable_mapping_capture,
     }
+}
+
+unsafe extern "C" fn unavailable_mapping_capture(
+    _context: usize,
+    _operation: u32,
+    _arguments: *mut reverie_dbt::NativeMappingCapture,
+) -> i32 {
+    0
+}
+
+unsafe extern "C" fn unsupported_controller_capture(
+    _context: usize,
+    _operation: u32,
+    output: *mut reverie_dbt::NativeControllerCaptureFact,
+) -> i32 {
+    if !output.is_null() {
+        // SAFETY: the callback contract supplies writable output when non-null.
+        unsafe { output.write(reverie_dbt::NativeControllerCaptureFact::default()) };
+    }
+    0
+}
+
+/// Stands in for the compare-and-exchange that callbacks older than ABI
+/// version 8 do not carry. Only refusing initialization paths read those.
+unsafe extern "C" fn unsupported_compare_exchange(
+    _address: usize,
+    _expected: u32,
+    _desired: u32,
+    _observed: *mut u32,
+) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Old initialization paths cannot provide private-memory authority.
+unsafe extern "C" fn unavailable_private_memory(
+    _context: usize,
+    _expected: *const reverie_dbt::NativePrivateMemorySnapshot,
+    output: *mut reverie_dbt::NativePrivateMemorySnapshot,
+) -> i32 {
+    if !output.is_null() {
+        // SAFETY: the callback contract supplies writable fixed-size storage.
+        unsafe { output.write(Default::default()) };
+    }
+    0
+}
+
+/// Legacy startup has no optional branch observation transport.
+unsafe extern "C" fn unavailable_branch_fact(
+    _context: usize,
+    output: *mut reverie_dbt::NativeBranchFact,
+) -> i32 {
+    if !output.is_null() {
+        // SAFETY: the native callback contract supplies fixed writable storage.
+        unsafe { output.write(Default::default()) };
+    }
+    0
 }
 
 fn runtime_callback_channels(
@@ -122,45 +206,35 @@ fn runtime_callback_channels(
 static DBT_TRACING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static DBT_EVIDENCE_LOG_LEVEL: AtomicI32 = AtomicI32::new(0);
 static DBT_DIAGNOSTIC_EMITTER: OnceLock<Emitter> = OnceLock::new();
-static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
-
-struct DbtSubscriber {
-    emit: Emitter,
-    level: DbtLogLevel,
-    canonical: bool,
-}
+/// The protected evidence channel, when this run asked for one.
+static DBT_EVIDENCE_EMITTER: OnceLock<Emitter> = OnceLock::new();
+/// Where DBT's own channel writes each event (its protected evidence, or its
+/// diagnostic channel when `HERMIT_LOG` sets a level), and whether each line
+/// carries the canonical prefix.
+static DBT_EVENT_SINK: OnceLock<(Emitter, bool)> = OnceLock::new();
 
 const DBT_LOG_RECORD_PREFIX: &str = "1970-01-01T00:00:00.000000Z ";
 
-impl Subscriber for DbtSubscriber {
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        self.level.enables(metadata.level())
-    }
+/// Writes one event to [`DBT_EVENT_SINK`], as one line.
+fn write_dbt_event(event: &Event<'_>) {
+    let Some(&(emit, canonical)) = DBT_EVENT_SINK.get() else {
+        return;
+    };
+    let line = format_dbt_event(event, canonical);
+    unsafe { emit(line.as_ptr(), line.len()) };
+}
 
-    fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
-        span::Id::from_u64(NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed))
-    }
-
-    fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
-
-    fn event(&self, event: &Event<'_>) {
-        let metadata = event.metadata();
-        let mut visitor = DbtEventVisitor::default();
-        event.record(&mut visitor);
-        let line = format_dbt_log_record(
-            metadata.level().as_str(),
-            metadata.target(),
-            &visitor.fields,
-            self.canonical,
-        );
-        unsafe { (self.emit)(line.as_ptr(), line.len()) };
-    }
-
-    fn enter(&self, _span: &span::Id) {}
-
-    fn exit(&self, _span: &span::Id) {}
+/// One event as one line of DBT's own channel.
+fn format_dbt_event(event: &Event<'_>, canonical: bool) -> String {
+    let metadata = event.metadata();
+    let mut visitor = DbtEventVisitor::default();
+    event.record(&mut visitor);
+    format_dbt_log_record(
+        metadata.level().as_str(),
+        metadata.target(),
+        &visitor.fields,
+        canonical,
+    )
 }
 
 #[derive(Default)]
@@ -217,13 +291,13 @@ enum DbtLogLevel {
 }
 
 impl DbtLogLevel {
-    fn enables(self, level: &tracing::Level) -> bool {
+    fn max_level(self) -> tracing::Level {
         match self {
-            Self::Error => *level == tracing::Level::ERROR,
-            Self::Warn => matches!(*level, tracing::Level::ERROR | tracing::Level::WARN),
-            Self::Info => !matches!(*level, tracing::Level::DEBUG | tracing::Level::TRACE),
-            Self::Debug => *level != tracing::Level::TRACE,
-            Self::Trace => true,
+            Self::Error => tracing::Level::ERROR,
+            Self::Warn => tracing::Level::WARN,
+            Self::Info => tracing::Level::INFO,
+            Self::Debug => tracing::Level::DEBUG,
+            Self::Trace => tracing::Level::TRACE,
         }
     }
 }
@@ -293,56 +367,71 @@ fn dbt_log_level() -> Option<DbtLogLevel> {
     dbt_log_level_from_code(effective_dbt_log_level())
 }
 
-fn install_dbt_subscriber_with<E>(
-    emit: Emitter,
-    level: DbtLogLevel,
-    canonical: bool,
-    install: impl FnOnce(DbtSubscriber) -> Result<(), E>,
+/// Installs Detcore's in-guest subscriber (`detcore::guest_log`) through
+/// `install`, with DBT's own channel writing every event up to `own`'s level to
+/// its emitter.
+fn install_dbt_subscriber_with(
+    own: Option<(Emitter, DbtLogLevel, bool)>,
+    install: impl FnOnce(Option<detcore::guest_log::OwnChannel>) -> bool,
 ) -> bool {
-    if install(DbtSubscriber {
-        emit,
-        level,
-        canonical,
-    })
-    .is_err()
-    {
+    let own = own.map(|(emit, level, canonical)| {
+        let _ = DBT_EVENT_SINK.set((emit, canonical));
+        detcore::guest_log::OwnChannel {
+            max_level: level.max_level(),
+            write: write_dbt_event,
+        }
+    });
+    if !install(own) {
         return false;
     }
     DBT_TRACING_ACTIVE.store(true, Ordering::Release);
     true
 }
 
+/// Detcore's warnings reach the run's log through the coordinator, as on every
+/// in-guest runtime (`detcore::guest_log`). When the run asked DBT to log, in
+/// its protected verification evidence (`canonical`) or at `HERMIT_LOG`'s
+/// level, DBT's own channel takes every event up to that level exactly as its
+/// subscriber did before, its DETLOG records included, and nothing is sent.
+/// With no coordinator and no level asked for, it takes warnings and errors on
+/// the diagnostic channel.
 fn init_dbt_tracing(emit: Emitter, canonical: bool) -> bool {
     if DBT_TRACING_ACTIVE.load(Ordering::Acquire) {
         return true;
     }
-    let Some(level) = dbt_log_level() else {
-        return false;
-    };
-    install_dbt_subscriber_with(
-        emit,
-        level,
-        canonical,
-        tracing::subscriber::set_global_default,
-    )
+    // With no coordinator to send to, warnings still print, on the diagnostic
+    // channel.
+    let level = dbt_log_level().or_else(|| {
+        (!canonical && !reverie_dbt::sync_rpc::is_active()).then_some(DbtLogLevel::Warn)
+    });
+    let own = level.map(|level| (emit, level, canonical));
+    let installed = install_dbt_subscriber_with(own, |own| {
+        detcore::guest_log::install(ofd_channel::coordinator_call, own)
+    });
+    if !installed {
+        emit_runtime_diagnostic(
+            "detcore-dbt: WARNING Detcore's in-guest subscriber was not installed: the process already has one\n",
+        );
+    }
+    installed
 }
 
 fn protected_evidence_capture_ready(protected_level: i32, tracing_active: bool) -> bool {
     protected_level == 0 || tracing_active
 }
 
-/// Environment variable through which `hermit --backend dbt run` hands the
-/// CLI-derived Detcore [`Config`] (JSON) to this in-guest runtime.
+/// Stable CLI-derived Detcore [`Config`] JSON for standalone initialization.
 ///
-/// The guest process inherits it from `drrun` (see the DBT launcher), so it is
-/// the cross-process channel that lets flags like `--strict`, `--seed`, and the
-/// time/CPUID virtualization switches reach the DBT Detcore Tool the same way
-/// they reach the ptrace backend.
+/// The admitted native startup mode selects this existing fallback only when
+/// no coordinator control is present. Coordinated initialization receives the
+/// complete physical Config from the existing first RPC frame instead.
 pub const DETCONFIG_ENV: &str = "HERMIT_DBT_DETCONFIG";
 
 /// Where the effective Detcore [`Config`] came from, for native diagnostics.
 enum ConfigSource {
-    /// Deserialized from [`DETCONFIG_ENV`] provided by `hermit run`.
+    /// Received from the coordinator through its existing first Config frame.
+    RpcHandshake,
+    /// Deserialized from [`DETCONFIG_ENV`] in admitted standalone initialization.
     Cli,
     /// [`DETCONFIG_ENV`] was set but could not be parsed; strict default used.
     ParseFallback,
@@ -360,27 +449,83 @@ fn default_dbt_config() -> Config {
     }
 }
 
-/// Builds the Detcore [`Config`] for this DBT runtime.
+/// What the DBT backend can do, in the form Detcore reads.
+///
+/// `hermit run --backend=dbt` copies the same value into its configuration.
+/// The coordinator frame retains that value; the stable [`DETCONFIG_ENV`]
+/// producer also encodes it for the existing standalone fallback.
+pub const fn backend_capabilities() -> reverie::BackendCapabilities {
+    reverie_dbt::DbtRunner::capabilities()
+}
+
+/// Builds the admitted standalone Detcore [`Config`] fallback.
 ///
 /// The configuration is taken from the CLI-derived Detcore config serialized
 /// into [`DETCONFIG_ENV`] when present; otherwise a strict default is used.
-/// Regardless of the source, the DBT execution-model invariants are re-asserted:
-/// the backend drives the Detcore global scheduler externally on a branch count
-/// rather than PMU retired-conditional-branch preemption, so timeslice
-/// preemption (`max_timeslice`) is disabled and threads stay sequentialized for
-/// the single external scheduler.
+/// Regardless of the source, the DBT execution-model invariants are re-asserted
+/// by [`assert_dbt_execution_model`]. A present coordinator control is handled
+/// by [`initial_dbt_config`] and never falls back through this function.
 fn load_dbt_config() -> (Config, ConfigSource) {
-    let (mut config, source) = match std::env::var(DETCONFIG_ENV) {
-        Ok(value) if !value.is_empty() => match serde_json::from_str::<Config>(&value) {
+    dbt_config_from(std::env::var(DETCONFIG_ENV).ok().as_deref())
+}
+
+/// [`load_dbt_config`] for a given value of [`DETCONFIG_ENV`]; `None` when the
+/// variable is absent or not Unicode.
+///
+/// The backend facts are those the value carries, decoded by
+/// [`detcore::decode_backend_config_json`]; `hermit run` encodes
+/// [`backend_capabilities`] there. Without a parseable value they are the
+/// strict default's, which are ptrace's. This is the admitted standalone
+/// fallback only: coordinated startup, including an empty-environment exec,
+/// receives the authoritative physical Config through [`initial_dbt_config`].
+fn dbt_config_from(value: Option<&str>) -> (Config, ConfigSource) {
+    let (mut config, source) = match value {
+        Some(value) if !value.is_empty() => match detcore::decode_backend_config_json(value) {
             Ok(config) => (config, ConfigSource::Cli),
             Err(_) => (default_dbt_config(), ConfigSource::ParseFallback),
         },
         _ => (default_dbt_config(), ConfigSource::Default),
     };
+    assert_dbt_execution_model(&mut config);
+    (config, source)
+}
+
+/// Selects the complete coordinator frame or the admitted standalone fallback.
+/// A present control remains authoritative even in native Standalone mode.
+fn initial_dbt_config(
+    mode: reverie_dbt::DbtStartupMode,
+    control: Option<&OsStr>,
+) -> Result<(Config, ConfigSource), String> {
+    let (mut config, source) = match control {
+        Some(path) => (
+            reverie_dbt::sync_rpc::read_initial_config::<Config>(Path::new(path))
+                .map_err(|error| error.to_string())?,
+            ConfigSource::RpcHandshake,
+        ),
+        None if mode == reverie_dbt::DbtStartupMode::Coordinated => {
+            return Err("coordinated startup requires a coordinator socket".into());
+        }
+        None => load_dbt_config(),
+    };
+    assert_dbt_execution_model(&mut config);
+    Ok((config, source))
+}
+
+/// Re-asserts the DBT execution model on a configuration from any source. The
+/// backend drives the Detcore global scheduler externally on a branch count
+/// rather than PMU retired-conditional-branch preemption, so timeslice
+/// preemption (`max_timeslice`) is disabled and threads stay sequentialized for
+/// the single external scheduler. A write the guest parks in the backend
+/// cannot be interrupted by a signal here, whatever the configuration says.
+/// And this runtime promotes shared open-file descriptions before every
+/// native fork, process-copying clone or exec it performs (see
+/// [`requires_native_lifecycle`]'s caller), whatever the configuration says,
+/// so a configuration from any source states that it does.
+fn assert_dbt_execution_model(config: &mut Config) {
     config.max_timeslice = None;
     config.sequentialize_threads = true;
-    config.backend_supports_parked_write_signal_interruption = false;
-    (config, source)
+    config.backend.supports_parked_write_signal_interruption = false;
+    config.backend.promotes_open_files_before_native_lifecycle = true;
 }
 
 // TODO-HUMAN-REVIEW(PR-587): Confirm DynamoRIO-native process lifecycle boundaries.
@@ -401,6 +546,7 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
 // TODO-HUMAN-REVIEW(PR-1038): Review DBT self-target queued-signal identity translation.
 // TODO-HUMAN-REVIEW(PR-1065): Review DBT self-target prlimit64 translation.
 fn translate_self_identity_targets(
+    abi: RuntimeAbi,
     sysnum: i64,
     args: &mut [u64; 6],
     virtual_pid: i32,
@@ -414,6 +560,12 @@ fn translate_self_identity_targets(
     // AUTONOMOUS-BOT-IMPLEMENTED
     if sysnum == libc::SYS_prlimit64 && args[0] as i32 == virtual_pid {
         args[0] = host_pid as u32 as u64;
+    }
+    // Current ABI queued-signal targets must stay in the Tool's guest namespace
+    // for process resolution. The native injector lowers them to physical IDs
+    // after shared Detcore handling; V1 still dispatches with physical IDs.
+    if abi == RuntimeAbi::Current {
+        return;
     }
     if virtual_tid <= 0 || host_tid <= 0 {
         return;
@@ -472,6 +624,7 @@ fn run_ready<F: Future>(future: F) -> F::Output {
 
 #[allow(clippy::too_many_arguments)]
 fn send_dbt_prepare_exec(
+    tool: &Detcore,
     context: *mut c_void,
     scheduler_tid: Pid,
     physical_pid: i32,
@@ -480,9 +633,11 @@ fn send_dbt_prepare_exec(
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
-) {
+    path: Option<PathBuf>,
+) -> PreparedExec {
     let runtime = current_runtime();
     let mm = thread_state.mm_id;
+    let blocking_overrides = thread_state.exec_blocking_overrides();
     let (tid, pid) = prepare_exec_guest_identity(scheduler_tid, physical_pid);
     let mut guest = DbtGuest::<Detcore>::new(
         context as usize,
@@ -497,11 +652,59 @@ fn send_dbt_prepare_exec(
         read_registers,
         write_registers,
     );
+    // Linux walks the old thread group's robust lists in the exec and marks
+    // the owner words; Detcore's parked waiters need its wakes, which the new
+    // image's fresh runtime cannot stage. Read them now, while the old image
+    // is mapped and before the client rewrites owner TIDs, and hand them to
+    // the coordinator (https://github.com/rrnewton/hermit/issues/4268).
+    let robust_wakes = run_ready(tool.exec_robust_list_wakes(&mut guest));
+    // The image the exec runs, resolved as Detcore's own execve handler
+    // resolves it. DBT declares DynamoRIO's library as its launcher, so the
+    // kernel's link names that library: the new image's `exe` link and its
+    // program break model come from this record.
+    let exe = path.and_then(|path| tool.exec_image_at(&guest, libc::AT_FDCWD, &path));
     run_ready(prepare_exec(
         &mut guest,
         mm,
-        std::collections::BTreeSet::new(),
+        blocking_overrides,
+        robust_wakes,
+        exe,
     ));
+    PreparedExec {
+        context: context as usize,
+        branches,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    }
+}
+
+/// The NUL-terminated path at guest `address`, read through DynamoRIO's
+/// reader a page at a time, so a string that ends near an unmapped page is
+/// still read whole: `None` for an unreadable address or a path no shorter
+/// than `PATH_MAX`, which the kernel's execve refuses too. The reader works
+/// where Reverie's `LocalMemory` does not, after the thread group's leader has
+/// exited (it copies through the leader's pid).
+fn read_guest_path(address: u64, read_memory: MemoryReader) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    const PAGE: u64 = 4096;
+    let mut path = Vec::new();
+    let mut at = address;
+    while path.len() < libc::PATH_MAX as usize {
+        let chunk = (PAGE - at % PAGE) as usize;
+        let mut bytes = vec![0_u8; chunk];
+        if unsafe { read_memory(at as usize, bytes.as_mut_ptr(), chunk) } == 0 {
+            return None;
+        }
+        if let Some(end) = bytes.iter().position(|&byte| byte == 0) {
+            path.extend_from_slice(&bytes[..end]);
+            return (path.len() < libc::PATH_MAX as usize)
+                .then(|| PathBuf::from(std::ffi::OsString::from_vec(path)));
+        }
+        path.extend_from_slice(&bytes);
+        at += chunk as u64;
+    }
+    None
 }
 
 fn prepare_exec_guest_identity(scheduler_tid: Pid, physical_pid: i32) -> (Pid, Pid) {
@@ -573,6 +776,19 @@ struct ThreadRuntime {
     state: DetcoreThreadState,
     initialized: bool,
     post_exec_pending: bool,
+    prepared_exec: Option<PreparedExec>,
+}
+
+// A failed native exec returns on this same DynamoRIO thread and leaves its
+// context and client callbacks alive. Retain them only across that syscall so
+// the existing failure callback can cancel Detcore's exec before any old-image
+// code resumes, without changing the native callback ABI.
+struct PreparedExec {
+    context: usize,
+    branches: u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 }
 
 struct PendingThreadParent {
@@ -909,6 +1125,29 @@ fn error_result(error: Error) -> i64 {
     }
 }
 
+/// Splits a Detcore handler error into a guest result or a run failure.
+///
+/// Only a Linux error belongs to the guest. Any other error means Detcore
+/// cannot continue faithfully: an invariant failed, evidence it needs is
+/// missing, or the syscall is unsupported. ptrace and KVM fail the run on
+/// such an error. Writing an invented `EIO` instead would let the guest
+/// catch it and continue, so an internal failure would look like guest
+/// behaviour. `Err` carries the diagnostic for the run's stderr.
+fn guest_errno_or_failure(error: Error) -> Result<i64, String> {
+    match error {
+        Error::Errno(errno) => Ok(-(errno.into_raw() as i64)),
+        Error::Tool(error) => match error.downcast_ref::<UnsupportedSyscallError>() {
+            Some(unsupported) => Err(format!("detcore-dbt: {unsupported}\n")),
+            None => Err(format!(
+                "detcore-dbt: Detcore failed handling a syscall: {error:#}\n"
+            )),
+        },
+        Error::Io(error) => Err(format!(
+            "detcore-dbt: Detcore failed handling a syscall: {error}\n"
+        )),
+    }
+}
+
 /// Returns the Detcore DBT cdylib built beside the running Hermit binary or in Cargo's deps directory.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-738): Review native-client linkage to the minimal DBT runtime.
@@ -1066,8 +1305,16 @@ pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
     IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
-unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, abi: RuntimeAbi) {
+unsafe fn runtime_background_init(
+    callbacks: &reverie_dbt::DbtRuntimeCallbacks,
+    abi: RuntimeAbi,
+    mode: reverie_dbt::DbtStartupMode,
+) -> Result<(), String> {
+    reverie_dbt::install_controller_capture_control(callbacks.controller_capture_control);
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
+    reverie_dbt::install_runtime_private_memory(callbacks.runtime_private_memory);
+    reverie_dbt::install_branch_fact_query(callbacks.branch_fact);
+    reverie_dbt::install_mapping_capture(callbacks.mapping_capture);
     let (emit_diagnostic, emit_evidence, protected_level) = runtime_callback_channels(callbacks);
     let _ = DBT_DIAGNOSTIC_EMITTER.set(emit_diagnostic);
     DBT_EVIDENCE_LOG_LEVEL.store(protected_level, Ordering::Release);
@@ -1080,6 +1327,9 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
         b"detcore-dbt: background client thread entered\n",
     );
     let protected_evidence_requested = protected_level != 0;
+    if protected_evidence_requested {
+        let _ = DBT_EVIDENCE_EMITTER.set(emit_evidence);
+    }
     let tracing_active = init_dbt_tracing(
         if protected_evidence_requested {
             emit_evidence
@@ -1102,8 +1352,15 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
                 emit_diagnostic,
                 b"detcore-dbt: constructing Detcore Config\n",
             );
-            let (mut config, source) = load_dbt_config();
+            let control = std::env::var_os(reverie_dbt::sync_rpc::RPC_SOCKET_ENV);
+            // The reader consumes its temporary owner before returning here,
+            // before GlobalState/Runtime/READY. Application RPC is unchanged.
+            let (mut config, source) = initial_dbt_config(mode, control.as_deref())?;
             match source {
+                ConfigSource::RpcHandshake => emit_lifecycle_marker(
+                    emit_diagnostic,
+                    b"detcore-dbt: using coordinator-provided Detcore Config\n",
+                ),
                 ConfigSource::Cli => {
                     emit_lifecycle_marker(emit_diagnostic, b"detcore-dbt: using CLI-provided Detcore Config\n")
                 }
@@ -1116,8 +1373,8 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
                 }
             }
             // Fail-closed unsupported-syscall handling (PR #644): the rest of the
-            // Config arrives via the CLI env above, but the panic flag comes from
-            // the DBT callback (the `-panic-on-unsupported-syscalls` client
+            // Config arrives via the selected startup source, but the panic
+            // flag comes from the DBT callback (the `-panic-on-unsupported-syscalls` client
             // argument), because DynamoRIO re-injects the client across execve
             // while an empty-env exec would drop the serialized config. Set up
             // the protected report descriptor the guest children write aggregated
@@ -1190,33 +1447,91 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
         emit_diagnostic,
         b"detcore-dbt: background scheduler completed\n",
     );
+    Ok(())
 }
 
-/// Runs Detcore's async global scheduler on a DynamoRIO-managed client thread.
+/// Runs Detcore's global scheduler through the admitted native startup bridge.
 ///
-/// The native client starts this entry point before registering guest events
-/// and waits for [`reverie_dbt_runtime_ready`] before allowing callbacks.
+/// The native client supplies its initialized per-image mode and handles a
+/// nonzero startup status through its existing tree-failure owner. The complete
+/// coordinator Config is read and its temporary socket closed before state or
+/// READY publication. Only admitted Standalone without control uses legacy JSON.
 ///
 /// # Safety
 ///
-/// `argument` must point to a valid [`reverie_dbt::DbtRuntimeCallbacks`] value.
+/// `argument` must be null or point to valid [`reverie_dbt::DbtRuntimeCallbacks`]
+/// for the call. `native_mode` must be the initialized state admitted by ABI 6.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm external scheduler callback and restart semantics.
-pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
+    argument: *mut c_void,
+    native_mode: u32,
+) -> i32 {
+    if argument.is_null() {
+        return 1;
+    }
     let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
-    unsafe { runtime_background_init(callbacks, RuntimeAbi::Current) };
+    let startup = reverie_dbt::DbtStartupMode::try_from(native_mode)
+        .map_err(|error| error.to_string())
+        .and_then(|mode| unsafe { runtime_background_init(callbacks, RuntimeAbi::Current, mode) });
+    if let Err(error) = startup {
+        let message = format!("detcore-dbt: startup refused: {error}\n");
+        unsafe { (callbacks.emit)(message.as_ptr(), message.len()) };
+        return 1;
+    }
+    0
 }
 
-/// Compatibility entry point for native clients using callback ABI version 1.
+/// Retained version-2 entry, unadmitted without native mode and startup status.
+///
+/// A direct no-mode call fatally refuses before Config or Runtime construction.
+/// This process-local refusal is not a certificate of DynamoRIO tree cleanup.
 ///
 /// # Safety
 ///
-/// `argument` must point to a valid version-1 callback structure.
+/// `argument` must be null or point to valid [`reverie_dbt::DbtRuntimeCallbacks`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
+    let emitter = if argument.is_null() {
+        None
+    } else {
+        Some(unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() }.emit)
+    };
+    refuse_legacy_background_init(emitter, RuntimeAbi::Current);
+}
+
+/// Retained version-1 entry with its original callback layout conversion.
+///
+/// Initialization without the native mode/status bridge fatally refuses before
+/// state. This process-local refusal is not proof of native tree cleanup.
+///
+/// # Safety
+///
+/// `argument` must be null or point to a valid version-1 callback structure.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_void) {
-    let callbacks = unsafe { &*argument.cast::<DbtRuntimeCallbacksV1>() };
-    let current = upgrade_runtime_callbacks_v1(callbacks);
-    unsafe { runtime_background_init(&current, RuntimeAbi::V1) };
+    let emitter = if argument.is_null() {
+        None
+    } else {
+        let callbacks = unsafe { &*argument.cast::<DbtRuntimeCallbacksV1>() };
+        Some(upgrade_runtime_callbacks_v1(callbacks).emit)
+    };
+    refuse_legacy_background_init(emitter, RuntimeAbi::V1);
+}
+
+fn refuse_legacy_background_init(emitter: Option<Emitter>, abi: RuntimeAbi) -> ! {
+    let message: &[u8] = match abi {
+        RuntimeAbi::V1 => {
+            b"detcore-dbt: ABI-1 initialization requires the ABI-6 native mode/status bridge\n"
+        }
+        RuntimeAbi::Current => {
+            b"detcore-dbt: ABI-2 initialization requires the ABI-6 native mode/status bridge\n"
+        }
+    };
+    if let Some(emit) = emitter {
+        unsafe { emit(message.as_ptr(), message.len()) };
+    }
+    std::process::abort()
 }
 
 /// Requests shutdown of the backend-owned scheduler at process exit.
@@ -1225,6 +1540,31 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_vo
 pub extern "C" fn reverie_dbt_runtime_process_exit() {
     READY_IMAGE.store(0, Ordering::Release);
     RUNTIME_SHUTDOWN.store(true, Ordering::Release);
+    if let Some(&emit) = DBT_EVIDENCE_EMITTER.get() {
+        emit_determinism_loss_record(emit, detcore::detlog::determinism_loss());
+    }
+}
+
+/// Writes `loss`, this process's determinism-loss latch, into the protected
+/// evidence stream as one record with target
+/// [`detcore::detlog::DETERMINISM_LOSS_RECORD_TARGET`], in the canonical form of
+/// every other evidence record. The latch lives in this process, where hermit
+/// cannot read it; hermit's DBT adapter refuses to compare a run whose
+/// evidence holds this record, as its generic verifier refuses a run whose own
+/// latch is set. Nothing is written when no loss was recorded.
+fn emit_determinism_loss_record(emit: Emitter, loss: Option<String>) {
+    let Some(reason) = loss else {
+        return;
+    };
+    let mut fields = String::new();
+    push_escaped_record_text(&mut fields, &reason);
+    let record = format_dbt_log_record(
+        tracing::Level::ERROR.as_str(),
+        detcore::detlog::DETERMINISM_LOSS_RECORD_TARGET,
+        &fields,
+        true,
+    );
+    unsafe { emit(record.as_ptr(), record.len()) };
 }
 
 /// Reports whether the Detcore global scheduler is ready for this image.
@@ -1315,6 +1655,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     else {
         return -1;
     };
+    let _ofd_scope = ofd_channel::Scope::enter(context as usize, invoke_syscall, det_tid);
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(det_pid, &runtime.config));
@@ -1347,6 +1688,14 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
             Err(status) => return status,
         }
     };
+    let emit_image_lifecycle = host_tid == pid && inherited_parent.is_none();
+    let Some(&emit) = DBT_DIAGNOSTIC_EMITTER.get() else {
+        return -1;
+    };
+    if emit_image_lifecycle {
+        emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
+        emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
+    }
     let parent_ref = inherited_parent
         .as_ref()
         .map(|parent| (Tid::from_raw(parent.tid.into()), &parent.state))
@@ -1363,6 +1712,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
         host_tid,
         parent_ref,
     );
+    if inherited_parent.is_some() {
+        state.reset_copied_open_file_locks();
+    }
     if let Some(parent) = &parent {
         state.reseed_child_rngs(&parent.state, parent.rng_entropy);
     } else if let Some(parent) = &inherited_parent {
@@ -1372,31 +1724,48 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
         };
         state.reseed_child_rngs(&parent.state, rng_entropy);
     }
-    let mut thread = Box::new(ThreadRuntime {
+    if inherited_parent.is_none() && parent.is_none() {
+        let Some(creator) = runtime.abi.open_file_creator(scratch.virtual_tid, host_tid) else {
+            return -1;
+        };
+        state.set_open_file_creator(creator);
+    }
+    let thread = Box::new(ThreadRuntime {
         tid: Pid::from_raw(det_tid.into()),
         state,
         initialized: false,
         post_exec_pending: host_tid == pid && inherited_parent.is_none(),
+        prepared_exec: None,
     });
-    if reverie_dbt::run_tool_thread_start(
-        tool,
-        context as usize,
-        Pid::from_raw(det_tid.into()),
-        host_pid,
-        branch_count,
-        &mut thread.state,
-        &runtime.global,
-        &runtime.config,
-        invoke_syscall,
-        read_registers,
-        write_registers,
-    )
+    scratch.runtime_state = Box::into_raw(thread);
+    if emit_image_lifecycle {
+        emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
+    }
+    // The native admission gate must not release a fresh image between its
+    // thread-start and post-exec hooks. Child state keeps post_exec_pending
+    // false, so the same once-only helper preserves its existing lifecycle.
+    if unsafe {
+        start_thread_runtime(
+            scratch,
+            &runtime,
+            tool,
+            context,
+            host_tid,
+            Pid::from_raw(det_tid.into()),
+            Pid::from_raw(det_pid.into()),
+            host_pid,
+            branch_count,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+            emit,
+            emit_image_lifecycle,
+        )
+    }
     .is_err()
     {
         return -1;
     }
-    thread.initialized = true;
-    scratch.runtime_state = Box::into_raw(thread);
     scratch.pending_clone_flags = 0;
     0
 }
@@ -1437,6 +1806,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created_v2(
         .get()
         .expect("Detcore DBT tool was initialized");
     let parent = unsafe { &mut *scratch.runtime_state };
+    let _ofd_scope = ofd_channel::Scope::enter(
+        context as usize,
+        invoke_syscall,
+        Tid::from_raw(parent.tid.into()),
+    );
     let flags = CloneFlags::from_bits_truncate(flags);
     parent.state.clone_flags = Some(flags);
     let parent_snapshot = parent.state.clone();
@@ -1526,6 +1900,7 @@ fn process_child_registration(
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ProcessCloneProperties {
+    copies_process: bool,
     blocks_parent: bool,
     shares_files_without_thread: bool,
     shares_memory_without_thread: bool,
@@ -1566,6 +1941,7 @@ fn process_clone_properties(
         return ProcessCloneProperties::default();
     };
     ProcessCloneProperties {
+        copies_process: flags & (libc::CLONE_THREAD | libc::CLONE_VFORK) as u64 == 0,
         blocks_parent: flags & libc::CLONE_VFORK as u64 != 0,
         shares_files_without_thread: flags & libc::CLONE_FILES as u64 != 0
             && flags & libc::CLONE_THREAD as u64 == 0,
@@ -1637,6 +2013,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
     else {
         return -1;
     };
+    let _ofd_scope = ofd_channel::Scope::enter(
+        context as usize,
+        invoke_syscall,
+        Tid::from_raw(parent.tid.into()),
+    );
     let mut guest = DbtGuest::new(
         context as usize,
         parent.tid,
@@ -1729,6 +2110,8 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(
             .tool
             .get()
             .expect("Detcore DBT tool was initialized");
+        let _ofd_scope =
+            ofd_channel::Scope::enter(context as usize, invoke_syscall, Tid::from_raw(tid.into()));
         let _ = reverie_dbt::run_tool_thread_exit_from_guest(
             tool,
             context as usize,
@@ -1750,23 +2133,49 @@ fn resume_paused_runtime() {
     READY_IMAGE.store(IMAGE_GENERATION.load(Ordering::Acquire), Ordering::Release);
 }
 
-/// Restarts the existing scheduler after the kernel rejects a native exec.
+/// Cancels the prepared exec after the kernel rejects the native syscall.
 ///
 /// # Safety
 ///
-/// `_scratch` must be the pointer supplied by the native DBT callback. It is not
-/// dereferenced because a failed exec preserves the current Detcore thread state.
+/// `scratch` must be the pointer supplied by the native DBT callback. The
+/// failed syscall preserves its thread state and the context retained by
+/// [`reverie_dbt_runtime_pre_syscall`]; `pid` must identify that same process.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm failed-exec preserves Runtime and thread state.
-pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(_scratch: *mut c_void, _pid: i32) {
-    assert!(
-        RUNTIME
-            .read()
-            .expect("Detcore DBT runtime lock poisoned")
-            .is_some(),
-        "failed exec had no Detcore runtime"
-    );
+pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(scratch: *mut c_void, pid: i32) {
+    // The in-process RPC path needs its scheduler polled while cancelling.
+    // Readiness alone grants no guest turn: this caller still owns its turn,
+    // and PrepareExec keeps its sibling cohort frozen until CancelExec.
     resume_paused_runtime();
+    let runtime = current_runtime();
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    if scratch.runtime_state.is_null() {
+        return;
+    }
+    let thread = unsafe { &mut *scratch.runtime_state };
+    let Some(prepared) = thread.prepared_exec.take() else {
+        return;
+    };
+    let (tid, pid) = prepare_exec_guest_identity(thread.tid, pid);
+    let _ofd_scope = ofd_channel::Scope::enter(
+        prepared.context,
+        prepared.invoke_syscall,
+        Tid::from_raw(tid.into()),
+    );
+    let mut guest = DbtGuest::<Detcore>::new(
+        prepared.context,
+        tid,
+        pid,
+        None,
+        prepared.branches,
+        &mut thread.state,
+        &runtime.global,
+        &runtime.config,
+        prepared.invoke_syscall,
+        prepared.read_registers,
+        prepared.write_registers,
+    );
+    run_ready(cancel_exec(&mut guest));
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1785,6 +2194,50 @@ fn copied_child_flock_action(operation: Option<i32>) -> i32 {
         0
     } else {
         -libc::ENOLCK
+    }
+}
+
+/// Whether a copied child's `fcntl` with these arguments sets or clears an OFD
+/// lock (`F_OFD_SETLK`, `F_OFD_SETLKW`, whatever the lock type). Missing
+/// arguments count as a change, so the strict refusal fails closed.
+fn copied_child_fcntl_changes_ofd_lock(args: *const u64) -> bool {
+    if args.is_null() {
+        return true;
+    }
+    // SAFETY: Reverie's DBT client passes its live six-element syscall
+    // argument array for the duration of this callback.
+    let command = unsafe { args.add(1).read() } as i32;
+    matches!(command, libc::F_OFD_SETLK | libc::F_OFD_SETLKW)
+}
+
+/// Whether `sysno` reads the clock or a resource limit, which the DBT client no
+/// longer answers from a table of its own (Reverie A8 step 2) and which a copied
+/// child cannot take to Detcore. A relative `clock_nanosleep` on a wall or
+/// monotonic clock only waits and reads nothing; the client's table passed it
+/// to the kernel too, so it is not counted here.
+fn copied_child_reads_clock_or_limit(sysno: Sysno, args: *const u64) -> bool {
+    match sysno {
+        Sysno::clock_gettime
+        | Sysno::clock_getres
+        | Sysno::clock_settime
+        | Sysno::gettimeofday
+        | Sysno::time
+        | Sysno::getrlimit
+        | Sysno::setrlimit
+        | Sysno::prlimit64 => true,
+        Sysno::clock_nanosleep => {
+            if args.is_null() {
+                return true;
+            }
+            // SAFETY: Reverie's DBT client passes its live six-element syscall
+            // argument array for the duration of this callback.
+            let (clock, flags) = unsafe { (args.read() as i32, args.add(1).read() as i32) };
+            let cpu_clock = clock < 0
+                || clock == libc::CLOCK_PROCESS_CPUTIME_ID
+                || clock == libc::CLOCK_THREAD_CPUTIME_ID;
+            flags != 0 || cpu_clock
+        }
+        _ => false,
     }
 }
 
@@ -1839,8 +2292,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     }
     // TODO-HUMAN-REVIEW(PR-981): Copied DBT children cannot enter the Rust
     // Detcore Tool. Strict mode therefore fails closed for receive syscalls that
-    // can expose native socket timestamps. Non-strict mode retains native
-    // behavior.
+    // can expose native socket timestamps. Non-strict mode retained native
+    // behavior until the descriptor-import arm below, which now answers
+    // recvmsg and recvmmsg with EPERM there.
     // TODO-HUMAN-REVIEW(PR-972): readlink identity canonicalization also requires
     // Detcore mediation. This ABI has neither syscall arguments nor a memory
     // writer, so a copied child must fail closed rather than expose native
@@ -1852,11 +2306,94 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
         let operation = (!args.is_null()).then(|| unsafe { args.add(1).read() as i32 });
         return copied_child_flock_action(operation);
     }
-    if matches!(
-        sysno,
-        Sysno::recvmsg | Sysno::recvmmsg | Sysno::readlink | Sysno::readlinkat
-    ) && strict
-    {
+    // pidfd_getfd NEVER RUNS NATIVELY IN A COPIED CHILD because it is the one native
+    // route by which a copied child can reach an open file description that
+    // ANOTHER guest process holds a Detcore claim about. A sibling that took
+    // LOCK_SH through Detcore holds a known mode for its description; a
+    // copied child that duplicates that description with pidfd_getfd and
+    // runs LOCK_UN natively (the flock arm above lets unlock through) makes
+    // the sibling's claim stale, and its next refused blocking upgrade would
+    // "restore" a lock it no longer holds. The instrumented root mediates
+    // pidfd_getfd (self only); a copied child cannot enter that handler.
+    // Evidence capture refuses this call too, but only in verify runs. The
+    // protection does not depend on the unsupported-syscall policy: a stale
+    // claim corrupts flock semantics (a "restored" lock the guest released),
+    // not only determinism, and before copied children could be admitted
+    // after a fork the up-front vfork guard, which is not policy-gated,
+    // refused this shape under --allow-unsupported-syscalls too. Only the
+    // form of the refusal follows the policy: the default fail-closed policy
+    // ends the run by name; the --allow-unsupported-syscalls opt-out
+    // answers EPERM without executing the call (the errno Linux gives when
+    // ptrace access to the target is denied), as the root answers an
+    // unserviceable call with an errno under that opt-out. Ending the run
+    // there is not an option: a copied child's fail-closed exit under the
+    // opt-out left the run hung (measured: the vfork parent stayed in
+    // kernel_clone and the tree never ended). SCM_RIGHTS reception, the
+    // other import route, is refused by the recvmsg arm below the same way.
+    if sysno == Sysno::pidfd_getfd {
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: refusing pidfd_getfd in copied child: a native duplicate of another process's open file description could change a lock that process's Detcore state holds a claim about\n",
+            );
+        }
+        return if strict { 1 } else { -libc::EPERM };
+    }
+    // An OFD lock change NEVER RUNS NATIVELY IN A COPIED CHILD because the
+    // `/proc/locks` ledger in Detcore's global state records which OFD locks
+    // each description holds, and a copied child's native F_OFD_SETLK or
+    // F_OFD_SETLKW (an unlock included) changes the kernel's lock without
+    // updating that record. An OFD row prints owner -1 in every PID
+    // namespace, and the ledger keeps such a row by field match, so a stale
+    // entry admits a host process's identical lock into the guest's
+    // /proc/locks. The parent's up-front OFD vfork guard cannot see a lock a
+    // sibling took through its own split copy of the description's model, so
+    // the refusal belongs at the call. F_OFD_GETLK changes nothing and stays
+    // native, as in the root, where it also sees host locks. POSIX
+    // F_SETLK/F_SETLKW stay native: POSIX rows are not in the ledger (it
+    // keeps OFD and flock rows only) and are kept by their owner pid, and
+    // Detcore caches no POSIX lock state. The protection does not depend on
+    // the unsupported-syscall policy, for the reason the pidfd_getfd arm
+    // gives: the up-front OFD and flock vfork guards it stands in for are not
+    // policy-gated. Under the --allow-unsupported-syscalls opt-out the call
+    // is answered ENOLCK without executing, as a copied child's blocking
+    // flock is (`copied_child_flock_action`), so the kernel's lock and the
+    // ledger's record stay in agreement.
+    if sysno == Sysno::fcntl && copied_child_fcntl_changes_ofd_lock(args) {
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: refusing fcntl F_OFD_SETLK/F_OFD_SETLKW in copied child: a native OFD lock change would leave the /proc/locks ledger's record of that description stale\n",
+            );
+        }
+        return if strict { 1 } else { -libc::ENOLCK };
+    }
+    // recvmsg and recvmmsg NEVER RUN NATIVELY IN A COPIED CHILD, under any
+    // policy, because an SCM_RIGHTS message is the other native route by
+    // which a copied child can import an open file description another guest
+    // process holds a Detcore claim about. A sibling's promoted description
+    // (OpenFileState::Shared) keeps its canonical known mode across the
+    // sender's sendmsg; a copied child that receives it and runs LOCK_UN
+    // natively makes that claim stale, as with pidfd_getfd above. Whether a
+    // call carries a control buffer cannot be told here: the msghdr is guest
+    // memory and this ABI has no reader (a fault in the runtime would take
+    // the place of the guest's EFAULT), so every call is refused, including
+    // one without a control buffer that would import nothing. Strict
+    // execution already refused both for native socket timestamps. Under the
+    // default fail-closed policy the run ends by name; under the
+    // --allow-unsupported-syscalls opt-out the call answers EPERM without
+    // executing (a security module can refuse a receive with it), for the
+    // reason the pidfd_getfd arm gives.
+    if matches!(sysno, Sysno::recvmsg | Sysno::recvmmsg) {
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: refusing recvmsg/recvmmsg in copied child: an SCM_RIGHTS message could import an open file description another process's Detcore state holds a claim about\n",
+            );
+        }
+        return if strict { 1 } else { -libc::EPERM };
+    }
+    if matches!(sysno, Sysno::readlink | Sysno::readlinkat) && strict {
         return 1;
     }
     // setpgid FAILS CLOSED IN STRICT MODE BECAUSE THE COPIED CHILD CAN PERFORM
@@ -1885,6 +2422,81 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     // copied children keep native behaviour, and only strict execution -- which
     // is where determinism is actually claimed -- refuses.
     if sysno == Sysno::setpgid && strict {
+        return 1;
+    }
+    // getpgrp, getpgid and getsid FAIL CLOSED IN STRICT MODE BECAUSE THE
+    // KERNEL'S ANSWER IS NOT DETCORE'S.
+    //
+    // The instrumented root is answered from Detcore's model (slice B3a-4c of
+    // https://github.com/rrnewton/hermit/issues/4266): a group or session
+    // inherited from outside the container's PID namespace reads 0, as Linux
+    // shows it. In a copied child the call would run natively, and the kernel
+    // answers for the process group the DBT launcher made for the run, whose
+    // id is the root's pid. A child would read a different group from its
+    // parent's. As with setpgid above, no fixed errno is faithful (the root's
+    // calls succeed), and a wrong answer about process-group identity is
+    // worse than no answer.
+    if matches!(sysno, Sysno::getpgrp | Sysno::getpgid | Sysno::getsid) && strict {
+        return 1;
+    }
+    // Detcore answers ordinary scheduling-policy queries with SCHED_OTHER.
+    // A copied child cannot enter the Tool and may inherit a different native
+    // policy. Refuse that strict escape without inventing a second answer.
+    if sysno == Sysno::sched_getscheduler && strict {
+        // The emitter is installed before READY and inherited by copied
+        // children. Use its raw write path, without an allocating/locking
+        // stderr fallback on the copied runtime stack.
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: unsupported syscall sched_getscheduler (145) in copied child\n",
+            );
+        }
+        return 1;
+    }
+    // Ordinary scheduler parameters are written by Detcore's shared Tool.
+    // A copied child cannot enter that Tool or write its modeled output through
+    // this ABI. Refuse the strict escape without a second parameter policy.
+    if sysno == Sysno::sched_getparam && strict {
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: unsupported syscall sched_getparam (143) in copied child\n",
+            );
+        }
+        return 1;
+    }
+    // Detcore's shared Tool owns affinity masks. A copied child cannot
+    // enter that Tool to write its modeled CPU set; refuse the strict native
+    // escape without installing another affinity policy here.
+    if sysno == Sysno::sched_getaffinity && strict {
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: unsupported syscall sched_getaffinity (204) in copied child\n",
+            );
+        }
+        return 1;
+    }
+    // Ordinary priority queries belong to Detcore's shared policy. A copied
+    // child cannot enter that Tool, so strict execution must refuse the native
+    // answer rather than install a second priority model here.
+    if sysno == Sysno::getpriority && strict {
+        if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: unsupported syscall getpriority (140) in copied child\n",
+            );
+        }
+        return 1;
+    }
+    // A copied child's clock and resource-limit reads have no deterministic
+    // answer here: the DBT client keeps no table of its own any more, and
+    // Detcore, which answers them in the root and in forked children, cannot
+    // be entered from a copied child. Strict mode refuses them by name rather
+    // than let a vfork child read host time or host limits; non-strict keeps
+    // native behaviour, as the arms above do.
+    if strict && copied_child_reads_clock_or_limit(sysno, args) {
         return 1;
     }
     if detcore::is_deterministically_refused_syscall(sysno)
@@ -1916,6 +2528,437 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
         syscall_args.arg5 as u64,
     ];
     unsafe { std::slice::from_raw_parts_mut(args, values.len()) }.copy_from_slice(&values);
+}
+
+/// Completes this thread's once-only lifecycle admission: constructs state
+/// when needed, runs thread-start, then the pending fresh-image post-exec hook.
+/// Native first-block admission and the syscall/RDTSC fallback paths share
+/// these flags and ordering. Returns `scratch.runtime_state`; `Err` carries
+/// the syscall result to install.
+///
+/// # Safety
+///
+/// `scratch.runtime_state` must be null or name this thread's `ThreadRuntime`,
+/// and the callbacks must be valid for this event.
+#[allow(clippy::too_many_arguments)]
+unsafe fn start_thread_runtime(
+    scratch: &mut NativeThreadScratch,
+    runtime: &Runtime,
+    tool: &Detcore,
+    context: *mut c_void,
+    tid: i32,
+    det_tid: Pid,
+    det_pid: Pid,
+    host_pid: Pid,
+    branches: u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    emit: unsafe extern "C" fn(*const u8, usize),
+    first_event: bool,
+) -> Result<*mut ThreadRuntime, i64> {
+    if scratch.runtime_state.is_null() {
+        if first_event {
+            emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
+            emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
+        }
+        let mut state = init_dbt_thread_state(
+            tool,
+            Tid::from_raw(det_tid.into()),
+            DetTid::from_raw(det_pid.into()),
+            tid,
+            None,
+        );
+        let Some(open_file_creator) = runtime.abi.open_file_creator(scratch.virtual_tid, tid)
+        else {
+            let message = b"detcore-dbt: no open-file creator identity for a new thread\n";
+            unsafe { emit(message.as_ptr(), message.len()) };
+            return Err(-(Errno::EIO.into_raw() as i64));
+        };
+        state.set_open_file_creator(open_file_creator);
+        if first_event {
+            emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
+        }
+        scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
+            tid: det_tid,
+            state,
+            initialized: false,
+            post_exec_pending: true,
+            prepared_exec: None,
+        }));
+    }
+    let thread = unsafe { &mut *scratch.runtime_state };
+    let det_tid = thread.tid;
+    if !thread.initialized {
+        if first_event {
+            emit_lifecycle_marker(emit, b"detcore-dbt: running Detcore thread-start hook\n");
+        }
+        #[cfg(test)]
+        first_instruction_observer::observe("start-enter", context, read_registers);
+        if let Err(error) = reverie_dbt::run_tool_thread_start(
+            tool,
+            context as usize,
+            det_tid,
+            host_pid,
+            branches,
+            &mut thread.state,
+            &runtime.global,
+            &runtime.config,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        ) {
+            let message = format!("detcore-dbt: Detcore thread-start hook failed: {error:#}\n");
+            unsafe { emit(message.as_ptr(), message.len()) };
+            return Err(error_result(error));
+        }
+        #[cfg(test)]
+        first_instruction_observer::observe("start-complete", context, read_registers);
+        thread.initialized = true;
+    }
+    if thread.post_exec_pending {
+        if first_event {
+            emit_lifecycle_marker(
+                emit,
+                b"detcore-dbt: thread-start hook completed; running post-exec\n",
+            );
+        }
+        #[cfg(test)]
+        first_instruction_observer::observe("post-exec-enter", context, read_registers);
+        if let Err(errno) = reverie_dbt::run_tool_post_exec(
+            tool,
+            context as usize,
+            det_tid,
+            host_pid,
+            branches,
+            &mut thread.state,
+            &runtime.global,
+            &runtime.config,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        ) {
+            return Err(-(errno.into_raw() as i64));
+        }
+        if first_event {
+            emit_lifecycle_marker(emit, b"detcore-dbt: post-exec hook completed\n");
+        }
+        #[cfg(test)]
+        first_instruction_observer::observe("post-exec-complete", context, read_registers);
+        thread.post_exec_pending = false;
+    }
+    Ok(scratch.runtime_state)
+}
+
+/// Answers one guest `rdtsc` (`with_aux == 0`) or `rdtscp` through the real
+/// Detcore Tool, so the guest reads Detcore's virtual clock and the read is
+/// charged and logged ("inbound rdtsc") as under ptrace, instead of a
+/// client-local counter outside Detcore's time.
+///
+/// Returns 1 with `tsc` written (and `aux` for `rdtscp`), or a negative value
+/// when the thread cannot be served; the client then ends the run.
+///
+/// # Safety
+///
+/// `scratch` must name this thread's initialized storage, the callbacks must be
+/// valid for this event, and `tsc` and `aux` must be writable.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_rdtsc(
+    context: *mut c_void,
+    scratch: *mut c_void,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    with_aux: i32,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    emit: unsafe extern "C" fn(*const u8, usize),
+    tsc: *mut u64,
+    aux: *mut u32,
+) -> i32 {
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    let runtime = current_runtime();
+    let Some((det_tid, det_pid)) =
+        runtime
+            .abi
+            .runtime_identity(scratch.virtual_tid, scratch.virtual_pid, tid, pid)
+    else {
+        return -1;
+    };
+    let _ofd_scope = ofd_channel::Scope::enter(context as usize, invoke_syscall, det_tid);
+    TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
+    let host_pid = Pid::from_raw(pid);
+    let det_tid = Pid::from_raw(det_tid.into());
+    let tool = runtime
+        .tool
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
+    let thread = match unsafe {
+        start_thread_runtime(
+            scratch,
+            &runtime,
+            tool,
+            context,
+            tid,
+            det_tid,
+            det_pid,
+            host_pid,
+            branches,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+            emit,
+            false,
+        )
+    } {
+        Ok(thread) => unsafe { &mut *thread },
+        Err(_) => return -1,
+    };
+    let request = if with_aux != 0 {
+        reverie::Rdtsc::Tscp
+    } else {
+        reverie::Rdtsc::Tsc
+    };
+    let mut guest = DbtGuest::new(
+        context as usize,
+        thread.tid,
+        host_pid,
+        None,
+        branches,
+        &mut thread.state,
+        &runtime.global,
+        &runtime.config,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    );
+    match run_ready(tool.handle_rdtsc_event(&mut guest, request)) {
+        Ok(result) => {
+            unsafe {
+                tsc.write(result.tsc);
+                aux.write(result.aux.unwrap_or(0));
+            }
+            1
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Answers one guest `cpuid` for `leaf` and `subleaf` through the real Detcore
+/// Tool (ABI version 9), so a DBT guest's CPUID comes from Detcore's machine
+/// description, the table `/proc/cpuinfo` is rendered from, and is charged and
+/// logged ("inbound cpuid") as under ptrace. The native client keeps no CPUID
+/// table of its own.
+///
+/// Returns 1 with `registers` written as EAX, EBX, ECX and EDX, or a negative
+/// value when the thread cannot be served; the client then ends the run.
+///
+/// # Safety
+///
+/// `scratch` must name this thread's initialized storage, the callbacks must be
+/// valid for this event, and `registers` must be writable.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_cpuid(
+    context: *mut c_void,
+    scratch: *mut c_void,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    leaf: u32,
+    subleaf: u32,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    emit: unsafe extern "C" fn(*const u8, usize),
+    registers: *mut [u32; 4],
+) -> i32 {
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    let runtime = current_runtime();
+    let Some((det_tid, det_pid)) =
+        runtime
+            .abi
+            .runtime_identity(scratch.virtual_tid, scratch.virtual_pid, tid, pid)
+    else {
+        return -1;
+    };
+    let _ofd_scope = ofd_channel::Scope::enter(context as usize, invoke_syscall, det_tid);
+    TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
+    let host_pid = Pid::from_raw(pid);
+    let det_tid = Pid::from_raw(det_tid.into());
+    let tool = runtime
+        .tool
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
+    let thread = match unsafe {
+        start_thread_runtime(
+            scratch,
+            &runtime,
+            tool,
+            context,
+            tid,
+            det_tid,
+            det_pid,
+            host_pid,
+            branches,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+            emit,
+            false,
+        )
+    } {
+        Ok(thread) => unsafe { &mut *thread },
+        Err(_) => return -1,
+    };
+    let mut guest = DbtGuest::new(
+        context as usize,
+        thread.tid,
+        host_pid,
+        None,
+        branches,
+        &mut thread.state,
+        &runtime.global,
+        &runtime.config,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    );
+    match run_ready(tool.handle_cpuid_event(&mut guest, leaf, subleaf)) {
+        Ok(result) => {
+            unsafe { registers.write([result.eax, result.ebx, result.ecx, result.edx]) };
+            1
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Reports one caught signal to Detcore's `Tool::handle_signal_event` (ABI
+/// version 7) from the native client's owned signal continuation, before the
+/// application handler runs.
+///
+/// Returns 0 to deliver the signal, 1 to suppress it, or 2 after writing a
+/// terminal `exit` or `exit_group` into `event`'s deferred syscall; a negative
+/// value ends the run. Two kinds are delivered unchanged without the Tool, as
+/// before version 7:
+/// - A realtime signal (32 to 64): `reverie_dbt`'s signal runner names
+///   signals with nix's `Signal`, which has no realtime numbers, and refuses
+///   them.
+/// - A `SIGCHLD`, while the backend's capabilities do not say the kernel's
+///   own child-exit copy reaches the Tool
+///   (`BackendCapabilities::reports_kernel_child_exit_signals`, false for DBT).
+///   Detcore then cannot match the kernel's copy to the scheduler's own, so its
+///   turn would come at the host-timed point the kernel sent it, and a guest
+///   that forks would no longer verify (`determinism-stress-c/fork-tree`).
+///
+/// # Safety
+///
+/// `scratch` must name this thread's initialized storage, `event` must be the
+/// native client's initialized, exclusively owned event, and the callbacks must
+/// be valid for this call.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
+    context: *mut c_void,
+    scratch: *mut c_void,
+    tid: i32,
+    pid: i32,
+    _image_generation: u64,
+    branches: u64,
+    event: *mut DbtSignalEvent,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    read_memory: MemoryReader,
+    _write_memory: MemoryWriter,
+    emit: unsafe extern "C" fn(*const u8, usize),
+) -> i32 {
+    if context.is_null() || scratch.is_null() || event.is_null() {
+        return -1;
+    }
+    let event = unsafe { &mut *event };
+    let runtime = current_runtime();
+    let bypasses_tool = match Signal::try_from(event.signal) {
+        Ok(Signal::SIGCHLD) => !runtime.config.backend.reports_kernel_child_exit_signals,
+        Ok(_) => false,
+        Err(_) if (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&event.signal) => true,
+        Err(_) => return -1,
+    };
+    if bypasses_tool {
+        event.delivered_signal = event.signal;
+        event.signal_info_changed = 0;
+        return 0;
+    }
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    let Some((det_tid, det_pid)) =
+        runtime
+            .abi
+            .runtime_identity(scratch.virtual_tid, scratch.virtual_pid, tid, pid)
+    else {
+        return -1;
+    };
+    let _ofd_scope = ofd_channel::Scope::enter(context as usize, invoke_syscall, det_tid);
+    TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
+    let host_pid = Pid::from_raw(pid);
+    let det_tid = Pid::from_raw(det_tid.into());
+    let tool = runtime
+        .tool
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
+    let thread = match unsafe {
+        start_thread_runtime(
+            scratch,
+            &runtime,
+            tool,
+            context,
+            tid,
+            det_tid,
+            det_pid,
+            host_pid,
+            branches,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+            emit,
+            false,
+        )
+    } {
+        Ok(thread) => unsafe { &mut *thread },
+        Err(_) => return -1,
+    };
+    let outcome = reverie_dbt::run_tool_signal_with_memory_reader(
+        tool,
+        context as usize,
+        thread.tid,
+        host_pid,
+        branches,
+        &mut thread.state,
+        &runtime.global,
+        &runtime.config,
+        event,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+        read_memory,
+    );
+    match outcome {
+        Ok(DbtSignalOutcome::Deliver(_)) => 0,
+        Ok(DbtSignalOutcome::Suppress) => 1,
+        Ok(DbtSignalOutcome::ExecuteOriginal(syscall)) => {
+            unsafe {
+                write_deferred_syscall(
+                    syscall,
+                    &mut event.deferred_sysnum,
+                    event.deferred_args.as_mut_ptr(),
+                )
+            };
+            2
+        }
+        Err(error) => {
+            let message = format!("detcore-dbt: signal admission failed: {error}\n");
+            unsafe { emit(message.as_ptr(), message.len()) };
+            -1
+        }
+    }
 }
 
 /// Dispatches one DynamoRIO syscall event through the real Detcore Tool.
@@ -1964,9 +3007,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
         return 1;
     };
+    let _ofd_scope = ofd_channel::Scope::enter(context as usize, invoke_syscall, det_tid);
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
     translate_self_identity_targets(
+        runtime.abi,
         sysnum,
         &mut dispatch_args,
         scratch.virtual_pid,
@@ -2023,91 +3068,31 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(det_pid, &runtime.config));
-    if first_event {
-        emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
-    }
-    if scratch.runtime_state.is_null() {
-        if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
-        }
-        let mut state = init_dbt_thread_state(
+    let thread = match unsafe {
+        start_thread_runtime(
+            scratch,
+            &runtime,
             tool,
-            Tid::from_raw(det_tid.into()),
-            DetTid::from_raw(det_pid.into()),
+            context,
             tid,
-            None,
-        );
-        let Some(open_file_creator) = runtime.abi.open_file_creator(scratch.virtual_tid, tid)
-        else {
-            unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
-            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-            return 1;
-        };
-        state.set_open_file_creator(open_file_creator);
-        if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
-        }
-        scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
-            tid: det_tid,
-            state,
-            initialized: false,
-            post_exec_pending: true,
-        }));
-    }
-    let thread = unsafe { &mut *scratch.runtime_state };
+            det_tid,
+            det_pid,
+            host_pid,
+            branches,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+            emit,
+            first_event,
+        )
+    } {
+        Ok(thread) => unsafe { &mut *thread },
+        // Starting Detcore's thread state failed before this syscall ran, so
+        // no errno would be the syscall's own. The copied-child callback
+        // already ends the run here; so does this one.
+        Err(_) => return -1,
+    };
     let det_tid = thread.tid;
-    if !thread.initialized {
-        if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbt: running Detcore thread-start hook\n");
-        }
-        if let Err(error) = reverie_dbt::run_tool_thread_start(
-            tool,
-            context as usize,
-            det_tid,
-            host_pid,
-            branches,
-            &mut thread.state,
-            &runtime.global,
-            &runtime.config,
-            invoke_syscall,
-            read_registers,
-            write_registers,
-        ) {
-            unsafe { result.write(error_result(error)) };
-            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-            return 1;
-        }
-        thread.initialized = true;
-    }
-    if thread.post_exec_pending {
-        if first_event {
-            emit_lifecycle_marker(
-                emit,
-                b"detcore-dbt: thread-start hook completed; running post-exec\n",
-            );
-        }
-        if let Err(errno) = reverie_dbt::run_tool_post_exec(
-            tool,
-            context as usize,
-            det_tid,
-            host_pid,
-            branches,
-            &mut thread.state,
-            &runtime.global,
-            &runtime.config,
-            invoke_syscall,
-            read_registers,
-            write_registers,
-        ) {
-            unsafe { result.write(-(errno.into_raw() as i64)) };
-            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-            return 1;
-        }
-        if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbt: post-exec hook completed\n");
-        }
-        thread.post_exec_pending = false;
-    }
 
     if sysnum == libc::SYS_execveat {
         unsafe { result.write(-(Errno::ENOSYS.into_raw() as i64)) };
@@ -2143,10 +3128,35 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         );
         return -1;
     }
+    // The copied child would run an OFD lock or unlock natively, which
+    // Detcore never sees, so the parent's /proc/locks ledger entry for that
+    // description could go stale and admit a host's identical row.
+    if clone_properties.blocks_parent
+        && !scratch.runtime_state.is_null()
+        && unsafe { &*scratch.runtime_state }
+            .state
+            .has_unsafe_vfork_ofd_state()
+    {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold an OFD lock\n",
+        );
+        return -1;
+    }
 
     // clone(2) and clone3(2) return in both the parent and child. Injecting
     // either from this callback makes the child return on the client stack.
     if requires_native_lifecycle(sysnum) {
+        if runtime.config.sequentialize_threads
+            && reverie_dbt::sync_rpc::is_active()
+            && !scratch.runtime_state.is_null()
+            && (sysnum == libc::SYS_execve || clone_properties.copies_process)
+        {
+            unsafe { &*scratch.runtime_state }
+                .state
+                .promote_shared_open_files()
+                .expect("could not publish shared OFDs before native lifecycle");
+        }
         if sysnum == libc::SYS_execve {
             // Linux permits a nonleader thread to exec. Detcore's PrepareExec
             // reconnect path accepts that thread's scheduler identity, so
@@ -2156,7 +3166,8 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
             if !scratch.runtime_state.is_null() {
                 let thread = unsafe { &mut *scratch.runtime_state };
                 if should_send_dbt_prepare_exec(thread.initialized, tid, pid) {
-                    send_dbt_prepare_exec(
+                    let prepared = send_dbt_prepare_exec(
+                        tool,
                         context,
                         thread.tid,
                         pid,
@@ -2165,7 +3176,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
                         invoke_syscall,
                         read_registers,
                         write_registers,
+                        read_guest_path(raw_args[0], read_memory),
                     );
+                    thread.prepared_exec = Some(prepared);
                 }
             }
             if RUNTIME_BACKGROUND_OWNER_PID.load(Ordering::Acquire) == pid {
@@ -2211,6 +3224,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     // backtrace. Dropping this callback makes the adapter fall back to direct
     // self-process reads, which cannot distinguish a guest fault from a client
     // fault as reliably as dr_safe_read.
+    #[cfg(test)]
+    if first_event {
+        first_instruction_observer::observe("first-syscall", context, read_registers);
+    }
     let mut outcome = reverie_dbt::run_tool_syscall_with_memory_reader(
         tool,
         context as usize,
@@ -2250,21 +3267,31 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
             unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
             2
         }
-        Err(Error::Tool(error)) => {
-            if let Some(unsupported) = error.downcast_ref::<UnsupportedSyscallError>() {
-                let message = format!("detcore-dbt: {unsupported}\n");
-                unsafe { emit(message.as_ptr(), message.len()) };
-                -1
-            } else {
-                unsafe { result.write(error_result(Error::Tool(error))) };
-                TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-                1
-            }
-        }
-        Err(error) => {
-            unsafe { result.write(error_result(error)) };
+        Err(error) => handler_error_action(
+            error,
+            |value| unsafe { result.write(value) },
+            |message| unsafe { emit(message.as_ptr(), message.len()) },
+        ),
+    }
+}
+
+/// The pre-syscall action for a Detcore handler error: 1 after writing a guest
+/// errno, or -1 after reporting a failure, which makes the native client end
+/// the run with exit code 101.
+fn handler_error_action(
+    error: Error,
+    write_result: impl FnOnce(i64),
+    emit: impl FnOnce(&[u8]),
+) -> i32 {
+    match guest_errno_or_failure(error) {
+        Ok(value) => {
+            write_result(value);
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
             1
+        }
+        Err(message) => {
+            emit(message.as_bytes());
+            -1
         }
     }
 }
@@ -2350,9 +3377,290 @@ mod tests {
 
     unsafe extern "C" fn test_idle() {}
 
+    #[derive(Debug)]
+    struct BrokenInvariant;
+
+    impl std::fmt::Display for BrokenInvariant {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("serial waitid invariant broken")
+        }
+    }
+
+    impl std::error::Error for BrokenInvariant {}
+
+    /// Runs `handler_error_action` and returns its action, the guest result it
+    /// wrote, and the diagnostic it reported.
+    fn handler_error_outcome(error: Error) -> (i32, Option<i64>, Option<String>) {
+        let mut written = None;
+        let mut reported = None;
+        let action = handler_error_action(
+            error,
+            |value| written = Some(value),
+            |message| reported = Some(String::from_utf8(message.to_vec()).unwrap()),
+        );
+        (action, written, reported)
+    }
+
+    #[test]
+    fn only_a_linux_error_from_a_handler_reaches_the_guest() {
+        assert_eq!(
+            handler_error_outcome(Error::Errno(Errno::ENOENT)),
+            (1, Some(-(Errno::ENOENT.into_raw() as i64)), None)
+        );
+        for (error, expected) in [
+            (
+                Error::Tool(BrokenInvariant.into()),
+                "detcore-dbt: Detcore failed handling a syscall: serial waitid invariant broken\n",
+            ),
+            (
+                Error::Io(io::Error::other("required evidence is missing")),
+                "detcore-dbt: Detcore failed handling a syscall: required evidence is missing\n",
+            ),
+            (
+                Error::Tool(UnsupportedSyscallError(reverie::syscalls::Sysno::kcmp).into()),
+                "detcore-dbt: unsupported syscall: kcmp\n",
+            ),
+        ] {
+            assert_eq!(
+                handler_error_outcome(error),
+                (-1, None, Some(expected.to_owned())),
+                "a non-errno handler error must end the run, never reach the guest"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_thread_start_ends_the_run_instead_of_failing_the_syscall() {
+        let source = include_str!("lib.rs");
+        let dispatch = source
+            .split_once("pub unsafe extern \"C\" fn reverie_dbt_runtime_pre_syscall")
+            .expect("pre-syscall callback")
+            .1;
+        let start = &dispatch[dispatch
+            .find("start_thread_runtime(")
+            .expect("thread start")..];
+        let arms = &start[..start.find("};").expect("end of the thread-start match")];
+        assert!(arms.contains("Err(_) => return -1,"), "{arms}");
+        assert!(!arms.contains("result.write"), "{arms}");
+    }
+
+    /// The configuration `hermit run --backend=dbt` would send, encoded as it
+    /// is put in the guest's environment.
+    fn hermit_run_dbt_detconfig() -> (Config, String) {
+        let mut sent = default_dbt_config();
+        sent.seed = 7;
+        sent.chaos = true;
+        sent.backend = backend_capabilities();
+        let json = detcore::encode_backend_config_json(
+            detcore::to_legacy_backend_json(&sent).unwrap(),
+            sent.backend,
+        )
+        .unwrap();
+        (sent, json)
+    }
+
+    #[test]
+    fn versioned_config_preserves_independent_descriptor_facts_in_the_runtime() {
+        for mask in 0_u8..16 {
+            let (mut sent, _) = hermit_run_dbt_detconfig();
+            sent.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
+            sent.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
+            sent.backend.internal_pipe_turns_are_host_timed = mask & 4 != 0;
+            sent.backend.loopback_pollers_yield_to_peers = mask & 8 != 0;
+            let json = detcore::encode_backend_config_json(
+                detcore::to_legacy_backend_json(&sent).unwrap(),
+                sent.backend,
+            )
+            .unwrap();
+            let (received, source) = dbt_config_from(Some(&json));
+            assert!(matches!(source, ConfigSource::Cli), "mask {mask}");
+            assert_eq!(received.backend, sent.backend, "mask {mask}");
+            assert_eq!(received.max_timeslice, None);
+            assert!(received.sequentialize_threads);
+        }
+    }
+
+    #[test]
+    fn a_rejected_versioned_config_keeps_the_existing_parse_fallback_policy() {
+        let (sent, _) = hermit_run_dbt_detconfig();
+        let legacy = detcore::to_legacy_backend_json(&sent).unwrap();
+        let backend = serde_json::to_string(&sent.backend).unwrap();
+        for json in [
+            format!("{{\"dbt_config_version\":2,\"config\":{legacy},\"backend\":{backend}}}"),
+            format!("{{\"dbt_config_version\":1,\"config\":{legacy}}}"),
+        ] {
+            assert!(detcore::decode_backend_config_json(&json).is_err());
+            let (received, source) = dbt_config_from(Some(&json));
+            assert!(matches!(source, ConfigSource::ParseFallback));
+            let (expected, _) = dbt_config_from(None);
+            // Defaults include a freshly sampled epoch; the fallback policy
+            // is established by the source, capabilities and execution model.
+            assert_eq!(received.backend, expected.backend);
+            assert_eq!(received.max_timeslice, None);
+            assert!(received.sequentialize_threads);
+        }
+    }
+
+    #[test]
+    fn dbt_execution_model_reads_the_dbt_backend_capabilities() {
+        assert_eq!(backend_capabilities(), reverie::BackendCapabilities::DBT);
+        let (_, json) = hermit_run_dbt_detconfig();
+        let (config, source) = dbt_config_from(Some(&json));
+        assert!(matches!(source, ConfigSource::Cli));
+        assert_eq!(config.backend, backend_capabilities());
+        assert!(!config.backend.supports_parked_write_signal_interruption);
+        assert_eq!(config.max_timeslice, None);
+        assert!(config.sequentialize_threads);
+
+        // The execution model holds whatever the configuration asked for.
+        let mut config = default_dbt_config();
+        config.max_timeslice = std::num::NonZeroU64::new(1);
+        config.sequentialize_threads = false;
+        assert!(config.backend.supports_parked_write_signal_interruption);
+        assert_dbt_execution_model(&mut config);
+        assert_eq!(config.max_timeslice, None);
+        assert!(config.sequentialize_threads);
+        assert!(!config.backend.supports_parked_write_signal_interruption);
+    }
+
+    /// In admitted standalone initialization, a missing fallback configuration
+    /// keeps the previous strict default's ptrace facts, with only parked-write
+    /// interruption disabled. These differ from DBT's own capabilities;
+    /// coordinated startup instead requires its authoritative configuration.
+    #[test]
+    fn a_dbt_run_without_a_cli_configuration_keeps_its_previous_backend_facts() {
+        let (_, json) = hermit_run_dbt_detconfig();
+        // A legacy key of the wrong type failed the parse when it was a
+        // `Config` field, and still does.
+        let mistyped = json.replacen("\"backend_is_kvm\":false", "\"backend_is_kvm\":0", 1);
+        assert_ne!(mistyped, json);
+        for (value, fallback) in [
+            (None, false),
+            (Some(""), false),
+            (Some("not json"), true),
+            (Some(mistyped.as_str()), true),
+        ] {
+            let (config, source) = dbt_config_from(value);
+            if fallback {
+                assert!(matches!(source, ConfigSource::ParseFallback), "{value:?}");
+            } else {
+                assert!(matches!(source, ConfigSource::Default), "{value:?}");
+            }
+            let backend = config.backend;
+            assert!(!backend.supports_parked_write_signal_interruption);
+            assert!(!backend.needs_killed_thread_rpc_cancellation);
+            assert!(backend.tracks_process_children);
+            assert!(backend.runs_exit_robust_list);
+            assert!(!backend.requires_thread_directed_process_signals);
+            // An unprepared configuration's capabilities: ptrace's, with the
+            // facts only a host sets for its backend left off, and the
+            // promotion this runtime performs whatever the source says.
+            let mut expected = Config::default().backend;
+            expected.supports_parked_write_signal_interruption = false;
+            expected.promotes_open_files_before_native_lifecycle = true;
+            assert_eq!(backend, expected);
+            assert_ne!(backend, backend_capabilities());
+            assert_eq!(config.max_timeslice, None);
+            assert!(config.sequentialize_threads);
+        }
+    }
+
+    /// The CLI encodes the admitted standalone fallback with
+    /// [`detcore::encode_backend_config_json`]. Its standalone reader retains
+    /// every field, DBT's capabilities included. Coordinated startup receives
+    /// the authoritative typed Config through its separate handshake.
+    #[test]
+    fn the_cli_configuration_round_trips_through_its_environment_encoding() {
+        let (sent, json) = hermit_run_dbt_detconfig();
+        assert!(detcore::from_legacy_backend_json(&json).is_err());
+        let (received, source) = dbt_config_from(Some(&json));
+        assert!(matches!(source, ConfigSource::Cli));
+        assert_eq!(received.backend, backend_capabilities());
+        assert_eq!(
+            serde_json::to_string(&received).unwrap(),
+            serde_json::to_string(&sent).unwrap()
+        );
+    }
+
+    /// In the admitted standalone fallback, a parseable configuration keeps
+    /// the backend facts it carries, as it did when those facts were separate
+    /// `Config` fields; only parked-write interruption is held off. A legacy
+    /// key that is absent takes that field's old default. This fallback does
+    /// not replace a present coordinator's authoritative typed Config.
+    #[test]
+    fn a_legacy_cli_configuration_keeps_the_backend_facts_it_carries() {
+        let (mut sent, _) = hermit_run_dbt_detconfig();
+        // Preserve the pre-discovery DBT input: legacy keys, with no envelope
+        // whose typed capabilities would take precedence over their projection.
+        sent.backend.tool_shares_guest_descriptor_table = false;
+        sent.backend.rediscovers_descriptors_after_exec = false;
+        let json = detcore::to_legacy_backend_json(&sent).unwrap();
+        let key = "\"backend_requires_thread_directed_process_signals\"";
+        let edited = json.replacen(&format!("{key}:true"), &format!("{key}:false"), 1);
+        assert_ne!(edited, json);
+        let (config, source) = dbt_config_from(Some(&edited));
+        assert!(matches!(source, ConfigSource::Cli));
+        let mut expected = sent.backend;
+        expected.requires_thread_directed_process_signals = false;
+        assert_eq!(config.backend, expected);
+
+        let key = "\"backend_supports_parked_write_signal_interruption\"";
+        let edited = json.replacen(&format!("{key}:false"), &format!("{key}:true"), 1);
+        assert_ne!(edited, json);
+        let (config, _) = dbt_config_from(Some(&edited));
+        assert_eq!(config.backend, sent.backend);
+
+        let mut object: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&json).unwrap();
+        object.remove("backend_tracks_process_children").unwrap();
+        let edited = serde_json::to_string(&object).unwrap();
+        let (config, source) = dbt_config_from(Some(&edited));
+        assert!(matches!(source, ConfigSource::Cli));
+        let mut expected = sent.backend;
+        expected.tracks_process_children = true;
+        assert_eq!(config.backend, expected);
+    }
+
+    #[test]
+    fn startup_authority_refuses_missing_or_invalid_control_without_fallback() {
+        use reverie_dbt::DbtStartupMode;
+
+        assert!(initial_dbt_config(DbtStartupMode::Coordinated, None).is_err());
+        for mode in [DbtStartupMode::Standalone, DbtStartupMode::Coordinated] {
+            // A present control is authoritative even in standalone mode.
+            // An invalid address must not become a successful JSON/default path.
+            assert!(initial_dbt_config(mode, Some(OsStr::new(""))).is_err());
+        }
+    }
+
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 4);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 15);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 88);
+        assert_eq!(
+            std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, branch_fact),
+            72
+        );
+        assert_eq!(std::mem::size_of::<reverie_dbt::NativeBranchFact>(), 48);
+        assert_eq!(
+            std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, controller_capture_control),
+            56,
+        );
+        assert_eq!(
+            std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, runtime_private_memory),
+            64,
+        );
+        assert_eq!(
+            std::mem::size_of::<reverie_dbt::NativeControllerCaptureFact>(),
+            24
+        );
+        assert_eq!(
+            std::mem::size_of::<reverie_dbt::NativePrivateMemorySnapshot>(),
+            176
+        );
+        // The native client's dbt_signal_event_t (ABI version 7).
+        assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
+        assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
         assert_eq!(
             reverie_dbt::DBT_RUNTIME_ABI_VERSION,
             IMPLEMENTED_DBT_RUNTIME_ABI_VERSION
@@ -2393,6 +3701,47 @@ mod tests {
         assert_eq!(current.emit_stdout as *const (), test_stdout as *const ());
         assert_eq!(current.emit_evidence as *const (), test_emit as *const ());
         assert_eq!(current.evidence_log_level, 0);
+
+        let mut guest_word = 7_u32;
+        let mut observed = 0xa5a5_a5a5_u32;
+        assert_eq!(
+            unsafe {
+                (current.compare_exchange_u32)(
+                    (&raw mut guest_word) as usize,
+                    7,
+                    9,
+                    &raw mut observed,
+                )
+            },
+            -libc::ENOSYS
+        );
+        assert_eq!(guest_word, 7);
+        assert_eq!(observed, 0xa5a5_a5a5);
+        assert_eq!(
+            unsafe { (current.compare_exchange_u32)(1, 7, 9, std::ptr::null_mut()) },
+            -libc::ENOSYS
+        );
+        let mut capture = reverie_dbt::NativeControllerCaptureFact::default();
+        // SAFETY: the fixed record contains only integer fields.
+        unsafe { std::ptr::write_bytes(&mut capture, 0xa5, 1) };
+        assert_eq!(
+            unsafe { (current.controller_capture_control)(0, 0, &mut capture) },
+            0,
+        );
+        assert_eq!(capture, reverie_dbt::NativeControllerCaptureFact::default());
+        let mut private = reverie_dbt::NativePrivateMemorySnapshot::default();
+        // SAFETY: the fixed record contains only integer fields.
+        unsafe { std::ptr::write_bytes(&mut private, 0xa5, 1) };
+        assert_eq!(
+            unsafe { (current.runtime_private_memory)(0, std::ptr::null(), &mut private) },
+            0,
+        );
+        assert_eq!(private, reverie_dbt::NativePrivateMemorySnapshot::default());
+        let mut branch = reverie_dbt::NativeBranchFact::default();
+        // SAFETY: the record has only integer fields and remains writable.
+        unsafe { std::ptr::write_bytes(&mut branch, 0xa5, 1) };
+        assert_eq!(unsafe { (current.branch_fact)(0, &mut branch) }, 0);
+        assert_eq!(branch, reverie_dbt::NativeBranchFact::default());
     }
 
     #[test]
@@ -2405,6 +3754,11 @@ mod tests {
             emit_stdout: test_stdout,
             emit_evidence: test_emit_evidence,
             evidence_log_level: 3,
+            compare_exchange_u32: unsupported_compare_exchange,
+            controller_capture_control: unsupported_controller_capture,
+            runtime_private_memory: unavailable_private_memory,
+            branch_fact: unavailable_branch_fact,
+            mapping_capture: unavailable_mapping_capture,
         };
         let (diagnostic, evidence, level) = runtime_callback_channels(&callbacks);
 
@@ -2414,6 +3768,35 @@ mod tests {
         assert!(protected_evidence_capture_ready(level, true));
         assert!(!protected_evidence_capture_ready(level, false));
         assert!(protected_evidence_capture_ready(0, false));
+    }
+
+    static LOSS_RECORDS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn capture_loss_record(bytes: *const u8, length: usize) {
+        let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
+        LOSS_RECORDS.lock().unwrap().extend_from_slice(bytes);
+    }
+
+    // The latch lives in the guest's client under DBT, so a recorded loss
+    // must leave the process as an evidence record, and nothing else must.
+    #[test]
+    fn a_recorded_determinism_loss_becomes_an_evidence_record() {
+        LOSS_RECORDS.lock().unwrap().clear();
+        emit_determinism_loss_record(capture_loss_record, None);
+        assert!(LOSS_RECORDS.lock().unwrap().is_empty());
+
+        emit_determinism_loss_record(
+            capture_loss_record,
+            Some("thread 3 of process 3 has a pending guest-handled SIGALRM\nbut".to_owned()),
+        );
+        assert_eq!(
+            String::from_utf8(LOSS_RECORDS.lock().unwrap().clone()).unwrap(),
+            format!(
+                "1970-01-01T00:00:00.000000Z ERROR {}: thread 3 of process 3 has a pending \
+                 guest-handled SIGALRM\\nbut\n",
+                detcore::detlog::DETERMINISM_LOSS_RECORD_TARGET
+            )
+        );
     }
 
     #[test]
@@ -2449,18 +3832,22 @@ mod tests {
     #[test]
     fn protected_evidence_refuses_when_subscriber_installation_fails() {
         let previous = DBT_TRACING_ACTIVE.swap(false, Ordering::AcqRel);
-        let mut selected_emitter = None;
+        let mut selected = None;
         let installed = install_dbt_subscriber_with(
-            test_emit_evidence,
-            DbtLogLevel::Info,
-            true,
-            |subscriber| {
-                selected_emitter = Some(subscriber.emit as *const ());
-                Err::<(), ()>(())
+            Some((test_emit_evidence, DbtLogLevel::Info, true)),
+            |own| {
+                selected = own.map(|own| own.max_level);
+                false
             },
         );
         assert!(!installed);
-        assert_eq!(selected_emitter, Some(test_emit_evidence as *const ()));
+        assert_eq!(selected, Some(tracing::Level::INFO));
+        assert_eq!(
+            DBT_EVENT_SINK
+                .get()
+                .map(|&(emit, canonical)| (emit as *const (), canonical)),
+            Some((test_emit_evidence as *const (), true))
+        );
         assert!(!DBT_TRACING_ACTIVE.load(Ordering::Acquire));
         assert!(!protected_evidence_capture_ready(3, installed));
         DBT_TRACING_ACTIVE.store(previous, Ordering::Release);
@@ -2632,12 +4019,52 @@ mod tests {
 
     #[test]
     fn protected_evidence_level_selects_the_expected_filter() {
+        // Through the subscriber DBT installs (detcore::guest_log), with its
+        // own channel at the INFO evidence level: ERROR, WARN and INFO are
+        // written, in order, in canonical form; DEBUG and TRACE are not; and no
+        // event the channel takes goes to the coordinator.
+        static WRITTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        fn write(event: &tracing::Event<'_>) {
+            WRITTEN.lock().unwrap().push(format_dbt_event(event, true));
+        }
+        fn call(
+            _request: <GlobalState as reverie::GlobalTool>::Request,
+        ) -> std::io::Result<<GlobalState as reverie::GlobalTool>::Response> {
+            panic!("an event DBT's own channel takes is not sent to the coordinator");
+        }
         let info = dbt_log_level_from_code(3).expect("INFO code");
-        assert!(info.enables(&tracing::Level::ERROR));
-        assert!(info.enables(&tracing::Level::WARN));
-        assert!(info.enables(&tracing::Level::INFO));
-        assert!(!info.enables(&tracing::Level::DEBUG));
-        assert!(!info.enables(&tracing::Level::TRACE));
+        let own = detcore::guest_log::OwnChannel {
+            max_level: info.max_level(),
+            write,
+        };
+        tracing::subscriber::with_default(detcore::guest_log::subscriber(call, Some(own)), || {
+            tracing::error!(target: "detcore::scheduler", "e");
+            tracing::warn!(target: "detcore::scheduler", "w");
+            tracing::info!(target: "detcore::scheduler", "DETLOG i");
+            tracing::debug!(target: "detcore::scheduler", "d");
+            tracing::trace!(target: "detcore::scheduler", "t");
+        });
+        assert_eq!(
+            *WRITTEN.lock().unwrap(),
+            [
+                "1970-01-01T00:00:00.000000Z ERROR detcore::scheduler: e\n",
+                "1970-01-01T00:00:00.000000Z WARN detcore::scheduler: w\n",
+                "1970-01-01T00:00:00.000000Z INFO detcore::scheduler: DETLOG i\n",
+            ]
+        );
+        let levels = (1..=5)
+            .map(|code| dbt_log_level_from_code(code).map(DbtLogLevel::max_level))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            levels,
+            [
+                Some(tracing::Level::ERROR),
+                Some(tracing::Level::WARN),
+                Some(tracing::Level::INFO),
+                Some(tracing::Level::DEBUG),
+                Some(tracing::Level::TRACE),
+            ]
+        );
         assert!(dbt_log_level_from_code(0).is_none());
         assert!(dbt_log_level_from_code(6).is_none());
     }
@@ -2724,13 +4151,17 @@ mod tests {
             process_clone_properties(libc::SYS_fork, &empty, |_, _| {
                 panic!("fork has no clone flags in guest memory")
             }),
-            ProcessCloneProperties::default()
+            ProcessCloneProperties {
+                copies_process: true,
+                ..ProcessCloneProperties::default()
+            }
         );
         assert_eq!(
             process_clone_properties(libc::SYS_vfork, &empty, |_, _| {
                 panic!("vfork has no clone flags in guest memory")
             }),
             ProcessCloneProperties {
+                copies_process: false,
                 blocks_parent: true,
                 shares_files_without_thread: false,
                 shares_memory_without_thread: false,
@@ -2857,9 +4288,21 @@ mod tests {
             .split_once("pub unsafe extern \"C\" fn reverie_dbt_runtime_pre_syscall")
             .expect("pre-syscall callback")
             .1;
+        // pre_syscall starts the thread's lazy Detcore state through
+        // start_thread_runtime (shared with the rdtsc callback), which must
+        // hold the lazy initialization itself.
         let initialize = dispatch
-            .find("if scratch.runtime_state.is_null()")
+            .find("start_thread_runtime(")
             .expect("lazy thread-state initialization");
+        let helper = source
+            .split_once("unsafe fn start_thread_runtime(")
+            .expect("thread-start helper")
+            .1;
+        let helper = &helper[..helper.find("\n}\n").expect("helper body")];
+        assert!(
+            helper.contains("if scratch.runtime_state.is_null()"),
+            "start_thread_runtime must lazily initialize the thread state"
+        );
         let lifecycle = dispatch
             .find("if requires_native_lifecycle(sysnum)")
             .expect("native lifecycle early return");
@@ -3067,6 +4510,7 @@ mod tests {
 
         let mut targeted = [3, 4, libc::SIGUSR1 as u64, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_rt_tgsigqueueinfo,
             &mut targeted,
             3,
@@ -3078,6 +4522,7 @@ mod tests {
 
         let mut process = [3, libc::SIGUSR1 as u64, 0, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_rt_sigqueueinfo,
             &mut process,
             3,
@@ -3089,6 +4534,7 @@ mod tests {
 
         let mut other = [5, 6, libc::SIGUSR1 as u64, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_rt_tgsigqueueinfo,
             &mut other,
             3,
@@ -3100,6 +4546,7 @@ mod tests {
 
         let mut process_group = [0, libc::SIGUSR1 as u64, 0, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_rt_sigqueueinfo,
             &mut process_group,
             0,
@@ -3110,11 +4557,20 @@ mod tests {
         assert_eq!(process_group[0], 0);
 
         let mut prlimit = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut prlimit, 3, 4, 10_003, 10_004);
+        translate_self_identity_targets(
+            RuntimeAbi::V1,
+            libc::SYS_prlimit64,
+            &mut prlimit,
+            3,
+            4,
+            10_003,
+            10_004,
+        );
         assert_eq!(prlimit[0], 10_003);
 
         let mut prlimit_without_tid = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_prlimit64,
             &mut prlimit_without_tid,
             3,
@@ -3125,11 +4581,20 @@ mod tests {
         assert_eq!(prlimit_without_tid[0], 10_003);
 
         let mut current = [0, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut current, 3, 4, 10_003, 10_004);
+        translate_self_identity_targets(
+            RuntimeAbi::V1,
+            libc::SYS_prlimit64,
+            &mut current,
+            3,
+            4,
+            10_003,
+            10_004,
+        );
         assert_eq!(current[0], 0);
 
         let mut other_process = [5, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_prlimit64,
             &mut other_process,
             3,
@@ -3138,6 +4603,53 @@ mod tests {
             10_004,
         );
         assert_eq!(other_process[0], 5);
+    }
+
+    #[test]
+    fn current_abi_preserves_queued_signal_targets_for_tool_resolution() {
+        let (scheduler_tid, process_pid) = RuntimeAbi::Current
+            .runtime_identity(4, 3, 10_004, 10_003)
+            .expect("current ABI guest identities are valid");
+        assert_eq!(i32::from(scheduler_tid), 4);
+        assert_eq!(i32::from(process_pid), 3);
+
+        for (sysnum, original) in [
+            (
+                libc::SYS_rt_sigqueueinfo,
+                [3, libc::SIGUSR1 as u64, 42, 0, 0, 0],
+            ),
+            (
+                libc::SYS_rt_tgsigqueueinfo,
+                [3, 4, libc::SIGUSR1 as u64, 42, 0, 0],
+            ),
+        ] {
+            let mut args = original;
+            translate_self_identity_targets(
+                RuntimeAbi::Current,
+                sysnum,
+                &mut args,
+                3,
+                4,
+                10_003,
+                10_004,
+            );
+            assert_eq!(
+                args, original,
+                "queued targets must reach the Tool in its guest namespace"
+            );
+        }
+
+        let mut prlimit = [3, libc::RLIMIT_NOFILE as u64, 42, 43, 0, 0];
+        translate_self_identity_targets(
+            RuntimeAbi::Current,
+            libc::SYS_prlimit64,
+            &mut prlimit,
+            3,
+            4,
+            10_003,
+            10_004,
+        );
+        assert_eq!(prlimit, [10_003, libc::RLIMIT_NOFILE as u64, 42, 43, 0, 0]);
     }
 
     #[test]
@@ -3409,6 +4921,16 @@ mod tests {
     // `flock` remains in this syscall-level register because the zero-argument
     // census represents a malformed operation, which intentionally reaches the
     // kernel for `EINVAL`. Dedicated argument tests prove blocking modes refuse.
+    // `getpid` and `gettid` became Determinized when the ordinary shared Tool
+    // began projecting completed own-ID results. The native client already
+    // answers copied-child queries without shared Tool projection. Record that
+    // pre-existing escape until its ownership moves.
+    // The clock and resource-limit reads (clock_gettime, clock_getres,
+    // gettimeofday, time, getrlimit, setrlimit, prlimit64) left this register
+    // when the DBT client dropped its own tables (A8 step 2) and
+    // `copied_child_reads_clock_or_limit` began refusing them. `clock_nanosleep`
+    // stays: the census's zero arguments are a relative CLOCK_REALTIME sleep,
+    // which only waits and still reaches the kernel.
     const ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES: &[&str] = &[
         "accept",
         "accept4",
@@ -3418,8 +4940,6 @@ mod tests {
         "bind",
         "chown",
         "clock_adjtime",
-        "clock_getres",
-        "clock_gettime",
         "clock_nanosleep",
         "clone",
         "clone3",
@@ -3461,15 +4981,14 @@ mod tests {
         "getgid",
         "getitimer",
         "getpeername",
-        "getpriority",
+        "getpid",
         "getrandom",
         "getresgid",
         "getresuid",
-        "getrlimit",
         "getrusage",
         "getsockname",
         "getsockopt",
-        "gettimeofday",
+        "gettid",
         "getuid",
         "inotify_add_watch",
         "inotify_init",
@@ -3497,7 +5016,6 @@ mod tests {
         "open",
         "openat",
         "pause",
-        "pidfd_getfd",
         "pidfd_open",
         "pidfd_send_signal",
         "pipe",
@@ -3508,7 +5026,6 @@ mod tests {
         "pread64",
         "preadv",
         "preadv2",
-        "prlimit64",
         "process_madvise",
         "pselect6",
         "pwrite64",
@@ -3524,10 +5041,7 @@ mod tests {
         "rt_sigsuspend",
         "rt_sigtimedwait",
         "rt_tgsigqueueinfo",
-        "sched_getaffinity",
         "sched_getattr",
-        "sched_getparam",
-        "sched_getscheduler",
         "sched_rr_get_interval",
         "sched_setaffinity",
         "sched_setattr",
@@ -3552,7 +5066,6 @@ mod tests {
         "setresgid",
         "setresuid",
         "setreuid",
-        "setrlimit",
         "setsid",
         "setsockopt",
         "setuid",
@@ -3567,7 +5080,6 @@ mod tests {
         "sysinfo",
         "syslog",
         "tgkill",
-        "time",
         "timer_create",
         "timer_delete",
         "timer_getoverrun",
@@ -3629,6 +5141,102 @@ mod tests {
             );
         }
 
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    /// The process-group and session getters, answered from Detcore's model in
+    /// the instrumented root, fail closed in a strict copied child, whose
+    /// native answer would be the kernel's group rather than the model's; a
+    /// non-strict copied child keeps native behaviour.
+    #[test]
+    fn copied_child_refuses_group_and_session_getters_in_strict_mode() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        for (strict, expected) in [(true, 1), (false, 0)] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            for sysno in [Sysno::getpgrp, Sysno::getpgid, Sysno::getsid] {
+                assert!(detcore::is_determinized_syscall(sysno));
+                assert_eq!(
+                    copied_child_action(sysno.id() as i64),
+                    expected,
+                    "{sysno} in a copied child, strict={strict}"
+                );
+            }
+        }
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    #[test]
+    fn copied_child_refuses_scheduler_policy_queries_only_in_strict_mode() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        assert!(detcore::is_determinized_syscall(Sysno::sched_getscheduler));
+        for (strict, expected) in [(true, 1), (false, 0)] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            assert_eq!(
+                copied_child_action(Sysno::sched_getscheduler.id() as i64),
+                expected,
+                "sched_getscheduler in a copied child, strict={strict}"
+            );
+        }
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    #[test]
+    fn copied_child_refuses_scheduler_parameter_queries_only_in_strict_mode() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        assert!(detcore::is_determinized_syscall(Sysno::sched_getparam));
+        for (strict, expected) in [(true, 1), (false, 0)] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            assert_eq!(
+                copied_child_action(Sysno::sched_getparam.id() as i64),
+                expected,
+                "sched_getparam in a copied child, strict={strict}"
+            );
+        }
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    #[test]
+    fn copied_child_refuses_affinity_queries_only_in_strict_mode() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        assert!(detcore::is_determinized_syscall(Sysno::sched_getaffinity));
+        for (strict, expected) in [(true, 1), (false, 0)] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            assert_eq!(
+                copied_child_action(Sysno::sched_getaffinity.id() as i64),
+                expected,
+                "sched_getaffinity in a copied child, strict={strict}"
+            );
+        }
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    #[test]
+    fn copied_child_refuses_priority_queries_only_in_strict_mode() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        assert!(detcore::is_determinized_syscall(Sysno::getpriority));
+        for (strict, expected) in [(true, 1), (false, 0)] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            assert_eq!(
+                copied_child_action(Sysno::getpriority.id() as i64),
+                expected,
+                "getpriority in a copied child, strict={strict}"
+            );
+        }
         COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
     }
 
@@ -3803,7 +5411,9 @@ mod tests {
             _context: usize,
             _sysnum: i64,
             _args: *const u64,
+            purpose: u32,
         ) -> i64 {
+            assert_eq!(purpose, reverie::InjectionPurpose::Application as u32);
             0
         }
         unsafe extern "C" fn read_registers(
@@ -3954,8 +5564,6 @@ mod tests {
             libc::SYS_splice,
             libc::SYS_keyctl,
             libc::SYS_ioctl,
-            libc::SYS_recvmsg,
-            libc::SYS_recvmmsg,
             libc::SYS_read,
             libc::SYS_readlink,
             libc::SYS_readlinkat,
@@ -3964,6 +5572,16 @@ mod tests {
                 copied_child_action(sysnum),
                 0,
                 "non-strict copied child must allow syscall {sysnum}"
+            );
+        }
+        // recvmsg and recvmmsg never run natively in a copied child: an
+        // SCM_RIGHTS message could import another process's description. Under
+        // the non-strict policy the call does not run and answers EPERM.
+        for sysnum in [libc::SYS_recvmsg, libc::SYS_recvmmsg] {
+            assert_eq!(
+                copied_child_action(sysnum),
+                -libc::EPERM,
+                "non-strict copied child must answer EPERM for syscall {sysnum}"
             );
         }
         for sysnum in [

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 #define _GNU_SOURCE
 
 #include <errno.h>
@@ -17,12 +9,12 @@
 #include <unistd.h>
 
 /* Make exactly argv[1] raw getpid calls, then print the count. */
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s CALLS\n", argv[0]);
     return 2;
   }
-  char* end = NULL;
+  char *end = NULL;
   errno = 0;
   unsigned long long calls = strtoull(argv[1], &end, 10);
   if (errno != 0 || end == argv[1] || *end != '\0' || argv[1][0] == '-') {

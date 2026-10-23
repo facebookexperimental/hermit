@@ -1,6 +1,6 @@
 [package]
 name = "hermit-install"
-version = "0.4.0"
+version = "0.5.1"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
@@ -9,6 +9,11 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+reverie-liteinst-artifact = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14", default-features = false }
+serde_json = "1"
+toml = "0.8"
+
 [build-dependencies]
-reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "c7a1ed25bca339daa0e69241353fc9882da63d7a", default-features = false }
-reverie-sabre = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "c7a1ed25bca339daa0e69241353fc9882da63d7a" }
+reverie-dbt = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14", default-features = false }
+reverie-sabre = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14" }

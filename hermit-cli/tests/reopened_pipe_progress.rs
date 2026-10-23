@@ -56,9 +56,7 @@ fn hermit_bash(extra: &[&str], script: &str) -> Command {
 fn run_bash(extra: &[&str], script: &str, expected_stdout: &str) {
     let mut command = hermit_bash(extra, script);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start guest: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     check_output(&rendered, &output, expected_stdout);
 }
 

@@ -8,7 +8,7 @@
 
 // Path queries and legacy path mutations whose results must come from the
 // recording. Replay runs in a chroot where host files such as /etc/passwd and
-// directories such as /usr/lib are absent, so a live access, faccessat, chdir
+// directories such as /usr/bin are absent, so a live access, faccessat, chdir
 // or getcwd answers differently there. Raw syscall numbers keep libc from
 // substituting the *at forms. Every result is checked against its expected
 // value, so record and replay cannot agree on a wrong failure and still pass.
@@ -209,7 +209,8 @@ int main(int argc, char** argv) {
       ENOENT);
 
   char cwd[4096];
-  expect("chdir_usr_lib", syscall(SYS_chdir, "/usr/lib"), 0);
+  // /usr/bin, not /usr/lib: the pinned validation root has no /usr/lib.
+  expect("chdir_usr_bin", syscall(SYS_chdir, "/usr/bin"), 0);
   long length = syscall(SYS_getcwd, cwd, sizeof(cwd));
   expect("getcwd", length, 0);
   if (length > 0) {
@@ -220,7 +221,8 @@ int main(int argc, char** argv) {
     }
   }
   expect("getcwd_small", syscall(SYS_getcwd, cwd, 2), ERANGE);
-  expect("chdir_missing", syscall(SYS_chdir, "/nonexistent/hermit"), ENOENT);
+  expect(
+      "chdir_missing", syscall(SYS_chdir, "/nonexistent/hermit"), ENOENT);
 
   if (argc > 1) {
     host_directory_rounds(argv[1]);

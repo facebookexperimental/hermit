@@ -69,8 +69,9 @@ https://github.com/rrnewton/hermit/pull/2737. It did not resolve this cell.
 
 That result is consistent with the code boundary rather than evidence that the
 wait change failed. Hermit sets
-`backend_requires_thread_directed_process_signals` only for DBT; SaBRe leaves
-it false. The changed path handles process-child waits such as `wait4`, while
+`backend_requires_thread_directed_process_signals` (now
+`BackendCapabilities::requires_thread_directed_process_signals`) only for DBT;
+SaBRe leaves it false. The changed path handles process-child waits such as `wait4`, while
 this guest creates a pthread and reaches the split after `ppoll` at
 `pthread_join`. The ppoll result is therefore separate from the host-timed
 `wait4` defect.

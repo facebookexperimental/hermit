@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Exercise the real launchers without compiling Rust or running Hermit guests.
 set -euo pipefail
 # Git exports its repository-location variables to hooks and `git rebase
@@ -220,6 +214,69 @@ exit 17
         assert (parent / "command.argv").is_file()
         retained(child)
     unchanged()
+
+    # A sharded harness passes only if its shards ran exactly its own test list,
+    # each test once. The stand-in harness lists seven tests and reports what
+    # it was asked to run, unless told to drop the --exact filter, to report
+    # one test short, or to print a list line that is not libtest's.
+    sharded = "ci/compat-envelope/scorecard.rs"
+    (root / sharded).parent.mkdir(parents=True)
+    (root / sharded).write_text("#!/usr/bin/env -S rust-script --force\n#[cfg(test)]\n")
+    subprocess.run(["git", "-C", str(root), "add", "--", sharded], check=True)
+    listed = ["m::a", "m::a_b", "m::ab", "n::c", "n::d", "n::e", "z::ignored"]
+    libtest = scratch / "libtest"
+    libtest.mkdir()
+    (libtest / "rust-script").write_text(f'''#!/usr/bin/env python3
+import os, sys
+listed = {listed!r}
+argv = sys.argv[1:]
+assert argv[0] == "--test", argv
+source, rest = argv[1], argv[2:]
+if not source.endswith("scorecard.rs"):
+    print("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s")
+    sys.exit(0)
+assert rest[0] == "--", rest
+rest, mode = rest[1:], os.environ.get("FIXTURE_SHARD_MODE", "")
+if rest == ["--list", "--format", "terse"]:
+    for name in listed:
+        print(name + ": test")
+    if mode == "badlist":
+        print("1 test, 0 benchmarks")
+    sys.exit(0)
+assert rest[0] == "--exact", rest
+chosen = rest[1:]
+with open(os.environ["FIXTURE_SHARD_LOG"], "a") as log:
+    log.write("".join(name + "\\n" for name in chosen))
+ran = listed if mode == "drop" else chosen
+ignored = sum(name == "z::ignored" for name in ran)
+passed = len(ran) - ignored - (mode == "short")
+print(f"test result: ok. {{passed}} passed; 0 failed; {{ignored}} ignored; 0 measured; "
+      f"{{len(listed) - len(ran)}} filtered out; finished in 0.00s")
+''')
+    (libtest / "rust-script").chmod(0o755)
+
+    def shard_run(mode):
+        log = scratch / f"shard-{mode or 'exact'}.log"
+        output = run([str(scripts / "run-script-tests.sh")],
+                     dict(env, PATH=str(libtest) + os.pathsep + env["PATH"],
+                          FIXTURE_SHARD_MODE=mode, FIXTURE_SHARD_LOG=str(log)))
+        return output, (log.read_text().splitlines() if log.exists() else [])
+
+    output, chosen = shard_run("")
+    assert output.returncode == 0, output
+    assert b"OK -- 3 script test suites passed" in output.stdout
+    assert sorted(chosen) == sorted(listed), chosen
+    for k, size in enumerate((2, 2, 2, 1), 1):
+        assert f"{sharded} (shard {k} of 4: {size} of 7 tests)".encode() in output.stdout
+    for mode in ("drop", "short"):
+        output, _ = shard_run(mode)
+        assert output.returncode == 1, (mode, output)
+        assert b"shard ran a different set than its" in output.stderr, (mode, output)
+        assert b"1 of 3 script test suites failed" in output.stderr, (mode, output)
+    output, chosen = shard_run("badlist")
+    assert output.returncode == 1 and chosen == [], output
+    assert b"cannot list its tests for sharding" in output.stderr, output
+    assert b"1 of 3 script test suites failed" in output.stderr, output
 
 print("rust-script log isolation: prepared/ordinary/nested/concurrent harnesses retain private logs; outer bytes, argv, failure and signals preserved")
 PY

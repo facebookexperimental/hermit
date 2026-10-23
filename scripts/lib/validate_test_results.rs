@@ -1,11 +1,5 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+//
 // Retain the producer-owned terminal test population behind one validation row.
 // Extracted from Hermit 9a0b6b782c955feb542102ba01aee88c2ebad240,
 // https://github.com/rrnewton/hermit/pull/2969.

@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # End-to-end Lua 5.4 determinism fixture.
 #
 # Lua 5.4 auto-seeds its `math.random` generator at interpreter startup from

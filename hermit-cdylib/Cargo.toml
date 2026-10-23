@@ -1,0 +1,21 @@
+[package]
+name = "hermit-cdylib"
+description = "libhermit.so, the shared-object form of the hermit library."
+version = "0.5.1"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+publish = false
+
+# Only the shared object. The hermit library itself stays an rlib so its tests
+# and binaries start from its metadata instead of waiting for this link.
+[lib]
+name = "hermit"
+crate-type = ["cdylib"]
+# The library it re-exports is documented and tested under its own name.
+doc = false
+test = false
+doctest = false
+
+[dependencies]
+hermit-rlib = { package = "hermit-run", version = "0.5.1", path = "../hermit-cli" }

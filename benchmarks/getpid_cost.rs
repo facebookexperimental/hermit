@@ -114,8 +114,8 @@ was patched. Otherwise that backend gets no fit and the harness exits 1.
 Wall times come from polling each run every 500 microseconds, so a sample
 can read up to one poll interval long.
 
-LiteInst needs libreverie_liteinst.so beside the Hermit binary, or the
-HERMIT_LITEINST_RUNTIME environment variable naming it (read by Hermit).
+LiteInst needs libdetcore_liteinst.so beside the Hermit binary, or the
+HERMIT_LITEINST_TOOL_RUNTIME environment variable naming it (read by Hermit).
 ";
 
 struct Options {

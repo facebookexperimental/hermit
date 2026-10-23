@@ -1,12 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/*
  * Freestanding "run a userspace program" launcher for QEMU-under-Hermit.
  *
  * Runs as guest init (PID 1) inside a QEMU-emulated Linux kernel executed under

@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Self-test for core-review-protocol-lint.sh.
 #
 # Feeds the linter fixture PR labels, body, KVM flag, exact head, and issue
@@ -17,36 +11,145 @@
 
 set -euo pipefail
 
+# SHARDS. The cases below are independent linter invocations, and running all
+# of them one after another took 42 s (host: docs/TESTING_ENVIRONMENTS.md,
+# "Named measurement hosts"), the second-longest path in
+# check.lint_checks. So this script runs itself CORE_REVIEW_LINT_TEST_JOBS times
+# in parallel; each copy walks every case in the same order, evaluates only the
+# cases whose index falls in its shard, and reports how many cases it saw. The
+# parent requires every shard to see the same number and the evaluated cases to
+# add up to it, so a case that no shard evaluates is a failure, not a silent
+# drop. A shard inherits the parent's verified authority directory and must not
+# obtain one itself: the parent's single fetch is what
+# scripts/test-authority-obtained-once.sh counts.
+shard_index=0
+shard_count=1
+if [ -n "${CORE_REVIEW_LINT_TEST_SHARD-}" ]; then
+    if ! [[ $CORE_REVIEW_LINT_TEST_SHARD =~ ^([0-9]+)/([1-9][0-9]*)$ ]] \
+        || [ "${BASH_REMATCH[1]}" -ge "${BASH_REMATCH[2]}" ] \
+        || [ ! -d "${DEV_HERMIT_PARENT-}" ]; then
+        echo "core-review-protocol-lint-test.sh: CORE_REVIEW_LINT_TEST_SHARD='${CORE_REVIEW_LINT_TEST_SHARD}' must be INDEX/COUNT with INDEX < COUNT, and DEV_HERMIT_PARENT must name the parent's authority directory" >&2
+        exit 2
+    fi
+    shard_index=${BASH_REMATCH[1]}
+    shard_count=${BASH_REMATCH[2]}
+fi
+
 # Same rule as the check-status checkers: if the pinned review-label contract
 # cannot be consulted, no case here is evaluable. Declare it and exit 0 so
 # `make lint-checks` still passes and ci/lint-checks-node.sh classifies the run
 # no_result (exit 75) instead of fail. A nonzero exit could never be reported as
 # no_result -- classify_run lets a real failure outrank any marker.
-_probe_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-_auth_rc=0
-_authority_dir=$("$_probe_root/scripts/authority-available.sh" "$_probe_root/scripts/review_contract_adapter.py") || _auth_rc=$?
-# ⚠️ ONLY EXIT 3 MAY SKIP, AND AN EARLIER VERSION OF THIS GUARD GOT IT WRONG.
-# It treated ANY nonzero from the helper as "unavailable", so a TAMPERED
-# authority -- fetched successfully, wrong bytes, AuthorityIntegrityError, exit
-# 1 -- was laundered into a no-result skip. That is the most dangerous possible
-# reading: the one failure mode the content pin exists to catch, silently
-# reported as "could not evaluate". Measured 2026-09-04: checker exited 0 with a
-# marker against a deliberately corrupted authority.
-if [ "$_auth_rc" -eq 3 ]; then
-    echo "NO-RESULT-CASE: core-review-protocol-lint-test.sh: the pinned review-label contract could not be consulted; no case in this checker was evaluated"
-    exit 0
-elif [ "$_auth_rc" -ne 0 ]; then
-    echo "core-review-protocol-lint-test.sh: obtaining the pinned review-label contract failed with exit $_auth_rc; that is not an outage and is not being skipped" >&2
-    exit "$_auth_rc"
-fi
-# ⚠️ EXPORTING THIS IS THE POINT, not tidiness. Every later adapter process in
-# this checker now reads the authority from disk instead of fetching it again,
-# so a 504 arriving after the check above cannot turn a case into a nonzero
-# exit. Probing alone left exactly that window open; see
-# scripts/authority-available.sh.
-export DEV_HERMIT_PARENT="$_authority_dir"
-trap 'rm -rf "$_authority_dir"' EXIT
+if [ -z "${CORE_REVIEW_LINT_TEST_SHARD-}" ]; then
+    _probe_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+    _auth_rc=0
+    _authority_dir=$("$_probe_root/scripts/authority-available.sh" "$_probe_root/scripts/review_contract_adapter.py") || _auth_rc=$?
+    # ⚠️ ONLY EXIT 3 MAY SKIP, AND AN EARLIER VERSION OF THIS GUARD GOT IT WRONG.
+    # It treated ANY nonzero from the helper as "unavailable", so a TAMPERED
+    # authority -- fetched successfully, wrong bytes, AuthorityIntegrityError, exit
+    # 1 -- was laundered into a no-result skip. That is the most dangerous possible
+    # reading: the one failure mode the content pin exists to catch, silently
+    # reported as "could not evaluate". Measured 2026-09-04: checker exited 0 with a
+    # marker against a deliberately corrupted authority.
+    if [ "$_auth_rc" -eq 3 ]; then
+        echo "NO-RESULT-CASE: core-review-protocol-lint-test.sh: the pinned review-label contract could not be consulted; no case in this checker was evaluated"
+        exit 0
+    elif [ "$_auth_rc" -ne 0 ]; then
+        echo "core-review-protocol-lint-test.sh: obtaining the pinned review-label contract failed with exit $_auth_rc; that is not an outage and is not being skipped" >&2
+        exit "$_auth_rc"
+    fi
+    # ⚠️ EXPORTING THIS IS THE POINT, not tidiness. Every later adapter process in
+    # this checker now reads the authority from disk instead of fetching it again,
+    # so a 504 arriving after the check above cannot turn a case into a nonzero
+    # exit. Probing alone left exactly that window open; see
+    # scripts/authority-available.sh.
+    export DEV_HERMIT_PARENT="$_authority_dir"
+    trap 'rm -rf "$_authority_dir"' EXIT
 
+    shard_jobs=${CORE_REVIEW_LINT_TEST_JOBS:-$(nproc 2>/dev/null || echo 1)}
+    if ! [[ $shard_jobs =~ ^[1-9][0-9]*$ ]]; then
+        echo "core-review-protocol-lint-test.sh: CORE_REVIEW_LINT_TEST_JOBS='${shard_jobs}' is not a positive integer" >&2
+        exit 2
+    fi
+    # The default is capped at 8 by memory, not by speed. Measured on the host
+    # in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts" (316 cores), 670 cases, peak anonymous memory sampled from the cgroup:
+    #   shards   wall     anon
+    #     1      39.1 s   104 MB
+    #     4      10.2 s   290 MB
+    #     8       5.3 s   542 MB
+    #    16       3.1 s   880 MB
+    #    32       1.9 s   1.73 GB
+    # This checker runs inside the lint node next to seven other checkers,
+    # under that node's 4 GiB memory cap, and test-authority-obtained-once.sh
+    # runs it a second time, often at the same moment. At 32 shards the two
+    # copies alone could reach 3.4 GB. At 8 the checker takes 5.3 s, well
+    # inside the node's ~19.5 s critical path (the pinned-root-cache and
+    # shell-lint checkers), so wider widths would save no node wall time.
+    # CORE_REVIEW_LINT_TEST_JOBS still sets any width explicitly, up to 32;
+    # past 32 it got slower (64: 2.0 s, 128: 2.7 s).
+    if [ -z "${CORE_REVIEW_LINT_TEST_JOBS-}" ] && [ "$shard_jobs" -gt 8 ]; then
+        shard_jobs=8
+    fi
+    if [ "$shard_jobs" -gt 32 ]; then
+        shard_jobs=32
+    fi
+    if [ "$shard_jobs" -gt 1 ]; then
+        shard_dir=$(mktemp -d)
+        trap 'rm -rf "$_authority_dir" "$shard_dir"' EXIT
+        shard_pids=()
+        for ((i = 0; i < shard_jobs; i++)); do
+            CORE_REVIEW_LINT_TEST_SHARD="$i/$shard_jobs" bash "${BASH_SOURCE[0]}" \
+                >"$shard_dir/$i.out" 2>&1 &
+            shard_pids+=("$!")
+        done
+        shard_status=0
+        shard_cases=
+        shard_pass=0
+        shard_fail=0
+        for ((i = 0; i < shard_jobs; i++)); do
+            rc=0
+            wait "${shard_pids[$i]}" || rc=$?
+            cat "$shard_dir/$i.out"
+            tally=$(grep -E "^core-review-protocol-lint shard $i/$shard_jobs: cases=[0-9]+ passed=[0-9]+ failed=[0-9]+$" \
+                "$shard_dir/$i.out" || true)
+            if [ "$rc" -ne 0 ]; then
+                echo "FAIL - shard $i/$shard_jobs exited $rc"
+                shard_status=1
+            fi
+            if ! [[ $tally =~ cases=([0-9]+)\ passed=([0-9]+)\ failed=([0-9]+)$ ]]; then
+                echo "FAIL - shard $i/$shard_jobs printed no tally; its cases were not all evaluated"
+                shard_status=1
+                continue
+            fi
+            if [ -z "$shard_cases" ]; then
+                shard_cases=${BASH_REMATCH[1]}
+            elif [ "${BASH_REMATCH[1]}" -ne "$shard_cases" ]; then
+                echo "FAIL - shard $i/$shard_jobs saw ${BASH_REMATCH[1]} cases, shard 0 saw $shard_cases; the shards did not walk the same cases"
+                shard_status=1
+            fi
+            # A shard owns the indices i < cases with i % shard_jobs == its
+            # index. Checking each shard, not only the total, keeps a case run
+            # twice in one shard from cancelling a case skipped in another.
+            owned=$(((BASH_REMATCH[1] - i + shard_jobs - 1) / shard_jobs))
+            if [ "$((BASH_REMATCH[2] + BASH_REMATCH[3]))" -ne "$owned" ]; then
+                echo "FAIL - shard $i/$shard_jobs evaluated $((BASH_REMATCH[2] + BASH_REMATCH[3])) cases; it owns $owned"
+                shard_status=1
+            fi
+            shard_pass=$((shard_pass + BASH_REMATCH[2]))
+            shard_fail=$((shard_fail + BASH_REMATCH[3]))
+        done
+        if [ "$((shard_pass + shard_fail))" -ne "${shard_cases:-0}" ]; then
+            echo "FAIL - the shards evaluated $((shard_pass + shard_fail)) of ${shard_cases:-0} cases"
+            shard_status=1
+        fi
+        echo
+        echo "core-review-protocol-lint self-test: ${shard_pass} passed, ${shard_fail} failed (${shard_jobs} shards)."
+        if [ "$shard_fail" -ne 0 ] || [ "$shard_status" -ne 0 ]; then
+            exit 1
+        fi
+        exit 0
+    fi
+fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly LINT="$SCRIPT_DIR/core-review-protocol-lint.sh"
@@ -91,6 +194,15 @@ readonly FULL_APPROVALS="[
 pass=0
 fail=0
 
+# owns_case: count one case and say whether this shard evaluates it. Every
+# counted case calls this exactly once, before doing any work, in every shard.
+case_index=0
+owns_case() {
+    local index=$case_index
+    case_index=$((case_index + 1))
+    [ $((index % shard_count)) -eq "$shard_index" ]
+}
+
 # run_case NAME EXPECTED_EXIT LABELS BODY [IS_KVM] [COMMENTS_JSON] [HEAD_SHA]
 #
 # Comments and head default to a valid dual-lane exact-head approval, so the
@@ -129,6 +241,7 @@ authenticate_comments() {
 }
 
 run_case() {
+    owns_case || return 0
     local name=$1 expected=$2 labels=$3 body=$4 is_kvm=${5:-false}
     local comments=${6-$FULL_APPROVALS} head=${7-$HEAD_SHA}
     local actual=0
@@ -154,6 +267,7 @@ run_case() {
 # missing"). Asserting the message is what makes those checks discriminable;
 # without it a mutation that removes them leaves the suite green.
 run_message_case() {
+    owns_case || return 0
     local name=$1 expected=$2 needle=$3 labels=$4 body=$5 comments=$6 head=$7
     local actual=0 output
     comments=$(authenticate_comments "$comments")
@@ -173,6 +287,7 @@ run_message_case() {
 }
 
 run_message_absent_case() {
+    owns_case || return 0
     local name=$1 expected=$2 forbidden=$3 labels=$4 body=$5 comments=$6 head=$7
     local actual=0 output
     comments=$(authenticate_comments "$comments")
@@ -242,6 +357,29 @@ run_case "bold-style headings are accepted" 0 \
     "$FULL_LABELS" \
     $'**Summary** foo\n**Determinism** bar\n**Linux Semantics** baz\n**Validation** qux\n**Human Review Required** trigger 4'
 
+# AGENTS.md requires every PR description to open with "Plain Language Summary
+# and Project Impact"; that heading satisfies the summary section, as "Summary"
+# still does.
+run_case "the AGENTS.md summary heading is accepted" 0 \
+    "$FULL_LABELS" "${FULL_BODY/\#\# Summary/## Plain Language Summary and Project Impact}"
+
+run_case "the AGENTS.md summary heading is accepted in bold" 0 \
+    "$FULL_LABELS" \
+    $'**Plain Language Summary and Project Impact** foo\n**Determinism** bar\n**Linux Semantics** baz\n**Validation** qux\n**Human Review Required** trigger 4'
+
+run_case "a heading with only part of the AGENTS.md summary title blocks" 1 \
+    "$FULL_LABELS" "${FULL_BODY/\#\# Summary/## Plain Language Summary}"
+
+run_case "prose naming the AGENTS.md summary title does not satisfy it" 1 \
+    "$FULL_LABELS" \
+    $'This plain language summary and project impact is prose.\n## Determinism\nd\n## Linux Semantics\nl\n## Validation\nv\n## Human Review Required\nt'
+
+run_message_case "a missing summary section names both accepted titles" 1 \
+    '"Plain Language Summary and Project Impact" (or "Summary")' \
+    "$FULL_LABELS" \
+    $'## Determinism\nx\n## Linux Semantics\ny\n## Validation\nz\n## Human Review Required\nt' \
+    "$FULL_APPROVALS" "$HEAD_SHA"
+
 # --- Missing review labels blocks --------------------------------------------
 run_case "missing adversarial-review-codex blocks" 1 \
     $'post-facto-human-review\nadversarial-review-claude1\npassed-review-codex\npassed-review-claude' \
@@ -306,17 +444,19 @@ for family in "${contract_families[@]}"; do
     done
 done
 
-diagnostic_status=0
-diagnostic=$(PR_LABELS=$'post-facto-human-review\nreview-round-codex\nadversarial-review-claude1\npassed-review-codex\npassed-review-claude' \
-    PR_BODY="$FULL_BODY" PR_NUMBER=test bash "$LINT" 2>&1) || diagnostic_status=$?
-if [ "$diagnostic_status" -eq 1 ] \
-    && [[ $diagnostic == *"adversarial-review-codex1, adversarial-review-codex2, adversarial-review-codex3, adversarial-review-codex4"* ]] \
-    && [[ $diagnostic != *"review-round-codex"* ]]; then
-    echo "ok   - missing-round diagnostic names exact accepted alternatives"
-    pass=$((pass + 1))
-else
-    echo "FAIL - missing-round diagnostic did not name exact accepted alternatives"
-    fail=$((fail + 1))
+if owns_case; then
+    diagnostic_status=0
+    diagnostic=$(PR_LABELS=$'post-facto-human-review\nreview-round-codex\nadversarial-review-claude1\npassed-review-codex\npassed-review-claude' \
+        PR_BODY="$FULL_BODY" PR_NUMBER=test bash "$LINT" 2>&1) || diagnostic_status=$?
+    if [ "$diagnostic_status" -eq 1 ] \
+        && [[ $diagnostic == *"adversarial-review-codex1, adversarial-review-codex2, adversarial-review-codex3, adversarial-review-codex4"* ]] \
+        && [[ $diagnostic != *"review-round-codex"* ]]; then
+        echo "ok   - missing-round diagnostic names exact accepted alternatives"
+        pass=$((pass + 1))
+    else
+        echo "FAIL - missing-round diagnostic did not name exact accepted alternatives"
+        fail=$((fail + 1))
+    fi
 fi
 
 # --- Missing body sections blocks --------------------------------------------
@@ -354,6 +494,7 @@ run_case "prose mention of a section keyword does not satisfy it" 1 \
 # unset case indistinguishable from an empty one and returned a PASS having
 # checked nothing.
 run_unset_case() { # NAME EXPECTED_EXIT UNSET_VAR [ENV...]
+    owns_case || return 0
     local name=$1 expected=$2 unset_var=$3; shift 3
     local actual=0
     env -u "$unset_var" PR_NUMBER=test "$@" bash "$LINT" >/dev/null 2>&1 || actual=$?
@@ -382,6 +523,7 @@ run_case "empty labels + empty body still passes (not applicable)" 0 "" ""
 # The fake python3 supplies the already-validated contract records so these
 # checks isolate the predicate status rather than depending on network access.
 run_predicate_status_case() { # NAME MODE RAW_STATUS OPERATION [LABELS]
+    owns_case || return 0
     local name=$1 mode=$2 raw_status=$3 operation=$4
     local labels=${5:-post-facto-human-review}
     local actual=0 output
@@ -478,7 +620,8 @@ fi
 # Prove that an unreviewed local or fetched parent contract cannot become the
 # authority silently. A changed local file falls back to the reviewed bytes;
 # changed fetched bytes are refused by the content pin.
-ROOT_DIR="$SCRIPT_DIR/.." python3 - <<'PY'
+if owns_case; then
+    ROOT_DIR="$SCRIPT_DIR/.." python3 - <<'PY'
 import hashlib
 import os
 from pathlib import Path
@@ -509,8 +652,9 @@ with tempfile.TemporaryDirectory(prefix="review-contract-adapter-") as tmp:
     else:
         raise AssertionError("changed fetched review contract passed its content pin")
 PY
-echo "ok   - review-contract adapter accepts only content-pinned authority bytes"
-pass=$((pass + 1))
+    echo "ok   - review-contract adapter accepts only content-pinned authority bytes"
+    pass=$((pass + 1))
+fi
 
 # --- Exact-head approval binding, BOTH DIRECTIONS ----------------------------
 #
@@ -970,6 +1114,7 @@ run_case "an old malformed line still blocks when that lane never re-bound" 1 \
 # because what they test IS the tagging. Measured against the pre-fix script,
 # every "blocks" case below exited 0.
 run_raw_case() {
+    owns_case || return 0
     local name=$1 expected=$2 comments=$3 actual=0
     PR_LABELS="$FULL_LABELS" PR_BODY="$FULL_BODY" PR_IS_KVM=false PR_NUMBER=test \
         PR_HEAD_SHA="$HEAD_SHA" PR_COMMENTS_JSON="$comments" \
@@ -981,6 +1126,7 @@ run_raw_case() {
     fi
 }
 run_raw_message_case() {
+    owns_case || return 0
     local name=$1 expected=$2 needle=$3 comments=$4 actual=0 output
     output=$(PR_LABELS="$FULL_LABELS" PR_BODY="$FULL_BODY" PR_IS_KVM=false PR_NUMBER=test \
         PR_HEAD_SHA="$HEAD_SHA" PR_COMMENTS_JSON="$comments" \
@@ -1363,44 +1509,57 @@ run_raw_message_case "a bare binding diagnosis names the role-tag requirement" \
 
 # --- PR_COMMENTS_FILE, the form the workflow actually uses --------------------
 
-comments_tmp=$(mktemp)
-authenticate_comments "$FULL_APPROVALS" > "$comments_tmp"
-actual=0
-PR_LABELS="$FULL_LABELS" PR_BODY="$FULL_BODY" PR_IS_KVM=false PR_NUMBER=test \
-    PR_HEAD_SHA="$HEAD_SHA" PR_COMMENTS_FILE="$comments_tmp" \
-    PR_AUTHOR="$PR_AUTHOR_FIXTURE" \
-    bash "$LINT" >/dev/null 2>&1 || actual=$?
-if [ "$actual" -eq 0 ]; then
-    echo "ok   - PR_COMMENTS_FILE is read and a valid binding passes (exit 0)"
-    pass=$((pass + 1))
-else
-    echo "FAIL - PR_COMMENTS_FILE is read and a valid binding passes: got ${actual}"
-    fail=$((fail + 1))
+if owns_case; then
+    comments_tmp=$(mktemp)
+    authenticate_comments "$FULL_APPROVALS" > "$comments_tmp"
+    actual=0
+    PR_LABELS="$FULL_LABELS" PR_BODY="$FULL_BODY" PR_IS_KVM=false PR_NUMBER=test \
+        PR_HEAD_SHA="$HEAD_SHA" PR_COMMENTS_FILE="$comments_tmp" \
+        PR_AUTHOR="$PR_AUTHOR_FIXTURE" \
+        bash "$LINT" >/dev/null 2>&1 || actual=$?
+    if [ "$actual" -eq 0 ]; then
+        echo "ok   - PR_COMMENTS_FILE is read and a valid binding passes (exit 0)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL - PR_COMMENTS_FILE is read and a valid binding passes: got ${actual}"
+        fail=$((fail + 1))
+    fi
+    rm -f "$comments_tmp"
 fi
-rm -f "$comments_tmp"
 
 # PR_COMMENTS_FILE must WIN over PR_COMMENTS_JSON, or the workflow's real input
 # could be silently shadowed by a stale inline value.
-comments_tmp=$(mktemp)
-authenticate_comments "$(printf '[{"body": "APPROVED-AT: codex %s"}]' "$OLD_SHA")" > "$comments_tmp"
-actual=0
-PR_LABELS="$FULL_LABELS" PR_BODY="$FULL_BODY" PR_IS_KVM=false PR_NUMBER=test \
-    PR_HEAD_SHA="$HEAD_SHA" PR_COMMENTS_FILE="$comments_tmp" \
-    PR_COMMENTS_JSON="$FULL_APPROVALS" PR_AUTHOR="$PR_AUTHOR_FIXTURE" \
-    bash "$LINT" >/dev/null 2>&1 || actual=$?
-if [ "$actual" -eq 1 ]; then
-    echo "ok   - PR_COMMENTS_FILE takes precedence over PR_COMMENTS_JSON (exit 1)"
-    pass=$((pass + 1))
-else
-    echo "FAIL - PR_COMMENTS_FILE takes precedence over PR_COMMENTS_JSON: got ${actual}"
-    fail=$((fail + 1))
+if owns_case; then
+    comments_tmp=$(mktemp)
+    authenticate_comments "$(printf '[{"body": "APPROVED-AT: codex %s"}]' "$OLD_SHA")" > "$comments_tmp"
+    actual=0
+    PR_LABELS="$FULL_LABELS" PR_BODY="$FULL_BODY" PR_IS_KVM=false PR_NUMBER=test \
+        PR_HEAD_SHA="$HEAD_SHA" PR_COMMENTS_FILE="$comments_tmp" \
+        PR_COMMENTS_JSON="$FULL_APPROVALS" PR_AUTHOR="$PR_AUTHOR_FIXTURE" \
+        bash "$LINT" >/dev/null 2>&1 || actual=$?
+    if [ "$actual" -eq 1 ]; then
+        echo "ok   - PR_COMMENTS_FILE takes precedence over PR_COMMENTS_JSON (exit 1)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL - PR_COMMENTS_FILE takes precedence over PR_COMMENTS_JSON: got ${actual}"
+        fail=$((fail + 1))
+    fi
+    rm -f "$comments_tmp"
 fi
-rm -f "$comments_tmp"
 
 PR_COMMENTS_FILE=/nonexistent/path/comments.json \
   run_message_case "an unreadable PR_COMMENTS_FILE is diagnosed as a plumbing fault" \
     1 "is not readable" "$FULL_LABELS" "$FULL_BODY" "" "$HEAD_SHA"
 
 echo
+if [ -n "${CORE_REVIEW_LINT_TEST_SHARD-}" ]; then
+    echo "core-review-protocol-lint shard ${shard_index}/${shard_count}: cases=${case_index} passed=${pass} failed=${fail}"
+    [ "$fail" -eq 0 ]
+    exit
+fi
+if [ "$((pass + fail))" -ne "$case_index" ]; then
+    echo "FAIL - evaluated $((pass + fail)) of ${case_index} cases"
+    exit 1
+fi
 echo "core-review-protocol-lint self-test: ${pass} passed, ${fail} failed."
 [ "$fail" -eq 0 ]

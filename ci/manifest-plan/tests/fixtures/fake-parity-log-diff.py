@@ -1,10 +1,4 @@
 #!/usr/bin/python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Test stand-in for the one `hermit log-diff` call the parity post-pass makes:
 
     log-diff <golden> <candidate> --json <report> --record-envelope cross-backend-detcore-v1
