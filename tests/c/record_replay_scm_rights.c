@@ -48,7 +48,12 @@
  *         which holds a stand-in eventfd in that slot, must take the link
  *         from the recording and serve the same event.
  *
- * Usage: record_replay_scm_rights pipe|stream|eventfd|inotify
+ *   memfd: maps one memfd MAP_SHARED several times in one process: twice
+ *         whole, once at an offset through the descriptor received over a
+ *         socketpair, and once at offset 0 by a thread. A write through any
+ *         mapping must be read through the others.
+ *
+ * Usage: record_replay_scm_rights pipe|stream|eventfd|inotify|memfd
  * Prints one line per step and exits 0 only if every step saw what Linux
  * gives a native run, the two eventfd lines that print an errno aside.
  */
@@ -430,10 +435,50 @@ static void inotify_mode(void) {
   rmdir(dir);
 }
 
+static void* map_shared(int fd, size_t len, off_t offset) {
+  void* address = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
+  check(address != MAP_FAILED, "mmap");
+  return address;
+}
+
+static void* touch_mapping(void* arg) {
+  int fd = *(int*)arg;
+  char* mine = map_shared(fd, 16, 0);
+  memcpy(mine + 10, "thread", 6);
+  return NULL;
+}
+
+static void memfd_mode(void) {
+  long page = sysconf(_SC_PAGESIZE);
+  int fd = memfd_create("hermit-shared", 0);
+  check(fd >= 0, "memfd_create");
+  check(ftruncate(fd, 2 * page) == 0, "ftruncate");
+  char* first = map_shared(fd, 2 * page, 0);
+  char* second = map_shared(fd, 2 * page, 0);
+  memcpy(first, "hello", 5);
+  printf("memfd: second sees %.5s\n", second);
+  memcpy(second + 5, "world", 5);
+  printf("memfd: first sees %.10s\n", first);
+
+  /* The received descriptor names the same file. */
+  int pair[2], received[MAX_FDS];
+  check(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0, "socketpair");
+  check(send_fds(pair[0], &fd, 1) == 0, "send memfd");
+  check(recv_fds(pair[1], received, 0) == 1, "receive memfd");
+  char* offset = map_shared(received[0], page, page);
+  memcpy(offset, "page two", 8);
+  printf("memfd: offset mapping reaches %.8s\n", first + page);
+
+  pthread_t thread;
+  check(pthread_create(&thread, NULL, touch_mapping, &fd) == 0, "spawn");
+  pthread_join(thread, NULL);
+  printf("memfd: thread's mapping reaches %.16s\n", second);
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc != 2) {
-    fprintf(stderr, "usage: %s pipe|stream|eventfd|inotify\n", argv[0]);
+    fprintf(stderr, "usage: %s pipe|stream|eventfd|inotify|memfd\n", argv[0]);
     return 2;
   }
   if (strcmp(argv[1], "pipe") == 0) {
@@ -444,6 +489,8 @@ int main(int argc, char** argv) {
     eventfd_mode();
   } else if (strcmp(argv[1], "inotify") == 0) {
     inotify_mode();
+  } else if (strcmp(argv[1], "memfd") == 0) {
+    memfd_mode();
   } else {
     fprintf(stderr, "unknown mode %s\n", argv[1]);
     return 2;

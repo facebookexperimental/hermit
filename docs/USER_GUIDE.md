@@ -2018,6 +2018,15 @@ fresh work directory. Save logs from both runs when narrowing the difference.
 - Keep the captured directory unchanged and use a compatible Hermit revision.
 - Record/replay support is experimental; some system calls and ancillary file
   descriptor behavior remain incomplete.
+- Replay maps recorded copies of file contents. Every `MAP_SHARED` mapping of
+  one file, in any process and PID namespace, maps one replay copy of that file
+  at its offset, opened with the access mode of the descriptor it was mapped
+  through, so a store through one is read through the others, as under Linux,
+  and a mapping of a descriptor opened read-only cannot be made writable. A
+  write through a descriptor reaches the mappings already made only when
+  replay holds the file itself (a file the recording created, or a memfd);
+  otherwise it reaches only mappings made after it, whose recorded contents
+  include it.
 
 ### CPUID Or Hardware Warnings
 

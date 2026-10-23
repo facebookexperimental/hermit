@@ -684,12 +684,16 @@ impl Replayer {
         offset: Option<i64>,
         advances_offset: bool,
     ) -> Result<(), Error> {
-        let pid = guest.pid();
-        if !self.fd_is_in_replay_root(pid, syscall.fd()) {
+        // The writing thread's own descriptor table names the file: a thread
+        // made without `CLONE_FILES` has a table of its own.
+        let (pid, tid) = (guest.pid(), guest.tid());
+        if !self.fd_is_in_replay_root(tid, syscall.fd())
+            && !super::mmap::writes_shared_backing(tid, syscall.fd())
+        {
             return Ok(());
         }
         let bytes = read_write_bytes(&guest.memory(), syscall, count)?;
-        self.replay_regular_file_bytes(pid, pid, syscall.fd(), &bytes, offset, advances_offset)
+        self.replay_regular_file_bytes(pid, tid, syscall.fd(), &bytes, offset, advances_offset)
     }
 
     /// Writes `bytes` at `offset` to the replay-root regular file `fd` names
@@ -704,6 +708,12 @@ impl Replayer {
         offset: Option<i64>,
         advances_offset: bool,
     ) -> Result<(), Error> {
+        // The pages of a file that guest mappings share are the replay's
+        // backing of it, which the write reaches too, as it reaches the page
+        // cache every mapping of the file maps under Linux.
+        if let Some(offset) = offset.and_then(|offset| u64::try_from(offset).ok()) {
+            super::mmap::write_shared_backing(task, fd, bytes, offset).map_err(Error::Io)?;
+        }
         if !self.fd_is_in_replay_root(task, fd) {
             return Ok(());
         }
@@ -1139,6 +1149,13 @@ impl Replayer {
                 let (output_lock, output) = outputs.output_endpoint(output_fd)?;
                 let _guard = output_lock.lock().await;
                 truncate_replay_output(output, event.length)?;
+            }
+            if event.replay_regular_file
+                && event.output_fd.is_none()
+                && let Ok(length) = u64::try_from(event.length)
+            {
+                super::mmap::truncate_shared_backing(guest.tid(), syscall.fd(), length)
+                    .map_err(Error::Io)?;
             }
             if event.replay_regular_file
                 && event.output_fd.is_none()

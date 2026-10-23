@@ -5603,6 +5603,359 @@ fn record_replay_reads_an_inotify_instance_received_over_scm_rights() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// `MAP_SHARED` mappings of one memfd in one process (see
+/// `tests/c/record_replay_scm_rights.c memfd`): two whole mappings, one at an
+/// offset through the descriptor received over a socketpair, and one a thread
+/// makes. Replay mapped a recorded file mapping as anonymous memory filled with
+/// the recorded bytes, so each mapping used to be a separate copy, and a write
+/// through one never reached the others; the guest then read stale bytes, took
+/// another path and replay diverged. Replay now maps every shared mapping of
+/// the file as a view of one memfd that backs it. Both phases must print what
+/// a native run prints.
+#[test]
+fn record_replay_shares_memory_between_mappings_of_one_memfd() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "scm-rights-memfd",
+        &workload("c_record_replay_scm_rights").path,
+        &["memfd"],
+        "memfd: second sees hello\n\
+         memfd: first sees helloworld\n\
+         memfd: offset mapping reaches page two\n\
+         memfd: thread's mapping reaches helloworldthread\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The replay of `tests/c/record_replay_shared_mappings.c` in `mode`, which
+/// both phases must print as `expected`, as a native run prints it. Replay
+/// backs each recorded shared file with one file of its own and maps every
+/// shared mapping of it as a view of that file at the recorded offset, so
+/// the mappings share exactly the pages Linux shared while recording.
+fn shared_mappings_failures(mode: &str, expected: &str) -> Vec<String> {
+    record_replay_output_failures(
+        &format!("shared-mappings-{mode}"),
+        &workload("c_record_replay_shared_mappings").path,
+        &[mode],
+        expected,
+    )
+}
+
+/// Two mappings that overlap, file pages [0, 2) and then [1, 3), share page 1,
+/// though neither holds the other's whole range.
+#[test]
+fn record_replay_shares_the_page_two_overlapping_mappings_hold() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "overlap",
+        "overlap: high sees from low\noverlap: low sees from high\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The overlapping mappings above, made in the other order: [1, 3) first.
+#[test]
+fn record_replay_shares_the_page_two_overlapping_mappings_hold_made_in_reverse() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "overlap-reverse",
+        "overlap-reverse: high sees from low\noverlap-reverse: low sees from high\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A mapping of file pages [0, 2) made after one of page 0 and one of page 1
+/// shares each page with the mapping that holds it, though no earlier mapping
+/// holds its whole range.
+#[test]
+fn record_replay_shares_a_mapping_across_two_adjacent_ones() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "adjacent-span",
+        "adjacent-span: span sees left and right\nadjacent-span: pieces see LEFT and RIGHT\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A two-page mapping whose first page was unmapped still shares its second
+/// page with a later mapping of that page, though nothing is mapped any more
+/// at the address the first mapping started at.
+#[test]
+fn record_replay_shares_the_page_left_after_a_mapping_lost_its_head() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "head-unmap",
+        "head-unmap: survivor sees new view\nhead-unmap: new view sees survivor\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A two-page mapping whose last page was unmapped shares its first page with
+/// a later mapping of both pages, and the later mapping's second page, which
+/// the first no longer maps, with a third mapping of it.
+#[test]
+fn record_replay_shares_the_page_left_after_a_mapping_lost_its_tail() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "tail-unmap",
+        "tail-unmap: survivor sees new view\ntail-unmap: new view sees survivor\ntail-unmap: third view sees page one\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A mapping that mremap moved still shares its pages with a later mapping of
+/// the file.
+#[test]
+fn record_replay_shares_a_mapping_mremap_moved() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "moved-source",
+        "moved-source: moved mapping sees new view\nmoved-source: new view sees moved\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A pwrite through the descriptor between two mappings of a page reaches the
+/// second mapping: replay writes each mapping's recorded bytes, the page as
+/// the write left it, to the file's backing when it maps it.
+#[test]
+fn record_replay_maps_what_a_pwrite_left_in_a_mapped_file() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "pwrite-remap",
+        "pwrite-remap: first view sees before\npwrite-remap: second view sees after!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A pwrite through the descriptor reaches a mapping made before it, as it
+/// reaches the page cache under Linux. Replay applies the write to the file's
+/// backing when the descriptor names a replay object of its own, here the
+/// guest's memfd.
+#[test]
+fn record_replay_shows_a_pwrite_through_an_older_mapping() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "pwrite-old-view",
+        "pwrite-old-view: first view sees before\npwrite-old-view: first view then sees after!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A forked child that maps the file again shares it with the parent's
+/// mapping, as one page cache serves both under Linux.
+#[test]
+fn record_replay_shares_a_file_a_forked_child_maps_again() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "fork-child",
+        "fork-child: child's mapping sees parent\nfork-child: parent sees child!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A guest whose descriptor table is full at its soft limit still replays its
+/// shared mappings. Hermit runs with a soft limit of 256 descriptors, which
+/// the guest inherits and fills; Detcore's virtual limit leaves that kernel
+/// limit alone. Replay needs a free slot for the guest to open the file's
+/// backing, so it raises the guest's soft limit for it and puts it back
+/// before the guest runs: the guest's table is still full afterwards.
+#[test]
+fn record_replay_shares_a_mapping_made_with_a_full_descriptor_table() {
+    let _guard = hermit_record_lock();
+    let (failures, _) = record_replay_output_failures_with(
+        "shared-mappings-near-limit",
+        &workload("c_record_replay_shared_mappings").path,
+        &["near-limit"],
+        &|command| {
+            // SAFETY: setrlimit is async-signal-safe, and the closure touches
+            // nothing else of the forked child's.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = limit.rlim_cur.min(256);
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        },
+        &[],
+        "near-limit: second sees at limit\nnear-limit: the table is still full\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A write through a descriptor of a thread whose table is its own (cloned
+/// without `CLONE_FILES`) reaches that thread's mapping of the file: replay
+/// finds the written file in the writing thread's table, where the number
+/// names another memfd in the leader's.
+#[test]
+fn record_replay_shows_a_write_through_a_threads_own_descriptor_table() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "private-table",
+        "private-table: worker's mapping sees worker\n\
+         private-table: leader's memfd is untouched\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A child in a PID namespace of its own that maps the file again shares it
+/// with the mapping it inherited and with its parent's: PID namespaces do not
+/// divide a file's pages, and replay keeps one backing per recorded file for
+/// the whole replay.
+#[test]
+fn record_replay_shares_a_file_a_child_in_a_new_pid_namespace_maps_again() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "nested-pidns",
+        "nested-pidns: child is pid 1 and sees parent\n\
+         nested-pidns: child's inherited mapping sees child!\n\
+         nested-pidns: parent sees child!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A shared mapping made through a descriptor opened read-only cannot be made
+/// writable, as Linux refuses with EACCES, while one made through a
+/// descriptor opened for reading and writing can: replay opens the file's
+/// backing with the recorded descriptor's access mode.
+#[test]
+fn record_replay_refuses_to_make_a_read_only_shared_mapping_writable() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "read-only-mprotect",
+        "read-only-mprotect: read-only descriptor: EACCES\n\
+         read-only-mprotect: read-write descriptor: made writable, sees contents\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A guest that chroots into a directory below the replay root and maps the
+/// file again shares it with the mapping it made before: the backing belongs
+/// to the replay, not to the root the guest sees, and the chrooted guest
+/// opens it through a link into its own root made for that open.
+#[test]
+fn record_replay_shares_a_file_a_chrooted_guest_maps_again() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "chroot",
+        "chroot: the new mapping sees outside\n\
+         chroot: the old mapping sees inside!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A guest that asks for a seccomp filter killing the calls a descriptor
+/// hand-off by receive would inject gets none, in record and in replay
+/// (Detcore refuses every filter), and its shared mappings replay: replay
+/// hands it the backing to open by name, with no such call.
+#[test]
+fn record_replay_shares_mappings_of_a_guest_that_asked_for_a_seccomp_filter() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "seccomp-filter",
+        "seccomp-filter: no_new_privs ENOSYS, install EOPNOTSUPP\n\
+         seccomp-filter: second sees filtered\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Installs, in the process about to exec, a seccomp filter that allows every
+/// call but `acct(2)`, which fails with EPERM: selective by action, and one
+/// that neither Hermit nor the guest makes.
+fn install_acct_refusing_filter() -> std::io::Result<()> {
+    let filter = [
+        // A = seccomp_data.nr
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_acct as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr().cast_mut(),
+    };
+    // SAFETY: prctl and seccomp are async-signal-safe, and `program` names
+    // `filter`, which outlives both calls.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            || libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                0,
+                &raw const program,
+            ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// A replay under a seccomp filter Hermit inherited from whatever launched
+/// it, which `--unsafe-ignore-host-seccomp` admits (as a library caller of
+/// replay is not checked), refuses its first shared file mapping by name
+/// before it adds any call to the guest: the filter allowed every recorded
+/// call, but is not known to allow the calls replay would add, and could kill
+/// or trap one. Record, which adds none, runs as natively.
+#[test]
+fn record_replay_refuses_shared_mappings_under_an_inherited_seccomp_filter() {
+    let _guard = hermit_record_lock();
+    let (failures, stderrs) = record_replay_output_failures_with(
+        "shared-mappings-inherited-filter",
+        &workload("c_record_replay_shared_mappings").path,
+        &["overlap"],
+        &|command| {
+            // SAFETY: the closure makes only async-signal-safe calls.
+            unsafe { command.pre_exec(install_acct_refusing_filter) };
+        },
+        &["--unsafe-ignore-host-seccomp"],
+        "overlap: high sees from low\noverlap: low sees from high\n",
+    );
+    assert_eq!(failures.len(), 1, "{}", failures.join("\n"));
+    assert!(
+        failures[0].starts_with("shared-mappings-inherited-filter replay"),
+        "{}",
+        failures[0]
+    );
+    let stderr = stderrs.last().expect("the replay's stderr");
+    assert!(
+        stderr.contains("replay cannot make a MAP_SHARED file mapping share")
+            && stderr.contains("admit the calls that make the view")
+            && stderr.contains("Seccomp_filters: 1"),
+        "{stderr}"
+    );
+}
+
 /// A guest that accepts its own loopback TCP connections (see
 /// `tests/c/record_replay_tcp_accept.c`). Record used to let `accept(2)` and
 /// `accept4(2)` run live and logged nothing, so replay issued them against a

@@ -144,8 +144,13 @@ pub struct ReplayMaterializationScope {
 impl ReplayMaterializationScope {
     pub fn new(root_fd: libc::c_int) -> io::Result<Self> {
         let root = duplicate_controller_fd(root_fd)?;
+        let identity = identity_for_fd(root.as_raw_fd())?;
+        replay_roots()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((identity, root.try_clone()?));
         Ok(Self {
-            identity: identity_for_fd(root.as_raw_fd())?,
+            identity,
             _root: root,
         })
     }
@@ -167,7 +172,36 @@ impl Drop for ReplayMaterializationScope {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .retain(|pending| pending.root != self.identity);
         }
+        replay_roots()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(identity, _)| *identity != self.identity);
     }
+}
+
+/// The real roots of the replays this process runs: each replay's own root
+/// directory, its `TempChroot`, as `ReplayMaterializationScope` holds it,
+/// whatever root a guest process later chroots into.
+fn replay_roots() -> &'static Mutex<Vec<(ReplayFileIdentity, OwnedFd)>> {
+    static ROOTS: OnceLock<Mutex<Vec<(ReplayFileIdentity, OwnedFd)>>> = OnceLock::new();
+    ROOTS.get_or_init(Default::default)
+}
+
+/// The real root of the replay guest process `pid` belongs to, as its
+/// device and inode and a path descriptor: the replay whose root is the
+/// process's own, or else the only replay this process runs, which a guest
+/// that chrooted belongs to. `None` when no replay root is known here, or
+/// several are and none is the process's own.
+pub(super) fn replay_root_of(pid: Pid) -> Option<((u64, u64), OwnedFd)> {
+    let own = replay_root_identity(pid).ok()?;
+    let roots = replay_roots()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (identity, root) = roots
+        .iter()
+        .find(|(identity, _)| *identity == own)
+        .or_else(|| (roots.len() == 1).then(|| &roots[0]))?;
+    Some(((identity.device, identity.inode), root.try_clone().ok()?))
 }
 
 fn duplicate_controller_fd(fd: libc::c_int) -> io::Result<OwnedFd> {
@@ -1251,6 +1285,8 @@ impl Tool for Replayer {
             None => EventStreamId::root(),
             Some((_, state)) => state.child_stream_ids.next(&state.stream_id),
         };
+        // Its mappings keep shared files' backings alive.
+        mmap::track_task(child.as_raw());
         // We have to unwrap because there is no way to handle errors here.
         ReplayerThreadState {
             events: EventReader::open(&self.data, &stream_id).unwrap_or_else(|err| {

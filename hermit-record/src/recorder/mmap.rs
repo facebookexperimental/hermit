@@ -26,6 +26,7 @@ use super::Recorder;
 use crate::event::MadviseEvent;
 use crate::event::MadviseRefill;
 use crate::event::MmapEvent;
+use crate::event::SharedMapping;
 use crate::event::SyscallEvent;
 
 const PAGE_SIZE: usize = 4096;
@@ -197,6 +198,31 @@ fn read_readable_runs(mem: &std::fs::File, start: usize, end: usize) -> Vec<(usi
     runs
 }
 
+/// The file a `MAP_SHARED` mapping of descriptor `fd` of thread `tid` maps,
+/// the mapping's `offset` in it, and the descriptor's access mode.
+/// `/proc/<tid>` shows that thread's own descriptor table, which is not the
+/// leader's for a thread cloned without `CLONE_FILES`.
+fn shared_mapping(tid: i32, fd: i32, offset: i64) -> Option<SharedMapping> {
+    let metadata = std::fs::metadata(format!("/proc/{tid}/fd/{fd}")).ok()?;
+    let fdinfo = std::fs::read_to_string(format!("/proc/{tid}/fdinfo/{fd}")).ok()?;
+    Some(SharedMapping {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        offset: u64::try_from(offset).ok()?,
+        access: descriptor_access(&fdinfo)?,
+    })
+}
+
+/// The access mode in a `/proc/<pid>/fdinfo/<fd>` listing: the `O_ACCMODE`
+/// bits of its octal `flags:` line.
+fn descriptor_access(fdinfo: &str) -> Option<i32> {
+    let flags = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("flags:"))?
+        .trim();
+    Some(i32::from_str_radix(flags, 8).ok()? & libc::O_ACCMODE)
+}
+
 impl Recorder {
     pub(super) async fn handle_mmap<G: Guest<Self>>(
         &self,
@@ -210,6 +236,13 @@ impl Recorder {
         }
 
         let len = syscall.len();
+        // Read before the call: the descriptor names the same file then, and a
+        // sibling thread could not have closed it, as the call holds the turn.
+        let shared = if syscall.flags().contains(MapFlags::MAP_SHARED) {
+            shared_mapping(guest.tid().as_raw(), syscall.fd(), syscall.offset())
+        } else {
+            None
+        };
 
         // Do the injection. We need to record the pointer the mapping is at and
         // all of the bytes contained in the mapping. This is very inefficient
@@ -241,6 +274,7 @@ impl Recorder {
                     Ok(SyscallEvent::Mmap(MmapEvent {
                         addr: addr.as_raw(),
                         buf,
+                        shared,
                     }))
                 }
                 Err(errno) => Err(errno),
@@ -331,6 +365,17 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fdinfo's `flags:` line is octal; its `O_ACCMODE` bits are the access
+    /// mode, whatever else (`O_CLOEXEC`, `O_LARGEFILE`) is set.
+    #[test]
+    fn a_descriptors_access_mode_is_read_from_its_fdinfo() {
+        let fdinfo = |flags: &str| format!("pos:\t0\nflags:\t{flags}\nmnt_id:\t25\nino:\t7\n");
+        assert_eq!(descriptor_access(&fdinfo("02100002")), Some(libc::O_RDWR));
+        assert_eq!(descriptor_access(&fdinfo("0100000")), Some(libc::O_RDONLY));
+        assert_eq!(descriptor_access(&fdinfo("02000001")), Some(libc::O_WRONLY));
+        assert_eq!(descriptor_access("pos:\t0\n"), None);
+    }
 
     const MAPS: &str = "\
 00400000-00401000 r-xp 00000000 08:01 1234 /usr/bin/guest
