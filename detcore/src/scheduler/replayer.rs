@@ -157,6 +157,28 @@ fn is_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
     false
 }
 
+/// The fields that make `observed` a hard desync from `expected` (see
+/// [`is_hard_desync`]), by name, so that a fatal desync says what differed.
+/// A schedule recorded on KVM before KVM reported the guest's own return
+/// address shows `end_rip` here: its syscall events hold the address of
+/// the backend's trampoline.
+fn hard_desync_fields(observed: &SchedEvent, expected: &SchedEvent) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if observed.dettid != expected.dettid {
+        fields.push("dettid");
+    }
+    if observed.op != expected.op {
+        fields.push("op");
+    }
+    if observed.start_rip != expected.start_rip {
+        fields.push("start_rip");
+    }
+    if observed.end_rip != expected.end_rip {
+        fields.push("end_rip");
+    }
+    fields
+}
+
 fn is_hard_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
     let mut strip1 = observed.clone();
     let mut strip2 = expected.clone();
@@ -323,7 +345,14 @@ impl Replayer {
                 let counts = self.desync_counts.entry(mytid).or_default();
                 if is_hard_desync(observed, &expected) {
                     if self.die_on_desync {
-                        eprintln!("Replay mode desynchronized from trace, bailing out.");
+                        eprintln!(
+                            "Replay mode desynchronized from trace, bailing out: event #{} differs \
+                             in {} (observed {}, recorded {})",
+                            current_ix,
+                            hard_desync_fields(observed, &expected).join(", "),
+                            observed,
+                            expected,
+                        );
                         return ReplayAction::Stop(StopReason::FatalDesync);
                     }
                     counts.hard += 1;
@@ -578,6 +607,30 @@ mod tests {
                 ..*se
             })
             .collect()
+    }
+
+    /// A fatal desync names the fields that differed: an event that matches
+    /// except for its `end_rip` (a schedule whose syscall events hold a
+    /// different return address) names exactly `end_rip`.
+    #[test]
+    fn a_hard_desync_names_the_fields_that_differ() {
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = b.other(SOME_RIP, tid(3));
+        let observed = SchedEvent {
+            end_rip: std::num::NonZeroUsize::new(SOME_RIP + 2),
+            ..recorded
+        };
+        assert!(is_hard_desync(&observed, &recorded));
+        assert_eq!(hard_desync_fields(&observed, &recorded), vec!["end_rip"]);
+        let other_thread = SchedEvent {
+            dettid: tid(4),
+            ..observed
+        };
+        assert_eq!(
+            hard_desync_fields(&other_thread, &recorded),
+            vec!["dettid", "end_rip"]
+        );
+        assert!(hard_desync_fields(&recorded, &recorded).is_empty());
     }
 
     #[test]
