@@ -57,8 +57,10 @@ use reverie::process::Namespace;
 use reverie::process::RunError;
 
 const GROUP_FILE: &str = "/etc/group";
+const LD_SO_CACHE: &str = "/etc/ld.so.cache";
 const NSCD_DIR: &str = "/var/run/nscd";
 const DETERMINISTIC_GROUP_ROOT: &[u8] = b"/tmpvol/.hermit/etc/group";
+const DETERMINISTIC_LD_SO_CACHE_ROOT: &[u8] = b"/tmpvol/.hermit/etc/ld.so.cache";
 const DETERMINISTIC_NSCD_ROOT: &[u8] = b"/tmpvol/.hermit/run/nscd";
 const DETERMINISTIC_TMP_ROOT: &[u8] = b"/tmpvol/.hermit/tmp";
 
@@ -566,6 +568,7 @@ impl MountInfoRootSource {
 // exist when the child binds them.
 pub(super) struct IdentityGuard {
     _group_file: Option<tempfile::NamedTempFile>,
+    _ld_so_cache: Option<tempfile::NamedTempFile>,
     _nscd_dir: Option<tempfile::TempDir>,
     mountinfo_roots: Vec<MountInfoRootSource>,
     user_mount_targets: Vec<PathBuf>,
@@ -644,6 +647,7 @@ impl IdentityGuard {
     pub(super) fn empty() -> Self {
         Self {
             _group_file: None,
+            _ld_so_cache: None,
             _nscd_dir: None,
             mountinfo_roots: Vec::new(),
             user_mount_targets: Vec::new(),
@@ -1085,8 +1089,38 @@ fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
     Ok(group_file)
 }
 
+/// Snapshot the host's dynamic-linker cache into a private temp file, or
+/// `None` when the host has none. The host's package manager replaces
+/// `/etc/ld.so.cache` (ldconfig writes a new file and renames it over the old
+/// one) whenever it installs a package, which on a managed host is many times
+/// an hour. A guest's loader opens the cache at every exec and keeps it open
+/// while it maps it, so a replacement during a run gives that run a new inode
+/// at a later open (named as a host input change) or an `fstat` of the open
+/// descriptor with `nlink` 0 instead of 1, which no host-input check can name.
+/// On 2026-10-23 that failed compat/nm and compat/openssl verify/kvm in one
+/// full validation. A copy taken when the container is set up, bound
+/// read-only over the path, keeps the cache one unchanging file for the
+/// guest's whole run, as the frozen `/etc/group` keeps group resolution.
+fn frozen_ld_so_cache() -> Result<Option<tempfile::NamedTempFile>, Error> {
+    let contents = match fs::read(LD_SO_CACHE) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        read => read.context("Failed to read the host dynamic-linker cache")?,
+    };
+    let mut cache = tempfile::NamedTempFile::new()
+        .context("Failed to create the frozen dynamic-linker cache for the guest")?;
+    cache
+        .write_all(&contents)
+        .context("Failed to populate the frozen dynamic-linker cache for the guest")?;
+    cache
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o644))
+        .context("Failed to set permissions on the frozen guest dynamic-linker cache")?;
+    Ok(Some(cache))
+}
+
 /// Deterministic identity-resolution mounts shared by `run`, `record`, and
-/// `replay`: a frozen `/etc/group` and an empty directory over the host nscd
+/// `replay`: a frozen `/etc/group`, a frozen `/etc/ld.so.cache`
+/// ([`frozen_ld_so_cache`]) and an empty directory over the host nscd
 /// cache. These keep guest NSS lookups from reaching nondeterministic host
 /// state (the nscd cache and the systemd-userdb socket), so record/replay
 /// reproduce the same group/user resolution that `run` mode already enforces.
@@ -1099,6 +1133,15 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
         DETERMINISTIC_GROUP_ROOT,
     )?];
     let mut mounts = vec![Mount::bind(group_file.path(), GROUP_FILE).readonly()];
+    let ld_so_cache = frozen_ld_so_cache()?;
+    if let Some(cache) = &ld_so_cache {
+        mountinfo_roots.push(MountInfoRootSource::new(
+            cache.path(),
+            Path::new(LD_SO_CACHE),
+            DETERMINISTIC_LD_SO_CACHE_ROOT,
+        )?);
+        mounts.push(Mount::bind(cache.path(), LD_SO_CACHE).readonly());
+    }
 
     // Host nscd cache readiness is external state and can differ between runs.
     let nscd_dir = if Path::new(NSCD_DIR).is_dir() {
@@ -1125,6 +1168,7 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
         mounts,
         IdentityGuard {
             _group_file: Some(group_file),
+            _ld_so_cache: ld_so_cache,
             _nscd_dir: nscd_dir,
             mountinfo_roots,
             user_mount_targets: Vec::new(),
@@ -5894,6 +5938,39 @@ mod tests {
         );
     }
 
+    // A host package install replaces /etc/ld.so.cache by renaming a new
+    // file over it, which gave a running guest a new inode or an fstat with
+    // nlink 0. The guest's cache is a frozen copy with the host's bytes, bound
+    // read-only at the literal path (a canonicalized file target would carry
+    // a trailing separator, which mount refuses with ENOTDIR).
+    #[test]
+    fn identity_hardening_freezes_the_dynamic_linker_cache() {
+        let (mounts, guard) =
+            identity_hardening_mounts().expect("identity hardening mounts should be constructible");
+        let Ok(host) = fs::read(LD_SO_CACHE) else {
+            assert!(guard._ld_so_cache.is_none());
+            return;
+        };
+        let cache = guard
+            ._ld_so_cache
+            .as_ref()
+            .expect("a host with a dynamic-linker cache gets a frozen copy");
+        assert_eq!(fs::read(cache.path()).unwrap(), host);
+        let bound = mounts
+            .iter()
+            .filter(|mount| mount.get_target() == Path::new(LD_SO_CACHE))
+            .collect::<Vec<_>>();
+        assert_eq!(bound.len(), 1, "{mounts:?}");
+        assert_eq!(
+            bound[0].get_target().as_os_str().as_encoded_bytes(),
+            LD_SO_CACHE.as_bytes()
+        );
+        assert!(guard.mountinfo_roots.iter().any(|root| {
+            root.target == Path::new(LD_SO_CACHE)
+                && root.deterministic_root.as_deref() == Some(DETERMINISTIC_LD_SO_CACHE_ROOT)
+        }));
+    }
+
     #[test]
     fn mountinfo_provenance_uses_object_identity_not_temp_name_or_target() {
         let actual = tempfile::NamedTempFile::new().expect("create actual temporary source");
@@ -5902,6 +5979,7 @@ mod tests {
             MountInfoRootSource::new(actual.path(), &target, b"/tmpvol/.hermit/matching").unwrap();
         let guard = IdentityGuard {
             _group_file: Some(actual),
+            _ld_so_cache: None,
             _nscd_dir: None,
             mountinfo_roots: vec![matching],
             user_mount_targets: Vec::new(),
@@ -5976,6 +6054,7 @@ mod tests {
                 .unwrap();
         let guard = IdentityGuard {
             _group_file: Some(actual),
+            _ld_so_cache: None,
             _nscd_dir: None,
             mountinfo_roots: vec![same_target_wrong_source],
             user_mount_targets: Vec::new(),
