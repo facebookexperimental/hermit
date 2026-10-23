@@ -942,6 +942,13 @@ mod tests {
         ("chaos-epoch-length-ns", &["--chaos-epoch-length-ns=100"]),
         ("record-preemptions", &["--record-preemptions"]),
         (
+            "strict-schedule-boundaries",
+            &[
+                "--strict-schedule-boundaries",
+                "--record-preemptions-to=/tmp/boundaries.json",
+            ],
+        ),
+        (
             "record-preemptions-to",
             &["--record-preemptions-to=/tmp/p.json"],
         ),

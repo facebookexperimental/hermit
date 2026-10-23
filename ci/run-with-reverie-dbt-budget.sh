@@ -2505,7 +2505,15 @@ fi
 # Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory, SDK and
 # native inputs, calibrated budget, job width and limits carry unchanged from
 # the 80f7dc63 entry.
-expected_pin=93a4273376476c5fa5a93f735ecbcf53bdbc5cc6
+# CARRY TO 32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14 (2026-10-23): from
+# 93a4273376476c5fa5a93f735ecbcf53bdbc5cc6. The namespace cleanup repair
+# changes only launcher.rs and its tests. build.rs, the complete DynamoRIO
+# vendor and third-party trees, DBT/root manifests, root lock and toolchain
+# retain identical Git object IDs. Native build inputs and the content-key
+# algorithm are unchanged, so preserve the calibrated budget, job width and
+# limits. This is a source-identity carry, not a new cold timing/install-key
+# measurement. Related: https://github.com/rrnewton/reverie/pull/1100
+expected_pin=32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
