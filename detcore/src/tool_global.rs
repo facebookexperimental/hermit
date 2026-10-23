@@ -1655,8 +1655,12 @@ impl GlobalState {
 
         let preemptions_to_replay: Option<HistoryReader> =
             cfg.replay_preemptions_from.as_ref().map(|path| {
-                HistoryReader::read(path)
-                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error))
+                // Keep ordinary file/JSON errors in their original panic class.
+                let history = HistoryReader::read(path).unwrap();
+                history
+                    .require_legacy_mode()
+                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+                history
             });
         let range = Self::read_port_range();
         let network = Self::network_engine(cfg).map(Mutex::new);

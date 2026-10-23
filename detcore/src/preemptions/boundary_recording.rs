@@ -244,6 +244,12 @@ impl HistoryReader {
         Recording::read(path).map(Self)
     }
 
+    /// History-only replay cannot honor boundary records. Admission must not
+    /// silently project a new-format recording into legacy priorities/RCBs.
+    pub(crate) fn require_legacy_mode(&self) -> anyhow::Result<()> {
+        self.0.require_strict_mode(false)
+    }
+
     pub(crate) fn thread_initial_priority(
         &self,
         tid: &crate::types::DetTid,
@@ -417,6 +423,7 @@ mod tests {
         writer.flush().unwrap();
         let before = std::fs::read(&path).unwrap();
         let history = HistoryReader::read(&path).unwrap();
+        assert!(history.require_legacy_mode().is_err());
         assert_eq!(
             history.thread_initial_priority(&tid),
             Some(crate::scheduler::runqueue::DEFAULT_PRIORITY)
@@ -581,5 +588,34 @@ mod explicit_mode_tests {
         assert!(typed.require_strict_mode(true).is_ok());
         assert!(legacy.require_strict_mode(true).is_err());
         assert!(typed.require_strict_mode(false).is_err());
+    }
+    #[test]
+    fn ordinary_history_admits_legacy_and_retains_read_error_panics() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.json");
+        std::fs::write(
+            &path,
+            Recording::Legacy(PreemptionRecord::default())
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            HistoryReader::read(&path)
+                .unwrap()
+                .require_legacy_mode()
+                .is_ok()
+        );
+        for contents in [None, Some("not a JSON recording")] {
+            match contents {
+                None => std::fs::remove_file(&path).unwrap(),
+                Some(value) => std::fs::write(&path, value).unwrap(),
+            }
+            let cfg = crate::Config {
+                replay_preemptions_from: Some(path.clone()),
+                ..crate::Config::default()
+            };
+            assert!(std::panic::catch_unwind(|| crate::GlobalState::for_tests(&cfg)).is_err());
+        }
     }
 }

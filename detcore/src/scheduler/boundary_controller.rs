@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_marker_and_partial_branch_keep_readmission_deferred_until_exact_eof() {
+    fn pending_marker_and_refused_branch_fragment_keep_readmission_deferred_until_exact_eof() {
         let branch = SchedEvent::branches(DetTid::from_raw(3), 10);
         let last = marker(3, 1);
         let mut scheduler = scheduler(vec![Record::Event(branch.clone()), last.clone()]);
@@ -535,7 +535,18 @@ mod tests {
         scheduler.priorities.insert(peer, REPLAY_DEFERRED_PRIORITY);
         let mut prefix = branch.clone();
         prefix.count = 4;
-        scheduler.consume_schedevent(&prefix);
+        assert!(
+            scheduler
+                .boundary_replayer
+                .as_mut()
+                .unwrap()
+                .observe(&Record::Event(prefix))
+                .is_err()
+        );
+        assert_eq!(
+            scheduler.boundary_replayer.as_ref().unwrap().stored_index(),
+            0
+        );
         scheduler.release_replay_priorities_if_exhausted();
         scheduler.readmit_ready_thread(peer);
         assert_eq!(
@@ -544,9 +555,7 @@ mod tests {
         );
         assert!(!scheduler.replay_priorities_released);
         assert!(scheduler.generate_partial_run_summary(None).is_err());
-        let mut suffix = branch;
-        suffix.count = 6;
-        scheduler.consume_schedevent(&suffix);
+        scheduler.consume_schedevent(&branch);
         assert!(
             !scheduler.replay_priorities_released,
             "the final marker still owns the stream"
@@ -587,9 +596,23 @@ mod tests {
             .insert(1, Some("marker.stack".into()));
         let mut part = branch.clone();
         part.count = 4;
-        assert!(scheduler.consume_schedevent(&part).print_stack.is_none());
-        part.count = 6;
-        assert_eq!(scheduler.consume_schedevent(&part).print_stack, Some(None));
+        assert!(
+            scheduler
+                .boundary_replayer
+                .as_mut()
+                .unwrap()
+                .observe(&Record::Event(part))
+                .is_err()
+        );
+        assert_eq!(
+            scheduler.boundary_replayer.as_ref().unwrap().stored_index(),
+            0
+        );
+        assert!(scheduler.boundary_stacktrace_events.contains_key(&0));
+        assert_eq!(
+            scheduler.consume_schedevent(&branch).print_stack,
+            Some(None)
+        );
         assert_eq!(
             scheduler
                 .consume_boundary_record(&last)

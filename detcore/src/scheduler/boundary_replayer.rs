@@ -26,18 +26,11 @@ use crate::slice_boundary::grant::Budget;
 pub(super) struct BoundaryReplayer {
     schedule: Schedule,
     next: usize,
-    // A partial Branch stays at the same stored index. End RIP/time belong to
-    // the complete span, so they are checked only when that span is complete.
-    branch_consumed: u32,
 }
 
 impl BoundaryReplayer {
     pub(super) fn new(schedule: Schedule) -> Self {
-        Self {
-            schedule,
-            next: 0,
-            branch_consumed: 0,
-        }
+        Self { schedule, next: 0 }
     }
 
     pub(super) fn stored_index(&self) -> usize {
@@ -92,44 +85,9 @@ impl BoundaryReplayer {
                 observed: Box::new(observed.clone()),
             });
         };
-        let mut remaining_partial = None;
-        if let (Record::Event(expected_event), Record::Event(observed_event)) = (expected, observed)
-            && expected_event.op == Op::Branch
-        {
-            let remaining = expected_event.count - self.branch_consumed;
-            let same_span = expected_event.dettid == observed_event.dettid
-                && observed_event.op == Op::Branch
-                && observed_event.count > 0
-                && observed_event.count <= remaining;
-            let starts_match = self.branch_consumed != 0
-                || expected_event.start_rip.is_none()
-                || expected_event.start_rip == observed_event.start_rip;
-            if !same_span || !starts_match {
-                return Err(self.mismatch(expected, observed));
-            }
-            if observed_event.count < remaining {
-                remaining_partial = Some(self.branch_consumed + observed_event.count);
-            } else {
-                // The final suffix must retain the stored endpoint evidence.
-                // Its own starting instruction is inside the span if an
-                // earlier prefix already retired, not the span's first RIP.
-                let mut suffix = expected_event.clone();
-                suffix.count = remaining;
-                if self.branch_consumed != 0 {
-                    suffix.start_rip = None;
-                }
-                Record::Event(suffix).check_observation(self.next, observed)?;
-            }
-        } else {
-            expected.check_observation(self.next, observed)?;
-        }
-        // Mutation is after every check above. A malformed boundary cannot
-        // skip a partial Branch or change the partial offset.
-        if let Some(consumed) = remaining_partial {
-            self.branch_consumed = consumed;
-            return Ok(ReplayAction::Continue(None));
-        }
-        self.branch_consumed = 0;
+        // Strict verification admits one actual observation per stored record.
+        // Unrecorded branch fragments would discard intermediate RIP/time evidence.
+        expected.check_observation(self.next, observed)?;
         self.next += 1;
         let Some(next_tid) = self.next_thread() else {
             return Ok(ReplayAction::Continue(None));
@@ -151,14 +109,6 @@ impl BoundaryReplayer {
                 })
             );
         Ok(ReplayAction::ContextSwitch(!deferred, next_tid, None))
-    }
-
-    fn mismatch(&self, expected: &Record, observed: &Record) -> Error {
-        Error::Mismatch {
-            index: self.next,
-            expected: Box::new(expected.clone()),
-            observed: Box::new(observed.clone()),
-        }
     }
 }
 
@@ -329,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_branch_keeps_stored_index_and_requires_exact_final_endpoint() {
+    fn partial_branch_is_refused_without_advancing_and_full_endpoints_remain_exact() {
         let mut whole = match event(3, Op::Branch, 10) {
             Record::Event(e) => e,
             _ => unreachable!(),
@@ -345,11 +295,10 @@ mod tests {
             end_time: Some(LogicalTime::from_nanos(400)),
             ..whole.clone()
         };
-        r.observe(&Record::Event(prefix)).unwrap();
+        assert!(r.observe(&Record::Event(prefix)).is_err());
         assert_eq!(r.stored_index(), 0);
         assert!(r.finish().is_err());
         assert!(r.observe(&marker).is_err());
-        assert_eq!(r.branch_consumed, 4);
         let suffix = SchedEvent {
             count: 6,
             start_rip: InstructionPointer::new(150),
@@ -358,26 +307,27 @@ mod tests {
         for bad in [
             SchedEvent {
                 count: 7,
-                ..suffix.clone()
+                ..whole.clone()
             },
             SchedEvent {
                 count: 0,
-                ..suffix.clone()
+                ..whole.clone()
             },
             SchedEvent {
                 end_rip: InstructionPointer::new(201),
-                ..suffix.clone()
+                ..whole.clone()
             },
             SchedEvent {
                 end_time: Some(LogicalTime::from_nanos(1001)),
-                ..suffix.clone()
+                ..whole.clone()
             },
         ] {
             assert!(r.observe(&Record::Event(bad)).is_err());
-            assert_eq!(r.branch_consumed, 4);
             assert_eq!(r.stored_index(), 0);
         }
-        r.observe(&Record::Event(suffix)).unwrap();
+        assert!(r.observe(&Record::Event(suffix)).is_err());
+        assert_eq!(r.stored_index(), 0);
+        r.observe(&Record::Event(whole)).unwrap();
         assert_eq!(r.stored_index(), 1);
         r.observe(&marker).unwrap();
         r.finish().unwrap();

@@ -3912,24 +3912,41 @@ enum ThreadStatus {
     NotRunning,
 }
 
+fn validate_strict_boundary_config(cfg: &Config) -> Result<(), &'static str> {
+    if !cfg.strict_schedule_boundaries {
+        return Ok(());
+    }
+    if cfg.chaos {
+        return Err("--strict-schedule-boundaries cannot be combined with --chaos");
+    }
+    if cfg.replay_preemptions_from.is_some() {
+        return Err(
+            "--strict-schedule-boundaries cannot be combined with --replay-preemptions-from",
+        );
+    }
+    if !cfg.sequentialize_threads || (!cfg.record_preemptions && cfg.replay_schedule_from.is_none())
+    {
+        return Err(
+            "--strict-schedule-boundaries requires sequentialized recording or schedule replay",
+        );
+    }
+    Ok(())
+}
+
 impl Scheduler {
     /// Create a new scheduler based on the configuration.
     pub fn new(cfg: &Config) -> Self {
-        if cfg.strict_schedule_boundaries
-            && (!cfg.sequentialize_threads
-                || (!cfg.record_preemptions && cfg.replay_schedule_from.is_none()))
-        {
-            exit_on_scheduler_refusal(&anyhow::anyhow!(
-                "strict schedule boundaries require sequentialized recording or schedule replay"
-            ));
+        if let Err(reason) = validate_strict_boundary_config(cfg) {
+            exit_on_scheduler_refusal(&anyhow::anyhow!(reason));
         }
         let mut boundary_replayer = None;
         let mut boundary_stacktrace_events = BTreeMap::new();
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
             Some(path) => {
                 trace!("Scheduler loading trace from path {}", path.display());
-                let recording =
-                    Recording::read(path).unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
+                // File/JSON failures retain the ordinary loader's panic class.
+                // Only explicit format-policy mismatches below are refusals.
+                let recording = Recording::read(path).unwrap();
                 recording
                     .require_strict_mode(cfg.strict_schedule_boundaries)
                     .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
@@ -34558,5 +34575,63 @@ mod poll_wake_tests {
         assert_eq!(wakes & perf, 0, "the preemption signal never does");
         // Without the record, the disposition decides, as before.
         assert_eq!(poll_wake_signals(&state, false) & usr1, 0);
+    }
+}
+
+#[cfg(test)]
+mod strict_boundary_admission_tests {
+    use super::*;
+
+    #[test]
+    fn strict_boundary_startup_names_unsupported_modes_without_changing_legacy() {
+        let mut cfg = Config {
+            strict_schedule_boundaries: true,
+            sequentialize_threads: true,
+            record_preemptions: true,
+            ..Config::default()
+        };
+        assert!(validate_strict_boundary_config(&cfg).is_ok());
+        cfg.chaos = true;
+        assert!(
+            validate_strict_boundary_config(&cfg)
+                .unwrap_err()
+                .contains("--chaos")
+        );
+        cfg.strict_schedule_boundaries = false;
+        assert!(validate_strict_boundary_config(&cfg).is_ok());
+        cfg.strict_schedule_boundaries = true;
+        cfg.chaos = false;
+        cfg.replay_preemptions_from = Some(PathBuf::from("history.json"));
+        assert!(
+            validate_strict_boundary_config(&cfg)
+                .unwrap_err()
+                .contains("--replay-preemptions-from")
+        );
+        cfg.strict_schedule_boundaries = false;
+        assert!(validate_strict_boundary_config(&cfg).is_ok());
+        cfg.strict_schedule_boundaries = true;
+        cfg.replay_preemptions_from = None;
+        cfg.record_preemptions = false;
+        assert!(validate_strict_boundary_config(&cfg).is_err());
+        cfg.replay_schedule_from = Some(PathBuf::from("schedule.json"));
+        assert!(validate_strict_boundary_config(&cfg).is_ok());
+        cfg.sequentialize_threads = false;
+        assert!(validate_strict_boundary_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn missing_and_corrupt_ordinary_schedule_remain_panics_not_policy_exits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schedule.json");
+        for contents in [None, Some("not a JSON schedule")] {
+            if let Some(contents) = contents {
+                std::fs::write(&path, contents).unwrap();
+            }
+            let cfg = Config {
+                replay_schedule_from: Some(path.clone()),
+                ..Config::default()
+            };
+            assert!(std::panic::catch_unwind(|| Scheduler::new(&cfg)).is_err());
+        }
     }
 }
