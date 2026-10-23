@@ -935,7 +935,11 @@ mod tests {
             // b4cd1664 and 74ed9f94; +28): 685.
             // Split the five mapping-capture birth cases into separately bounded
             // test identities, preserving every case and assertion (+4): 689.
-            assert_eq!(population, 689);
+            // redis_strict's declared-Redis tests (Hermit 9d901894): the Redis L2
+            // test moves there from frontier_app_benchmarks, plus
+            // a_declared_redis_pair_is_used_only_when_declared and
+            // a_bad_redis_declaration_is_refused_rather_than_replaced (+2): 691.
+            assert_eq!(population, 691);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
