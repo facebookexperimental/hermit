@@ -3295,7 +3295,7 @@ async fn run_sabre(
         backend_stats::request(print_summary_to_json_file),
         &stats,
     );
-    global
+    let finalized = global
         .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
         .await;
     tracing::info!(
@@ -3306,10 +3306,13 @@ async fn run_sabre(
         "SaBRe ptrace fallback completed",
     );
     if detcore_never_engaged {
-        return Err(Error::new(BackendRunFailure)
-            .context(sabre_uninstrumented_guest_message(&output.status)));
+        return detcore::combine_finalization(
+            Err(Error::new(BackendRunFailure)
+                .context(sabre_uninstrumented_guest_message(&output.status))),
+            finalized,
+        );
     }
-    Ok(output)
+    detcore::combine_finalization(Ok(output), finalized)
 }
 
 #[cfg(not(feature = "sabre"))]
@@ -3875,7 +3878,7 @@ async fn finish_kvm_tool_completion(
             completion
                 .global_state
                 .clean_up(print_summary, print_summary_to_json_file)
-                .await;
+                .await?;
             Ok(output)
         }
         Err(error) => {
@@ -4579,7 +4582,12 @@ async fn run_dbt(
             );
             global.force_shutdown_with_error();
             global.cancel_internal_scheduler().await;
-            global.clean_up(false, &None).await;
+            global.clean_up(false, &None).await.map_err(|error| {
+                error.context(format!(
+                    "DBT cleanup after observed guest status {:?}",
+                    output.status
+                ))
+            })?;
             (output, global) = launch().await.map_err(|error| {
                 anyhow!("failed to launch drrun ({}): {error}", drrun.display())
             })?;
@@ -4603,7 +4611,11 @@ async fn run_dbt(
             );
             global.force_shutdown_with_error();
             global.cancel_internal_scheduler().await;
-            global.clean_up(false, &None).await;
+            global.clean_up(false, &None).await.map_err(|error| {
+                error.context(format!(
+                    "DBT cleanup after observed guest status {status:?}"
+                ))
+            })?;
             (status, global) = launch().await.map_err(|error| {
                 anyhow!("failed to launch drrun ({}): {error}", drrun.display())
             })?;
@@ -4615,7 +4627,14 @@ async fn run_dbt(
         global.force_shutdown_with_error();
         global.cancel_internal_scheduler().await;
     }
-    global.clean_up(print_summary, &None).await;
+    global
+        .clean_up(print_summary, &None)
+        .await
+        .map_err(|error| {
+            error.context(format!(
+                "DBT cleanup after observed guest status {status:?}"
+            ))
+        })?;
     Ok(Output {
         status: status.into(),
         stdout,
@@ -5181,7 +5200,7 @@ async fn dispatch_backend(
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
-            global_state
+            let finalized = global_state
                 .clean_up_with_dispatch_stats(
                     print_summary,
                     print_summary_to_json_file,
@@ -5192,9 +5211,12 @@ async fn dispatch_backend(
             // the run's INFO lines is fixed (D25); a stopping refusal logs it
             // just before it exits instead.
             detcore::host_timed_producers::emit_run_end_log();
-            refuse_in_guest_policy(backend, policy_refusal)?;
-            settled?;
-            refuse_in_guest_trap_patching(backend, patched)?;
+            let result = (|| {
+                refuse_in_guest_policy(backend, policy_refusal)?;
+                settled?;
+                refuse_in_guest_trap_patching(backend, patched)
+            })();
+            detcore::combine_finalization(result, finalized)?;
             return Ok(exit_status);
         }
         #[cfg(not(feature = "liteinst"))]
@@ -5224,7 +5246,12 @@ async fn dispatch_backend(
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
     global_state
         .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
-        .await; // Before it's dropped by this function.
+        .await
+        .map_err(|error| {
+            error.context(format!(
+                "ptrace cleanup after observed guest status {exit_status:?}"
+            ))
+        })?; // Before it's dropped by this function.
     Ok(exit_status)
 }
 
@@ -5517,7 +5544,7 @@ async fn dispatch_output_backend(
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
-            global_state
+            let finalized = global_state
                 .clean_up_with_dispatch_stats(
                     print_summary,
                     print_summary_to_json_file,
@@ -5528,9 +5555,12 @@ async fn dispatch_output_backend(
             // the run's INFO lines is fixed (D25); a stopping refusal logs it
             // just before it exits instead.
             detcore::host_timed_producers::emit_run_end_log();
-            refuse_in_guest_policy(backend, policy_refusal)?;
-            settled?;
-            refuse_in_guest_trap_patching(backend, patched)?;
+            let result = (|| {
+                refuse_in_guest_policy(backend, policy_refusal)?;
+                settled?;
+                refuse_in_guest_trap_patching(backend, patched)
+            })();
+            detcore::combine_finalization(result, finalized)?;
             return Ok(Output {
                 status,
                 stdout: output.stdout,
@@ -5567,7 +5597,13 @@ async fn dispatch_output_backend(
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
     global_state
         .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
-        .await;
+        .await
+        .map_err(|error| {
+            error.context(format!(
+                "ptrace cleanup after observed guest status {:?}",
+                output.status
+            ))
+        })?;
     Ok(output)
 }
 

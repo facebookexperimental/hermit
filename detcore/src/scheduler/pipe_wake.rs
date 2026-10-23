@@ -92,7 +92,7 @@ impl Scheduler {
             }
             return ReadyOutcome::default();
         }
-        if self.replayer.is_some() {
+        if self.has_schedule_replay() {
             return ReadyOutcome::default();
         }
         let queued: Vec<DetTid> = self.run_queue.tids().copied().collect();

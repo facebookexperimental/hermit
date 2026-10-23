@@ -25,6 +25,8 @@ use crate::metadata::record_or_replay_config;
 use crate::ptrace_completion::Control;
 use crate::ptrace_completion::{self};
 
+type MountIdentityProvenance = Option<(Vec<u64>, Vec<u64>)>;
+
 /// Represents a recording that is currently running.
 pub struct Record {
     /// The running tracee.
@@ -139,6 +141,16 @@ impl Record {
         Ok(())
     }
 
+    fn finish_completed_metadata(
+        metadata: &mut Metadata,
+        metadata_path: &Path,
+        provenance: Result<MountIdentityProvenance, Error>,
+        finalized: Result<(), Error>,
+    ) -> Result<(), Error> {
+        let provenance = detcore::combine_finalization(provenance, finalized)?;
+        Self::persist_completed_metadata(metadata, metadata_path, provenance)
+    }
+
     /// Waits for the recording to finish and returns its exit status.
     pub async fn wait(self, control: Rc<Control>) -> Result<ExitStatus, Error> {
         let Self {
@@ -151,9 +163,9 @@ impl Record {
             .mount_identity_provenance()
             .map(|value| value.map(|p| (p.mountinfo_order, p.assignment_order)))
             .map_err(Error::msg);
-        global_state.clean_up(false, &None).await;
-        // Publish final metadata only after the original successful state joined.
-        Self::persist_completed_metadata(&mut metadata, &metadata_path, provenance?)?;
+        let finalized = global_state.clean_up(false, &None).await;
+        // Publish completed metadata only after provenance and finalization succeed.
+        Self::finish_completed_metadata(&mut metadata, &metadata_path, provenance, finalized)?;
         Ok(exit_status)
     }
 
@@ -169,9 +181,9 @@ impl Record {
             .mount_identity_provenance()
             .map(|value| value.map(|p| (p.mountinfo_order, p.assignment_order)))
             .map_err(Error::msg);
-        global_state.clean_up(false, &None).await;
-        // Publish final metadata only after the original successful state joined.
-        Self::persist_completed_metadata(&mut metadata, &metadata_path, provenance?)?;
+        let finalized = global_state.clean_up(false, &None).await;
+        // Publish completed metadata only after provenance and finalization succeed.
+        Self::finish_completed_metadata(&mut metadata, &metadata_path, provenance, finalized)?;
         Ok(output)
     }
 }
@@ -188,4 +200,43 @@ fn write_metadata(file: impl std::io::Write, metadata: &Metadata) -> std::io::Re
     let mut writer = std::io::BufWriter::new(file);
     serde_json::to_writer_pretty(&mut writer, metadata)?;
     std::io::Write::flush(&mut writer)
+}
+
+#[cfg(test)]
+mod finalization_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_finalization_preserves_original_metadata_bytes_and_provenance_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.json");
+        let mut metadata = Metadata::new(&Command::new(std::env::current_exe().unwrap())).unwrap();
+        for provenance_fails in [false, true] {
+            fs::write(&path, b"original metadata sentinel").unwrap();
+            let provenance = if provenance_fails {
+                Err(Error::msg("provenance failed first"))
+            } else {
+                Ok(None)
+            };
+            let error = Record::finish_completed_metadata(
+                &mut metadata,
+                &path,
+                provenance,
+                Err(crate::error::terminal_replay_refusal_for_test().await),
+            )
+            .unwrap_err();
+            assert_eq!(fs::read(&path).unwrap(), b"original metadata sentinel");
+            assert_eq!(
+                crate::SerializableError::from(error).kind(),
+                if provenance_fails {
+                    crate::FailureKind::Error
+                } else {
+                    crate::FailureKind::PolicyRefusal
+                }
+            );
+        }
+        Record::finish_completed_metadata(&mut metadata, &path, Ok(None), Ok(())).unwrap();
+        let actual: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(actual.is_object());
+    }
 }

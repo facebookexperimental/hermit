@@ -83,8 +83,8 @@ use crate::config::Config;
 use crate::consts::ROOT_DETPID;
 use crate::fd::SharedOpenFileError;
 use crate::ivar::Ivar;
-use crate::preemptions::PreemptionReader;
 use crate::preemptions::ThreadHistory;
+use crate::preemptions::boundary_recording::HistoryReader;
 use crate::procfs_inode;
 use crate::procfs_inode::ProcfsName;
 use crate::record_or_replay::RecordOrReplay;
@@ -1254,7 +1254,7 @@ pub struct GlobalState {
     cfg: Config,
 
     /// Storage for the preemption record read from `replay_preemptions_from`.
-    preemptions_to_replay: Option<PreemptionReader>,
+    preemptions_to_replay: Option<HistoryReader>,
 
     /// The start is when we construct the global state.  Close enough.
     realtime_start: SystemTime,
@@ -1653,10 +1653,11 @@ impl GlobalState {
             None
         };
 
-        let preemptions_to_replay: Option<PreemptionReader> = cfg
-            .replay_preemptions_from
-            .as_ref()
-            .map(|path| PreemptionReader::new(path));
+        let preemptions_to_replay: Option<HistoryReader> =
+            cfg.replay_preemptions_from.as_ref().map(|path| {
+                HistoryReader::read(path)
+                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error))
+            });
         let range = Self::read_port_range();
         let network = Self::network_engine(cfg).map(Mutex::new);
 
@@ -2043,7 +2044,15 @@ impl GlobalState {
     ///
     /// If the boolean argument is true, print to stderr, otherwise only print the summary
     /// to the log.
-    pub async fn clean_up(self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
+    ///
+    /// Returns terminal replay, recording, or summary errors after consuming
+    /// the remaining recording writer. Callers retain their outer owners until
+    /// this returns and must not publish completed metadata on failure.
+    pub async fn clean_up(
+        self,
+        to_stderr: bool,
+        print_summary_to_json_file: &Option<PathBuf>,
+    ) -> anyhow::Result<()> {
         self.clean_up_with_dispatch_stats(to_stderr, print_summary_to_json_file, None)
             .await
     }
@@ -2056,7 +2065,7 @@ impl GlobalState {
         to_stderr: bool,
         print_summary_to_json_file: &Option<PathBuf>,
         dispatch_stats: Option<reverie::DispatchStats>,
-    ) {
+    ) -> anyhow::Result<()> {
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
             handle.await.expect("Global scheduler clean shutdown");
@@ -2074,15 +2083,29 @@ impl GlobalState {
                 &self.host_mutations.lock().unwrap(),
             );
         }
-        let (mut summary, info_reprio_descrip) = self.into_run_summary_for_log().unwrap();
-        summary.dispatch_stats = dispatch_stats;
-
-        // Print machine-readable summary:
-        if let Some(path) = print_summary_to_json_file {
-            let json = serde_json::to_string_pretty(&summary).unwrap();
-            fs::write(path, json + "\n").unwrap();
-        }
-
+        let summary_result = self
+            .finalize_run_summary()
+            .and_then(|(mut summary, description)| {
+                summary.dispatch_stats = dispatch_stats;
+                // No summary is published unless terminal validation and recording
+                // output both succeeded. Output errors retain their ordinary class.
+                if let Some(path) = print_summary_to_json_file {
+                    let json = serde_json::to_string_pretty(&summary)?;
+                    fs::write(path, json + "\n")?;
+                }
+                Ok((summary, description))
+            });
+        // A saved network refusal is an additional observed cause on this new
+        // error path. The existing network-only report/exit path stays below.
+        let (mut summary, info_reprio_descrip) = match summary_result {
+            Ok(summary) => summary,
+            Err(error) => {
+                return crate::combine_finalization(
+                    Err(error),
+                    network_refusal.map_or(Ok(()), |refusal| Err(anyhow::anyhow!(refusal))),
+                );
+            }
+        };
         // Print human-readable summary:
         if to_stderr {
             // In this case, print summary irrespective of logging level.
@@ -2117,14 +2140,31 @@ impl GlobalState {
             }
             std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
         }
+        Ok(())
     }
 
     #[cfg(test)]
     fn into_run_summary(self) -> anyhow::Result<RunSummary> {
-        self.into_run_summary_for_log().map(|(summary, _)| summary)
+        self.finalize_run_summary().map(|(summary, _)| summary)
     }
 
-    fn into_run_summary_for_log(self) -> anyhow::Result<(RunSummary, Option<String>)> {
+    // Keep GlobalState alive until every remaining writer has been consumed.
+    // In particular, strict finish can fail before the summary takes it. A
+    // consumed failed write is absent and must never be retried by Drop.
+    fn finalize_run_summary(&self) -> anyhow::Result<(RunSummary, Option<String>)> {
+        let summary = self.run_summary_for_log();
+        let writer = self.sched.lock().unwrap().preemption_writer.take();
+        // Do not hold the scheduler mutex while doing output I/O.
+        let flushed = if self.cfg.record_preemptions_to.is_some() {
+            writer.map_or(Ok(()), |writer| writer.flush().map_err(anyhow::Error::msg))
+        } else {
+            drop(writer);
+            Ok(())
+        };
+        crate::combine_finalization(summary, flushed)
+    }
+
+    fn run_summary_for_log(&self) -> anyhow::Result<(RunSummary, Option<String>)> {
         // First, the scheduler can generate part of the summary (and flush once).
         let (mut summary, info_reprio_descrip) = {
             let mut sched = self.sched.lock().unwrap();
@@ -2444,6 +2484,11 @@ impl GlobalTool for GlobalState {
         // observe a signal), so no request kind has to be listed for it. A
         // request answered without either carries no mark.
         let dtid = DetTid::from_raw(from.as_raw());
+        let request_mm = gr.1;
+        // Root/reloaded image self-registration precedes StartNewThread. Its
+        // existing ParentContinue grant must not initialize callback counters
+        // or consume the budget which belongs after the startup reset.
+        let self_registration = registers_own_image(dtid, &gr.2);
         self.sched.lock().unwrap().take_grant(dtid);
         let (time, response) = if !resumes_from_grant(&gr.2) {
             self.dispatch_rpc(from, gr).await
@@ -2464,7 +2509,49 @@ impl GlobalTool for GlobalState {
                 _ => (time, response),
             }
         };
-        let granted = self.sched.lock().unwrap().take_grant(dtid);
+        let (granted, boundary_budget, boundary_owner) = {
+            let mut scheduler = self.sched.lock().unwrap();
+            let granted = scheduler.take_grant(dtid);
+            let terminal =
+                response == GlobalResponse::ThreadExited || response == GlobalResponse::Retired;
+            let mut budget = scheduler
+                .boundary_budgets
+                .finish(dtid, request_mm, granted && !self_registration, terminal)
+                .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+            // Same-leader exec keeps its existing turn; its authenticated
+            // image-completion reply carries the new image's expectation
+            // without pretending another resource turn was committed.
+            if !terminal && matches!(response, GlobalResponse::MarkPastFirstExecve(_)) {
+                assert!(
+                    budget.is_none(),
+                    "exec completion cannot steal an old grant budget"
+                );
+                budget = scheduler
+                    .boundary_budget_for_live_owner(dtid)
+                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+            }
+            let owner = if !terminal
+                && !self_registration
+                && (granted || matches!(response, GlobalResponse::MarkPastFirstExecve(_)))
+            {
+                scheduler.boundary_owners.as_ref().map(|owners| {
+                    owners
+                        .owner(dtid, request_mm)
+                        .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error))
+                })
+            } else {
+                None
+            };
+            (granted, budget, owner)
+        };
+        let response = match boundary_budget {
+            Some(budget) => GlobalResponse::WithSliceBoundaryBudget(budget, Box::new(response)),
+            None => response,
+        };
+        let response = match boundary_owner {
+            Some(owner) => GlobalResponse::WithSliceBoundaryOwner(owner, Box::new(response)),
+            None => response,
+        };
         if granted
             && response != GlobalResponse::ThreadExited
             && response != GlobalResponse::Retired
@@ -3075,7 +3162,7 @@ impl GlobalState {
                 unreachable!("private-memory publication precedes clock accounting")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
-                let (response, _) = self
+                let (response, _, stack) = self
                     .recv_resources_with_origin(
                         from,
                         pid,
@@ -3086,7 +3173,9 @@ impl GlobalState {
                     )
                     .await;
                 match response {
-                    SchedulerRpcResult::Continue(r) => R::ParkedRequest(r),
+                    SchedulerRpcResult::Continue(r) => {
+                        Self::with_boundary_stack(R::ParkedRequest(r), stack)
+                    }
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -3128,11 +3217,20 @@ impl GlobalState {
             }
 
             GlobalRequest::RequestResources(rs, pid) => {
-                let (response, _endtime) = self
-                    .recv_request_resources(from, pid, rs, Some(request_mm))
+                let (response, time, stack) = self
+                    .recv_resources_with_origin(
+                        from,
+                        pid,
+                        rs,
+                        Some(request_mm),
+                        RpcOrigin::DirectRequestResources,
+                        ControlCapability::None,
+                    )
                     .await;
-                match response {
-                    SchedulerRpcResult::Continue(response) => R::RequestResources(response),
+                match self.resource_grant_reply(from, response, time).0 {
+                    SchedulerRpcResult::Continue(response) => {
+                        Self::with_boundary_stack(R::RequestResources(response), stack)
+                    }
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -4373,25 +4471,29 @@ impl GlobalState {
         &self,
         from: Tid,
         detpid: DetPid,
-        rs: Resources,
+        mut rs: Resources,
         request_mm: Option<MmId>,
         rpc: RpcOrigin,
         capability: ControlCapability,
-    ) -> (SchedulerRpcResult<ResourceReply>, Option<LogicalTime>) {
+    ) -> (
+        SchedulerRpcResult<ResourceReply>,
+        Option<LogicalTime>,
+        MaybePrintStack,
+    ) {
         let dettid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
-
+        let mut boundary_stack = None;
         let resp2 = {
             let mut sched = self.lock_rpc_scheduler(false).await;
             if sched.thread_is_logically_killed(dettid)
                 || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm))
             {
-                return (SchedulerRpcResult::ThreadExited, None);
+                return (SchedulerRpcResult::ThreadExited, None, None);
             }
             // A host-timed request (a background operation's rejoin) can pass
             // admission just before a SIGKILL commit retires its thread. The
             // handler's response exit turns this into an unanswered request.
             if sched.is_unaccounted_sigkill_victim(dettid) {
-                return (SchedulerRpcResult::ThreadExited, None);
+                return (SchedulerRpcResult::ThreadExited, None, None);
             }
             let Some(nextturn) = sched.next_turns.get(&dettid).cloned() else {
                 panic!(
@@ -4414,7 +4516,25 @@ impl GlobalState {
                 )
             {
                 sched.fail_parked(dettid, error);
-                return (SchedulerRpcResult::ThreadExited, None);
+                return (SchedulerRpcResult::ThreadExited, None, None);
+            }
+            if let Some(boundary) = rs.slice_boundary.take() {
+                let mm = request_mm.unwrap_or_else(|| {
+                    crate::scheduler::exit_on_scheduler_refusal(
+                        &"slice-boundary protocol refusal: unauthenticated request",
+                    )
+                });
+                if rs.tid != dettid {
+                    crate::scheduler::exit_on_scheduler_refusal(
+                        &"slice-boundary protocol refusal: resource owner differs from sender",
+                    );
+                }
+                boundary_stack = sched
+                    .accept_slice_boundary(dettid, mm, &boundary)
+                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+                if boundary_stack.is_some() {
+                    self.signal_requested_stacktrace(dettid);
+                }
             }
             sched.request_put(&nextturn.req, rs.clone(), &self.global_time);
             nextturn.resp
@@ -4424,8 +4544,14 @@ impl GlobalState {
             dettid, &resp2, rs
         );
         let answer = resp2.get().await; // Block on the scheduler allowing our guest to proceed.
-        self.finish_resource_response(from, detpid, rs, request_mm, answer)
-            .await
+        let (result, time) = self
+            .finish_resource_response(from, detpid, rs, request_mm, answer)
+            .await;
+        if matches!(result, SchedulerRpcResult::ThreadExited) {
+            (result, time, None)
+        } else {
+            (result, time, boundary_stack)
+        }
     }
 
     async fn finish_resource_response(
@@ -4625,8 +4751,7 @@ impl GlobalState {
             if !is_ordinary_priority(prio) {
                 panic!(
                     "Read a bad initial_prority from file: {}\nFull file: {}",
-                    prio,
-                    pr.load_all(),
+                    prio, pr,
                 );
             }
             prio
@@ -4725,6 +4850,11 @@ impl GlobalState {
                     flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_VM)),
                 )
             };
+            if let Some(owners) = &mut sched.boundary_owners {
+                owners
+                    .fresh(child_dettid, child_mm)
+                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+            }
             if !initial_current_root {
                 sched.register_reused_transferred_exec_tid(child_dettid, child_mm);
                 sched.record_thread_mm(child_dettid, child_mm);
@@ -5056,6 +5186,7 @@ impl GlobalState {
                     decides_signal_interruption_itself: false,
                     continues_sigreturn: false,
                     private_sigchld_decides: false,
+                    slice_boundary: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -5581,6 +5712,39 @@ impl GlobalState {
         self.inodes.lock().unwrap().set_mtime(ino, mtime);
     }
 
+    fn with_boundary_stack(response: GlobalResponse, stack: MaybePrintStack) -> GlobalResponse {
+        match stack {
+            Some(path) => GlobalResponse::WithSliceBoundaryStack(path, Box::new(response)),
+            None => response,
+        }
+    }
+
+    // The caller holds the same scheduler lock as the existing event path.
+    fn signal_requested_stacktrace(&self, dettid: DetTid) {
+        if let Some(sig) = &self.cfg.stacktrace_signal {
+            trace!(
+                "[dtid {}] signaling thread with {} at the point of stack trace printing.",
+                dettid, sig.0
+            );
+            let tid = Pid::from_raw(dettid.as_raw());
+            // TODO(T78538674): virtualize pid/tid:
+            // We send a raw signal here and let the guest pick it up WHENEVER it resumes.
+            // We don't use the "signal_guest" method because we don't necessarily respect that
+            // protocol here.
+            // Alarm/timer signals are guest-chosen and may be realtime, which
+            // `nix` cannot name; fall through to the raw syscall for those.
+            match sig.signal() {
+                Some(named) => signal::kill(tid, named).unwrap(),
+                None => {
+                    // SAFETY: `tid` is a live thread this scheduler owns and
+                    // `sig.raw()` is a signal number the guest already supplied.
+                    let rc = unsafe { libc::kill(tid.as_raw(), sig.raw()) };
+                    assert_eq!(rc, 0, "raw kill of signal {} failed", sig.raw());
+                }
+            }
+        }
+    }
+
     async fn recv_trace_schedevent(
         &self,
         ev: SchedEvent,
@@ -5698,30 +5862,9 @@ impl GlobalState {
             }
         };
 
-        if result.print_stack_strace.is_some()
-            && let Some(sig) = &self.cfg.stacktrace_signal
-        {
+        if result.print_stack_strace.is_some() && self.cfg.stacktrace_signal.is_some() {
             let _sched = self.lock_rpc_scheduler(false).await;
-            trace!(
-                "[dtid {}] signaling thread with {} at the point of stack trace printing.",
-                ev.dettid, sig.0
-            );
-            let tid = Pid::from_raw(ev.dettid.as_raw());
-            // TODO(T78538674): virtualize pid/tid:
-            // We send a raw signal here and let the guest pick it up WHENEVER it resumes.
-            // We don't use the "signal_guest" method because we don't necessarily respect that
-            // protocol here.
-            // Alarm/timer signals are guest-chosen and may be realtime, which
-            // `nix` cannot name; fall through to the raw syscall for those.
-            match sig.signal() {
-                Some(named) => signal::kill(tid, named).unwrap(),
-                None => {
-                    // SAFETY: `tid` is a live thread this scheduler owns and
-                    // `sig.raw()` is a signal number the guest already supplied.
-                    let rc = unsafe { libc::kill(tid.as_raw(), sig.raw()) };
-                    assert_eq!(rc, 0, "raw kill of signal {} failed", sig.raw());
-                }
-            }
+            self.signal_requested_stacktrace(ev.dettid);
         }
 
         SchedulerRpcResult::Continue(result)
@@ -6792,6 +6935,18 @@ pub enum GlobalResponse {
     LockLedgerRefused(()),
     /// Appended mapping capture response.
     MappingCapture(mapping_capture::Reply),
+    /// Typed expectation delivered by the existing grant, appended without
+    /// renumbering any legacy wire variant. Not a new resource request.
+    WithSliceBoundaryBudget(crate::slice_boundary::grant::Budget, Box<GlobalResponse>),
+    /// Actual lifecycle identity on the existing grant, not an expectation
+    /// from replay. Appended without renumbering existing wire variants.
+    WithSliceBoundaryOwner(
+        detcore_model::schedule::boundary::Owner,
+        Box<GlobalResponse>,
+    ),
+    /// Stored-index stack request returned on the annotated operation's own
+    /// response, without a mailbox another concurrent RPC could consume.
+    WithSliceBoundaryStack(Option<PathBuf>, Box<GlobalResponse>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -7384,6 +7539,7 @@ where
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
     let continues_sigreturn = request_continues_sigreturn(&request);
+    let starts_thread = matches!(request, GlobalRequest::StartNewThread(..));
     let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
     // A grant while the request was pending is a hand-off to the scheduler,
     // the one place every hand-off is noted (`ThreadState::note_scheduler_handoff`).
@@ -7393,6 +7549,18 @@ where
             .thread_state_mut()
             .note_scheduler_handoff(continues_sigreturn);
     }
+    if let GlobalResponse::WithSliceBoundaryOwner(owner, response) = resp.1 {
+        resp.1 = *response;
+        crate::slice_boundary::adopt_owner(guest.thread_state_mut(), owner, starts_thread)
+            .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+    }
+    let boundary_budget = match resp.1 {
+        GlobalResponse::WithSliceBoundaryBudget(budget, response) => {
+            resp.1 = *response;
+            Some(budget)
+        }
+        _ => None,
+    };
     let deadline = match resp.1 {
         GlobalResponse::WithDeadline(remaining, response) => {
             resp.1 = *response;
@@ -7400,6 +7568,10 @@ where
         }
         _ => None,
     };
+    if let GlobalResponse::WithSliceBoundaryStack(path, response) = resp.1 {
+        resp.1 = *response;
+        write_backtrace(guest, path.as_ref());
+    }
     guest.thread_state_mut().last_grant_deadline = deadline;
     cap_timeslice_at_deadline(guest, deadline);
     if resp.1 == GlobalResponse::Retired {
@@ -7448,6 +7620,14 @@ where
             .thread_state_mut()
             .thread_logical_time
             .advance_to(time);
+    }
+    if let Some(budget) = boundary_budget {
+        let installed = if starts_thread {
+            crate::slice_boundary::grant::stage_start(guest.thread_state_mut(), budget)
+        } else {
+            crate::slice_boundary::grant::install(guest.thread_state_mut(), budget)
+        };
+        installed.unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
     }
     resp
 }
@@ -7618,6 +7798,17 @@ fn request_continues_sigreturn(request: &GlobalRequest) -> bool {
     }
 }
 
+// Only the actual sender's registration is pre-admission. A parent's
+// continuation after registering a different child remains an ordinary grant.
+fn registers_own_image(sender: DetTid, request: &GlobalRequest) -> bool {
+    match request {
+        GlobalRequest::WithForwardedCount(_, request) => registers_own_image(sender, request),
+        GlobalRequest::CreateChildThread(child, ..) => *child == sender,
+        GlobalRequest::CreateVforkChildThread(_, _, child, ..) => *child == sender,
+        _ => false,
+    }
+}
+
 fn resumes_from_grant(request: &GlobalRequest) -> bool {
     match request {
         GlobalRequest::WithForwardedCount(_, request) => resumes_from_grant(request),
@@ -7778,6 +7969,26 @@ where
     } else {
         None
     }
+}
+
+/// Complete the existing startup reset after its grant. In particular, a
+/// boundary budget arrives before this reset and is installed only after it;
+/// the legacy preemption-history and deadline-cap ordering is unchanged.
+pub(crate) fn finish_thread_start<G, T>(cfg: &Config, guest: &mut G, history: Option<ThreadHistory>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let reset = {
+        let thread = guest.thread_state_mut();
+        thread.preemption_points = history.map(|history| history.into_iter());
+        crate::slice_boundary::grant::reset_start(thread, cfg)
+            .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error))
+    };
+    let deadline = guest.thread_state_mut().last_grant_deadline.take();
+    cap_timeslice_at_deadline(guest, deadline);
+    crate::slice_boundary::grant::finish_start(guest.thread_state_mut(), reset)
+        .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
 }
 
 /// Keep only the clone pointer that requests an exit-time clear and wake.
@@ -10578,6 +10789,7 @@ mod tests {
     use reverie::Guest;
     use reverie::Tid;
     use reverie::syscalls::CloneFlags;
+    use reverie::syscalls::Sysno;
 
     use super::FutexAction;
     use super::GlobalRequest;
@@ -11223,6 +11435,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn boundary_owner_is_allocated_by_actual_root_registration() {
+        for current_image in [false, true] {
+            let config = Config {
+                sequentialize_threads: false,
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            state.sched.lock().unwrap().boundary_owners =
+                Some(crate::slice_boundary::lifecycle::Registry::default());
+            let root = DetTid::from_raw(3);
+            let mm = if current_image {
+                MmId::initial(root).for_exec(root)
+            } else {
+                MmId::initial(root)
+            };
+            let before = {
+                let scheduler = state.sched.lock().unwrap();
+                (scheduler.turn, scheduler.committed_time)
+            };
+            assert_eq!(
+                state
+                    .recv_create_child_thread(
+                        Tid::from_raw(root.as_raw()),
+                        mm,
+                        super::ChildRegistration {
+                            parent_dettid: root,
+                            parent_detpid: root,
+                            child_dettid: root,
+                            child_tid_addr: 0,
+                            flags: None,
+                            exit_signal: libc::SIGCHLD,
+                            physical_ids: None,
+                            maybe_priority: Some(DEFAULT_PRIORITY),
+                            parent_is_kernel_blocked: false,
+                        }
+                    )
+                    .await,
+                SchedulerRpcResult::Continue(())
+            );
+            let scheduler = state.sched.lock().unwrap();
+            let owner = scheduler
+                .boundary_owners
+                .as_ref()
+                .unwrap()
+                .owner(root, mm)
+                .unwrap();
+            assert_eq!(owner.tid, root);
+            assert_eq!(owner.birth_tid, root);
+            assert_eq!(owner.birth_generation, 0);
+            assert_eq!(owner.thread_generation, 0);
+            assert_eq!(owner.address_space_creator, mm.creator());
+            assert_eq!(owner.address_space_generation, mm.generation());
+            assert_eq!((scheduler.turn, scheduler.committed_time), before);
+        }
+    }
+
+    #[tokio::test]
     async fn initial_current_root_registration_is_consistent_and_single_use() {
         let config = Config {
             sequentialize_threads: false,
@@ -11302,6 +11571,74 @@ mod tests {
             SchedulerRpcResult::ThreadExited
         ));
         assert_eq!(state.sched.lock().unwrap().thread_mm(root), Some(current));
+    }
+
+    #[tokio::test]
+    async fn boundary_same_leader_exec_completion_returns_actual_new_owner_without_a_turn() {
+        let (config, state, tid, process) = cancellation_test_state();
+        install_test_registration(&state, tid, Ivar::new());
+        let old_mm = MmId::initial(tid);
+        let new_mm = old_mm.for_exec(tid);
+        let old_owner = {
+            let mut scheduler = state.sched.lock().unwrap();
+            scheduler.install_test_exec_incarnation(tid, old_mm);
+            let mut owners = crate::slice_boundary::lifecycle::Registry::default();
+            let owner = owners.fresh(tid, old_mm).unwrap();
+            scheduler.boundary_owners = Some(owners);
+            owner
+        };
+        state.pending_exec_states.lock().unwrap().insert(
+            process,
+            PendingExecState {
+                caller: tid,
+                process,
+                mm: old_mm,
+                fd_blocking: Default::default(),
+            },
+        );
+        let before = {
+            let scheduler = state.sched.lock().unwrap();
+            (scheduler.turn, scheduler.committed_time)
+        };
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(tid.as_raw()),
+                (
+                    DetTime::new(&config),
+                    new_mm,
+                    GlobalRequest::MarkPastFirstExecve(process, None, None, None),
+                ),
+            )
+            .await;
+        let GlobalResponse::WithSliceBoundaryOwner(owner, response) = response.1 else {
+            panic!("lost actual exec owner")
+        };
+        assert!(matches!(*response, GlobalResponse::MarkPastFirstExecve(_)));
+        assert_eq!(
+            (owner.birth_tid, owner.birth_generation),
+            (old_owner.birth_tid, old_owner.birth_generation)
+        );
+        assert_eq!(owner.thread_generation, old_owner.thread_generation);
+        assert_eq!(owner.address_space_generation, new_mm.generation());
+        let scheduler = state.sched.lock().unwrap();
+        assert_eq!(
+            scheduler
+                .boundary_owners
+                .as_ref()
+                .unwrap()
+                .owner(tid, new_mm)
+                .unwrap(),
+            owner
+        );
+        assert!(
+            scheduler
+                .boundary_owners
+                .as_ref()
+                .unwrap()
+                .owner(tid, old_mm)
+                .is_err()
+        );
+        assert_eq!((scheduler.turn, scheduler.committed_time), before);
     }
 
     #[tokio::test]
@@ -11731,6 +12068,12 @@ mod tests {
         .with_backend(|backend| {
             backend.needs_killed_thread_rpc_cancellation = true;
         });
+        cancellation_test_state_with_config(config)
+    }
+
+    fn cancellation_test_state_with_config(
+        config: Config,
+    ) -> (Config, GlobalState, DetTid, DetPid) {
         let state = GlobalState::initialize(&config, false);
         let dettid = DetTid::from_raw(17);
         let detpid = DetPid::from_raw(17);
@@ -11766,6 +12109,723 @@ mod tests {
         );
         scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
         scheduler.runqueue_push_back(dettid);
+    }
+
+    // These tests stage a validated expectation, but use the real RPC and
+    // real committed turn to deliver it. They do not enable replay lookahead
+    // or claim callback/exec-lifecycle qualification.
+    async fn boundary_producer_roundtrip(
+        enabled: bool,
+        input: Option<&std::path::Path>,
+        output: Option<&std::path::Path>,
+    ) -> (Vec<Resources>, LogicalTime, LogicalTime, u64, u64) {
+        use detcore_model::schedule::boundary::Entry;
+        use detcore_model::schedule::boundary::Phase;
+        use detcore_model::schedule::boundary::Record;
+        use reverie::Tool;
+
+        use crate::preemptions::boundary_recording::Recording;
+        let (config, state, tid, process) = if input.is_some() || output.is_some() {
+            cancellation_test_state_with_config(
+                Config {
+                    sequentialize_threads: true,
+                    replay_schedule_from: input.map(std::path::Path::to_path_buf),
+                    strict_schedule_boundaries: true,
+                    record_preemptions: true,
+                    record_preemptions_to: output.map(std::path::Path::to_path_buf),
+                    ..Config::default()
+                }
+                .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true),
+            )
+        } else {
+            cancellation_test_state()
+        };
+        install_test_registration(&state, tid, Ivar::new());
+        let mut thread = crate::ThreadState::new(tid, &config, ());
+        thread.detpid = Some(process);
+        thread.next_timeslice(&config);
+        if enabled {
+            thread.slice_boundary = Some(crate::slice_boundary::Observations::new(&thread, 0));
+            let mut scheduler = state.sched.lock().unwrap();
+            let mut owners = crate::slice_boundary::lifecycle::Registry::default();
+            owners.fresh(tid, thread.mm_id).unwrap();
+            scheduler.boundary_owners = Some(owners);
+            scheduler.record_thread_mm(tid, thread.mm_id);
+            if input.is_some() {
+                let budget = scheduler
+                    .boundary_budget_for_live_owner(tid)
+                    .unwrap()
+                    .unwrap();
+                crate::slice_boundary::grant::install(&mut thread, budget).unwrap();
+            }
+            let mut writer =
+                crate::preemptions::PreemptionWriter::new(output.map(std::path::Path::to_path_buf))
+                    .with_slice_boundaries()
+                    .unwrap();
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            scheduler.preemption_writer = Some(writer);
+        }
+        let mut guest = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+            ppid: None,
+            private_memory: None,
+        };
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let mut turns = Vec::new();
+        for _ in 0..2 {
+            if let Some(mut observed) = guest.thread.slice_boundary.take() {
+                observed
+                    .callback(&guest.thread, Entry::Cpuid, Phase::Prehook)
+                    .unwrap();
+                guest.thread.slice_boundary = Some(observed);
+            }
+            let mut request = Box::pin(tool.end_timeslice(&mut guest));
+            for _ in 0..8 {
+                assert!(futures::poll!(&mut request).is_pending());
+                if state.sched.lock().unwrap().next_turns[&tid]
+                    .req
+                    .try_read()
+                    .is_some()
+                {
+                    break;
+                }
+            }
+            let posted = state.sched.lock().unwrap().next_turns[&tid]
+                .req
+                .try_read()
+                .unwrap()
+                .unwrap();
+            assert!(
+                posted.slice_boundary.is_none(),
+                "stored/reposted resource must not retain an annotation"
+            );
+            assert!(posted.upgraded_to_runnable().slice_boundary.is_none());
+            let turn = crate::scheduler::do_a_turn_blocking(
+                state.sched.clone(),
+                state.global_time.clone(),
+                &Err(crate::scheduler::SkipTurn),
+            )
+            .await
+            .expect("the original request must commit exactly one turn");
+            assert!(turn.slice_boundary.is_none());
+            turns.push(turn);
+            request.await;
+        }
+        let mut scheduler = state.sched.lock().unwrap();
+        if enabled {
+            let writer = scheduler.preemption_writer.take().unwrap();
+            let encoded = if let Some(path) = output {
+                writer.flush().unwrap();
+                std::fs::read_to_string(path).unwrap()
+            } else {
+                writer.into_string()
+            };
+            let Recording::Boundaries(recording) = Recording::decode(encoded.as_bytes()).unwrap()
+            else {
+                panic!("lost typed recording")
+            };
+            let records = recording.schedule().records();
+            assert_eq!(records.len(), 2);
+            for (index, record) in records.iter().enumerate() {
+                let Record::TimesliceEnd(boundary) = record else {
+                    panic!("introduced an ordinary event")
+                };
+                assert_eq!(boundary.identity.slice, index as u64 + 1);
+                assert_eq!(boundary.identity.checkin, index as u64 + 1);
+                assert_eq!(boundary.identity.committed_rcbs, 0);
+                assert_eq!(boundary.identity.entry, Entry::Cpuid);
+            }
+            assert_eq!(scheduler.recorded_event_count, 2);
+            if input.is_some() {
+                assert_eq!(
+                    scheduler
+                        .generate_partial_run_summary(None)
+                        .unwrap()
+                        .schedevent_replayed,
+                    2
+                );
+            }
+        }
+        (
+            turns,
+            scheduler.committed_time,
+            guest.thread.thread_logical_time.as_nanos(),
+            scheduler.turn,
+            guest.thread.stats.timeslice_count,
+        )
+    }
+
+    #[tokio::test]
+    async fn boundary_actual_reset_and_resource_transport_preserve_original_turns_and_clocks() {
+        assert_eq!(
+            boundary_producer_roundtrip(true, None, None).await,
+            boundary_producer_roundtrip(false, None, None).await
+        );
+    }
+
+    #[tokio::test]
+    async fn boundary_recorded_bytes_replay_two_original_yields_with_exact_clock_and_turn_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.json");
+        let replay = dir.path().join("replay.json");
+        let recorded = boundary_producer_roundtrip(true, None, Some(&first)).await;
+        let replayed = boundary_producer_roundtrip(true, Some(&first), Some(&replay)).await;
+        assert_eq!(recorded, replayed);
+        assert_eq!(
+            std::fs::read(first).unwrap(),
+            std::fs::read(replay).unwrap()
+        );
+    }
+
+    // Exercise the syscall handler and the original resource receiver/turn,
+    // rather than calling close_slice or end_timeslice directly. No guest or
+    // backend is executed by this fixture. Both timer modes remain supported.
+    async fn boundary_sched_yield_handler(
+        input: Option<&std::path::Path>,
+        typed: bool,
+        chaos: bool,
+        timers: bool,
+        stale_owner: bool,
+    ) -> (
+        crate::preemptions::boundary_recording::Recording,
+        LogicalTime,
+        LogicalTime,
+        u64,
+        u64,
+    ) {
+        use detcore_model::schedule::boundary::Cause;
+        use detcore_model::schedule::boundary::Entry;
+        use detcore_model::schedule::boundary::Phase;
+        use detcore_model::schedule::boundary::Record;
+        use reverie::Tool;
+
+        use crate::preemptions::boundary_recording::Recording;
+
+        let (config, state, tid, process) = cancellation_test_state_with_config(
+            Config {
+                sequentialize_threads: true,
+                replay_schedule_from: input.map(std::path::Path::to_path_buf),
+                strict_schedule_boundaries: typed && !chaos && input.is_some(),
+                chaos,
+                max_timeslice: if timers {
+                    Config::default().max_timeslice
+                } else {
+                    None
+                },
+                target_timeslice: None,
+                ..Config::default()
+            }
+            .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true),
+        );
+        install_test_registration(&state, tid, Ivar::new());
+        let mut thread = crate::ThreadState::new(tid, &config, ());
+        thread.detpid = Some(process);
+        thread.next_timeslice(&config);
+        let initial_slices = thread.stats.timeslice_count;
+        {
+            let mut scheduler = state.sched.lock().unwrap();
+            let mut writer = crate::preemptions::PreemptionWriter::new(None);
+            if typed {
+                thread.slice_boundary = Some(crate::slice_boundary::Observations::new(&thread, 0));
+                let mut owners = crate::slice_boundary::lifecycle::Registry::default();
+                owners.fresh(tid, thread.mm_id).unwrap();
+                scheduler.boundary_owners = Some(owners);
+                scheduler.record_thread_mm(tid, thread.mm_id);
+                if let Some(budget) = scheduler.boundary_budget_for_live_owner(tid).unwrap() {
+                    crate::slice_boundary::grant::install(&mut thread, budget).unwrap();
+                }
+                writer = writer.with_slice_boundaries().unwrap();
+            }
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            scheduler.preemption_writer = Some(writer);
+        }
+        let mut guest = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+            ppid: None,
+            private_memory: None,
+        };
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        for occurrence in 1..=2 {
+            if let Some(mut observed) = guest.thread.slice_boundary.take() {
+                observed
+                    .syscall(&guest.thread, Sysno::sched_yield, Phase::Prehook)
+                    .unwrap();
+                guest.thread.slice_boundary = Some(observed);
+            }
+            if stale_owner {
+                guest.thread.mm_id = guest.thread.mm_id.for_exec(tid);
+            }
+            let before_turn = state.sched.lock().unwrap().turn;
+            let before_requests = guest.requests.lock().unwrap().len();
+            let mut request = Box::pin(
+                tool.handle_sched_yield(&mut guest, reverie::syscalls::SchedYield::default()),
+            );
+            for _ in 0..8 {
+                assert!(futures::poll!(&mut request).is_pending());
+                if state.sched.lock().unwrap().next_turns[&tid]
+                    .req
+                    .try_read()
+                    .is_some()
+                {
+                    break;
+                }
+            }
+            let posted = state.sched.lock().unwrap().next_turns[&tid]
+                .req
+                .try_read()
+                .unwrap()
+                .unwrap();
+            assert!(posted.slice_boundary.is_none());
+            assert!(posted.upgraded_to_runnable().slice_boundary.is_none());
+            // Record's original strong yield and replay's original weak yield
+            // remain distinct. Typed boundary consumption must not replace the
+            // replay request with an independent one-turn exclusion.
+            let expected = if input.is_none() && !chaos {
+                ResourceID::SchedYield
+            } else {
+                ResourceID::SleepUntil(LogicalTime::from_nanos(0))
+            };
+            assert_eq!(posted.resources.len(), 1);
+            assert_eq!(posted.resources.get(&expected), Some(&Permission::W));
+            let turn = crate::scheduler::do_a_turn_blocking(
+                state.sched.clone(),
+                state.global_time.clone(),
+                &Err(crate::scheduler::SkipTurn),
+            )
+            .await
+            .expect("one sched_yield must commit its original turn");
+            assert!(turn.slice_boundary.is_none());
+            assert_eq!(request.await.unwrap(), 0);
+            assert_eq!(state.sched.lock().unwrap().turn, before_turn + 1);
+            assert_eq!(guest.requests.lock().unwrap().len(), before_requests + 1);
+            if let Some(mut observed) = guest.thread.slice_boundary.take() {
+                observed
+                    .syscall(&guest.thread, Sysno::sched_yield, Phase::Posthook)
+                    .unwrap();
+                guest.thread.slice_boundary = Some(observed);
+            }
+            let closes = typed && !chaos;
+            assert_eq!(
+                guest.thread.stats.timeslice_count,
+                initial_slices + if closes && timers { occurrence } else { 0 }
+            );
+        }
+        let mut scheduler = state.sched.lock().unwrap();
+        let recording = Recording::decode(
+            scheduler
+                .preemption_writer
+                .take()
+                .unwrap()
+                .into_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        if let Recording::Boundaries(recording) = &recording {
+            let records = recording.schedule().records();
+            assert_eq!(records.len(), if chaos { 0 } else { 2 });
+            for (index, record) in records.iter().enumerate() {
+                let Record::TimesliceEnd(boundary) = record else {
+                    panic!("not a boundary")
+                };
+                assert_eq!(boundary.identity.cause, Cause::ExplicitSchedYield);
+                assert_eq!(boundary.identity.phase, Phase::Prehook);
+                assert_eq!(
+                    boundary.identity.entry,
+                    Entry::Syscall {
+                        syscall: Sysno::sched_yield,
+                        occurrence: index as u64 + 1
+                    }
+                );
+                assert_eq!(boundary.identity.slice, index as u64 + 1);
+                assert_eq!(boundary.identity.checkin, index as u64 * 2 + 1);
+                assert_eq!(boundary.identity.committed_rcbs, 0);
+                assert_eq!(boundary.count, 1);
+            }
+            assert_eq!(
+                scheduler.recorded_event_count,
+                u64::try_from(records.len()).unwrap()
+            );
+            if input.is_some() && !chaos {
+                assert_eq!(
+                    scheduler
+                        .generate_partial_run_summary(None)
+                        .unwrap()
+                        .schedevent_replayed,
+                    2
+                );
+            }
+        } else {
+            assert_eq!(scheduler.recorded_event_count, 0);
+        }
+        (
+            recording,
+            scheduler.committed_time,
+            guest.thread.thread_logical_time.as_nanos(),
+            scheduler.turn,
+            guest.thread.stats.timeslice_count,
+        )
+    }
+
+    #[tokio::test]
+    async fn boundary_actual_sched_yield_handler_replays_with_and_without_timers() {
+        let directory = tempfile::tempdir().unwrap();
+        for timers in [false, true] {
+            let recorded = boundary_sched_yield_handler(None, true, false, timers, false).await;
+            let input = directory.path().join(format!("{timers}.json"));
+            recorded.0.write(&input).unwrap();
+            let replayed =
+                boundary_sched_yield_handler(Some(&input), true, false, timers, false).await;
+            // Complete metadata, identities, clocks, turns and reset counts.
+            assert_eq!(recorded, replayed);
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_actual_sched_yield_handler_preserves_legacy_and_chaos_weak_yield() {
+        use crate::preemptions::boundary_recording::Recording;
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("legacy.json");
+        Recording::Legacy(PreemptionRecord::from_sched_events(vec![]))
+            .write(&input)
+            .unwrap();
+        for timers in [false, true] {
+            boundary_sched_yield_handler(Some(&input), false, false, timers, false).await;
+        }
+        // Even a typed observation state must not intercept the chaos route.
+        // A configured maximum makes this the existing WeakYield chaos arm.
+        boundary_sched_yield_handler(Some(&input), false, true, true, false).await;
+        boundary_sched_yield_handler(Some(&input), true, true, true, false).await;
+    }
+
+    async fn boundary_bad_yield_replay(kind: &str) {
+        use detcore_model::schedule::boundary::Cause;
+        use detcore_model::schedule::boundary::Entry;
+        use detcore_model::schedule::boundary::Record;
+        use detcore_model::schedule::boundary::Schedule;
+
+        use crate::preemptions::boundary_recording::BoundaryRecording;
+        use crate::preemptions::boundary_recording::Recording;
+
+        let recorded = boundary_sched_yield_handler(None, true, false, false, false)
+            .await
+            .0;
+        let Recording::Boundaries(recorded) = recorded else {
+            panic!("not typed")
+        };
+        let mut records = recorded.schedule().records().to_vec();
+        records.truncate(1);
+        if kind == "missing" {
+            records.clear();
+        } else if kind != "owner" {
+            let Record::TimesliceEnd(boundary) = &mut records[0] else {
+                unreachable!()
+            };
+            match kind {
+                "cause" => boundary.identity.cause = Cause::SoftwareCheckin,
+                "occurrence" => {
+                    boundary.identity.entry = Entry::Syscall {
+                        syscall: Sysno::sched_yield,
+                        occurrence: 2,
+                    }
+                }
+                _ => panic!("unknown negative fixture"),
+            }
+        }
+        let input = tempfile::tempdir().unwrap();
+        let path = input.path().join("bad.json");
+        Recording::Boundaries(
+            BoundaryRecording::new(
+                PreemptionRecord::from_sched_events(vec![]),
+                Schedule::new(records).unwrap(),
+            )
+            .unwrap(),
+        )
+        .write(&path)
+        .unwrap();
+        boundary_sched_yield_handler(Some(&path), true, false, false, kind == "owner").await;
+        panic!("actual sched_yield handler accepted {kind}");
+    }
+
+    #[tokio::test]
+    async fn boundary_actual_sched_yield_handler_refuses_missing_marker() {
+        if in_child_expecting_refusal(
+            "boundary_actual_sched_yield_handler_refuses_missing_marker",
+            "Exhausted",
+        ) {
+            boundary_bad_yield_replay("missing").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_actual_sched_yield_handler_refuses_wrong_cause() {
+        if in_child_expecting_refusal(
+            "boundary_actual_sched_yield_handler_refuses_wrong_cause",
+            "expected Identity",
+        ) {
+            boundary_bad_yield_replay("cause").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_actual_sched_yield_handler_refuses_wrong_occurrence() {
+        if in_child_expecting_refusal(
+            "boundary_actual_sched_yield_handler_refuses_wrong_occurrence",
+            "expected Identity",
+        ) {
+            boundary_bad_yield_replay("occurrence").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_actual_sched_yield_handler_refuses_stale_owner() {
+        if in_child_expecting_refusal(
+            "boundary_actual_sched_yield_handler_refuses_stale_owner",
+            "stale observation owner",
+        ) {
+            boundary_bad_yield_replay("owner").await;
+        }
+    }
+
+    #[test]
+    fn boundary_resource_union_refuses_either_annotated_operand_before_mutation() {
+        let tid = DetTid::from_raw(17);
+        let config = Config::default();
+        let mut thread = crate::ThreadState::new(tid, &config, ());
+        let mut observed = crate::slice_boundary::Observations::new(&thread, 0);
+        observed
+            .callback(
+                &thread,
+                detcore_model::schedule::boundary::Entry::Cpuid,
+                detcore_model::schedule::boundary::Phase::Prehook,
+            )
+            .unwrap();
+        let boundary = observed
+            .close_slice(&mut thread, &config, false, None)
+            .unwrap()
+            .boundary;
+        for side in 0..2 {
+            let mut left = Resources::new(tid);
+            let mut right = Resources::new(tid);
+            right.insert(ResourceID::MemAddrSpace(tid), Permission::RW);
+            if side == 0 {
+                left.slice_boundary = Some(Box::new(boundary.clone()));
+            } else {
+                right.slice_boundary = Some(Box::new(boundary.clone()));
+            }
+            let annotated = if side == 0 { &left } else { &right };
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || annotated.upgraded_to_runnable()
+                ))
+                .is_err()
+            );
+            let before = left.clone();
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| left.union(&right)))
+                    .is_err()
+            );
+            assert_eq!(left, before);
+        }
+    }
+
+    async fn boundary_grant_roundtrip(
+        route: u8,
+        with_budget: bool,
+        automatic: bool,
+    ) -> (
+        Resources,
+        LogicalTime,
+        LogicalTime,
+        u64,
+        (Option<LogicalTime>, Option<LogicalTime>, u64),
+    ) {
+        let input = tempfile::tempdir().unwrap();
+        let (config, state, tid, process) = if automatic {
+            use detcore_model::schedule::boundary::Boundary;
+            use detcore_model::schedule::boundary::Record;
+            use detcore_model::schedule::boundary::Schedule;
+
+            use crate::preemptions::boundary_recording::BoundaryRecording;
+            use crate::preemptions::boundary_recording::Recording;
+            let tid = DetTid::from_raw(17);
+            let budget = crate::slice_boundary::grant::tests::budget(tid, MmId::initial(tid), 91);
+            let recording = Recording::Boundaries(
+                BoundaryRecording::new(
+                    PreemptionRecord::from_sched_events(vec![]),
+                    Schedule::new(vec![Record::TimesliceEnd(Boundary {
+                        identity: budget.expected(),
+                        count: 1,
+                        start_rip: None,
+                        end_rip: None,
+                        end_time: None,
+                    })])
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            let path = input.path().join("recording.json");
+            recording.write(&path).unwrap();
+            cancellation_test_state_with_config(
+                Config {
+                    sequentialize_threads: true,
+                    replay_schedule_from: Some(path),
+                    strict_schedule_boundaries: true,
+                    ..Config::default()
+                }
+                .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true),
+            )
+        } else {
+            cancellation_test_state()
+        };
+        install_test_registration(&state, tid, Ivar::new());
+        let mut thread = crate::ThreadState::new(tid, &config, ());
+        thread.detpid = Some(process);
+        if route != 1 {
+            thread.next_timeslice(&config);
+        }
+        thread.slice_boundary = Some(crate::slice_boundary::Observations::new(&thread, 0));
+        let budget = crate::slice_boundary::grant::tests::budget(tid, thread.mm_id, 91);
+        if with_budget {
+            let mut scheduler = state.sched.lock().unwrap();
+            let mut owners = crate::slice_boundary::lifecycle::Registry::default();
+            owners.fresh(tid, thread.mm_id).unwrap();
+            scheduler.boundary_owners = Some(owners);
+            if automatic {
+                scheduler.record_thread_mm(tid, thread.mm_id);
+                assert_eq!(
+                    scheduler.boundary_budget_for_live_owner(tid).unwrap(),
+                    Some(budget)
+                );
+            } else {
+                scheduler
+                    .boundary_budgets
+                    .queue(thread.mm_id, budget)
+                    .unwrap();
+            }
+            if route == 1 {
+                // The real startup reply must initialize from lifecycle
+                // authority before it stages the separate expected budget.
+                thread.slice_boundary = None;
+            }
+        }
+        let original_slices = thread.stats.timeslice_count;
+        let original_maximum = thread.max_timeslice_end;
+        let mut guest = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+            ppid: None,
+            private_memory: None,
+        };
+        let mut request = Box::pin(async {
+            match route {
+                0 => {
+                    let mut resources = Resources::new(tid);
+                    resources.insert(ResourceID::MemAddrSpace(process), Permission::RW);
+                    assert_eq!(
+                        super::resource_request(&mut guest, resources).await,
+                        ResumeStatus::Normal
+                    );
+                }
+                1 => assert_eq!(
+                    super::thread_start_request(&config, &mut guest, process).await,
+                    None
+                ),
+                2 => {
+                    let response =
+                        super::send_and_update_time(&mut guest, GlobalRequest::ResumeExec(process))
+                            .await;
+                    assert_eq!(
+                        response.1,
+                        GlobalResponse::ResumeExec(ResumeStatus::Normal, None)
+                    );
+                }
+                _ => unreachable!(),
+            }
+        });
+        for _ in 0..8 {
+            assert!(futures::poll!(&mut request).is_pending());
+            if state.sched.lock().unwrap().next_turns[&tid]
+                .req
+                .try_read()
+                .is_some()
+            {
+                break;
+            }
+        }
+        assert!(
+            state.sched.lock().unwrap().next_turns[&tid]
+                .req
+                .try_read()
+                .is_some()
+        );
+        let turn = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .expect("the original resource turn must commit");
+        request.await;
+        if route == 1 {
+            // The actual startup continuation runs the reset AFTER the RPC,
+            // with its original history/cap order. Its budget must still be
+            // pending here, not armed and then erased by next_timeslice.
+            assert_eq!(guest.thread.replay_rcb_end, None);
+            assert_eq!(guest.thread.stats.timeslice_count, original_slices);
+            super::finish_thread_start(&config, &mut guest, None);
+        }
+        assert_eq!(guest.thread.replay_rcb_end, with_budget.then_some(91));
+        assert_eq!(
+            guest.thread.stats.timeslice_count,
+            original_slices + u64::from(route == 1)
+        );
+        if route != 1 {
+            assert_eq!(guest.thread.max_timeslice_end, original_maximum);
+        }
+        let scheduler = state.sched.lock().unwrap();
+        (
+            turn,
+            scheduler.committed_time,
+            guest.thread.thread_logical_time.as_nanos(),
+            scheduler.turn,
+            (
+                guest.thread.max_timeslice_end,
+                guest.thread.end_of_timeslice,
+                guest.thread.stats.timeslice_count,
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn boundary_budget_survives_real_resource_start_and_exec_resume_rpc_without_an_extra_turn()
+     {
+        for route in 0..3 {
+            assert_eq!(
+                boundary_grant_roundtrip(route, true, false).await,
+                boundary_grant_roundtrip(route, false, false).await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_loaded_cursor_delivers_only_through_the_existing_grant_and_start_reset() {
+        for route in 0..3 {
+            assert_eq!(
+                boundary_grant_roundtrip(route, true, true).await,
+                boundary_grant_roundtrip(route, false, false).await,
+            );
+        }
     }
 
     // Exercise external registration and post-exec through the real global RPC
@@ -14729,6 +15789,326 @@ mod tests {
         .expect("image admission must finish without guest instructions");
     }
 
+    // Startup's posthook reads the backend clock even before guest instructions.
+    // This dedicated fixture reports exactly zero and counts those reads;
+    // the older ExternalRegistrationGuest's host-clock refusal stays intact.
+    struct BoundaryAdmissionGuest<'a> {
+        inner: ExternalRegistrationGuest<'a>,
+        clock_reads: usize,
+    }
+
+    impl<'a> std::ops::Deref for BoundaryAdmissionGuest<'a> {
+        type Target = ExternalRegistrationGuest<'a>;
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+    impl std::ops::DerefMut for BoundaryAdmissionGuest<'_> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.inner
+        }
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for BoundaryAdmissionGuest<'_> {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            self.inner.send_rpc(message).await
+        }
+        fn config(&self) -> &Config {
+            self.inner.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for BoundaryAdmissionGuest<'_> {
+        type Memory = reverie::syscalls::LocalMemory;
+        type Stack = ExternalRegistrationStack;
+        fn tid(&self) -> reverie::Pid {
+            self.inner.tid()
+        }
+        fn pid(&self) -> reverie::Pid {
+            self.inner.pid()
+        }
+        fn ppid(&self) -> Option<reverie::Pid> {
+            self.inner.ppid()
+        }
+        fn memory(&self) -> Self::Memory {
+            self.inner.memory()
+        }
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+            &mut self.inner.thread
+        }
+        fn thread_state(&self) -> &crate::ThreadState<()> {
+            &self.inner.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            self.inner.regs().await
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            self.inner.stack().await
+        }
+        async fn daemonize(&mut self) {
+            self.inner.daemonize().await
+        }
+        async fn inject<S: reverie::syscalls::SyscallInfo>(
+            &mut self,
+            syscall: S,
+        ) -> Result<i64, reverie::syscalls::Errno> {
+            self.inner.inject(syscall).await
+        }
+        async fn tail_inject<S: reverie::syscalls::SyscallInfo>(
+            &mut self,
+            syscall: S,
+        ) -> reverie::Never {
+            self.inner.tail_inject(syscall).await
+        }
+        fn set_timer(&mut self, schedule: reverie::TimerSchedule) -> Result<(), reverie::Error> {
+            self.inner.set_timer(schedule)
+        }
+        fn set_timer_precise(
+            &mut self,
+            schedule: reverie::TimerSchedule,
+        ) -> Result<(), reverie::Error> {
+            self.inner.set_timer_precise(schedule)
+        }
+        fn read_clock(&mut self) -> Result<u64, reverie::Error> {
+            self.clock_reads += 1;
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn boundary_actual_root_admission_keeps_registration_before_start_and_one_reset() {
+        use detcore_model::schedule::boundary::Boundary;
+        use detcore_model::schedule::boundary::Cause;
+        use detcore_model::schedule::boundary::Entry;
+        use detcore_model::schedule::boundary::Record;
+        use detcore_model::schedule::boundary::Schedule;
+        use reverie::Tool;
+
+        use crate::preemptions::boundary_recording::BoundaryRecording;
+        use crate::preemptions::boundary_recording::Recording;
+
+        for timers in [true, false] {
+            let mut trajectories = Vec::new();
+            for mode in 0..3 {
+                let temp = tempfile::tempdir().unwrap();
+                let root = super::ROOT_DETPID;
+                let mut expected =
+                    crate::slice_boundary::grant::tests::budget(root, MmId::initial(root), 0)
+                        .expected();
+                expected.checkin = 3;
+                expected.entry = Entry::Cpuid;
+                expected.cause = Cause::SoftwareCheckin;
+                if !timers {
+                    expected.entry = Entry::Syscall {
+                        syscall: reverie::syscalls::Sysno::sched_yield,
+                        occurrence: 1,
+                    };
+                    expected.cause = Cause::ExplicitSchedYield;
+                }
+                let input = temp.path().join("input");
+                Recording::Boundaries(
+                    BoundaryRecording::new(
+                        PreemptionRecord::from_sched_events(vec![]),
+                        Schedule::new(vec![Record::TimesliceEnd(Boundary {
+                            identity: expected,
+                            count: 1,
+                            start_rip: None,
+                            end_rip: None,
+                            end_time: None,
+                        })])
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .write(&input)
+                .unwrap();
+                let config = Config {
+                    sequentialize_threads: true,
+                    no_rcb_time: true,
+                    max_timeslice: if timers {
+                        Config::default().max_timeslice
+                    } else {
+                        None
+                    },
+                    record_preemptions: mode == 1,
+                    strict_schedule_boundaries: mode != 0,
+                    record_preemptions_to: (mode == 1).then(|| temp.path().join("output")),
+                    replay_schedule_from: (mode == 2).then_some(input),
+                    ..Config::default()
+                }
+                .with_backend(|backend| backend.delivers_preemption_timer_events = false);
+                let state = GlobalState::initialize(&config, false);
+                let tool = Detcore::new(Tid::from_raw(root.as_raw()), &config);
+                let mut guest = BoundaryAdmissionGuest {
+                    inner: ExternalRegistrationGuest {
+                        global: &state,
+                        config: &config,
+                        thread: tool.init_thread_state(Tid::from_raw(root.as_raw()), None),
+                        requests: Mutex::new(Vec::new()),
+                        post_exec: false,
+                        ppid: None,
+                        private_memory: None,
+                    },
+                    clock_reads: 0,
+                };
+                guest.thread.detpid = Some(root);
+                assert!(guest.thread.slice_boundary.is_none());
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    let mut start = std::pin::pin!(tool.handle_thread_start(&mut guest));
+                    assert!(futures::poll!(start.as_mut()).is_pending());
+                    let grants = async {
+                        let first = crate::scheduler::do_a_turn_blocking(
+                            state.sched.clone(),
+                            state.global_time.clone(),
+                            &Err(crate::scheduler::SkipTurn),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(first.resources.len(), 1);
+                        assert!(first.resources.contains_key(&ResourceID::ParentContinue {
+                            parent: root,
+                            child: root,
+                        }));
+                        // Poll the real startup continuation concurrently. Wait for
+                        // its next actual request before inspecting the mailbox.
+                        let next = state.sched.lock().unwrap().next_turns[&root].req.clone();
+                        let pending = next.get().await.unwrap();
+                        assert!(
+                            pending
+                                .resources
+                                .contains_key(&ResourceID::MemAddrSpace(root))
+                        );
+                        if mode == 2 {
+                            let mut different = expected;
+                            different.committed_rcbs = 1;
+                            let schedule = Schedule::new(vec![Record::TimesliceEnd(Boundary {
+                                identity: different,
+                                count: 1,
+                                start_rip: None,
+                                end_rip: None,
+                                end_time: None,
+                            })])
+                            .unwrap();
+                            let different =
+                                crate::slice_boundary::grant::Budget::at(&schedule, 0).unwrap();
+                            // A conflicting queue would succeed if ParentContinue had
+                            // consumed the pending budget. It must still be present.
+                            assert!(
+                                state
+                                    .sched
+                                    .lock()
+                                    .unwrap()
+                                    .boundary_budgets
+                                    .queue(MmId::initial(root), different)
+                                    .is_err()
+                            );
+                        }
+                        let second = crate::scheduler::do_a_turn_blocking(
+                            state.sched.clone(),
+                            state.global_time.clone(),
+                            &Ok(first),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(second.resources.len(), 1);
+                        assert!(
+                            second
+                                .resources
+                                .contains_key(&ResourceID::MemAddrSpace(root))
+                        );
+                    };
+                    let (started, ()) = tokio::join!(start, grants);
+                    started.unwrap();
+                })
+                .await
+                .expect("the two original admission grants must finish");
+                assert_eq!(guest.thread.stats.timeslice_count, u64::from(timers));
+                let requests = guest.requests.lock().unwrap();
+                let registration = requests
+                    .iter()
+                    .position(|r| matches!(r, GlobalRequest::CreateChildThread(..)))
+                    .unwrap();
+                let start = requests
+                    .iter()
+                    .position(|r| matches!(r, GlobalRequest::StartNewThread(..)))
+                    .unwrap();
+                assert!(registration < start);
+                if mode != 0 {
+                    let observed =
+                        serde_json::to_value(guest.thread.slice_boundary.as_ref().unwrap())
+                            .unwrap();
+                    assert_eq!(observed["start_reset_done"], true);
+                    assert_eq!(observed["checkin"], 2);
+                    assert_eq!(observed["completed_slices"], 0);
+                    assert_eq!(observed["current"][0], "ThreadStart");
+                    assert_eq!(observed["current"][1], "Posthook");
+                    assert_eq!(observed["pending_start_budget"], serde_json::Value::Null);
+                    assert_eq!(observed["expected_budget"].is_null(), mode != 2);
+                }
+                let sched = state.sched.lock().unwrap();
+                trajectories.push((
+                    sched.turn,
+                    sched.committed_time,
+                    guest.thread.thread_logical_time.as_nanos(),
+                    guest.thread.stats.timeslice_count,
+                    guest.thread.committed_clock_value,
+                    guest.thread.scheduler_grants,
+                    guest.clock_reads,
+                ));
+            }
+            assert_eq!(trajectories[0], trajectories[1]);
+            assert_eq!(trajectories[0], trajectories[2]);
+        }
+    }
+
+    #[test]
+    fn boundary_self_registration_is_not_a_parent_child_or_ordinary_grant() {
+        let root = super::ROOT_DETPID;
+        let request =
+            GlobalRequest::CreateChildThread(root, root, 0, None, libc::SIGCHLD, None, None);
+        assert!(super::registers_own_image(root, &request));
+        assert!(!super::registers_own_image(DetTid::from_raw(17), &request));
+        assert!(super::registers_own_image(
+            root,
+            &GlobalRequest::WithForwardedCount(4, Box::new(request))
+        ));
+        assert!(!super::registers_own_image(
+            root,
+            &GlobalRequest::StartNewThread(root, root, None, None)
+        ));
+        assert!(!super::registers_own_image(
+            root,
+            &GlobalRequest::ResumeExec(root)
+        ));
+        assert!(!super::registers_own_image(
+            root,
+            &GlobalRequest::GlobalTimeLowerBound
+        ));
+        let vfork = GlobalRequest::CreateVforkChildThread(
+            root,
+            root,
+            DetTid::from_raw(17),
+            0,
+            CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM,
+            libc::SIGCHLD,
+            None,
+        );
+        assert!(!super::registers_own_image(root, &vfork));
+        assert!(super::registers_own_image(DetTid::from_raw(17), &vfork));
+
+        let mut thread = crate::ThreadState::new(root, &Config::default(), ());
+        let owner = crate::slice_boundary::lifecycle::Registry::default()
+            .fresh(root, thread.mm_id)
+            .unwrap();
+        assert!(crate::slice_boundary::adopt_owner(&mut thread, owner, false).is_err());
+        assert!(thread.slice_boundary.is_none());
+    }
+
     /// A reloading backend supplies a real in-tree parent for a fresh image.
     /// That image must reconnect its prepared exec before ordinary requests can
     /// publish the replacement native memory owner.
@@ -16437,9 +17817,10 @@ mod tests {
         let cleanup = state.clean_up(false, &summary_path);
 
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), cleanup)
-                .await
-                .is_ok(),
+            matches!(
+                tokio::time::timeout(Duration::from_millis(100), cleanup).await,
+                Ok(Ok(()))
+            ),
             "cleanup waited for a scheduler whose guest never registered"
         );
     }
@@ -16473,12 +17854,14 @@ mod tests {
         state.cancel_internal_scheduler().await;
         let summary_path = None;
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                state.clean_up(false, &summary_path),
-            )
-            .await
-            .is_ok(),
+            matches!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    state.clean_up(false, &summary_path),
+                )
+                .await,
+                Ok(Ok(()))
+            ),
             "cleanup waited after cancelling a registered scheduler"
         );
     }
@@ -17320,7 +18703,7 @@ mod tests {
         }
         assert!(!log.exists(), "nothing is written while the run goes on");
 
-        state.clean_up(false, &None).await;
+        state.clean_up(false, &None).await.unwrap();
         let text = std::fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3, "{text}");

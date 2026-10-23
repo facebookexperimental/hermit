@@ -13,9 +13,11 @@ use clap::Parser;
 use colored::Colorize;
 use detcore::edit_distance::iterable_bubble_sort;
 use detcore::preemptions::PreemptionRecord;
-use detcore::preemptions::read_trace;
+use detcore::preemptions::boundary_recording::Recording;
 use detcore_model::pid::DetTid;
 use detcore_model::schedule::SchedEvent;
+use detcore_model::schedule::boundary::Record;
+use detcore_model::schedule::boundary::Schedule;
 
 use crate::CommonOpts;
 
@@ -55,8 +57,8 @@ pub struct DiffOpts {
 
 impl DiffOpts {
     pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
-        let first_schedule = read_trace(&self.file_a);
-        let second_schedule = read_trace(&self.file_b);
+        let first_schedule = legacy_schedule(&self.file_a, "schedule diff/interpolation")?;
+        let second_schedule = legacy_schedule(&self.file_b, "schedule diff/interpolation")?;
         println!("first schedule length: {}", first_schedule.len());
         println!("second schedule length: {}", second_schedule.len());
         let bubbles = iterable_bubble_sort(&first_schedule, &second_schedule);
@@ -87,7 +89,7 @@ pub struct InspectOpts {
 /// Return all events which are right before a preemption.
 fn preempt_events(sched: &[SchedEvent]) -> Vec<SchedEvent> {
     let mut acc = Vec::new();
-    for ix in 0..sched.len() - 1 {
+    for ix in 0..sched.len().saturating_sub(1) {
         if sched[ix].dettid != sched[ix + 1].dettid {
             acc.push(sched[ix].clone());
         }
@@ -107,7 +109,13 @@ fn per_thread_events(events: &Vec<SchedEvent>) -> BTreeMap<DetTid, Vec<SchedEven
 
 impl InspectOpts {
     pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
-        let schedule = read_trace(&self.sched_file);
+        let schedule = match Recording::read(&self.sched_file)? {
+            Recording::Legacy(record) => record.into_global(),
+            Recording::Boundaries(record) => {
+                print!("{}", inspect_boundaries(record.schedule(), self.verbose)?);
+                return Ok(true);
+            }
+        };
         println!("Schedule length: {}", schedule.len());
 
         let preempts = preempt_events(&schedule);
@@ -126,7 +134,7 @@ impl InspectOpts {
         if self.verbose {
             println!("Full context switch event list in order, with before/after events:");
             let mut count = 0;
-            for ix in 0..schedule.len() - 1 {
+            for ix in 0..schedule.len().saturating_sub(1) {
                 if schedule[ix].dettid != schedule[ix + 1].dettid {
                     count += 1;
                     println!(" {: >2}: {} => {}", count, schedule[ix], schedule[ix + 1]);
@@ -158,7 +166,20 @@ pub struct PrintOpts {
 
 impl PrintOpts {
     pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
-        let schedule = read_trace(&self.sched_file);
+        let mut recording = Recording::read(&self.sched_file)?;
+        if self.strip_times {
+            recording.strip_times();
+        }
+        let schedule = match recording {
+            Recording::Legacy(record) => record.into_global(),
+            Recording::Boundaries(record) => {
+                print!(
+                    "{}",
+                    print_boundaries(record.schedule(), self.indices, self.tid)?
+                );
+                return Ok(true);
+            }
+        };
         let mut last_skipped = false;
         let mut thread_counts: BTreeMap<DetTid, u64> = BTreeMap::new();
         for (global_ix, ev) in schedule.iter().enumerate() {
@@ -213,8 +234,8 @@ impl InterpolateOpts {
     pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
         let latency = Self::common_pipe_wake_latency(&self.file_a, &self.file_b)?;
         let copy = Self::common_signal_state_copy(&self.file_a, &self.file_b)?;
-        let first_schedule = read_trace(&self.file_a);
-        let second_schedule = read_trace(&self.file_b);
+        let first_schedule = legacy_schedule(&self.file_a, "schedule diff/interpolation")?;
+        let second_schedule = legacy_schedule(&self.file_b, "schedule diff/interpolation")?;
         // let i = 0;
         let dir = tempfile::Builder::new()
             .prefix("hermit_internal")
@@ -289,9 +310,174 @@ impl InterpolateOpts {
     }
 }
 
+fn legacy_schedule(
+    path: &std::path::Path,
+    operation: &'static str,
+) -> anyhow::Result<Vec<SchedEvent>> {
+    Ok(Recording::read(path)?.into_legacy(operation)?.into_global())
+}
+
+fn record_tid(record: &Record) -> DetTid {
+    match record {
+        Record::Event(event) => event.dettid,
+        Record::TimesliceEnd(boundary) => boundary.identity.owner.tid,
+    }
+}
+
+// Inspection is read-only and names stored indices in the complete stream.
+// It never projects away markers to pass them to a legacy editor.
+fn inspect_boundaries(schedule: &Schedule, verbose: bool) -> anyhow::Result<String> {
+    use std::fmt::Write;
+    let records = schedule.records();
+    let boundaries = records
+        .iter()
+        .filter(|r| matches!(r, Record::TimesliceEnd(_)))
+        .count();
+    let switches = records
+        .windows(2)
+        .filter(|p| record_tid(&p[0]) != record_tid(&p[1]))
+        .count();
+    let mut result = format!(
+        "Slice-boundary schedule: {} stored records, {} ordinary events, {} slice boundaries\nContext-switch endpoints: {}\n",
+        records.len(),
+        records.len() - boundaries,
+        boundaries,
+        switches,
+    );
+    if verbose {
+        for (index, record) in records.iter().enumerate() {
+            writeln!(result, "{index}: {}", serde_json::to_string(record)?)?;
+        }
+    }
+    Ok(result)
+}
+
+fn print_boundaries(
+    schedule: &Schedule,
+    indices: bool,
+    tid: Option<i32>,
+) -> anyhow::Result<String> {
+    use std::fmt::Write;
+    let mut result = String::new();
+    let mut counts = BTreeMap::<DetTid, u64>::new();
+    let mut last_skipped = false;
+    for (index, record) in schedule.records().iter().enumerate() {
+        let owner = record_tid(record);
+        let count = counts.entry(owner).or_default();
+        let thread_index = *count;
+        *count += 1;
+        if tid.is_some_and(|tid| tid != owner.as_raw()) {
+            if !last_skipped {
+                result.push('\n');
+            }
+            last_skipped = true;
+            continue;
+        }
+        last_skipped = false;
+        if indices {
+            write!(result, "{: <9} ", format!("({index},{thread_index})"))?;
+        }
+        writeln!(result, "{}", serde_json::to_string(record)?)?;
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boundary_inspection_keeps_every_record_index_and_editors_refuse_the_format() {
+        use detcore::preemptions::boundary_recording::BoundaryRecording;
+        use detcore_model::schedule::boundary::Boundary;
+        use detcore_model::schedule::boundary::Cause;
+        use detcore_model::schedule::boundary::Entry;
+        use detcore_model::schedule::boundary::Identity;
+        use detcore_model::schedule::boundary::Owner;
+        use detcore_model::schedule::boundary::Phase;
+        let tid = DetTid::from_raw(3);
+        let owner = Owner {
+            tid,
+            thread_generation: 0,
+            birth_tid: tid,
+            birth_generation: 0,
+            address_space_creator: tid,
+            address_space_generation: 0,
+        };
+        let schedule = Schedule::new(vec![
+            Record::Event(SchedEvent::branches(tid, 3)),
+            Record::TimesliceEnd(Boundary {
+                identity: Identity {
+                    owner,
+                    cause: Cause::SoftwareCheckin,
+                    phase: Phase::Prehook,
+                    entry: Entry::Cpuid,
+                    committed_rcbs: 3,
+                    checkin: 1,
+                    slice: 1,
+                },
+                count: 1,
+                start_rip: None,
+                end_rip: None,
+                end_time: Some(detcore_model::time::LogicalTime::from_nanos(19)),
+            }),
+            Record::Event(SchedEvent::branches(DetTid::from_raw(4), 2)),
+        ])
+        .unwrap();
+        let inspection = inspect_boundaries(&schedule, true).unwrap();
+        assert!(inspection.contains("3 stored records, 2 ordinary events, 1 slice boundaries"));
+        assert!(inspection.contains("Context-switch endpoints: 1"));
+        for (index, record) in schedule.records().iter().enumerate() {
+            assert!(inspection.contains(&format!(
+                "{index}: {}\n",
+                serde_json::to_string(record).unwrap()
+            )));
+        }
+        let printed = print_boundaries(&schedule, false, None).unwrap();
+        let decoded: Vec<Record> = printed
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(decoded, schedule.records());
+        let filtered = print_boundaries(&schedule, true, Some(3)).unwrap();
+        assert!(filtered.starts_with("(0,0)"));
+        assert!(filtered.lines().nth(1).unwrap().starts_with("(1,1)"));
+        assert_eq!(filtered.lines().count(), 3);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recording.json");
+        let recording = Recording::Boundaries(
+            BoundaryRecording::new(PreemptionRecord::from_sched_events(vec![]), schedule).unwrap(),
+        );
+        recording.write(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(legacy_schedule(&path, "schedule diff/interpolation").is_err());
+        let options = CommonOpts::parse_from(["test"]);
+        assert!(
+            DiffOpts {
+                file_a: path.clone(),
+                file_b: path.clone()
+            }
+            .run(&options)
+            .is_err()
+        );
+        assert!(
+            InterpolateOpts {
+                interpolate: 50,
+                file_a: path.clone(),
+                file_b: path.clone()
+            }
+            .run(&options)
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert!(
+            inspect_boundaries(&Schedule::new(vec![]).unwrap(), true)
+                .unwrap()
+                .contains("0 stored records")
+        );
+        assert!(preempt_events(&[]).is_empty());
+    }
 
     /// Two schedules recorded under different signal-state copy settings
     /// cannot be interpolated; one that does not say takes the other's.

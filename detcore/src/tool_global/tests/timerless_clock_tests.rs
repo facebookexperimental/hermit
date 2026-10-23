@@ -665,3 +665,92 @@ async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer()
         assert_eq!(sched.turn, 0);
     }
 }
+
+/// Actual shared pre/post hooks and the CPUID Tool callback, with typed
+/// observations installed by the fixture. The RPC stub still refuses any
+/// added scheduling request. This is callback plumbing, not backend replay.
+#[test]
+fn boundary_callback_tokens_preserve_actual_accounting_and_nested_entries() {
+    futures::executor::block_on(async {
+        let mut trajectories = Vec::new();
+        for observed in [false, true] {
+            let config = Config {
+                sequentialize_threads: true,
+                record_preemptions: true,
+                strict_schedule_boundaries: true,
+                ..Config::default()
+            }
+            .with_backend(|backend| backend.delivers_preemption_timer_events = false);
+            let tool: Detcore = Detcore::new(Tid::from_raw(TID.as_raw()), &config);
+            let mut thread = tool.init_thread_state(Tid::from_raw(TID.as_raw()), None);
+            thread.detpid = Some(TID);
+            thread.next_timeslice(&config);
+            if observed {
+                thread.slice_boundary = Some(crate::slice_boundary::Observations::new(&thread, 0));
+            }
+            let mut guest = ClockGuest {
+                config,
+                thread,
+                raw: 1,
+                reads: 0,
+                records: Mutex::new(Vec::new()),
+                precise_timers: Vec::new(),
+                imprecise_timers: Vec::new(),
+                rpc_state: None,
+            };
+            let initial_slices = guest.thread.stats.timeslice_count;
+            use crate::slice_boundary::callbacks::Callback;
+            let outer = tool
+                .pre_handler_hook_observed(
+                    &mut guest,
+                    false,
+                    CheckIn::Event,
+                    Some(Callback::Syscall(reverie::syscalls::Sysno::read)),
+                )
+                .await;
+            guest.raw = 2;
+            let nested = tool
+                .pre_handler_hook_observed(
+                    &mut guest,
+                    false,
+                    CheckIn::Event,
+                    Some(Callback::Syscall(reverie::syscalls::Sysno::getpid)),
+                )
+                .await;
+            tool.post_handler_hook_observed(&mut guest, CheckIn::Event, nested)
+                .await;
+            tool.post_handler_hook_observed(&mut guest, CheckIn::Event, outer)
+                .await;
+            if observed {
+                let observation =
+                    serde_json::to_value(guest.thread.slice_boundary.as_ref().unwrap()).unwrap();
+                assert_eq!(observation["checkin"], 4);
+                assert_eq!(observation["current"][0]["Syscall"]["occurrence"], 1);
+                assert_eq!(observation["current"][1], "Posthook");
+                assert_eq!(observation["current"][2], 2);
+            }
+            // Use the real Tool implementation, not only the token helper.
+            tool.handle_cpuid_event(&mut guest, 0, 0).await.unwrap();
+            if observed {
+                let observation =
+                    serde_json::to_value(guest.thread.slice_boundary.as_ref().unwrap()).unwrap();
+                assert_eq!(observation["checkin"], 6);
+                assert_eq!(observation["current"][0], "Cpuid");
+                assert_eq!(observation["current"][1], "Posthook");
+            }
+            assert_eq!(guest.thread.stats.timeslice_count, initial_slices);
+            trajectories.push((
+                serde_json::to_value(&guest.thread.thread_logical_time).unwrap(),
+                guest.thread.committed_clock_value,
+                guest.thread.end_of_timeslice,
+                guest.thread.max_timeslice_end,
+                guest.thread.stats.timeslice_count,
+                guest.records.into_inner().unwrap(),
+                guest.reads,
+                guest.precise_timers,
+                guest.imprecise_timers,
+            ));
+        }
+        assert_eq!(trajectories[0], trajectories[1]);
+    });
+}

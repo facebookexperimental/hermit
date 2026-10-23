@@ -716,3 +716,83 @@ fn mid_startup_timeout_retains_original_waiter_and_resources() {
 }
 
 include!("ptrace_random_failure_tests.rs");
+
+#[test]
+fn terminal_result_releases_owned_future_and_keeps_concurrent_caller_alive() {
+    isolated(
+        "terminal_result_releases_owned_future_and_keeps_concurrent_caller_alive",
+        || {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let other = std::thread::spawn(move || {
+                run_on_tracer_thread(None, move |_| async move {
+                    entered_tx.send(()).unwrap();
+                    release_rx.await?;
+                    Ok(73u32)
+                })
+            });
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let copied_drops = drops.clone();
+            let path = Arc::new(Mutex::new(PathBuf::new()));
+            let copied_path = path.clone();
+            let error = run_on_tracer_thread::<(), _, _>(None, move |_| async move {
+                let directory = tempfile::tempdir()?;
+                *copied_path.lock().unwrap() = directory.path().to_owned();
+                let _guard = DropCount(copied_drops);
+                let error = crate::error::terminal_replay_refusal_for_test().await;
+                assert!(
+                    directory.path().is_dir(),
+                    "backing must outlive finalization"
+                );
+                Err(error)
+            })
+            .unwrap_err();
+            assert!(error.is::<detcore::TerminalReplayRefusal>());
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(!path.lock().unwrap().exists());
+            assert!(
+                crate::tracer_thread::execute(|| OWNERS.with(|owners| owners.borrow().is_empty()))
+                    .unwrap()
+            );
+            assert_eq!(*UNRESOLVED.lock().unwrap(), 0);
+            release_tx.send(()).unwrap();
+            assert_eq!(other.join().unwrap().unwrap(), 73);
+            assert_eq!(
+                run_on_tracer_thread(None, |_| async { Ok(89u32) }).unwrap(),
+                89
+            );
+        },
+    );
+}
+
+#[tokio::test]
+async fn finalization_secondary_preserves_nested_cleanup_kind_and_stage() {
+    let pending = HermitCleanupUnconfirmed {
+        key: 0,
+        origin: OriginNumbers::current().unwrap().0,
+        stage: HermitCleanupStage::GlobalStateCleanup,
+        snapshot: Snapshot {
+            kind: FailureKind::RunTimeout,
+            primary: "original timeout during cleanup".into(),
+            ..Snapshot::startup()
+        },
+    };
+    let error = detcore::combine_finalization::<()>(
+        Err(Error::new(pending)),
+        Err(crate::error::terminal_replay_refusal_for_test().await),
+    )
+    .unwrap_err();
+    let error =
+        detcore::combine_finalization::<()>(Err(error), Err(Error::msg("another output failure")))
+            .unwrap_err();
+    let serialized = crate::SerializableError::from(Error::new(reverie::Error::Tool(error)));
+    assert_eq!(serialized.kind(), FailureKind::RunTimeout);
+    assert_eq!(
+        serialized.cleanup_stage(),
+        Some(HermitCleanupStage::GlobalStateCleanup)
+    );
+    let diagnostic = format!("{serialized:?}");
+    assert!(diagnostic.contains("Incomplete"));
+    assert!(diagnostic.contains("another output failure"));
+}

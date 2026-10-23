@@ -1838,12 +1838,7 @@ rust_replay_case!(
     "poll",
     Mode::ChaosReplay
 );
-rust_replay_case!(
-    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
-    trace_replay_rust_poll,
-    "poll",
-    Mode::TraceReplay
-);
+rust_replay_case!(trace_replay_rust_poll, "poll", Mode::TraceReplay);
 rust_replay_case!(trace_replay_chaos_rust_poll, "poll", Mode::TraceReplayChaos);
 rust_replay_case!(
     #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
@@ -1852,7 +1847,6 @@ rust_replay_case!(
     Mode::ChaosReplay
 );
 rust_replay_case!(
-    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
     trace_replay_rust_print_clock_nanosleep_monotonic_abs_race,
     "print_clock_nanosleep_monotonic_abs_race",
     Mode::TraceReplay
@@ -1864,7 +1858,6 @@ rust_replay_case!(
     Mode::ChaosReplay
 );
 rust_replay_case!(
-    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
     trace_replay_rust_print_clock_nanosleep_monotonic_race,
     "print_clock_nanosleep_monotonic_race",
     Mode::TraceReplay
@@ -1876,7 +1869,6 @@ rust_replay_case!(
     Mode::ChaosReplay
 );
 rust_replay_case!(
-    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
     trace_replay_rust_print_clock_nanosleep_realtime_abs_race,
     "print_clock_nanosleep_realtime_abs_race",
     Mode::TraceReplay
@@ -1888,7 +1880,6 @@ rust_replay_case!(
     Mode::ChaosReplay
 );
 rust_replay_case!(
-    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
     trace_replay_rust_print_nanosleep_race,
     "print_nanosleep_race",
     Mode::TraceReplay

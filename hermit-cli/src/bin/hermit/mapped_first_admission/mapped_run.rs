@@ -615,28 +615,46 @@ unsafe fn run_inner(
             }
             global
                 .clean_up_with_dispatch_stats(print_summary, summary_json, dispatch)
-                .await;
-        });
-        Ok(())
+                .await
+        })
     });
-    if let Some(Err(error)) = finalization {
-        errors.push(format!("actual global finalization: {error}"));
-    }
+    // Keep the typed error out of the string-only cleanup diagnostics. The
+    // latter remain the original custody/cleanup verdict when already present.
+    let finalization = finalization.unwrap_or_else(|| {
+        Err(anyhow::anyhow!(
+            "global finalization panicked; original panic retained"
+        ))
+    });
+    #[cfg(all(test, feature = "mm-cancellation-test-support"))]
+    let finalization_message = finalization
+        .as_ref()
+        .err()
+        .map(|e| format!("actual global finalization: {e:#}"));
     #[cfg(all(test, feature = "mm-cancellation-test-support"))]
     if let Some(cancel) = cancellation.as_mut() {
         // After retained verification, Arc unwrap and finalization: no later
         // cleanup Result may escape the control's complete error custody.
-        cancel.finish_outcome(&primary, &errors);
+        let mut complete_errors = errors.clone();
+        if let Some(message) = &finalization_message {
+            complete_errors.push(message.clone());
+        }
+        cancel.finish_outcome(&primary, &complete_errors);
     }
     if let Some(payload) = panic_payload {
         resume_unwind(payload);
     }
     if !errors.is_empty() {
-        return Err(anyhow::anyhow!(
-            "mapped cleanup={errors:?}; execution={primary:?}"
-        ));
+        return detcore::combine_finalization(
+            Err(anyhow::anyhow!(
+                "mapped cleanup={errors:?}; execution={primary:?}"
+            )),
+            finalization,
+        );
     }
-    primary?.ok_or_else(|| anyhow::anyhow!("no actual mapped terminal status"))
+    let primary = primary.map_err(anyhow::Error::from).and_then(|status| {
+        status.ok_or_else(|| anyhow::anyhow!("no actual mapped terminal status"))
+    });
+    detcore::combine_finalization(primary, finalization)
 }
 
 // Read-only intermediate evidence while the original physical owner retains

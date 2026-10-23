@@ -205,8 +205,8 @@ impl Replay {
             _materialization_scope,
         } = self;
         let (exit_status, global_state) = crate::ptrace_completion::wait(tracer, control).await?;
-        global_state.clean_up(false, &None).await;
-        chroot.remove()?;
+        let finalized = global_state.clean_up(false, &None).await;
+        finish_replay_chroot(finalized, chroot)?;
         Ok(exit_status)
     }
 
@@ -222,10 +222,16 @@ impl Replay {
         } = self;
         let (output, global_state) =
             crate::ptrace_completion::wait_with_output(tracer, control).await?;
-        global_state.clean_up(false, &None).await;
-        chroot.remove()?;
+        let finalized = global_state.clean_up(false, &None).await;
+        finish_replay_chroot(finalized, chroot)?;
         Ok(output)
     }
+}
+
+// Explicit close still runs on finalization failure; retain its failure too.
+fn finish_replay_chroot(finalized: Result<(), Error>, chroot: TempChroot) -> Result<(), Error> {
+    let removed = chroot.remove().map_err(Error::from);
+    detcore::combine_finalization(finalized, removed)
 }
 
 fn prepare_replay_mounts(chroot: &TempChroot, mounts: &[Mount]) -> io::Result<Vec<Mount>> {
@@ -792,5 +798,46 @@ mod tests {
             fs::read(chroot.path().join("mounted-file")).unwrap(),
             b"existing"
         );
+    }
+}
+
+#[cfg(test)]
+mod finalization_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn terminal_error_does_not_skip_explicit_chroot_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let chroot = TempChroot::new_in(directory.path()).unwrap();
+        let path = chroot.path().to_owned();
+        fs::write(path.join("backing"), b"owned until finalization").unwrap();
+        let error = finish_replay_chroot(
+            Err(crate::error::terminal_replay_refusal_for_test().await),
+            chroot,
+        )
+        .unwrap_err();
+        assert!(error.is::<detcore::TerminalReplayRefusal>());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn terminal_and_explicit_close_errors_are_both_retained() {
+        let directory = tempfile::tempdir().unwrap();
+        let chroot = TempChroot::new_in(directory.path()).unwrap();
+        let path = chroot.path().to_owned();
+        let moved = directory.path().join("original-root");
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"not a directory").unwrap();
+        let error = finish_replay_chroot(
+            Err(crate::error::terminal_replay_refusal_for_test().await),
+            chroot,
+        )
+        .unwrap_err();
+        let pair = error
+            .downcast_ref::<detcore::FinalizationFailure>()
+            .unwrap();
+        assert!(pair.primary().is::<detcore::TerminalReplayRefusal>());
+        assert!(pair.secondary().is::<io::Error>());
+        assert!(moved.is_dir());
     }
 }

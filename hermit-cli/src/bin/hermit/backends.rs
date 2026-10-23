@@ -2045,7 +2045,7 @@ async fn clean_up_dbt_global(
     status: &std::process::ExitStatus,
     mut global: detcore::GlobalState,
     report: Option<&std::fs::File>,
-) -> std::io::Result<()> {
+) -> Result<(), Error> {
     // The runner has drained RPC owners before returning exclusive GlobalState.
     // Forward its aggregate through the existing invocation pipe used by
     // copied-child records, without opening or duplicating a descriptor.
@@ -2063,9 +2063,9 @@ async fn clean_up_dbt_global(
         // that failed before registration cannot start the owned scheduler.
         global.cancel_internal_scheduler().await;
     }
-    global.clean_up(false, &None).await;
-    // Export failure must never bypass scheduler cleanup.
-    exported
+    let finalized = global.clean_up(false, &None).await;
+    // Export failure must never bypass scheduler cleanup or lose its class.
+    detcore::combine_finalization(exported.map_err(Error::from), finalized)
 }
 
 /// Name the stage that actually failed.
@@ -2357,12 +2357,14 @@ mod tests {
         for (name, raw_status) in [("exit255", 255 << 8), ("SIGKILL", libc::SIGKILL)] {
             let global = detcore::GlobalState::init_global_state(&config).await;
             let status = std::process::ExitStatus::from_raw(raw_status);
-            let completed = tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                super::clean_up_dbt_global(&status, global, None),
-            )
-            .await
-            .is_ok();
+            let completed = matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    super::clean_up_dbt_global(&status, global, None),
+                )
+                .await,
+                Ok(Ok(()))
+            );
             assert_eq!(status.into_raw(), raw_status);
             outcomes.push((name, completed));
         }
@@ -2387,12 +2389,14 @@ mod tests {
         };
         let global = detcore::GlobalState::init_global_state(&config).await;
         assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                super::clean_up_dbt_global(&status, global, None),
-            )
-            .await
-            .is_ok(),
+            matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    super::clean_up_dbt_global(&status, global, None),
+                )
+                .await,
+                Ok(Ok(()))
+            ),
             "cleanup without an owned scheduler did not complete"
         );
         let config = detcore::Config {

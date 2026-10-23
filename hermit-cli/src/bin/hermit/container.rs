@@ -5696,6 +5696,58 @@ mod tests {
         assert!(classified.downcast_ref::<PolicyRefusal>().is_none());
     }
 
+    #[tokio::test]
+    async fn typed_terminal_refusal_and_io_keep_distinct_container_classes() {
+        use detcore::preemptions::PreemptionRecord;
+        use detcore::preemptions::boundary_recording::BoundaryRecording;
+        use detcore::preemptions::boundary_recording::Recording;
+        use detcore_model::pid::DetTid;
+        use detcore_model::schedule::SchedEvent;
+        use detcore_model::schedule::boundary::Record;
+        use detcore_model::schedule::boundary::Schedule;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("terminal.json");
+        let recording = Recording::Boundaries(
+            BoundaryRecording::new(
+                PreemptionRecord::default(),
+                Schedule::new(vec![Record::Event(SchedEvent::branches(
+                    DetTid::from_raw(1),
+                    1,
+                ))])
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        std::fs::write(&path, recording.encode().unwrap()).unwrap();
+        let error = detcore::GlobalState::init_for_external_scheduler(&detcore::Config {
+            sequentialize_threads: true,
+            strict_schedule_boundaries: true,
+            replay_schedule_from: Some(path),
+            record_preemptions: false,
+            ..detcore::Config::default()
+        })
+        .clean_up(false, &None)
+        .await
+        .unwrap_err();
+        assert!(error.is::<detcore::TerminalReplayRefusal>());
+        let serialized = SerializableError::from(Error::new(reverie::Error::Tool(error)));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        let classified = classify_container_result::<()>(Ok(Err(serialized))).unwrap_err();
+        assert!(classified.is::<PolicyRefusal>());
+        assert!(!classified.is::<ContainerChildPanic>());
+        assert!(format!("{classified:#}").contains("Incomplete"));
+        for error in [
+            Error::new(std::io::Error::other("summary output failed")),
+            Error::msg("terminal replay refusal: slice-boundary protocol refusal"),
+        ] {
+            let serialized = SerializableError::from(error);
+            assert_eq!(serialized.kind(), FailureKind::Error);
+            let classified = classify_container_result::<()>(Ok(Err(serialized))).unwrap_err();
+            assert!(!classified.is::<PolicyRefusal>());
+            assert!(!classified.is::<ContainerChildPanic>());
+        }
+    }
+
     #[test]
     fn skid_overshoot_count_survives_the_container_boundary() {
         let reported = SerializableError::from(Error::new(SkidOvershootError::new(3)));

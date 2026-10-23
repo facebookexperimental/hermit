@@ -649,6 +649,14 @@ pub struct Config {
     #[clap(long)]
     pub record_preemptions: bool,
 
+    /// Record and replay the complete slice-boundary protocol used by strict
+    /// trace verification. This mode refuses mismatches, extra observations,
+    /// incomplete replay and legacy schedule files; it does not resynchronize.
+    /// Ordinary recording/replay and schedule editing retain their legacy mode.
+    #[serde(default)]
+    #[clap(long)]
+    pub strict_schedule_boundaries: bool,
+
     /// File to write the record of preemptions (in JSON).  Implies `--record-preemptions`.
     #[clap(long, value_name = "filepath")]
     pub record_preemptions_to: Option<PathBuf>,
@@ -1572,6 +1580,9 @@ impl fmt::Display for Config {
         if self.chaos {
             write!(f, " --chaos")?;
         }
+        if self.strict_schedule_boundaries {
+            write!(f, " --strict-schedule-boundaries")?;
+        }
         if self.record_preemptions {
             write!(f, " --record-preemptions")?;
         }
@@ -2266,6 +2277,11 @@ impl Default for Config {
 /// [`Config::backend`] from the fifteen keys. A plain `Config`
 /// deserialization ignores the keys and gives the field its serde default.
 pub fn to_legacy_backend_json(config: &Config) -> serde_json::Result<String> {
+    if config.strict_schedule_boundaries {
+        return Err(serde::ser::Error::custom(
+            "strict schedule boundaries cannot be represented by the legacy backend configuration",
+        ));
+    }
     let mut json = Vec::with_capacity(4096);
     let mut serializer = serde_json::Serializer::new(&mut json);
     config.serialize(legacy_backend_json::ConfigSerializer {
@@ -2734,8 +2750,9 @@ mod legacy_backend_json {
     /// as unset.
     /// `signal_at` came after the form froze; the scheduler acts on it, not
     /// the runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 24] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 25] = [
         "backend",
+        "strict_schedule_boundaries",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
         "in_guest_detlog_forward_policy",
@@ -2888,7 +2905,8 @@ mod legacy_backend_json {
                         .map_err(<A::Error as de::Error>::custom)
                 }
                 Some(
-                    "record_host_inputs"
+                    "strict_schedule_boundaries"
+                    | "record_host_inputs"
                     | "guest_may_inherit_a_terminal"
                     | "in_guest_site_patching_off"
                     | "in_guest_refuses_host_timed_producers"
@@ -3179,7 +3197,8 @@ mod legacy_backend_json {
                     Ok(())
                 }
                 // No legacy key; see FIELDS_WITHOUT_A_LEGACY_KEY.
-                "record_host_inputs"
+                "strict_schedule_boundaries"
+                | "record_host_inputs"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
@@ -3907,7 +3926,8 @@ mod tests {
         for field in &fields {
             match field.as_str() {
                 "backend" => expected.extend(names.map(str::to_owned)),
-                "record_host_inputs"
+                "strict_schedule_boundaries"
+                | "record_host_inputs"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
@@ -3949,10 +3969,10 @@ mod tests {
         // `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `signal_delivery_check_fatal`,
         // `work_span_report`, `signal_at` and `in_guest_signal_delivery`
-        // none: fourteen more keys, and twenty-three fewer, so nine keys
-        // fewer than fields.
+        // and `strict_schedule_boundaries` none: fourteen more keys and
+        // twenty-four fewer, so ten keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 9);
+        assert_eq!(fields.len(), keys.len() + 10);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5647,5 +5667,67 @@ mod tests {
             ..Default::default()
         };
         config.validate();
+    }
+}
+
+#[cfg(test)]
+mod strict_boundary_mode_tests {
+    use super::Config;
+
+    #[test]
+    fn strict_boundary_policy_is_explicit_and_round_trips_the_actual_wire() {
+        let ordinary = Config::default();
+        assert!(!ordinary.strict_schedule_boundaries);
+        let mut old_shape = serde_json::to_value(&ordinary).unwrap();
+        assert_eq!(
+            old_shape
+                .as_object_mut()
+                .unwrap()
+                .remove("strict_schedule_boundaries"),
+            Some(false.into())
+        );
+        assert!(
+            !serde_json::from_value::<Config>(old_shape)
+                .unwrap()
+                .strict_schedule_boundaries
+        );
+        let explicit = Config {
+            strict_schedule_boundaries: true,
+            ..ordinary
+        };
+        let encoded = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(encoded["strict_schedule_boundaries"], true);
+        assert!(
+            serde_json::from_value::<Config>(encoded)
+                .unwrap()
+                .strict_schedule_boundaries
+        );
+        assert!(
+            explicit
+                .to_string()
+                .contains("--strict-schedule-boundaries")
+        );
+        for config in [&Config::default(), &explicit] {
+            let bytes = bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap();
+            let (decoded, consumed): (Config, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(
+                decoded.strict_schedule_boundaries,
+                config.strict_schedule_boundaries
+            );
+            assert_eq!(
+                bincode::serde::encode_to_vec(&decoded, bincode::config::legacy()).unwrap(),
+                bytes
+            );
+        }
+        let legacy = super::to_legacy_backend_json(&Config::default()).unwrap();
+        assert!(!legacy.contains("strict_schedule_boundaries"));
+        assert!(
+            !super::from_legacy_backend_json(&legacy)
+                .unwrap()
+                .strict_schedule_boundaries
+        );
+        assert!(super::to_legacy_backend_json(&explicit).is_err());
     }
 }

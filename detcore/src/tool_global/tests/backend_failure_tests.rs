@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -262,7 +263,7 @@ async fn backend_failure_completes_unstarted_daemon_without_aborting_it() {
     .expect("terminal startup must complete")
     .expect("daemon must not panic or be aborted");
     assert!(state.sched.lock().unwrap().started_up.try_read().is_none());
-    state.clean_up(false, &None).await;
+    state.clean_up(false, &None).await.unwrap();
 }
 
 #[tokio::test]
@@ -294,7 +295,7 @@ async fn backend_failure_completes_registered_daemon_without_another_request() {
     .expect("daemon must not panic or be aborted");
     assert!(request.try_read().is_none());
     assert_eq!(state.sched.lock().unwrap().turn, 0);
-    state.clean_up(false, &None).await;
+    state.clean_up(false, &None).await.unwrap();
 }
 
 #[tokio::test]
@@ -763,4 +764,172 @@ fn both_fork_and_thread_construction_reset_the_parent_start_marker() {
         assert!(!child.thread_start_entered);
         assert!(state.thread_start_entered);
     }
+}
+
+// These finalization controls invoke the real global cleanup. No scheduler
+// callback or guest outcome is fabricated as a successful replay.
+fn terminal_replay_state(
+    directory: &std::path::Path,
+    incomplete: bool,
+    recording: Option<PathBuf>,
+) -> GlobalState {
+    use detcore_model::schedule::boundary::Record;
+    use detcore_model::schedule::boundary::Schedule;
+
+    use crate::preemptions::PreemptionRecord;
+    use crate::preemptions::boundary_recording::BoundaryRecording;
+    use crate::preemptions::boundary_recording::Recording;
+    let events = if incomplete {
+        vec![Record::Event(SchedEvent::branches(DetTid::from_raw(1), 1))]
+    } else {
+        vec![]
+    };
+    let replay = directory.join("terminal-replay.json");
+    let recorded = Recording::Boundaries(
+        BoundaryRecording::new(PreemptionRecord::default(), Schedule::new(events).unwrap())
+            .unwrap(),
+    );
+    std::fs::write(&replay, recorded.encode().unwrap()).unwrap();
+    GlobalState::initialize(
+        &Config {
+            sequentialize_threads: true,
+            replay_schedule_from: Some(replay),
+            strict_schedule_boundaries: true,
+            record_preemptions: recording.is_some(),
+            record_preemptions_to: recording,
+            ..Config::default()
+        },
+        false,
+    )
+}
+
+#[tokio::test]
+async fn terminal_replay_refusal_consumes_remaining_writer_without_summary_or_drop_retry() {
+    use detcore_model::schedule::boundary::Error as BoundaryError;
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("partial.json");
+    let summary = directory.path().join("summary.json");
+    std::fs::write(&summary, b"untouched summary sentinel").unwrap();
+    let state = terminal_replay_state(directory.path(), true, Some(output.clone()));
+    let scheduler = state.sched.clone();
+    let error = state
+        .clean_up(false, &Some(summary.clone()))
+        .await
+        .unwrap_err();
+    assert!(error.is::<crate::TerminalReplayRefusal>());
+    assert!(error.chain().any(|cause| matches!(
+        cause.downcast_ref::<BoundaryError>(),
+        Some(BoundaryError::Incomplete {
+            index: 0,
+            remaining: 1
+        })
+    )));
+    assert!(scheduler.lock().unwrap().preemption_writer.is_none());
+    assert!(
+        output.is_file(),
+        "partial writer must be explicitly consumed"
+    );
+    assert_eq!(
+        std::fs::read(&summary).unwrap(),
+        b"untouched summary sentinel"
+    );
+    // Dropping the remaining scheduler owner must not retry the output. Its
+    // former file is now a directory, so a hidden retry would panic here.
+    std::fs::remove_file(&output).unwrap();
+    std::fs::create_dir(&output).unwrap();
+    drop(scheduler);
+    assert!(output.is_dir());
+}
+
+#[tokio::test]
+async fn terminal_replay_and_writer_failures_keep_both_and_consume_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = terminal_replay_state(directory.path(), true, Some(directory.path().to_owned()));
+    let scheduler = state.sched.clone();
+    let error = state.clean_up(false, &None).await.unwrap_err();
+    let pair = error.downcast_ref::<crate::FinalizationFailure>().unwrap();
+    assert!(pair.primary().is::<crate::TerminalReplayRefusal>());
+    assert!(
+        pair.secondary()
+            .to_string()
+            .contains("Failed to write boundary recording")
+    );
+    assert!(format!("{error:#}").contains("Incomplete"));
+    assert!(format!("{error:#}").contains("Failed to write boundary recording"));
+    assert!(scheduler.lock().unwrap().preemption_writer.is_none());
+    drop(scheduler);
+    assert!(directory.path().is_dir());
+}
+
+#[tokio::test]
+async fn completed_replay_writer_failure_is_an_ordinary_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = terminal_replay_state(directory.path(), false, Some(directory.path().to_owned()));
+    let scheduler = state.sched.clone();
+    let summary = directory.path().join("summary.json");
+    let error = state
+        .clean_up(false, &Some(summary.clone()))
+        .await
+        .unwrap_err();
+    assert!(
+        !error
+            .chain()
+            .any(|cause| cause.is::<crate::TerminalReplayRefusal>())
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("Failed to write boundary recording")
+    );
+    assert!(scheduler.lock().unwrap().preemption_writer.is_none());
+    assert!(!summary.exists());
+}
+
+#[tokio::test]
+async fn valid_terminal_replay_writes_summary_and_recording() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("completed.json");
+    let summary = directory.path().join("summary.json");
+    let state = terminal_replay_state(directory.path(), false, Some(output.clone()));
+    let scheduler = state.sched.clone();
+    state.clean_up(false, &Some(summary.clone())).await.unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(summary).unwrap()).unwrap();
+    assert!(summary.is_object());
+    assert!(scheduler.lock().unwrap().preemption_writer.is_none());
+    let crate::preemptions::boundary_recording::Recording::Boundaries(recording) =
+        crate::preemptions::boundary_recording::Recording::read(&output).unwrap()
+    else {
+        panic!("complete typed recording lost its format");
+    };
+    assert!(recording.schedule().records().is_empty());
+}
+
+#[tokio::test]
+async fn terminal_summary_clock_and_output_errors_remain_ordinary() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = terminal_replay_state(directory.path(), false, None);
+    state.realtime_start = SystemTime::now() + Duration::from_secs(60);
+    let error = state.clean_up(false, &None).await.unwrap_err();
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<std::time::SystemTimeError>())
+    );
+    assert!(
+        !error
+            .chain()
+            .any(|cause| cause.is::<crate::TerminalReplayRefusal>())
+    );
+    let state = terminal_replay_state(directory.path(), false, None);
+    let error = state
+        .clean_up(false, &Some(directory.path().to_owned()))
+        .await
+        .unwrap_err();
+    assert!(error.chain().any(|cause| cause.is::<std::io::Error>()));
+    assert!(
+        !error
+            .chain()
+            .any(|cause| cause.is::<crate::TerminalReplayRefusal>())
+    );
 }

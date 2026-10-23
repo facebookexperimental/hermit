@@ -711,6 +711,11 @@ pub struct Resources {
     /// interruption itself) included.
     #[serde(default)]
     pub(crate) private_sigchld_decides: bool,
+    /// Observation of the slice reset immediately preceding this original
+    /// operation. Consumed once under the authenticated scheduler lock, before
+    /// publication; it is never a ResourceID, permission or additional turn.
+    #[serde(default)]
+    pub(crate) slice_boundary: Option<Box<detcore_model::schedule::boundary::Boundary>>,
 }
 
 impl fmt::Debug for Resources {
@@ -769,6 +774,9 @@ impl fmt::Debug for Resources {
         if self.private_sigchld_decides {
             debug.field("private_sigchld_decides", &true);
         }
+        if let Some(boundary) = &self.slice_boundary {
+            debug.field("slice_boundary", boundary);
+        }
         debug.finish()
     }
 }
@@ -778,6 +786,10 @@ impl Resources {
     /// `Scheduler::upgrade_polled_to_runnable` puts in its place:
     /// `poll_attempt` 0, with the retry number kept in `upgraded_from_attempt`.
     pub(crate) fn upgraded_to_runnable(&self) -> Resources {
+        assert!(
+            self.slice_boundary.is_none(),
+            "slice-boundary annotation must be consumed before poll upgrade"
+        );
         let mut runnable = self.clone();
         runnable.upgraded_from_attempt = runnable.upgraded_from_attempt.max(runnable.poll_attempt);
         runnable.poll_attempt = 0;
@@ -809,6 +821,7 @@ impl Resources {
             decides_signal_interruption_itself: false,
             continues_sigreturn: false,
             private_sigchld_decides: false,
+            slice_boundary: None,
         }
     }
 
@@ -817,6 +830,10 @@ impl Resources {
     /// (NB: equivalent to Haskell `Data.Map.unionWith perm_union`)
     pub fn union(&mut self, other: &Resources) {
         assert_eq!(self.tid, other.tid);
+        assert!(
+            self.slice_boundary.is_none() && other.slice_boundary.is_none(),
+            "slice-boundary protocol refuses merging an annotated operation"
+        );
         // Union describes a combined operation, not the exact wait whose owner
         // captured the snapshot. Never promote either operand's authority.
         self.in_guest_sleep_sigalrm = None;

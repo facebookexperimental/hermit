@@ -491,3 +491,59 @@ async fn a_turn_granted_during_the_check_fails_the_commit_before_the_record() {
     assert_eq!(take_phases(), ["dequeued", "delivered", "checked"]);
     assert!(guest.thread.signal_announcements.is_empty());
 }
+
+/// The announcement's semantic entry exists before its prehook/await, but its
+/// eventual delivery ordinal comes only from the unchanged commit. Withdrawal
+/// keeps the entry/turn and removes only the original pending announcement.
+#[tokio::test]
+async fn boundary_signal_entries_survive_withdrawal_and_link_actual_commit_without_a_turn() {
+    let mut histories = Vec::new();
+    for observed in [false, true] {
+        let (tool, mut guest) = setup();
+        if observed {
+            guest.thread.slice_boundary =
+                Some(crate::slice_boundary::Observations::new(&guest.thread, 0));
+        }
+        let first = announce(&tool, &mut guest, libc::SIGUSR1).await;
+        let second = announce(&tool, &mut guest, libc::SIGUSR2).await;
+        assert_eq!(guest.thread.stats.signal_count, 0);
+        if observed {
+            let state =
+                serde_json::to_value(guest.thread.slice_boundary.as_ref().unwrap()).unwrap();
+            assert_eq!(state["checkin"], 2);
+            assert_eq!(state["current"][0]["SignalEntry"]["occurrence"], 2);
+            assert_eq!(state["current"][0]["SignalEntry"]["announced"], true);
+            assert_eq!(state["current"][1], "Prehook");
+        }
+        let before_withdraw = guest.thread.slice_boundary.clone();
+        let after_announce = turns(&guest);
+        tool.withdraw_signal_event(&mut guest.thread, first);
+        assert_eq!(guest.thread.slice_boundary, before_withdraw);
+        assert_eq!(turns(&guest), after_announce);
+        assert_eq!(
+            tool.commit_signal_event(&mut guest, first).await,
+            Err(Errno::EINVAL)
+        );
+        tool.commit_signal_event(&mut guest, second).await.unwrap();
+        assert_eq!(turns(&guest), after_announce);
+        assert_eq!(guest.thread.stats.signal_count, 1);
+        if observed {
+            let state =
+                serde_json::to_value(guest.thread.slice_boundary.as_ref().unwrap()).unwrap();
+            assert_eq!(state["checkin"], 3);
+            assert_eq!(state["current"][0]["Signal"]["occurrence"], 2);
+            assert_eq!(state["current"][0]["Signal"]["delivery"], 1);
+            assert_eq!(state["current"][0]["Signal"]["announced"], true);
+            assert_eq!(state["current"][1], "Posthook");
+        }
+        histories.push((
+            turns(&guest),
+            guest.thread.stats.signal_count,
+            guest.thread.scheduler_grants,
+            guest.thread.stats.timeslice_count,
+            serde_json::to_value(&guest.thread.thread_logical_time).unwrap(),
+            guest.thread.next_signal_announcement,
+        ));
+    }
+    assert_eq!(histories[0], histories[1]);
+}

@@ -8,6 +8,8 @@
 
 //! Deterministic scheduling algorithm.
 
+mod boundary_controller;
+mod boundary_replayer;
 pub(crate) mod child_exit_sigchld;
 pub(crate) mod discarded_at_send;
 #[cfg(test)]
@@ -94,7 +96,7 @@ use crate::config::RunsPostFork;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
-use crate::preemptions::read_trace;
+use crate::preemptions::boundary_recording::Recording;
 use crate::resources::ExternalOpId;
 use crate::resources::LOOPBACK_POLL_YIELD_FYI;
 use crate::resources::Permission;
@@ -1955,6 +1957,15 @@ pub struct Scheduler {
     /// information and needs to "cooperate" and setup it's preemption for the amount
     pub timeslices: BTreeMap<DetTid, Option<LogicalTime>>,
 
+    /// Typed boundary expectations carried by the same existing grant reply.
+    /// Unlike legacy `timeslices`, these are guest RCB identities, not logical
+    /// durations. No production lookahead populates this staged mailbox yet.
+    pub boundary_budgets: crate::slice_boundary::grant::Mailbox,
+
+    /// Present only for the explicit boundary protocol. Lifecycle authority
+    /// comes from actual registration/exec, never replay lookahead.
+    pub(crate) boundary_owners: Option<crate::slice_boundary::lifecycle::Registry>,
+
     /// The virtual time that remained before the earliest pending deadline
     /// when each thread was last granted a turn ([`Scheduler::deadline_remaining`]),
     /// taken by the grant's reply so the thread can end its slice there
@@ -1989,6 +2000,11 @@ pub struct Scheduler {
 
     /// An instance of replayer that is responsible for replaying events in case --replay-preemptions-from is specified
     pub replayer: Option<Replayer>,
+
+    // New-format construction remains disabled until actual callback and
+    // lifecycle integration is complete. Controller tests install it directly.
+    boundary_replayer: Option<boundary_replayer::BoundaryReplayer>,
+    boundary_stacktrace_events: std::collections::BTreeMap<usize, Option<PathBuf>>,
 
     /// Whether the replayed schedule's priorities were dropped when its
     /// recording ran out (`release_replay_priorities_if_exhausted`).
@@ -3899,21 +3915,61 @@ enum ThreadStatus {
 impl Scheduler {
     /// Create a new scheduler based on the configuration.
     pub fn new(cfg: &Config) -> Self {
+        if cfg.strict_schedule_boundaries
+            && (!cfg.sequentialize_threads
+                || (!cfg.record_preemptions && cfg.replay_schedule_from.is_none()))
+        {
+            exit_on_scheduler_refusal(&anyhow::anyhow!(
+                "strict schedule boundaries require sequentialized recording or schedule replay"
+            ));
+        }
+        let mut boundary_replayer = None;
+        let mut boundary_stacktrace_events = BTreeMap::new();
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
             Some(path) => {
                 trace!("Scheduler loading trace from path {}", path.display());
-                let vec = read_trace(path);
-                trace!("Trace loaded, length {}", vec.len());
-
-                let toprint = cfg
-                    .stacktrace_event
-                    .iter()
-                    .map(|(ix, path)| (*ix, Some(vec[*ix as usize].clone()), path.clone()))
-                    .collect();
-                let mut replayer = Replayer::new(vec);
-                replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
-                replayer.die_on_desync = cfg.die_on_desync;
-                (Some(replayer), Some(toprint))
+                let recording =
+                    Recording::read(path).unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
+                recording
+                    .require_strict_mode(cfg.strict_schedule_boundaries)
+                    .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
+                match recording {
+                    Recording::Legacy(record) => {
+                        let vec = record.into_global();
+                        trace!("Trace loaded, length {}", vec.len());
+                        let toprint = cfg
+                            .stacktrace_event
+                            .iter()
+                            .map(|(ix, path)| (*ix, Some(vec[*ix as usize].clone()), path.clone()))
+                            .collect();
+                        let mut replayer = Replayer::new(vec);
+                        replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
+                        replayer.die_on_desync = cfg.die_on_desync;
+                        (Some(replayer), Some(toprint))
+                    }
+                    Recording::Boundaries(record) => {
+                        for (index, path) in &cfg.stacktrace_event {
+                            let index = usize::try_from(*index)
+                                .ok()
+                                .filter(|index| *index < record.schedule().records().len())
+                                .unwrap_or_else(|| exit_on_scheduler_refusal(&anyhow::anyhow!(
+                                    "slice-boundary protocol refusal: stack index is outside the complete stream"
+                                )));
+                            if boundary_stacktrace_events
+                                .insert(index, path.clone())
+                                .is_some()
+                            {
+                                exit_on_scheduler_refusal(&anyhow::anyhow!(
+                                    "slice-boundary protocol refusal: duplicate stack index"
+                                ));
+                            }
+                        }
+                        boundary_replayer = Some(boundary_replayer::BoundaryReplayer::new(
+                            record.schedule().clone(),
+                        ));
+                        (None, None)
+                    }
+                }
             }
             None => (
                 None,
@@ -3929,6 +3985,22 @@ impl Scheduler {
                 },
             ),
         };
+        // The strict verifier explicitly selects the complete protocol. Ordinary
+        // producers and the recovery/editor path keep the legacy representation.
+        let boundaries = cfg.strict_schedule_boundaries;
+        let preemption_writer = cfg.record_preemptions.then(|| {
+            let writer = PreemptionWriter::new(cfg.record_preemptions_to.clone())
+                .with_epoch(cfg.epoch)
+                .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect())
+                .with_signal_state_copy(cfg.signal_state_copy);
+            if boundaries {
+                writer
+                    .with_slice_boundaries()
+                    .expect("new, empty recording")
+            } else {
+                writer
+            }
+        });
 
         let stacktrace_events: Option<StacktraceEventsIter> = m_vec.map(|mut v| {
             v.sort_by_key(|(ix, _, _)| *ix);
@@ -3937,17 +4009,10 @@ impl Scheduler {
 
         let (backend_failure_sender, backend_failure_wake) = oneshot::channel();
         Self {
-            preemption_writer: if cfg.record_preemptions {
-                Some(
-                    PreemptionWriter::new(cfg.record_preemptions_to.clone())
-                        .with_epoch(cfg.epoch)
-                        .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect())
-                        .with_signal_state_copy(cfg.signal_state_copy),
-                )
-            } else {
-                None
-            },
+            preemption_writer,
             replayer,
+            boundary_replayer,
+            boundary_stacktrace_events,
             replay_priorities_released: false,
             recorded_event_count: 0,
             stacktrace_events,
@@ -4132,6 +4197,8 @@ impl Scheduler {
             thread_tree: Default::default(),
             priorities: Default::default(),
             timeslices: Default::default(),
+            boundary_budgets: Default::default(),
+            boundary_owners: boundaries.then(Default::default),
             deadline_hints: Default::default(),
             granted: Default::default(),
             per_thread_timeslice: Default::default(),
@@ -4817,6 +4884,13 @@ impl Scheduler {
     ///
     /// PreReq: we're running under --replay-schedule-from
     pub fn consume_schedevent(&mut self, observed: &SchedEvent) -> ConsumeResult {
+        if self.boundary_replayer.is_some() {
+            return self
+                .consume_boundary_record(&detcore_model::schedule::boundary::Record::Event(
+                    observed.clone(),
+                ))
+                .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
+        }
         debug_assert!(self.replayer.is_some());
         let mytid = observed.dettid;
 
@@ -5002,6 +5076,10 @@ impl Scheduler {
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
     pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
+        if let Some(owners) = &mut self.boundary_owners {
+            owners.retire(*dtid, mm);
+        }
+        self.boundary_budgets.retire(*dtid, mm);
         if self.backend.needs_killed_thread_rpc_cancellation {
             self.logically_killed_threads.insert(*dtid);
         }
@@ -5679,7 +5757,7 @@ impl Scheduler {
     /// the replay cursor and does not issue a scheduler turn.
     pub(crate) fn reconnect_transferred_exec(&mut self, reconnect: ExecReconnect) -> Vec<DetTid> {
         assert_ne!(reconnect.caller, reconnect.new_leader);
-        let replay_resume = self.replayer.as_ref().and_then(Replayer::next_resume);
+        let replay_resume = self.replay_next_resume();
         let former = reconnect.caller;
         let leader = reconnect.new_leader;
         let consumed_syscalls = self.per_thread_syscalls.get(&leader).copied().unwrap_or(0);
@@ -5707,6 +5785,13 @@ impl Scheduler {
         let group = self.thread_tree.my_thread_group(&detpid);
         assert!(group.contains(&caller));
         assert!(group.contains(&new_leader));
+        if let Some(owners) = &mut self.boundary_owners {
+            owners
+                .exec(caller, new_leader, pre_exec_mm, post_exec_mm)
+                .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
+        }
+        self.boundary_budgets.retire(caller, pre_exec_mm);
+        self.boundary_budgets.retire(new_leader, pre_exec_mm);
         self.exec_incarnations.insert(new_leader, post_exec_mm);
         self.thread_mms.insert(new_leader, post_exec_mm);
         // Reloading backends enter thread-start before handle_post_exec. Cancel
@@ -13643,7 +13728,7 @@ impl Scheduler {
     /// input turn selection reads. The priority it returns is the one recorded
     /// for `dettid`, so a preemption replay restores it as a fixed priority.
     fn bound_chaos_starvation(&mut self, dettid: DetTid, drawn: Priority) -> Priority {
-        if !self.chaos_bounds_starvation || self.replayer.is_some() {
+        if !self.chaos_bounds_starvation || self.has_schedule_replay() {
             return drawn;
         }
         let queued: Vec<(DetTid, Priority)> = self
@@ -13701,7 +13786,7 @@ impl Scheduler {
         let old_priority = self.priorities.insert(dettid, new_priority);
 
         // Do not attempt to record preemptions/priorities when we're dictated by a raw schedule replay.
-        if self.replayer.is_none()
+        if !self.has_schedule_replay()
             && let Some(pw) = &mut self.preemption_writer
         {
             let old_prio = old_priority.unwrap();
@@ -14129,6 +14214,8 @@ impl Scheduler {
     /// Precondition: guest is stopped.
     /// Postcondition: guest is running concurrently with this scheduler/tracer thread.
     fn unblock_guest(&mut self, dtid: DetTid, resp: &Ivar<SchedResponse>) -> Result<(), SkipTurn> {
+        self.prepare_boundary_grant(dtid)
+            .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
         trace!(
             "[sched-step5] Guest unblocking (via {}); clear ivars for the next turn on dettid {}",
             &resp, &dtid
@@ -14233,6 +14320,7 @@ impl Scheduler {
         };
         self.granted.insert(dtid);
         self.parked.running = Some(dtid);
+        self.boundary_budgets.committed_grant(dtid);
         resp.put(answer);
         Ok(())
     }
@@ -14471,7 +14559,7 @@ impl Scheduler {
         placeholder_syscall: Syscall,
         global_time: &Mutex<GlobalTime>,
     ) {
-        let replay = self.replayer.is_some();
+        let replay = self.has_schedule_replay();
         let record = self.preemption_writer.is_some();
         if !(replay || record) {
             return;
@@ -14566,7 +14654,8 @@ impl Scheduler {
     /// thread, so it is the same in every run.
     fn release_replay_priorities_if_exhausted(&mut self) {
         if self.replay_priorities_released
-            || self.replayer.as_ref().is_none_or(Replayer::has_events_left)
+            || !self.has_schedule_replay()
+            || self.replay_has_records_left()
         {
             return;
         }
@@ -14589,11 +14678,7 @@ impl Scheduler {
     /// deferred priority could wait behind a foreground one for ever, so
     /// readmission is eager again.
     fn readmit_ready_thread(&mut self, dettid: DetTid) {
-        if self
-            .replayer
-            .as_ref()
-            .is_some_and(Replayer::has_events_left)
-        {
+        if self.replay_has_records_left() {
             self.runqueue_push_back(dettid);
         } else {
             self.run_queue.push_eager_io_repoll(dettid);
@@ -15179,11 +15264,17 @@ impl Scheduler {
         &mut self,
         preemptions_to: Option<&PathBuf>,
     ) -> anyhow::Result<(RunSummary, Option<String>)> {
-        let schedevent_replayed = self
-            .replayer
-            .as_ref()
-            .map(|r| r.events_popped)
-            .unwrap_or_default();
+        if let Some(replayer) = &self.boundary_replayer {
+            replayer.finish().map_err(crate::TerminalReplayRefusal)?;
+        }
+        let schedevent_replayed = if let Some(replayer) = &self.boundary_replayer {
+            replayer.stored_index() as u64
+        } else {
+            self.replayer
+                .as_ref()
+                .map(|r| r.events_popped)
+                .unwrap_or_default()
+        };
         let total_desync_stats = self
             .replayer
             .as_ref()
@@ -15240,7 +15331,11 @@ impl Scheduler {
                 // description before adding the host artifact destination.
                 info_description = buf.clone();
                 writeln!(buf, "  (Writing to file {:?})", path)?;
+                let strict = pw.records_slice_boundaries();
                 if let Err(str) = pw.flush() {
+                    if strict {
+                        return Err(anyhow::anyhow!(str));
+                    }
                     tracing::warn!("{}", str);
                 }
             } else {
@@ -18016,6 +18111,38 @@ mod test {
         );
         assert!(!sched.run_queue.contains_tid(caller));
         assert!(sched.run_queue.contains_tid(unrelated));
+    }
+
+    #[test]
+    fn boundary_owner_survives_actual_transferred_exec_and_old_retirement() {
+        let mut sched = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let (process, mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+        let mut owners = crate::slice_boundary::lifecycle::Registry::default();
+        let displaced = owners.fresh(leader, mm).unwrap();
+        let survivor = owners.fresh(caller, mm).unwrap();
+        sched.boundary_owners = Some(owners);
+        let before = (sched.turn, sched.committed_time);
+        reconnect_transferred_exec(&mut sched, leader, caller, process, mm);
+        assert_eq!((sched.turn, sched.committed_time), before);
+        let owners = sched.boundary_owners.as_mut().unwrap();
+        let replacement = owners.owner(leader, mm.for_exec(leader)).unwrap();
+        assert_eq!(replacement.birth_tid, survivor.birth_tid);
+        assert_eq!(replacement.birth_generation, survivor.birth_generation);
+        assert_eq!(
+            replacement.thread_generation,
+            displaced.thread_generation + 1
+        );
+        assert!(owners.owner(caller, mm).is_err());
+        assert!(owners.owner(leader, mm).is_err());
+        owners.retire(leader, mm);
+        assert_eq!(
+            owners.owner(leader, mm.for_exec(leader)).unwrap(),
+            replacement
+        );
+        assert!(sched.next_turns.contains_key(&leader));
+        assert!(!sched.next_turns.contains_key(&caller));
     }
 
     #[test]

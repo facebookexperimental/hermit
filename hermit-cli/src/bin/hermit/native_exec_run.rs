@@ -460,12 +460,12 @@ async fn run_captured(physical: PhysicalRun, captured: &mut CapturedNativeOutput
         global.cancel_internal_scheduler().await;
     }
     let dispatch = result.as_ref().ok().and_then(|dispatch| dispatch.clone());
-    global
+    let finalized = global
         .clean_up_with_dispatch_stats(print_summary, &summary_json, dispatch)
         .await;
     // Keep actual files/root/endpoint-directory pins through the cleanup above.
     drop((root, runtime_files, artifacts, _directory_fd, _directory));
-    result.map(|_| ())
+    detcore::combine_finalization(result.map(|_| ()), finalized)
 }
 
 async fn serve_provider(listener: OwnedFd, owner: Arc<NativeRunOwner>) -> io::Result<()> {

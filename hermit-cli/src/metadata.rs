@@ -1202,6 +1202,7 @@ fn record_or_replay_config_with_timer_support(
         network_trace: Default::default(),
         recordreplay_modes: true,
         replaying: false,
+        strict_schedule_boundaries: false,
         record_preemptions: false,
         record_preemptions_to: None,
         replay_preemptions_from: None,

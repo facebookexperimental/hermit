@@ -347,7 +347,7 @@ mod real_random {
                     }
                 }
                 let (output, global) = consume(outcome, control).await?;
-                global.clean_up(false, &Some(future_summary)).await;
+                global.clean_up(false, &Some(future_summary)).await?;
                 Ok(output)
             })
         });

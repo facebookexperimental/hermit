@@ -3517,6 +3517,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let request = Self::sched_yield_request(guest);
                     resource_request(guest, request).await;
                 }
+                SchedYieldRoute::WeakYield
+                    if !self.cfg.chaos && guest.thread_state().slice_boundary.is_some() =>
+                {
+                    // Typed replay must observe this actual syscall's boundary,
+                    // even if its expected marker is missing. The existing
+                    // replay close still posts the weak-yield resource.
+                    self.end_timeslice_for_sched_yield(guest).await;
+                }
                 SchedYieldRoute::WeakYield => {
                     let request = Self::yield_request(guest);
                     resource_request(guest, request).await;

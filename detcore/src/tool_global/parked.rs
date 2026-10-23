@@ -29,9 +29,22 @@ impl GlobalState {
         mm: Option<MmId>,
         origin: RpcOrigin,
     ) -> (SchedulerRpcResult<ResumeStatus>, Option<LogicalTime>) {
-        let (result, time) = self
+        let (result, time, stack) = self
             .recv_resources_with_origin(from, pid, resources, mm, origin, ControlCapability::None)
             .await;
+        assert!(
+            stack.is_none(),
+            "internal grants cannot consume boundary stack requests"
+        );
+        self.resource_grant_reply(from, result, time)
+    }
+
+    pub(super) fn resource_grant_reply(
+        &self,
+        from: Tid,
+        result: SchedulerRpcResult<ResourceReply>,
+        time: Option<LogicalTime>,
+    ) -> (SchedulerRpcResult<ResumeStatus>, Option<LogicalTime>) {
         match result {
             SchedulerRpcResult::Continue(ResourceReply::Grant(status)) => {
                 (SchedulerRpcResult::Continue(status), time)

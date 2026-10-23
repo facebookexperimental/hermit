@@ -3887,17 +3887,20 @@ pub(crate) struct InboundStop {
 
 /// What a delivery's turn leaves for what the granted delivery settles
 /// (`Detcore::inbound_turn`, `Detcore::inbound_delivered`).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct InboundTurn {
     /// The delivering thread.
     pub(crate) dettid: DetTid,
     /// The thread's signal count before this delivery.
     pub(crate) mycount: u64,
+    /// Actual callback identity retained through an announcement's await.
+    #[serde(default)]
+    pub(crate) boundary_token: Option<crate::slice_boundary::callbacks::Token>,
 }
 
 /// One delivery announced to `Tool::announce_signal_event` and not yet
 /// settled.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SignalAnnouncementState {
     /// The announcement's token.
     pub(crate) token: u64,
@@ -4416,6 +4419,11 @@ pub struct ThreadState<T> {
     /// space is readable, so a group exit can walk every dying sibling's list.
     #[serde(default)]
     pub(crate) robust_list_process: Arc<Mutex<RobustListProcessState>>,
+
+    /// Staged boundary protocol state. Runtime creation/exec does not enable
+    /// it yet; legacy state keeps `None`. Native transfer cannot discard it.
+    #[serde(default)]
+    pub(crate) slice_boundary: Option<crate::slice_boundary::Observations>,
 }
 
 /// We cannot assume that the record_or_replay "subtool" is Debug, so it is handy to be able to
@@ -4637,6 +4645,7 @@ impl<T> ThreadState<T> {
             ));
         }
         if self.preemption_points.is_some()
+            || self.slice_boundary.is_some()
             || !self.interrupt_at.is_empty()
             || self.replay_rcb_end.is_some()
             || self.last_rcb_timer.is_some()
@@ -5078,6 +5087,7 @@ impl<T> ThreadState<T> {
             interrupt_at: cfg.interrupts_for_thread(pid),
             robust_list_head: None,
             robust_list_process: Arc::new(Mutex::new(RobustListProcessState::default())),
+            slice_boundary: None,
         }
     }
 
@@ -5535,6 +5545,7 @@ impl<T> ThreadState<T> {
             decides_signal_interruption_itself: false,
             continues_sigreturn: false,
             private_sigchld_decides: false,
+            slice_boundary: None,
         }
     }
 

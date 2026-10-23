@@ -149,6 +149,7 @@ fn is_policy_refusal(err: &Error) -> bool {
     // (https://github.com/rrnewton/reverie/issues/1064).
     fn refuses(cause: &(dyn std::error::Error + 'static)) -> bool {
         cause.is::<detcore::UnsupportedSyscallError>()
+            || cause.is::<detcore::TerminalReplayRefusal>()
             || cause.is::<reverie_ptrace::UntracedStubSyscall>()
     }
     if err.chain().any(refuses) {
@@ -175,7 +176,36 @@ pub(crate) fn classify_ptrace_primary(error: &reverie::Error) -> FailureKind {
     }
 }
 
+// Follow only the primary of the finalization pair, including Tool's
+// transparent wrapper. Ordinary anyhow downcasts do not traverse its source().
+fn finalization_primary(error: &Error) -> Option<&Error> {
+    if let Some(pair) = error.downcast_ref::<detcore::FinalizationFailure>() {
+        return Some(pair.primary());
+    }
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<reverie::Error>() {
+            Some(reverie::Error::Tool(inner)) => finalization_primary(inner),
+            _ => None,
+        })
+}
+
+fn classify_preserving_cleanup(error: &Error) -> (FailureKind, Option<crate::HermitCleanupStage>) {
+    if let Some(primary) = finalization_primary(error) {
+        classify_preserving_cleanup(primary)
+    } else if let Some(error) = error.downcast_ref::<crate::HermitCleanupUnconfirmed>() {
+        (error.primary_kind(), Some(error.stage()))
+    } else if let Some(error) = error.downcast_ref::<crate::HermitPtraceFailure>() {
+        (error.kind(), None)
+    } else {
+        (classify_unwrapped(error), None)
+    }
+}
+
 fn classify_unwrapped(error: &Error) -> FailureKind {
+    if let Some(primary) = finalization_primary(error) {
+        return classify_preserving_cleanup(primary).0;
+    }
     if let Some(error) = error.downcast_ref::<crate::SkidOvershootError>() {
         FailureKind::SkidOvershoot {
             count: error.count(),
@@ -211,14 +241,7 @@ impl From<Error> for SerializableError {
         // side can only ever fail. Detecting the refusal after the boundary
         // would mean matching on English, which is the thing `kind` exists to
         // avoid.
-        let (kind, cleanup_stage) =
-            if let Some(error) = err.downcast_ref::<crate::HermitCleanupUnconfirmed>() {
-                (error.primary_kind(), Some(error.stage()))
-            } else if let Some(error) = err.downcast_ref::<crate::HermitPtraceFailure>() {
-                (error.kind(), None)
-            } else {
-                (classify_unwrapped(&err), None)
-            };
+        let (kind, cleanup_stage) = classify_preserving_cleanup(&err);
         Self {
             error,
             context,
@@ -245,8 +268,115 @@ impl From<SerializableError> for Error {
 }
 
 #[cfg(test)]
+pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
+    use detcore::preemptions::PreemptionRecord;
+    use detcore::preemptions::boundary_recording::BoundaryRecording;
+    use detcore::preemptions::boundary_recording::Recording;
+    use detcore_model::pid::DetTid;
+    use detcore_model::schedule::SchedEvent;
+    use detcore_model::schedule::boundary::Record;
+    use detcore_model::schedule::boundary::Schedule;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unconsumed.json");
+    let recording = Recording::Boundaries(
+        BoundaryRecording::new(
+            PreemptionRecord::default(),
+            Schedule::new(vec![Record::Event(SchedEvent::branches(
+                DetTid::from_raw(1),
+                1,
+            ))])
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    std::fs::write(&path, recording.encode().unwrap()).unwrap();
+    detcore::GlobalState::init_for_external_scheduler(&detcore::Config {
+        sequentialize_threads: true,
+        strict_schedule_boundaries: true,
+        replay_schedule_from: Some(path),
+        record_preemptions: false,
+        ..detcore::Config::default()
+    })
+    .clean_up(false, &None)
+    .await
+    .unwrap_err()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_refusal_is_typed_direct_and_through_reverie() {
+        for wrapped in [false, true] {
+            let error = terminal_replay_refusal_for_test().await;
+            assert!(error.is::<detcore::TerminalReplayRefusal>());
+            let error = if wrapped {
+                Error::new(reverie::Error::Tool(error))
+            } else {
+                error
+            };
+            let serialized = SerializableError::from(error);
+            assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+            assert!(format!("{serialized:?}").contains("Incomplete"));
+            let bytes =
+                bincode::serde::encode_to_vec(&serialized, bincode::config::legacy()).unwrap();
+            let (decoded, used): (SerializableError, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+            assert_eq!(used, bytes.len());
+            assert_eq!(decoded, serialized);
+        }
+        for error in [
+            Error::new(std::io::Error::other("recording write failed")),
+            Error::msg("terminal replay refusal: slice-boundary protocol refusal"),
+        ] {
+            assert_eq!(SerializableError::from(error).kind(), FailureKind::Error);
+        }
+    }
+
+    #[tokio::test]
+    async fn finalization_secondary_never_overrides_primary_classification() {
+        for (primary, kind) in [
+            (
+                Error::new(std::io::Error::other("ordinary primary")),
+                FailureKind::Error,
+            ),
+            (
+                Error::new(crate::GuestTimedOut {
+                    limit: std::time::Duration::from_secs(3),
+                }),
+                FailureKind::RunTimeout,
+            ),
+            (
+                Error::new(crate::BackendRunFailure),
+                FailureKind::BackendRunFailure,
+            ),
+            (
+                Error::new(crate::SkidOvershootError::new(2)),
+                FailureKind::SkidOvershoot { count: 2 },
+            ),
+        ] {
+            let paired = detcore::combine_finalization::<()>(
+                Err(primary),
+                Err(terminal_replay_refusal_for_test().await),
+            )
+            .unwrap_err();
+            let serialized = SerializableError::from(Error::new(reverie::Error::Tool(paired)));
+            assert_eq!(serialized.kind(), kind);
+            assert!(
+                serialized.error.contains("Incomplete"),
+                "secondary must survive serialization"
+            );
+        }
+        let paired = detcore::combine_finalization::<()>(
+            Err(terminal_replay_refusal_for_test().await),
+            Err(Error::new(std::io::Error::other("secondary write failure"))),
+        )
+        .unwrap_err();
+        let serialized = SerializableError::from(paired);
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(serialized.error.contains("secondary write failure"));
+    }
 
     #[test]
     fn unsupported_preemption_keeps_its_policy_class_across_the_container_boundary() {

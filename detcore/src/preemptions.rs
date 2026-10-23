@@ -8,6 +8,8 @@
 
 //! A datatype to abstract a record of thread preemptions, as generated during chaos mode execution.
 
+pub mod boundary_recording;
+
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::iter::FromIterator;
@@ -1065,6 +1067,7 @@ mod tests {
 #[derive(Debug)]
 pub struct PreemptionWriter {
     inner: PreemptionRecord,
+    boundary_records: Option<Vec<detcore_model::schedule::boundary::Record>>,
     dest: Option<PathBuf>,
     flushed: bool,
 }
@@ -1075,9 +1078,33 @@ impl PreemptionWriter {
     pub fn new(path: Option<PathBuf>) -> Self {
         PreemptionWriter {
             inner: Default::default(),
+            boundary_records: None,
             dest: path,
             flushed: false,
         }
+    }
+
+    /// Select the explicit boundary protocol before recording any global
+    /// event. Metadata stays in the legacy history, with exactly one global
+    /// stream in the new envelope. Existing writers remain legacy by default.
+    pub fn with_slice_boundaries(mut self) -> Result<Self, String> {
+        if !self.inner.global.is_empty() || self.boundary_records.is_some() {
+            self.flushed = true;
+            return Err("slice-boundary protocol must be selected before recording events".into());
+        }
+        self.boundary_records = Some(Vec::new());
+        Ok(self)
+    }
+
+    /// Whether this writer must retain the complete versioned boundary stream.
+    pub fn records_slice_boundaries(&self) -> bool {
+        self.boundary_records.is_some()
+    }
+
+    /// The next complete stored index, before accepting an annotation. The
+    /// controller validates index/stack requests before consuming its cursor.
+    pub(crate) fn next_boundary_index(&self) -> Option<usize> {
+        self.boundary_records.as_ref().map(Vec::len)
     }
 
     /// Store the virtual-time epoch the recorded logical times are measured
@@ -1186,6 +1213,14 @@ impl PreemptionWriter {
 
     /// Add a SchedEvent to the global log of thread behavior.
     pub fn insert_schedevent(&mut self, ev: SchedEvent) {
+        if let Some(records) = &mut self.boundary_records {
+            assert!(
+                ev.count > 0,
+                "slice-boundary protocol refuses zero-count events"
+            );
+            records.push(detcore_model::schedule::boundary::Record::Event(ev));
+            return;
+        }
         if ev.count > 0 {
             self.inner.global.push(ev)
             // TODO, aggregation: possibly check if the last event was the SAME, and combine them,
@@ -1193,6 +1228,25 @@ impl PreemptionWriter {
         } else {
             trace!("NOT recording scheduled event with zero count!");
         }
+    }
+
+    /// Append the observation of an existing slice-end request at its exact
+    /// stream position. Refuse use with a legacy writer rather than silently
+    /// dropping the boundary. Full stream ordering is checked before output.
+    pub fn insert_slice_boundary(
+        &mut self,
+        boundary: detcore_model::schedule::boundary::Boundary,
+    ) -> Result<usize, String> {
+        let records = self
+            .boundary_records
+            .as_mut()
+            .ok_or_else(|| "cannot append a slice boundary to a legacy recording".to_string())?;
+        let index = records.len();
+        boundary.validate_shape(index).map_err(|e| e.to_string())?;
+        records.push(detcore_model::schedule::boundary::Record::TimesliceEnd(
+            boundary,
+        ));
+        Ok(index)
     }
 
     /// Set the priority of the current thread after a change.
@@ -1209,7 +1263,8 @@ impl PreemptionWriter {
     /// Abort writing to disk and instead gather the output thusfar into a string.
     pub fn into_string(mut self) -> String {
         self.flushed = true;
-        self.inner.to_string()
+        self.serialized_string()
+            .expect("invalid preemption recording")
     }
 
     /// Finish any IO necessary to flush the record to disk.
@@ -1221,12 +1276,34 @@ impl PreemptionWriter {
 
     fn write_to_disk(&mut self) -> Result<(), String> {
         if let Some(path) = &self.dest {
-            self.inner.write_to_disk(path)
+            if self.boundary_records.is_none() {
+                return self.inner.write_to_disk(path);
+            }
+            // Validate the complete stream before opening an existing file.
+            let mut bytes = self.serialized_string()?.into_bytes();
+            bytes.push(b'\n');
+            std::fs::write(path, bytes)
+                .map_err(|e| format!("Failed to write boundary recording {}: {e}", path.display()))
         } else {
             Err(
                 "Cannot write_to_disk because this PreemptionWriter was created without a backing file.".to_string()
             )
         }
+    }
+
+    fn serialized_string(&self) -> Result<String, String> {
+        let Some(records) = &self.boundary_records else {
+            return Ok(self.inner.to_string());
+        };
+        let schedule = detcore_model::schedule::boundary::Schedule::new(records.clone())
+            .map_err(|e| e.to_string())?;
+        let recording = boundary_recording::Recording::Boundaries(
+            boundary_recording::BoundaryRecording::new(self.inner.clone(), schedule)
+                .map_err(|e| e.to_string())?,
+        );
+        let mut bytes = recording.encode().map_err(|e| e.to_string())?;
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        String::from_utf8(bytes).map_err(|e| e.to_string())
     }
 }
 
@@ -1285,11 +1362,7 @@ pub fn read_recorded_epoch(path: &Path) -> Result<Option<DateTime<Utc>>, String>
         #[serde(default)]
         epoch: Option<DateTime<Utc>>,
     }
-    let file = File::open(path)
-        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
-    let record: EpochOnly = serde_json::from_reader(std::io::BufReader::new(file))
-        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
-    Ok(record.epoch)
+    Ok(boundary_recording::read_settings::<EpochOnly>(path)?.epoch)
 }
 
 /// Read only the `--pipe-wake-latency` stored in a preemption record file, as
@@ -1301,11 +1374,7 @@ pub fn read_recorded_pipe_wake_latency(path: &Path) -> Result<Option<u64>, Strin
         #[serde(default)]
         pipe_wake_latency: Option<u64>,
     }
-    let file = File::open(path)
-        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
-    let record: LatencyOnly = serde_json::from_reader(std::io::BufReader::new(file))
-        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
-    Ok(record.pipe_wake_latency)
+    Ok(boundary_recording::read_settings::<LatencyOnly>(path)?.pipe_wake_latency)
 }
 
 /// The refusal of a replay whose `--pipe-wake-latency` differs from the one a
@@ -1341,11 +1410,7 @@ pub fn read_recorded_signal_state_copy(path: &Path) -> Result<Option<bool>, Stri
         #[serde(default)]
         signal_state_copy: Option<bool>,
     }
-    let file = File::open(path)
-        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
-    let record: CopyOnly = serde_json::from_reader(std::io::BufReader::new(file))
-        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
-    Ok(record.signal_state_copy)
+    Ok(boundary_recording::read_settings::<CopyOnly>(path)?.signal_state_copy)
 }
 
 /// The refusal of a replay whose signal-state copy setting differs from the
@@ -1378,6 +1443,14 @@ pub fn signal_state_copy_mismatch(
 
 // TODO: eventually this should do streaming IO, and abstract it behind this interface.
 impl PreemptionReader {
+    /// Fallible legacy access for editors. A boundary recording cannot be
+    /// flattened into a legacy event vector, even if it has no markers.
+    pub fn try_new(path: &Path) -> anyhow::Result<Self> {
+        let inner =
+            boundary_recording::Recording::read(path)?.into_legacy("legacy preemption reader")?;
+        Ok(Self { inner })
+    }
+
     /// Access the stored `PreemptionRecord`, and eagerly or lazily load its data from disk.
     pub fn new(path: &Path) -> Self {
         let pr = read_preemption_record(path);
@@ -1430,12 +1503,8 @@ pub fn strip_times_from_events_file(
     dest: Option<PathBuf>,
 ) -> anyhow::Result<PathBuf> {
     let new_path = dest.unwrap_or_else(|| sched_path.with_extension("notimes"));
-    let mut preemptions = PreemptionReader::new(sched_path).into_inner();
-    for se in preemptions.schedevents_iter_mut() {
-        se.end_time = None;
-    }
-    preemptions
-        .write_to_disk(new_path.as_ref())
-        .map_err(anyhow::Error::msg)?;
+    let mut recording = boundary_recording::Recording::read(sched_path)?;
+    recording.strip_times();
+    recording.write(&new_path)?;
     Ok(new_path)
 }
