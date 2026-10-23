@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One maintained private-static build/section/link/DATA-package pipeline."""
 import argparse
+from contextlib import ExitStack
 import hashlib
 import importlib.util
 import json
@@ -242,10 +243,14 @@ def main():
                     fact=row[stream];need(owned.file_fact(fact['path']) == fact,'coordinate stream changed before publication')
         journal['publication'] = publisher.publish(owned,lc,linked,cr,c['data_roles'],bound['publish'],final_close)
         journal['state'] = 'PUBLISHED_PRIVATE_STATIC_DATA_NOT_QUALIFIED'
-    except BaseException as error:
+    except Exception as error:
         body_error = error
         journal.update(state='FAIL',error=repr(error))
+    except BaseException as error:
+        body_error = error
         cancelled = cancellation(cancelled, error)
+        journal.update(state='FAIL',error=repr(error))
+        raise
     finally:
         errors = []
         # Successful publication already executed final_close immediately
@@ -253,17 +258,28 @@ def main():
         remaining_closes = [] if journal['state'] == 'PUBLISHED_PRIVATE_STATIC_DATA_NOT_QUALIFIED' else [
             close_all, *([lambda: archive.files_close(ac)] if ac is not None else []),
             *([lambda: owned.files_close(lc),lambda: owned.private_close(lc)] if lc is not None else [])]
-        for close in remaining_closes:
-            try: close()
-            except BaseException as error:
+        def cleanup(close):
+            nonlocal cancelled
+            try:
+                close()
+            except Exception as error:
                 errors.append(repr(error))
+            except BaseException as error:
                 cancelled = cancellation(cancelled, error)
-        if errors: journal.update(state='FAIL',close_errors=errors)
+                errors.append(repr(error))
+                raise
+
         try:
-            save(out/'pipeline-result.json',journal)
+            with ExitStack() as pending:
+                for close in reversed(remaining_closes):
+                    pending.callback(cleanup, close)
         finally:
-            if cancelled is not None:
-                raise cancelled
+            if errors: journal.update(state='FAIL',close_errors=errors)
+            try:
+                save(out/'pipeline-result.json',journal)
+            finally:
+                if cancelled is not None:
+                    raise cancelled
     need(journal['state'] == 'PUBLISHED_PRIVATE_STATIC_DATA_NOT_QUALIFIED',
          repr({'body_error':repr(body_error),'close_errors':journal.get('close_errors',[])}))
 

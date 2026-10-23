@@ -616,5 +616,145 @@ class StreamContextCleanup(unittest.TestCase):
                     self.exercise(module, error, close_errors=closes, expected=expected)
 
 
+class CleanupCallbackOrdering(unittest.TestCase):
+    def cancellations(self):
+        class OwnerCancellation(BaseException):
+            pass
+        return [KeyboardInterrupt(), SystemExit(37), GeneratorExit(), OwnerCancellation()]
+
+    def test_cohort_keeps_first_of_multiple_cleanup_cancellations(self):
+        for first in self.cancellations():
+            second = SystemExit(41)
+            calls = []
+            def observed(path):
+                name = Path(path).name
+                calls.append(name)
+                if calls.count(name) == 2:
+                    if name == 'a': raise first
+                    if name == 'b': raise second
+                    raise OSError('last close')
+                return dict(path=str(path), bytes=1, sha256=name * 2)
+            rows = [('unit', [('H', name, 1, name * 2) for name in ['a', 'b', 'c']])]
+            with self.subTest(first=first), \
+                 mock.patch.object(cohort, 'COHORTS', rows), \
+                 mock.patch.object(cohort, 'observed_file', side_effect=observed):
+                with self.assertRaises(type(first)) as caught:
+                    cohort.bind('/unit')
+            self.assertIs(caught.exception, first)
+            self.assertEqual(calls, ['a', 'b', 'c', 'a', 'b', 'c'])
+            for error in [first, second, 'last close']:
+                self.assertIn(repr(error) if not isinstance(error, str) else error,
+                              str(caught.exception.__cause__))
+
+    def test_collector_keeps_first_cleanup_cancel_and_attempts_reap(self):
+        for first in self.cancellations():
+            calls = []
+            def action(name, error=None):
+                def run(*args, **kwargs):
+                    calls.append((name, kwargs))
+                    if error is not None: raise error
+                    return -9
+                return run
+            pipes = [types.SimpleNamespace(fileno=lambda: 10, close=action(name, OSError(name)))
+                     for name in ['stdout', 'stderr']]
+            child = types.SimpleNamespace(pid=123, stdout=pipes[0], stderr=pipes[1],
+                                          wait=action('wait'))
+            selector = types.SimpleNamespace(register=lambda *args: None, get_map=lambda: True,
+                select=thrown(ValueError('body')), close=action('selector', SystemExit(41)))
+            row = {}
+            with self.subTest(first=first), \
+                 mock.patch.object(owned.subprocess, 'Popen', return_value=child), \
+                 mock.patch.object(owned.selectors, 'DefaultSelector', return_value=selector), \
+                 mock.patch.object(owned.os, 'set_blocking'), \
+                 mock.patch.object(owned.os, 'killpg', side_effect=action('kill', first)):
+                with self.assertRaises(type(first)) as caught:
+                    owned.bounded_stream_command(['/unit/child'], '/', {}, None, None, 1024, 1, row)
+            self.assertIs(caught.exception, first)
+            self.assertEqual([name for name, _ in calls], ['kill', 'selector', 'stdout', 'stderr', 'wait'])
+            self.assertEqual(calls[-1][1], {'timeout': 5})
+            self.assertEqual(row['exit'], -9)
+            self.assertEqual(len(row['cleanup_errors']), 4)
+
+    def test_producer_cleanup_cancellations_preserve_order_and_final_journal(self):
+        for module in [owned, archive]:
+            for first in self.cancellations():
+                with self.subTest(module=module.__name__, first=first), \
+                     tempfile.TemporaryDirectory() as directory, ExitStack() as patches:
+                    _, argv = MainCleanup.producer(self, module, directory)
+                    events = []; saved = []
+                    def close(*args):
+                        events.append('source')
+                        if len(events) == 1: raise ValueError('body')
+                        raise first
+                    def private(*args):
+                        events.append('private')
+                        raise SystemExit(41)
+                    real_save = module.save
+                    def save(path, value):
+                        if value['state'] != 'FAIL':
+                            return real_save(path, value)
+                        events.append('journal')
+                        saved.append(json.loads(json.dumps(value)))
+                        raise OSError('journal')
+                    patches.enter_context(mock.patch.object(sys, 'argv', argv))
+                    patches.enter_context(mock.patch.object(module, 'files_close', side_effect=close))
+                    patches.enter_context(mock.patch.object(module, 'private_close', side_effect=private))
+                    patches.enter_context(mock.patch.object(module, 'save', side_effect=save))
+                    if module is owned:
+                        patches.enter_context(mock.patch.object(module, 'runtime_content_preflight'))
+                        patches.enter_context(mock.patch.object(module, 'runtime_handoff_preflight',
+                                                               return_value={'path': '/unit/handoff.rs'}))
+                    with self.assertRaises(type(first)) as caught:
+                        module.main()
+                    self.assertIs(caught.exception, first)
+                    self.assertEqual(events, ['source', 'source', 'private', 'journal'])
+                    self.assertEqual(saved[-1]['state'], 'FAIL')
+                    self.assertIn('body', saved[-1]['error'])
+                    self.assertEqual(len(saved[-1]['close_errors']), 2)
+
+    def test_publish_cleanup_continues_owned_rollback_after_multiple_cancellations(self):
+        # Exercise the actual finalizer with its publication-ownership flags set.
+        # No producer/ELF inspection is needed to reach the late rollback boundary.
+        tree = ast.parse(Path(publisher.__file__).read_text())
+        publish = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'publish')
+        transaction = next(n for n in publish.body if isinstance(n, ast.Try) and n.finalbody)
+        fixture = ast.parse('def finalizer():\n    cancelled = None\n    final_errors = []\n').body[0]
+        fixture.body.extend(transaction.finalbody)
+        for first in self.cancellations():
+            with self.subTest(first=first), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                pending_image, pending_data, image_path, data_path, sentinel = [root/name for name in
+                    ['pending-image', 'pending-data', 'image', 'data', 'foreign-sentinel']]
+                for path in [pending_image, pending_data, image_path, data_path, sentinel]:
+                    path.write_bytes(path.name.encode())
+                fd = os.open(image_path, os.O_RDONLY)
+                events = []; real_close = os.close; real_unlink = Path.unlink
+                def close(descriptor):
+                    events.append('close'); real_close(descriptor); raise first
+                def unlink(path, *args, **kwargs):
+                    events.append(path.name)
+                    if path == pending_image: raise SystemExit(41)
+                    return real_unlink(path, *args, **kwargs)
+                namespace = dict(vars(publisher), fd=fd, original_error=ValueError('body'),
+                    pending_image=pending_image, pending_data=pending_data, image_path=image_path,
+                    data_path=data_path, created_image=True, created_data=True)
+                exec(compile(ast.fix_missing_locations(ast.Module(body=[fixture], type_ignores=[])),
+                             publisher.__file__, 'exec'), namespace)
+                fake_os = types.SimpleNamespace(close=close)
+                namespace['os'] = fake_os
+                with mock.patch.object(Path, 'unlink', unlink):
+                    with self.assertRaises(type(first)) as caught:
+                        namespace['finalizer']()
+                self.assertIs(caught.exception, first)
+                self.assertEqual(events, ['close', 'pending-image', 'pending-data', 'data', 'image'])
+                self.assertTrue(pending_image.exists(), 'failed unlink remains a cleanup failure')
+                self.assertFalse(pending_data.exists())
+                self.assertFalse(data_path.exists())
+                self.assertFalse(image_path.exists())
+                self.assertEqual(sentinel.read_bytes(), b'foreign-sentinel')
+                self.assertIn('body', str(caught.exception.__cause__))
+                self.assertIn('SystemExit(41)', str(caught.exception.__cause__))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -385,31 +385,40 @@ def main():
         raise
     finally:
         close_errors = []
-        try:
-            files_close(c)
-        except BaseException as error:
-            close_errors.append('source/tools: ' + repr(error))
-            cancelled = cancellation(cancelled, error)
-        try:
+
+        def cleanup(action, label, *args):
+            nonlocal cancelled
+            try:
+                action(*args)
+            except Exception as error:
+                close_errors.append(label + repr(error))
+            except BaseException as error:
+                cancelled = cancellation(cancelled, error)
+                close_errors.append(label + repr(error))
+                raise
+
+        def close_private():
             result['private_after'] = private_close(c)
             need(result.get('private_before') == result['private_after'], 'private inventory close mismatch')
-        except BaseException as error:
-            close_errors.append('private inventory: ' + repr(error))
-            cancelled = cancellation(cancelled, error)
-        try:
+
+        def close_archive():
             if result.get('archive'):
                 need(sha(result['archive']['path']) == result['archive']['sha256'], 'archive changed at close')
-        except BaseException as error:
-            close_errors.append('selected archive: ' + repr(error))
-            cancelled = cancellation(cancelled, error)
-        result['source_tools_closed'] = not close_errors
-        if close_errors:
-            result.update(state='FAIL', close_errors=close_errors)
+
         try:
-            save(out / 'result.json', result)
+            with ExitStack() as pending:
+                pending.callback(cleanup, close_archive, 'selected archive: ')
+                pending.callback(cleanup, close_private, 'private inventory: ')
+                pending.callback(cleanup, files_close, 'source/tools: ', c)
         finally:
-            if cancelled is not None:
-                raise cancelled
+            result['source_tools_closed'] = not close_errors
+            if close_errors:
+                result.update(state='FAIL', close_errors=close_errors)
+            try:
+                save(out / 'result.json', result)
+            finally:
+                if cancelled is not None:
+                    raise cancelled
     need(result['state'] == 'ARCHIVE_BUILD_ONLY_NOT_QUALIFIED', 'archive/source/private-input close failed')
 
 

@@ -7,7 +7,7 @@ sys.dont_write_bytecode = True
 ASSETS=Path(__file__).resolve().parent.parent/'assets'
 ROOT='detcore_liteinst_mapped_entry'
 MAINTAINED=Path(__file__).resolve().parent.parent/'archive/prepare.py'
-MAINTAINED_SHA='38cd2bf11368a119c7c2e52c3f477f665518f0fd5dbc7f7b326fff40c6465e1a'
+MAINTAINED_SHA='f04fa86505f68aa7ca44cb720a15d134f3c38d4072bc0b5e725482a073a55eeb'
 # Preserve the existing private static-image C/TLS ABI; retention is not provenance.
 ABI_ROOTS=['__init_tls', 'malloc', '__libc_malloc', '__libc_malloc_impl', 'calloc', '__libc_calloc', 'free', '__libc_free', 'realloc', '__libc_realloc', 'reallocarray', 'aligned_alloc', 'memalign', 'valloc', 'posix_memalign', 'malloc_usable_size', '__malloc_allzerop']
 RO_ROOTS={'.reverie_inguest_fixed_gate_template':(4096,4096,2),'.rodata.hermit_mapped_layout':(96,8,0x200002)} # measured SHF_ALLOC / SHF_ALLOC|SHF_GNU_RETAIN
@@ -342,12 +342,18 @@ def main():
   result.update(state='PASS_SECTION_SCRIPT_PREPARATION_ONLY',prepared_inputs=identity(out/'prepared-link-inputs.json'),archive=build['archive'],h_head=a.h_head,r_head=a.r_head)
  except BaseException as error:result.update(state='FAIL',error=repr(error));cancelled=cancellation(cancelled,error);raise
  finally:
-  if guard:
-   try:guard();save(out/'source-after.json',c['source_before']);result['source_and_inputs_unchanged']=True
-   except BaseException as error:result.update(state='FAIL',custody_error=repr(error),source_and_inputs_unchanged=False);cancelled=cancellation(cancelled,error)
-  result['produced_outputs']=produced;result['wall_seconds']=time.monotonic()-began
-  try:save(out/'result.json',result)
+  try:
+   if guard:
+    try:guard();save(out/'source-after.json',c['source_before']);result['source_and_inputs_unchanged']=True
+    except Exception as error:result.update(state='FAIL',custody_error=repr(error),source_and_inputs_unchanged=False)
+    except BaseException as error:
+     cancelled=cancellation(cancelled,error)
+     result.update(state='FAIL',custody_error=repr(error),source_and_inputs_unchanged=False)
+     raise
   finally:
-   if cancelled is not None:raise cancelled
+   result['produced_outputs']=produced;result['wall_seconds']=time.monotonic()-began
+   try:save(out/'result.json',result)
+   finally:
+    if cancelled is not None:raise cancelled
  return 0 if result['state']=='PASS_SECTION_SCRIPT_PREPARATION_ONLY' else 1
 if __name__=='__main__':raise SystemExit(main())

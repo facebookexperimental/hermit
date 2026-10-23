@@ -29,7 +29,7 @@ PRIVATE_INVENTORY_SHA256 = 'f825b66769fb55bee298b0a41277b38767970e5cad4beca8400f
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
 STREAM = 64 * 1024 * 1024
 RUNTIME_COHORT = D / 'runtime_cohort.py'
-RUNTIME_COHORT_SHA256 = '04168aef6f04f86d469095d2d60aec4b996e78c717a01b503b137553a845b326'
+RUNTIME_COHORT_SHA256 = '0719d65058f7e70a89fcde95ae5a5a30fb405eb7341a539d946c042199e65c05'
 REQUIRED_HANDOFF_SOURCE_SHA256 = '85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75'
 
 
@@ -135,31 +135,36 @@ def bounded_stream_command(argv, cwd, env, stdout_file, stderr_file, limit, time
             nonlocal cancelled
             try:
                 action()
+            except Exception as error:
+                cleanup_errors.append(error)
             except BaseException as error:
                 cleanup_errors.append(error)
                 cancelled = cancellation(cancelled, error)
+                raise
 
-        cleanup(kill_retained_group)
-        cleanup(selector.close)
-        if child is not None:
-            for pipe in [child.stdout, child.stderr]:
-                if pipe is not None:
-                    cleanup(pipe.close)
+        def reap():
+            try:
+                row['exit'] = child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                row['reap_deadline_hit'] = True
+                raise RuntimeError('leader not reaped after bounded group kill')
 
-            def reap():
-                try:
-                    row['exit'] = child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    row['reap_deadline_hit'] = True
-                    raise RuntimeError('leader not reaped after bounded group kill')
-
-            cleanup(reap)
-        if cleanup_errors:
-            row['cleanup_errors'] = [repr(error) for error in cleanup_errors]
-        if cancelled is not None:
-            raise cancelled
-        if cleanup_errors:
-            raise cleanup_errors[-1]
+        try:
+            with ExitStack() as pending:
+                if child is not None:
+                    pending.callback(cleanup, reap)
+                    for pipe in [child.stderr, child.stdout]:
+                        if pipe is not None:
+                            pending.callback(cleanup, pipe.close)
+                pending.callback(cleanup, selector.close)
+                pending.callback(cleanup, kill_retained_group)
+        finally:
+            if cleanup_errors:
+                row['cleanup_errors'] = [repr(error) for error in cleanup_errors]
+            if cancelled is not None:
+                raise cancelled
+            if cleanup_errors:
+                raise cleanup_errors[-1]
 
 
 def producer_environment(c):
@@ -1155,36 +1160,45 @@ def main():
         raise
     finally:
         close_errors = []
-        try:
-            files_close(c)
-        except BaseException as error:
-            close_errors.append('source/tools: ' + repr(error))
-            cancelled = cancellation(cancelled, error)
-        try:
+
+        def cleanup(action, label, *args):
+            nonlocal cancelled
+            try:
+                action(*args)
+            except Exception as error:
+                close_errors.append(label + repr(error))
+            except BaseException as error:
+                cancelled = cancellation(cancelled, error)
+                close_errors.append(label + repr(error))
+                raise
+
+        def close_private():
             result['private_after'] = private_close(c)
             need(result.get('private_before') == result['private_after'], 'private inventory close mismatch')
-        except BaseException as error:
-            close_errors.append('private inventory: ' + repr(error))
-            cancelled = cancellation(cancelled, error)
-        try:
+
+        def close_archive():
             if result.get('archive'):
                 need(sha(result['archive']['path']) == result['archive']['sha256'], 'archive changed at close')
-        except BaseException as error:
-            close_errors.append('selected archive: ' + repr(error))
-            cancelled = cancellation(cancelled, error)
-        for path, expected in produced.items():
-            try: need(file_fact(path) == expected, 'produced evidence changed: ' + path)
-            except BaseException as error:
-                close_errors.append('output custody: ' + repr(error))
-                cancelled = cancellation(cancelled, error)
-        result['source_tools_closed'] = not close_errors
-        if close_errors:
-            result.update(state='FAIL', close_errors=close_errors)
+
+        def close_output(path, expected):
+            need(file_fact(path) == expected, 'produced evidence changed: ' + path)
+
         try:
-            save(out / 'result.json', result)
+            with ExitStack() as pending:
+                for path, expected in reversed(list(produced.items())):
+                    pending.callback(cleanup, close_output, 'output custody: ', path, expected)
+                pending.callback(cleanup, close_archive, 'selected archive: ')
+                pending.callback(cleanup, close_private, 'private inventory: ')
+                pending.callback(cleanup, files_close, 'source/tools: ', c)
         finally:
-            if cancelled is not None:
-                raise cancelled
+            result['source_tools_closed'] = not close_errors
+            if close_errors:
+                result.update(state='FAIL', close_errors=close_errors)
+            try:
+                save(out / 'result.json', result)
+            finally:
+                if cancelled is not None:
+                    raise cancelled
     need(result['state'] == 'PASS_OWNED_FINAL_LINK_INSPECTION_ONLY', 'owned link/inspection/source close failed')
 
 

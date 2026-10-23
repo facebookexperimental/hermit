@@ -1,4 +1,5 @@
 """Publish closed private-static DATA, never source/entry/Ready authority."""
+from contextlib import ExitStack
 import hashlib
 import importlib.util
 import json
@@ -312,27 +313,35 @@ def publish(m, c, result_path, coordinates_path, roles, destination, close_pipel
     finally:
         # Do not hide a body/publication failure behind a later cleanup failure.
         # Own only fresh paths this invocation created; no existing file removal.
-        def failed(error):
+        def cleanup(action, *args, **kwargs):
             nonlocal cancelled
-            final_errors.append(repr(error))
-            cancelled = cancellation(cancelled, error)
+            try:
+                action(*args, **kwargs)
+            except Exception as error:
+                final_errors.append(repr(error))
+            except BaseException as error:
+                cancelled = cancellation(cancelled, error)
+                final_errors.append(repr(error))
+                raise
+
+        def rollback(created, path):
+            if created and (original_error is not None or final_errors):
+                path.unlink()
+
         try:
-            os.close(fd)
-        except BaseException as error: failed(error)
-        for path in [pending_image,pending_data]:
-            if path is not None:
-                try: path.unlink(missing_ok=True)
-                except BaseException as error: failed(error)
-        if original_error is not None or final_errors:
-            for created,path in [(created_data,data_path),(created_image,image_path)]:
-                if created:
-                    try: path.unlink()
-                    except BaseException as error: failed(error)
-        # After every cleanup and rollback, a KeyboardInterrupt or SystemExit
-        # keeps its identity; the ordinary diagnostics become its cause.
-        if cancelled is not None:
-            if cancelled is original_error and not final_errors:
-                raise cancelled
-            raise cancelled from RuntimeError({'body_error':repr(original_error),'cleanup_errors':final_errors})
-        if final_errors:
-            raise RuntimeError({'body_error':repr(original_error),'cleanup_errors':final_errors}) from original_error
+            with ExitStack() as pending:
+                pending.callback(cleanup, rollback, created_image, image_path)
+                pending.callback(cleanup, rollback, created_data, data_path)
+                for path in [pending_data, pending_image]:
+                    if path is not None:
+                        pending.callback(cleanup, path.unlink, missing_ok=True)
+                pending.callback(cleanup, os.close, fd)
+        finally:
+            # After every cleanup and rollback, a KeyboardInterrupt or SystemExit
+            # keeps its identity; the ordinary diagnostics become its cause.
+            if cancelled is not None:
+                if cancelled is original_error and not final_errors:
+                    raise cancelled
+                raise cancelled from RuntimeError({'body_error':repr(original_error),'cleanup_errors':final_errors})
+            if final_errors:
+                raise RuntimeError({'body_error':repr(original_error),'cleanup_errors':final_errors}) from original_error

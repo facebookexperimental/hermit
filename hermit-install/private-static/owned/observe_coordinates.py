@@ -116,33 +116,48 @@ def main():
                'missing/duplicate/excess decoded syscall rows')
         record['decoded_syscalls'] = sites
         record['state'] = 'RECORDS_OBSERVED_NOT_QUALIFIED'
-    except BaseException as error:
+    except Exception as error:
         record.update(state='FAIL', error=repr(error))
+    except BaseException as error:
         cancelled = m.cancellation(cancelled, error)
+        record.update(state='FAIL', error=repr(error))
+        raise
     finally:
         errors = []
-        def failed(error):
+        def cleanup(action, *args):
             nonlocal cancelled
-            errors.append(repr(error))
-            cancelled = m.cancellation(cancelled, error)
-        for row in record['commands']:
-            for stream in ['stdout','stderr']:
-                if stream in row:
-                    try: m.need(m.file_fact(row[stream]['path']) == row[stream], 'coordinate stream changed')
-                    except BaseException as error: failed(error)
-        try: close()
-        except BaseException as error: failed(error)
-        try:
+            try:
+                action(*args)
+            except Exception as error:
+                errors.append(repr(error))
+            except BaseException as error:
+                cancelled = m.cancellation(cancelled, error)
+                errors.append(repr(error))
+                raise
+
+        def close_stream(fact):
+            m.need(m.file_fact(fact['path']) == fact, 'coordinate stream changed')
+
+        def close_private():
             record['private_after'] = m.private_close(c)
             m.need(record.get('private_before') == record['private_after'], 'private inventory changed')
-        except BaseException as error: failed(error)
-        record['source_tools_closed'] = not errors
-        if errors: record.update(state='FAIL', close_errors=errors)
+
         try:
-            m.save(out / 'result.json', record)
+            with ExitStack() as pending:
+                pending.callback(cleanup, close_private)
+                pending.callback(cleanup, close)
+                for row in reversed(record['commands']):
+                    for stream in ['stderr', 'stdout']:
+                        if stream in row:
+                            pending.callback(cleanup, close_stream, row[stream])
         finally:
-            if cancelled is not None:
-                raise cancelled
+            record['source_tools_closed'] = not errors
+            if errors: record.update(state='FAIL', close_errors=errors)
+            try:
+                m.save(out / 'result.json', record)
+            finally:
+                if cancelled is not None:
+                    raise cancelled
     m.need(record['state'] == 'RECORDS_OBSERVED_NOT_QUALIFIED', 'coordinate observation failed')
 
 

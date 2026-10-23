@@ -1,4 +1,5 @@
 """Finite source association only; full chosen-head custody and Rust proofs remain mandatory."""
+from contextlib import ExitStack
 import hashlib
 import os
 from pathlib import Path
@@ -173,23 +174,38 @@ def bind(workspace):
                        for label,relative,size,digest in rows)]
         need(len(matches) == 1, 'runtime sources are not one complete reviewed content cohort')
         result = dict(cohort=matches[0], files=[fact for _,_,fact in opened])
+    except Exception as failure:
+        error = failure
     except BaseException as failure:
         error = failure
-    # Close every successful read, then re-raise the first KeyboardInterrupt
-    # or SystemExit itself; ordinary failures keep the aggregate RuntimeError.
-    cancelled = error if error is not None and not isinstance(error, Exception) else None
-    closes = []
-    for _,_,fact in opened:
+        raise
+    finally:
+        # Close every successful read, including after a directly rethrown
+        # cancellation. ExitStack keeps running the remaining close callbacks.
+        cancelled = error if error is not None and not isinstance(error, Exception) else None
+        closes = []
+
+        def close(fact):
+            nonlocal cancelled
+            try:
+                need(observed_file(Path(fact['path'])) == fact, 'runtime cohort source changed at close')
+            except Exception as failure:
+                closes.append(repr(failure))
+            except BaseException as failure:
+                if cancelled is None:
+                    cancelled = failure
+                closes.append(repr(failure))
+                raise
+
         try:
-            need(observed_file(Path(fact['path'])) == fact, 'runtime cohort source changed at close')
-        except BaseException as failure:
-            closes.append(repr(failure))
-            if cancelled is None and not isinstance(failure, Exception):
-                cancelled = failure
-    if cancelled is not None:
-        if error is cancelled and not closes:
-            raise cancelled
-        raise cancelled from RuntimeError(dict(body_error=repr(error),close_errors=closes))
-    if error is not None or closes:
-        raise RuntimeError(dict(body_error=repr(error),close_errors=closes)) from error
+            with ExitStack() as pending:
+                for _,_,fact in reversed(opened):
+                    pending.callback(close, fact)
+        finally:
+            if cancelled is not None:
+                if error is cancelled and not closes:
+                    raise cancelled
+                raise cancelled from RuntimeError(dict(body_error=repr(error),close_errors=closes))
+            if error is not None or closes:
+                raise RuntimeError(dict(body_error=repr(error),close_errors=closes)) from error
     return result
