@@ -16,6 +16,8 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
+#[path = "common/prepared_redis.rs"]
+mod prepared_redis;
 
 use std::ffi::OsString;
 use std::net::TcpListener;
@@ -223,9 +225,11 @@ fn sqlite_transaction_is_nondeterministic_natively_and_l2_under_hermit() {
     workload.assert_l2_under_strict_hermit();
 }
 
-#[test]
-fn redis_commands_are_nondeterministic_natively_and_l2_under_hermit() {
-    let script = repository().join("hermit-cli/tests/fixtures/frontier-apps/redis-workload.sh");
+/// The declared Redis pair, or the system's from the fixed locations.
+fn redis_executables() -> (PathBuf, PathBuf) {
+    if let Some(redis) = prepared_redis::prepared_redis() {
+        return (redis.server, redis.cli);
+    }
     let redis_server = required_app(
         "redis-server",
         &[
@@ -242,6 +246,13 @@ fn redis_commands_are_nondeterministic_natively_and_l2_under_hermit() {
             "/bin/redis-cli",
         ],
     );
+    (redis_server, redis_cli)
+}
+
+#[test]
+fn redis_commands_are_nondeterministic_natively_and_l2_under_hermit() {
+    let script = repository().join("hermit-cli/tests/fixtures/frontier-apps/redis-workload.sh");
+    let (redis_server, redis_cli) = redis_executables();
     let root = format!("/tmp/hermit-frontier-redis-{}", std::process::id());
     let workload = Workload {
         name: "Redis command benchmark",

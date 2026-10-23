@@ -8,7 +8,10 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
+#[path = "common/prepared_redis.rs"]
+mod prepared_redis;
 
+use std::ffi::OsString;
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
@@ -91,6 +94,9 @@ fn unused_loopback_port() -> u16 {
 }
 
 fn system_redis() -> (PathBuf, PathBuf) {
+    if let Some(redis) = prepared_redis::prepared_redis() {
+        return (redis.server, redis.cli);
+    }
     // The pinned root has redis at /bin only.
     let redis_server = executable(&[
         "/usr/bin/redis-server",
@@ -309,4 +315,94 @@ fn redis_source_build_and_extended_suite_under_strict_hermit() {
         stdout.contains("redis-source-build-strict-ok\n"),
         "source-build runner omitted its success marker:\n{stdout}"
     );
+}
+
+/// Writes an empty file `name` in `directory` with `mode`.
+fn file_with_mode(directory: &Path, name: &str, mode: u32) -> PathBuf {
+    fs::create_dir_all(directory).expect("failed to create a fixture directory");
+    let path = directory.join(name);
+    fs::write(&path, b"").expect("failed to write a fixture file");
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("failed to set a mode");
+    path
+}
+
+/// The HERMIT_PREPARED_REDIS text that declares `server` and `cli`.
+fn redis_declaration(server: &Path, cli: &Path) -> OsString {
+    serde_json::json!({"redis-cli": cli, "redis-server": server})
+        .to_string()
+        .into()
+}
+
+#[test]
+fn a_declared_redis_pair_is_used_only_when_declared() {
+    assert_eq!(prepared_redis::parse_prepared_redis(None), Ok(None));
+    let root = tempfile::tempdir().expect("failed to create a fixture directory");
+    let server = file_with_mode(root.path(), "redis-server", 0o755);
+    let cli = file_with_mode(root.path(), "redis-cli", 0o755);
+    let declared = redis_declaration(&server, &cli);
+    let expected = prepared_redis::PreparedRedis { server, cli };
+    assert_eq!(
+        prepared_redis::parse_prepared_redis(Some(declared)),
+        Ok(Some(expected))
+    );
+}
+
+#[test]
+fn a_bad_redis_declaration_is_refused_rather_than_replaced() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = tempfile::tempdir().expect("failed to create a fixture directory");
+    let server = file_with_mode(root.path(), "redis-server", 0o755);
+    let cli = file_with_mode(root.path(), "redis-cli", 0o755);
+    let renamed = file_with_mode(root.path(), "redis-sentinel", 0o755);
+    let plain_server = file_with_mode(&root.path().join("plain"), "redis-server", 0o644);
+    let plain_cli = file_with_mode(&root.path().join("plain"), "redis-cli", 0o644);
+    let directory = root.path().join("directory/redis-server");
+    fs::create_dir_all(&directory).expect("failed to create a fixture directory");
+    let missing = root.path().join("missing/redis-cli");
+    let only_server = serde_json::json!({"redis-server": &server}).to_string();
+    let extra = serde_json::json!({"redis-cli": &cli, "redis-server": &server, "x": &cli});
+    let cases: [(OsString, &str); 11] = [
+        (OsString::from_vec(vec![0xff]), "is not UTF-8"),
+        ("not json".into(), "is not a JSON object of paths"),
+        (
+            r#"{"redis-cli": 1, "redis-server": 2}"#.into(),
+            "is not a JSON object of paths",
+        ),
+        (
+            only_server.into(),
+            "must name exactly redis-cli and redis-server",
+        ),
+        (
+            extra.to_string().into(),
+            "must name exactly redis-cli and redis-server",
+        ),
+        (
+            redis_declaration(Path::new("redis-server"), &cli),
+            "which is not absolute",
+        ),
+        (
+            redis_declaration(&renamed, &cli),
+            "does not keep the file name redis-server",
+        ),
+        (
+            redis_declaration(&directory, &cli),
+            "which is not an executable file",
+        ),
+        (
+            redis_declaration(&plain_server, &cli),
+            "which is not an executable file",
+        ),
+        (redis_declaration(&server, &plain_cli), "names redis-cli"),
+        (
+            redis_declaration(&server, &missing),
+            "No such file or directory",
+        ),
+    ];
+    for (declared, problem) in cases {
+        let shown = format!("{declared:?}");
+        let refused = prepared_redis::parse_prepared_redis(Some(declared));
+        let refused = refused.expect_err(&format!("accepted {shown}"));
+        assert!(refused.contains(problem), "{shown}: {refused}");
+    }
 }
