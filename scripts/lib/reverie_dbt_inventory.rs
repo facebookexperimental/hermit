@@ -15,4 +15,4 @@
 
 /// `git ls-files -- reverie-dbt` in the pinned Reverie checkout lists this
 /// many files.
-pub const REVERIE_DBT_FILES: usize = 1006;
+pub const REVERIE_DBT_FILES: usize = 1008;
