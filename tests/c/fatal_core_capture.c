@@ -12,6 +12,7 @@
  *   segv          dirty 1 MiB of heap, put MARKER at its start, segfault
  *   dontdump      like segv, but first put SECRET in a page excluded from
  *                 cores with madvise(MADV_DONTDUMP)
+ *   dumpable-secret  the same page without MADV_DONTDUMP, as a control
  *   children MIB...  fork one child per argument, one at a time, that
  *                 dirties that many MiB of incompressible heap and segfaults;
  *                 exit 1
@@ -31,7 +32,6 @@
 
 #define MARKER "HERMIT-FATAL-CORE-MARKER"
 #define THREAD_MARKER 0x4845524d49543132u
-#define SECRET "HERMIT-DONTDUMP-SECRET"
 
 /* Volatile so that no store to the heap is dropped as dead. */
 static unsigned char* volatile heap;
@@ -52,6 +52,27 @@ static void dirty_and_segfault(size_t mib, unsigned seed) {
   }
   memcpy((void*)heap, MARKER, sizeof(MARKER));
   *(volatile int*)0 = 1;
+}
+
+static void secret_page_and_segfault(int exclude) {
+  /* Decode directly into the page: a plaintext copy in the ELF's read-only
+   * mapping would make the global core search depend on coredump_filter.
+   * Volatile reads prevent constant folding; volatile writes retain the page. */
+  static const volatile unsigned char encoded_secret[] = {
+      0xed, 0xe0, 0xf7, 0xe8, 0xec, 0xf1, 0x88, 0xe1, 0xea, 0xeb, 0xf1,
+      0xe1, 0xf0, 0xe8, 0xf5, 0x88, 0xf6, 0xe0, 0xe6, 0xf7, 0xe0, 0xf1,
+      0xa5};
+  volatile unsigned char* page =
+      mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (page == MAP_FAILED ||
+      (exclude && madvise((void*)page, 4096, MADV_DONTDUMP) != 0)) {
+    perror("mmap/madvise");
+    exit(3);
+  }
+  for (size_t i = 0; i < sizeof(encoded_secret); i++) {
+    page[i] = encoded_secret[i] ^ 0xa5;
+  }
+  dirty_and_segfault(1, 1);
 }
 
 static void fork_segfaulting_children(int count, char** mib) {
@@ -113,15 +134,9 @@ int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "";
   if (strcmp(mode, "segv") == 0) {
     dirty_and_segfault(1, 1);
-  } else if (strcmp(mode, "dontdump") == 0) {
-    char* page =
-        mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (page == MAP_FAILED || madvise(page, 4096, MADV_DONTDUMP) != 0) {
-      perror("mmap/madvise");
-      exit(3);
-    }
-    memcpy(page, SECRET, sizeof(SECRET));
-    dirty_and_segfault(1, 1);
+  } else if (strcmp(mode, "dontdump") == 0 ||
+             strcmp(mode, "dumpable-secret") == 0) {
+    secret_page_and_segfault(strcmp(mode, "dontdump") == 0);
   } else if (strcmp(mode, "children") == 0) {
     fork_segfaulting_children(argc - 2, argv + 2);
     return 1;
@@ -134,7 +149,8 @@ int main(int argc, char** argv) {
   }
   fprintf(
       stderr,
-      "usage: %s segv | dontdump | children MIB... | child-segv-ok | threads\n",
+      "usage: %s segv | dontdump | dumpable-secret | children MIB... | "
+      "child-segv-ok | threads\n",
       argv[0]);
   return 2;
 }
