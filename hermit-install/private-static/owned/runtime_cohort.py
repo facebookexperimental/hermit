@@ -112,10 +112,45 @@ FINAL_DEVELOPMENT_051 = (
     ('R', 'reverie-loader/src/mapped_inputs.rs', 17803, '81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2'),
     ('R', 'reverie-loader/src/musl_tls.rs', 7478, '84011bb8505fa3357908e7445b1305f54303bae32ddb9d393546da8e309ee1ea'),
 )
+# Exact 0.5.3 version-only manifest tuple; historical declarations and proof checks remain.
+FINAL_DEVELOPMENT_053 = (
+    ('H', 'detcore-liteinst/build.rs', 2881, '9a2552ea4d2ba0190a9fc06244102ff95fd1902830369b90c0e891d7373c9633'),
+    ('H', 'detcore-liteinst/src/exec_initial.rs', 30450, '693667e8ae6efe87f9fa5810a61dbeffe3306ad89157aea9111b4b653a2236f8'),
+    ('H', 'detcore-liteinst/src/exec_initial/mapped_entry.rs', 6707, '34e21f21a41f2346889c242c869bc32c74821c625dd5b9cf9bd2181ca2d8d40e'),
+    ('H', 'detcore-liteinst/src/exec_initial/mapped_entry/bounds.rs', 1439, '4ab8a19e17b52905fea0176b45c63c48e5fc581c9977c927b8817c4de129f1e0'),
+    ('H', 'detcore-liteinst/src/exec_native/catalog.rs', 10932, '3ef894a3325cd56a172fb67809d3b39109db839a916a6f3c6fcf927ec25c7ff7'),
+    ('H', 'detcore-liteinst/src/exec_native/consumer.rs', 8232, '292f0a0df98d2dc6588f2af6976c79932423f44df84166ae158e9b4a7fb36b4d'),
+    ('H', 'detcore-liteinst/src/exec_native/consumer_tests.rs', 21835, 'e3f0f107556e7261e5e5f80a8a2b4d1fbec38572de95df5df13363c479299fab'),
+    ('H', 'detcore-liteinst/src/exec_native/driver.rs', 32420, 'bc0626efe96659f01fb6bb921cc61ef8bb76833522b45ba114d97888e8bb2975'),
+    ('H', 'detcore-liteinst/src/exec_native/entry.rs', 17706, 'c9fe2808730baba77dd3710403d6f7f0eab0892b9bf6ae98fb9ea817eda94ca0'),
+    ('H', 'detcore-liteinst/src/exec_native/mod.rs', 296, '25d35c840dd19367fe4ff54553972dc949b76dc4c6dfdb64c41e9657552724d1'),
+    ('H', 'detcore-liteinst/src/exec_native/provider.rs', 19017, '12a6f762a00d460c06d03f143587124c8cc9c615725f8dce152282433f02ff1e'),
+    ('H', 'detcore-liteinst/src/lib.rs', 30461, '61fa5f040e0188ec076c10f3a3260acb722257aa60a595ed815a158365fd5af3'),
+    ('R', 'reverie-inguest/Cargo.toml', 5569, 'd95d1413c8853732664d795dadfa65fa9c666d356585384c9d29eea5b351dfe8'),
+    ('R', 'reverie-inguest/src/guest/exec_private.rs', 182321, '026cecaff9850b3bf916bc0ecb56d0e9021ca5130e7bfc1f64e21a48bc0dd4a9'),
+    ('R', 'reverie-inguest/src/guest/exec_private/mapped_initial.rs', 37162, 'a28b8e9b8a8b3efdc70f39e11253a5525aff36c315d33cd3fbec99f0489845ad'),
+    ('R', 'reverie-inguest/src/guest/exec_private/mapped_initial/libc_relay.rs', 50822, 'a7a4df88f1fd44855a0ccf7c60ca03dedb8c7e336c6239549484ee038fbc9547'),
+    ('R', 'reverie-inguest/src/guest/exec_private/mapped_initial/libc_relay/frontend.rs', 18922, '28a785bd1945b7aae1e72bc688da1918368ab5e2fb1a4d9927bf00be5e01fcb4'),
+    ('R', 'reverie-inguest/src/guest/exec_private/mapped_initial/mapped_scalar.rs', 20465, '285f7f75bf9f388a771d685607ce65f7097c27d21869952d46b3a7ce70897612'),
+    ('R', 'reverie-inguest/src/lib.rs', 11734, '0fbf94503eac27b65e52967c11c675e23e7a2f50338ca32150002ff4c64fabbf'),
+    ('R', 'reverie-inguest/src/private_runtime/mod.rs', 2093, 'f6764939d2016bd3c9414b17b35f21f8cf7217f128135b83cfb5459aa3ae5e1e'),
+    ('R', 'reverie-inguest/src/private_runtime/tls/abi.rs', 12171, 'f7de3cd3a0653785f8aacc01e0fabdeb89172b2660f07ea0df9d393078299aab'),
+    ('R', 'reverie-inguest/src/private_runtime/tls/layout.rs', 499, '8fcceedb234c081b5125d95d73eaafa083fadc2d1be41698b724487ab7cfae36'),
+    ('R', 'reverie-inguest/src/private_runtime/tls/mod.rs', 4853, '369e35bcafda51a271720507dcf7a7c9072fb5db7486e110e14f15e4df91f0dd'),
+    ('R', 'reverie-inguest/src/trap.rs', 49799, '5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b'),
+    ('R', 'reverie-inguest/src/trap/fixed_gates.rs', 36554, 'ff3f6f6c46e872734ae921e869dbccc0ce1aeefe4bc3af8f29363cf276501e54'),
+    ('R', 'reverie-inguest/src/trap/frame.rs', 35075, '357d2d884f7fdcc43b8d4acde8bc04e43023c85e6a77c569ac60c64dbb6030a0'),
+    ('R', 'reverie-loader/Cargo.toml', 343, '11ddee33344d8e2917248497d34e52c987eeca15d029cab1f87995dd5ad7b682'),
+    ('R', 'reverie-loader/src/handoff.rs', 76132, '85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75'),
+    ('R', 'reverie-loader/src/lib.rs', 1510, 'b3318334635e632a23283c1f51633b090eb809de9710ab0c98038b684abbb5b8'),
+    ('R', 'reverie-loader/src/mapped_inputs.rs', 17803, '81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2'),
+    ('R', 'reverie-loader/src/musl_tls.rs', 7478, '84011bb8505fa3357908e7445b1305f54303bae32ddb9d393546da8e309ee1ea'),
+)
 COHORTS = (("historical-bounded-bootstrap", HISTORICAL),
            ("merged-runtime-content-v1", CURRENT_MERGED),
            ("final-candidate-content-v1", FINAL_CANDIDATE_V1),
-           ("development-051-content-v1", FINAL_DEVELOPMENT_051))
+           ("development-051-content-v1", FINAL_DEVELOPMENT_051),
+           ("development-053-content-v1", FINAL_DEVELOPMENT_053))
 
 
 def need(ok, message):

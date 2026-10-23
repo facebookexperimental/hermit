@@ -3,7 +3,7 @@
 [package]
 name = "hermetic_infra_hermit_flaky-tests"
 description = "Intentionally racy guest programs for Hermit deterministic scheduling and race-search tests."
-version = "0.5.1"
+version = "0.5.3"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"

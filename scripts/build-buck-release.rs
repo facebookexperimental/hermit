@@ -1444,7 +1444,7 @@ fn verify_generated_buck(text: &str) -> Result<(), String> {
     let mapped_files = text
         .lines()
         .filter(|line| {
-            line.trim_start().starts_with('"') && line.contains(": \"vendor/reverie-dbt-0.5.1/")
+            line.trim_start().starts_with('"') && line.contains(": \"vendor/reverie-dbt-0.5.3/")
         })
         .count();
     if mapped_files != reverie_dbt_inventory::REVERIE_DBT_FILES {
@@ -6325,7 +6325,7 @@ mod tests {
             let mut text = GENERATED_MARKERS.join("\n");
             for index in 0..files {
                 text.push_str(&format!(
-                    "\n    \"f{index}\": \"vendor/reverie-dbt-0.5.1/f{index}\","
+                    "\n    \"f{index}\": \"vendor/reverie-dbt-0.5.3/f{index}\","
                 ));
             }
             text

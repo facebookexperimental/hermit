@@ -3,7 +3,7 @@
 
 [package]
 name = "hermit-lit-guests"
-version = "0.5.1"
+version = "0.5.3"
 edition = "2021"
 description = "The Rust programs detcore/tests/lit's fixtures run as %me, for hermit-cli/tests/lit.rs."
 license = "BSD-3-Clause"

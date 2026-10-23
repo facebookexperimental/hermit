@@ -1,12 +1,12 @@
 [package]
 name = "hermit-run-kvm"
 description = "Hermit's KVM run: the root of Detcore's KVM instantiation, compiled apart from the hermit library so it builds in parallel."
-version = "0.5.1"
+version = "0.5.3"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
 publish = false
 
 [dependencies]
-detcore = { package = "hermit-detcore", version = "0.5.1", path = "../detcore" }
-reverie-kvm = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "bc87651747f1daf371da9651e0e0ce0a90a404e9" }
+detcore = { package = "hermit-detcore", version = "0.5.3", path = "../detcore" }
+reverie-kvm = { version = "0.5.3", git = "https://github.com/rrnewton/reverie.git", rev = "befaebe7482ef3fa8becb242bd020ec882963205" }

@@ -3,7 +3,7 @@
 [package]
 name = "detcore-testutils"
 description = "Test utilities for Detcore integration tests in the Hermit deterministic execution engine."
-version = "0.5.1"
+version = "0.5.3"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
@@ -11,12 +11,12 @@ publish = false
 
 [dependencies]
 libc = "0.2.186"
-hermit-test-workdir = { version = "0.5.1", path = "../../../common/test-workdir" }
-detcore = { package = "hermit-detcore", version = "0.5.1", path = "../.." }
+hermit-test-workdir = { version = "0.5.3", path = "../../../common/test-workdir" }
+detcore = { package = "hermit-detcore", version = "0.5.3", path = "../.." }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
-reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "bc87651747f1daf371da9651e0e0ce0a90a404e9" }
-reverie-ptrace = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "bc87651747f1daf371da9651e0e0ce0a90a404e9" }
-test-allocator = { version = "0.5.1", path = "../../../common/test-allocator" }
+reverie = { package = "reverie-core", version = "0.5.3", git = "https://github.com/rrnewton/reverie.git", rev = "befaebe7482ef3fa8becb242bd020ec882963205" }
+reverie-ptrace = { version = "0.5.3", git = "https://github.com/rrnewton/reverie.git", rev = "befaebe7482ef3fa8becb242bd020ec882963205" }
+test-allocator = { version = "0.5.3", path = "../../../common/test-allocator" }
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }

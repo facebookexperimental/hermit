@@ -10,7 +10,7 @@ rust_library(
         "cargo_toml_dir": ".",
         "cargo_toml_config": {
             "package": {
-                "version": "0.5.1",
+                "version": "0.5.3",
                 "readme": "README.md",
                 "homepage": "https://hermetic-infra.org",
                 "documentation": "https://docs.rs/hermit-test-workdir",

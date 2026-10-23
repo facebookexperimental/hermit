@@ -2538,7 +2538,10 @@ fi
 # and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so the
 # inventory, SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the 30f403ba entry.
-expected_pin=bc87651747f1daf371da9651e0e0ce0a90a404e9
+# CARRY TO befaebe7482ef3fa8becb242bd020ec882963205: version-only 0.5.3 from bc87651747f1daf371da9651e0e0ce0a90a404e9.
+# Package versions and exact qualifier declarations change; DBT/SDK runtime source,
+# recipes, inventory997 and calibrated resource limits are unchanged. No runtime proof carries.
+expected_pin=befaebe7482ef3fa8becb242bd020ec882963205
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

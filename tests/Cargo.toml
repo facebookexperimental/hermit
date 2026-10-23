@@ -3,7 +3,7 @@
 [package]
 name = "hermetic_infra_hermit_tests"
 description = "Guest programs used by Hermit integration and compatibility tests."
-version = "0.5.1"
+version = "0.5.3"
 edition = "2024"
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
@@ -194,7 +194,7 @@ path = "standalone/stacktrace_events.rs"
 
 [dependencies]
 close-err = "1.0.2"
-detcore = { package = "hermit-detcore", version = "0.5.1", path = "../detcore" }
+detcore = { package = "hermit-detcore", version = "0.5.3", path = "../detcore" }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 regex = "1.13.1"

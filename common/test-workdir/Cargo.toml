@@ -3,7 +3,7 @@
 [package]
 name = "hermit-test-workdir"
 description = "Per-run filesystem isolation for Hermit tests inside the pinned root."
-version = "0.5.1"
+version = "0.5.3"
 edition = "2024"
 readme = "README.md"
 homepage = "https://hermetic-infra.org"
