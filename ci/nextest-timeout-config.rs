@@ -178,6 +178,32 @@ const PARITY_POST_PASS_NO_GUEST_WRAPPER_NAME: &str = "hermit-parity-post-pass-no
 // (at most 35.7 s wall); 64f898eb's was stopped by the cap at 22.28 (32.4 s
 // wall). ceil(1.5 * 22.28) = 34.
 const PARITY_POST_PASS_NO_GUEST_CPU_SECONDS: u64 = 34;
+// Two more on the same host, from the 164 full validations recorded from
+// 2026-10-18 to 2026-10-23 (dev-hermit minibeads dh-dbjdh). Each runs Hermit
+// under ptrace strict verification many times in one test, so its CPU grows
+// with host contention as the ones above do.
+//
+// hermit-run::epoll_determinism epoll_pwait2_polls_under_run_strict runs 15
+// `run --strict --verify` modes of tests/c/epoll_pwait_temporary_mask.c: 157
+// of 163 attempts completed at 5.20 to 21.87 CPU seconds (5.2 to 8.7 in
+// ops-tick validations, 8.8 to 21.87 in coordinator validations, at most 56.4
+// s wall); 4 were stopped by the 22-second cap at 22.01 to 22.78 (26.8 to
+// 30.2 s wall) and 2 by the 57-second wall at 13.74 and 15.85 CPU seconds.
+// ceil(1.5 * 22.78) = 35. Its 12-mode sibling
+// epoll_pwait_sleeps_under_its_temporary_mask: 162 of 163 completed at up to
+// 18.47 (at most 54.6 s wall), 1 stopped by the cap at 22.03.
+// ceil(1.5 * 22.03) = 34.
+const EPOLL_PWAIT2_STRICT_WRAPPER_NAME: &str = "hermit-epoll-pwait2-strict-cpu";
+const EPOLL_PWAIT2_STRICT_CPU_SECONDS: u64 = 35;
+const EPOLL_PWAIT_MASK_WRAPPER_NAME: &str = "hermit-epoll-pwait-mask-cpu";
+const EPOLL_PWAIT_MASK_CPU_SECONDS: u64 = 34;
+// hermit-run::cli a_cross_process_sigkill_notification_verifies_at_bitwise_parity:
+// 155 of 158 completed at 6.76 to 21.77 CPU seconds (7.1 to 9.6 in ops-tick
+// validations, 10.5 to 21.77 in coordinator validations, at most 53.5 s wall);
+// 2 were stopped by the cap at 22.07 and 22.21 (30.5 and 33.5 s wall) and 1 by
+// the wall at 9.92. ceil(1.5 * 22.21) = 34.
+const CROSS_PROCESS_SIGKILL_WRAPPER_NAME: &str = "hermit-cross-process-sigkill-cpu";
+const CROSS_PROCESS_SIGKILL_CPU_SECONDS: u64 = 34;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 #[derive(Clone, Copy)]
@@ -212,7 +238,7 @@ impl MeasuredCpuAllowance {
     }
 }
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 29] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         package: "hermit-run",
@@ -404,6 +430,30 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 29] = [
         binary: "hermit-manifest-plan::bin/test-harness",
         test: "tests::the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest",
         cpu_seconds: PARITY_POST_PASS_NO_GUEST_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: EPOLL_PWAIT2_STRICT_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::epoll_determinism",
+        test: "epoll_pwait2_polls_under_run_strict",
+        cpu_seconds: EPOLL_PWAIT2_STRICT_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: EPOLL_PWAIT_MASK_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::epoll_determinism",
+        test: "epoll_pwait_sleeps_under_its_temporary_mask",
+        cpu_seconds: EPOLL_PWAIT_MASK_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: CROSS_PROCESS_SIGKILL_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "a_cross_process_sigkill_notification_verifies_at_bitwise_parity",
+        cpu_seconds: CROSS_PROCESS_SIGKILL_CPU_SECONDS,
         wall_seconds: None,
     },
 ];
@@ -1120,7 +1170,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), signal discard ({SIGNAL_DISCARD_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), signal discard ({SIGNAL_DISCARD_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), cross-process SIGKILL ({CROSS_PROCESS_SIGKILL_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -2258,6 +2308,27 @@ mod tests {
                 PARITY_POST_PASS_NO_GUEST_WRAPPER_NAME,
                 34,
             ),
+            (
+                "hermit-run",
+                "hermit-run::epoll_determinism",
+                "epoll_pwait2_polls_under_run_strict",
+                EPOLL_PWAIT2_STRICT_WRAPPER_NAME,
+                35,
+            ),
+            (
+                "hermit-run",
+                "hermit-run::epoll_determinism",
+                "epoll_pwait_sleeps_under_its_temporary_mask",
+                EPOLL_PWAIT_MASK_WRAPPER_NAME,
+                34,
+            ),
+            (
+                "hermit-run",
+                "hermit-run::cli",
+                "a_cross_process_sigkill_notification_verifies_at_bitwise_parity",
+                CROSS_PROCESS_SIGKILL_WRAPPER_NAME,
+                34,
+            ),
         ]);
         let identities = expected
             .iter()
@@ -2621,7 +2692,7 @@ mod tests {
             prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
                 .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 29);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 32);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),
