@@ -1336,6 +1336,34 @@ fn fdinfo_refusal(call: &str, fd: RawFd, step: &str, errno: Errno) -> String {
     )
 }
 
+/// The `SigBlk` a status snapshot reports for the thread it describes
+/// (`mask_thread`, from `ProcfsFile::status_mask_thread`) in place of the
+/// kernel's, or `None` to keep the kernel's: the guest mask that thread
+/// published to the scheduler (`Scheduler::published_guest_sigmask`), where
+/// guest masks are published at all (`publishes_guest_masks`): under
+/// signal-target modelling, where the kernel's mask is Detcore's private one
+/// while it holds the thread under it (Codex review of R2b-2 stage 2, P2;
+/// <https://github.com/rrnewton/hermit/issues/4273>), and under the in-guest
+/// delivery gate, where each request publishes the guest's mask and the
+/// kernel's may be the in-guest runtime's (A5 step 3c.1b). With nothing
+/// published for the thread the scheduler answers `None`, and the kernel's
+/// `SigBlk` is reported, as before.
+pub(crate) async fn status_published_sigblk<G, T>(
+    guest: &mut G,
+    mask_thread: Option<i32>,
+) -> Option<u64>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match mask_thread {
+        Some(thread) if crate::syscalls::helpers::publishes_guest_masks(guest.config()) => {
+            crate::tool_global::published_guest_sigmask(guest, DetTid::from_raw(thread)).await
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod fdinfo_refusal_tests {
     use super::*;
@@ -6477,16 +6505,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         // under a private blocking mask, which that thread published to the
         // scheduler; the kernel's `SigBlk` is Detcore's mask (Codex review of
         // R2b-2 stage 2, P2; https://github.com/rrnewton/hermit/issues/4273).
-        // Masks are published only where the scheduler models signal targets.
+        // Masks are published only where the scheduler models signal targets,
+        // and under the in-guest delivery gate, where each request publishes
+        // the guest's mask (A5 step 3c.1b) and the kernel's may be the in-guest
+        // runtime's (`publishes_guest_masks`). With nothing published for the
+        // thread, the kernel's `SigBlk` is reported, as before.
         let mask_thread = guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.procfs_status_mask_thread(&contents)
         })?;
-        let published_sigblk = match mask_thread {
-            Some(thread) if crate::scheduler::discarded_at_send::records(guest.config()) => {
-                crate::tool_global::published_guest_sigmask(guest, DetTid::from_raw(thread)).await
-            }
-            _ => None,
-        };
+        let published_sigblk = status_published_sigblk(guest, mask_thread).await;
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),

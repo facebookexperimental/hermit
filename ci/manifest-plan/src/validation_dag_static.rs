@@ -2730,7 +2730,20 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // rendered_procfs_seek_follows_each_llseek,
     // a_cmdline_path_avoids_the_buffer_and_the_source_area,
     // the_watch_queue_probe_tells_a_notification_pipe): 2412.
-    ("test.detcore_unit", 2412),
+    // And A5 step 3c.1b's nine: the seven
+    // tool_global::tests::guest_mask_publication_tests units (every parent of
+    // design 18.16's table publishes its mask at its request; none with the
+    // gate off; nothing without a known mask; phase 1's virtual SIGALRM bit;
+    // publish_wait_mask under the gate; publishes_guest_masks; the coordinator
+    // records a published mask as the request is filed) and
+    // scheduler::test::under_the_gate_a_threads_mask_is_the_one_its_latest_request_published
+    // and scheduler::test::under_the_gate_a_background_grant_records_the_published_mask_and_arms_nothing:
+    // 2421, listed.
+    // And tool_global::tests::guest_mask_publication_tests::proc_status_sigblk_shows_the_published_mask_under_the_gate
+    // (slice 3c.1b review round 1): 2422, listed.
+    // And scheduler::test::under_the_gate_a_rejoin_publishes_at_its_readmission_not_at_its_filing
+    // (slice 3c.1b review round 2): 2423, listed.
+    ("test.detcore_unit", 2423),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4820,7 +4833,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 75 shared Detcore tests; no hosted exclusions changed.
     // And the same eleven /proc/<pid>/cmdline units of the LinuxEmu D4b pin:
     // 2412.
-    ("test.detcore_unit_on_host", 2412),
+    // And the same nine slice 3c.1b guest-mask publication units: 2421, listed.
+    // And the same slice 3c.1b /proc status SigBlk unit: 2422, listed.
+    // And the same slice 3c.1b rejoin-publication unit: 2423, listed.
+    ("test.detcore_unit_on_host", 2423),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

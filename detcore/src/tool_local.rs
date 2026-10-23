@@ -5546,6 +5546,7 @@ impl<T> ThreadState<T> {
             continues_sigreturn: false,
             private_sigchld_decides: false,
             slice_boundary: None,
+            guest_signal_mask: None,
         }
     }
 

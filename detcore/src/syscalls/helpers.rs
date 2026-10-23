@@ -2882,6 +2882,18 @@ where
     Ok(mask)
 }
 
+/// Whether the scheduler keeps a guest mask that differs from the kernel's
+/// `SigBlk` (`Scheduler::saved_guest_sigmasks`) and reads it in its place, so
+/// that a thread must publish it: under signal-target modelling
+/// (`Config::models_signal_targets`, which is where the discarded-at-send
+/// record is kept, `discarded_at_send::records`), and under the in-guest
+/// delivery gate (`Config::in_guest_signal_delivery`; A5 step 3c.1b), where the
+/// kernel's mask may be the in-guest runtime's. With both off, nothing is
+/// published and every reader takes `SigBlk`, as before step 3c.1b.
+pub(crate) fn publishes_guest_masks(cfg: &crate::Config) -> bool {
+    crate::scheduler::discarded_at_send::records(cfg) || cfg.in_guest_signal_delivery
+}
+
 /// The waiting thread's mask as last told to the scheduler
 /// (`publish_wait_mask`). It is deliberately not `Copy`: a wait loop in an
 /// `async move` block must reborrow it, or the block would publish into a
@@ -2894,8 +2906,9 @@ pub(crate) struct PublishedWaitMask(Option<KernelSigset>);
 /// differs from `published`, the last one told. The scheduler reads it in
 /// place of the thread's `SigBlk` (`set_saved_guest_sigmask`), for example to
 /// decide whether a leader ignores an `ITIMER_REAL` expiry at generation
-/// (https://github.com/rrnewton/hermit/issues/4139). Only under signal-target
-/// modelling, the only configuration whose scheduler reads it for a wait.
+/// (https://github.com/rrnewton/hermit/issues/4139). Only where the scheduler
+/// reads it for a wait (`publishes_guest_masks`): under signal-target
+/// modelling, or under the in-guest delivery gate.
 pub(crate) async fn publish_wait_mask<T, G>(
     guest: &mut G,
     mask: Option<KernelSigset>,
@@ -2904,7 +2917,7 @@ pub(crate) async fn publish_wait_mask<T, G>(
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    if mask == published.0 || !guest.config().models_signal_targets() {
+    if mask == published.0 || !publishes_guest_masks(guest.config()) {
         return;
     }
     crate::tool_global::set_saved_guest_sigmask(guest, mask).await;

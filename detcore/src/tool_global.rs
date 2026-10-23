@@ -4586,6 +4586,11 @@ impl GlobalState {
                     self.signal_requested_stacktrace(dettid);
                 }
             }
+            // The guest mask the request publishes (A5 step 3c.1b), recorded
+            // before the scheduler can act on the request; a no-op with the
+            // in-guest delivery gate off, and for a rejoin, whose filing is
+            // host-timed (recorded when the thread is readmitted instead).
+            sched.record_request_guest_mask(dettid, &rs);
             sched.request_put(&nextturn.req, rs.clone(), &self.global_time);
             nextturn.resp
         };
@@ -5237,6 +5242,7 @@ impl GlobalState {
                     continues_sigreturn: false,
                     private_sigchld_decides: false,
                     slice_boundary: None,
+                    guest_signal_mask: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -7917,6 +7923,52 @@ where
     );
 }
 
+/// The guest mask a request publishes under the in-guest delivery gate
+/// (`Resources::guest_signal_mask`; A5 step 3c.1b, design 18.16.1 section 6,
+/// <https://github.com/rrnewton/hermit/issues/4485>), read in the thread's own
+/// turn just before the request leaves it, or `None`:
+/// - `None` with the gate (`Config::in_guest_signal_delivery`) off, so a run
+///   without it sends exactly what it sent before;
+/// - `None` when the call's temporary mask could not be read
+///   (`Resources::blocked_signal_mask_unknown`): nothing is claimed;
+/// - a call's temporary mask (`Resources::blocked_signal_mask`: the mask
+///   argument of `rt_sigsuspend` or a masked `pselect6`, read in this turn),
+///   which governs the thread while it sleeps in, or is readmitted from, that
+///   call, as Linux's `blocked` holds it then;
+/// - otherwise the backend's record of the mask the guest resumes under
+///   (`Guest::resume_signal_mask`), `None` from a backend that keeps no guest
+///   mask apart. In a process whose SIGALRM is a signal-phase-1 guest handler
+///   (`BackendCapabilities::virtualizes_guest_sigalrm` and
+///   `ThreadState::sigalrm_handled`), its SIGALRM bit is the runtime's virtual
+///   one, as this thread last published it to the scheduler's ledger
+///   (`ThreadState::sigalrm_blocked_published`, synced at the callback's
+///   entry before any request), not the physical one. Phase 1 refuses every
+///   temporary-mask call in such a process, so a temporary mask is never
+///   adjusted.
+pub(crate) fn publish_request_guest_mask<G, T>(guest: &G, r: &Resources) -> Option<u64>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !guest.config().in_guest_signal_delivery || r.blocked_signal_mask_unknown {
+        return None;
+    }
+    if let Some(temporary) = r.blocked_signal_mask {
+        return Some(temporary);
+    }
+    let own = guest.resume_signal_mask()?;
+    let thread = guest.thread_state();
+    if guest.config().backend.virtualizes_guest_sigalrm && thread.sigalrm_handled {
+        let sigalrm = 1_u64 << (libc::SIGALRM - 1);
+        return Some(if thread.sigalrm_blocked_published {
+            own | sigalrm
+        } else {
+            own & !sigalrm
+        });
+    }
+    Some(own)
+}
+
 /// Global method RPC to request to control a resource.
 ///
 /// Blocking: future returns only when resources are fully acquired.
@@ -7952,6 +8004,7 @@ where
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",
             &dettid, r
         );
+        r.guest_signal_mask = publish_request_guest_mask(guest, &r);
         let resp =
             send_and_update_time(guest, GlobalRequest::RequestResources(r.clone(), detpid)).await;
         match resp.1 {
@@ -10906,6 +10959,7 @@ mod tests {
     mod backend_failure_tests;
     mod exec_identity_tests;
     mod exec_teardown_tests;
+    mod guest_mask_publication_tests;
     mod stopping_refusal_tests;
     mod timerless_clock_tests;
     use std::collections::BTreeSet;

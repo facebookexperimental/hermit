@@ -10,6 +10,11 @@
 
 mod accept_in_turn;
 mod files;
+/// The `SigBlk` a `/proc` status snapshot reports in place of the kernel's,
+/// for the guest-mask publication tests (`initialize_procfs_snapshot` calls it
+/// directly).
+#[cfg(test)]
+pub(crate) use files::status_published_sigblk;
 pub(crate) mod guest_siginfo;
 pub mod helpers;
 
