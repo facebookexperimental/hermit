@@ -84,6 +84,13 @@ enum ProcfsKind {
     /// through `AT_NULL`. Only rendered; a file the kernel opens keeps the
     /// kernel's bytes, unclassified (`ProcfsFile::kernel_served`).
     ProcessAuxv,
+    /// `/proc/<pid>/cmdline`: the process's argument area, read from its
+    /// memory at every read by Linux's `get_mm_cmdline` rule
+    /// ([`read_cmdline`]), at the area Detcore recorded from the image's
+    /// initial stack (`Detcore::record_process_auxv`). Only rendered, and
+    /// only for the reader's own process; a file the kernel opens keeps the
+    /// kernel's bytes, unclassified (`ProcfsFile::kernel_served`).
+    ProcessCmdline,
     CpuidleCounter,
     Smaps,
     /// `/proc/*/maps`. Its per-mapping line carries a DEVICE and an INODE for
@@ -351,9 +358,10 @@ fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
 /// none of these, so a mapping is `ENODEV` and `SEEK_END` lands at its size, 0.
 pub(crate) fn rendered_path_is_seq_file(path: &Path) -> bool {
     // A process's `auxv` is a plain file of the memory map's `saved_auxv`
-    // (`auxv_read`, `generic_file_llseek` on size 0).
+    // (`auxv_read`, `generic_file_llseek` on size 0), and its `cmdline` one
+    // of its argument area (`proc_pid_cmdline_read`, the same seek).
     !path.starts_with("/proc/sys")
-        && !per_process_name(path).is_some_and(|name| name.filename == "auxv")
+        && !per_process_name(path).is_some_and(|name| matches!(name.filename, "auxv" | "cmdline"))
 }
 
 /// The most bytes a process's `auxv` holds: Linux's `saved_auxv` is
@@ -404,6 +412,256 @@ pub(crate) fn initial_stack_auxv(
         at = at.checked_add(16)?;
     }
     None
+}
+
+/// A process's argument and environment areas, as Linux keeps them in its
+/// memory map (`mm->arg_start`, `arg_end`, `env_start`, `env_end`), which
+/// its `/proc/<pid>/cmdline` reads ([`read_cmdline`]). `create_elf_tables`
+/// sets them when it lays out the new image's strings: the argument strings
+/// from `arg_start` (`argv[0]`) to `arg_end`, just past the last one's NUL,
+/// and the environment strings from `env_start`, equal to `arg_end`, to
+/// `env_end`, just past the last one's NUL.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub struct CmdlineArea {
+    /// The first argument string's first byte (`argv[0]`).
+    pub arg_start: u64,
+    /// Just past the last argument string's NUL.
+    pub arg_end: u64,
+    /// The first environment string's first byte.
+    pub env_start: u64,
+    /// Just past the last environment string's NUL.
+    pub env_end: u64,
+}
+
+/// The most bytes one argument or environment string takes, its NUL
+/// included: Linux's `MAX_ARG_STRLEN` (32 pages), past which an exec fails.
+const MAX_ARG_STRLEN: u64 = 32 * 4096;
+
+/// The page size `get_mm_cmdline` reads in, and which bounds a
+/// `setproctitle` title (`get_mm_proctitle`).
+const CMDLINE_PAGE: u64 = 4096;
+
+/// The argument and environment areas of a new image whose initial stack
+/// pointer is `stack`, found as `create_elf_tables` makes them: from
+/// `argv[0]`, each of the `argc` argument strings in turn, then each
+/// environment string, every one through its NUL. `read_word` reads a guest
+/// memory word and `read_bytes` reads guest bytes at an address into a
+/// buffer, returning how many it could read from its start.
+///
+/// `None` where a word or string cannot be read, a string has no NUL within
+/// `MAX_ARG_STRLEN`, the layout is implausible (more than 2^20 arguments or
+/// environment entries), or a pointer in `argv` or `envp` is not where the
+/// previous string ended: strings packed so are what Linux's loader makes,
+/// and KVM's, and a stack laid out otherwise is not taken for one.
+pub(crate) fn initial_stack_cmdline_area(
+    stack: u64,
+    mut read_word: impl FnMut(u64) -> Option<u64>,
+    mut read_bytes: impl FnMut(u64, &mut [u8]) -> usize,
+) -> Option<CmdlineArea> {
+    const MAX_ENTRIES: u64 = 1 << 20;
+    let argc = read_word(stack)?;
+    if argc > MAX_ENTRIES {
+        return None;
+    }
+    let mut arguments = Vec::new();
+    for index in 0..argc {
+        arguments.push(read_word(stack.checked_add(8 * (1 + index))?)?);
+    }
+    let mut at = stack.checked_add(8 * (1 + argc))?;
+    if read_word(at)? != 0 {
+        return None;
+    }
+    let mut environment = Vec::new();
+    loop {
+        at = at.checked_add(8)?;
+        let pointer = read_word(at)?;
+        if pointer == 0 {
+            break;
+        }
+        if environment.len() as u64 >= MAX_ENTRIES {
+            return None;
+        }
+        environment.push(pointer);
+    }
+    // Where there are no strings at all (no argument: Linux gives every image
+    // at least an empty `argv[0]`, so only another loader's), every bound is
+    // zero and the file is empty.
+    let Some(&first) = arguments.first().or(environment.first()) else {
+        return Some(CmdlineArea::default());
+    };
+    let mut end_of = |pointers: &[u64], mut cursor: u64| -> Option<u64> {
+        for &pointer in pointers {
+            if pointer != cursor {
+                return None;
+            }
+            cursor = cursor.checked_add(string_length(cursor, &mut read_bytes)? + 1)?;
+        }
+        Some(cursor)
+    };
+    let arg_end = end_of(&arguments, first)?;
+    let env_end = end_of(&environment, arg_end)?;
+    Some(CmdlineArea {
+        arg_start: first,
+        arg_end,
+        env_start: arg_end,
+        env_end,
+    })
+}
+
+/// The length of the NUL-terminated string at `at`, without its NUL, as
+/// `strnlen_user` bounded by `MAX_ARG_STRLEN`; `None` where its bytes cannot
+/// be read or no NUL comes within that bound.
+fn string_length(at: u64, read: &mut impl FnMut(u64, &mut [u8]) -> usize) -> Option<u64> {
+    let mut length = 0;
+    let mut chunk = [0_u8; CMDLINE_PAGE as usize];
+    while length < MAX_ARG_STRLEN {
+        let address = at.checked_add(length)?;
+        // Up to the next page boundary, so that a read stops where the
+        // mapped bytes do.
+        let size = (CMDLINE_PAGE - address % CMDLINE_PAGE).min(MAX_ARG_STRLEN - length) as usize;
+        let got = read(address, &mut chunk[..size]);
+        if got == 0 {
+            return None;
+        }
+        if let Some(nul) = chunk[..got].iter().position(|byte| *byte == 0) {
+            return Some(length + nul as u64);
+        }
+        length += got as u64;
+    }
+    None
+}
+
+/// The process memory a read of `/proc/<pid>/cmdline` reads, and the
+/// caller's buffer it copies to ([`read_cmdline`]).
+pub(crate) trait CmdlineMemory {
+    /// Read the process's bytes at `at` into `buffer` as Linux's
+    /// `access_remote_vm` does, respecting page protection: from `at` up to
+    /// the first byte that cannot be read. Returns how many it read.
+    fn read(&mut self, at: u64, buffer: &mut [u8]) -> usize;
+    /// Copy `bytes` to the caller's buffer at `offset` from its start, as
+    /// `copy_to_user` does: up to the first byte that cannot be written.
+    /// Returns how many it copied.
+    fn copy_out(&mut self, offset: usize, bytes: &[u8]) -> usize;
+}
+
+/// One plain read of `count` bytes at position `pos` of a process's
+/// `/proc/<pid>/cmdline`, by Linux's `get_mm_cmdline` (fs/proc/base.c,
+/// Linux 6.17), from the process's argument and environment areas `area`:
+/// the bytes go to the caller's buffer through `memory` as Linux copies
+/// them, page by page, each page read just before it is copied out, so a
+/// buffer that overlaps the argument area sees the bytes Linux would.
+/// `Ok` is the bytes copied; `Err(EFAULT)` where the first copy out copied
+/// nothing. The rules, in Linux's order:
+///
+/// 1. A memory map whose image is not yet laid out (`env_end` 0), or whose
+///    argument area is empty (`arg_start` not below `arg_end`), reads
+///    nothing.
+/// 2. The environment area counts only where it starts at `arg_end` and is
+///    not reversed; otherwise it is empty, at `arg_end`. The file's length is
+///    then `env_end - arg_start`; a read at or past it reads nothing, and a
+///    read is cut to it.
+/// 3. Where the argument area's last byte (`arg_end - 1`) can be read and is
+///    not NUL, the process has overwritten its arguments (`setproctitle`):
+///    the file is the string at `arg_start`, through its NUL if one comes
+///    within one page of what can be read there, at most one page
+///    (`get_mm_proctitle`). It may run on into the environment area.
+/// 4. Otherwise the file is exactly the argument area, `arg_start` to
+///    `arg_end`, read from `pos` a page at a time and copied out after each
+///    page, until a byte cannot be read or copied.
+///
+/// What Linux decides around this function: a task without a memory map (a
+/// zombie, a thread group whose leader has exited for its top-level file, a
+/// kernel thread) reads nothing (`get_task_mm`), and a task that is gone
+/// fails with ESRCH (`proc_pid_cmdline_read`).
+pub(crate) fn read_cmdline(
+    area: &CmdlineArea,
+    pos: u64,
+    count: usize,
+    memory: &mut impl CmdlineMemory,
+) -> Result<usize, reverie::syscalls::Errno> {
+    let CmdlineArea {
+        arg_start,
+        arg_end,
+        env_start,
+        env_end,
+    } = *area;
+    if env_end == 0 || arg_start >= arg_end {
+        return Ok(0);
+    }
+    let env_end = if env_start != arg_end || env_end < env_start {
+        arg_end
+    } else {
+        env_end
+    };
+    let len = env_end - arg_start;
+    if pos >= len {
+        return Ok(0);
+    }
+    let count = (count as u64).min(len - pos);
+    if count == 0 {
+        return Ok(0);
+    }
+    let mut last = [0_u8];
+    if memory.read(arg_end - 1, &mut last) == 1 && last[0] != 0 {
+        if pos >= CMDLINE_PAGE {
+            return Ok(0);
+        }
+        let mut page = vec![0_u8; CMDLINE_PAGE as usize];
+        let got = memory.read(arg_start, &mut page);
+        if got == 0 {
+            return Ok(0);
+        }
+        let mut length = page[..got]
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(got);
+        // The NUL is included where one was found.
+        if length < got {
+            length += 1;
+        }
+        let pos = pos as usize;
+        if length <= pos {
+            return Ok(0);
+        }
+        let end = pos + (length - pos).min(count as usize);
+        return match memory.copy_out(0, &page[pos..end]) {
+            0 => Err(reverie::syscalls::Errno::EFAULT),
+            copied => Ok(copied),
+        };
+    }
+    let Some(mut at) = arg_start.checked_add(pos).filter(|at| *at < arg_end) else {
+        return Ok(0);
+    };
+    let mut remaining = count.min(arg_end - at);
+    let mut copied = 0;
+    let mut page = vec![0_u8; CMDLINE_PAGE as usize];
+    while remaining > 0 {
+        let size = remaining.min(CMDLINE_PAGE) as usize;
+        let got = memory.read(at, &mut page[..size]);
+        if got == 0 {
+            break;
+        }
+        let out = memory.copy_out(copied, &page[..got]);
+        if out == 0 {
+            if copied == 0 {
+                return Err(reverie::syscalls::Errno::EFAULT);
+            }
+            break;
+        }
+        at += out as u64;
+        copied += out;
+        remaining -= out as u64;
+    }
+    Ok(copied)
 }
 
 /// What the name of the memfd standing in for a procfs file Detcore renders
@@ -1308,6 +1566,7 @@ impl ProcfsFile {
             other if is_process_file_path(other, "arch_status") => ProcfsKind::ArchStatus,
             other if is_process_file_path(other, "cgroup") => ProcfsKind::ProcessCgroup,
             other if is_process_file_path(other, "auxv") => ProcfsKind::ProcessAuxv,
+            other if is_process_file_path(other, "cmdline") => ProcfsKind::ProcessCmdline,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
             other if is_process_file_path(other, "smaps") => ProcfsKind::Smaps,
@@ -1464,17 +1723,19 @@ impl ProcfsFile {
 
     /// The per-process files Detcore renders, and their names. `mountinfo`
     /// and `mounts` only in a session with a container mount table
-    /// ([`RenderedFiles::mounts`]).
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 4] = [
+    /// ([`RenderedFiles::mounts`]). A name's index numbers its files' inodes
+    /// (`procfs_inode::per_process_inode`), so a new name goes last.
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 5] = [
         (ProcfsKind::ProcessCgroup, "cgroup"),
         (ProcfsKind::ProcessAuxv, "auxv"),
         (ProcfsKind::Mountinfo, "mountinfo"),
         (ProcfsKind::ProcessMounts, "mounts"),
+        (ProcfsKind::ProcessCmdline, "cmdline"),
     ];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 4] =
-        ["cgroup", "auxv", "mountinfo", "mounts"];
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 5] =
+        ["cgroup", "auxv", "mountinfo", "mounts", "cmdline"];
 
     /// Pin which view of the mounts this kernel-opened `mountinfo` or `mounts`
     /// reads: the kernel's (`kernel`, its task's root had changed when it was
@@ -1505,8 +1766,22 @@ impl ProcfsFile {
     /// `auxv`, whose bytes Detcore takes only from the guest's own stack, and
     /// which a descriptor the kernel opened keeps reading from the kernel, as
     /// before Detcore rendered it.
+    ///
+    /// Nor a process's `cmdline`, which Linux reads from the process's memory
+    /// at every read: a descriptor the kernel opened keeps reading the
+    /// kernel's file, as before Detcore rendered it.
     pub(crate) fn kernel_served(&self) -> bool {
-        self.kind != ProcfsKind::ProcessAuxv
+        !self.is_plain_process_file()
+    }
+
+    /// Whether this is a per-process file Linux serves with a plain `read`
+    /// and `generic_file_llseek` on size 0, not a `seq_file`: a process's
+    /// `auxv` (`auxv_read`) and `cmdline` (`proc_pid_cmdline_read`).
+    fn is_plain_process_file(&self) -> bool {
+        matches!(
+            self.kind,
+            ProcfsKind::ProcessAuxv | ProcfsKind::ProcessCmdline
+        )
     }
 
     /// Whether this is a per-process file whose `show` Linux runs when it is
@@ -1518,15 +1793,33 @@ impl ProcfsFile {
     /// Nor `mountinfo` or `mounts`, whose open takes the task's mount
     /// namespace and root (`mounts_open_common`) and whose reads show that
     /// namespace whatever became of the task since.
+    ///
+    /// Nor `cmdline`, whose every read reads the process's memory again
+    /// ([`Self::renders_at_every_read`]).
     pub(crate) fn shows_at_read(&self) -> bool {
         self.per_process_name().is_some()
-            && self.kind != ProcfsKind::ProcessAuxv
+            && !self.is_plain_process_file()
             && self.mount_table_rendering().is_none()
     }
 
     /// Whether this is a process's `auxv`.
     pub(crate) fn is_process_auxv(&self) -> bool {
         self.kind == ProcfsKind::ProcessAuxv
+    }
+
+    /// Whether this is a process's `cmdline`.
+    pub(crate) fn is_process_cmdline(&self) -> bool {
+        self.kind == ProcfsKind::ProcessCmdline
+    }
+
+    /// Whether every read of this file, Detcore having opened it as rendered,
+    /// is served by reading the process's memory again, at the read's own
+    /// position and count, with no snapshot: a process's `cmdline`, which
+    /// Linux's `get_mm_cmdline` reads that way, so a guest that rewrites its
+    /// arguments in place (`setproctitle`) reads the new bytes at its next
+    /// read (`Detcore::read_rendered_cmdline`).
+    pub(crate) fn reads_memory_at_every_read(&self) -> bool {
+        self.rendered && self.is_process_cmdline()
     }
 
     /// Bind the caller's spellings (`self`, `thread-self`) of a per-process
@@ -1640,8 +1933,9 @@ impl ProcfsFile {
     pub(crate) fn has_read_iter(&self) -> bool {
         match self.kind {
             ProcfsKind::Fixed(file) => file.has_read_iter(),
-            // `auxv_read` is a plain `read` (RWF_NOWAIT is EOPNOTSUPP).
-            ProcfsKind::ProcessAuxv => false,
+            // `auxv_read` and `proc_pid_cmdline_read` are plain `read`s
+            // (RWF_NOWAIT is EOPNOTSUPP).
+            ProcfsKind::ProcessAuxv | ProcfsKind::ProcessCmdline => false,
             _ => true,
         }
     }
@@ -1717,6 +2011,10 @@ impl ProcfsFile {
             // open (or, for a descriptor rebuilt from its placeholder, its
             // exec generation) supplies; nothing else is rendered.
             ProcfsKind::ProcessAuxv => b"",
+            // The bytes are the process's argument area, which each read
+            // reads from the process's memory
+            // (`Detcore::read_rendered_cmdline`); no snapshot is taken.
+            ProcfsKind::ProcessCmdline => b"",
             // The bytes are the session's container mount table, which the
             // first read supplies (`Detcore::mount_table_snapshot`).
             ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts => b"",
@@ -2053,7 +2351,7 @@ impl ProcfsFile {
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
             ProcfsKind::ProcessCgroup => sanitize_process_cgroup(&contents),
             // Binary, and Detcore's own record: kept as it is.
-            ProcfsKind::ProcessAuxv => contents.to_vec(),
+            ProcfsKind::ProcessAuxv | ProcfsKind::ProcessCmdline => contents.to_vec(),
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents, mapping_identities),
             ProcfsKind::Maps => {
@@ -8560,6 +8858,482 @@ total_commit_ms 0\n"
         assert_eq!(
             initial_stack_auxv(stack, read(&words(&full))).map(|bytes| bytes.len()),
             Some(MAX_AUXV_BYTES)
+        );
+    }
+
+    /// A process's `cmdline` is a per-process file Detcore renders, by every
+    /// spelling of a task's directory, and `/proc/cmdline` (the kernel's
+    /// command line) is not one. Like `auxv` it is a plain file read through
+    /// `read`, with no `show` method, and a descriptor the kernel opened stays
+    /// unclassified; unlike `auxv`, a rendered one takes no snapshot: every
+    /// read reads the process's memory, as `get_mm_cmdline` does.
+    #[test]
+    fn a_process_cmdline_is_rendered_at_every_read() {
+        for spelling in [
+            "/proc/self/cmdline",
+            "/proc/thread-self/cmdline",
+            "/proc/7/cmdline",
+            "/proc/7/task/8/cmdline",
+            "/proc/self/task/8/cmdline",
+        ] {
+            let file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            assert_eq!(file.per_process_name(), Some("cmdline"), "{spelling}");
+            assert!(file.is_process_cmdline(), "{spelling}");
+            assert!(!file.kernel_served(), "{spelling}");
+            assert!(!file.shows_at_read(), "{spelling}");
+            assert!(!file.snapshot_at_first_read(), "{spelling}");
+            assert!(!file.has_read_iter(), "{spelling}");
+            assert!(!file.seeks_only_from_start_or_position(), "{spelling}");
+            assert!(!file.faults_on_a_short_copy(), "{spelling}");
+            // Not rendered: a kernel-opened descriptor reads the kernel.
+            assert!(!file.reads_memory_at_every_read(), "{spelling}");
+        }
+        assert!(
+            ProcfsFile::from_path(Path::new("/proc/cmdline"))
+                .is_none_or(|file| file.per_process_name().is_none())
+        );
+        let mut file = ProcfsFile::from_path(Path::new("/proc/self/cmdline")).unwrap();
+        file.bind_task(3, 5);
+        file.set_task_incarnation(TaskIncarnation {
+            process: 1,
+            thread: None,
+        });
+        let rendered = file.into_rendered();
+        let path = rendered.opened_path().unwrap();
+        assert_eq!(path, Path::new("/proc/3/cmdline"));
+        assert!(!rendered_path_is_seq_file(path));
+        assert!(rendered.rendering_template().is_empty());
+        assert!(rendered.reads_memory_at_every_read());
+        // No snapshot is ever taken: every read reads memory.
+        assert_eq!(rendered.rendered_snapshot(), None);
+        // The name is the last per-process name, so the others keep their
+        // inode numbers.
+        assert_eq!(ProcfsFile::PER_PROCESS_NAMES.last(), Some(&"cmdline"));
+    }
+
+    /// Guest memory for the `cmdline` rules: `bytes` at `base`, readable only
+    /// there, as `access_remote_vm` reads it (the bytes from the address up
+    /// to the first one that cannot be read).
+    fn cmdline_memory(base: u64, bytes: &[u8]) -> impl FnMut(u64, &mut [u8]) -> usize + '_ {
+        move |at, buffer| {
+            let Some(offset) = at.checked_sub(base).map(|offset| offset as usize) else {
+                return 0;
+            };
+            if offset >= bytes.len() {
+                return 0;
+            }
+            let count = buffer.len().min(bytes.len() - offset);
+            buffer[..count].copy_from_slice(&bytes[offset..offset + count]);
+            count
+        }
+    }
+
+    /// [`CmdlineMemory`] for the `cmdline` rules: the process's bytes as
+    /// `read` reads them, and the caller's buffer as a vector that takes at
+    /// most `writable` bytes (`copy_to_user` stops at the first byte it cannot
+    /// write).
+    struct TestCmdline<R> {
+        read: R,
+        out: Vec<u8>,
+        writable: usize,
+    }
+
+    impl<R: FnMut(u64, &mut [u8]) -> usize> CmdlineMemory for TestCmdline<R> {
+        fn read(&mut self, at: u64, buffer: &mut [u8]) -> usize {
+            (self.read)(at, buffer)
+        }
+
+        fn copy_out(&mut self, offset: usize, bytes: &[u8]) -> usize {
+            assert_eq!(offset, self.out.len(), "copied out in order");
+            let room = self
+                .writable
+                .saturating_sub(self.out.len())
+                .min(bytes.len());
+            self.out.extend_from_slice(&bytes[..room]);
+            room
+        }
+    }
+
+    /// The bytes one read of `count` at `pos` copies out, the caller's buffer
+    /// all writable.
+    fn cmdline_bytes(
+        area: &CmdlineArea,
+        pos: u64,
+        count: usize,
+        read: impl FnMut(u64, &mut [u8]) -> usize,
+    ) -> Vec<u8> {
+        let mut memory = TestCmdline {
+            read,
+            out: Vec::new(),
+            writable: usize::MAX,
+        };
+        let copied = read_cmdline(area, pos, count, &mut memory).unwrap();
+        assert_eq!(copied, memory.out.len());
+        memory.out
+    }
+
+    /// Linux's `get_mm_cmdline` (fs/proc/base.c, 6.17): the argument area
+    /// exactly, at any position and count, while its last byte is NUL.
+    #[test]
+    fn a_cmdline_read_is_the_argument_area_at_its_position() {
+        let base = 0x7fff_0000_u64;
+        let memory = b"prog\0\0two words\0PATH=/bin\0HOME=/\0".to_vec();
+        let area = CmdlineArea {
+            arg_start: base,
+            arg_end: base + 16,
+            env_start: base + 16,
+            env_end: base + memory.len() as u64,
+        };
+        let read = |pos, count| cmdline_bytes(&area, pos, count, cmdline_memory(base, &memory));
+        assert_eq!(read(0, usize::MAX), b"prog\0\0two words\0");
+        assert_eq!(read(0, 3), b"pro");
+        assert_eq!(read(4, 3), b"\0\0t");
+        assert_eq!(read(15, 8), b"\0");
+        // At or past the argument area's end, nothing, though the file's
+        // length (rule 2) counts the environment area.
+        assert_eq!(read(16, 8), b"");
+        assert_eq!(read(1 << 40, 8), b"");
+        assert_eq!(read(0, 0), b"");
+        // Inner bytes changed, the last still NUL: the area, as it now is.
+        let mut renamed = memory.clone();
+        renamed[4] = b'_';
+        renamed[0] = b'P';
+        assert_eq!(
+            cmdline_bytes(&area, 0, usize::MAX, cmdline_memory(base, &renamed)),
+            b"Prog_\0two words\0"
+        );
+        // Bytes that cannot be read end the read (`access_remote_vm`).
+        assert_eq!(
+            cmdline_bytes(&area, 0, usize::MAX, cmdline_memory(base, &memory[..7])),
+            b"prog\0\0t"
+        );
+        assert_eq!(
+            cmdline_bytes(&area, 0, usize::MAX, cmdline_memory(base + 4, &memory[4..])),
+            b""
+        );
+        // No environment area yet (`env_end` 0), or no argument area.
+        let unborn = CmdlineArea { env_end: 0, ..area };
+        assert_eq!(
+            cmdline_bytes(&unborn, 0, 64, cmdline_memory(base, &memory)),
+            b""
+        );
+        let empty = CmdlineArea {
+            arg_end: base,
+            ..area
+        };
+        assert_eq!(
+            cmdline_bytes(&empty, 0, 64, cmdline_memory(base, &memory)),
+            b""
+        );
+        assert_eq!(
+            cmdline_bytes(&CmdlineArea::default(), 0, 64, cmdline_memory(0, b"")),
+            b""
+        );
+    }
+
+    /// Where the argument area's last byte is not NUL (`setproctitle`), the
+    /// file is one string from `arg_start`, through its NUL, at most one page
+    /// (`get_mm_proctitle`), and never past the environment area's end, or
+    /// past the argument area's where the environment area does not follow
+    /// it (rule 2).
+    #[test]
+    fn a_retitled_cmdline_is_one_string_into_the_environment_area() {
+        let base = 0x7fff_0000_u64;
+        let area = CmdlineArea {
+            arg_start: base,
+            arg_end: base + 16,
+            env_start: base + 16,
+            env_end: base + 40,
+        };
+        let titled = |title: &[u8]| {
+            let mut memory = b"prog\0\0two words\0PATH=/bin\0HOME=/srv/xx\0/exe\0".to_vec();
+            memory[..title.len()].copy_from_slice(title);
+            memory
+        };
+        // A short title, the last argument byte overwritten: the title and its
+        // NUL.
+        let mut memory = titled(b"title\0");
+        memory[15] = b'Z';
+        assert_eq!(
+            cmdline_bytes(&area, 0, usize::MAX, cmdline_memory(base, &memory)),
+            b"title\0"
+        );
+        assert_eq!(
+            cmdline_bytes(&area, 2, 2, cmdline_memory(base, &memory)),
+            b"tl"
+        );
+        assert_eq!(
+            cmdline_bytes(&area, 6, 2, cmdline_memory(base, &memory)),
+            b""
+        );
+        // A title running on into the environment area.
+        let memory = titled(b"a title longer than the area\0");
+        assert_eq!(
+            cmdline_bytes(&area, 0, usize::MAX, cmdline_memory(base, &memory)),
+            b"a title longer than the area\0"
+        );
+        assert_eq!(
+            cmdline_bytes(&area, 20, 4, cmdline_memory(base, &memory)),
+            b"the "
+        );
+        // No NUL before the environment area's end: cut there, without one.
+        let memory = titled(&[b'M'; 44]);
+        assert_eq!(
+            cmdline_bytes(&area, 0, usize::MAX, cmdline_memory(base, &memory)),
+            vec![b'M'; 40]
+        );
+        // No NUL in what can be read: all of it, within the file's length.
+        assert_eq!(
+            cmdline_bytes(&area, 0, usize::MAX, cmdline_memory(base, &memory[..30])),
+            vec![b'M'; 30]
+        );
+        // An environment area that does not start at `arg_end`, or is
+        // reversed, does not count: the argument area bounds the title.
+        let apart = CmdlineArea {
+            env_start: base + 17,
+            ..area
+        };
+        let reversed = CmdlineArea {
+            env_start: base + 16,
+            env_end: base + 15,
+            ..area
+        };
+        for area in [apart, reversed] {
+            assert_eq!(
+                cmdline_bytes(&area, 0, usize::MAX, cmdline_memory(base, &memory)),
+                vec![b'M'; 16],
+                "{area:?}"
+            );
+        }
+        // At most one page, and nothing at a position past it.
+        let big = CmdlineArea {
+            arg_start: base,
+            arg_end: base + 16,
+            env_start: base + 16,
+            env_end: base + 10_000,
+        };
+        let long = vec![b'L'; 10_000];
+        assert_eq!(
+            cmdline_bytes(&big, 0, usize::MAX, cmdline_memory(base, &long)).len(),
+            4096
+        );
+        assert_eq!(
+            cmdline_bytes(&big, 4095, 8, cmdline_memory(base, &long)),
+            b"L"
+        );
+        assert_eq!(
+            cmdline_bytes(&big, 4096, 8, cmdline_memory(base, &long)),
+            b""
+        );
+        // A last argument byte that cannot be read is not a title: the
+        // argument area's readable bytes.
+        assert_eq!(
+            cmdline_bytes(&area, 0, usize::MAX, cmdline_memory(base, &memory[..15])),
+            vec![b'M'; 15]
+        );
+    }
+
+    /// A read starts at its position, so a page of the argument area that
+    /// can be read is read even where an earlier one cannot (Linux reads
+    /// from `arg_start + pos`, base.c:344-371); a page that cannot be read
+    /// (PROT_NONE, or unmapped) ends the read there; and the setproctitle
+    /// test reads exactly the one byte at `arg_end - 1`, so a following page
+    /// that cannot be read does not hide it.
+    #[test]
+    fn a_cmdline_read_reads_from_its_position_page_by_page() {
+        let base = 0x7fff_0000_u64;
+        let mut bytes = vec![b'a'; 2 * 4096];
+        bytes[2 * 4096 - 1] = 0;
+        let area = CmdlineArea {
+            arg_start: base,
+            arg_end: base + 2 * 4096,
+            env_start: base + 2 * 4096,
+            env_end: base + 2 * 4096,
+        };
+        // The first page cannot be read; the second can.
+        let second_page_only = |at: u64, buffer: &mut [u8]| {
+            if at < base + 4096 {
+                return 0;
+            }
+            cmdline_memory(base, &bytes)(at, buffer)
+        };
+        assert_eq!(cmdline_bytes(&area, 0, 64, second_page_only), b"");
+        assert_eq!(
+            cmdline_bytes(&area, 4096 + 10, 4, second_page_only),
+            b"aaaa"
+        );
+        // The second page cannot be read: a read through it stops at its
+        // start.
+        assert_eq!(
+            cmdline_bytes(&area, 4090, 64, cmdline_memory(base, &bytes[..4096])).len(),
+            6
+        );
+        // The last argument byte is not NUL and the next page cannot be read:
+        // a title, read as one string from arg_start (the sentinel is the one
+        // byte at arg_end - 1, which a word-sized read would have missed).
+        let mut titled = b"title xyz".to_vec();
+        let titled_area = CmdlineArea {
+            arg_start: base,
+            arg_end: base + titled.len() as u64,
+            env_start: base + titled.len() as u64,
+            env_end: base + titled.len() as u64,
+        };
+        assert_eq!(
+            cmdline_bytes(&titled_area, 0, 64, cmdline_memory(base, &titled)),
+            b"title\0"
+        );
+        // The last argument byte cannot be read (PROT_NONE): not a title, and
+        // the read ends where the readable bytes do.
+        titled.truncate(6);
+        assert_eq!(
+            cmdline_bytes(&titled_area, 0, 64, cmdline_memory(base, &titled)),
+            b"title\0"
+        );
+    }
+
+    /// Each page is read just before it is copied out, as Linux alternates
+    /// `access_remote_vm` and `copy_to_user`; a copy out that copies nothing
+    /// is EFAULT at the start and ends the read after it.
+    #[test]
+    fn a_cmdline_read_copies_out_in_linux_order() {
+        let base = 0x7fff_0000_u64;
+        let mut with_nul = vec![b'b'; 5000];
+        with_nul[4999] = 0;
+        let area = CmdlineArea {
+            arg_start: base,
+            arg_end: base + 5000,
+            env_start: base + 5000,
+            env_end: base + 5000,
+        };
+        let reads = std::cell::RefCell::new(Vec::new());
+        let mut memory = TestCmdline {
+            read: |at: u64, buffer: &mut [u8]| {
+                reads.borrow_mut().push((at, buffer.len()));
+                cmdline_memory(base, &with_nul)(at, buffer)
+            },
+            out: Vec::new(),
+            writable: 4100,
+        };
+        assert_eq!(read_cmdline(&area, 0, 5000, &mut memory), Ok(4100));
+        // The sentinel, the first page, the second page, whose copy out was
+        // short (4 bytes), then, as Linux's loop goes on after a short copy
+        // (base.c:355-374), the rest of that page, whose copy out copies
+        // nothing and ends the read.
+        assert_eq!(
+            *reads.borrow(),
+            vec![
+                (base + 4999, 1),
+                (base, 4096),
+                (base + 4096, 904),
+                (base + 4100, 900)
+            ]
+        );
+        let mut nothing = TestCmdline {
+            read: cmdline_memory(base, &with_nul),
+            out: Vec::new(),
+            writable: 0,
+        };
+        assert_eq!(
+            read_cmdline(&area, 0, 10, &mut nothing),
+            Err(reverie::syscalls::Errno::EFAULT)
+        );
+        assert_eq!(read_cmdline(&area, 0, 0, &mut nothing), Ok(0));
+        assert_eq!(read_cmdline(&area, 6000, 10, &mut nothing), Ok(0));
+        // A title copied out to a buffer that takes nothing is EFAULT too.
+        let titled_area = CmdlineArea {
+            arg_end: base + 10,
+            env_start: base + 10,
+            env_end: base + 10,
+            ..area
+        };
+        assert_eq!(
+            read_cmdline(&titled_area, 0, 10, &mut nothing),
+            Err(reverie::syscalls::Errno::EFAULT)
+        );
+    }
+
+    /// A new image's argument and environment areas, from its initial stack,
+    /// as `create_elf_tables` lays out the strings: packed from `argv[0]`,
+    /// the environment straight after the arguments. Pointers that do not
+    /// follow the strings, a string with no NUL that can be read, or an
+    /// implausible count give nothing.
+    #[test]
+    fn the_initial_stack_gives_the_cmdline_areas() {
+        let stack = 0x7ffe_0000_u64;
+        let strings = 0x7ffe_1000_u64;
+        let text = b"prog\0\0two words\0A=1\0B=22\0/exe\0".to_vec();
+        let words = |values: &[u64]| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (stack + 8 * index as u64, *value))
+                .collect::<std::collections::BTreeMap<u64, u64>>()
+        };
+        let area = |stack_words: &[u64], text: &[u8]| {
+            let memory = words(stack_words);
+            initial_stack_cmdline_area(
+                stack,
+                |at| memory.get(&at).copied(),
+                cmdline_memory(strings, text),
+            )
+        };
+        let packed = [
+            3,
+            strings,
+            strings + 5,
+            strings + 6,
+            0,
+            strings + 16,
+            strings + 20,
+            0,
+        ];
+        assert_eq!(
+            area(&packed, &text),
+            Some(CmdlineArea {
+                arg_start: strings,
+                arg_end: strings + 16,
+                env_start: strings + 16,
+                env_end: strings + 25,
+            })
+        );
+        // No environment: it is empty, at the argument area's end.
+        assert_eq!(
+            area(&[1, strings, 0, 0], &text),
+            Some(CmdlineArea {
+                arg_start: strings,
+                arg_end: strings + 5,
+                env_start: strings + 5,
+                env_end: strings + 5,
+            })
+        );
+        // No strings at all: every bound zero.
+        assert_eq!(area(&[0, 0, 0], &text), Some(CmdlineArea::default()));
+        // A pointer that is not where the previous string ended.
+        let mut apart = packed;
+        apart[3] = strings + 7;
+        assert_eq!(area(&apart, &text), None);
+        let mut environment_apart = packed;
+        environment_apart[5] = strings + 17;
+        assert_eq!(area(&environment_apart, &text), None);
+        // A string whose NUL cannot be read.
+        assert_eq!(area(&packed, &text[..18]), None);
+        // An unreadable word, or a missing NULL after the arguments.
+        assert_eq!(area(&packed[..6], &text), None);
+        assert_eq!(area(&[1, strings, strings + 5], &text), None);
+        // An implausible count.
+        assert_eq!(area(&[1 << 21, 0, 0], &text), None);
+        // A string reaching the next page is read across the boundary.
+        let page_end = 0x7ffe_2000_u64;
+        let crossing = b"0123456789\0".to_vec();
+        let memory = words(&[1, page_end - 4, 0, 0]);
+        assert_eq!(
+            initial_stack_cmdline_area(
+                stack,
+                |at| memory.get(&at).copied(),
+                cmdline_memory(page_end - 4, &crossing),
+            )
+            .map(|area| area.arg_end - area.arg_start),
+            Some(11)
         );
     }
 

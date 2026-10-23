@@ -695,6 +695,63 @@ fn random_device_lseek_result(status_flags: i32, whence: Whence) -> Result<i64, 
     }
 }
 
+/// How a procfs file Detcore renders seeks (`Detcore::handle_lseek`), by its
+/// file operations' `llseek`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderedSeek {
+    /// `seq_lseek`: only from the start or the position.
+    SeqFile,
+    /// `generic_file_llseek` (a process's `auxv` and `cmdline`).
+    Generic,
+    /// `default_llseek` (a sysctl file).
+    Default,
+}
+
+/// The position a seek of a rendered procfs file, every one of which has
+/// size 0, moves to from `current`: Linux's answer for its `llseek` (`seek`).
+///
+/// `generic_file_llseek` (fs/read_write.c, v6.17) compares a `SEEK_DATA` or
+/// `SEEK_HOLE` offset with the size as an unsigned number (`must_set_pos`,
+/// read_write.c:120 and 129), so every offset, a negative one included, is
+/// at or past the end: ENXIO. Its `vfs_setpos` refuses a negative position or
+/// one past the superblock's `s_maxbytes` (EINVAL): procfs keeps
+/// `alloc_super`'s MAX_NON_LFS, 2^31 - 1. `default_llseek` (read_write.c:
+/// 349-370) compares signed and has no `s_maxbytes` bound: an offset at or
+/// past the size 0 is ENXIO; a negative `SEEK_DATA` offset stays and reaches
+/// its EINVAL for a negative position; a negative `SEEK_HOLE` offset is
+/// replaced by the size, so the seek moves to 0. `seq_lseek` refuses every
+/// whence but `SEEK_SET` and `SEEK_CUR` with EINVAL.
+fn rendered_procfs_seek(
+    seek: RenderedSeek,
+    whence: Whence,
+    offset: i64,
+    current: usize,
+) -> Result<usize, Errno> {
+    const MAX_NON_LFS: usize = (1 << 31) - 1;
+    let requested = i128::from(offset);
+    let new_offset = match whence {
+        Whence::SEEK_SET => requested,
+        Whence::SEEK_CUR => current as i128 + requested,
+        _ if seek == RenderedSeek::SeqFile => return Err(Errno::EINVAL),
+        Whence::SEEK_END => requested,
+        // At or past the end, which is 0.
+        Whence::SEEK_DATA | Whence::SEEK_HOLE
+            if requested >= 0 || seek == RenderedSeek::Generic =>
+        {
+            return Err(Errno::ENXIO);
+        }
+        // default_llseek: the hole at the end, the size.
+        Whence::SEEK_HOLE => 0,
+        Whence::SEEK_DATA => requested,
+        _ => return Err(Errno::EINVAL),
+    };
+    let new_offset = usize::try_from(new_offset).map_err(|_| Errno::EINVAL)?;
+    if seek == RenderedSeek::Generic && new_offset > MAX_NON_LFS {
+        return Err(Errno::EINVAL);
+    }
+    Ok(new_offset)
+}
+
 /// Why a stat Detcore takes for its own bookkeeping failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatFailure {
@@ -2208,8 +2265,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         if maximum == 0 {
             return Ok(0);
         }
-        if let Some(offset) = offset
-            && offset.checked_add(maximum as i64).is_none()
+        // `rw_verify_area` checks the position the read starts at, explicit
+        // or the shared cursor (`readv`, `preadv2` at -1), plus the whole
+        // count, before the flags are looked at (fs/read_write.c
+        // `vfs_readv`): an end past LLONG_MAX is EINVAL.
+        let position = match offset {
+            Some(offset) => offset,
+            None => {
+                self.adopt_rendered_procfs_position(guest, fd).await?;
+                let cursor = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.procfs_position())?
+                    .map_or(0, |(position, _)| position);
+                i64::try_from(cursor).map_err(|_| Errno::EINVAL)?
+            }
+        };
+        if i64::try_from(maximum)
+            .ok()
+            .and_then(|maximum| position.checked_add(maximum))
+            .is_none()
         {
             return Err(Errno::EINVAL.into());
         }
@@ -2217,6 +2291,39 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(fd, |detfd| detfd.procfs_has_read_iter())?;
         validate_procfs_vector_flags(flags, read_iter)?;
+        // A rendered `cmdline` has a plain `read`, which Linux calls once per
+        // vector, in order, at the advancing position, stopping at the first
+        // short or failed one (`do_loop_readv_writev`, fs/read_write.c), each
+        // call reading memory again.
+        if guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_reads_memory_at_every_read())?
+        {
+            let start = position as u64;
+            let mut total = 0_usize;
+            for iovec in iovecs {
+                match self
+                    .read_rendered_cmdline(guest, fd, iovec.base, iovec.len, start + total as u64)
+                    .await
+                {
+                    Ok(copied) => {
+                        total += copied;
+                        if copied != iovec.len {
+                            break;
+                        }
+                    }
+                    Err(error) if total == 0 => return Err(error),
+                    Err(_) => break,
+                }
+            }
+            if offset.is_none() {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.commit_procfs_read(start as usize, total))?;
+                self.sync_rendered_procfs_position(guest, fd).await?;
+            }
+            return Ok(total as i64);
+        }
         // A file the kernel opened takes its snapshot at its first read.
         if guest
             .thread_state()
@@ -5715,6 +5822,65 @@ impl<T: RecordOrReplay> Detcore<T> {
         Some(bytes)
     }
 
+    /// A `read` (`offset` `None`, at the shared cursor, which it advances by
+    /// the bytes copied) or a `pread64` (at `offset`) of the rendered
+    /// `/proc/<pid>/cmdline` open as `fd`, in `vfs_read`'s order
+    /// (fs/read_write.c): a descriptor that cannot read is EBADF; a buffer
+    /// beyond the user address limit is EFAULT; `rw_verify_area` refuses a
+    /// count above `SSIZE_MAX` or a position whose end overflows (EINVAL);
+    /// then the file's own read, even for a count of zero, which still finds
+    /// its task (ESRCH once it is gone), with the count cut to
+    /// `MAX_RW_COUNT` (`Detcore::read_rendered_cmdline`).
+    async fn read_rendered_cmdline_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        buf: Option<AddrMut<'_, u8>>,
+        len: usize,
+        offset: Option<u64>,
+    ) -> Result<i64, Error> {
+        // Linux's MAX_RW_COUNT: INT_MAX rounded down to a page.
+        const MAX_RW_COUNT: usize = 0x7fff_f000;
+        let status = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.status_flags())?;
+        if !can_read(status) {
+            return Err(Errno::EBADF.into());
+        }
+        validate_procfs_destination(
+            || crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit()),
+            buf,
+            len,
+        )?;
+        let pos = match offset {
+            Some(offset) => offset,
+            None => {
+                self.adopt_rendered_procfs_position(guest, fd).await?;
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.procfs_position())?
+                    .map_or(0, |(position, _)| position) as u64
+            }
+        };
+        let ends = i64::try_from(len)
+            .ok()
+            .and_then(|len| i64::try_from(pos).ok()?.checked_add(len));
+        if ends.is_none() {
+            return Err(Errno::EINVAL.into());
+        }
+        let destination = buf.map_or(0, |buf| buf.as_raw());
+        let copied = self
+            .read_rendered_cmdline(guest, fd, destination, len.min(MAX_RW_COUNT), pos)
+            .await?;
+        if offset.is_none() {
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.commit_procfs_read(pos as usize, copied);
+            })?;
+            self.sync_rendered_procfs_position(guest, fd).await?;
+        }
+        Ok(copied as i64)
+    }
+
     async fn initialize_procfs_snapshot<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -6524,6 +6690,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .read_timer_slack(guest, call.fd(), call.buf(), call.len())
                 .await;
         }
+        // A rendered `cmdline`: every read, of any count, reads memory.
+        if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_reads_memory_at_every_read())
+            .unwrap_or(false)
+        {
+            return self
+                .read_rendered_cmdline_call(guest, call.fd(), call.buf(), call.len(), None)
+                .await;
+        }
 
         if call.len() == 0 {
             if let Ok(Some(status_flags)) = guest.thread_state().with_detfd(call.fd(), |detfd| {
@@ -6866,6 +7042,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .pread_timer_slack(guest, call.fd(), call.buf(), call.len(), call.offset())
                 .await;
         }
+        // A rendered `cmdline`: `ksys_pread64` refuses a negative position
+        // first, then every read, of any count, reads memory.
+        if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_reads_memory_at_every_read())
+            .unwrap_or(false)
+        {
+            let offset = u64::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
+            return self
+                .read_rendered_cmdline_call(guest, call.fd(), call.buf(), call.len(), Some(offset))
+                .await;
+        }
 
         if call.len() == 0 {
             // As for read, a zero-count pread's result goes through
@@ -7156,21 +7344,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             if status_flags & libc::O_PATH != 0 {
                 return Err(Errno::EBADF.into());
             }
-            let seq_file = crate::procfs::rendered_path_is_seq_file(rendered);
-            let requested = i128::from(call.offset());
-            let new_offset = match call.whence() {
-                Whence::SEEK_SET => requested,
-                Whence::SEEK_CUR => current as i128 + requested,
-                _ if seq_file => return Err(Errno::EINVAL.into()),
-                Whence::SEEK_END => requested,
-                // At or past the end, which is 0.
-                Whence::SEEK_DATA | Whence::SEEK_HOLE if requested >= 0 => {
-                    return Err(Errno::ENXIO.into());
-                }
-                Whence::SEEK_DATA | Whence::SEEK_HOLE => requested,
-                _ => return Err(Errno::EINVAL.into()),
+            let seek = if crate::procfs::rendered_path_is_seq_file(rendered) {
+                RenderedSeek::SeqFile
+            } else if crate::procfs::per_process_name(rendered)
+                .is_some_and(|name| matches!(name.filename, "auxv" | "cmdline"))
+            {
+                RenderedSeek::Generic
+            } else {
+                RenderedSeek::Default
             };
-            let new_offset = usize::try_from(new_offset).map_err(|_| Errno::EINVAL)?;
+            let new_offset = rendered_procfs_seek(seek, call.whence(), call.offset(), current)?;
             let result = i64::try_from(new_offset).map_err(|_| Errno::EOVERFLOW)?;
             // seq_lseek to another positive position traverses the file,
             // which runs a per-process file's `show` (ESRCH once its task is
@@ -15536,6 +15719,73 @@ mod test {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn rendered_procfs_seek_follows_each_llseek() {
+        use super::RenderedSeek::*;
+        // generic_file_llseek (auxv, cmdline): SEEK_DATA and SEEK_HOLE at any
+        // offset of a file of size 0, a negative one included, are ENXIO.
+        for whence in [Whence::SEEK_DATA, Whence::SEEK_HOLE] {
+            for offset in [i64::MIN, -1, 0, 1, i64::MAX] {
+                assert_eq!(
+                    super::rendered_procfs_seek(Generic, whence, offset, 0),
+                    Err(Errno::ENXIO)
+                );
+            }
+            assert_eq!(
+                super::rendered_procfs_seek(Default, whence, 0, 0),
+                Err(Errno::ENXIO)
+            );
+            assert_eq!(
+                super::rendered_procfs_seek(SeqFile, whence, -1, 0),
+                Err(Errno::EINVAL)
+            );
+        }
+        // default_llseek compares signed: a negative SEEK_DATA offset stays
+        // negative (EINVAL); a negative SEEK_HOLE offset becomes the size, 0.
+        assert_eq!(
+            super::rendered_procfs_seek(Default, Whence::SEEK_DATA, -1, 0),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            super::rendered_procfs_seek(Default, Whence::SEEK_HOLE, -1, 5),
+            Ok(0)
+        );
+        // vfs_setpos: s_maxbytes (MAX_NON_LFS) bounds generic_file_llseek only.
+        let max = (1_i64 << 31) - 1;
+        assert_eq!(
+            super::rendered_procfs_seek(Generic, Whence::SEEK_SET, max, 0),
+            Ok(max as usize)
+        );
+        assert_eq!(
+            super::rendered_procfs_seek(Generic, Whence::SEEK_SET, max + 1, 0),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            super::rendered_procfs_seek(Generic, Whence::SEEK_CUR, 1, max as usize),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            super::rendered_procfs_seek(Default, Whence::SEEK_SET, max + 1, 0),
+            Ok(max as usize + 1)
+        );
+        assert_eq!(
+            super::rendered_procfs_seek(Generic, Whence::SEEK_SET, -1, 0),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            super::rendered_procfs_seek(Generic, Whence::SEEK_END, 3, 0),
+            Ok(3)
+        );
+        assert_eq!(
+            super::rendered_procfs_seek(SeqFile, Whence::SEEK_END, 0, 0),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            super::rendered_procfs_seek(Generic, Whence::from_raw(99), 0, 0),
+            Err(Errno::EINVAL)
+        );
     }
 
     #[test]

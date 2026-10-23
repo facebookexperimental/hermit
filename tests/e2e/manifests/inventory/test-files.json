@@ -1639,6 +1639,18 @@
       "why": "tests/c/probe_family.h is owned by C guests that include probe_family.h: The `probe_family.h` header runs each member of a merged probe family in its own child process and fails the family if any member fails. It has no translation unit or main function, so its behavior is covered through the manifest entries that compile its consumers."
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/proc_cmdline.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/proc_cmdline.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Reads its own /proc/<pid>/cmdline whole, in chunks, at offsets, relative to /proc, after the guest rewrites its arguments (setproctitle into the environment area), with a PROT_NONE argument page, for a thread, an exited leader and across exec, as Linux's get_mm_cmdline shows it (c-programs/proc-cmdline); its other-process variant is tests/c/proc_cmdline_other_processes.c; Detcore renders a process's own file from its memory"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/proc_cmdline_other_processes.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/proc_cmdline_other_processes.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: tests/c/proc_cmdline.c's other-process variant, which also reads a child's /proc/<pid>/cmdline and an inherited descriptor after its opener rewrote its arguments, where the kernel beneath serves another process's file (ptrace, DBT)"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/proc_directory_alias_level.c",
       "runner": "hermit-cli/tests/procfs_determinism.rs",

@@ -2718,7 +2718,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (IR-13): 2326, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // 75 boundary, lifecycle, admission and finalization tests; actual libtest list: 2401.
-    ("test.detcore_unit", 2401),
+    // And the eleven /proc/<pid>/cmdline units of the LinuxEmu D4b pin
+    // (a_process_cmdline_is_rendered_at_every_read,
+    // a_cmdline_read_is_the_argument_area_at_its_position,
+    // a_retitled_cmdline_is_one_string_into_the_environment_area,
+    // a_cmdline_read_reads_from_its_position_page_by_page,
+    // a_cmdline_read_copies_out_in_linux_order,
+    // the_initial_stack_gives_the_cmdline_areas,
+    // a_cmdline_read_respects_page_protection,
+    // process_cmdline_areas_follow_exec_and_fork,
+    // rendered_procfs_seek_follows_each_llseek,
+    // a_cmdline_path_avoids_the_buffer_and_the_source_area,
+    // the_watch_queue_probe_tells_a_notification_pipe): 2412.
+    ("test.detcore_unit", 2412),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4806,7 +4818,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve slice 3c.1a units: 2326, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same 75 shared Detcore tests; no hosted exclusions changed.
-    ("test.detcore_unit_on_host", 2401),
+    // And the same eleven /proc/<pid>/cmdline units of the LinuxEmu D4b pin:
+    // 2412.
+    ("test.detcore_unit_on_host", 2412),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

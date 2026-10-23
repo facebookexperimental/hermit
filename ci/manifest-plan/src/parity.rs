@@ -6205,7 +6205,11 @@ mod tests {
         // adds one row per candidate backend: 2955.
         // c-programs/random-device-spellings (LinuxEmu D3a's guest) adds one
         // row per candidate backend: 2960.
-        assert_eq!(parsed.cells.len(), 2960);
+        // c-programs/proc-cmdline (LinuxEmu D4b's guest) adds one row per
+        // candidate backend: 2965.
+        // c-programs/proc-cmdline-other-processes (the same guest, another
+        // process's file) adds one row per candidate backend: 2970.
+        assert_eq!(parsed.cells.len(), 2970);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448

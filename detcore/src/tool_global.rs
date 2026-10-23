@@ -1309,6 +1309,12 @@ struct ProcessExitCleanup {
 pub(crate) struct ProcessAuxvTable {
     /// Each live process's current image's auxiliary vector.
     processes: BTreeMap<DetPid, Vec<u8>>,
+    /// Each live process's current image's argument and environment areas,
+    /// which its rendered `/proc/<pid>/cmdline` reads from its memory
+    /// (`Detcore::record_process_auxv`, `Detcore::read_rendered_cmdline`):
+    /// one entry per live process whose image's initial stack Detcore read,
+    /// inherited at fork and forgotten at exit, as the vectors are.
+    cmdline_areas: BTreeMap<DetPid, crate::procfs::CmdlineArea>,
     /// Each task's filesystem group, and the groups whose root changed.
     roots: FsRoots,
     /// Whether this run has warned that a backend reports no initial stack
@@ -1428,12 +1434,39 @@ impl ProcessAuxvTable {
     }
 
     /// A new process `child` runs its creator `parent`'s image until it
-    /// execs.
+    /// execs: its vector, and its argument and environment areas, at the same
+    /// addresses in its copy of its creator's memory.
     pub(crate) fn inherit(&mut self, parent: DetPid, child: DetPid) {
         match self.processes.get(&parent).cloned() {
             Some(bytes) => self.processes.insert(child, bytes),
             None => self.processes.remove(&child),
         };
+        match self.cmdline_areas.get(&parent).copied() {
+            Some(area) => self.cmdline_areas.insert(child, area),
+            None => self.cmdline_areas.remove(&child),
+        };
+    }
+
+    /// Record `area`, the argument and environment areas of `process`'s new
+    /// image, as its current ones; `None` where Detcore read none (the
+    /// backend reports no initial stack pointer, or the stack held no
+    /// plausible layout), which drops what it held before the exec, so that
+    /// its `/proc/<pid>/cmdline` is the kernel's.
+    pub(crate) fn record_cmdline(
+        &mut self,
+        process: DetPid,
+        area: Option<crate::procfs::CmdlineArea>,
+    ) {
+        match area {
+            Some(area) => self.cmdline_areas.insert(process, area),
+            None => self.cmdline_areas.remove(&process),
+        };
+    }
+
+    /// `process`'s current image's argument and environment areas, if
+    /// Detcore recorded them.
+    pub(crate) fn current_cmdline(&self, process: DetPid) -> Option<crate::procfs::CmdlineArea> {
+        self.cmdline_areas.get(&process).copied()
     }
 
     /// A new task `child` of `parent`: it shares `parent`'s filesystem group
@@ -1475,6 +1508,7 @@ impl ProcessAuxvTable {
     /// `process` is gone: none of its facts stay.
     pub(crate) fn forget_process(&mut self, process: DetPid) {
         self.processes.remove(&process);
+        self.cmdline_areas.remove(&process);
         self.roots.forget(process);
     }
 
@@ -4181,10 +4215,12 @@ impl GlobalState {
                         .map(Box::new),
                 )
             }
-            GlobalRequest::RecordProcessAuxv(bytes) => {
+            GlobalRequest::RecordProcessAuxv(bytes, cmdline) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let process = sched.registered_process(dtid).unwrap_or(dtid);
-                self.process_auxv.lock().unwrap().record(process, bytes);
+                let mut table = self.process_auxv.lock().unwrap();
+                table.record(process, bytes);
+                table.record_cmdline(process, cmdline);
                 R::RecordProcessAuxv(())
             }
             GlobalRequest::ProcessAuxv(process) => {
@@ -4194,6 +4230,15 @@ impl GlobalState {
                     .registered_process(DetTid::from_raw(process.as_raw()))
                     .unwrap_or(process);
                 R::ProcessAuxv(self.process_auxv.lock().unwrap().current(process))
+            }
+            GlobalRequest::ProcessCmdline(process) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                // `/proc/<tid>/cmdline` is a thread's process's.
+                let process = sched
+                    .registered_process(DetTid::from_raw(process.as_raw()))
+                    .unwrap_or(process);
+                let area = self.process_auxv.lock().unwrap().current_cmdline(process);
+                R::ProcessCmdline(process, area)
             }
             GlobalRequest::MarkChangedRoot => {
                 // The sending task's own filesystem group: a thread created
@@ -4288,11 +4333,12 @@ impl GlobalState {
                     )))
                 }
             }
-            GlobalRequest::AuxvFromKernel(why) => {
+            GlobalRequest::AuxvFromKernel(why, cmdline) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let process = sched.registered_process(dtid).unwrap_or(dtid);
                 let mut table = self.process_auxv.lock().unwrap();
                 table.forget(process);
+                table.record_cmdline(process, cmdline);
                 R::AuxvFromKernel(table.first_kernel_file(why))
             }
             GlobalRequest::GroupOrSession(pid, session) => R::GroupOrSession(
@@ -6625,16 +6671,20 @@ pub enum GlobalRequest {
     /// scheduler accounting. Appended last.
     PublishSignalMask(Option<u64>),
     /// The auxiliary vector the sender's process's new image found on its
-    /// initial stack (`ProcessAuxvTable::record`). Appended last.
-    RecordProcessAuxv(Vec<u8>),
+    /// initial stack (`ProcessAuxvTable::record`), and the image's argument
+    /// and environment areas there, if Detcore found them
+    /// (`ProcessAuxvTable::record_cmdline`). Appended last.
+    RecordProcessAuxv(Vec<u8>, Option<crate::procfs::CmdlineArea>),
     /// A process's image's auxiliary vector (`ProcessAuxvTable::current`), for
     /// `/proc/<pid>/auxv`. Appended last.
     ProcessAuxv(DetPid),
     /// The sender's process's new image's `/proc/<pid>/auxv` is left to the
     /// kernel beneath (`ProcessAuxvTable::forget`), for the reason given.
     /// Answers whether this is the run's first such image for that reason,
-    /// which the sender warns of. Appended last.
-    AuxvFromKernel(AuxvFromKernel),
+    /// which the sender warns of. Also the image's argument and environment
+    /// areas on its initial stack, if Detcore found them
+    /// (`ProcessAuxvTable::record_cmdline`). Appended last.
+    AuxvFromKernel(AuxvFromKernel, Option<crate::procfs::CmdlineArea>),
     /// The signals whose new action an in-guest runtime refused, bit `n - 1`
     /// for signal `n`, and whether it refused an alternate signal stack
     /// (`crate::refused_signal_controls`). Answered before the forwarded-record
@@ -6705,6 +6755,10 @@ pub enum GlobalRequest {
     /// `Config::in_guest_signal_delivery`, whose gate requires that
     /// ownership. Appended last.
     StoppingRefusal(String),
+    /// The process a `/proc/<pid>/cmdline` names (a thread's number names its
+    /// process), and its argument and environment areas
+    /// (`ProcessAuxvTable::current_cmdline`). Appended last.
+    ProcessCmdline(DetPid),
 }
 
 /// Responses from the global object
@@ -6951,6 +7005,8 @@ pub enum GlobalResponse {
     /// Stored-index stack request returned on the annotated operation's own
     /// response, without a mailbox another concurrent RPC could consume.
     WithSliceBoundaryStack(Option<PathBuf>, Box<GlobalResponse>),
+    /// The process, and its areas if Detcore recorded them. Appended last.
+    ProcessCmdline(DetPid, Option<crate::procfs::CmdlineArea>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -9544,16 +9600,41 @@ where
 }
 
 /// Record the auxiliary vector the sender's process's new image found on
-/// its initial stack (`ProcessAuxvTable::record`).
-pub(crate) async fn record_process_auxv<G, T>(guest: &mut G, bytes: Vec<u8>)
+/// its initial stack (`ProcessAuxvTable::record`), and the image's argument
+/// and environment areas there, if Detcore found them
+/// (`ProcessAuxvTable::record_cmdline`).
+pub(crate) async fn record_process_auxv<G, T>(
+    guest: &mut G,
+    bytes: Vec<u8>,
+    cmdline: Option<crate::procfs::CmdlineArea>,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::RecordProcessAuxv(bytes, cmdline))
+        .await
+        .1;
+    assert_eq!(response, GlobalResponse::RecordProcessAuxv(()));
+}
+
+/// The process `/proc/<process>/cmdline` names (a thread's number names its
+/// process), and the argument and environment areas of its image, if
+/// Detcore recorded them (`ProcessAuxvTable::current_cmdline`).
+pub(crate) async fn process_cmdline<G, T>(
+    guest: &mut G,
+    process: DetPid,
+) -> (DetPid, Option<crate::procfs::CmdlineArea>)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let response = send_and_update_time(guest, GlobalRequest::RecordProcessAuxv(bytes))
+    match send_and_update_time(guest, GlobalRequest::ProcessCmdline(process))
         .await
-        .1;
-    assert_eq!(response, GlobalResponse::RecordProcessAuxv(()));
+        .1
+    {
+        GlobalResponse::ProcessCmdline(process, area) => (process, area),
+        _ => unreachable!(),
+    }
 }
 
 /// The process whose image `/proc/<process>/auxv` describes (a thread's
@@ -9703,12 +9784,18 @@ where
 /// to the kernel beneath for `why`, and learn whether it is the run's first
 /// for that reason, which the caller warns of: the guest's tool prints where
 /// the run's output shows it, which the global tool's log does not on DBT.
-pub(crate) async fn auxv_from_kernel<G, T>(guest: &mut G, why: AuxvFromKernel) -> bool
+/// `cmdline` is the image's argument and environment areas, if Detcore found
+/// them on its initial stack (`ProcessAuxvTable::record_cmdline`).
+pub(crate) async fn auxv_from_kernel<G, T>(
+    guest: &mut G,
+    why: AuxvFromKernel,
+    cmdline: Option<crate::procfs::CmdlineArea>,
+) -> bool
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    match send_and_update_time(guest, GlobalRequest::AuxvFromKernel(why))
+    match send_and_update_time(guest, GlobalRequest::AuxvFromKernel(why, cmdline))
         .await
         .1
     {
@@ -10211,6 +10298,47 @@ mod tests {
         table.inherit(parent, child);
         assert_eq!(table.current(child), None);
         assert_eq!(table.len(), 0);
+    }
+
+    /// A process's argument and environment areas follow its images as its
+    /// vector does: recorded at exec, copied to a fork child (which runs its
+    /// creator's image at the same addresses), replaced by the child's own
+    /// exec, dropped by an exec Detcore read no areas for, and forgotten at
+    /// exit.
+    #[test]
+    fn process_cmdline_areas_follow_exec_and_fork() {
+        use super::ProcessAuxvTable;
+        use crate::procfs::CmdlineArea;
+        use crate::types::DetPid;
+        let (parent, child) = (DetPid::from_raw(3), DetPid::from_raw(4));
+        let area = |start| CmdlineArea {
+            arg_start: start,
+            arg_end: start + 8,
+            env_start: start + 8,
+            env_end: start + 16,
+        };
+        let mut table = ProcessAuxvTable::default();
+        assert_eq!(table.current_cmdline(parent), None);
+        table.record_cmdline(parent, Some(area(0x1000)));
+        table.inherit(parent, child);
+        assert_eq!(table.current_cmdline(child), Some(area(0x1000)));
+        table.record_cmdline(child, Some(area(0x2000)));
+        assert_eq!(table.current_cmdline(child), Some(area(0x2000)));
+        assert_eq!(table.current_cmdline(parent), Some(area(0x1000)));
+        // An exec Detcore read no areas for leaves the kernel's file.
+        table.record_cmdline(child, None);
+        assert_eq!(table.current_cmdline(child), None);
+        // A vector forgotten keeps the areas; the process's exit does not.
+        table.record_cmdline(child, Some(area(0x3000)));
+        table.forget(child);
+        assert_eq!(table.current_cmdline(child), Some(area(0x3000)));
+        table.forget_process(child);
+        assert_eq!(table.current_cmdline(child), None);
+        table.forget_process(parent);
+        // A creator with no areas gives its child none.
+        table.record_cmdline(child, Some(area(0x4000)));
+        table.inherit(parent, child);
+        assert_eq!(table.current_cmdline(child), None);
     }
 
     /// Hermit's tasks are exactly its own thread group, named from its own PID
@@ -11805,9 +11933,13 @@ mod tests {
                 (DetTime::new(&config), mm, request),
             )
         };
-        let response = rpc(root, root_mm, GlobalRequest::RecordProcessAuxv(vec![7; 32]))
-            .await
-            .1;
+        let response = rpc(
+            root,
+            root_mm,
+            GlobalRequest::RecordProcessAuxv(vec![7; 32], None),
+        )
+        .await
+        .1;
         assert_eq!(response, GlobalResponse::RecordProcessAuxv(()));
         for (task, flags) in [
             (forked, CloneFlags::empty()),
@@ -11855,7 +11987,7 @@ mod tests {
             let response = rpc(
                 forked,
                 forked_mm,
-                GlobalRequest::AuxvFromKernel(AuxvFromKernel::Implausible),
+                GlobalRequest::AuxvFromKernel(AuxvFromKernel::Implausible, None),
             )
             .await
             .1;

@@ -76,7 +76,7 @@ raw-cpuid = "10.7.0"
 regex = "1.13.1"
 # Abstract Reverie interface ONLY. Never add a concrete backend here (see the
 # BACKEND-ABSTRACTION COMMANDMENT at the top of this file).
-reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14" }
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "ec92a13ae175e1b945c4f1a1b392410ae9dfd1ec" }
 ruzstd = "0.9.0"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }

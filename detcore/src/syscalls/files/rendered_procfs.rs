@@ -1265,7 +1265,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 let without_mm = answer.without_mm;
                 self.bind_task_identity(guest, &mut procfs, answer).await?;
-                if Self::auxv_kept_by_kernel(guest, &procfs, without_mm).await {
+                if self.kept_by_kernel(guest, &procfs, without_mm).await {
                     return Ok(None);
                 }
                 // A process's `mountinfo` or `mounts` shows the mounts below
@@ -1791,7 +1791,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // now, which the open pins (`open_process_auxv`).
         // Boxed: the access check's injected calls would otherwise grow every
         // open's future, which some backends poll on a small stack.
-        let auxv = if procfs.is_process_auxv() && !flags.contains(OFlag::O_PATH) {
+        let opened = if procfs.is_process_auxv() && !flags.contains(OFlag::O_PATH) {
             Some(Box::pin(self.open_process_auxv(guest, &procfs)).await?)
         } else {
             None
@@ -1806,17 +1806,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`ProcfsFile::snapshot_is_rerendered`). A file Linux renders when it
         // is read takes none until its first read
         // (`ProcfsFile::snapshot_at_first_read`).
-        let snapshot = match auxv {
+        let snapshot = match opened {
             Some(bytes) => Some(bytes),
-            None if procfs.is_process_auxv() => None,
+            None if procfs.is_process_auxv() || procfs.is_process_cmdline() => None,
             None => {
                 (!procfs.snapshot_at_first_read()).then(|| self.render_snapshot(guest, &procfs))
             }
         };
         // A process's `auxv`'s snapshot does not fit a memfd name: it stays
-        // with the open file description (and `PLACEHOLDER_OPENS`).
+        // with the open file description (and `PLACEHOLDER_OPENS`). A
+        // `cmdline` takes none: its open reads no memory
+        // (`proc_pid_cmdline_ops` has no `open`), and every read reads the
+        // memory of the process it names (`Self::read_rendered_cmdline`).
         let carried: Vec<u8> = match &snapshot {
-            Some(snapshot) if !procfs.snapshot_is_rerendered() && !procfs.is_process_auxv() => {
+            Some(snapshot)
+                if !procfs.snapshot_is_rerendered()
+                    && !procfs.is_process_auxv()
+                    && !procfs.is_process_cmdline() =>
+            {
                 snapshot.clone()
             }
             _ => Vec::new(),
@@ -2336,8 +2343,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             let without_mm = answer.without_mm;
             self.bind_task_identity(guest, &mut file, answer).await?;
             // A process whose `auxv` the kernel serves lists the kernel's
-            // entry, as a path to it opens the kernel's file.
-            if Self::auxv_kept_by_kernel(guest, &file, without_mm).await {
+            // entry, as a path to it opens the kernel's file; so does another
+            // process's `cmdline`.
+            if self.kept_by_kernel(guest, &file, without_mm).await {
                 return Ok(None);
             }
             return Ok(file.rendered_path(files).map(procfs_inode::rendered_inode));
@@ -2362,20 +2370,300 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// or not its vector is still kept, so the host-timed moment the global
     /// tool forgets an exited process's vector changes nothing the guest
     /// sees.
-    async fn auxv_kept_by_kernel<G: Guest<Self>>(
+    ///
+    /// And whether `file` is a process's `cmdline` that the kernel serves:
+    /// another process's, whose memory Detcore cannot read (Linux reads the
+    /// target's memory at each read), or the caller's own where Detcore
+    /// recorded no argument area for its image (the same backends and stacks
+    /// as for `auxv`).
+    async fn kept_by_kernel<G: Guest<Self>>(
+        &self,
         guest: &mut G,
         file: &ProcfsFile,
         without_mm: bool,
     ) -> bool {
-        let Some(task) = file
-            .bound_task()
-            .filter(|_| file.is_process_auxv() && !without_mm)
-        else {
+        let Some(task) = file.bound_task() else {
             return false;
         };
-        crate::tool_global::process_auxv(guest, detcore_model::pid::DetPid::from_raw(task.process))
+        let process = detcore_model::pid::DetPid::from_raw(task.process);
+        if file.is_process_cmdline() {
+            let (process, area) = crate::tool_global::process_cmdline(guest, process).await;
+            return process != self.own_detpid(guest) || area.is_none();
+        }
+        if !file.is_process_auxv() || without_mm {
+            return false;
+        }
+        crate::tool_global::process_auxv(guest, process)
             .await
             .is_none()
+    }
+
+    /// One plain read of the rendered `/proc/<pid>/cmdline` open as `fd`, of
+    /// `count` bytes at position `pos` into the caller's buffer at
+    /// `destination`, as Linux's `proc_pid_cmdline_read` reads it
+    /// (fs/proc/base.c:393-408): it finds the descriptor's task again (ESRCH
+    /// where it is gone, or another task now holds its numbers), reads
+    /// nothing where the task has no memory map (a zombie, or the top-level
+    /// file of a thread group whose leader has exited: `get_task_mm`), and
+    /// otherwise reads the process's memory now, at the read's position,
+    /// page by page, copying out after each page (`procfs::read_cmdline`).
+    /// Returns the bytes copied.
+    ///
+    /// Detcore reads only the calling process's memory. Where the file is
+    /// another process's (a descriptor its owner opened that reached the
+    /// caller across `fork` or `SCM_RIGHTS`), the read goes to the kernel
+    /// beneath's file of that task ([`Self::kernel_cmdline_read`]), as before
+    /// Detcore rendered it, and never to a copy.
+    pub(crate) async fn read_rendered_cmdline<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        destination: usize,
+        count: usize,
+        pos: u64,
+    ) -> Result<usize, Error> {
+        let path = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_rendered_path())?
+            .ok_or(Errno::EBADF)?;
+        let task = ProcfsFile::from_rendered_path(path)
+            .and_then(|file| file.bound_task())
+            .ok_or(Errno::ESRCH)?;
+        match self.rendered_task_state(guest, path).await {
+            Some((_, false)) | None => return Err(Errno::ESRCH.into()),
+            Some((answer, true)) if answer.without_mm => return Ok(0),
+            Some(_) => {}
+        }
+        let (process, area) = crate::tool_global::process_cmdline(
+            guest,
+            detcore_model::pid::DetPid::from_raw(task.process),
+        )
+        .await;
+        // A read of zero bytes has found its task, which is all Linux's
+        // does before get_mm_cmdline returns 0 (base.c:325-328): no memory,
+        // and no injection.
+        if count == 0 {
+            return Ok(0);
+        }
+        // Another process's file, or the caller's own where Detcore recorded
+        // no argument area for its current image (a stack layout
+        // initial_stack_cmdline_area refused, or one it could not read, on a
+        // backend that reports the initial stack pointer; a descriptor kept
+        // across an exec into such an image), is the kernel beneath's.
+        let Some(area) = area.filter(|_| process == self.own_detpid(guest)) else {
+            return Box::pin(self.kernel_cmdline_read(guest, task, area, destination, count, pos))
+                .await;
+        };
+        let mut memory = guest.memory();
+        let mut adapter = GuestCmdlineMemory {
+            memory: &mut memory,
+            destination,
+            failure: None,
+        };
+        let read = crate::procfs::read_cmdline(&area, pos, count, &mut adapter);
+        if let Some(failure) = adapter.failure {
+            return Err(failure.into());
+        }
+        Ok(read?)
+    }
+
+    /// One read of `count` bytes at `pos` of the kernel beneath's
+    /// `/proc/<pid>/cmdline` (or `/proc/<pid>/task/<tid>/cmdline`) of `task`,
+    /// into the caller's buffer at `destination`: the caller's own open of
+    /// the kernel's file by the kernel's numbers
+    /// (`Self::kernel_procfs_number`), a `pread64` into the caller's buffer,
+    /// and the close ([`Self::inject_cmdline_pread`]). On ptrace the kernel
+    /// reads the task's memory as Linux does; where the kernel beneath serves
+    /// no `/proc` for the caller (KVM), its answer to the open is the read's
+    /// (https://github.com/rrnewton/hermit/issues/4564). The path lives in
+    /// borrowed stack scratch whose bytes go back on every path, or, where
+    /// that scratch would overlap the caller's buffer (whose bytes its
+    /// restoration would erase) or the target's recorded argument and
+    /// environment area `source` (which the caller shares when the target
+    /// is a `CLONE_VM` relative, and whose bytes the kernel would read with
+    /// the path written over them), in a transient private page; where that
+    /// page overlaps either too, or a step Detcore cannot finish cleanly, the
+    /// read goes to the failure policy.
+    ///
+    /// This reopens a pathname in the caller's own root, mount namespace,
+    /// descriptor table and seccomp filter, where Linux's read of the open
+    /// descriptor needs none of them: a caller that changed its root or mount
+    /// namespace so that `/proc` is not the kernel's procfs reads ENOENT or
+    /// another file, a full descriptor table gives EMFILE, and a seccomp
+    /// filter that refuses the open gives its answer
+    /// (https://github.com/rrnewton/hermit/issues/4568).
+    async fn kernel_cmdline_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        task: crate::procfs::BoundTask,
+        source: Option<crate::procfs::CmdlineArea>,
+        destination: usize,
+        count: usize,
+        pos: u64,
+    ) -> Result<usize, Error> {
+        const PATH_CAPACITY: usize = 64;
+        let process = Self::kernel_procfs_number(guest, task.process)
+            .await
+            .ok_or(Errno::ESRCH)?;
+        let path = match task.thread {
+            Some(thread) => {
+                let thread = Self::kernel_procfs_number(guest, thread)
+                    .await
+                    .ok_or(Errno::ESRCH)?;
+                format!("/proc/{process}/task/{thread}/cmdline")
+            }
+            None => format!("/proc/{process}/cmdline"),
+        };
+        let borrowed = match Self::borrow_scratch::<G, PATH_CAPACITY>(guest).await {
+            Ok(Some(borrowed)) => borrowed,
+            Ok(None) => {
+                return Err(Self::scratch_failure(
+                    guest,
+                    Sysno::read,
+                    format!("no guest stack scratch can hold the path {path}"),
+                )
+                .await);
+            }
+            Err(reason) => return Err(Self::scratch_failure(guest, Sysno::read, reason).await),
+        };
+        let (scratch, original, stack_guard) = borrowed;
+        let overlaps = |at: usize, length: usize| {
+            cmdline_path_overlaps(at, length, destination, count, source)
+        };
+        if !overlaps(scratch.as_raw(), PATH_CAPACITY) {
+            let answer =
+                Self::inject_cmdline_pread(guest, scratch, &path, destination, count, pos).await;
+            let restored = guest.memory().write_exact(scratch, &original);
+            drop(stack_guard);
+            if let Err(errno) = restored {
+                return Err(Self::scratch_failure(
+                    guest,
+                    Sysno::read,
+                    format!(
+                        "the guest stack scratch under a kernel cmdline read could not be \
+                         restored: {errno}"
+                    ),
+                )
+                .await);
+            }
+            return match answer {
+                Ok(read) => Ok(read?),
+                Err(reason) => Err(Self::scratch_failure(guest, Sysno::read, reason).await),
+            };
+        }
+        // The stack scratch overlaps the caller's buffer (a buffer below the
+        // stack pointer), whose bytes the scratch's restoration would erase,
+        // or the target's argument area (a CLONE_VM child whose stack pointer
+        // lies in the parent's arguments), whose bytes the path would replace
+        // while the kernel reads them. Put the stack back untouched and hold
+        // the path in a transient private page instead, a new mapping that no
+        // mapped buffer or area can lie in.
+        let restored = guest.memory().write_exact(scratch, &original);
+        drop(stack_guard);
+        if let Err(errno) = restored {
+            return Err(Self::scratch_failure(
+                guest,
+                Sysno::read,
+                format!("the guest stack scratch could not be put back unused: {errno}"),
+            )
+            .await);
+        }
+        const PAGE: usize = 4096;
+        let Some(page) = super::procfs_levels::map_transient(guest, PAGE).await else {
+            return Err(Self::scratch_failure(
+                guest,
+                Sysno::read,
+                format!("no transient page can hold the path {path}"),
+            )
+            .await);
+        };
+        if overlaps(page.as_raw(), PAGE) {
+            super::procfs_levels::unmap_transient(guest, page, PAGE).await;
+            return Err(Self::scratch_failure(
+                guest,
+                Sysno::read,
+                format!(
+                    "the transient page for the path {path} overlaps the caller's buffer or \
+                     the target's argument area"
+                ),
+            )
+            .await);
+        }
+        let answer = Self::inject_cmdline_pread(guest, page, &path, destination, count, pos).await;
+        super::procfs_levels::unmap_transient(guest, page, PAGE).await;
+        match answer {
+            Ok(read) => Ok(read?),
+            Err(reason) => Err(Self::scratch_failure(guest, Sysno::read, reason).await),
+        }
+    }
+
+    /// The caller's open of the kernel's `path`, written to `scratch`, a
+    /// `pread64` of `count` bytes at `pos` into the caller's buffer at
+    /// `destination`, and the close ([`Self::kernel_cmdline_read`]). An
+    /// injected call Reverie reports did not run (ERESTARTSYS) is retried.
+    /// `Ok(Err(errno))` is the kernel's answer to the open or the read;
+    /// `Err` is a step Detcore could not finish cleanly.
+    async fn inject_cmdline_pread<G: Guest<Self>>(
+        guest: &mut G,
+        scratch: AddrMut<'static, u8>,
+        path: &str,
+        destination: usize,
+        count: usize,
+        pos: u64,
+    ) -> Result<Result<usize, Errno>, String> {
+        const PATH_CAPACITY: usize = 64;
+        if let Err(errno) = guest
+            .memory()
+            .write_exact(scratch, &c_string::<PATH_CAPACITY>(path.as_bytes()))
+        {
+            return Err(format!(
+                "the path {path} could not be written to the guest scratch: {errno}"
+            ));
+        }
+        let opened = loop {
+            match guest
+                .inject(
+                    syscalls::Openat::new()
+                        .with_dirfd(libc::AT_FDCWD)
+                        .with_path(PathPtr::from_ptr(scratch.as_raw() as *const libc::c_char))
+                        .with_flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC),
+                )
+                .await
+            {
+                Err(Errno::ERESTARTSYS) => continue,
+                opened => break opened,
+            }
+        };
+        let fd = match opened {
+            Ok(fd) => fd as RawFd,
+            Err(errno) => return Ok(Err(errno)),
+        };
+        let read = loop {
+            match guest
+                .inject(
+                    syscalls::Pread64::new()
+                        .with_fd(fd)
+                        .with_buf(AddrMut::from_raw(destination))
+                        .with_len(count)
+                        .with_offset(pos as libc::loff_t),
+                )
+                .await
+            {
+                Err(Errno::ERESTARTSYS) => continue,
+                read => break read.map(|copied| copied as usize),
+            }
+        };
+        loop {
+            match guest.inject(syscalls::Close::new().with_fd(fd)).await {
+                Ok(_) | Err(Errno::EINTR) => return Ok(read),
+                Err(Errno::ERESTARTSYS) => continue,
+                Err(errno) => {
+                    return Err(format!(
+                        "the descriptor {fd} of {path} could not be closed: {errno}"
+                    ));
+                }
+            }
+        }
     }
 
     /// Bind the per-process file `file` to the identity of the task the
@@ -3019,6 +3307,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (the host kernel's file on ptrace and DBT, the provider's EACCES
     /// backstop on KVM), and the run warns of each reason once, by name
     /// (`tool_global::auxv_from_kernel`).
+    ///
+    /// The same stack gives the image's argument and environment areas
+    /// (`procfs::initial_stack_cmdline_area`), which the process's rendered
+    /// `/proc/<pid>/cmdline` reads from its memory
+    /// ([`Self::read_rendered_cmdline`]); without them, the same backends
+    /// leave that file to the kernel beneath too. Both go to the global tool
+    /// in the one request this callback already makes.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#4213): Review the auxiliary vector Detcore takes from
     // each new image's initial stack, which its rendered /proc/<pid>/auxv
@@ -3032,17 +3327,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         // the file is left to the kernel beneath:
         // the host kernel's file on ptrace and DBT, the provider's refusal on
         // KVM.
-        let found = match guest.initial_stack_pointer() {
+        let (found, cmdline) = match guest.initial_stack_pointer() {
             Some(stack) => {
                 let memory = guest.memory();
-                crate::procfs::initial_stack_auxv(stack, |at| {
+                let read_word = |at: u64| {
                     let address =
                         reverie::syscalls::Addr::<u64>::from_raw(usize::try_from(at).ok()?)?;
                     memory.read_value(address).ok()
-                })
-                .ok_or(AuxvFromKernel::Implausible)
+                };
+                (
+                    crate::procfs::initial_stack_auxv(stack, read_word)
+                        .ok_or(AuxvFromKernel::Implausible),
+                    crate::procfs::initial_stack_cmdline_area(stack, read_word, |at, buffer| {
+                        read_prefix(&memory, at, buffer)
+                    }),
+                )
             }
-            None => Err(AuxvFromKernel::NoInitialStackPointer),
+            None => (Err(AuxvFromKernel::NoInitialStackPointer), None),
         };
         let bytes = match found {
             Ok(bytes) => bytes,
@@ -3052,7 +3353,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // it (`ProcessAuxvTable::clear`). The run says once, by name,
                 // what the guest sees instead; the global tool's per-run flag
                 // decides the first, so a second run in one process warns too.
-                if crate::tool_global::auxv_from_kernel(guest, why).await {
+                if crate::tool_global::auxv_from_kernel(guest, why, cmdline).await {
                     match why {
                         AuxvFromKernel::NoInitialStackPointer => warn!(
                             "auxv: backend gives no initial stack pointer; guest auxv is the \
@@ -3067,7 +3368,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return;
             }
         };
-        crate::tool_global::record_process_auxv(guest, bytes).await;
+        crate::tool_global::record_process_auxv(guest, bytes, cmdline).await;
     }
 
     /// Adopt, before `call` runs, each descriptor it names that Detcore has
@@ -3252,6 +3553,189 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(())
     }
 
+    /// Linux's answer to `splice` from a rendered `/proc/<pid>/cmdline`
+    /// (`fd_in`, `args.arg0`), which must not read the empty placeholder
+    /// standing in for it, in the order Linux 6.17 checks (fs/splice.c): a
+    /// length of 0 is 0 and unknown flags are EINVAL (`SYSCALL_DEFINE6(splice)`,
+    /// splice.c:1622-1626); a source or destination that is not open or is
+    /// `O_PATH` is EBADF (splice.c:1628-1634, `fdget` skips `O_PATH`); a
+    /// destination pipe that splice can use (not a notification pipe:
+    /// [`Self::splice_pipe`]) with an `off_out` is ESPIPE (`__do_splice`,
+    /// splice.c:1416-1418); an unreadable `off_out` or `off_in` is EFAULT
+    /// (splice.c:1422-1431); a source that cannot read or a destination that
+    /// cannot write is EBADF (`do_splice`, splice.c:1310-1312); and then,
+    /// because `proc_pid_cmdline_ops` has no `splice_read`, EINVAL: at
+    /// splice.c:1383 for a destination that is not a pipe, and from
+    /// `do_splice_read` through `splice_file_to_pipe` (splice.c:1376) for a
+    /// pipe. The destination's state is the kernel's answer (`F_GETFL`,
+    /// `fstat`, the watch-queue probe), as for a transfer into a
+    /// placeholder.
+    ///
+    /// Not modelled, declared: before that last EINVAL a destination pipe
+    /// with no reader gives SIGPIPE and EPIPE, and a full one EAGAIN when
+    /// nonblocking or a wait for space (`wait_for_space`, splice.c:1261). By
+    /// default Detcore refuses `splice` with EINVAL for every other file; this
+    /// answer stands with and without `--allow-unsupported-syscalls`. `None`
+    /// for any other source.
+    async fn answer_cmdline_splice<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        args: &reverie::syscalls::SyscallArgs,
+    ) -> Option<Result<i64, Error>> {
+        let status = guest
+            .thread_state()
+            .with_detfd(args.arg0 as RawFd, |detfd| {
+                detfd
+                    .procfs_reads_memory_at_every_read()
+                    .then(|| detfd.status_flags())
+            })
+            .ok()
+            .flatten()?;
+        Some(self.cmdline_splice_answer(guest, args, status).await)
+    }
+
+    /// [`Self::answer_cmdline_splice`]'s answer for a source whose status
+    /// flags are `status`. The destination's state comes from the kernel by
+    /// injected probes, each retried while Reverie reports it did not run
+    /// (ERESTARTSYS) or it was interrupted (EINTR): EBADF only where the
+    /// kernel says the descriptor is not open, and any other probe failure
+    /// the named refusal of the failure policy, never an errno Detcore made
+    /// up.
+    async fn cmdline_splice_answer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        args: &reverie::syscalls::SyscallArgs,
+        status: i32,
+    ) -> Result<i64, Error> {
+        const SPLICE_F_ALL: usize = 0xf;
+        fn readable_offset<M: MemoryAccess>(memory: &M, address: usize) -> Result<(), Errno> {
+            let address = reverie::syscalls::Addr::<i64>::from_raw(address).ok_or(Errno::EFAULT)?;
+            memory
+                .read_value(address)
+                .map(|_| ())
+                .map_err(|_| Errno::EFAULT)
+        }
+        let (off_in, out, off_out) = (args.arg1, args.arg2 as RawFd, args.arg3);
+        if args.arg4 == 0 {
+            return Ok(0);
+        }
+        if args.arg5 & !SPLICE_F_ALL != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        if status & libc::O_PATH != 0 {
+            return Err(Errno::EBADF.into());
+        }
+        let out_status = loop {
+            match guest
+                .inject(
+                    syscalls::Fcntl::new()
+                        .with_fd(out)
+                        .with_cmd(syscalls::FcntlCmd::F_GETFL),
+                )
+                .await
+            {
+                Err(Errno::ERESTARTSYS | Errno::EINTR) => continue,
+                Ok(flags) => break flags as i32,
+                Err(Errno::EBADF) => return Err(Errno::EBADF.into()),
+                Err(errno) => {
+                    return Err(Self::scratch_failure(
+                        guest,
+                        Sysno::splice,
+                        format!(
+                            "the status flags of splice's destination {out} could not be read: \
+                             {errno}"
+                        ),
+                    )
+                    .await);
+                }
+            }
+        };
+        if out_status & libc::O_PATH != 0 {
+            return Err(Errno::EBADF.into());
+        }
+        if off_out != 0 && self.splice_pipe(guest, out).await? {
+            return Err(Errno::ESPIPE.into());
+        }
+        if off_out != 0 {
+            readable_offset(&guest.memory(), off_out)?;
+        }
+        if off_in != 0 {
+            readable_offset(&guest.memory(), off_in)?;
+        }
+        let reads = matches!(status & libc::O_ACCMODE, libc::O_RDONLY | libc::O_RDWR);
+        let writes = matches!(out_status & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR);
+        if !reads || !writes {
+            return Err(Errno::EBADF.into());
+        }
+        Err(Errno::EINVAL.into())
+    }
+
+    /// Whether the open descriptor `fd` is a pipe that splice can use,
+    /// Linux's `get_pipe_info(file, true)` (fs/pipe.c:1413-1424): a pipe or
+    /// FIFO (the kernel's `fstat`), but not a notification pipe
+    /// (`pipe2(O_NOTIFICATION_PIPE)`, which has a watch queue). The watch
+    /// queue is told by `ioctl(IOC_WATCH_QUEUE_SET_SIZE, 0)`, which changes
+    /// nothing whatever it answers (`watch_queue_set_size`,
+    /// kernel/watch_queue.c:237-252): ENODEV for a pipe without one, EBUSY or
+    /// EINVAL for one with one, and ENOTTY from a kernel without watch
+    /// queues, where no pipe has one. Each probe is retried as in
+    /// [`Self::cmdline_splice_answer`]; any other failure, which leaves the
+    /// pipe unclassified, is the named refusal of the failure policy.
+    async fn splice_pipe<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) -> Result<bool, Error> {
+        const IOC_WATCH_QUEUE_SET_SIZE: usize = 0x5760; // _IO('W', 0x60)
+        let stat = loop {
+            match self.inject_fstat(guest, fd).await {
+                Err(Errno::ERESTARTSYS | Errno::EINTR) => continue,
+                stat => break stat,
+            }
+        };
+        let stat = match stat {
+            Ok(stat) => stat,
+            Err(errno) => {
+                return Err(Self::scratch_failure(
+                    guest,
+                    Sysno::splice,
+                    format!(
+                        "the file type of splice's destination {fd} could not be read: {errno}"
+                    ),
+                )
+                .await);
+            }
+        };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
+            return Ok(false);
+        }
+        let probe = loop {
+            let call = Syscall::from_raw(
+                Sysno::ioctl,
+                reverie::syscalls::SyscallArgs::new(
+                    fd as usize,
+                    IOC_WATCH_QUEUE_SET_SIZE,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            );
+            match guest.inject(call).await {
+                Err(Errno::ERESTARTSYS | Errno::EINTR) => continue,
+                probe => break probe,
+            }
+        };
+        match splice_pipe_from_watch_queue_probe(probe) {
+            Some(usable) => Ok(usable),
+            None => Err(Self::scratch_failure(
+                guest,
+                Sysno::splice,
+                format!(
+                    "splice's destination pipe {fd} could not be classified as a notification \
+                     pipe or not: the watch-queue probe answered {probe:?}"
+                ),
+            )
+            .await),
+        }
+    }
+
     /// Answer `call` if it must not reach the placeholder behind a rendered
     /// procfs descriptor: what a procfs file refuses, in the order Linux
     /// checks. A read-only placeholder's description already makes the kernel
@@ -3268,6 +3752,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (sysno, args) = call.into_parts();
         if let Some(answer) = self.answer_rendered_procfs_write(guest, sysno, &args).await {
             return Some(answer.map_err(Error::from));
+        }
+        if sysno == Sysno::splice
+            && let Some(answer) = self.answer_cmdline_splice(guest, &args).await
+        {
+            return Some(answer);
         }
         let fd = match sysno {
             Sysno::pwrite64
@@ -4199,6 +4688,72 @@ fn could_name_rendered(path: &Path, files: RenderedFiles) -> bool {
         || (!last.is_empty() && last.iter().all(u8::is_ascii_digit))
 }
 
+/// The guest's bytes at `at`, up to the first one it cannot read, through
+/// the vectored, protection-respecting copy (`super::read_guest_prefix`):
+/// how many it read. Any failure other than a fault reads nothing.
+fn read_prefix<M: MemoryAccess>(memory: &M, at: u64, buffer: &mut [u8]) -> usize {
+    usize::try_from(at)
+        .ok()
+        .and_then(AddrMut::<u8>::from_raw)
+        .map_or(0, |address| {
+            super::read_guest_prefix(memory, address, buffer).unwrap_or(0)
+        })
+}
+
+/// The calling process's memory as a read of its own rendered
+/// `/proc/<pid>/cmdline` reads and copies it (`procfs::CmdlineMemory`):
+/// reads through the vectored, protection-respecting copy, as Linux's
+/// `access_remote_vm` without `FOLL_FORCE` (never `PTRACE_PEEKDATA`, which
+/// reaches pages the guest made unreadable and reads whole words), and
+/// copies to the caller's buffer at `destination` through the user-access
+/// write, up to its first byte the guest cannot write. A failure other than
+/// a fault (the backend's) is kept in `failure` and ends the read.
+struct GuestCmdlineMemory<'m, M> {
+    memory: &'m mut M,
+    destination: usize,
+    failure: Option<Errno>,
+}
+
+impl<M: MemoryAccess> crate::procfs::CmdlineMemory for GuestCmdlineMemory<'_, M> {
+    fn read(&mut self, at: u64, buffer: &mut [u8]) -> usize {
+        if self.failure.is_some() {
+            return 0;
+        }
+        let Some(address) = usize::try_from(at).ok().and_then(AddrMut::<u8>::from_raw) else {
+            return 0;
+        };
+        match super::read_guest_prefix(&*self.memory, address, buffer) {
+            Ok(read) => read,
+            Err(errno) => {
+                self.failure = Some(errno);
+                0
+            }
+        }
+    }
+
+    fn copy_out(&mut self, offset: usize, bytes: &[u8]) -> usize {
+        let mut copied = 0;
+        while copied < bytes.len() && self.failure.is_none() {
+            let Some(address) = self
+                .destination
+                .checked_add(offset + copied)
+                .and_then(AddrMut::<u8>::from_raw)
+            else {
+                break;
+            };
+            match self
+                .memory
+                .write_with_user_access(address, &bytes[copied..])
+            {
+                Ok(0) | Err(Errno::EFAULT) => break,
+                Ok(written) => copied += written,
+                Err(errno) => self.failure = Some(errno),
+            }
+        }
+        copied
+    }
+}
+
 /// An attribute value of `size` bytes at guest address `address` (at most
 /// `XATTR_SIZE_MAX`, which the answer checks first), if the guest can read it.
 fn read_value<M: MemoryAccess>(memory: &M, address: u64, size: usize) -> Option<Vec<u8>> {
@@ -4261,6 +4816,47 @@ fn read_pair<U: Copy, M: MemoryAccess>(memory: &M, address: u64) -> Result<Optio
         Some(address) => Ok(Some(memory.read_value(address)?)),
         None => Ok(None),
     }
+}
+
+/// What `ioctl(fd, IOC_WATCH_QUEUE_SET_SIZE, 0)` on a pipe or FIFO says about
+/// whether splice can use it (`Detcore::splice_pipe`): `Some(true)` for a pipe
+/// without a watch queue (ENODEV, or ENOTTY from a kernel without watch
+/// queues), `Some(false)` for a notification pipe (EBUSY once sized, EINVAL
+/// for the size 0 before), which `get_pipe_info(file, true)` refuses, and
+/// `None` for any other answer, which classifies nothing.
+fn splice_pipe_from_watch_queue_probe(probe: Result<i64, Errno>) -> Option<bool> {
+    match probe {
+        Err(Errno::ENODEV | Errno::ENOTTY) => Some(true),
+        Err(Errno::EBUSY | Errno::EINVAL) => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether a path written at `at`, `length` bytes, for a kernel read of
+/// another process's `/proc/<pid>/cmdline` (`Detcore::kernel_cmdline_read`)
+/// overlaps a range it must not lie in: the caller's buffer, `count` bytes at
+/// `destination`, whose bytes restoring the scratch would erase; or the
+/// target's argument and environment area `source`, which get_mm_cmdline
+/// reads from `arg_start` through `env_end` (fs/proc/base.c:319-328), and
+/// which a caller sharing the target's memory (`CLONE_VM`) would have
+/// overwritten with the path while the kernel reads it. Empty ranges overlap
+/// nothing.
+fn cmdline_path_overlaps(
+    at: usize,
+    length: usize,
+    destination: usize,
+    count: usize,
+    source: Option<crate::procfs::CmdlineArea>,
+) -> bool {
+    let end = at.saturating_add(length);
+    let hits = |start: usize, stop: usize| start < stop && at < stop && start < end;
+    hits(destination, destination.saturating_add(count))
+        || source.is_some_and(|area| {
+            hits(
+                area.arg_start as usize,
+                area.env_end.max(area.arg_end) as usize,
+            )
+        })
 }
 
 #[cfg(test)]
@@ -4419,6 +5015,141 @@ mod tests {
             if expected != "bound" {
                 assert_eq!(bound, None, "a refused generation is bound to no file");
             }
+        }
+    }
+
+    /// A read of the caller's own `cmdline` reads guest memory through the
+    /// vectored, protection-respecting copy (`GuestCmdlineMemory`), as
+    /// `access_remote_vm` without `FOLL_FORCE`: here real memory of this
+    /// process, through `LocalMemory`. The setproctitle test reads exactly
+    /// the one byte at `arg_end - 1`, which a following unmapped page does not
+    /// hide (a word-sized `PTRACE_PEEKDATA` there would fail); a PROT_NONE
+    /// page of the argument area reads nothing, as on Linux, and a read at a
+    /// position past it reads the next page.
+    #[test]
+    fn the_watch_queue_probe_tells_a_notification_pipe() {
+        // A pipe without a watch queue, and any pipe of a kernel without them.
+        assert_eq!(
+            splice_pipe_from_watch_queue_probe(Err(Errno::ENODEV)),
+            Some(true)
+        );
+        assert_eq!(
+            splice_pipe_from_watch_queue_probe(Err(Errno::ENOTTY)),
+            Some(true)
+        );
+        // A notification pipe, sized or not.
+        assert_eq!(
+            splice_pipe_from_watch_queue_probe(Err(Errno::EBUSY)),
+            Some(false)
+        );
+        assert_eq!(
+            splice_pipe_from_watch_queue_probe(Err(Errno::EINVAL)),
+            Some(false)
+        );
+        // Anything else classifies nothing; a success cannot happen for the
+        // size 0 and is no answer either.
+        assert_eq!(splice_pipe_from_watch_queue_probe(Ok(0)), None);
+        assert_eq!(splice_pipe_from_watch_queue_probe(Err(Errno::EPERM)), None);
+        assert_eq!(splice_pipe_from_watch_queue_probe(Err(Errno::EBADF)), None);
+    }
+
+    #[test]
+    fn a_cmdline_path_avoids_the_buffer_and_the_source_area() {
+        let area = crate::procfs::CmdlineArea {
+            arg_start: 0x1000,
+            arg_end: 0x1040,
+            env_start: 0x1040,
+            env_end: 0x1080,
+        };
+        // The caller's buffer: touching ends do not overlap; a count of 0
+        // overlaps nothing.
+        assert!(cmdline_path_overlaps(0x500, 64, 0x520, 8, None));
+        assert!(!cmdline_path_overlaps(0x500, 64, 0x540, 8, None));
+        assert!(!cmdline_path_overlaps(0x500, 64, 0x4f8, 8, None));
+        assert!(cmdline_path_overlaps(0x500, 64, 0x4f8, 9, None));
+        assert!(!cmdline_path_overlaps(0x500, 64, 0x520, 0, None));
+        // The target's area, arguments through environment (a CLONE_VM
+        // child's stack pointer inside its parent's arguments).
+        assert!(cmdline_path_overlaps(0x1000, 64, 0x9000, 8, Some(area)));
+        assert!(cmdline_path_overlaps(0x1070, 64, 0x9000, 8, Some(area)));
+        assert!(cmdline_path_overlaps(0xfc1, 64, 0x9000, 8, Some(area)));
+        assert!(!cmdline_path_overlaps(0xfc0, 64, 0x9000, 8, Some(area)));
+        assert!(!cmdline_path_overlaps(0x1080, 64, 0x9000, 8, Some(area)));
+        // An environment area that does not follow the arguments still
+        // leaves arg_start..arg_end protected.
+        let detached = crate::procfs::CmdlineArea { env_end: 0, ..area };
+        assert!(cmdline_path_overlaps(0x1020, 8, 0x9000, 8, Some(detached)));
+        assert!(!cmdline_path_overlaps(0x1040, 8, 0x9000, 8, Some(detached)));
+    }
+
+    #[test]
+    fn a_cmdline_read_respects_page_protection() {
+        const PAGE: usize = 4096;
+        // SAFETY: a fresh private anonymous mapping, unmapped below.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                3 * PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let base = base as usize;
+        let page1 = base + PAGE;
+        let page2 = base + 2 * PAGE;
+        let titled = b"title\0xyz";
+        let other = b"abc\0";
+        // SAFETY: both ranges lie in the mapping, before its protection
+        // changes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                titled.as_ptr(),
+                (page2 - titled.len()) as *mut u8,
+                titled.len(),
+            );
+            std::ptr::copy_nonoverlapping(other.as_ptr(), page1 as *mut u8, other.len());
+            assert_eq!(libc::munmap(page2 as *mut libc::c_void, PAGE), 0);
+            assert_eq!(
+                libc::mprotect(base as *mut libc::c_void, PAGE, libc::PROT_NONE),
+                0
+            );
+        }
+        let read = |area: &crate::procfs::CmdlineArea, pos: u64, count: usize| {
+            let mut out = vec![0_u8; count];
+            let mut memory = reverie::syscalls::LocalMemory::new();
+            let mut adapter = GuestCmdlineMemory {
+                memory: &mut memory,
+                destination: out.as_mut_ptr() as usize,
+                failure: None,
+            };
+            let copied = crate::procfs::read_cmdline(area, pos, count, &mut adapter).unwrap();
+            assert_eq!(adapter.failure, None);
+            out.truncate(copied);
+            out
+        };
+        let area = |start: usize, end: usize| crate::procfs::CmdlineArea {
+            arg_start: start as u64,
+            arg_end: end as u64,
+            env_start: end as u64,
+            env_end: end as u64,
+        };
+        // The argument area ends at the last byte before an unmapped page,
+        // which is not NUL: a title.
+        assert_eq!(read(&area(page2 - titled.len(), page2), 0, 64), b"title\0");
+        // The argument area lies in a PROT_NONE page: nothing.
+        assert_eq!(read(&area(base + 100, base + 110), 0, 64), b"");
+        // It starts in the PROT_NONE page and ends in the next: a read from
+        // the start reads nothing, one at a position in the next page reads
+        // it.
+        let spanning = area(page1 - 6, page1 + other.len());
+        assert_eq!(read(&spanning, 0, 64), b"");
+        assert_eq!(read(&spanning, 6, 64), b"abc\0");
+        // SAFETY: the two pages still mapped, unmapped once.
+        unsafe {
+            assert_eq!(libc::munmap(base as *mut libc::c_void, 2 * PAGE), 0);
         }
     }
 
