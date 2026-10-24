@@ -720,12 +720,46 @@ pub struct BlockedPool {
     /// jobserver `pselect6` continuation -- and `--strict --verify` diverges.
     ///
     /// Instead the parent is parked here, out of the run queue, and re-admitted
-    /// by `step2e_process_signal_deferred` only once no ordinary (non-poller)
-    /// guest work remains: the same deterministic-work-first policy that governs
-    /// `external_io_blockers`. The physical signal has already been delivered by
-    /// the kernel, so the handler's `wait4`/`waitpid` still reaps a real host
-    /// zombie and no synthetic signal is ever generated.
+    /// by `step2e_process_signal_deferred` once no ordinary (non-poller) guest
+    /// work remains, the same deterministic-work-first policy that governs
+    /// `external_io_blockers`, or, on a backend that reports child-exit
+    /// publication, once every thread that was such work when it was parked
+    /// has had a turn since (`sigchld_deferred_behind`), whichever comes
+    /// first. The physical signal has already been delivered by the kernel,
+    /// so the handler's `wait4`/`waitpid` still reaps a real host zombie and
+    /// no synthetic signal is ever generated.
     pub sigchld_deferred: BTreeSet<DetTid>,
+
+    /// For each thread in `sigchld_deferred`, the threads that were runnable
+    /// work (`RunQueue::runnable_besides`) when its delivery was deferred and
+    /// have neither committed a turn nor stopped being runnable work since.
+    /// Once it is empty the deferred delivery has waited behind all the run
+    /// queue's work from its deferral, and is re-admitted even if other work
+    /// is runnable by then: a sibling that never blocks no longer starves it
+    /// forever (<https://github.com/rrnewton/hermit/issues/4132>). A
+    /// background continuation (`external_io_blockers`) is not in the run
+    /// queue, so it is not waited for here; in `hermit run` it is admitted at
+    /// quiescence, as before.
+    ///
+    /// Recorded only for a deferral of a process in `sigchld_fenced`: one
+    /// whose kernel copy was raised while the schedule waited for the child's
+    /// exit to be published, so the turn of the deferral is fixed by the
+    /// schedule. Otherwise that turn can depend on host timing (when the
+    /// kernel's copy reached a running parent), which the quiescence wait
+    /// absorbs and a bound counted from it would not, so such a thread has no
+    /// entry and waits for quiescence alone, as before.
+    pub sigchld_deferred_behind: BTreeMap<DetTid, BTreeSet<DetTid>>,
+
+    /// Parent processes whose pending `SIGCHLD` from the kernel was raised at
+    /// a point the schedule fixes: a child's exit whose notification Linux
+    /// discards or ignores (an Exit grant's publication hold), or a child
+    /// killed by SIGKILL (the kill turn waits for its publication), on a
+    /// backend that reports child-exit publication. Taken at the next
+    /// `InboundSignal(SIGCHLD)` of a thread of the process, granted or
+    /// deferred. A copy that coalesced with an earlier, host-timed one can
+    /// leave a mark that a later delivery of that process takes; that
+    /// delivery's deferral is then bounded where only quiescence was meant.
+    pub sigchld_fenced: BTreeSet<DetPid>,
 
     /// Deferred `SIGCHLD` parents that `step2e_process_signal_deferred` has
     /// re-admitted to the run queue, and threads whose `SIGCHLD` delivery the
@@ -9877,7 +9911,7 @@ impl Scheduler {
         let _ = self.blocked.continuation_masks.remove(dtid);
         let _ = self.background_entry_barriers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
-        self.blocked.sigchld_deferred.remove(dtid);
+        self.undefer_sigchld(*dtid);
         self.blocked.sigchld_ready.remove(dtid);
         self.blocked.woken_sleeps.remove(dtid);
         self.blocked.sleep_interruptions.remove(dtid);
@@ -11621,42 +11655,94 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Take `dtid` out of `blocked.sigchld_deferred`, with the work it waited
+    /// behind. Whether it was deferred.
+    pub(super) fn undefer_sigchld(&mut self, dtid: DetTid) -> bool {
+        self.blocked.sigchld_deferred_behind.remove(&dtid);
+        self.blocked.sigchld_deferred.remove(&dtid)
+    }
+
+    /// `dtid` committed a turn: a deferred `SIGCHLD` delivery that waited
+    /// behind it (`blocked.sigchld_deferred_behind`) waits behind it no longer.
+    fn sigchld_deferrals_pass(&mut self, dtid: DetTid) {
+        for behind in self.blocked.sigchld_deferred_behind.values_mut() {
+            behind.remove(&dtid);
+        }
+    }
+
     /// Re-admit parents whose host-async `SIGCHLD` was parked in
     /// `blocked.sigchld_deferred` (see `block_for_one_resource`). Uses the same
     /// deterministic-work-first gate as `step2c_process_io_blockers`: a deferred
-    /// signal is delivered only once the run queue holds no ordinary (non-poller)
+    /// signal is delivered once the run queue holds no ordinary (non-poller)
     /// guest work, so its commit order is fixed by the scheduler rather than by
     /// host signal-arrival timing. Where that gate keeps the deliveries parked,
     /// a schedule replay still readmits the one whose thread its recorded
     /// schedule runs next once only polling retries are queued
-    /// (`replay_readmits_parked_sigchld`). Runs after external-IO harvesting so
-    /// a ready IO continuation is always ordered ahead of a deferred signal.
+    /// (`replay_readmits_parked_sigchld`). Runs after external-IO harvesting,
+    /// so at such a quiescence a ready IO continuation is ordered ahead of a
+    /// deferred signal.
+    ///
+    /// Where the deferral recorded the work it waits behind
+    /// (`sigchld_deferred_behind`, on a backend that reports child-exit
+    /// publication), the wait is bounded: the delivery is also re-admitted
+    /// once every thread that was runnable work when it was deferred has
+    /// committed a turn or stopped being runnable work, at most one turn of
+    /// each. That reads the schedule alone (the run queue at a deferral whose
+    /// turn the schedule fixes, and the turns committed since), and it moves
+    /// no clock. A background continuation still waiting for quiescence is
+    /// then ordered after the signal, deterministically.
     fn step2e_process_signal_deferred(&mut self) {
+        let deferred = &self.blocked.sigchld_deferred;
+        self.blocked
+            .sigchld_deferred_behind
+            .retain(|dtid, _| deferred.contains(dtid));
         if self.blocked.sigchld_deferred.is_empty() {
             return;
         }
         let only_pollers = self.run_queue.only_pollers() && !self.vfork_child_runs_turn();
-        if !self.run_queue.is_empty() && !only_pollers {
-            // Where this gate keeps the deliveries parked, a schedule replay
-            // still readmits the one whose thread its recorded schedule runs
-            // next once nothing but polling retries is queued, the test a
-            // delivery takes before it is parked (`sigchld_waits_behind_work`):
-            // replay-held pollers count as work for `only_pollers`, so the
-            // gate would keep it parked past its turn. Where the gate admits
-            // every parked delivery, below, nothing changes.
-            if let Some(next) = self.replay_readmits_parked_sigchld() {
-                info!("[step2] Re-admit deferred SIGCHLD for dtid {:?}", next);
-                self.blocked.sigchld_deferred.remove(&next);
-                self.blocked.sigchld_ready.insert(next);
-                self.readmit_ready_thread(next);
+        if self.run_queue.is_empty() || only_pollers {
+            // BTreeSet drains in sorted DetTid order, giving a canonical admission
+            // order when several parents are owed a signal at the same quiescence.
+            let ready = std::mem::take(&mut self.blocked.sigchld_deferred);
+            self.blocked.sigchld_deferred_behind.clear();
+            for dtid in ready {
+                info!("[step2] Re-admit deferred SIGCHLD for dtid {:?}", dtid);
+                self.blocked.sigchld_ready.insert(dtid);
+                self.readmit_ready_thread(dtid);
             }
             return;
         }
-        // BTreeSet drains in sorted DetTid order, giving a canonical admission
-        // order when several parents are owed a signal at the same quiescence.
-        let ready = std::mem::take(&mut self.blocked.sigchld_deferred);
-        for dtid in ready {
-            info!("[step2] Re-admit deferred SIGCHLD for dtid {:?}", dtid);
+        // Where this gate keeps the deliveries parked, a schedule replay
+        // still readmits the one whose thread its recorded schedule runs
+        // next once nothing but polling retries is queued, the test a
+        // delivery takes before it is parked (`sigchld_waits_behind_work`):
+        // replay-held pollers count as work for `only_pollers`, so the
+        // gate would keep it parked past its turn. Where the gate admits
+        // every parked delivery, above, nothing changes.
+        if let Some(next) = self.replay_readmits_parked_sigchld() {
+            info!("[step2] Re-admit deferred SIGCHLD for dtid {:?}", next);
+            self.undefer_sigchld(next);
+            self.blocked.sigchld_ready.insert(next);
+            self.readmit_ready_thread(next);
+        }
+        // In DetTid order, each thread whose delivery has waited behind all
+        // the work that was runnable when it was deferred.
+        let run_queue = &self.run_queue;
+        let waited: Vec<DetTid> = self
+            .blocked
+            .sigchld_deferred_behind
+            .iter_mut()
+            .filter_map(|(dtid, behind)| {
+                behind.retain(|ahead| run_queue.holds_work(*ahead));
+                behind.is_empty().then_some(*dtid)
+            })
+            .collect();
+        for dtid in waited {
+            info!(
+                "[step2] Re-admit deferred SIGCHLD for dtid {:?}: the work runnable at its deferral has run",
+                dtid
+            );
+            self.undefer_sigchld(dtid);
             self.blocked.sigchld_ready.insert(dtid);
             self.readmit_ready_thread(dtid);
         }
@@ -14479,7 +14565,7 @@ impl Scheduler {
         // https://github.com/rrnewton/hermit/issues/4229). Before that,
         // `thread_status` found it in no pool and reported it gone, and the
         // send panicked.
-        if self.blocked.sigchld_deferred.remove(&dettid) {
+        if self.undefer_sigchld(dettid) {
             info!(
                 "[dtid {}] signal {} re-admits its deferred SIGCHLD delivery.",
                 dettid, signal
@@ -18609,6 +18695,9 @@ impl Scheduler {
                             if !self.child_exit_publications_completed.remove(process) {
                                 self.child_exit_publications_pending.insert(*process);
                             }
+                            // Either way the kernel's copy is pending before
+                            // the next turn (`sigchld_fenced`).
+                            self.blocked.sigchld_fenced.insert(parent);
                         }
                         // Caught, blocked and every state Hermit cannot classify
                         // keep the synthetic SIGCHLD.
@@ -18686,7 +18775,8 @@ impl Scheduler {
             // which diverges under `--strict --verify`. Defer it deterministic-
             // work-first: park the parent out of the run queue and let
             // `step2e_process_signal_deferred` re-admit it once no ordinary guest
-            // work remains, mirroring the `external_io_blockers` policy. Signals
+            // work remains, mirroring the `external_io_blockers` policy, or once
+            // the work that is runnable now has had its turn. Signals
             // that the scheduler itself synthesizes deterministically (timers via
             // `fire_alarm`) are never SIGCHLD and are unaffected.
             ResourceID::WaitidSignals(_) => Ok(()),
@@ -18721,6 +18811,13 @@ impl Scheduler {
                 // signal targets, a delivery of a copy it sent is marked for the
                 // very thread that took it (`dequeue_sigchld`).
                 let already_readmitted = self.blocked.sigchld_ready.remove(&dettid);
+                // Whether this delivery's copy was raised at a point the
+                // schedule fixes (`sigchld_fenced`): taken by any SIGCHLD.
+                let fenced = sig.signal() == Some(Signal::SIGCHLD)
+                    && self
+                        .blocked
+                        .sigchld_fenced
+                        .remove(&self.sigchld_process(dettid));
                 if sig.signal() == Some(Signal::SIGCHLD)
                     && signal_interrupt_errno.is_none()
                     && !already_readmitted
@@ -18729,6 +18826,15 @@ impl Scheduler {
                     self.run_queue.undo_tentative_pop(); // Begun in step3.
                     assert!(self.run_queue.remove_tid(dettid));
                     self.blocked.sigchld_deferred.insert(dettid);
+                    // The work it waits behind: what is runnable now. Each of
+                    // these leaves the set at its next commit (`unblock_guest`)
+                    // or once it is no longer runnable work (step2e). Only
+                    // where the schedule fixes the turn of this deferral
+                    // (`sigchld_deferred_behind`).
+                    if fenced {
+                        let behind = self.run_queue.runnable_besides(dettid);
+                        self.blocked.sigchld_deferred_behind.insert(dettid, behind);
+                    }
                     Err(SkipTurn)
                 } else {
                     Ok(())
@@ -20452,6 +20558,7 @@ impl Scheduler {
         }
         self.last_committed_turn = Some(self.turn);
         self.turn += 1;
+        self.sigchld_deferrals_pass(dtid);
         let answer = if fatal_alarm {
             SchedResponse::InGuestFatalAlarm
         } else if signaled {
@@ -40409,6 +40516,135 @@ mod test {
             assert!(scheduler.run_queue.contains_tid(first));
             assert!(scheduler.run_queue.contains_tid(second));
         }
+    }
+
+    /// Defer `signaled`'s host-async `SIGCHLD` in a scheduler whose run queue
+    /// holds `busy` as ordinary work besides it, with the kernel's copy raised
+    /// at a point the schedule fixes (`fenced`, `BlockedPool::sigchld_fenced`)
+    /// or not.
+    fn defer_sigchld_beside_with(busy: &[DetTid], signaled: DetTid, fenced: bool) -> Scheduler {
+        let mut scheduler = Scheduler::new(&Config::default());
+        for tid in busy.iter().copied().chain([signaled]) {
+            register_known_thread(&mut scheduler, tid);
+            scheduler.runqueue_push_back(tid);
+        }
+        if fenced {
+            let process = scheduler.sigchld_process(signaled);
+            scheduler.blocked.sigchld_fenced.insert(process);
+        }
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_tid(signaled),
+            Some(signaled)
+        );
+        let inbound = ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD));
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    signaled,
+                    &inbound,
+                    &Permission::W,
+                    None,
+                    None,
+                    &Ivar::new()
+                )
+                .is_err()
+        );
+        assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
+        assert!(
+            scheduler.blocked.sigchld_fenced.is_empty(),
+            "the mark is taken"
+        );
+        scheduler
+    }
+
+    /// [`defer_sigchld_beside_with`] with a fenced copy, as a child killed by
+    /// SIGKILL, or one whose SIGCHLD Linux discards, gives on ptrace.
+    fn defer_sigchld_beside(busy: &[DetTid], signaled: DetTid) -> Scheduler {
+        defer_sigchld_beside_with(busy, signaled, true)
+    }
+
+    /// A deferred `SIGCHLD` waits behind the work that was runnable when it
+    /// was deferred, one turn of each, and then is re-admitted although that
+    /// work is still runnable: a sibling that never blocks no longer starves
+    /// it (https://github.com/rrnewton/hermit/issues/4132). Before, it waited
+    /// for a queue with no ordinary work, which such a sibling never leaves.
+    #[test]
+    fn a_deferred_sigchld_is_readmitted_once_the_work_runnable_at_its_deferral_has_had_a_turn() {
+        let (first, second, signaled) = (
+            DetTid::from_raw(100),
+            DetTid::from_raw(101),
+            DetTid::from_raw(102),
+        );
+        let mut scheduler = defer_sigchld_beside(&[first, second], signaled);
+        assert_eq!(
+            scheduler.blocked.sigchld_deferred_behind.get(&signaled),
+            Some(&BTreeSet::from([first, second]))
+        );
+        scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
+        // One of them has had its turn and is runnable again: still behind
+        // the other.
+        scheduler.sigchld_deferrals_pass(first);
+        scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
+        assert!(!scheduler.run_queue.contains_tid(signaled));
+        // Both have: the delivery is re-admitted beside them, and its
+        // `InboundSignal` turn is granted rather than deferred again.
+        scheduler.sigchld_deferrals_pass(second);
+        scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_deferred.is_empty());
+        assert!(scheduler.blocked.sigchld_deferred_behind.is_empty());
+        assert!(scheduler.blocked.sigchld_ready.contains(&signaled));
+        assert!(scheduler.run_queue.contains_tid(signaled));
+        assert!(scheduler.run_queue.contains_tid(first));
+        assert!(scheduler.run_queue.contains_tid(second));
+    }
+
+    /// Work that becomes runnable after the deferral does not hold the
+    /// delivery, and work that stops being runnable (it blocked, exited or
+    /// was killed) without a turn stops holding it.
+    #[test]
+    fn a_deferred_sigchld_waits_only_for_work_still_runnable_from_its_deferral() {
+        let (busy, gone, late, signaled) = (
+            DetTid::from_raw(100),
+            DetTid::from_raw(101),
+            DetTid::from_raw(102),
+            DetTid::from_raw(103),
+        );
+        let mut scheduler = defer_sigchld_beside(&[busy, gone], signaled);
+        register_known_thread(&mut scheduler, late);
+        scheduler.runqueue_push_back(late);
+        assert!(scheduler.run_queue.remove_tid(gone));
+        scheduler.step2e_process_signal_deferred();
+        assert_eq!(
+            scheduler.blocked.sigchld_deferred_behind.get(&signaled),
+            Some(&BTreeSet::from([busy]))
+        );
+        scheduler.sigchld_deferrals_pass(busy);
+        scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_deferred.is_empty());
+        assert!(scheduler.run_queue.contains_tid(signaled));
+    }
+
+    /// A copy raised at a point the schedule does not fix (a caught SIGCHLD
+    /// that reached a running parent, or any copy on a backend that does not
+    /// report child-exit publication) can be deferred at a turn that depends
+    /// on host timing, so nothing is counted from it: the delivery waits for
+    /// quiescence alone, as before, however many turns the busy thread takes.
+    #[test]
+    fn a_deferred_sigchld_whose_copy_was_not_fenced_waits_for_quiescence() {
+        let (busy, signaled) = (DetTid::from_raw(100), DetTid::from_raw(101));
+        let mut scheduler = defer_sigchld_beside_with(&[busy], signaled, false);
+        assert!(scheduler.blocked.sigchld_deferred_behind.is_empty());
+        for _ in 0..3 {
+            scheduler.sigchld_deferrals_pass(busy);
+            scheduler.step2e_process_signal_deferred();
+            assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
+        }
+        assert!(scheduler.run_queue.remove_tid(busy));
+        scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_deferred.is_empty());
+        assert!(scheduler.run_queue.contains_tid(signaled));
     }
 
     /// The control for the two tests above: a queue of real pollers alone still

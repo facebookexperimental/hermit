@@ -184,6 +184,8 @@ static HB_CHILD_WAIT_CYCLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_KILL_HELD_CHILD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_HERMIT_TASKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PAUSE_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGCHLD_BUSY_SIBLING_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGKILL_ROBUST_PSHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_DISCARD_AT_SEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3036,6 +3038,44 @@ fn pause_sigchld_guest() -> &'static Path {
         );
         guest
     })
+}
+
+/// `tests/c/sigchld_busy_sibling.c`, built once per test process.
+fn sigchld_busy_sibling_guest() -> &'static Path {
+    SIGCHLD_BUSY_SIBLING_GUEST.get_or_init(|| compile_c_guest("sigchld_busy_sibling"))
+}
+
+/// `tests/c/sigkill_robust_pshared.c`, built once per test process.
+fn sigkill_robust_pshared_guest() -> &'static Path {
+    SIGKILL_ROBUST_PSHARED_GUEST.get_or_init(|| compile_c_guest("sigkill_robust_pshared"))
+}
+
+/// Compile `tests/c/<name>.c` with `-pthread` into this test process's build
+/// root.
+fn compile_c_guest(name: &str) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = process_build_root(name);
+    fs::create_dir_all(&build_root)
+        .unwrap_or_else(|error| panic!("failed to create the {name} directory: {error}"));
+    let guest = build_root.join(name);
+    let output = Command::new("cc")
+        .args([
+            "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-std=c11", "-pthread",
+        ])
+        .arg(repository.join(format!("tests/c/{name}.c")))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to compile the {name} guest: {error}"));
+    assert!(
+        output.status.success(),
+        "{name} guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
 }
 
 fn signal_hermit_tasks_guest() -> &'static Path {
@@ -51833,6 +51873,118 @@ fn a_pause_returns_for_a_childs_sigchld() {
     );
 }
 
+/// A parent's child-exit `SIGCHLD` is delivered beside a sibling thread that
+/// never blocks (it calls `sched_yield` until the parent has reaped the child),
+/// as on Linux, where each mode prints its line and exits 0. Before, the
+/// scheduler deferred the delivery until no other work was runnable, which
+/// that sibling never allows, so the `kill` and `exit` runs ended at their
+/// timeout (https://github.com/rrnewton/hermit/issues/4132); the
+/// `sigsuspend` mode, whose parent waits for its handler, finished already.
+/// The delivery now waits behind the work that was runnable when it came,
+/// one turn of each, each run reaches canonical bitwise parity, and a
+/// recorded schedule of the `kill` run replays to the same output.
+#[test]
+fn a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks() {
+    let guest = sigchld_busy_sibling_guest().to_str().unwrap().to_owned();
+    for (mode, expected) in [
+        (
+            "kill",
+            "mode=kill exited=0 code=0 signaled=1 sig=9 handled=0\n",
+        ),
+        (
+            "exit",
+            "mode=exit exited=1 code=0 signaled=0 sig=0 handled=0\n",
+        ),
+        (
+            "sigsuspend",
+            "mode=sigsuspend exited=1 code=0 signaled=0 sig=0 handled=1\n",
+        ),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let verdict_arg = format!("--verify-json={}", verdict.display());
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                verdict_arg.as_str(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(150),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}: {stdout}\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: {log}");
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(&verdict)
+                .unwrap_or_else(|error| panic!("{mode}: no verdict: {error}\n{log}")),
+        )
+        .unwrap_or_else(|error| panic!("{mode}: unreadable verdict: {error}"));
+        let compared = &report["compared_log_messages"];
+        assert!(
+            report["bitwise_parity"] == true
+                && compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "{mode}: no bitwise parity over equal, nonzero INFO counts: {report}\n{log}"
+        );
+    }
+    // A recorded schedule of a run whose delivery the bound re-admitted
+    // replays to the same output: replay re-admits it at the same turn.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let record = format!("--record-preemptions-to={}", schedule.display());
+    let replay = format!("--replay-schedule-from={}", schedule.display());
+    for (label, flag) in [("record", record.as_str()), ("replay", replay.as_str())] {
+        let run = directory.path().join(label);
+        fs::create_dir_all(&run).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=info",
+                "run",
+                "--strict",
+                flag,
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                "kill",
+            ]),
+            &run,
+            Duration::from_secs(150),
+            false,
+        );
+        // The delivery was re-admitted by the bound, not at a quiescence.
+        assert!(
+            log.contains("the work runnable at its deferral has run"),
+            "{label}: the bound did not re-admit the delivery:\n{log}"
+        );
+        let stdout = fs::read_to_string(run.join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{label}: {stdout}\n{log}"
+        );
+        assert_eq!(
+            stdout, "mode=kill exited=0 code=0 signaled=1 sig=9 handled=0\n",
+            "{label}: {log}"
+        );
+    }
+}
+
 /// A child-exit `SIGCHLD` ends a `pause` or `nanosleep` only as Linux delivery
 /// would: caught and unblocked, it ends the call (EINTR); blocked, or with its
 /// default (ignore) action, the call goes on, a pause until its `SIGALRM`, a
@@ -52766,6 +52918,78 @@ fn a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_w
         assert!(
             log.contains(":: Success: deterministic. Determinism verified."),
             "{mode}: verification failed:\n{log}"
+        );
+    }
+}
+
+/// A parent SIGKILLs a forked child that shares a non-robust process-shared
+/// mutex with it, while a contender thread in the parent keeps locking that
+/// mutex with a timeout until the parent has reaped the child
+/// (`tests/c/sigkill_robust_pshared.c` in `plain` mode). The contender never
+/// blocks for long, so the parent's `SIGCHLD`, deferred until no other work
+/// was runnable, waited forever, and these chaos seeds ran to their timeout
+/// (https://github.com/rrnewton/hermit/issues/4132). Each now exits 0 after
+/// reaping a child killed by SIGKILL, as every native run does, and reaches
+/// canonical bitwise parity.
+///
+/// PMU REQUIRED. The child spins inside and outside its critical section with
+/// no syscall, so only the PMU timer preempts it, and a spinner can end a run
+/// in a typed skid-overshoot refusal: the runs are retried through
+/// `run_pmu_spinner_retrying_skid`, test.cli and test.cli_on_host skip this
+/// case by exact name, and privileged-test.pmu_cli_cases runs it.
+#[test]
+fn a_parent_reaps_its_sigkilled_child_beside_a_contender_that_never_blocks() {
+    let _guard = hermit_run_guard();
+    let guest = sigkill_robust_pshared_guest().to_str().unwrap().to_owned();
+    for (seed, delay_us, hold_spins) in [("--seed=3", "20000", "100"), ("--seed=1", "10000", "300")]
+    {
+        let check = |stdout: &str| {
+            assert!(
+                stdout.is_empty() || stdout.starts_with("mode=plain "),
+                "{seed}: a refused attempt printed {stdout:?}"
+            );
+        };
+        let SpinnerRun {
+            status,
+            stdout,
+            stderr: log,
+        } = run_pmu_spinner_retrying_skid(
+            "a_parent_reaps_its_sigkilled_child_beside_a_contender_that_never_blocks",
+            &[
+                "run",
+                "--strict",
+                "--chaos",
+                "--preemption-timeout=1000",
+                seed,
+                "--verify",
+                "--verify-strict",
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                "plain",
+                delay_us,
+                hold_spins,
+            ],
+            Duration::from_secs(150),
+            check,
+        );
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{seed}: stdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert!(
+            stdout.starts_with("mode=plain signaled=1 sig=9 "),
+            "{seed}: {stdout}\n{log}"
+        );
+        assert!(
+            log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+            "{seed}: comparison was not canonical:\n{log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{seed}: verification failed:\n{log}"
         );
     }
 }

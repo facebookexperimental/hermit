@@ -2786,6 +2786,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/sigchld_busy_sibling.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/sigchld_busy_sibling.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks compiles this guest, whose parent reaps a child it SIGKILLed, a child that exited, or one whose SIGCHLD handler it waited for in sigsuspend(), while a sibling thread calls sched_yield until the parent is done, and requires each mode's native output at canonical bitwise parity (https://github.com/rrnewton/hermit/issues/4132); it remains a guest fixture because its CLI test checks the exact status and stdout of strict runs."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/sigchld_once.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/sigchld_once.c is owned by hermit-cli/tests/cli.rs: the CLI test each_child_exit_gives_its_parent_one_sigchld runs it natively and at bitwise parity on ptrace and SaBRe, and requires one child exit to give its parent exactly one SIGCHLD with Linux's siginfo (CLD_EXITED, the child's pid and exit status). SaBRe delivered two, the scheduler's copy and the kernel's, the second at a host-timed point (dev-hermit minibeads dh-l1fk). It stays a fixture because a generic manifest cannot assert the guest's own SIGCHLD count and siginfo."
@@ -2801,6 +2807,12 @@
       "path": "tests/c/sigkill_cross_process.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/sigkill_cross_process.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests a_cross_process_sigkill_verifies_at_bitwise_parity, a_cross_process_sigkill_of_a_child_or_own_group_verifies_at_bitwise_parity, a_cross_process_sigkill_edge_case_verifies_at_bitwise_parity, a_cross_process_sigkill_notification_verifies_at_bitwise_parity, a_late_or_vectored_sigkill_notification_read_verifies_at_bitwise_parity and a_positioned_or_self_read_sigkill_notification_verifies_at_bitwise_parity (one mode table, split so each stays inside the per-test CPU and wall budgets, https://github.com/rrnewton/hermit/issues/4220 and https://github.com/rrnewton/hermit/issues/4783) compile this guest, in which a process kills its parent with SIGKILL (with and without a bystander process taking scheduler turns), and requires five consecutive `run --strict --verify --verify-strict` runs per mode to reach canonical bitwise parity and print how the parent ended (https://github.com/rrnewton/hermit/issues/3994); it remains a guest fixture because a manifest cell runs one verified run, while this regression needs repeated runs to show the retirement no longer lands at a host-chosen position."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/sigkill_robust_pshared.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/sigkill_robust_pshared.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_parent_reaps_its_sigkilled_child_beside_a_contender_that_never_blocks compiles this guest, whose parent SIGKILLs a forked child sharing a process-shared mutex with it while a contender thread keeps locking that mutex, and requires its plain mode to finish at chaos seeds that used to starve the parent's SIGCHLD (https://github.com/rrnewton/hermit/issues/4132); it remains a guest fixture because its CLI test checks the status, the stdout prefix and the bitwise parity of strict chaos runs."
     },
     {
       "disposition": "manifest-test",

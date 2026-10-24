@@ -631,6 +631,9 @@ impl Scheduler {
                     self.child_exit_publications_pending.insert(process);
                     self.sigkill.unpublished.insert(process);
                 }
+                // The kernel's copy is pending at a point the schedule fixes
+                // (`BlockedPool::sigchld_fenced`).
+                self.blocked.sigchld_fenced.insert(parent);
             }
             super::ChildExitNotification::Deliver | super::ChildExitNotification::Undecided => {
                 // The kernel sends the parent its own SIGCHLD too, once the
@@ -644,6 +647,9 @@ impl Scheduler {
                 {
                     self.child_exit_publications_pending.insert(process);
                     self.sigkill.unpublished.insert(process);
+                }
+                if self.backend.reports_child_exit_publication {
+                    self.blocked.sigchld_fenced.insert(parent);
                 }
                 self.child_exit_sigchld.exit_status.insert(
                     process,

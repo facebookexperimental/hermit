@@ -939,7 +939,7 @@ impl Scheduler {
                 // that delivery stands for this exit: commit it now instead of
                 // sending a second one, which would also find the thread in no
                 // pool at all.
-                self.blocked.sigchld_deferred.remove(&deferred);
+                self.undefer_sigchld(deferred);
                 self.blocked.sigchld_ready.insert(deferred);
                 self.readmit_ready_thread(deferred);
                 if let SignalTimerId::ChildExit { child, .. } = id {

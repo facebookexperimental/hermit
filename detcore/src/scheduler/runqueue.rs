@@ -392,6 +392,24 @@ impl RunQueue {
             .any(|(k, v)| v.tid != exclude && !v.counts_as_poller(k.priority))
     }
 
+    /// The queued threads besides `exclude` that [`Self::has_runnable_besides`]
+    /// counts as work, in thread order. Read-only.
+    pub fn runnable_besides(&self, exclude: DetTid) -> BTreeSet<DetTid> {
+        self.queue
+            .iter()
+            .filter(|(k, v)| v.tid != exclude && !v.counts_as_poller(k.priority))
+            .map(|(_, v)| v.tid)
+            .collect()
+    }
+
+    /// Whether `tid` is queued as work in the sense of
+    /// [`Self::has_runnable_besides`]: queued, and not a poller. Read-only.
+    pub fn holds_work(&self, tid: DetTid) -> bool {
+        self.queue
+            .iter()
+            .any(|(k, v)| v.tid == tid && !v.counts_as_poller(k.priority))
+    }
+
     /// True when every queued thread is a poller (or the queue is empty): the
     /// "no deterministic work is runnable" test of the deterministic-work-first
     /// gates. A poller is a polling entry (`push_poller`) whose backoff has
