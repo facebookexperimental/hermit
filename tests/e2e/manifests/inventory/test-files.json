@@ -1903,6 +1903,12 @@
       "why": "tests/c/private_dev_shm.c is owned by hermit-cli/tests/cli.rs: a_run_gets_a_private_empty_dev_shm runs it under ptrace, --strict and not, and requires a private, empty /dev/shm (a mode-1777 tmpfs mounted nosuid,nodev whose mount row names no host user) in which a POSIX shared memory object can be created exclusively under the name of a host object the guest neither sees nor changes, and that --bind /dev/shm shows the host object; concurrent_runs_do_not_share_dev_shm runs it twice at once and requires the second run to find /dev/shm empty and create the name the first holds. It stays a fixture because the tests compare against host state and coordinate two runs."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/private_ipc.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/private_ipc.c is owned by hermit-cli/tests/cli.rs: a_run_gets_a_private_ipc_namespace runs it under ptrace, --strict and not, and under --namespace-only, and requires an empty /dev/mqueue (a fresh mqueue mount, nosuid,nodev,noexec) in which a message queue can be created exclusively under the name of a host queue the guest neither sees nor removes, ENOSYS from the System V and mq_* calls under Detcore, and, under --namespace-only, exclusive creates of the System V key and mq_open name the host already uses; a bind of the host's /dev/mqueue shows the host queue. concurrent_runs_do_not_share_ipc runs it twice at once in both modes and requires the second run to create what the first holds. It stays a fixture because the tests compare against host state and coordinate two runs."
+    },
+    {
       "disposition": "support-data",
       "path": "tests/c/probe_family.h",
       "runner": "C guests that include probe_family.h",

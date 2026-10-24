@@ -1508,7 +1508,7 @@ pub(super) fn namespace_container(
 ) -> Container {
     let mut container = Container::new();
     container
-        .unshare(Namespace::PID)
+        .unshare(GUEST_NAMESPACES)
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local")
@@ -1520,6 +1520,18 @@ pub(super) fn namespace_container(
     apply_affinity(&mut container, pin_threads, cpu_profile_source);
     container
 }
+
+/// The namespaces a guest's container makes besides the user, mount and UTS
+/// ones its setup adds (and the network one of `--network local`): its own
+/// PID namespace, and its own IPC namespace, empty, so that the guest shares
+/// System V IPC objects and POSIX message queues with neither the host nor
+/// another run. Every run of a program gets the same PIDs and random bytes,
+/// so a program that keys or names such objects after them chooses the same
+/// keys and names in every run. Detcore refuses the System V and `mq_*`
+/// calls (`is_unsupported_async_ipc_syscall`), but a guest still reaches the
+/// namespace's message queues through its mqueue filesystem
+/// ([`private_mqueue`]), and a `--namespace-only` guest reaches all of it.
+pub(super) const GUEST_NAMESPACES: Namespace = Namespace::PID.union(Namespace::IPC);
 
 /// The container's own `/proc`, a new procfs of its PID namespace.
 pub(super) fn container_proc_mount() -> Mount {
@@ -1548,17 +1560,64 @@ pub(super) const GUEST_DEV_SHM: &str = "/dev/shm";
 /// `None` where one of the caller's mounts at `covering` covers `/dev/shm` (a
 /// mount at `/dev/shm`, `/dev` or `/`, which replaces it; `--bind /dev/shm`
 /// keeps the host's), or where the host has no `/dev/shm` to cover.
-pub(super) fn private_dev_shm<'a>(mut covering: impl Iterator<Item = &'a Path>) -> Option<Mount> {
+pub(super) fn private_dev_shm<'a>(covering: impl Iterator<Item = &'a Path>) -> Option<Mount> {
     let target = Path::new(GUEST_DEV_SHM);
-    let resolved = canonical_mount_target(target);
-    if !target.is_dir() || covering.any(|user| resolved.starts_with(canonical_mount_target(user))) {
-        return None;
-    }
-    Some(
+    is_uncovered_directory(target, covering).then(|| {
         Mount::tmpfs(target)
             .source("tmpfs")
-            .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_STRICTATIME),
-    )
+            .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_STRICTATIME)
+    })
+}
+
+/// Whether the host has a directory at guest path `target` for a mount of
+/// Hermit's own to cover, and none of the caller's mounts at `covering` covers
+/// it (a mount at `target` or at one of its ancestors, which replaces it).
+fn is_uncovered_directory<'a>(target: &Path, mut covering: impl Iterator<Item = &'a Path>) -> bool {
+    let resolved = canonical_mount_target(target);
+    target.is_dir() && !covering.any(|user| resolved.starts_with(canonical_mount_target(user)))
+}
+
+/// Where Linux distributions mount the mqueue filesystem, which lists the IPC
+/// namespace's POSIX message queues as files.
+pub(super) const GUEST_DEV_MQUEUE: &str = "/dev/mqueue";
+
+/// The guest's own `/dev/mqueue`, a fresh mount of the mqueue filesystem of
+/// its IPC namespace ([`GUEST_NAMESPACES`]) over the host's, which lists, and
+/// lets a guest create, open and unlink, the host's queues: Detcore refuses
+/// `mq_open`, but not an `open` of `/dev/mqueue/NAME` with `O_CREAT`, which
+/// creates a queue. It is mounted as systemd mounts it (`nosuid`, `nodev`,
+/// `noexec`), last in the plan: nothing is mounted into it and no mount's
+/// source is in it.
+///
+/// `None` where one of the caller's mounts at `user_targets` covers
+/// `/dev/mqueue` (a mount at `/dev/mqueue`, `/dev` or `/`; a bind of the
+/// host's `/dev/mqueue` keeps the host's queues there), or where the host has
+/// no `/dev/mqueue`. A caller's mount below `/dev/mqueue`, which the private
+/// mount would cover, is refused.
+pub(super) fn private_mqueue<'a>(
+    user_targets: impl Iterator<Item = &'a Path> + Clone,
+) -> Result<Option<Mount>, Error> {
+    let target = Path::new(GUEST_DEV_MQUEUE);
+    if !is_uncovered_directory(target, user_targets.clone()) {
+        return Ok(None);
+    }
+    let resolved = canonical_mount_target(target);
+    if let Some(below) = user_targets
+        .into_iter()
+        .find(|user| canonical_mount_target(user).starts_with(&resolved))
+    {
+        anyhow::bail!(
+            "cannot mount at {}: the guest's /dev/mqueue is its own mqueue filesystem, which \
+             would cover it; mount at /dev/mqueue itself to replace it",
+            below.display()
+        );
+    }
+    Ok(Some(
+        Mount::new(target)
+            .source("mqueue")
+            .fstype("mqueue")
+            .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC),
+    ))
 }
 
 /// Whether guest path `path` is `/dev/shm` itself.
@@ -1665,7 +1724,7 @@ pub(super) fn image_container(
 ) -> Result<(Container, IdentityGuard), Error> {
     let mut container = Container::new();
     container
-        .unshare(Namespace::PID)
+        .unshare(GUEST_NAMESPACES)
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local")

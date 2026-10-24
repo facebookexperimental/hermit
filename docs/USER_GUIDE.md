@@ -24,7 +24,7 @@ Hermit supports x86_64 Linux. It requires:
 
 - A Rust nightly toolchain. The repository's `rust-toolchain.toml` selects it
   automatically when Rust is managed by `rustup`.
-- Linux user, PID, and mount namespaces.
+- Linux user, PID, IPC, and mount namespaces.
 - Parent-child `ptrace` and seccomp filter support.
 - `libunwind` and LZMA development libraries.
 - User-space performance counters for precise thread preemption. Hermit can
@@ -190,7 +190,8 @@ starts instead of drawing that input from the host.
 - makes I/O completion behavior deterministic;
 - virtualizes time, random inputs, CPUID, and selected file metadata;
 - rejects syscalls classified Unsupported instead of forwarding them silently;
-- gives the guest an isolated PID namespace and `/tmp`;
+- gives the guest isolated PID and IPC namespaces, `/tmp`, `/dev/shm` and
+  `/dev/mqueue`;
 - uses an isolated local network namespace;
 - exposes most of the host file system read/write.
 
@@ -1136,6 +1137,22 @@ through it, `--bind DIR:/dev/shm` uses host directory `DIR` instead, and a
 the host's `/dev/shm`, an `--image` run has none, and `hermit replay` does not
 make one, as it answers the guest's calls from the recording.
 
+Every run and recording also gets its own IPC namespace, empty, and a fresh
+mqueue filesystem of it at `/dev/mqueue`, mounted as systemd mounts it
+(`nosuid`, `nodev`, `noexec`). Detcore refuses System V IPC and the `mq_*`
+calls with `ENOSYS`, as a kernel built without them would, but a guest can
+still list, create, open and remove POSIX message queues as files in
+`/dev/mqueue`: those are now its own, not the host's or another run's. A
+`--namespace-only` guest, whose System V and `mq_*` calls reach the kernel,
+likewise gets keys and names that no other run or host process holds; it no
+longer reaches the host's System V objects or message queues, which only a
+`--no-namespace` run, sharing the host's IPC namespace, still does. A
+`--mount` at `/dev/mqueue`, `/dev` or `/` replaces the private mqueue mount,
+and `--mount type=bind,source=/dev/mqueue,target=/dev/mqueue` shows the
+host's queues there; a mount below `/dev/mqueue` is refused. `hermit replay`
+gets the IPC namespace but no private `/dev/mqueue`, and an `--image` run's
+minimal `/dev` has none.
+
 DBT reserves `/tmp/.hermit-dbt-stats-N` for its current run's statistics, choosing
 the lowest number that does not overlap a declared bind target. The backing
 capture remains private to that run. With `--tmp=DIR`, this can create an empty
@@ -1149,9 +1166,10 @@ host's live table. It is the same on every backend, and in every run as long as
 the mounts it lists (and, under `--no-namespace`, the mounts holding the working
 directory and `/tmp`) do not change on the host between runs. In Hermit's
 container it lists the mounts Hermit installed (its `/proc`, `/tmp`,
-`/dev/shm`, identity files and your `--mount` and `--bind` targets), the
-ancestors of those mounts, and the base mountpoints `/`, `/proc`, `/dev`,
-`/dev/pts`, `/dev/shm`, `/dev/mqueue`, `/sys`, `/sys/fs/cgroup` and `/run` where
+`/dev/shm`, `/dev/mqueue`, identity files and your `--mount` and `--bind`
+targets), the ancestors of those mounts, and the base mountpoints `/`, `/proc`,
+`/dev`, `/dev/pts`, `/dev/shm`, `/dev/mqueue`, `/sys`, `/sys/fs/cgroup` and
+`/run` where
 they are mounted. A filesystem Hermit or a `--mount` mounts afresh in the
 container (not a bind) shows no `uid=` or `gid=` option for the host user who
 ran Hermit, as the same mount made by root shows none; a `--namespace-only`
@@ -1527,12 +1545,12 @@ it into guest `/tmp`. Hermit's startup error names this case explicitly.
 
 ### Namespace Setup Fails With EPERM
 
-Hermit needs unprivileged user, PID, and mount namespace support. Container
+Hermit needs unprivileged user, PID, IPC, and mount namespace support. Container
 runtimes and hardened hosts may disable these facilities. A useful host probe
 is:
 
 ```bash
-unshare --user --map-root-user --pid --mount --fork true
+unshare --user --map-root-user --pid --ipc --mount --fork true
 ```
 
 If that fails, adjust the host or container policy. Running Hermit as root is

@@ -1639,10 +1639,11 @@ pub(super) fn conclude_dbt_verification(
 const DYNAMORIO_CONFIG_DIR_ENV: &str = "DYNAMORIO_CONFIGDIR";
 
 /// Each physical DBT run is the init of its own container, the one every
-/// backend uses (`RunOpts::launch_in_container`): PID, UTS, mount and
-/// network namespaces, a private /tmp and the identity mounts. Under
-/// `--no-namespace` it is a plain child. The coordinator runtime is created
-/// inside, so its workers and the guest share those namespaces.
+/// backend uses (`RunOpts::launch_in_container`): PID, IPC, UTS, mount and
+/// network namespaces, a private /tmp, /dev/shm and /dev/mqueue and the
+/// identity mounts. Under `--no-namespace` it is a plain child. The coordinator
+/// runtime is created inside, so its workers and the guest share those
+/// namespaces.
 #[cfg(feature = "dbt")]
 struct DbtExecution {
     options: super::run::RunOpts,

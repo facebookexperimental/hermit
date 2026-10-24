@@ -438,6 +438,82 @@ fn record_replay_gives_the_guest_a_private_dev_shm() {
     );
 }
 
+/// A recording's guest gets its own IPC namespace and `/dev/mqueue`, as
+/// `hermit run`'s does: it neither lists the host's message queues nor leaves
+/// its own in the host's namespace, and its replay matches.
+#[test]
+fn record_replay_gives_the_guest_a_private_ipc_namespace() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let host_queue =
+        Path::new("/dev/mqueue").join(format!("hermit-record-host-queue-{}", std::process::id()));
+    // One one-byte message at most, far below the user's RLIMIT_MSGQUEUE.
+    let c_name = std::ffi::CString::new(format!(
+        "/{}",
+        host_queue.file_name().unwrap().to_str().unwrap()
+    ))
+    .unwrap();
+    // SAFETY: an all-zero mq_attr is valid; the fields set are the ones
+    // mq_open reads.
+    let mut attributes: libc::mq_attr = unsafe { std::mem::zeroed() };
+    attributes.mq_maxmsg = 1;
+    attributes.mq_msgsize = 1;
+    // SAFETY: the name is NUL-terminated and the attributes outlive the call.
+    let queue = unsafe {
+        libc::mq_open(
+            c_name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600,
+            &mut attributes as *mut libc::mq_attr,
+        )
+    };
+    assert!(
+        queue != -1,
+        "failed to create a host message queue: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: the descriptor was just opened here.
+    unsafe { libc::mq_close(queue) };
+    assert!(
+        host_queue.exists(),
+        "/dev/mqueue is not the mqueue mount of this process's IPC namespace"
+    );
+    // Removed when dropped, however the test ends.
+    struct Remove<'a>(&'a Path);
+    impl Drop for Remove<'_> {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.0);
+        }
+    }
+    let _remove = Remove(&host_queue);
+    let guest_queue = format!("hermit-record-guest-queue-{}", std::process::id());
+    let script = format!(
+        "ls -A /dev/mqueue | wc -l && : > /dev/mqueue/{guest_queue} && ls /dev/mqueue \
+         && rm /dev/mqueue/{guest_queue}"
+    );
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--", "/bin/sh", "-c", &script]);
+    let output = command_output(command, "record/replay in a private IPC namespace");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!("0\n{guest_queue}\n")),
+        "the guest's /dev/mqueue was not its own and empty:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+    assert!(host_queue.exists(), "the guest removed the host's queue");
+}
+
 /// Records `script` with standard output `record_stdout`, then lets `prepare`
 /// reset host state and replays the recording with `--autopilot` and standard
 /// output `replay_stdout`, returning the replay's output.

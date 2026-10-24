@@ -127,7 +127,7 @@ gates a different set of tests.
 | **PMU availability** | Deterministic preemption counts **retired conditional branches (RCBs)** via the CPU performance-monitoring unit. Many VMs and restricted containers do not expose a usable PMU. | `perf stat -e branches true`; see failure signatures below |
 | **perf permissions** | Even with a PMU, the kernel must allow `perf_event_open` for the user. | `cat /proc/sys/kernel/perf_event_paranoid` (lower is more permissive; `<= 1` is typically required for unprivileged use) |
 | **CPUID interception** | RDRAND/RDSEED masking and CPUID virtualization rely on CPUID faulting. Some virtualized hosts prevent the fault from taking effect or expose unexpected feature bits. | Requires CPUID-faulting support; see `rdrand_rdseed_is_masked` below |
-| **User/mount namespaces** | Hermit builds the guest container from user, mount, PID, and UTS namespaces. Many container runtimes and hardened hosts block these. | `unshare --user --map-root-user --mount true` |
+| **User/mount namespaces** | Hermit builds the guest container from user, mount, PID, IPC, and UTS namespaces. Many container runtimes and hardened hosts block these. | `unshare --user --map-root-user --ipc --mount true` |
 
 Because the axes are independent, describe an environment by its capabilities,
 not by a single "supported/unsupported" label.

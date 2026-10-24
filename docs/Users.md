@@ -42,10 +42,12 @@ unsolicited file descriptors inherited from its caller. Pass guest inputs throug
 the documented file, mount and standard-stream options. An operating system that
 cannot perform this descriptor cleanup is refused before a guest starts.
 
-Each `hermit run` gets its own empty `/tmp` and `/dev/shm` (a recording, its
-own `/dev/shm`), so files and POSIX shared memory objects do not pass between
-concurrent runs, or between a run and the host, unless you bind them in
-(`--bind`, see [USER_GUIDE.md](USER_GUIDE.md)).
+Each `hermit run` gets its own empty `/tmp`, `/dev/shm` and IPC namespace (a
+recording, its own `/dev/shm` and IPC namespace), so files, POSIX shared
+memory objects and message queues do not pass between concurrent runs, or
+between a run and the host, unless you bind them in: `--bind` for files and
+shared memory objects, `--mount type=bind,source=/dev/mqueue,target=/dev/mqueue`
+for message queues (see [USER_GUIDE.md](USER_GUIDE.md)).
 
 ## Further reading
 

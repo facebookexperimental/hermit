@@ -46,6 +46,7 @@ use super::container::identity_hardening_mounts;
 use super::container::is_below_dev_shm;
 use super::container::namespace_container;
 use super::container::private_dev_shm;
+use super::container::private_mqueue;
 use super::container::refuse_bind_from_host_dev_shm;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
@@ -537,6 +538,9 @@ impl StartOpts {
             into_dev_shm
                 .into_iter()
                 .map(|mount| PlannedMount::hermit(mount.clone().touch_target())),
+        );
+        plan.extend(
+            private_mqueue(self.mount.iter().map(Mount::get_target))?.map(PlannedMount::hermit),
         );
         identity_guard.set_plan(&mut container, plan)?;
         if let Some(workdir) = &self.workdir {

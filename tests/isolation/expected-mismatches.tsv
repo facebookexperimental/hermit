@@ -95,7 +95,6 @@ ptrace,dbt,sabre,liteinst,in-guest-trap,kvm,e9patch	namespace.cgroup.native_gues
 kvm	namespace.cgroup.pidN_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
 kvm	namespace.cgroup.pidN_task/N_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
 kvm	namespace.ipc.host_separation	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
-ptrace,dbt,sabre,liteinst,in-guest-trap,e9patch	namespace.ipc.host_separation	mismatch	https://github.com/rrnewton/hermit/issues/4459	the container makes no IPC namespace
 ptrace,dbt,sabre,liteinst,in-guest-trap,kvm,e9patch	namespace.ipc.native_guest	no_result	https://github.com/rrnewton/hermit/issues/4465	the native census needs /proc/<pid>/task/<tid>/children, which the kernel lacks
 kvm	namespace.ipc.pidN_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation
 kvm	namespace.ipc.pidN_task/N_alias	no_result	https://github.com/rrnewton/hermit/issues/4282	KVM's own /proc refuses the observation

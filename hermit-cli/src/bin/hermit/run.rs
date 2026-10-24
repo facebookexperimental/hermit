@@ -69,10 +69,10 @@ use reverie::process::Container;
 use reverie::process::ExitStatus;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
-use reverie::process::Namespace;
 use reverie::process::Output;
 
 use super::container::GUEST_DEV_SHM;
+use super::container::GUEST_NAMESPACES;
 use super::container::HostLayout;
 use super::container::IdentityGuard;
 use super::container::LogCapExceeded;
@@ -88,6 +88,7 @@ use super::container::is_dev_shm;
 use super::container::is_in_dev_shm;
 use super::container::namespace_container;
 use super::container::private_dev_shm;
+use super::container::private_mqueue;
 use super::container::refuse_bind_from_host_dev_shm;
 use super::container::refuse_covered_bind_source;
 use super::global_opts::GlobalOpts;
@@ -12843,12 +12844,12 @@ impl RunOpts {
         }
     }
 
-    /// Run `work` as the init of this run's container: the PID, UTS, mount and
-    /// network namespaces, private /tmp and identity mounts that every backend
-    /// shares, or a plain child under `--no-namespace`. `work` receives the
-    /// parent-held `guards`, the container's identity mounts, and any explicitly
-    /// enrolled native run. An adapter that cannot consume a native run must
-    /// refuse it.
+    /// Run `work` as the init of this run's container: the PID, IPC, UTS, mount
+    /// and network namespaces, private /tmp, /dev/shm and /dev/mqueue and
+    /// identity mounts that every backend shares, or a plain child under
+    /// `--no-namespace`. `work` receives the parent-held `guards`, the
+    /// container's identity mounts, and any explicitly enrolled native run. An
+    /// adapter that cannot consume a native run must refuse it.
     pub(super) fn launch_in_container<G, F, T>(
         &self,
         guards: G,
@@ -12992,7 +12993,7 @@ impl RunOpts {
 
         let mut command = self.namespace_only_guest_command()?;
         // `--namespace-only` does NOT go through `with_container`: it unshares
-        // `Namespace::PID` and execs the guest directly, so the guest process
+        // the guest's PID and IPC namespaces and execs the guest directly, so the guest process
         // ITSELF becomes PID 1 of the new namespace and inherits the same
         // undeliverable-signal protection. An adversarial review found this
         // second launch path after the `with_container` guards were in place --
@@ -13055,7 +13056,7 @@ impl RunOpts {
                 .pre_exec(move || super::container::install_group_kill_filter(&filter, guest_end));
         }
         command
-            .unshare(Namespace::PID)
+            .unshare(GUEST_NAMESPACES)
             .map_root()
             .hostname("hermetic-container.local")
             .domainname("local")
@@ -14014,8 +14015,8 @@ impl RunOpts {
     /// `--bind`s not below `/dev/shm` (a backend adapter's own last, marked as
     /// a backend's); the e9patch overlay (a backend's own); the private `/tmp`
     /// here only when its directory is in the host's `/dev/shm`; the private
-    /// `/dev/shm`; the caller's mounts and binds below it; and the private
-    /// `/tmp`.
+    /// `/dev/shm`; the caller's mounts and binds below it; the private `/tmp`;
+    /// and the private `/dev/mqueue`.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
         self.mounts_on(tmpfs, HostLayout::of_host())
     }
@@ -14251,6 +14252,9 @@ impl RunOpts {
         mounts.extend(dev_shm.map(PlannedMount::hermit));
         mounts.extend(into_dev_shm);
         mounts.extend(private_tmp);
+        mounts.extend(
+            private_mqueue(self.mount.iter().map(Mount::get_target))?.map(PlannedMount::hermit),
+        );
 
         Ok(PreparedMounts {
             mounts,

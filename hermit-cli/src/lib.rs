@@ -833,7 +833,7 @@ fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
     if pid == 0 {
         let supported = match probe {
             CapabilityProbe::Namespaces => unsafe {
-                libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) == 0
+                libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID | libc::CLONE_NEWIPC) == 0
             },
             CapabilityProbe::Ptrace => {
                 // SAFETY: PTRACE_TRACEME ignores the pid and address arguments.
@@ -890,13 +890,13 @@ fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
     }
 }
 
-/// Whether a run creates Hermit's user and PID namespaces. A `--no-namespace`
+/// Whether a run creates Hermit's user, PID and IPC namespaces. A `--no-namespace`
 /// run starts the guest as a plain child and never calls `unshare`, so the
 /// namespace probe says nothing about whether it can run
 /// (<https://github.com/rrnewton/hermit/issues/4515>).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NamespaceUse {
-    /// The run unshares its user and PID namespaces (the default).
+    /// The run unshares its user, PID and IPC namespaces (the default).
     Creates,
     /// The run creates no namespace (`--no-namespace`).
     None,
@@ -917,9 +917,10 @@ fn check_tracing_environment(
 ) -> Result<(), Error> {
     if namespaces == NamespaceUse::Creates && !probe(CapabilityProbe::Namespaces)? {
         anyhow::bail!(
-            "Hermit cannot create its required user and PID namespaces: \
-             unshare(CLONE_NEWUSER | CLONE_NEWPID) was denied. Allow unprivileged user namespaces \
-             and the unshare syscall in the host/container policy."
+            "Hermit cannot create its required user, PID and IPC namespaces: \
+             unshare(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWIPC) was denied. Allow unprivileged \
+             user namespaces, IPC namespaces (user.max_ipc_namespaces) and the unshare syscall in \
+             the host/container policy."
         );
     }
     if !probe(CapabilityProbe::Ptrace)? {
@@ -6748,9 +6749,9 @@ mod tests {
         let denied = [CapabilityProbe::Namespaces];
         let (refusal, ran) = check_with_denied(NamespaceUse::Creates, &denied);
         assert!(
-            refusal
-                .as_deref()
-                .is_some_and(|refusal| refusal.contains("unshare(CLONE_NEWUSER | CLONE_NEWPID)")),
+            refusal.as_deref().is_some_and(|refusal| {
+                refusal.contains("unshare(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWIPC)")
+            }),
             "{refusal:?}"
         );
         assert_eq!(ran, [CapabilityProbe::Namespaces]);
