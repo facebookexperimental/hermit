@@ -536,11 +536,27 @@ impl RunData {
         Ok(Self::new(aopts, runname, ro))
     }
 
-    /// Create the initial target attempt without an analyze trial bound.
-    /// The run arguments' own timeout still applies.
+    /// Create the initial target attempt. `auto` does not bound it: the
+    /// trials' bound derives from it; the run arguments' own timeout still
+    /// applies. With --run1-preemptions it replays a copy of the record in the
+    /// workspace, because the guest's container does not see the host's
+    /// /tmp, where records often are; that replay can hang like any other,
+    /// so an explicit --trial-timeout bounds it.
     pub fn new_run1_target(aopts: &AnalyzeOpts, runname: String) -> anyhow::Result<Self> {
         let ro = Self::get_run1_runopts(aopts)?;
-        Ok(Self::new_unbounded(aopts, runname, ro))
+        let mut run = Self::new_unbounded(aopts, runname, ro);
+        if let Some(record) = &aopts.run1_preemptions {
+            let copy = run.root_path().with_extension(PREEMPTS_EXT);
+            std::fs::copy(record, &copy).with_context(|| {
+                format!(
+                    "cannot copy --run1-preemptions {} into the workspace",
+                    record.display()
+                )
+            })?;
+            run = run.with_preempts_path_in(copy);
+            run.apply_trial_bound();
+        }
+        Ok(run)
     }
 
     /// Replay with the selected run's seeds and the original replay policy.
@@ -691,10 +707,9 @@ impl RunData {
         let mut ro = Self::get_base_runopts(aopts)?;
 
         // If there was a --sched-seed specified in run_args, it is overridden by this setting:
+        // --run1-preemptions: `new_run1_target` replays a workspace copy.
         if let Some(seed) = aopts.run1_seed {
             ro.det_opts.det_config.seed = seed;
-        } else if let Some(path) = &aopts.run1_preemptions {
-            ro.det_opts.det_config.replay_preemptions_from = Some(path.clone());
         }
         Ok(ro)
     }
@@ -2136,6 +2151,43 @@ mod tests {
             );
             assert!(format!("{error:#}").contains(expected), "{error:#}");
         }
+    }
+
+    /// The target run of `--run1-preemptions` replays a copy of the record in
+    /// the workspace (the guest's container does not see the host's /tmp),
+    /// and an explicit `--trial-timeout` bounds it.
+    #[test]
+    fn a_recorded_target_run_replays_a_workspace_copy_within_an_explicit_bound() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let record = elsewhere.path().join("target.preempts");
+        std::fs::write(&record, "{}").unwrap();
+        let run1_preemptions = format!("--run1-preemptions={}", record.display());
+        let args = crate::Args::try_parse_from([
+            "hermit",
+            "analyze",
+            "--trial-timeout=7",
+            run1_preemptions.as_str(),
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("not analyze")
+        };
+        options.apply_global(&args.global);
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let run = RunData::new_run1_target(&options, "run1_target".to_string()).unwrap();
+        let replayed = run
+            .runopts
+            .det_opts
+            .det_config
+            .replay_preemptions_from
+            .clone();
+        let copy = workspace.path().join("run1_target.preempts");
+        assert_eq!(replayed.as_deref(), Some(copy.as_path()));
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "{}");
+        assert_eq!(run.runopts.run_timeout(), Some(Duration::from_secs(7)));
     }
 
     /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding

@@ -210,6 +210,7 @@ deterministic execution.
 | Message | Class | Trigger | Fix |
 | --- | --- | --- | --- |
 | `cannot search through executions with --no-sequentialize-threads. Determinism required` | Configuration | Analyze was asked to search without deterministic scheduling. | Remove `--no-sequentialize-threads`. |
+| `the replay of --run1-preemptions ... did not meet the target criteria` | Configuration | The record did not reproduce the target under these run arguments. | Pass the run arguments the record was made with after `--`, `--seed` included, or identify the target with `--run1-seed`. |
 | `FAILED. The run did not match the target criteria. Try --search.` | Configuration | A single analyze execution did not satisfy its target predicate. | Correct the predicate/input or add `--search`. |
 | `Hermit refused analysis run ...; no program outcome was established`, exit 122 | Unsupported / Configuration | A typed policy refusal stopped a target, baseline or replay trial. It supplies no completed outcome and cannot establish a causal candidate. An ordinary guest exit 122 is distinct. | Inspect the named refusal in the error chain and the indicated trial log or stderr. Use a supported operation or configuration before retrying; captured stacks alone do not prove completion. |
 | `First run matched criteria but second run did not` | Configuration | A supposed target execution is not reproducible. | Fix external inputs and unsupported calls before minimizing. Pin `--analyze-seed` and workload inputs. |

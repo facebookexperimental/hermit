@@ -155,6 +155,9 @@ pub struct AnalyzeOpts {
     pub run1_seed: Option<u64>,
 
     /// Load target execution from hermit run --record-preemptions-to.
+    ///
+    /// Analyze replays the record as the target run. It is an error if that replay does not meet
+    /// the indicated target criteria.
     #[clap(
         long,
         conflicts_with = "run1_seed",
@@ -240,13 +243,14 @@ pub struct AnalyzeOpts {
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
 
-    /// Wall-clock bound on each run after the initial target attempt: a positive number of
-    /// seconds, `auto` (the default), or `off`.
+    /// Wall-clock bound on each run after the initial target attempt (and, when explicit, on the
+    /// replay of a `--run1-preemptions` record): a positive number of seconds, `auto` (the
+    /// default), or `off`.
     ///
     /// With `auto`, the initial run and completed target/baseline endpoint runs are measured.
     /// Later runs are bounded at max(60 s, 10 times the slowest measured run), rounded up to
-    /// whole seconds. With `--run1-preemptions`, no initial run is made: automatic bounds wait
-    /// for a measured replay, so use an explicit number to bound trials immediately.
+    /// whole seconds. With `--run1-preemptions`, the initial run is a replay of the record: it
+    /// is measured like a seed's, and an explicit number bounds it too.
     /// A trial that reaches its bound stops analysis with exit 124: it establishes no outcome
     /// and cannot support a successful report. Retry with a larger bound if the guest can
     /// finish. A `--timeout` in the run arguments also bounds the initial run and wins wherever

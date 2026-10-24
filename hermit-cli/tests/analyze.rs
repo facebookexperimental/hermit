@@ -1245,3 +1245,87 @@ fn analyze_targets_the_exit_code_hermit_run_reports() {
         );
     }
 }
+
+/// `--run1-preemptions` replays the record as the target run, measured for
+/// the trial bound and logged like a seed's run. Before, analyze did not run
+/// it at all, and the next phase unwrapped the log of a run that never ran
+/// (exit 101). The record is read from the host's /tmp, which the guest's
+/// container does not see, so analyze replays a copy in its workspace. A
+/// replay that misses the target ends the analysis with an error that says
+/// why.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_starts_from_a_recorded_target_run() {
+    let label = "analyze --prefix-search --run1-preemptions analyze_race_then plain";
+    let guest = &workloads().race_then;
+    let seed = race_then_target_seed("plain", &[]);
+    // Recorded outside /tmp: the run's guest has a private one, and the
+    // record is written from inside the container.
+    let workspace =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("failed to create a workspace");
+    let recorded = workspace.path().join("target.preempts");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["run", "--chaos"])
+        .arg(format!("--seed={seed}"))
+        .arg(format!("--record-preemptions-to={}", recorded.display()))
+        .arg("--")
+        .arg(guest)
+        .arg("plain");
+    let output = hermit_test::hermit_output(label, &mut command);
+    assert!(
+        output.status.success() && output.stdout == b"b-first\n",
+        "{label}: the recorded run missed the target\n{}",
+        combined_output(&output)
+    );
+    let host_tmp = tempfile::tempdir_in("/tmp").expect("failed to create a directory under /tmp");
+    let record = host_tmp.path().join("target.preempts");
+    fs::copy(&recorded, &record).unwrap();
+
+    let _guard = analyze_lock();
+    let analyze = |target_stdout: &str, report_file: &Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .args(["analyze", "--prefix-search", "--target-exit-code=0", "-v"])
+            .arg(format!("--target-stdout={target_stdout}"))
+            .arg(format!("--run1-preemptions={}", record.display()))
+            .arg(format!("--report-file={}", report_file.display()))
+            .args(["--", "--chaos"])
+            .arg(format!("--seed={seed}"))
+            .arg("--")
+            .arg(guest)
+            .arg("plain");
+        hermit_test::hermit_output(label, &mut command)
+    };
+    let report_file = workspace.path().join("report.json");
+    let output = analyze("b-first", &report_file);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label}: {}\n{combined}",
+        output.status
+    );
+    assert!(
+        combined.contains("First run matched target criteria")
+            && combined.contains("Runs from here on are bounded at"),
+        "{label}: the record was not run as the target\n{combined}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report_file).unwrap()).unwrap();
+    assert!(
+        report["critical_event1"]["event_index"].is_u64(),
+        "{label}: {report}"
+    );
+
+    // The record's replay prints b-first, so a-first is a miss.
+    let output = analyze("a-first", &workspace.path().join("miss.json"));
+    let combined = combined_output(&output);
+    assert!(
+        !output.status.success()
+            && output.status.code() != Some(101)
+            && combined.contains("did not meet the target criteria")
+            && combined.contains("--seed included"),
+        "{label}: a missed replay: {}\n{combined}",
+        output.status
+    );
+}

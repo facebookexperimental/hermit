@@ -1060,8 +1060,8 @@ The default `auto` uses the initial completed run and completed target/baseline
 endpoints: max(60 seconds, 10 times the slowest measured run), rounded up to
 whole seconds. Analyze prints the bound when it changes. A shorter `--timeout`
 in the run arguments still wins and also bounds the initial run. With
-`--run1-preemptions`, no initial run is measured, so pass an explicit
-`--trial-timeout` to bound trials before a completed replay is measured. On a
+`--run1-preemptions` the initial run is a replay of the record, measured like
+a seed's, which an explicit `--trial-timeout=SECONDS` bounds too. On a
 backend that does not enforce `--timeout`, `auto` gives no bound and an explicit
 number is refused; bound the whole analysis from outside there.
 
