@@ -115,6 +115,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::Read;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -287,6 +288,7 @@ static CPU_TIME_CLOCKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROC_CPU_TIMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DATAGRAM_READ_SHUTDOWN_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PRIVATE_DEV_SHM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SELECT_TIMEOUT_NORMALIZATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROC_STATUS_TRACER_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DEATH_TEST_TRACER_CHECK_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -38937,6 +38939,324 @@ fn a_death_test_that_looks_for_a_debugger_dies_as_it_does_natively() {
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{args:?}");
     }
+}
+
+/// A POSIX shared memory object in the host's `/dev/shm`, removed when the
+/// test ends.
+struct HostShmObject(PathBuf);
+
+impl HostShmObject {
+    /// The object `name` (`/hermit-...`), holding `contents`.
+    fn create(name: &str, contents: &[u8]) -> Self {
+        let path = Path::new("/dev/shm").join(name.trim_start_matches('/'));
+        fs::write(&path, contents).expect("failed to create a host /dev/shm object");
+        Self(path)
+    }
+}
+
+impl Drop for HostShmObject {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Every run gets a private, empty `/dev/shm`: a fresh tmpfs, mounted as
+/// Linux distributions mount it (mode 1777, `nosuid`, `nodev`), whose mount
+/// row names no host user. A guest neither sees the host's POSIX shared
+/// memory objects nor changes them, even under the same name;
+/// `--bind /dev/shm` keeps the host's, and a `--bind` below `/dev/shm` adds a
+/// host file to the private one. The guest is `tests/c/private_dev_shm.c`.
+#[test]
+fn a_run_gets_a_private_empty_dev_shm() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&PRIVATE_DEV_SHM_GUEST, "private_dev_shm")
+        .to_str()
+        .unwrap();
+    let name = format!("/hermit-private-dev-shm-{}", std::process::id());
+    let host_object = HostShmObject::create(&name, b"host");
+    let expected = format!(
+        "/dev/shm entries: 0\n\
+         /dev/shm mode 1777, tmpfs: yes\n\
+         shm_open({name}, O_CREAT | O_EXCL): created\n\
+         shared memory written and unlinked: yes\n\
+         mount row: rw,nosuid,nodev tmpfs, owner in superblock options: no\n"
+    );
+    for strict in [true, false] {
+        let mut args = vec!["run", "--timeout", "120"];
+        if strict {
+            args.push("--strict");
+        }
+        args.extend(["--base-env=minimal", "--", guest, "check", &name]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+    assert_eq!(fs::read(&host_object.0).unwrap(), b"host");
+
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--bind",
+        "/dev/shm",
+        "--",
+        guest,
+        "sees",
+        &name,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), format!("shm_open({name}): opened\n"));
+
+    // A host file bound below the private /dev/shm is an object there.
+    let host_dir = tempfile::tempdir().unwrap();
+    let host_file = host_dir.path().join("bound");
+    fs::write(&host_file, b"bound").unwrap();
+    let bound = format!("/hermit-bound-dev-shm-{}", std::process::id());
+    let bind = format!("{}:/dev/shm{bound}", host_file.display());
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--bind",
+        &bind,
+        "--",
+        guest,
+        "sees",
+        &bound,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), format!("shm_open({bound}): opened\n"));
+}
+
+/// Two runs at once each have their own `/dev/shm`: while one holds a POSIX
+/// shared memory object, the other finds `/dev/shm` empty and creates the
+/// same name exclusively. Every run of a program gets the same PIDs and
+/// random bytes, so programs that name such objects after them collide this
+/// way between concurrent runs on a shared `/dev/shm`.
+#[test]
+fn concurrent_runs_do_not_share_dev_shm() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&PRIVATE_DEV_SHM_GUEST, "private_dev_shm")
+        .to_str()
+        .unwrap();
+    let name = format!("/hermit-concurrent-dev-shm-{}", std::process::id());
+    let holder_args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--",
+        guest,
+        "hold",
+        &name,
+    ];
+    let mut holder = hermit_command(&holder_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start the holding run");
+    let mut holder_stdout = BufReader::new(holder.stdout.take().unwrap());
+    let mut holder_stderr = holder.stderr.take().unwrap();
+    // The holding run's stderr, once it has ended: closing its stdin ends it.
+    let mut holder_stderr_text = |stdin: &mut Option<std::process::ChildStdin>| {
+        drop(stdin.take());
+        let mut text = String::new();
+        let _ = holder_stderr.read_to_string(&mut text);
+        text
+    };
+    let mut created = String::new();
+    holder_stdout.read_line(&mut created).unwrap();
+    assert_eq!(
+        created,
+        format!("shm_open({name}, O_CREAT | O_EXCL): created\n"),
+        "the holding run's stderr:\n{}",
+        holder_stderr_text(&mut holder.stdin)
+    );
+
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--",
+        guest,
+        "check",
+        &name,
+    ];
+    let output = hermit(&args);
+    let holder_stderr = holder_stderr_text(&mut holder.stdin);
+    let mut released = String::new();
+    holder_stdout.read_to_string(&mut released).unwrap();
+    let status = holder.wait().unwrap();
+    assert_success(&output, &args);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.starts_with(&format!(
+            "/dev/shm entries: 0\n\
+             /dev/shm mode 1777, tmpfs: yes\n\
+             shm_open({name}, O_CREAT | O_EXCL): created\n"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        status.success(),
+        "the holding run failed: {status:?}\n{holder_stderr}"
+    );
+    assert_eq!(released, "released: yes\n", "{holder_stderr}");
+}
+
+/// The private `/dev/shm` is installed after every mount sourced from a host
+/// path, so such a source in the host's `/dev/shm` is still the host's: a
+/// `--bind` from it into guest `/tmp` shows the host's object, a run whose
+/// `$TMPDIR` (which holds its private `/tmp`) is there starts, and
+/// `--tmp=/dev/shm` is the host's. A bind from it into the private
+/// `/dev/shm`, which would find the guest's own empty tmpfs, is refused, as
+/// is one from host `/tmp` when `$TMPDIR` is in `/dev/shm` and a program or
+/// an output file there, which the guest cannot see.
+#[test]
+fn host_dev_shm_sources_stay_the_hosts() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&PRIVATE_DEV_SHM_GUEST, "private_dev_shm")
+        .to_str()
+        .unwrap();
+    let name = format!("hermit-dev-shm-source-{}", std::process::id());
+    let _object = HostShmObject::create(&name, b"host");
+
+    let target = format!("/tmp/hostshm/{name}");
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--bind",
+        "/dev/shm:/tmp/hostshm",
+        "--",
+        "/bin/cat",
+        &target,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "host");
+
+    let tmpdir = tempfile::Builder::new()
+        .prefix("hermit-dev-shm-tmpdir-")
+        .tempdir_in("/dev/shm")
+        .expect("failed to create a TMPDIR under /dev/shm");
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--",
+        guest,
+        "check",
+        "/hermit-dev-shm-tmpdir-probe",
+    ];
+    let mut command = hermit_command(&args);
+    command.env("TMPDIR", tmpdir.path());
+    let output = hermit_test::hermit_output("a run with TMPDIR under /dev/shm", &mut command);
+    assert_success(&output, &args);
+    assert!(
+        stdout(&output).starts_with("/dev/shm entries: 0\n"),
+        "{}",
+        stdout(&output)
+    );
+
+    let through_tmp = format!("/tmp/{name}");
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--tmp=/dev/shm",
+        "--",
+        "/bin/cat",
+        &through_tmp,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "host", "--tmp=/dev/shm is not the host's");
+
+    let source = format!("/dev/shm/{name}");
+    let refused = |args: &[&str], expected: &str| {
+        let output = hermit(args);
+        assert!(!output.status.success(), "{args:?} was not refused");
+        assert!(
+            stderr(&output).contains(expected),
+            "{args:?} was refused without saying {expected:?}:\n{}",
+            stderr(&output)
+        );
+    };
+    refused(
+        &[
+            "run",
+            "--base-env=minimal",
+            "--bind",
+            &source,
+            "--",
+            guest,
+            "check",
+            "/x",
+        ],
+        &format!("cannot bind {source} from host /dev/shm to {source}"),
+    );
+    let host_tmp_file = tempfile::Builder::new()
+        .prefix("hermit-dev-shm-from-tmp-")
+        .tempfile_in("/tmp")
+        .expect("failed to create a file under host /tmp");
+    let from_tmp = format!("{}:/dev/shm/from-tmp", host_tmp_file.path().display());
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--bind",
+        &from_tmp,
+        "--",
+        "/bin/true",
+    ];
+    let mut command = hermit_command(&args);
+    command.env("TMPDIR", tmpdir.path());
+    let output =
+        hermit_test::hermit_output("a bind from host /tmp, TMPDIR in /dev/shm", &mut command);
+    assert!(!output.status.success(), "{args:?} was not refused");
+    assert!(
+        stderr(&output).contains(&format!(
+            "cannot bind {} from host /tmp to /dev/shm/from-tmp",
+            host_tmp_file.path().display()
+        )),
+        "{}",
+        stderr(&output)
+    );
+    let program = tempfile::Builder::new()
+        .prefix("hermit-dev-shm-program-")
+        .tempfile_in("/dev/shm")
+        .expect("failed to create a program under /dev/shm");
+    fs::copy("/bin/true", program.path()).unwrap();
+    refused(
+        &[
+            "run",
+            "--base-env=minimal",
+            "--",
+            program.path().to_str().unwrap(),
+        ],
+        "is under host /dev/shm, but Hermit gives the guest a private /dev/shm",
+    );
+    let summary = format!("/dev/shm/{name}.json");
+    refused(
+        &[
+            "run",
+            "--base-env=minimal",
+            "--summary-json",
+            &summary,
+            "--",
+            "/bin/true",
+        ],
+        "it is under host /dev/shm, but Hermit gives the guest a private /dev/shm",
+    );
 }
 
 /// Under DBT each guest `cpuid` is answered by Detcore, as under ptrace, so

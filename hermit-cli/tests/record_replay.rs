@@ -393,6 +393,51 @@ fn record_replay_flocks_a_self_created_file_opened_by_relative_path() {
     );
 }
 
+/// A recording's guest gets a private, empty `/dev/shm`, as `hermit run`'s
+/// does: it neither sees the host's objects nor leaves its own there, and its
+/// replay matches.
+#[test]
+fn record_replay_gives_the_guest_a_private_dev_shm() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    // Removed when dropped, however the test ends.
+    let host_object = tempfile::Builder::new()
+        .prefix("hermit-record-host-object-")
+        .tempfile_in("/dev/shm")
+        .expect("failed to create a host /dev/shm object");
+    let host_object = host_object.path();
+    let guest_object = format!("hermit-record-guest-object-{}", std::process::id());
+    let script = format!(
+        "ls -A /dev/shm | wc -l && test ! -e {} && echo guest > /dev/shm/{guest_object} \
+         && ls /dev/shm",
+        host_object.display()
+    );
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--", "/bin/sh", "-c", &script]);
+    let output = command_output(command, "record/replay in a private /dev/shm");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!("0\n{guest_object}\n")),
+        "the guest's /dev/shm was not private and empty:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+    assert!(
+        !Path::new("/dev/shm").join(&guest_object).exists(),
+        "the guest's object reached the host's /dev/shm"
+    );
+}
+
 /// Records `script` with standard output `record_stdout`, then lets `prepare`
 /// reset host state and replays the recording with `--autopilot` and standard
 /// output `replay_stdout`, returning the replay's output.

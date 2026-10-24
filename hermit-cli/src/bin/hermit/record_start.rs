@@ -43,7 +43,10 @@ use super::container::IdentityGuard;
 use super::container::PlannedMount;
 use super::container::container_proc_mount;
 use super::container::identity_hardening_mounts;
+use super::container::is_below_dev_shm;
 use super::container::namespace_container;
+use super::container::private_dev_shm;
+use super::container::refuse_bind_from_host_dev_shm;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
@@ -493,25 +496,48 @@ impl StartOpts {
         self.network.unwrap_or(NetworkingMode::Local)
     }
 
+    /// The recording's container, with `backend_mounts` (e9patch's overlay
+    /// of the rewritten program) installed as a backend's own before the
+    /// private `/dev/shm`, so that their sources are still the host's.
     fn configured_container(
         &self,
         network: NetworkingMode,
+        backend_mounts: Vec<Mount>,
     ) -> Result<(Container, IdentityGuard), Error> {
         let mut container = namespace_container(true, None);
         network.configure(&mut container, false);
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts(None)?;
+        let dev_shm = private_dev_shm(self.mount.iter().map(Mount::get_target));
+        // The caller's mounts below `/dev/shm`, which go into the private one.
+        let (into_dev_shm, user_mounts): (Vec<_>, Vec<_>) = self
+            .mount
+            .iter()
+            .partition(|mount| dev_shm.is_some() && is_below_dev_shm(mount.get_target()));
         for mount in &self.mount {
             let user_target = mount.get_target();
-            identity_guard.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
+            if into_dev_shm.contains(&mount) {
+                refuse_bind_from_host_dev_shm(mount)?;
+            } else {
+                identity_guard.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
+            }
             if mount.get_source().is_some() && super::container::is_bind_mount(mount) {
                 identity_guard.add_user_bind(user_target, None);
             }
         }
         // The mount plan, `/proc` first, installed by the container's setup
-        // and recorded in its init (`IdentityGuard::record_plan`).
+        // and recorded in its init (`IdentityGuard::record_plan`). The private
+        // `/dev/shm` follows every mount sourced from a host path, as in
+        // `hermit run`, and precedes the mounts that go into it.
         let mut plan = vec![PlannedMount::hermit(container_proc_mount())];
         plan.extend(identity_mounts.into_iter().map(PlannedMount::hermit));
-        plan.extend(self.mount.iter().cloned().map(PlannedMount::hermit));
+        plan.extend(user_mounts.into_iter().cloned().map(PlannedMount::hermit));
+        plan.extend(backend_mounts.into_iter().map(PlannedMount::backend));
+        plan.extend(dev_shm.map(PlannedMount::hermit));
+        plan.extend(
+            into_dev_shm
+                .into_iter()
+                .map(|mount| PlannedMount::hermit(mount.clone().touch_target())),
+        );
         identity_guard.set_plan(&mut container, plan)?;
         if let Some(workdir) = &self.workdir {
             container.current_dir(workdir);
@@ -523,22 +549,20 @@ impl StartOpts {
         &self,
         global: &GlobalOpts,
     ) -> Result<(Container, IdentityGuard), Error> {
-        let overlay = self.prepare_e9patch_overlay(global)?;
-        let (mut container, mut identity_guard) = self.configured_container(self.network())?;
-        if let Some(overlay) = overlay {
-            // The rewritten program over its original path: e9patch's own
-            // mounts, which the guest's mount table leaves out.
-            identity_guard.add_backend_mounts(
-                &mut container,
-                [
+        // The rewritten program over its original path: e9patch's own
+        // mounts, which the guest's mount table leaves out.
+        let overlay = self
+            .prepare_e9patch_overlay(global)?
+            .map(|overlay| {
+                vec![
                     Mount::bind(&overlay.source, &overlay.target).readonly(),
                     Mount::new(overlay.target).flags(
                         MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY,
                     ),
-                ],
-            )?;
-        }
-        Ok((container, identity_guard))
+                ]
+            })
+            .unwrap_or_default();
+        self.configured_container(self.network(), overlay)
     }
 
     /// The `--verify-json` path this invocation will publish a verdict to, if
@@ -788,7 +812,8 @@ impl StartOpts {
             )?;
         let (recording, recording_outcome) = recording;
         eprintln!(":: {}", "Replaying...".yellow().bold());
-        let (mut replay_container, replay_identity) = self.configured_container(self.network())?;
+        let (mut replay_container, replay_identity) =
+            self.configured_container(self.network(), Vec::new())?;
         let mounts = self.mount.clone();
         let replay_global = global2.clone();
         let (replay, (_data, _identity, log1, log2)) = super::owned_container::run(
@@ -970,7 +995,7 @@ impl StartOpts {
         global: &GlobalOpts,
     ) -> Result<(reverie::process::Output, Option<detcore::TerminalOutcome>), Error> {
         eprintln!(":: {}", "Replaying...".yellow().bold());
-        let (mut container, identity) = self.configured_container(self.network())?;
+        let (mut container, identity) = self.configured_container(self.network(), Vec::new())?;
         let mounts = self.mount.clone();
         let replay_global = global.clone();
         let data = data.to_owned();
@@ -1085,7 +1110,7 @@ impl StartOpts {
         // on that container result, unreachable in exactly the case that needed
         // it. The watch owns the reap and releases the accept.
         let gdb_watch = GdbClientWatch::spawn(gdb_command, gdbserver_port)?;
-        let (mut container, identity) = self.configured_container(self.network())?;
+        let (mut container, identity) = self.configured_container(self.network(), Vec::new())?;
         let guards = Rc::new(RefCell::new((
             temp_data_dir,
             identity,

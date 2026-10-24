@@ -1897,6 +1897,12 @@
       "why": "tests/c/printf_with_threads.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/private_dev_shm.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/private_dev_shm.c is owned by hermit-cli/tests/cli.rs: a_run_gets_a_private_empty_dev_shm runs it under ptrace, --strict and not, and requires a private, empty /dev/shm (a mode-1777 tmpfs mounted nosuid,nodev whose mount row names no host user) in which a POSIX shared memory object can be created exclusively under the name of a host object the guest neither sees nor changes, and that --bind /dev/shm shows the host object; concurrent_runs_do_not_share_dev_shm runs it twice at once and requires the second run to find /dev/shm empty and create the name the first holds. It stays a fixture because the tests compare against host state and coordinate two runs."
+    },
+    {
       "disposition": "support-data",
       "path": "tests/c/probe_family.h",
       "runner": "C guests that include probe_family.h",

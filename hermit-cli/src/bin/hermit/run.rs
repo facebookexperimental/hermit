@@ -72,6 +72,7 @@ use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
+use super::container::GUEST_DEV_SHM;
 use super::container::HostLayout;
 use super::container::IdentityGuard;
 use super::container::LogCapExceeded;
@@ -82,7 +83,13 @@ use super::container::apply_affinity;
 use super::container::container_proc_mount;
 use super::container::identity_hardening_mounts_on;
 use super::container::image_container;
+use super::container::is_below_dev_shm;
+use super::container::is_dev_shm;
+use super::container::is_in_dev_shm;
 use super::container::namespace_container;
+use super::container::private_dev_shm;
+use super::container::refuse_bind_from_host_dev_shm;
+use super::container::refuse_covered_bind_source;
 use super::global_opts::GlobalOpts;
 use super::host_capabilities::cpu_identity;
 use super::host_capabilities::exact_branch_counter_verdict;
@@ -248,12 +255,48 @@ fn reverie_timer_support() -> Result<(), TimerUnavailable> {
         .map_err(|error| TimerUnavailable::NoPmuProfile(error.to_string()))
 }
 
-fn warn_bind_outside_tmp(bind: &Bind) {
-    crate::tracing::diagnostic_eprintln!(
-        "WARNING: --bind target {} is outside guest /tmp, so this option has no \
-         effect; files outside /tmp are already visible unless another mount hides them",
-        bind.target.to_string_lossy()
-    );
+/// A `--bind`'s host source and guest target.
+fn bind_paths(bind: &Bind) -> (&Path, &Path) {
+    (
+        Path::new(OsStr::from_bytes(bind.source.to_bytes())),
+        Path::new(OsStr::from_bytes(bind.target.to_bytes())),
+    )
+}
+
+/// Whether the container applies `bind`: one at or below guest `/tmp`, one
+/// below the private `/dev/shm` (where the guest gets one,
+/// `private_dev_shm`), or one at `/dev/shm` from another host directory,
+/// which replaces it. `--bind /dev/shm` mounts nothing: it keeps the host's
+/// `/dev/shm`.
+fn bind_is_applied(bind: &Bind, private_dev_shm: bool) -> bool {
+    let (source, target) = bind_paths(bind);
+    target.starts_with(TMP_DIR)
+        || (is_dev_shm(target) && !is_dev_shm(source))
+        || (is_below_dev_shm(target) && private_dev_shm)
+}
+
+/// Whether `bind` is `--bind /dev/shm`, which keeps the host's `/dev/shm`
+/// for the guest and mounts nothing.
+fn keeps_host_dev_shm(bind: &Bind) -> bool {
+    let (source, target) = bind_paths(bind);
+    is_dev_shm(source) && is_dev_shm(target)
+}
+
+fn warn_unapplied_bind(bind: &Bind) {
+    let target = bind.target.to_string_lossy();
+    if is_below_dev_shm(bind_paths(bind).1) {
+        crate::tracing::diagnostic_eprintln!(
+            "WARNING: --bind target {target} is below a guest /dev/shm that is not Hermit's \
+             private one (a --mount or --bind at /dev/shm replaced it, or --bind /dev/shm kept \
+             the host's), so this option has no effect; use --mount to mount into it"
+        );
+    } else {
+        crate::tracing::diagnostic_eprintln!(
+            "WARNING: --bind target {target} is outside guest /tmp and the guest's private \
+             /dev/shm, so this option has no effect; files outside them are already visible \
+             unless another mount hides them"
+        );
+    }
 }
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
 const NORMALIZED_FORWARDED_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
@@ -1535,8 +1578,11 @@ pub struct RunOpts {
     #[clap(long, value_name = "path")]
     mount: Vec<MountArg>,
 
-    /// Bind-mount a host file or directory into guest `/tmp`. Use `SOURCE` to preserve its path or
-    /// `SOURCE:TARGET` to choose a target under `/tmp`; the source must already exist.
+    /// Bind-mount a host file or directory into guest `/tmp` or the guest's private `/dev/shm`.
+    /// Use `SOURCE` to preserve its path or `SOURCE:TARGET` to choose a target under `/tmp` or
+    /// `/dev/shm`; the source must already exist, and one bound below `/dev/shm` must not be in
+    /// the host's `/dev/shm`. `--bind /dev/shm` keeps the host's `/dev/shm` in place of the
+    /// guest's private one; `--bind DIR:/dev/shm` uses host directory `DIR` instead.
     #[clap(long, value_name = "path")]
     pub(crate) bind: Vec<Bind>,
 
@@ -11751,6 +11797,8 @@ impl RunOpts {
                 let crosses_implicit_mount = symlinked
                     && ((tmp_is_remapped
                         && path_resolution_visits_prefix(&host, Path::new(TMP_DIR))?)
+                        || (self.has_private_dev_shm()
+                            && path_resolution_visits_prefix(&host, Path::new(GUEST_DEV_SHM))?)
                         || path_resolution_visits_prefix(&host, Path::new("/proc"))?);
                 if symlinked && (!self.mount.is_empty() || crosses_implicit_mount) {
                     anyhow::bail!(
@@ -11787,12 +11835,12 @@ impl RunOpts {
     }
 
     fn mapped_host_program(&self, program: &Path) -> GuestPathMapping {
+        let private_dev_shm = self.has_private_dev_shm();
         for bind in self.bind.iter().rev() {
-            let source = Path::new(OsStr::from_bytes(bind.source.to_bytes()));
-            let target = Path::new(OsStr::from_bytes(bind.target.to_bytes()));
-            if !target.starts_with(TMP_DIR) {
+            if !bind_is_applied(bind, private_dev_shm) {
                 continue;
             }
+            let (source, target) = bind_paths(bind);
             if let Some(path) = mapped_path(program, source, target) {
                 return GuestPathMapping::Mapped(path);
             }
@@ -11812,6 +11860,9 @@ impl RunOpts {
                 .as_ref()
                 .map(|tmp| GuestPathMapping::Mapped(tmp.join(suffix)))
                 .unwrap_or(GuestPathMapping::Hidden);
+        }
+        if private_dev_shm && is_in_dev_shm(program) {
+            return GuestPathMapping::Hidden;
         }
         GuestPathMapping::Unchanged
     }
@@ -12093,6 +12144,19 @@ impl RunOpts {
         Ok(GuestProgram::Search(candidates))
     }
 
+    /// Refuse a program at `requested` under host `/dev/shm`, which the
+    /// guest's private `/dev/shm` hides.
+    fn refuse_program_under_dev_shm(&self, requested: &Path) -> Result<(), Error> {
+        if requested.exists() && is_in_dev_shm(requested) && self.has_private_dev_shm() {
+            anyhow::bail!(
+                "Program {} is under host /dev/shm, but Hermit gives the guest a private \
+                 /dev/shm. Pass --bind /dev/shm to keep the host's, or move the program.",
+                requested.display()
+            );
+        }
+        Ok(())
+    }
+
     fn resolve_guest_and_host_program(&self) -> Result<(PathBuf, PathBuf), Error> {
         let command = self.guest_command()?;
         let requested = Path::new(command.get_program());
@@ -12110,6 +12174,7 @@ impl RunOpts {
                     requested.display()
                 );
             }
+            self.refuse_program_under_dev_shm(&requested)?;
             anyhow::bail!(
                 "Program {} is not visible through the configured guest mounts",
                 requested.display()
@@ -12291,6 +12356,11 @@ impl RunOpts {
                      directory (or the --tmp directory)",
                     "Write it outside /tmp, or pass --tmp=/tmp to expose host /tmp.",
                 )
+            } else if path.starts_with(GUEST_DEV_SHM) {
+                (
+                    "it is under host /dev/shm, but Hermit gives the guest a private /dev/shm",
+                    "Write it outside /dev/shm, or pass --bind /dev/shm to keep the host's.",
+                )
             } else {
                 (
                     "a --mount without a source hides it",
@@ -12407,6 +12477,7 @@ impl RunOpts {
                     requested.display()
                 );
             }
+            self.refuse_program_under_dev_shm(requested)?;
             return validate_executable(requested, requested, None);
         }
 
@@ -13829,20 +13900,19 @@ impl RunOpts {
     }
 
     /// The `--bind`s the DBT adapter checks, as (source, target) pairs: those
-    /// with a target under guest `/tmp`, which is where [`Self::mounts`] applies
-    /// binds for every backend. It warns about any other bind, which has no
-    /// effect.
+    /// [`Self::mounts`] applies for every backend ([`bind_is_applied`]).
+    /// It warns about any other bind, which has no effect.
     #[cfg(feature = "dbt")]
     pub(super) fn dbt_binds(&self) -> Vec<(PathBuf, PathBuf)> {
-        let mut binds = Vec::with_capacity(self.bind.len());
-        for bind in &self.bind {
-            let source = PathBuf::from(OsStr::from_bytes(bind.source.to_bytes()));
-            let target = PathBuf::from(OsStr::from_bytes(bind.target.to_bytes()));
-            if target.starts_with(TMP_DIR) {
-                binds.push((source, target));
-            }
-        }
-        binds
+        let private_dev_shm = self.has_private_dev_shm();
+        self.bind
+            .iter()
+            .filter(|bind| bind_is_applied(bind, private_dev_shm))
+            .map(|bind| {
+                let (source, target) = bind_paths(bind);
+                (source.to_path_buf(), target.to_path_buf())
+            })
+            .collect()
     }
 
     /// These options with the DBT adapter's own container inputs added after
@@ -13920,10 +13990,32 @@ impl RunOpts {
         Ok(shared)
     }
 
+    /// The guest paths at which the caller's mounts can cover `/dev/shm`:
+    /// every `--mount` target, and a `--bind` at `/dev/shm` itself.
+    fn dev_shm_covering_targets(&self) -> impl Iterator<Item = &Path> {
+        self.mount.iter().map(Mount::get_target).chain(
+            self.bind
+                .iter()
+                .map(|bind| bind_paths(bind).1)
+                .filter(|target| is_dev_shm(target)),
+        )
+    }
+
+    /// Whether the guest's `/dev/shm` is the container's private one
+    /// ([`private_dev_shm`]), which hides the host's.
+    fn has_private_dev_shm(&self) -> bool {
+        !self.no_namespace
+            && self.image.is_none()
+            && private_dev_shm(self.dev_shm_covering_targets()).is_some()
+    }
+
     /// Returns the mounts to be used with the container, in the order they are
-    /// installed: the identity-hardening mounts, the caller's `--mount`s and
-    /// `--bind`s (a backend adapter's own last, marked as a backend's), the
-    /// e9patch overlay (a backend's own), and the private `/tmp`.
+    /// installed: the identity-hardening mounts; the caller's `--mount`s and
+    /// `--bind`s not below `/dev/shm` (a backend adapter's own last, marked as
+    /// a backend's); the e9patch overlay (a backend's own); the private `/tmp`
+    /// here only when its directory is in the host's `/dev/shm`; the private
+    /// `/dev/shm`; the caller's mounts and binds below it; and the private
+    /// `/tmp`.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
         self.mounts_on(tmpfs, HostLayout::of_host())
     }
@@ -14014,10 +14106,38 @@ impl RunOpts {
                 PlannedMount::hermit(mount)
             }
         };
+        let dev_shm = private_dev_shm(self.dev_shm_covering_targets());
+        // The caller's mounts below `/dev/shm`, installed into the private one.
+        let mut into_dev_shm = Vec::new();
+        // The private /tmp is bound before the private `/dev/shm` when its own
+        // directory is in the host's `/dev/shm` (`$TMPDIR` or `--tmp` there),
+        // and then covers host /tmp before the binds into `/dev/shm`.
+        let tmp_first = is_in_dev_shm(tmpfs);
+        let refuse_into_dev_shm = |mount: &Mount| -> Result<(), Error> {
+            refuse_bind_from_host_dev_shm(mount)?;
+            if tmp_first {
+                refuse_covered_bind_source(
+                    mount,
+                    Path::new(TMP_DIR),
+                    "the guest's private /tmp is kept in host /dev/shm (TMPDIR or --tmp), so it \
+                     covers host /tmp before the bind is made; bind the source from elsewhere, \
+                     or keep the private /tmp outside /dev/shm",
+                )?;
+            }
+            Ok(())
+        };
 
         for (index, mount) in self.mount.iter().map(|arg| &arg.mount).enumerate() {
             let backend = index >= backend_mounts_from;
             let user_target = mount.get_target();
+            if dev_shm.is_some() && is_below_dev_shm(user_target) {
+                refuse_into_dev_shm(mount)?;
+                if mount.get_source().is_some() && super::container::is_bind_mount(mount) {
+                    identity_sources.add_user_bind(user_target, None);
+                }
+                into_dev_shm.push(planned(mount.clone().touch_target(), backend));
+                continue;
+            }
             identity_sources.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
             let staging = mount
                 .get_target()
@@ -14044,9 +14164,14 @@ impl RunOpts {
             let backend = index >= backend_binds_from;
             let mount = Mount::from(bind.clone()).rshared();
 
-            // Bind mounts currently only make sense for things in `/tmp` since
-            // that is the only directory we overlay.
-            if let Ok(relative_path) = mount.get_target().strip_prefix(TMP_DIR) {
+            // Bind mounts only make sense in the directories the container
+            // replaces: `/tmp`, staged in the private tmp directory, and
+            // `/dev/shm`, whose private tmpfs they go into.
+            if !bind_is_applied(bind, dev_shm.is_some()) {
+                if !keeps_host_dev_shm(bind) {
+                    warn_unapplied_bind(bind);
+                }
+            } else if let Ok(relative_path) = mount.get_target().strip_prefix(TMP_DIR) {
                 // Discard provenance only for a bind we actually retain. An
                 // ignored outside-/tmp bind must not suppress the real
                 // identity-hardening mount at that target.
@@ -14056,8 +14181,14 @@ impl RunOpts {
                 let target = tmpfs.join(relative_path);
                 identity_sources.add_user_bind(mount.get_target(), Some(&target));
                 user_mounts.push(planned(mount.target(target).touch_target(), backend));
+            } else if is_dev_shm(mount.get_target()) {
+                // Another host directory as the guest's `/dev/shm`.
+                identity_sources.add_user_bind(mount.get_target(), None);
+                user_mounts.push(planned(mount, backend));
             } else {
-                warn_bind_outside_tmp(bind);
+                refuse_into_dev_shm(&mount)?;
+                identity_sources.add_user_bind(mount.get_target(), None);
+                into_dev_shm.push(planned(mount.touch_target(), backend));
             }
         }
 
@@ -14100,14 +14231,26 @@ impl RunOpts {
         // we still preserve the files or directories bind-mounted inside of it
         // while hiding the real /tmp. A host without /tmp has none to hide,
         // and nothing to mount onto (refused above for a caller's mount).
-        if layout.tmp {
-            mounts.push(PlannedMount::hermit(Mount::bind(tmpfs, TMP_DIR).rshared()));
+        let mut private_tmp = if layout.tmp {
+            Some(PlannedMount::hermit(Mount::bind(tmpfs, TMP_DIR).rshared()))
         } else {
             tracing::info!(
                 "[hermit] this host has no {TMP_DIR}, so the guest has none either: Hermit's \
                  private {TMP_DIR} goes over the host's"
             );
+            None
+        };
+        // The private `/dev/shm` follows every other mount sourced from a host
+        // path, so that a source in the host's `/dev/shm` is still the host's,
+        // and precedes the mounts that go into it. It precedes the private
+        // /tmp too, so that a bind into it can come from host /tmp, unless the
+        // private /tmp's own directory is in the host's `/dev/shm`.
+        if tmp_first {
+            mounts.extend(private_tmp.take());
         }
+        mounts.extend(dev_shm.map(PlannedMount::hermit));
+        mounts.extend(into_dev_shm);
+        mounts.extend(private_tmp);
 
         Ok(PreparedMounts {
             mounts,

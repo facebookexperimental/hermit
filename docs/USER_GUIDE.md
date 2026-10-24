@@ -1107,13 +1107,34 @@ hermit run --bind=/host/path:/guest-name -- /tmp/guest-name
 ```
 
 `--bind=SOURCE` exposes a host path under guest `/tmp` with its name preserved;
-`--bind=SOURCE:TARGET` selects the target under guest `/tmp`. For general mount
-targets, use Docker-style `--mount` syntax. Mount sources must exist before
-Hermit starts.
+`--bind=SOURCE:TARGET` selects the target under guest `/tmp` or the guest's
+private `/dev/shm` (below). For general mount targets, use Docker-style
+`--mount` syntax. Mount sources must exist before Hermit starts.
 
 `--tmp=DIR` uses a chosen host directory as guest `/tmp`. `--tmp=/tmp` exposes
 the real host `/tmp`, which is convenient for diagnosis but weakens isolation
 and reproducibility.
+
+Every run and recording also gets a private, empty `/dev/shm`: a fresh tmpfs,
+mounted as Linux distributions mount it (mode 1777, `nosuid`, `nodev`, and
+tmpfs's default size, half the host's RAM). POSIX shared memory objects and
+named semaphores (`shm_open`, `sem_open`) therefore do not pass between the
+guest and the host or another run. That matters because every run of a
+program gets the same PIDs and random bytes: a program that names such objects
+after them chooses the same names in every run, and concurrent runs sharing
+the host's `/dev/shm` would open, truncate and remove each other's.
+
+Hermit installs it after every mount whose source is a host path, so a
+`--bind /dev/shm/x:/tmp/x` or a `TMPDIR` below `/dev/shm` still names the
+host's, and before the binds and mounts below `/dev/shm`, which go into it. A
+bind from the host's `/dev/shm` into the private one is refused, and so is
+one from host `/tmp` when `TMPDIR` or `--tmp` keeps the private `/tmp` in the
+host's `/dev/shm` (it is then bound first). `--bind
+/dev/shm` keeps the host's `/dev/shm` for a guest that talks to host processes
+through it, `--bind DIR:/dev/shm` uses host directory `DIR` instead, and a
+`--mount` at `/dev/shm` (or at `/dev`) replaces it. A `--no-namespace` run uses
+the host's `/dev/shm`, an `--image` run has none, and `hermit replay` does not
+make one, as it answers the guest's calls from the recording.
 
 DBT reserves `/tmp/.hermit-dbt-stats-N` for its current run's statistics, choosing
 the lowest number that does not overlap a declared bind target. The backing
@@ -1127,10 +1148,14 @@ The guest's mount table (`/proc/<pid>/mountinfo`, `/proc/<pid>/mounts` and
 host's live table. It is the same on every backend, and in every run as long as
 the mounts it lists (and, under `--no-namespace`, the mounts holding the working
 directory and `/tmp`) do not change on the host between runs. In Hermit's
-container it lists the mounts Hermit installed (its `/proc`, `/tmp`, identity
-files and your `--mount` and `--bind` targets), the ancestors of those mounts,
-and the base mountpoints `/`, `/proc`, `/dev`, `/dev/pts`, `/dev/shm`,
-`/dev/mqueue`, `/sys`, `/sys/fs/cgroup` and `/run` where they are mounted. With
+container it lists the mounts Hermit installed (its `/proc`, `/tmp`,
+`/dev/shm`, identity files and your `--mount` and `--bind` targets), the
+ancestors of those mounts, and the base mountpoints `/`, `/proc`, `/dev`,
+`/dev/pts`, `/dev/shm`, `/dev/mqueue`, `/sys`, `/sys/fs/cgroup` and `/run` where
+they are mounted. A filesystem Hermit or a `--mount` mounts afresh in the
+container (not a bind) shows no `uid=` or `gid=` option for the host user who
+ran Hermit, as the same mount made by root shows none; a `--namespace-only`
+guest, which reads the kernel's table, still sees them. With
 `--no-namespace`, where Hermit installs no mount, it lists the mounts holding
 the guest's working directory and the host `/tmp`, their ancestors, and those
 base mountpoints. Every other host mount is hidden, although its files stay

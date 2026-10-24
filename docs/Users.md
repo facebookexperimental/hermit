@@ -42,6 +42,11 @@ unsolicited file descriptors inherited from its caller. Pass guest inputs throug
 the documented file, mount and standard-stream options. An operating system that
 cannot perform this descriptor cleanup is refused before a guest starts.
 
+Each `hermit run` gets its own empty `/tmp` and `/dev/shm` (a recording, its
+own `/dev/shm`), so files and POSIX shared memory objects do not pass between
+concurrent runs, or between a run and the host, unless you bind them in
+(`--bind`, see [USER_GUIDE.md](USER_GUIDE.md)).
+
 ## Further reading
 
 * Find hermit [CLI examples here](https://fb.workplace.com/notes/hermetic-infra-fyi/hermit-tech-preview-a-linux-reproducibility-tool/244656753248444/)

@@ -794,25 +794,6 @@ impl IdentityGuard {
         Ok(())
     }
 
-    /// Append `mounts`, a backend's own, to the plan and to `container`'s
-    /// setup. There must be a plan, not yet recorded: a backend's mount
-    /// dropped silently would run the guest without it.
-    pub(super) fn add_backend_mounts(
-        &mut self,
-        container: &mut Container,
-        mounts: impl IntoIterator<Item = Mount>,
-    ) -> Result<(), Error> {
-        let MountPlan::Recorded(plan, installations, None) = &mut self.plan else {
-            anyhow::bail!("a backend's own mounts need the container's mount plan");
-        };
-        for mount in mounts {
-            container.mount(mount.clone());
-            plan.push(PlannedMount::backend(mount));
-        }
-        *installations = installations_of(plan);
-        Ok(())
-    }
-
     /// The container's mounts were installed into an image root, every one
     /// of them Hermit's.
     pub(super) fn set_image_root(&mut self) {
@@ -935,16 +916,23 @@ impl IdentityGuard {
         &self,
         current: Vec<detcore_model::container_mounts::ContainerMount>,
     ) -> Result<Option<ContainerMountTable>, Error> {
-        let (rows, installed, backend) = match &self.plan {
+        let (mut rows, installed, backend, fresh) = match &self.plan {
             MountPlan::Unrecorded => return Ok(None),
             MountPlan::Recorded(_, _, None) => {
                 anyhow::bail!(
                     "the container mount table was asked for before the plan was recorded"
                 )
             }
-            MountPlan::Recorded(_, installations, Some(rows)) => {
+            MountPlan::Recorded(plan, installations, Some(rows)) => {
                 let (installed, backend) = owned_mounts(rows, installations);
-                (current, installed, backend)
+                // The rows of the plan's fresh (not bind) mounts, one each.
+                let fresh = plan
+                    .iter()
+                    .zip(installations)
+                    .filter(|(planned, _)| !is_bind_mount(&planned.mount))
+                    .flat_map(|(_, installation)| installation.ids.iter().copied())
+                    .collect::<std::collections::BTreeSet<_>>();
+                (current, installed, backend, fresh)
             }
             MountPlan::ImageRoot => {
                 // Every row under an image root is one the setup installed.
@@ -967,9 +955,20 @@ impl IdentityGuard {
                     .map(|row| row.raw_mount_id)
                     .filter(|id| !placeholder.contains(id))
                     .collect();
-                (current, installed, placeholder)
+                // No fresh mount of the plan here: an image root records none.
+                (
+                    current,
+                    installed,
+                    placeholder,
+                    std::collections::BTreeSet::new(),
+                )
             }
         };
+        for row in &mut rows {
+            if fresh.contains(&row.raw_mount_id) {
+                row.super_options = superblock_options_as_root(&row.super_options);
+            }
+        }
         let never = rows
             .iter()
             .filter(|row| row.is_ephemeral_host_seed() && !installed.contains(&row.raw_mount_id))
@@ -1527,6 +1526,109 @@ pub(super) fn container_proc_mount() -> Mount {
     Mount::proc().allow_readonly_fallback()
 }
 
+/// Where glibc's `shm_open` and `sem_open` keep POSIX shared memory objects
+/// and named semaphores.
+pub(super) const GUEST_DEV_SHM: &str = "/dev/shm";
+
+/// The guest's private `/dev/shm`, a fresh tmpfs over the host's, so that no
+/// two runs, and no run and the host, share POSIX shared memory objects or
+/// semaphores. Every run of a program gets the same PIDs and random bytes, so
+/// a program that names such objects after them chooses the same names in
+/// every run, and concurrent runs on the host's `/dev/shm` open, truncate and
+/// unlink each other's. It is mounted as Linux distributions mount
+/// `/dev/shm`: `nosuid`, `nodev` and `strictatime`, with tmpfs's default mode
+/// (1777) and size (half the host's RAM). It is not `noexec`, as theirs is
+/// not: SaBRe stages a program there.
+///
+/// A plan installs it after every mount whose source is a host path, so that a
+/// source below the host's `/dev/shm` (or a `$TMPDIR` there, which holds the
+/// private `/tmp`) is still the host's, and before the mounts below
+/// `/dev/shm` ([`is_below_dev_shm`]), which go into it.
+///
+/// `None` where one of the caller's mounts at `covering` covers `/dev/shm` (a
+/// mount at `/dev/shm`, `/dev` or `/`, which replaces it; `--bind /dev/shm`
+/// keeps the host's), or where the host has no `/dev/shm` to cover.
+pub(super) fn private_dev_shm<'a>(mut covering: impl Iterator<Item = &'a Path>) -> Option<Mount> {
+    let target = Path::new(GUEST_DEV_SHM);
+    let resolved = canonical_mount_target(target);
+    if !target.is_dir() || covering.any(|user| resolved.starts_with(canonical_mount_target(user))) {
+        return None;
+    }
+    Some(
+        Mount::tmpfs(target)
+            .source("tmpfs")
+            .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_STRICTATIME),
+    )
+}
+
+/// Whether guest path `path` is `/dev/shm` itself.
+pub(super) fn is_dev_shm(path: &Path) -> bool {
+    canonical_mount_target(path) == canonical_mount_target(Path::new(GUEST_DEV_SHM))
+}
+
+/// Whether a mount at guest path `target` goes into the private `/dev/shm`:
+/// it is strictly below `/dev/shm`.
+pub(super) fn is_below_dev_shm(target: &Path) -> bool {
+    let dev_shm = canonical_mount_target(Path::new(GUEST_DEV_SHM));
+    let resolved = canonical_mount_target(target);
+    resolved.starts_with(&dev_shm) && resolved != dev_shm
+}
+
+/// Whether host path `path` is `/dev/shm` or below it.
+pub(super) fn is_in_dev_shm(path: &Path) -> bool {
+    canonical_mount_target(path).starts_with(canonical_mount_target(Path::new(GUEST_DEV_SHM)))
+}
+
+/// Refuse a bind into the private `/dev/shm` whose source is below host
+/// directory `covered`, which an earlier mount of the plan covers, so that
+/// the bind would find that mount's contents instead; `reason` says which.
+pub(super) fn refuse_covered_bind_source(
+    mount: &Mount,
+    covered: &Path,
+    reason: &str,
+) -> Result<(), Error> {
+    if let Some(source) = mount.get_source().filter(|_| is_bind_mount(mount))
+        && canonical_mount_target(source).starts_with(canonical_mount_target(covered))
+    {
+        anyhow::bail!(
+            "cannot bind {} from host {} to {} in the guest's private /dev/shm: {reason}",
+            source.display(),
+            covered.display(),
+            mount.get_target().display()
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a bind into the private `/dev/shm` whose source is in the host's
+/// `/dev/shm`: the private one covers that source before the bind is made,
+/// so the bind would find the guest's own empty tmpfs instead.
+pub(super) fn refuse_bind_from_host_dev_shm(mount: &Mount) -> Result<(), Error> {
+    refuse_covered_bind_source(
+        mount,
+        Path::new(GUEST_DEV_SHM),
+        "the private /dev/shm covers the host's before the bind is made; pass --bind /dev/shm \
+         to keep the host's /dev/shm instead",
+    )
+}
+
+/// The superblock options `options` of a row a fresh (not bind) mount of the
+/// plan made, as the same mount by root shows them: without `uid=` or `gid=`.
+/// The container's user namespace maps one ID to its root, so a filesystem
+/// the plan mounts can be owned by no one else, and Linux prints a tmpfs's
+/// owner as the initial user namespace sees it, omitting root
+/// (`shmem_show_options`): a tmpfs the container's root mounts shows the host
+/// IDs of the user who ran Hermit (`uid=1000,gid=1000`) where the same mount
+/// by root shows none. The guest is root in its namespace and is told the
+/// host IDs nowhere else.
+fn superblock_options_as_root(options: &[u8]) -> Vec<u8> {
+    options
+        .split(|byte| *byte == b',')
+        .filter(|option| !option.starts_with(b"uid=") && !option.starts_with(b"gid="))
+        .collect::<Vec<_>>()
+        .join(&b',')
+}
+
 /// PROTOTYPE: a container whose root filesystem is a materialized OCI image
 /// rootfs. This is the *filesystem half* of hermit-as-container-runtime: the
 /// guest's file inputs come deterministically from the pinned image rather than
@@ -1637,9 +1739,10 @@ pub(super) fn image_container(
     //   of environmental coupling is the point of image mode. Absent,
     //   `open("/dev/tty")` reports ENOENT instead of ENXIO; both mean "no
     //   controlling terminal".
-    // * `/dev/shm` -- a writable shared-memory area is cross-process shared state
-    //   and a determinism question in its own right, and nothing in the current
-    //   image workloads needs it.
+    // * `/dev/shm` -- a writable shared-memory area is cross-process shared state,
+    //   and nothing in the current image workloads needs it. A namespaced run
+    //   without an image gets a private one ([`private_dev_shm`]); an image run
+    //   could get the same tmpfs when a workload needs it.
     // The KVM backend's VMM process opens /dev/kvm after chroot, so the host
     // device must be bound inside the root for that backend only. Other
     // backends keep the materializer's empty placeholder file.
@@ -5684,6 +5787,17 @@ mod readonly_proc;
 mod tests {
     use super::*;
     use crate::container_clone::CheckedClone;
+
+    /// The `uid=` and `gid=` options go; every other option stays, in order.
+    #[test]
+    fn superblock_options_leave_out_the_owner() {
+        assert_eq!(
+            superblock_options_as_root(b"rw,uid=1000,gid=100,inode64,huge=within_size"),
+            b"rw,inode64,huge=within_size"
+        );
+        assert_eq!(superblock_options_as_root(b"rw,mode=700"), b"rw,mode=700");
+        assert_eq!(superblock_options_as_root(b"rw"), b"rw");
+    }
 
     /// A rewrite for a mount the snapshot lacks (a user bind's recursive copy
     /// whose host directory was removed, detaching it) is dropped; every
