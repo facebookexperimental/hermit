@@ -231,6 +231,7 @@ async fn legacy_callback_close_trial(
         ..Config::default()
     }
     .with_backend(|backend| backend.delivers_preemption_timer_events = true);
+    config = crate::clock_identity::test_sources::qualified(config);
     config.validate();
     let (config, state, tid, process) = cancellation_test_state_with_config(config);
     install_test_registration(&state, tid, Ivar::new());
@@ -480,7 +481,8 @@ async fn legacy_callback_history_restores_actual_progress_after_same_leader_relo
         let path = dir.path().join("reload.json");
         let leader = super::ROOT_DETPID;
         if replay {
-            let mut writer = crate::preemptions::PreemptionWriter::new(None);
+            let mut writer = crate::preemptions::PreemptionWriter::new(None)
+                .with_identity(crate::clock_identity::test_sources::known());
             writer.register_thread(leader, DEFAULT_PRIORITY);
             writer.insert_schedevent(SchedEvent::branches(leader, 10));
             writer.insert_schedevent(SchedEvent::branches(leader, 7));
@@ -510,6 +512,7 @@ async fn legacy_callback_history_restores_actual_progress_after_same_leader_relo
             ..Config::default()
         }
         .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true);
+        config = crate::clock_identity::test_sources::qualified(config);
         config.validate();
         let state = GlobalState::initialize(&config, false);
         assert_eq!(state.sched.lock().unwrap().callback_history_active, active);
@@ -626,7 +629,10 @@ async fn legacy_callback_history_restores_actual_progress_after_same_leader_relo
                 .unwrap()
                 .into_string();
             let record: crate::preemptions::PreemptionRecord =
-                serde_json::from_str(&encoded).unwrap();
+                crate::preemptions::boundary_recording::Recording::decode(encoded.as_bytes())
+                    .unwrap()
+                    .into_legacy("test")
+                    .unwrap();
             record.validate().unwrap();
             assert_eq!(
                 record
@@ -649,13 +655,18 @@ async fn legacy_callback_history_old_chaos_replay_record_flags_make_no_authority
     use crate::slice_boundary::callbacks::Callback;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("old.json");
-    std::fs::write(&path, r#"{"per_thread":{},"global":[]}"#).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"rcb_history":{"format":2,"identity":"rcb:cond-retired:user:v1","recording":{"per_thread":{},"global":[]}}}"#,
+    )
+    .unwrap();
     let mut config = Config {
         chaos: true,
         record_preemptions: true,
         replay_schedule_from: Some(path),
         ..Config::default()
     };
+    config = crate::clock_identity::test_sources::qualified(config);
     config.validate();
     let (config, state, tid, process) = cancellation_test_state_with_config(config);
     let mut thread = crate::ThreadState::new(tid, &config, ());
@@ -702,13 +713,15 @@ async fn legacy_callback_branch_deadline_trial(annotated: bool, owner_switch: bo
         ..Config::default()
     }
     .with_backend(|backend| backend.delivers_preemption_timer_events = true);
+    config = crate::clock_identity::test_sources::qualified(config);
     config.validate();
     let start = crate::ThreadState::new(tid, &config, ())
         .thread_logical_time
         .as_nanos();
     let at = start + Duration::from_nanos(100);
     let deadline = at + Duration::from_nanos(900);
-    let mut writer = crate::preemptions::PreemptionWriter::new(None);
+    let mut writer = crate::preemptions::PreemptionWriter::new(None)
+        .with_identity(crate::clock_identity::test_sources::known());
     writer.register_thread(tid, DEFAULT_PRIORITY);
     writer.insert_schedevent(SchedEvent::branches(tid, 10));
     let peer_event = SchedEvent::syscall(
@@ -953,10 +966,12 @@ async fn legacy_callback_expired_deadline_trial_recording_at(
         config.sched_heuristic = crate::config::SchedHeuristic::Random;
         config.record_preemptions = true;
     }
+    config = crate::clock_identity::test_sources::qualified(config);
     config.validate();
     let start = crate::ThreadState::new(tid, &config, ()).thread_logical_time.as_nanos();
     let at = start + Duration::from_nanos(110);
-    let mut writer = crate::preemptions::PreemptionWriter::new(None);
+    let mut writer = crate::preemptions::PreemptionWriter::new(None)
+        .with_identity(crate::clock_identity::test_sources::known());
     writer.register_thread(tid, DEFAULT_PRIORITY);
     // The first actual branch installs the next Branch(10) deadline. At that
     // deadline, the following Branch/Other/Syscall window supplies no new one.
@@ -1031,7 +1046,11 @@ async fn legacy_callback_expired_deadline_trial_recording_at(
     drop(scheduler);
     let departure = if record {
         let written = state.sched.lock().unwrap().preemption_writer.take().unwrap().into_string();
-        let recorded: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        let crate::preemptions::boundary_recording::Recording::Legacy(recorded) =
+            crate::preemptions::boundary_recording::Recording::decode(written.as_bytes()).unwrap()
+        else {
+            panic!("a legacy recording writes a legacy record");
+        };
         assert!(recorded.require_faithful_replay().is_err(), "a record that omitted the expiry row must refuse faithful replay");
         recorded.replay_departed_at()
     } else { None };

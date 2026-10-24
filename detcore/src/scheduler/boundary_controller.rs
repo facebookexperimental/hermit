@@ -351,18 +351,25 @@ mod tests {
         let schedule = Schedule::new(vec![marker(3, 1)]).unwrap();
         let path = directory.path().join("recording.json");
         Recording::Boundaries(
-            BoundaryRecording::new(PreemptionRecord::from_sched_events(vec![]), schedule).unwrap(),
+            BoundaryRecording::new(
+                PreemptionRecord::from_sched_events_with_identity(
+                    vec![],
+                    Some(crate::clock_identity::test_sources::known()),
+                ),
+                schedule,
+            )
+            .unwrap(),
         )
         .write(&path)
         .unwrap();
-        let config = Config {
+        let config = crate::clock_identity::test_sources::qualified(Config {
             sequentialize_threads: true,
             replay_schedule_from: Some(path.clone()),
             record_preemptions: true,
             strict_schedule_boundaries: true,
             stacktrace_event: vec![(0, Some("marker.stack".into()))],
             ..Config::default()
-        };
+        });
         let mut scheduler = Scheduler::new(&config);
         assert!(scheduler.replayer.is_none());
         assert!(
@@ -406,9 +413,10 @@ mod tests {
         assert_eq!(scheduler.boundary_budget_for_live_owner(tid).unwrap(), None);
         // Old format retains its exact old replayer and producer rather than
         // trying to synthesize absent callback identities.
-        Recording::Legacy(PreemptionRecord::from_sched_events(vec![
-            SchedEvent::branches(tid, 1),
-        ]))
+        Recording::Legacy(PreemptionRecord::from_sched_events_with_identity(
+            vec![SchedEvent::branches(tid, 1)],
+            Some(crate::clock_identity::test_sources::known()),
+        ))
         .write(&path)
         .unwrap();
         let legacy = Scheduler::new(&Config {

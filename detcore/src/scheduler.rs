@@ -5745,8 +5745,108 @@ impl Scheduler {
     }
 }
 
+/// An admitted `replay_schedule_from` recording, with its
+/// `--stacktrace-event` selections already resolved against its complete
+/// stream (`AdmittedSchedule::new`), before the run is committed.
+pub(crate) struct AdmittedSchedule {
+    pub(crate) recording: Recording,
+    pub(crate) stacks: ReplayStacks,
+}
+
+/// The `--stacktrace-event` selections of an admitted schedule replay.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReplayStacks {
+    /// A legacy schedule's event at each selected index.
+    Legacy(Vec<(u64, Option<SchedEvent>, Option<PathBuf>)>),
+    /// A slice-boundary schedule's selected record indices.
+    Boundaries(BTreeMap<usize, Option<PathBuf>>),
+}
+
+impl AdmittedSchedule {
+    /// Resolves `cfg`'s stack selections against `recording`'s complete
+    /// stream. In a slice-boundary schedule an index outside it, or one given
+    /// twice, is a policy refusal; in a legacy schedule an index at or past
+    /// the end resolves without a recorded event, naming the events the run
+    /// makes after the schedule runs out.
+    pub(crate) fn new(cfg: &Config, recording: Recording) -> Result<Self, &'static str> {
+        let stacks = match &recording {
+            Recording::Legacy(_) => {
+                // Indices are traced (observed) event counts or, under
+                // `--stacktrace-at-schedule-positions` (how `hermit analyze`
+                // asks for its stacks), positions of the replayed schedule.
+                // Either way no recorded event is kept to match against, and
+                // one at or past the end names the events the run makes after
+                // the schedule runs out.
+                ReplayStacks::Legacy(
+                    cfg.stacktrace_event
+                        .iter()
+                        .map(|(ix, path)| (*ix, None, path.clone()))
+                        .collect(),
+                )
+            }
+            Recording::Boundaries(record) => {
+                let mut events = BTreeMap::new();
+                for (index, path) in &cfg.stacktrace_event {
+                    let index = usize::try_from(*index)
+                        .ok()
+                        .filter(|index| *index < record.schedule().records().len())
+                        .ok_or(
+                            "slice-boundary protocol refusal: stack index is outside the complete stream",
+                        )?;
+                    if events.insert(index, path.clone()).is_some() {
+                        return Err("slice-boundary protocol refusal: duplicate stack index");
+                    }
+                }
+                ReplayStacks::Boundaries(events)
+            }
+        };
+        Ok(Self { recording, stacks })
+    }
+}
+
+/// The refusal of a run whose replayed priority history's callback
+/// checkpoints (`None` when it replays none) disagree with the launch
+/// decision `annotated` (`Config::annotated_priority_replay`), or `None`.
+pub(crate) fn priority_checkpoint_mode_refusal(
+    annotated: bool,
+    checkpoints: Option<&BTreeMap<DetTid, Vec<crate::preemptions::callback_history::Checkpoint>>>,
+) -> Option<String> {
+    let Some(checkpoints) = checkpoints else {
+        return annotated.then(|| {
+            "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: the run was prepared to replay a \
+             callback-annotated priority history, but names no --replay-preemptions-from"
+                .to_owned()
+        });
+    };
+    let carries = checkpoints.values().any(|points| !points.is_empty());
+    (carries != annotated).then(|| {
+        format!(
+            "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: the replayed preemption record {} \
+             callback checkpoints, but the run was prepared as if it {}",
+            if carries { "carries" } else { "carries no" },
+            if annotated {
+                "carried them"
+            } else {
+                "carried none"
+            },
+        )
+    })
+}
+
+/// Ends the run with a policy refusal for an invalid strict-boundary
+/// configuration, before anything else is prepared.
+pub(crate) fn refuse_invalid_strict_boundary_config(cfg: &Config) {
+    if let Err(reason) = validate_strict_boundary_config(cfg) {
+        exit_on_scheduler_refusal(&anyhow::anyhow!(reason));
+    }
+}
+
 impl Scheduler {
-    /// Create a new scheduler based on the configuration.
+    /// Create a new scheduler based on the configuration, preparing the
+    /// run's RCB clock and admitting its replay inputs first
+    /// (`crate::clock_identity::prepare_run`). The crate builds its own
+    /// scheduler through `GlobalState`, which runs the same phases.
+    #[cfg(test)]
     pub fn new(cfg: &Config) -> Self {
         crate::record_or_replay::admit_chosen_input_stream(cfg, reverie::ToolStreamRole::Plain);
         if let Err(refusal) =
@@ -5754,9 +5854,27 @@ impl Scheduler {
         {
             exit_on_scheduler_refusal(&refusal);
         }
-        if let Err(reason) = validate_strict_boundary_config(cfg) {
-            exit_on_scheduler_refusal(&anyhow::anyhow!(reason));
-        }
+        refuse_invalid_strict_boundary_config(cfg);
+        // A scheduler alone reads no priority history, so neither admits one
+        // nor checks its checkpoints against the launch decision;
+        // `GlobalState` does both with the same preparation.
+        let prepared = crate::clock_identity::prepare_run(&Config {
+            replay_preemptions_from: None,
+            annotated_priority_replay: false,
+            ..cfg.clone()
+        });
+        Self::new_admitted(cfg, prepared.schedule, &prepared.clock)
+    }
+
+    /// Phase 4 of `crate::clock_identity`: a scheduler built from the admitted
+    /// `replay_schedule_from` recording and its resolved stack selections,
+    /// whose writer states `clock`'s committed identity. The caller has
+    /// refused an invalid strict-boundary configuration and prepared the run.
+    pub(crate) fn new_admitted(
+        cfg: &Config,
+        schedule: Option<AdmittedSchedule>,
+        clock: &crate::clock_identity::CommittedClock,
+    ) -> Self {
         let mut callback_checkpoints: BTreeMap<
             DetTid,
             std::collections::VecDeque<crate::preemptions::callback_history::Checkpoint>,
@@ -5771,24 +5889,19 @@ impl Scheduler {
         let mut replayed_format = None;
         let mut charge_replayed_switch_ins = false;
         let mut uncapped_replay_backstop = None;
-        let (replayer, m_vec) = match &cfg.replay_schedule_from {
-            Some(path) => {
-                trace!("Scheduler loading trace from path {}", path.display());
-                // File/JSON failures retain the ordinary loader's panic class.
-                // Only explicit format-policy mismatches below are refusals.
-                let recording = Recording::read(path).unwrap_or_else(|error| {
-                    if error
-                        .chain()
-                        .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>())
-                    {
-                        exit_on_scheduler_refusal(&format!("{error:#}"));
-                    }
-                    panic!("{error:?}")
-                });
+        let (replayer, m_vec) = match schedule {
+            Some(AdmittedSchedule { recording, stacks }) => {
+                trace!("Scheduler loading its admitted trace");
                 // Validate the exact decoded record installed below. A CLI
                 // pathname preflight cannot authorize a later unchecked read.
                 recording
-                    .validate_replay_inputs(&path.display().to_string(), cfg.guest_ids)
+                    .validate_replay_inputs(
+                        &cfg.replay_schedule_from
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
+                        cfg.guest_ids,
+                    )
                     .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
                 recording
                     .require_faithful_replay()
@@ -5823,8 +5936,8 @@ impl Scheduler {
                 // instruction-offset format follow format 1's.
                 replayed_format = Some(recording.timing_format());
                 charge_replayed_switch_ins = recording.charges_replayed_switch_ins();
-                match recording {
-                    Recording::Legacy(record) => {
+                match (recording, stacks) {
+                    (Recording::Legacy(record), ReplayStacks::Legacy(toprint)) => {
                         uncapped_replay_backstop = record
                             .uncapped_slices()
                             .map(|latest| uncapped_replay_backstop_for(latest, cfg));
@@ -5838,45 +5951,20 @@ impl Scheduler {
                         let notes_background_starts = record.notes_background_starts();
                         let vec = record.into_global();
                         trace!("Trace loaded, length {}", vec.len());
-                        // Indices are traced (observed) event counts or, under
-                        // `--stacktrace-at-schedule-positions` (how `hermit analyze`
-                        // asks for its stacks), positions of the replayed schedule.
-                        // Either way no recorded event is kept to match against, and
-                        // one at or past the end names the events the run makes after
-                        // the schedule runs out.
-                        let toprint = cfg
-                            .stacktrace_event
-                            .iter()
-                            .map(|(ix, path)| (*ix, None, path.clone()))
-                            .collect();
                         let mut replayer = Replayer::new(vec)
                             .with_background_starts(&background_starts, notes_background_starts);
                         replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
                         replayer.die_on_desync = cfg.die_on_desync;
                         (Some(replayer), Some(toprint))
                     }
-                    Recording::Boundaries(record) => {
-                        for (index, path) in &cfg.stacktrace_event {
-                            let index = usize::try_from(*index)
-                                .ok()
-                                .filter(|index| *index < record.schedule().records().len())
-                                .unwrap_or_else(|| exit_on_scheduler_refusal(&anyhow::anyhow!(
-                                    "slice-boundary protocol refusal: stack index is outside the complete stream"
-                                )));
-                            if boundary_stacktrace_events
-                                .insert(index, path.clone())
-                                .is_some()
-                            {
-                                exit_on_scheduler_refusal(&anyhow::anyhow!(
-                                    "slice-boundary protocol refusal: duplicate stack index"
-                                ));
-                            }
-                        }
+                    (Recording::Boundaries(record), ReplayStacks::Boundaries(stacks)) => {
+                        boundary_stacktrace_events = stacks;
                         boundary_replayer = Some(boundary_replayer::BoundaryReplayer::new(
                             record.schedule().clone(),
                         ));
                         (None, None)
                     }
+                    _ => unreachable!("stack selections resolved for another recording kind"),
                 }
             }
             None => (
@@ -5934,6 +6022,7 @@ impl Scheduler {
         let boundaries = cfg.strict_schedule_boundaries;
         let preemption_writer = cfg.record_preemptions.then(|| {
             let writer = PreemptionWriter::new(cfg.record_preemptions_to.clone())
+                .with_identity(clock.history_identity())
                 .with_epoch(cfg.epoch)
                 .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect())
                 .with_signal_state_copy(cfg.signal_state_copy)
@@ -23171,20 +23260,12 @@ impl Scheduler {
         &mut self,
         checkpoints: &BTreeMap<DetTid, Vec<crate::preemptions::callback_history::Checkpoint>>,
     ) -> Result<(), String> {
-        let annotated = checkpoints.values().any(|points| !points.is_empty());
-        if annotated != self.annotated_priority_replay {
-            return Err(format!(
-                "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: the replayed preemption record {} \
-                 callback checkpoints, but the run was prepared as if it {}",
-                if annotated { "carries" } else { "carries no" },
-                if self.annotated_priority_replay {
-                    "carried them"
-                } else {
-                    "carried none"
-                },
-            ));
+        if let Some(refusal) =
+            priority_checkpoint_mode_refusal(self.annotated_priority_replay, Some(checkpoints))
+        {
+            return Err(refusal);
         }
-        if annotated {
+        if self.annotated_priority_replay {
             self.callback_checkpoints = checkpoints
                 .iter()
                 .map(|(tid, points)| (*tid, points.iter().cloned().collect()))
@@ -26406,29 +26487,36 @@ mod test {
     /// older rules (`TimeSkipMode::Legacy`) and records format 1.
     #[test]
     fn a_record_states_its_format_and_its_replay_follows_it() {
-        let recording = Config {
+        let recording = crate::clock_identity::test_sources::qualified(Config {
             record_preemptions: true,
             ..Config::default()
-        };
+        });
         let written = Scheduler::new(&recording)
             .preemption_writer
             .take()
             .unwrap()
             .into_string();
-        let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        let crate::preemptions::boundary_recording::Recording::Legacy(record) =
+            crate::preemptions::boundary_recording::Recording::decode(written.as_bytes()).unwrap()
+        else {
+            panic!("a legacy recording writes a legacy record");
+        };
         assert!(record.lists_its_time_skips());
 
         let dir = tempfile::tempdir().unwrap();
         let replay = |record: crate::preemptions::PreemptionRecord| {
             let path = dir.path().join("record.json");
-            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
-            Scheduler::new(&Config {
+            std::fs::write(&path, record.to_string()).unwrap();
+            Scheduler::new(&crate::clock_identity::test_sources::qualified(Config {
                 replay_schedule_from: Some(path),
                 record_preemptions: true,
                 ..Config::default()
-            })
+            }))
         };
-        let empty = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new());
+        let empty = crate::preemptions::PreemptionRecord::from_sched_events_with_identity(
+            Vec::new(),
+            Some(crate::clock_identity::test_sources::known()),
+        );
         let mut current = replay(empty.clone().with_current_format());
         assert_eq!(
             current.time_skip_mode,
@@ -26464,15 +26552,18 @@ mod test {
         let load = |format, recordreplay_modes, replaying| {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("schedule.json");
-            let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
-                .with_format(format);
+            let record = crate::preemptions::PreemptionRecord::from_sched_events_with_identity(
+                Vec::new(),
+                Some(crate::clock_identity::test_sources::known()),
+            )
+            .with_format(format);
             Recording::Legacy(record).write(&path).unwrap();
-            Scheduler::new(&Config {
+            Scheduler::new(&crate::clock_identity::test_sources::qualified(Config {
                 replay_schedule_from: Some(path),
                 recordreplay_modes,
                 replaying,
                 ..Config::default()
-            })
+            }))
         };
         if let Ok(case) = std::env::var(CHILD) {
             let (format, replaying) = case.split_once(':').unwrap();
@@ -26721,19 +26812,25 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         let replay = |format: u32| {
             let path = dir.path().join("record.json");
-            let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
-                .with_current_format();
-            let mut value = serde_json::to_value(&record).unwrap();
-            value["format_version"] = serde_json::json!(format);
-            std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
-            let mut sched = Scheduler::new(&Config {
-                replay_schedule_from: Some(path),
-                record_preemptions: true,
-                ..Config::default()
-            });
-            let written: crate::preemptions::PreemptionRecord =
-                serde_json::from_str(&sched.preemption_writer.take().unwrap().into_string())
-                    .unwrap();
+            let record = crate::preemptions::PreemptionRecord::from_sched_events_with_identity(
+                Vec::new(),
+                Some(crate::clock_identity::test_sources::known()),
+            )
+            .with_format(Some(format));
+            std::fs::write(&path, record.to_string()).unwrap();
+            let mut sched =
+                Scheduler::new(&crate::clock_identity::test_sources::qualified(Config {
+                    replay_schedule_from: Some(path),
+                    record_preemptions: true,
+                    ..Config::default()
+                }));
+            let written_text = sched.preemption_writer.take().unwrap().into_string();
+            let crate::preemptions::boundary_recording::Recording::Legacy(written) =
+                crate::preemptions::boundary_recording::Recording::decode(written_text.as_bytes())
+                    .unwrap()
+            else {
+                panic!("a legacy replay writes a legacy record");
+            };
             (sched.charge_replayed_switch_ins, written.format_version())
         };
         assert_eq!(replay(3), (true, Some(3)));
@@ -26803,32 +26900,38 @@ mod test {
             SchedEvent::branches(tid, 10).with_time(LogicalTime::from_nanos(100)),
             SchedEvent::branches(tid, 20).with_time(LogicalTime::from_nanos(200)),
         ];
-        let replay = |value: serde_json::Value| {
+        let replay = |record: &PreemptionRecord| {
             let path = dir.path().join("record.json");
-            std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
-            Scheduler::new(&Config {
+            std::fs::write(&path, record.to_string()).unwrap();
+            Scheduler::new(&crate::clock_identity::test_sources::qualified(Config {
                 replay_schedule_from: Some(path),
                 record_preemptions: true,
                 ..Config::default()
-            })
+            }))
         };
         let written = |sched: &mut Scheduler| -> PreemptionRecord {
             let mut writer = sched.preemption_writer.take().unwrap();
             for event in &events {
                 writer.insert_schedevent(event.clone());
             }
-            serde_json::from_str(&writer.into_string()).unwrap()
+            let text = writer.into_string();
+            let crate::preemptions::boundary_recording::Recording::Legacy(record) =
+                crate::preemptions::boundary_recording::Recording::decode(text.as_bytes()).unwrap()
+            else {
+                panic!("a legacy recording writes a legacy record");
+            };
+            record
         };
 
-        let mut fresh = Scheduler::new(&Config {
+        let mut fresh = Scheduler::new(&crate::clock_identity::test_sources::qualified(Config {
             record_preemptions: true,
             ..Config::default()
-        });
+        }));
         let recorded = written(&mut fresh);
         assert_eq!(recorded.format_version(), Some(STOPLESS_SLICE_ENDS_FORMAT));
         assert!(recorded.notes_background_starts());
 
-        let mut noting = replay(serde_json::to_value(&recorded).unwrap());
+        let mut noting = replay(&recorded);
         assert!(noting.charge_replayed_switch_ins);
         let re_record = written(&mut noting);
         assert_eq!(
@@ -26843,7 +26946,7 @@ mod test {
             1
         );
 
-        let mut again = replay(serde_json::to_value(&re_record).unwrap());
+        let mut again = replay(&re_record);
         assert!(again.charge_replayed_switch_ins);
         again.record_or_replay_background_start(tid, 1);
         assert!(
@@ -31477,16 +31580,19 @@ mod test {
             let path = dir
                 .path()
                 .join(format!("record-{recorded_once}-{chaos}.json"));
-            let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
-                .with_expired_wait_runs_charged_once(recorded_once);
-            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            let record = crate::preemptions::PreemptionRecord::from_sched_events_with_identity(
+                Vec::new(),
+                Some(crate::clock_identity::test_sources::known()),
+            )
+            .with_expired_wait_runs_charged_once(recorded_once);
+            std::fs::write(&path, record.to_string()).unwrap();
             for schedule in [true, false] {
-                let config = Config {
+                let config = crate::clock_identity::test_sources::qualified(Config {
                     chaos,
                     replay_schedule_from: schedule.then(|| path.clone()),
                     replay_preemptions_from: (!schedule).then(|| path.clone()),
                     ..Default::default()
-                };
+                });
                 assert_eq!(
                     Scheduler::new(&config).expired_wait_runs_charged_once,
                     recorded_once,
@@ -31503,12 +31609,12 @@ mod test {
             (ExpiredWaitCharge::Each, false),
         ] {
             for replay in [None, Some(path.clone())] {
-                let config = Config {
+                let config = crate::clock_identity::test_sources::qualified(Config {
                     chaos: true,
                     expired_wait_charge: Some(charge),
                     replay_schedule_from: replay.clone(),
                     ..Default::default()
-                };
+                });
                 assert_eq!(
                     Scheduler::new(&config).expired_wait_runs_charged_once,
                     once,
@@ -31517,12 +31623,12 @@ mod test {
             }
         }
         // A replay that also records stores the rule it replayed under.
-        let replaying_recorder = Config {
+        let replaying_recorder = crate::clock_identity::test_sources::qualified(Config {
             chaos: true,
             replay_schedule_from: Some(path.clone()),
             record_preemptions: true,
             ..Default::default()
-        };
+        });
         let scheduler = Scheduler::new(&replaying_recorder);
         assert!(scheduler.expired_wait_runs_charged_once);
         assert!(
@@ -36174,16 +36280,19 @@ mod test {
         let dir = tempfile::tempdir().unwrap();
         for (recorded, chaos) in [(true, true), (false, false), (true, false), (false, true)] {
             let path = dir.path().join(format!("record-{recorded}-{chaos}.json"));
-            let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
-                .with_queued_sleeps_registered_at_first_pass(recorded);
-            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            let record = crate::preemptions::PreemptionRecord::from_sched_events_with_identity(
+                Vec::new(),
+                Some(crate::clock_identity::test_sources::known()),
+            )
+            .with_queued_sleeps_registered_at_first_pass(recorded);
+            std::fs::write(&path, record.to_string()).unwrap();
             for schedule in [true, false] {
-                let config = Config {
+                let config = crate::clock_identity::test_sources::qualified(Config {
                     chaos,
                     replay_schedule_from: schedule.then(|| path.clone()),
                     replay_preemptions_from: (!schedule).then(|| path.clone()),
                     ..first_pass_config()
-                };
+                });
                 assert_eq!(
                     Scheduler::new(&config).queued_sleeps_registered_at_first_pass,
                     recorded,
@@ -36200,12 +36309,12 @@ mod test {
             (SleepRegistration::WhenChosen, false),
         ] {
             for replay in [None, Some(path.clone())] {
-                let config = Config {
+                let config = crate::clock_identity::test_sources::qualified(Config {
                     chaos: true,
                     sleep_registration: Some(registration),
                     replay_schedule_from: replay.clone(),
                     ..first_pass_config()
-                };
+                });
                 assert_eq!(
                     Scheduler::new(&config).queued_sleeps_registered_at_first_pass,
                     first_pass,
@@ -36214,12 +36323,12 @@ mod test {
             }
         }
         // A replay that also records stores the rule it replayed under.
-        let replaying_recorder = Config {
+        let replaying_recorder = crate::clock_identity::test_sources::qualified(Config {
             chaos: true,
             replay_schedule_from: Some(path.clone()),
             record_preemptions: true,
             ..first_pass_config()
-        };
+        });
         let scheduler = Scheduler::new(&replaying_recorder);
         assert!(scheduler.queued_sleeps_registered_at_first_pass);
         assert!(
@@ -40830,13 +40939,18 @@ mod test {
         let recorded = vec![event(100), event(100)];
         std::fs::write(
             &schedule,
-            serde_json::json!({ "per_thread": {}, "global": recorded }).to_string(),
+            crate::preemptions::PreemptionRecord::from_sched_events_with_identity(
+                recorded,
+                Some(crate::clock_identity::test_sources::known()),
+            )
+            .to_string(),
         )
         .unwrap();
-        let mut scheduler = Scheduler::new(&Config {
-            replay_schedule_from: Some(schedule),
-            ..Config::default()
-        });
+        let mut scheduler =
+            Scheduler::new(&crate::clock_identity::test_sources::qualified(Config {
+                replay_schedule_from: Some(schedule),
+                ..Config::default()
+            }));
         let origin = Origin {
             callback: Callback::PmuTimer,
             site: Site::Prehook,
@@ -41246,7 +41360,11 @@ mod test {
         // it is not an exact record of the run.
         let event = scheduler.recorded_event_count;
         let written = scheduler.preemption_writer.take().unwrap().into_string();
-        let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        let crate::preemptions::boundary_recording::Recording::Legacy(record) =
+            crate::preemptions::boundary_recording::Recording::decode(written.as_bytes()).unwrap()
+        else {
+            panic!("a legacy recording writes a legacy record");
+        };
         assert_eq!(record.replay_departed_at(), Some(event));
         // The same in a faithful replay is reported, and marks its record too.
         let (mut faithful, spinner) = replaying_and_recording_spinner(true);
@@ -41254,7 +41372,11 @@ mod test {
         spinner_changepoint(&mut faithful, spinner, DEFAULT_PRIORITY + 2, 500);
         assert_eq!(reports(), before + 1);
         let written = faithful.preemption_writer.take().unwrap().into_string();
-        let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        let crate::preemptions::boundary_recording::Recording::Legacy(record) =
+            crate::preemptions::boundary_recording::Recording::decode(written.as_bytes()).unwrap()
+        else {
+            panic!("a legacy recording writes a legacy record");
+        };
         assert!(record.replay_departed_at().is_some());
         // Only a replay's record can be edited.
         let (scheduler, _) = replaying_and_recording_spinner(false);
@@ -56334,17 +56456,20 @@ mod strict_boundary_admission_tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("schedule.json");
         let tid = DetTid::from_raw(3);
-        Recording::Legacy(PreemptionRecord::from_sched_events(vec![
-            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Prehook),
-            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Posthook),
-        ]))
+        Recording::Legacy(PreemptionRecord::from_sched_events_with_identity(
+            vec![
+                SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Prehook),
+                SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Posthook),
+            ],
+            Some(crate::clock_identity::test_sources::known()),
+        ))
         .write(&path)
         .unwrap();
-        let cfg = Config {
+        let cfg = crate::clock_identity::test_sources::qualified(Config {
             replay_schedule_from: Some(path),
             stacktrace_event: vec![(7, None), (2, None)],
             ..Config::default()
-        };
+        });
         let scheduler = Scheduler::new(&cfg);
         let positions: Vec<u64> = scheduler
             .stacktrace_events

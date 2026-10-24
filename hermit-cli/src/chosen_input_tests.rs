@@ -137,13 +137,25 @@ fn json_chosen_raw_schedule_and_priority_routes_refuse_before_target_start() {
     let directory = tempfile::tempdir().unwrap();
     let good = directory.path().join("qualified.json");
     let bad = directory.path().join("unqualified.json");
+    // Modern fixtures state this host's qualified RCB identity, so identity
+    // admission passes and the Chosen provenance refusal under test fires.
+    // The authentic-legacy bytes stay unwrapped: Chosen validation precedes
+    // identity admission on both routes, so they take it too.
+    let host = reverie::pmu_config::resolve_host_clock()
+        .expect("a chosen-input replay needs this host's RCB clock qualified");
+    let enveloped = |inner: &serde_json::Value| {
+        serde_json::to_vec(&serde_json::json!({
+            "rcb_history": {"format": 2, "identity": host.metric.id(), "recording": inner}
+        }))
+        .unwrap()
+    };
     let mut value = serde_json::json!({
         "per_thread": {}, "global": [],
         "guest_ids": serde_json::to_value(config(0).guest_ids).unwrap(),
         "reserved_input": {"contract": "sealed-private-input-v1", "base": "0x71010000",
             "abi": std::env::consts::ARCH, "page_bytes": unsafe { libc::sysconf(libc::_SC_PAGESIZE) }}
     });
-    std::fs::write(&good, serde_json::to_vec(&value).unwrap()).unwrap();
+    std::fs::write(&good, enveloped(&value)).unwrap();
     if parts[2] == "missing" {
         value.as_object_mut().unwrap().remove("reserved_input");
     } else {
@@ -158,9 +170,13 @@ fn json_chosen_raw_schedule_and_priority_routes_refuse_before_target_start() {
         )
         .unwrap();
     } else {
-        std::fs::write(&bad, serde_json::to_vec(&value).unwrap()).unwrap();
+        std::fs::write(&bad, enveloped(&value)).unwrap();
     }
     let mut config = config(0);
+    let prepared =
+        crate::prepare_backend_config(detcore::Config::default(), crate::Backend::Ptrace);
+    config.backend.rcb_clock_contract = prepared.backend.rcb_clock_contract;
+    config.rcb_clock_claim = prepared.rcb_clock_claim;
     match parts[1].as_str() {
         "schedule" => config.replay_schedule_from = Some(bad),
         "priority" => config.replay_preemptions_from = Some(bad),

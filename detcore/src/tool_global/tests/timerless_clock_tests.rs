@@ -616,24 +616,29 @@ async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer()
             file.path(),
             // A timer preemption the thread runs on from, as recordings write
             // it: branches, with no OtherInstructions after them, then more.
-            crate::preemptions::PreemptionRecord::from_sched_events(vec![
-                event.clone(),
-                branch.clone(),
-                SchedEvent {
-                    count: 1,
-                    end_time: Some(sample_time + LogicalTime::from_nanos(1_240)),
-                    ..branch.clone()
-                },
-            ])
+            crate::preemptions::PreemptionRecord::from_sched_events_with_identity(
+                vec![
+                    event.clone(),
+                    branch.clone(),
+                    SchedEvent {
+                        count: 1,
+                        end_time: Some(sample_time + LogicalTime::from_nanos(1_240)),
+                        ..branch.clone()
+                    },
+                ],
+                Some(crate::clock_identity::test_sources::known()),
+            )
             .to_string(),
         )
         .unwrap();
-        let config = Config {
-            sequentialize_threads: true,
-            replay_schedule_from: Some(file.path().to_path_buf()),
-            ..Config::default()
-        }
-        .with_backend(|backend| backend.delivers_preemption_timer_events = delivers_timer);
+        let config = crate::clock_identity::test_sources::qualified(
+            Config {
+                sequentialize_threads: true,
+                replay_schedule_from: Some(file.path().to_path_buf()),
+                ..Config::default()
+            }
+            .with_backend(|backend| backend.delivers_preemption_timer_events = delivers_timer),
+        );
         let state = GlobalState::initialize(&config, false);
         state
             .past_first_execve
@@ -751,19 +756,18 @@ async fn a_prehook_switch_hands_the_switching_thread_the_recorded_slice() {
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         file.path(),
-        crate::preemptions::PreemptionRecord::from_sched_events(vec![
-            prehook.clone(),
-            branches,
-            after,
-        ])
+        crate::preemptions::PreemptionRecord::from_sched_events_with_identity(
+            vec![prehook.clone(), branches, after],
+            Some(crate::clock_identity::test_sources::known()),
+        )
         .to_string(),
     )
     .unwrap();
-    let config = Config {
+    let config = crate::clock_identity::test_sources::qualified(Config {
         sequentialize_threads: true,
         replay_schedule_from: Some(file.path().to_path_buf()),
         ..Config::default()
-    };
+    });
     let state = GlobalState::initialize(&config, false);
     state
         .past_first_execve

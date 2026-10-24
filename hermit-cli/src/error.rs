@@ -386,8 +386,11 @@ impl From<SerializableError> for Error {
     }
 }
 
+/// A boundary schedule with one record no run consumes, stating `identity`.
 #[cfg(test)]
-pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
+fn unconsumed_schedule_for_test(
+    identity: Option<detcore::preemptions::HistoryIdentity>,
+) -> detcore::preemptions::boundary_recording::Recording {
     use detcore::preemptions::PreemptionRecord;
     use detcore::preemptions::boundary_recording::BoundaryRecording;
     use detcore::preemptions::boundary_recording::Recording;
@@ -395,9 +398,7 @@ pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
     use detcore_model::schedule::SchedEvent;
     use detcore_model::schedule::boundary::Record;
     use detcore_model::schedule::boundary::Schedule;
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("unconsumed.json");
-    let recording = Recording::Boundaries(
+    Recording::Boundaries(
         BoundaryRecording::new(
             PreemptionRecord::default(),
             Schedule::new(vec![Record::Event(SchedEvent::branches(
@@ -407,18 +408,38 @@ pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
             .unwrap(),
         )
         .unwrap(),
-    );
+    )
+    .with_identity(identity)
+}
+
+#[cfg(test)]
+pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
+    use detcore::preemptions::HistoryIdentity;
+    // The replay reaches its terminal refusal only past identity admission:
+    // the schedule states this host's qualified RCB metric, and the run is
+    // prepared for this host's clock as `prepare_backend_config` prepares a
+    // ptrace run. Its other capabilities stay the defaults.
+    let host = reverie::pmu_config::resolve_host_clock()
+        .expect("a terminal replay needs this host's RCB clock qualified");
+    let prepared =
+        crate::prepare_backend_config(detcore::Config::default(), crate::Backend::Ptrace);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unconsumed.json");
+    let recording = unconsumed_schedule_for_test(Some(HistoryIdentity::Known(host.metric)));
     std::fs::write(&path, recording.encode().unwrap()).unwrap();
-    detcore::GlobalState::init_for_external_scheduler(&detcore::Config {
+    let mut config = detcore::Config {
         sequentialize_threads: true,
         strict_schedule_boundaries: true,
         replay_schedule_from: Some(path),
         record_preemptions: false,
         ..detcore::Config::default()
-    })
-    .clean_up(false, &None)
-    .await
-    .unwrap_err()
+    };
+    config.backend.rcb_clock_contract = prepared.backend.rcb_clock_contract;
+    config.rcb_clock_claim = prepared.rcb_clock_claim;
+    detcore::GlobalState::init_for_external_scheduler(&config)
+        .clean_up(false, &None)
+        .await
+        .unwrap_err()
 }
 
 #[cfg(test)]
@@ -481,6 +502,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_unconsumed_schedule_without_identity_is_refused_before_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unconsumed.json");
+        std::fs::write(&path, unconsumed_schedule_for_test(None).encode().unwrap()).unwrap();
+        let refusal = crate::rcb_history_refusal(
+            &detcore::Config::default(),
+            &[("--replay-schedule-from", path.as_path())],
+        )
+        .unwrap()
+        .expect("an identity-less schedule is refused");
+        assert!(
+            refusal.contains("it states no RCB coordinate identity"),
+            "{refusal}"
+        );
     }
 
     #[tokio::test]

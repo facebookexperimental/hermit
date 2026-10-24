@@ -75,7 +75,7 @@ pub(crate) async fn receiver_cleanup(
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("input.json");
     let output = directory.path().join("output.json");
-    let config = Config {
+    let mut config = Config {
         sequentialize_threads: true,
         max_timeslice: None,
         target_timeslice: std::num::NonZeroU64::new(100_000),
@@ -85,6 +85,11 @@ pub(crate) async fn receiver_cleanup(
         record_preemptions_to: Some(output.clone()),
         ..Config::default()
     };
+    // Prepared for this host's clock as `prepare_backend_config` prepares a
+    // ptrace run, so the qualified history below is admitted.
+    let prepared = crate::prepare_backend_config(Config::default(), crate::Backend::Ptrace);
+    config.backend.rcb_clock_contract = prepared.backend.rcb_clock_contract;
+    config.rcb_clock_claim = prepared.rcb_clock_claim;
     let tid = DetTid::from_raw(3);
     let from = Tid::from_raw(tid.as_raw());
     let mut thread = ThreadState::new(tid, &config, ());
@@ -100,11 +105,14 @@ pub(crate) async fn receiver_cleanup(
         "chaos_epochs": [],
     }))
     .unwrap();
-    let record: PreemptionRecord = serde_json::from_value(json!({
+    let record: PreemptionRecord = serde_json::from_value::<PreemptionRecord>(json!({
         "per_thread": {"3": history},
         "global": [],
     }))
-    .unwrap();
+    .unwrap()
+    .with_identity(Some(detcore::preemptions::HistoryIdentity::Known(
+        reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+    )));
     record.validate().unwrap();
     record.require_faithful_replay().unwrap();
     record.write_to_disk(&input).unwrap();
@@ -177,8 +185,9 @@ pub(crate) async fn receiver_cleanup(
     );
     let destination = bad_summary.then(|| directory.path().to_path_buf());
     let cleanup = state.clean_up(false, &destination).await;
-    let rerecorded: PreemptionRecord =
-        serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    let rerecorded: PreemptionRecord = detcore::preemptions::PreemptionReader::try_new(&output)
+        .unwrap()
+        .into_inner();
     assert!(rerecorded.schedevents().is_empty());
     (cleanup, rerecorded.replay_departed_at())
 }

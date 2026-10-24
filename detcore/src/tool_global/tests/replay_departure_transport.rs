@@ -32,7 +32,7 @@ use crate::types::LogicalTime;
 async fn fixture(edited: bool) -> (tempfile::TempDir, Config, GlobalState, ThreadState<()>) {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("input.json");
-    let config = Config {
+    let config = crate::clock_identity::test_sources::qualified(Config {
         sequentialize_threads: true,
         max_timeslice: None,
         target_timeslice: std::num::NonZeroU64::new(100_000),
@@ -42,7 +42,7 @@ async fn fixture(edited: bool) -> (tempfile::TempDir, Config, GlobalState, Threa
         record_preemptions: true,
         record_preemptions_to: Some(dir.path().join("output.json")),
         ..Config::default()
-    };
+    });
     let tid = DetTid::from_raw(3);
     let mut thread = ThreadState::new(tid, &config, ());
     thread.detpid = Some(tid);
@@ -60,6 +60,7 @@ async fn fixture(edited: bool) -> (tempfile::TempDir, Config, GlobalState, Threa
         "per_thread": {"3": history, "4": history}, "global": [],
     }))
     .unwrap();
+    let record = record.with_identity(Some(crate::clock_identity::test_sources::known()));
     record.validate().unwrap();
     record.write_to_disk(&input).unwrap();
     let state = <GlobalState as GlobalTool>::init_global_state(&config).await;

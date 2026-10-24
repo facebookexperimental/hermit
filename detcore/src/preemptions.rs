@@ -15,7 +15,6 @@ mod reserved_input;
 mod streaming;
 
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::iter::FromIterator;
 use std::path::Path;
 use std::path::PathBuf;
@@ -43,6 +42,27 @@ use crate::scheduler::runqueue::is_ordinary_priority;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;
+
+/// The RCB-coordinate identity a stored history declares. Only a history
+/// written in the `rcb_history` envelope (`boundary_recording`) has one; a
+/// legacy file states none, so where it was produced is unknown.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum HistoryIdentity {
+    /// Its RCB coordinates count this metric.
+    Known(reverie::pmu_config::RcbMetric),
+    /// Its producer's RCB clock was not a qualified contract, for the reason
+    /// it states. Never executable.
+    Unqualified(String),
+}
+
+impl std::fmt::Display for HistoryIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Known(metric) => f.write_str(metric.id()),
+            Self::Unqualified(reason) => write!(f, "unqualified ({reason})"),
+        }
+    }
+}
 
 /// The first format whose records note every background start
 /// (`BackgroundStart`), so that a call such a record does not start at a point
@@ -398,6 +418,10 @@ pub struct PreemptionRecord {
     /// Hermit passes it through, so replay admission can refuse it
     /// rather than lose the marker on decode and admit it as plain.
     rewrite_exclusives_stripped_heuristic: bool,
+    /// The identity of this record's RCB coordinates, carried by the
+    /// `rcb_history` envelope around the record rather than inside it.
+    /// `None` for a legacy file, and for a record built without one.
+    identity: Option<HistoryIdentity>,
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -818,13 +842,28 @@ pub fn read_recorded_chaos_slowdown(path: &Path) -> Result<bool, String> {
 
 impl std::fmt::Display for PreemptionRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        streaming::fmt_json(self, f, false)
+        let str = boundary_recording::encode_record(self).unwrap();
+        write!(f, "{}", str)
     }
 }
 
 impl PreemptionRecord {
     /// TODO: This is not ideal because PreemptionRecord shouldn't be doing double duty as an eventlog.
+    /// `identity` is that of the events' RCB coordinates: the admitted
+    /// source's for events taken from another history, `None` where it is
+    /// unknown.
+    /// Events synthesized without a stated RCB coordinate identity.
     pub fn from_sched_events(events: Vec<SchedEvent>) -> Self {
+        Self::from_sched_events_with_identity(events, None)
+    }
+
+    /// `identity` is that of the events' RCB coordinates: the admitted
+    /// source's for events taken from another history, `None` where it is
+    /// unknown.
+    pub fn from_sched_events_with_identity(
+        events: Vec<SchedEvent>,
+        identity: Option<HistoryIdentity>,
+    ) -> Self {
         let mut record = Self {
             per_thread: Default::default(),
             global: events,
@@ -854,6 +893,7 @@ impl PreemptionRecord {
             background_starts_unnoted: false,
             rewrite_exclusives: None,
             rewrite_exclusives_stripped_heuristic: false,
+            identity,
         };
         // A schedule spliced, cut or continued from a recording keeps the
         // offsets of the events it took, and says so: only a recording in the
@@ -937,6 +977,7 @@ impl PreemptionRecord {
             background_starts_unnoted,
             rewrite_exclusives,
             rewrite_exclusives_stripped_heuristic,
+            identity,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -1028,6 +1069,9 @@ impl PreemptionRecord {
             background_starts_unnoted: *background_starts_unnoted,
             rewrite_exclusives: *rewrite_exclusives,
             rewrite_exclusives_stripped_heuristic: *rewrite_exclusives_stripped_heuristic,
+            // A prefix states its source's coordinates, so it keeps its
+            // source's identity.
+            identity: identity.clone(),
         };
         // The background starts are points of the recorded run too, and go
         // the same way, as an edited record's do (`forget_run_points`): a
@@ -1355,6 +1399,17 @@ impl PreemptionRecord {
     /// sleeps.
     pub fn with_queued_sleeps_registered_at_first_pass(mut self, first_pass: bool) -> Self {
         self.queued_sleeps_registered_at_first_pass = first_pass;
+        self
+    }
+
+    /// The identity of this record's RCB coordinates, if it states one.
+    pub fn identity(&self) -> Option<&HistoryIdentity> {
+        self.identity.as_ref()
+    }
+
+    /// The same record, stating `identity` for its coordinates.
+    pub fn with_identity(mut self, identity: Option<HistoryIdentity>) -> Self {
+        self.identity = identity;
         self
     }
 
@@ -1721,6 +1776,7 @@ impl PreemptionRecord {
             background_starts_unnoted: false,
             rewrite_exclusives: self.rewrite_exclusives,
             rewrite_exclusives_stripped_heuristic: self.rewrite_exclusives_stripped_heuristic,
+            identity: self.identity.clone(),
         }
     }
 
@@ -1852,7 +1908,18 @@ impl PreemptionRecord {
     /// too), and at least [`INSTRUCTION_OFFSET_ROWS_FORMAT`] when only its rows
     /// do. Either way a Hermit that predates the offsets refuses the record
     /// rather than replaying it without them.
+    /// `identity` is that of the coordinates: the admitted source's for
+    /// coordinates taken from another history, `None` where it is unknown.
+    /// Histories synthesized without a stated RCB coordinate identity.
     pub fn from_vecs(bt: &BTreeMap<DetTid, Vec<(LogicalTime, Priority)>>) -> Self {
+        Self::from_vecs_with_identity(bt, None)
+    }
+
+    /// [`Self::from_vecs`], stating `identity` for the histories' coordinates.
+    pub fn from_vecs_with_identity(
+        bt: &BTreeMap<DetTid, Vec<(LogicalTime, Priority)>>,
+        identity: Option<HistoryIdentity>,
+    ) -> Self {
         let mut bt2 = BTreeMap::new();
         for (tid, vec) in bt {
             let th = if vec.is_empty() {
@@ -1921,6 +1988,7 @@ impl PreemptionRecord {
             background_starts_unnoted: false,
             rewrite_exclusives: None,
             rewrite_exclusives_stripped_heuristic: false,
+            identity,
         }
     }
 
@@ -4554,7 +4622,7 @@ mod tests {
     /// (https://github.com/rrnewton/hermit/issues/4380).
     #[test]
     fn the_pipe_wake_latency_round_trips_and_is_compared_exactly() {
-        let off = PreemptionRecord::from_sched_events(Vec::new());
+        let off = PreemptionRecord::from_sched_events_with_identity(Vec::new(), None);
         assert!(
             !serde_json::to_string(&off)
                 .unwrap()
@@ -4562,8 +4630,8 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         for latency in [Some(0), Some(3_000_000)] {
-            let record =
-                PreemptionRecord::from_sched_events(Vec::new()).with_pipe_wake_latency(latency);
+            let record = PreemptionRecord::from_sched_events_with_identity(Vec::new(), None)
+                .with_pipe_wake_latency(latency);
             let json = serde_json::to_string(&record).unwrap();
             let back: PreemptionRecord = serde_json::from_str(&json).unwrap();
             assert_eq!(back.pipe_wake_latency(), latency);
@@ -5193,7 +5261,7 @@ mod tests {
 
     #[test]
     fn the_signal_state_copy_setting_round_trips_and_is_compared() {
-        let unsaid = PreemptionRecord::from_sched_events(Vec::new());
+        let unsaid = PreemptionRecord::from_sched_events_with_identity(Vec::new(), None);
         assert_eq!(unsaid.signal_state_copy(), None);
         assert!(
             !serde_json::to_string(&unsaid)
@@ -6996,7 +7064,10 @@ mod tests {
 
         use crate::slice_boundary::callbacks::Callback;
         let tid = DetTid::from_raw(3);
-        let mut record = PreemptionRecord::from_sched_events(vec![SchedEvent::branches(tid, 10)]);
+        let mut record = PreemptionRecord::from_sched_events_with_identity(
+            vec![SchedEvent::branches(tid, 10)],
+            None,
+        );
         let time = LogicalTime::from_nanos(100);
         let mut history = ThreadHistory::new();
         history.prio_changes.push((time, 1000));
@@ -7070,7 +7141,7 @@ mod tests {
         let encoded = serde_json::to_string(&record).unwrap();
         let decoded: PreemptionRecord = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, record);
-        let empty = PreemptionRecord::from_sched_events(Vec::new());
+        let empty = PreemptionRecord::from_sched_events_with_identity(Vec::new(), None);
         assert_eq!(
             serde_json::to_string(&empty).unwrap(),
             r#"{"per_thread":{},"global":[]}"#
@@ -7528,6 +7599,13 @@ impl PreemptionWriter {
         }
     }
 
+    /// The identity of the coordinates this writer records: the run's
+    /// validated producer clock.
+    pub fn with_identity(mut self, identity: HistoryIdentity) -> Self {
+        self.inner.identity = Some(identity);
+        self
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -7939,19 +8017,22 @@ pub fn read_trace(path: &Path) -> Vec<SchedEvent> {
 }
 
 fn read_preemption_record(path: &Path) -> PreemptionRecord {
-    let parsed = File::open(path)
-        .map_err(anyhow::Error::from)
-        .and_then(|file| {
-            let (record, _) = streaming::parse_utf8_pass::<PreemptionRecord, _>(file)?;
-            record.validate().map_err(anyhow::Error::msg)?;
-            Ok(record)
-        });
-    parsed.unwrap_or_else(|error| {
+    let parsed = boundary_recording::Recording::read(path)
+        .and_then(|recording| recording.into_legacy("legacy preemption reader"));
+    let pr = parsed.unwrap_or_else(|error| {
         panic!(
             "Error reading preemption record {}: {error:#}",
             path.display()
         )
-    })
+    });
+    if let Err(e) = pr.validate() {
+        panic!(
+            "Invalid PreemptionRecord when loading from path {}. Error:\n {}",
+            path.display(),
+            e
+        );
+    }
+    pr
 }
 
 /// Read only the virtual-time epoch stored in a preemption record file.
@@ -8009,12 +8090,19 @@ pub fn read_recorded_instruction_offsets(path: &Path) -> Result<bool, String> {
 /// [`read_recorded_epoch`] reads the epoch. `Ok(None)` means the record was
 /// made with the option off, or before the field existed.
 pub fn read_recorded_pipe_wake_latency(path: &Path) -> Result<Option<u64>, String> {
-    #[derive(Deserialize)]
-    struct LatencyOnly {
-        #[serde(default)]
-        pipe_wake_latency: Option<u64>,
-    }
     Ok(boundary_recording::read_settings::<LatencyOnly>(path)?.pipe_wake_latency)
+}
+
+/// [`read_recorded_pipe_wake_latency`] over `bytes` already read from `path`,
+/// which only names them in errors.
+pub fn recorded_pipe_wake_latency_in(path: &Path, bytes: &[u8]) -> Result<Option<u64>, String> {
+    Ok(boundary_recording::settings_in::<LatencyOnly>(path, bytes)?.pipe_wake_latency)
+}
+
+#[derive(Deserialize)]
+struct LatencyOnly {
+    #[serde(default)]
+    pipe_wake_latency: Option<u64>,
 }
 
 /// The refusal of a replay whose `--pipe-wake-latency` differs from the one a
@@ -8138,12 +8226,19 @@ pub fn post_crash_timeslice_for_replay(
 /// preemption record file, as [`read_recorded_epoch`] reads the epoch.
 /// `Ok(None)` for a record written before the field existed.
 pub fn read_recorded_signal_state_copy(path: &Path) -> Result<Option<bool>, String> {
-    #[derive(Deserialize)]
-    struct CopyOnly {
-        #[serde(default)]
-        signal_state_copy: Option<bool>,
-    }
     Ok(boundary_recording::read_settings::<CopyOnly>(path)?.signal_state_copy)
+}
+
+/// [`read_recorded_signal_state_copy`] over `bytes` already read from
+/// `path`, which only names them in errors.
+pub fn recorded_signal_state_copy_in(path: &Path, bytes: &[u8]) -> Result<Option<bool>, String> {
+    Ok(boundary_recording::settings_in::<CopyOnly>(path, bytes)?.signal_state_copy)
+}
+
+#[derive(Deserialize)]
+struct CopyOnly {
+    #[serde(default)]
+    signal_state_copy: Option<bool>,
 }
 
 /// Read only whether a preemption record file carries callback checkpoints

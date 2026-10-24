@@ -2253,6 +2253,17 @@ impl AnalyzeOpts {
         record.write_to_disk(path).map_err(anyhow::Error::msg)
     }
 
+    /// Refuse, before any trial, recordings whose RCB coordinates the trials'
+    /// effective clock cannot execute, or a record the run arguments replay
+    /// that it cannot (`RunOpts::refuse_unadmitted_rcb_histories`). Every
+    /// trial would be refused for it when it starts.
+    pub fn refuse_unadmitted_rcb_histories(
+        &self,
+        recordings: &[(&str, &Path)],
+    ) -> anyhow::Result<()> {
+        RunData::get_raw_runopts(self).refuse_unadmitted_rcb_histories(recordings)
+    }
+
     /// Refuse, before any trial, recordings made under another
     /// `--pipe-wake-latency` than the trials' own, including a different
     /// latency (<https://github.com/rrnewton/hermit/issues/4380>). Trials start
@@ -2513,7 +2524,17 @@ pub fn trial_record_from(
     best.and_then(|(shared, _, source)| {
         source.schedule_prefix(shared).with_schedule(events.clone())
     })
-    .unwrap_or_else(|| PreemptionRecord::from_sched_events(events))
+    .unwrap_or_else(|| {
+        // No source shares a prefix: the events still count what every
+        // source counts, where they agree; otherwise unknown.
+        let identity = match sources {
+            [first, rest @ ..] if rest.iter().all(|s| s.identity() == first.identity()) => {
+                first.identity().cloned()
+            }
+            _ => None,
+        };
+        PreemptionRecord::from_sched_events_with_identity(events, identity)
+    })
 }
 
 #[cfg(test)]

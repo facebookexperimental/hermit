@@ -865,9 +865,11 @@ mod callback_history_scheduler_tests {
             );
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("strict.json");
+            let typed = typed.with_identity(Some(crate::clock_identity::test_sources::known()));
             std::fs::write(&path, typed.encode().unwrap()).unwrap();
             cfg.record_preemptions = false;
             cfg.replay_schedule_from = Some(path);
+            let cfg = crate::clock_identity::test_sources::qualified(cfg);
             assert!(!crate::scheduler::Scheduler::new(&cfg).callback_history_active);
         }
     }

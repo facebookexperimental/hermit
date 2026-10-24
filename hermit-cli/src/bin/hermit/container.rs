@@ -6664,9 +6664,15 @@ mod tests {
         use detcore_model::schedule::boundary::Schedule;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("terminal.json");
+        // Synthetic data stating the qualified test metric, which the run
+        // prepared below admits on a host whose profile qualifies.
         let recording = Recording::Boundaries(
             BoundaryRecording::new(
-                PreemptionRecord::default(),
+                PreemptionRecord::default().with_identity(Some(
+                    detcore::preemptions::HistoryIdentity::Known(
+                        reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+                    ),
+                )),
                 Schedule::new(vec![Record::Event(SchedEvent::branches(
                     DetTid::from_raw(1),
                     1,
@@ -6676,16 +6682,20 @@ mod tests {
             .unwrap(),
         );
         std::fs::write(&path, recording.encode().unwrap()).unwrap();
-        let error = detcore::GlobalState::init_for_external_scheduler(&detcore::Config {
-            sequentialize_threads: true,
-            strict_schedule_boundaries: true,
-            replay_schedule_from: Some(path),
-            record_preemptions: false,
-            ..detcore::Config::default()
-        })
-        .clean_up(false, &None)
-        .await
-        .unwrap_err();
+        let config = hermit::prepare_backend_config(
+            detcore::Config {
+                sequentialize_threads: true,
+                strict_schedule_boundaries: true,
+                replay_schedule_from: Some(path),
+                record_preemptions: false,
+                ..detcore::Config::default()
+            },
+            hermit::Backend::Ptrace,
+        );
+        let error = detcore::GlobalState::init_for_external_scheduler(&config)
+            .clean_up(false, &None)
+            .await
+            .unwrap_err();
         assert!(error.is::<detcore::TerminalReplayRefusal>());
         let serialized = SerializableError::from(Error::new(reverie::Error::Tool(error)));
         assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);

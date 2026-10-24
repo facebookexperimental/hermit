@@ -1126,12 +1126,13 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // send modelled,
     // 0x190 a fatal signal retires the process's other threads in its turn,
     // 0x193 every /proc status file shows TracerPid 0,
-    // and 0x195 runs a kernel-run poll's restart as the guest's own
-    // restart_syscall),
+    // 0x195 runs a kernel-run poll's restart as the guest's own
+    // restart_syscall,
+    // and 0x19e counts every conditional branch on seven Intel models),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x19d,
+        metadata["version"], 0x19e,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

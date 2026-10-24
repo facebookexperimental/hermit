@@ -3687,7 +3687,58 @@ pub fn prepare_backend_config_with_capabilities(
     // sets, from the final configuration and the process's PID-namespace
     // ownership (`in_guest_signal_delivery_gate`, A5 step 3c.1, D35 and D52).
     config.in_guest_signal_delivery = false;
+    // The RCB clock this run is prepared for, which Detcore checks against the
+    // clock it finds before recording or replaying a history.
+    config.rcb_clock_claim = rcb_clock_claim(&config);
     config
+}
+
+/// The qualified RCB clock `config` is prepared for: the backend's clock
+/// contract and this host's qualified profile, whether or not Detcore
+/// consumes the counter. Reads CPUID only; it installs no PMU configuration,
+/// so a `--skid-margin` recorded later still applies.
+fn rcb_clock_claim(config: &DetConfig) -> detcore_model::config::RcbClockClaim {
+    use detcore_model::config::RcbClockClaim;
+    match (
+        config.backend.rcb_clock_contract,
+        reverie::pmu_config::resolve_host_clock(),
+    ) {
+        (Some(_), Ok(host)) => RcbClockClaim::Known(host.key()),
+        _ => RcbClockClaim::Unset,
+    }
+}
+
+/// The RCB clock identity refusal Detcore's replay admission would give a
+/// run prepared with `config` ([`prepare_backend_config`]) for the histories
+/// in `inputs`, each an option and a path, or `None` when its effective RCB
+/// clock admits their identities. An early diagnostic of identity only: it
+/// does not check a history's strict or legacy mode, which Detcore checks
+/// when the run starts, as it checks identity again. It reads CPUID and the
+/// process's PMU state, installs and pins nothing, so a `--skid-margin`
+/// recorded later still applies. An unreadable history is an error, not a
+/// refusal.
+pub fn rcb_history_refusal(
+    config: &DetConfig,
+    inputs: &[(&str, &Path)],
+) -> anyhow::Result<Option<String>> {
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    let sources = detcore::clock_identity::ClockSources {
+        host: reverie::pmu_config::resolve_host_clock(),
+        state: reverie::pmu_config::pmu_state(),
+    };
+    let validated = match detcore::clock_identity::validate_run_clock(config, &sources) {
+        Ok(validated) => validated,
+        Err(refusal) => return Ok(Some(refusal)),
+    };
+    for (option, path) in inputs {
+        let recording = detcore::preemptions::boundary_recording::Recording::read(path)?;
+        if let Err(refusal) = validated.admit(&format!("{option} {}", path.display()), &recording) {
+            return Ok(Some(refusal));
+        }
+    }
+    Ok(None)
 }
 
 /// The configuration of an in-guest run on the loader route (the exec-stop,

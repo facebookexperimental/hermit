@@ -669,7 +669,12 @@ async fn backend_failure_cleanup_does_not_build_an_invalid_run_summary() {
     assert!(cleanup.scheduler.is_ok());
     assert!(cleanup.preemption_recording.is_ok());
     let actual: crate::preemptions::PreemptionRecord =
-        serde_json::from_slice(&std::fs::read(recording).unwrap()).unwrap();
+        crate::preemptions::boundary_recording::Recording::decode(
+            &std::fs::read(recording).unwrap(),
+        )
+        .unwrap()
+        .into_legacy("test")
+        .unwrap();
     actual.validate().unwrap();
     let mut expected = crate::preemptions::ThreadHistory::new()
         .with_prio_changes(vec![(time, DEFAULT_PRIORITY)])
@@ -802,17 +807,18 @@ fn terminal_replay_state(
     let recorded = Recording::Boundaries(
         BoundaryRecording::new(PreemptionRecord::default(), Schedule::new(events).unwrap())
             .unwrap(),
-    );
+    )
+    .with_identity(Some(crate::clock_identity::test_sources::known()));
     std::fs::write(&replay, recorded.encode().unwrap()).unwrap();
     GlobalState::initialize(
-        &Config {
+        &crate::clock_identity::test_sources::qualified(Config {
             sequentialize_threads: true,
             replay_schedule_from: Some(replay),
             strict_schedule_boundaries: true,
             record_preemptions: recording.is_some(),
             record_preemptions_to: recording,
             ..Config::default()
-        },
+        }),
         false,
     )
 }

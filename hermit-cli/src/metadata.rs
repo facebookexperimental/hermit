@@ -978,7 +978,22 @@ impl RecordVersion {
 // with that access mode, instead of making separate anonymous copies. An
 // older reader cannot decode the new field, and an older recording has no
 // identity with which to restore sharing, so it is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19d);
+// 0x19d -> 0x19e (HIGHEST_SHIPPED+1 at this change's rebase onto main
+// shipping 0x19d; provisionally 0x19b at its earlier rebase onto main
+// shipping 0x19a, since spent on the replayed-MAP_SHARED fix-forward): on
+// seven Intel models (Ice Lake 0x6A, 0x6C, 0x7D and 0x7E, Tiger Lake 0x8D,
+// Sapphire Rapids 0x8F and Emerald Rapids 0xCF) the retired-conditional-
+// branch counter changes from umask 0x01, which counts only taken
+// conditional branches there, to umask 0x11, every conditional branch, the
+// metric every other profile counts. Every RCB coordinate a recording made
+// on those hosts stores (preemption points, branch counts, timer targets)
+// counted the other quantity. A history now states its RCB coordinate
+// identity in the `rcb_history` envelope; replay requires the recording
+// backend and a qualified RCB metric, and a history with no recorded
+// identity is refused before the guest starts. An older recording would
+// place its events elsewhere; it is refused here.
+// https://github.com/rrnewton/hermit/pull/4668
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19e);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -1003,7 +1018,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19d);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19d;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19e;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1343,6 +1358,10 @@ fn record_or_replay_config_with_timer_support(
         cpu_profile_source: None,
         // Record and replay run under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
+        // A recording replays no standalone history (`replay_schedule_from`
+        // and `replay_preemptions_from` stay unset below) and writes none;
+        // its compatibility is the record epoch's.
+        rcb_clock_claim: Default::default(),
         // As `hermit run` sets it for ptrace (`prepare_backend_config` in
         // lib.rs). With it off, the scheduler did not model signal targets, so
         // a thread asleep in a backgrounded rt_sigsuspend that a child-exit
@@ -2505,7 +2524,6 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x184)));
     }
 
-    /// A 0x186 recording polled a MSG_DONTWAIT send or receive on a
     /// A 0x187 recording polled a MSG_DONTWAIT send or receive on a
     /// socketpair end until it stopped failing with EAGAIN; this replayer runs
     /// it once, so the version gate must refuse it.
@@ -2515,7 +2533,19 @@ mod tests {
         // was rebased onto, not only the version before the original bump.
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
+    }
+
+    /// A recording from before the corrected RCB event (0x19a and earlier)
+    /// made on one of the seven corrected Intel models counted only taken
+    /// conditional branches, so every RCB coordinate it stores names another
+    /// point in the guest; the version gate must refuse it on every host, as
+    /// a full recording does not state which counter it used. A recording of
+    /// this version is accepted.
+    #[test]
+    fn record_version_rejects_streams_from_before_the_corrected_rcb_event() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19a)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x19e)));
     }
 
     #[test]

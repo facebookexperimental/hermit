@@ -15,6 +15,9 @@ use std::path::PathBuf;
 use anyhow::Context;
 use anyhow::bail;
 use clap::Parser;
+use detcore::clock_identity::combined_identity;
+#[cfg(test)]
+use detcore::preemptions::HistoryIdentity;
 use detcore::preemptions::PreemptionRecord;
 use hermit::Error;
 use regex::Regex;
@@ -91,6 +94,11 @@ pub struct BisectOpts {
     inexact_branch_counter: fn() -> Option<String>,
 }
 
+/// What [`BisectOpts::prepare`] gives the first replay: the trial
+/// configuration and the good and bad schedules (each stating the RCB
+/// coordinate identity both were checked to share).
+type Prepared = (AnalyzeOpts, PreemptionRecord, PreemptionRecord);
+
 impl BisectOpts {
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Before the two schedules are read, the largest allocation.
@@ -101,10 +109,7 @@ impl BisectOpts {
 
     /// Everything `main` does before the first replay: the refusals, the two
     /// schedules, and the trial configuration they imply.
-    fn prepare(
-        &self,
-        global: &GlobalOpts,
-    ) -> Result<(AnalyzeOpts, PreemptionRecord, PreemptionRecord), Error> {
+    fn prepare(&self, global: &GlobalOpts) -> Result<Prepared, Error> {
         let mut analyzer = AnalyzeOpts {
             target_stdout: self.target_stdout.clone(),
             target_stderr: self.target_stderr.clone(),
@@ -211,6 +216,17 @@ impl BisectOpts {
             ("--good", &self.good),
             ("--bad", &self.bad),
         ])?;
+        analyzer
+            .refuse_unadmitted_rcb_histories(&[("--good", &self.good), ("--bad", &self.bad)])?;
+        // Every trial schedule mixes the two, so both must count the same
+        // thing; the records keep the identity they state.
+        combined_identity(
+            (&format!("--good {}", self.good.display()), good.identity()),
+            (&format!("--bad {}", self.bad.display()), bad.identity()),
+        )
+        .map_err(|refusal| {
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(refusal)
+        })?;
         // A trial spliced from either schedule's prefix makes the jumps of
         // global time that prefix contains (`crate::app::time_skip_carry`).
         {
@@ -260,8 +276,10 @@ impl BisectOpts {
 fn read_schedule(path: &Path, label: &str) -> anyhow::Result<PreemptionRecord> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read --{label} schedule {}", path.display()))?;
-    let record: PreemptionRecord = serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse --{label} schedule {}", path.display()))?;
+    let record: PreemptionRecord =
+        detcore::preemptions::boundary_recording::Recording::decode(contents.as_bytes())
+            .and_then(|recording| recording.into_legacy("bisect"))
+            .with_context(|| format!("failed to parse --{label} schedule {}", path.display()))?;
     record
         .validate()
         .map_err(anyhow::Error::msg)
@@ -407,11 +425,11 @@ mod tests {
     use crate::app::container::PolicyRefusal;
 
     fn search_record(events: Vec<SchedEvent>) -> serde_json::Value {
-        let record = PreemptionRecord::from_sched_events(events)
+        let record = PreemptionRecord::from_sched_events_with_identity(events, known())
             .with_pipe_wake_latency(Some(3_000_000))
             .with_signal_state_copy(Some(true));
-        let mut record = serde_json::to_value(record).unwrap();
-        record["epoch"] = serde_json::json!(RECORDED);
+        let mut record: serde_json::Value = serde_json::from_str(&record.to_string()).unwrap();
+        settings(&mut record)["epoch"] = serde_json::json!(RECORDED);
         record
     }
 
@@ -420,7 +438,7 @@ mod tests {
     fn prepare_search_records(
         good: &serde_json::Value,
         bad: &serde_json::Value,
-    ) -> Result<(AnalyzeOpts, PreemptionRecord, PreemptionRecord), Error> {
+    ) -> Result<Prepared, Error> {
         let dir = tempfile::tempdir().unwrap();
         let good_path = dir.path().join("good.json");
         let bad_path = dir.path().join("bad.json");
@@ -456,7 +474,7 @@ mod tests {
         let record = |events, format| {
             let mut value = search_record(events);
             if let Some(format) = format {
-                value["format_version"] = serde_json::json!(format);
+                settings(&mut value)["format_version"] = serde_json::json!(format);
             }
             value
         };
@@ -568,8 +586,8 @@ mod tests {
         let numbered = |count, ids: Option<serde_json::Value>| {
             let mut record = search_record(vec![SchedEvent::branches(DetTid::from_raw(3), count)]);
             if let Some(ids) = ids {
-                record["guest_ids"] = ids;
-                record["reserved_input"] = provenance.clone();
+                settings(&mut record)["guest_ids"] = ids;
+                settings(&mut record)["reserved_input"] = provenance.clone();
             }
             record
         };
@@ -698,7 +716,7 @@ mod tests {
                 let mut good = good.clone();
                 let mut bad = bad.clone();
                 let changed = if change_good { &mut good } else { &mut bad };
-                changed[field] = value.clone();
+                settings(changed)[field] = value.clone();
                 let error = prepare_search_records(&good, &bad).unwrap_err();
                 let message = format!("{error:#}");
                 assert!(message.contains(cause), "{field}: {message}");
@@ -918,20 +936,55 @@ mod tests {
         );
     }
 
-    /// The two flaky_cas fixtures, written to `dir` as the --good and --bad
-    /// schedules with the given recorded epochs.
+    fn known() -> Option<HistoryIdentity> {
+        Some(HistoryIdentity::Known(
+            reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+        ))
+    }
+
+    /// A synthetic schedule standing in for the `fixture` ("passing" or
+    /// "failing") endpoint: branch events of threads 3 and 5 in an order of
+    /// its own, stating `identity`. It records no run; the checked-in
+    /// flaky_cas recordings' producer is unknown, so they are not relabelled.
+    fn synthetic_schedule(fixture: &str, identity: Option<HistoryIdentity>) -> serde_json::Value {
+        let (three, five) = (detcore::DetTid::from_raw(3), detcore::DetTid::from_raw(5));
+        let order = match fixture {
+            "passing" => [three, five, three],
+            _ => [three, three, five],
+        };
+        let mut writer = detcore::preemptions::PreemptionWriter::new(None);
+        if let Some(identity) = identity {
+            writer = writer.with_identity(identity);
+        }
+        writer.register_thread(three, detcore::DEFAULT_PRIORITY);
+        writer.register_thread(five, detcore::DEFAULT_PRIORITY);
+        for tid in order {
+            writer.insert_schedevent(SchedEvent::branches(tid, 1));
+        }
+        serde_json::from_str(&writer.into_string()).unwrap()
+    }
+
+    /// The settings of a schedule from `synthetic_schedule`: inside its
+    /// identity envelope when it has one.
+    fn settings(record: &mut serde_json::Value) -> &mut serde_json::Value {
+        if record.get("rcb_history").is_some() {
+            &mut record["rcb_history"]["recording"]
+        } else {
+            record
+        }
+    }
+
+    /// Two synthetic qualified schedules, written to `dir` as the --good and
+    /// --bad schedules with the given recorded epochs.
     fn schedules_with_epochs(
         dir: &Path,
         good: Option<&str>,
         bad: Option<&str>,
     ) -> (PathBuf, PathBuf) {
-        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
         let write = |fixture: &str, epoch: Option<&str>| {
-            let source = resources.join(format!("flaky_cas_sequence_schedules-{fixture}.json"));
-            let mut record: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(source).unwrap()).unwrap();
+            let mut record = synthetic_schedule(fixture, known());
             if let Some(epoch) = epoch {
-                record["epoch"] = serde_json::Value::from(epoch);
+                settings(&mut record)["epoch"] = serde_json::Value::from(epoch);
             }
             let path = dir.join(format!("{fixture}.json"));
             fs::write(&path, record.to_string()).unwrap();
@@ -1095,14 +1148,12 @@ mod tests {
     #[test]
     fn bisect_replays_under_the_bad_schedules_expired_wait_charge() {
         use detcore_model::config::ExpiredWaitCharge;
-        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
         let dir = tempfile::tempdir().unwrap();
         let write = |fixture: &str, name: &str, once: bool| {
-            let source = resources.join(format!("flaky_cas_sequence_schedules-{fixture}.json"));
-            let mut record: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(source).unwrap()).unwrap();
+            let mut record = synthetic_schedule(fixture, known());
             if once {
-                record["expired_wait_runs_charged_once"] = serde_json::Value::from(true);
+                settings(&mut record)["expired_wait_runs_charged_once"] =
+                    serde_json::Value::from(true);
             }
             let path = dir.path().join(name);
             fs::write(&path, record.to_string()).unwrap();
@@ -1158,14 +1209,12 @@ mod tests {
     #[test]
     fn bisect_replays_under_the_bad_schedules_sleep_registration() {
         use detcore_model::config::SleepRegistration;
-        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
         let dir = tempfile::tempdir().unwrap();
         let write = |fixture: &str, name: &str, first_pass: bool| {
-            let source = resources.join(format!("flaky_cas_sequence_schedules-{fixture}.json"));
-            let mut record: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(source).unwrap()).unwrap();
+            let mut record = synthetic_schedule(fixture, known());
             if first_pass {
-                record["queued_sleeps_registered_at_first_pass"] = serde_json::Value::from(true);
+                settings(&mut record)["queued_sleeps_registered_at_first_pass"] =
+                    serde_json::Value::from(true);
             }
             let path = dir.path().join(name);
             fs::write(&path, record.to_string()).unwrap();
@@ -1221,14 +1270,11 @@ mod tests {
     /// (https://github.com/rrnewton/hermit/issues/4380).
     #[test]
     fn bisect_refuses_schedules_under_another_pipe_wake_latency() {
-        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
         let dir = tempfile::tempdir().unwrap();
         let write = |fixture: &str, name: &str, latency: Option<u64>| {
-            let source = resources.join(format!("flaky_cas_sequence_schedules-{fixture}.json"));
-            let mut record: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(source).unwrap()).unwrap();
+            let mut record = synthetic_schedule(fixture, known());
             if let Some(latency) = latency {
-                record["pipe_wake_latency"] = serde_json::Value::from(latency);
+                settings(&mut record)["pipe_wake_latency"] = serde_json::Value::from(latency);
             }
             let path = dir.path().join(name);
             fs::write(&path, record.to_string()).unwrap();
@@ -1285,6 +1331,46 @@ mod tests {
                 format!("{error:#}").contains("refuse --replay-schedule-from in the run arguments"),
                 "{error:#}"
             );
+        }
+    }
+
+    /// Bisect refuses, before any trial, a pair of schedules whose RCB
+    /// coordinates it cannot execute or mix: an unqualified or legacy
+    /// endpoint, or endpoints stating different identities. On any host one
+    /// of the two refusals applies, so no trial schedule is ever written.
+    #[test]
+    fn bisect_refuses_endpoints_it_cannot_execute_or_mix() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |fixture: &str, name: &str, identity: Option<HistoryIdentity>| {
+            let path = dir.path().join(name);
+            fs::write(&path, synthetic_schedule(fixture, identity).to_string()).unwrap();
+            path
+        };
+        let unqualified = || Some(HistoryIdentity::Unqualified("claim-unset".to_owned()));
+        for (good, bad) in [
+            (known(), unqualified()),
+            (unqualified(), known()),
+            (known(), None),
+        ] {
+            let good = write("passing", "good.json", good);
+            let bad = write("failing", "bad.json", bad);
+            let good = format!("--good={}", good.display());
+            let bad = format!("--bad={}", bad.display());
+            let argv = [
+                "hermit",
+                "bisect",
+                good.as_str(),
+                bad.as_str(),
+                "--",
+                "/bin/true",
+            ];
+            let args = crate::app::Args::try_parse_from(argv).unwrap();
+            let crate::app::Subcommand::Bisect(options) = args.command else {
+                panic!("{argv:?} is not bisect")
+            };
+            let error = options.prepare(&args.global).map(|_| ()).unwrap_err();
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            assert!(format!("{error:#}").contains("hermit refused"), "{error:#}");
         }
     }
 

@@ -50,7 +50,7 @@ async fn stale_filing_cleanup(stale: bool) -> (anyhow::Result<()>, Option<u64>, 
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("input.json");
     let output = directory.path().join("output.json");
-    let config = Config {
+    let config = crate::clock_identity::test_sources::qualified(Config {
         sequentialize_threads: true,
         max_timeslice: None,
         target_timeslice: std::num::NonZeroU64::new(100_000),
@@ -59,7 +59,7 @@ async fn stale_filing_cleanup(stale: bool) -> (anyhow::Result<()>, Option<u64>, 
         record_preemptions: true,
         record_preemptions_to: Some(output.clone()),
         ..Config::default()
-    };
+    });
     let tid = DetTid::from_raw(3);
     let mut thread = crate::ThreadState::new(tid, &config, ());
     thread.detpid = Some(tid);
@@ -75,11 +75,12 @@ async fn stale_filing_cleanup(stale: bool) -> (anyhow::Result<()>, Option<u64>, 
         .with_preemption_rcbs(vec![1, 1]);
     // Go through the actual record decoder, validator, writer and startup
     // history loader. Equal RCB targets are permitted; times increase.
-    let record: PreemptionRecord = serde_json::from_value(serde_json::json!({
+    let record: PreemptionRecord = serde_json::from_value::<PreemptionRecord>(serde_json::json!({
         "per_thread": {"3": history},
         "global": [],
     }))
-    .unwrap();
+    .unwrap()
+    .with_identity(Some(crate::clock_identity::test_sources::known()));
     record.validate().unwrap();
     record.write_to_disk(&input).unwrap();
     let state = <GlobalState as GlobalTool>::init_global_state(&config).await;

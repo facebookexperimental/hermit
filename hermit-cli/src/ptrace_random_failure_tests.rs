@@ -576,8 +576,12 @@ mod real_random {
                 .count(),
             2
         );
-        let record: detcore::preemptions::PreemptionRecord =
-            serde_json::from_slice(&std::fs::read(&recording).unwrap()).unwrap();
+        // Read through the production decoder: the writer states the run's
+        // RCB identity in the `rcb_history` envelope around the record.
+        let recording =
+            detcore::preemptions::boundary_recording::Recording::read(&recording).unwrap();
+        assert!(recording.identity().is_some(), "the recording states its RCB identity");
+        let record = recording.into_legacy("real_random recording").unwrap();
         assert_eq!(
             record.extract_all().len(),
             2,

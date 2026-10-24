@@ -39,6 +39,7 @@
 pub mod aarch64_lse;
 pub mod access_trace;
 mod arch;
+pub mod clock_identity;
 mod commit_creds;
 mod config;
 mod consts;

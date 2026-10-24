@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use anyhow::bail;
 use colored::Colorize;
+use detcore::clock_identity::combined_identity;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::preemptions::boundary_recording::Recording;
@@ -3021,6 +3022,13 @@ impl AnalyzeOpts {
             let path = newrun.sched_path_out().to_path_buf();
             let record = PreemptionReader::try_new(&path)?.into_inner();
             RunData::require_complete_record(&record, &path)?;
+            // A trial whose recording states another identity than its
+            // endpoints ends the search: its coordinates count differently.
+            combined_identity(
+                ("the bisection endpoints", target.identity()),
+                (&newrun.sched_out_file_name(), record.identity()),
+            )
+            .map_err(anyhow::Error::msg)?;
             // Only a completed trial contributes its realized schedule and jumps.
             self.time_skip_sources.lock().unwrap().remember(&record);
             let completed = CompletedScheduleTrial {
@@ -3551,7 +3559,8 @@ impl AnalyzeOpts {
         self.refuse_unsound_continuation_timeslice()?;
         self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
         self.adopt_instruction_offsets(&recordings)?;
-        self.prepare_trial_guest_ids(&recordings)
+        self.prepare_trial_guest_ids(&recordings)?;
+        self.refuse_unadmitted_rcb_histories(&recordings)
     }
 
     /// Take the settings `analyze` inherits from the global options: every
@@ -4007,6 +4016,17 @@ impl AnalyzeOpts {
         baseline_endpoint_run.require_complete_output()?;
         let target = target_endpoint_run.preempts_out().clone();
         let baseline = baseline_endpoint_run.preempts_out().clone();
+        combined_identity(
+            (
+                &target_sched_name,
+                target_endpoint_run.preempts_out().identity(),
+            ),
+            (
+                &baseline_sched_name,
+                baseline_endpoint_run.preempts_out().identity(),
+            ),
+        )
+        .map_err(anyhow::Error::msg)?;
 
         eprintln!(
             ":: {} (event lengths {} / {}): {} {}",
@@ -6851,10 +6871,15 @@ mod tests {
             (500_000_000, 500_000_000, true),
             (500_000_000, 200_000_000, false),
         ] {
-            PreemptionRecord::from_sched_events(Vec::new())
-                .with_chaos_timeslice(Some(recorded))
-                .write_to_disk(&record)
-                .unwrap();
+            PreemptionRecord::from_sched_events_with_identity(
+                Vec::new(),
+                Some(detcore::preemptions::HistoryIdentity::Known(
+                    reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+                )),
+            )
+            .with_chaos_timeslice(Some(recorded))
+            .write_to_disk(&record)
+            .unwrap();
             let args = crate::app::Args::try_parse_from([
                 "hermit".to_owned(),
                 "analyze".into(),
@@ -8425,15 +8450,35 @@ mod tests {
     const RECORDED_RFC3339: &str = "2000-12-31T23:59:59.123456789+00:00";
     const OTHER: &str = "2026-01-01T00:00:00Z";
 
+    /// A synthetic preemption record of three branch events of thread 3 that
+    /// states the qualified RCB metric explicitly. It records no run; a
+    /// checked-in recording's producer is unknown, so none is relabelled.
+    fn synthetic_record() -> serde_json::Value {
+        let tid = detcore::DetTid::from_raw(3);
+        let mut writer = detcore::preemptions::PreemptionWriter::new(None).with_identity(
+            detcore::preemptions::HistoryIdentity::Known(
+                reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+            ),
+        );
+        writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
+        for count in [1, 2, 3] {
+            writer.insert_schedevent(SchedEvent::branches(tid, count));
+        }
+        serde_json::from_str(&writer.into_string()).unwrap()
+    }
+
+    /// The settings of a record from `synthetic_record`, inside its identity
+    /// envelope.
+    fn settings(record: &mut serde_json::Value) -> &mut serde_json::Value {
+        &mut record["rcb_history"]["recording"]
+    }
+
     /// A preemption record written to `dir` under `name`, with the given
     /// recorded epoch.
     fn record_with_epoch(dir: &Path, name: &str, epoch: Option<&str>) -> PathBuf {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test-resources/flaky_cas_sequence_schedules-passing.json");
-        let mut record: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(source).unwrap()).unwrap();
+        let mut record = synthetic_record();
         if let Some(epoch) = epoch {
-            record["epoch"] = serde_json::Value::from(epoch);
+            settings(&mut record)["epoch"] = serde_json::Value::from(epoch);
         }
         let path = dir.join(format!("{name}.json"));
         std::fs::write(&path, record.to_string()).unwrap();
@@ -8488,7 +8533,8 @@ mod tests {
             let mut value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             if once {
-                value["expired_wait_runs_charged_once"] = serde_json::Value::from(true);
+                settings(&mut value)["expired_wait_runs_charged_once"] =
+                    serde_json::Value::from(true);
             }
             std::fs::write(&path, value.to_string()).unwrap();
             path
@@ -8589,7 +8635,8 @@ mod tests {
             let mut value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             if first_pass {
-                value["queued_sleeps_registered_at_first_pass"] = serde_json::Value::from(true);
+                settings(&mut value)["queued_sleeps_registered_at_first_pass"] =
+                    serde_json::Value::from(true);
             }
             std::fs::write(&path, value.to_string()).unwrap();
             path
@@ -8698,7 +8745,7 @@ mod tests {
             let mut value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             if let Some(latency) = latency {
-                value["pipe_wake_latency"] = serde_json::Value::from(latency);
+                settings(&mut value)["pipe_wake_latency"] = serde_json::Value::from(latency);
             }
             std::fs::write(&path, value.to_string()).unwrap();
             path
@@ -8736,7 +8783,10 @@ mod tests {
         assert_eq!(written(&options), [Some(0); 3]);
         assert_eq!(
             options
-                .stamp_trial_record(PreemptionRecord::from_vecs(&Default::default()))
+                .stamp_trial_record(PreemptionRecord::from_vecs_with_identity(
+                    &Default::default(),
+                    None
+                ))
                 .pipe_wake_latency(),
             Some(0)
         );
@@ -9049,7 +9099,7 @@ mod tests {
             let mut value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             if let Some(copy) = copy {
-                value["signal_state_copy"] = serde_json::Value::from(copy);
+                settings(&mut value)["signal_state_copy"] = serde_json::Value::from(copy);
             }
             std::fs::write(&path, value.to_string()).unwrap();
             path
