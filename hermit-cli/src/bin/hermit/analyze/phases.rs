@@ -365,34 +365,61 @@ fn slice_from(schedule: &[SchedEvent], from: usize, thread: DetTid) -> Slice {
     slice
 }
 
+/// Whether two stacks have the same frames, whichever threads they belong
+/// to.
+fn same_frames(first: &PrettyBacktrace, second: &PrettyBacktrace) -> bool {
+    first.iter().eq(second.iter())
+}
+
+/// The events at which the deciding thread's slice ends in the continuation
+/// with the deciding event and in the one without it, when the stacks of the
+/// threads that run next (`next_stacks`) tell nothing apart: both captured,
+/// with the same frames (often threads just started, at their first
+/// instruction). `None` otherwise.
+fn slice_end_events(
+    with: &Slice,
+    without: &Slice,
+    next_stacks: [Option<&PrettyBacktrace>; 2],
+) -> Option<[usize; 2]> {
+    match (next_stacks, with.next, without.next) {
+        ([Some(first), Some(second)], Some((with_next, _)), Some((without_next, _)))
+            if same_frames(first, second) =>
+        {
+            Some([with_next - 1, without_next - 1])
+        }
+        _ => None,
+    }
+}
+
 /// The header of a `--prefix-search` report whose deciding event `event`,
 /// #`decision`, is a timing decision: `with` and `without` are how long its
-/// thread then runs with and without that event replayed.
+/// thread then runs with and without that event replayed. `slice_ends`, the
+/// last events of those slices, is set when stack1 and stack2 show where the
+/// deciding thread stops instead of the thread that runs next.
 fn timing_decision_header(
     decision: usize,
     event: &SchedEvent,
-    with: &Slice,
-    without: &Slice,
+    (with, without): (&Slice, &Slice),
     criteria: &str,
     continuation: MaybeTimeslice,
+    slice_ends: Option<[usize; 2]>,
 ) -> String {
     let thread = event.dettid;
     let then = |slice: &Slice, stack: &str| match slice.next {
-        Some((index, next)) => format!("then thread {next} runs at event #{index} ({stack})"),
+        Some((index, next)) if slice_ends.is_none() => {
+            format!("then thread {next} runs at event #{index} ({stack})")
+        }
+        Some((index, next)) => format!("then thread {next} runs at event #{index}"),
         None => "and no other thread runs after it".to_owned(),
     };
-    format!(
+    let mut header = format!(
         "The scheduling decision at event #{decision} of the target schedule decides the \
          outcome, and it is a timing decision: with or without it, the scheduler runs thread \
          {thread} there, so what decides is how long thread {thread} runs, not which thread \
          runs.\nWith event #{decision} replayed ({event}), thread {thread} runs {} events ({} \
          retired conditional branches) from event #{decision} on, {}, and the run meets the \
          target criteria ({criteria}).\nWithout it, scheduling without chaos {}, thread {thread} \
-         runs {} events ({} retired conditional branches), {}, and the run does not.\nThread \
-         {thread}'s own stack at event #{decision} is printed first (deciding_event in the \
-         report file).\nThe outcome depends on what thread {thread} does before the other thread \
-         runs: add synchronization that makes its timing irrelevant, or that enforces the \
-         passing order.\n",
+         runs {} events ({} retired conditional branches), {}, and the run does not.\n",
         with.events,
         with.branches,
         then(with, "stack1"),
@@ -400,7 +427,22 @@ fn timing_decision_header(
         without.events,
         without.branches,
         then(without, "stack2"),
-    )
+    );
+    if let Some([with_end, without_end]) = slice_ends {
+        header.push_str(&format!(
+            "The thread that runs next has the same stack in both continuations (often a \
+             thread just started), so stack1 and stack2 show where thread {thread} is when its \
+             slice ends instead: at event #{with_end} with the event, at event #{without_end} \
+             without it.\n"
+        ));
+    }
+    header.push_str(&format!(
+        "Thread {thread}'s own stack at event #{decision} is printed first (deciding_event in \
+         the report file).\nThe outcome depends on what thread {thread} does before the other \
+         thread runs: add synchronization that makes its timing irrelevant, or that enforces \
+         the passing order.\n"
+    ));
+    header
 }
 
 /// What a stack-trace replay of a critical pair gave.
@@ -1213,14 +1255,66 @@ impl AnalyzeOpts {
                 "WARNING:".yellow().bold(),
             );
         }
+        let next_index = |variant: &[SchedEvent], slice: &Slice| {
+            slice.next.map_or(variant.len(), |(index, _)| index)
+        };
+        let mut critical = [
+            (next_index(&target_continued, &with), stack1),
+            (next_index(continued, &without), stack2),
+        ];
+        // When the threads that run next have the same stack in both
+        // continuations, those stacks tell nothing apart; where the deciding
+        // thread stops does. Its stacks replace them only when both were
+        // captured.
+        let mut slice_ends = slice_end_events(
+            &with,
+            &without,
+            [critical[0].1.as_ref(), critical[1].1.as_ref()],
+        );
+        if let Some(ends) = slice_ends {
+            let stack_at = |runname: &str, variant: &PreemptionRecord, end: usize| {
+                if end == decision {
+                    // A slice of one event ends where it starts.
+                    Ok((true, deciding.clone()))
+                } else {
+                    self.prefix_stack(runname, variant, end + 1, end, continuation)
+                }
+            };
+            let (_, with_end) = stack_at(
+                "final_target_slice_end_for_stacktraces",
+                &with_record,
+                ends[0],
+            )?;
+            let (_, without_end) = stack_at(
+                "final_baseline_slice_end_for_stacktraces",
+                &without_record,
+                ends[1],
+            )?;
+            match (with_end, without_end) {
+                (Some(with_end), Some(without_end)) => {
+                    critical = [(ends[0], Some(with_end)), (ends[1], Some(without_end))];
+                }
+                _ => slice_ends = None,
+            }
+        }
+        let [(event1, stack1), (event2, stack2)] = critical;
         let mut header = timing_decision_header(
             decision,
             &events[decision],
-            &with,
-            &without,
+            (&with, &without),
             &self.display_criteria(),
             continuation,
+            slice_ends,
         );
+        if slice_ends.is_some()
+            && let (Some(first), Some(second)) = (&stack1, &stack2)
+            && same_frames(first, second)
+        {
+            header.push_str(&format!(
+                "Thread {thread} has the same stack at both events: what differs is how far it \
+                 gets before the other thread runs, not where it stops.\n"
+            ));
+        }
         let name = |path: &Path| {
             path.file_name()
                 .unwrap_or_default()
@@ -1257,19 +1351,16 @@ impl AnalyzeOpts {
         Self::print_stack("stack2", &stack2);
         println!("\n{}", context);
 
-        let next_index = |variant: &[SchedEvent], slice: &Slice| {
-            slice.next.map_or(variant.len(), |(index, _)| index)
-        };
         Ok(Some(Report {
             header,
             additional_context: context,
             baseline_run: false,
             critical_event1: ReportCriticalEvent {
-                event_index: next_index(&target_continued, &with),
+                event_index: event1,
                 stack: stack1,
             },
             critical_event2: ReportCriticalEvent {
-                event_index: next_index(continued, &without),
+                event_index: event2,
                 stack: stack2,
             },
             deciding_event: Some(ReportCriticalEvent {
@@ -3443,10 +3534,10 @@ mod tests {
         let header = timing_decision_header(
             1,
             &SchedEvent::branches(thread, 10),
-            &with,
-            &without,
+            (&with, &without),
             "matching stderr",
             NonZeroU64::new(200_000_000),
+            None,
         );
         for expected in [
             "it is a timing decision: with or without it, the scheduler runs thread 3 there",
@@ -3455,6 +3546,73 @@ mod tests {
         ] {
             assert!(header.contains(expected), "no {expected:?} in\n{header}");
         }
+
+        // The thread that runs next is where it was in both: stack1 and
+        // stack2 show where thread 3 stops instead, and the next threads are
+        // named without them.
+        let header = timing_decision_header(
+            1,
+            &SchedEvent::branches(thread, 10),
+            (&with, &without),
+            "matching stderr",
+            NonZeroU64::new(200_000_000),
+            Some([3, 2]),
+        );
+        for expected in [
+            "from event #1 on, then thread 7 runs at event #4, and the run meets",
+            "then thread 5 runs at event #3, and the run does not",
+            "so stack1 and stack2 show where thread 3 is when its slice ends instead: at event #3 with the event, at event #2 without it.",
+        ] {
+            assert!(header.contains(expected), "no {expected:?} in\n{header}");
+        }
+        assert!(!header.contains("(stack1)"), "{header}");
+    }
+
+    /// The deciding thread's slice ends replace the next threads' stacks only
+    /// when those have the same frames (whichever threads they are) and both
+    /// were captured.
+    #[test]
+    fn slice_ends_are_reported_only_when_the_next_stacks_tell_nothing_apart() {
+        let stack = |thread: i32, ips: &[u64]| -> PrettyBacktrace {
+            let frames: Vec<_> = ips
+                .iter()
+                .map(|ip| {
+                    serde_json::json!({
+                        "frame": {"ip": ip, "is_signal": false},
+                        "symbol": null,
+                        "locations": []
+                    })
+                })
+                .collect();
+            serde_json::from_value(serde_json::json!({
+                "thread_id": thread, "thread_name": null, "frames": frames
+            }))
+            .unwrap()
+        };
+        let thread = DetTid::from_raw(3);
+        let with = slice_from(&events(&[5, 3, 3, 3, 7, 5]), 1, thread);
+        let without = slice_from(&events(&[5, 3, 3, 5, 7]), 1, thread);
+        let started = [0x10, 0x20];
+        // Two different threads, both just started.
+        let (seven, five) = (stack(7, &started), stack(5, &started));
+        assert_eq!(
+            slice_end_events(&with, &without, [Some(&seven), Some(&five)]),
+            Some([3, 2])
+        );
+        let elsewhere = stack(5, &[0x30, 0x20]);
+        assert_eq!(
+            slice_end_events(&with, &without, [Some(&seven), Some(&elsewhere)]),
+            None
+        );
+        assert_eq!(
+            slice_end_events(&with, &without, [Some(&seven), None]),
+            None
+        );
+        let alone = slice_from(&events(&[5, 3, 3]), 1, thread);
+        assert_eq!(
+            slice_end_events(&alone, &without, [Some(&seven), Some(&five)]),
+            None
+        );
     }
 
     #[test]
