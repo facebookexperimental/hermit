@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Machine-readable verification reports shared by the Hermit producer and its consumers.
 
 use serde::Deserialize;
@@ -49,6 +41,9 @@ impl std::fmt::Display for Verdict {
 /// pre-run stamp left when the invocation died before recording a more specific
 /// result. Collapsing both into `no_result` made a completed guest refusal and a
 /// container or launcher failure indistinguishable to the result reader.
+/// `RunFailed` means Hermit started a verification run and a typed failure of
+/// that run stopped it: before it existed, such a run left the `NotRun` stamp,
+/// so a guest that ran (often to a clean exit) was recorded as never run.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum NoResultReason {
@@ -67,6 +62,46 @@ pub enum NoResultReason {
     /// A sandbox exited before returning its guest Output. This is an
     /// attempted execution failure, with no guest disposition or comparison.
     ContainerFailed(ContainerFailure),
+    /// Hermit started verification run `run`, and a typed failure of that run
+    /// stopped it before any comparison. `detail` is the failure's message.
+    RunFailed {
+        run: VerificationRun,
+        failure: RunFailure,
+        detail: String,
+    },
+}
+
+/// What stopped a verification run that Hermit had started.
+///
+/// Each is a property of Hermit or its backend running this guest, so a
+/// result reader counts it as a failure of the cell on that backend, with the
+/// detail as its reason. An error that is none of these (a bad flag, an
+/// unreadable path) is not typed here and leaves the `NotRun` stamp.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunFailure {
+    /// The backend failed while running the guest: the DBT evidence check, a
+    /// KVM execution failure, a SaBRe guest that never reached Detcore.
+    BackendFailure,
+    /// The run recorded a determinism loss, so its records are not compared.
+    DeterminismLoss,
+    /// A fail-closed policy refused this guest during the run: an unsupported
+    /// system call, or a guest the backend cannot instrument.
+    PolicyRefusal,
+    /// Detcore's scheduler found every remaining thread permanently blocked
+    /// (its "Deadlock detected" report) and ended the run.
+    Deadlock,
+}
+
+impl RunFailure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendFailure => "backend_failure",
+            Self::DeterminismLoss => "determinism_loss",
+            Self::PolicyRefusal => "policy_refusal",
+            Self::Deadlock => "deadlock",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -122,6 +157,42 @@ pub enum InfrastructureError {
     /// A ptrace PMU timer interrupt arrived after its target. Both runs and
     /// their comparison may still be retained, but the result is not admitted.
     SkidOvershoot { count: u64 },
+    /// The two runs diverged, and a host file the guest opened changed during
+    /// one of them: `run` opened `path` again and found the host file `after`
+    /// where it had found `before`, while the other run found the same file at
+    /// that open (see `detcore_model::host_input`). Hermit numbers inodes in
+    /// the order it first sees them, so a file replaced mid-run alone shifts
+    /// every later inode number of that run. The comparison is retained, but
+    /// the divergence is not attributed to Hermit.
+    HostInputChanged {
+        run: VerificationRun,
+        path: String,
+        before: detcore_model::host_input::HostFileIdentity,
+        after: detcore_model::host_input::HostFileIdentity,
+    },
+}
+
+impl std::fmt::Display for InfrastructureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SkidOvershoot { count } => {
+                write!(f, "{count} precise-timer skid overshoot(s)")
+            }
+            Self::HostInputChanged {
+                run,
+                path,
+                before,
+                after,
+            } => write!(
+                f,
+                "host input changed during run {}: {path} ({before} -> {after})",
+                match run {
+                    VerificationRun::Run1 => 1,
+                    VerificationRun::Run2 => 2,
+                }
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -377,6 +448,24 @@ pub struct VerificationReport {
     /// Corresponding first differing compared message from the right execution.
     #[serde(default)]
     pub first_divergent_right_message: Option<String>,
+    /// Whether the retired-branch counter that this run's virtual clock and
+    /// preemption points came from was exact on the producing host: the same
+    /// verdict `hermit host-capabilities` reports as `exact_branch_counter`
+    /// (<https://github.com/rrnewton/hermit/issues/3794>). Present for a run
+    /// on a backend that reads that counter (ptrace, e9patch, and `record
+    /// start`); absent for another backend, and in a report written before
+    /// this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_branch_counter: Option<BranchCounterVerdict>,
+}
+
+/// [`VerificationReport::exact_branch_counter`]: present, and the producer's
+/// evidence (the CPU and, when absent, the kind of validation failure).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchCounterVerdict {
+    pub present: bool,
+    pub evidence: String,
 }
 
 /// Accept `null` but not a MISSING field. serde maps an absent `Option` field to
@@ -414,6 +503,7 @@ impl VerificationReport {
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
+            exact_branch_counter: None,
         }
     }
 
@@ -422,6 +512,35 @@ impl VerificationReport {
     /// compare. A null comparison beside a product verdict is contradictory
     /// and stays refused at parse.
     fn require_consistent_outcome_fields(self) -> Result<Self, String> {
+        if let Some(NoResultReason::RunFailed { detail, .. }) = &self.no_result_reason {
+            if detail.trim().is_empty() {
+                return Err("incomplete verification report: run_failed omitted its detail".into());
+            }
+            // The failed run returned no Output and was not compared; like
+            // container_failed, it names no guest disposition.
+            if self.verdict != Verdict::NoResult
+                || self.verified
+                || self.bitwise_parity
+                || self.infrastructure_error.is_some()
+                || self.comparison.is_some()
+                || self.compared_log_messages.is_some()
+                || self.compared_outputs.is_some()
+                || self.dbt_counted_branches.is_some()
+                || self.runtime.is_some()
+                || self.guest_exit_code.is_some()
+                || self.guest_signal.is_some()
+                || self.first_divergent_scheduler_turn.is_some()
+                || self.first_divergent_virtual_nanoseconds.is_some()
+                || self.first_divergent_record.is_some()
+                || self.first_divergent_syscall.is_some()
+                || self.first_divergent_left_message.is_some()
+                || self.first_divergent_right_message.is_some()
+            {
+                return Err(
+                    "run_failed contradicts its no-comparison, unknown-guest outcome".into(),
+                );
+            }
+        }
         if let Some(NoResultReason::ContainerFailed(failure)) = &self.no_result_reason {
             let valid_status = match failure.disposition {
                 // classify_container_result reserves these normal exit codes
@@ -482,6 +601,16 @@ impl VerificationReport {
             (Verdict::InfrastructureError, Some(InfrastructureError::SkidOvershoot { .. })) => {
                 return Err(
                     "incomplete verification report: skid_overshoot count must be positive".into(),
+                );
+            }
+            // Named only for a divergence: the comparison that found it is
+            // part of the evidence.
+            (Verdict::InfrastructureError, Some(InfrastructureError::HostInputChanged { .. }))
+                if self.comparison.is_some() => {}
+            (Verdict::InfrastructureError, Some(InfrastructureError::HostInputChanged { .. })) => {
+                return Err(
+                    "incomplete verification report: host_input_changed requires the comparison that found the divergence"
+                        .into(),
                 );
             }
             (Verdict::InfrastructureError, None) => {
@@ -739,6 +868,41 @@ impl VerificationReport {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_exact_branch_counter_verdict_is_optional_and_strictly_typed() {
+        // Absent: the key is not written, so a report from another backend has
+        // exactly the bytes it had before the field existed.
+        let report = VerificationReport::no_result();
+        let bytes = serde_json::to_vec(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("exact_branch_counter").is_none(), "{value}");
+        assert_eq!(
+            VerificationReport::from_current_json_slice(&bytes)
+                .unwrap()
+                .exact_branch_counter,
+            None
+        );
+        // Present: it round-trips through the current-producer reader.
+        let mut report = VerificationReport::no_result();
+        report.exact_branch_counter = Some(BranchCounterVerdict {
+            present: false,
+            evidence: "fixture CPU: Reverie performance-counter validation failed \
+                       (AmdSpecLockMapShouldBeDisabled)"
+                .into(),
+        });
+        let bytes = serde_json::to_vec(&report).unwrap();
+        assert_eq!(
+            VerificationReport::from_current_json_slice(&bytes)
+                .unwrap()
+                .exact_branch_counter,
+            report.exact_branch_counter
+        );
+        // An unknown key inside the verdict is refused, not dropped.
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["exact_branch_counter"]["measured_counts"] = serde_json::json!(91);
+        assert!(VerificationReport::from_json_slice(value.to_string().as_bytes()).is_err());
+    }
+
     fn failed_container_report(
         run: VerificationRun,
         disposition: ContainerDisposition,
@@ -749,6 +913,48 @@ mod tests {
             disposition,
         }));
         report
+    }
+
+    #[test]
+    fn run_failure_round_trips_and_names_no_guest_disposition() {
+        for run in [VerificationRun::Run1, VerificationRun::Run2] {
+            for failure in [
+                RunFailure::BackendFailure,
+                RunFailure::DeterminismLoss,
+                RunFailure::PolicyRefusal,
+                RunFailure::Deadlock,
+            ] {
+                let mut report = VerificationReport::no_result();
+                report.no_result_reason = Some(NoResultReason::RunFailed {
+                    run,
+                    failure,
+                    detail: "drrun started and the DBT run then failed".into(),
+                });
+                let bytes = serde_json::to_vec(&report).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["no_result_reason"]["kind"], "run_failed");
+                assert_eq!(value["no_result_reason"]["failure"], failure.as_str());
+                assert_eq!(
+                    VerificationReport::from_current_json_slice(&bytes).unwrap(),
+                    report
+                );
+                assert!(report.require_canonical_comparison().is_err());
+
+                let mut guest = report.clone();
+                guest.guest_exit_code = Some(0);
+                let bytes = serde_json::to_vec(&guest).unwrap();
+                assert!(VerificationReport::from_current_json_slice(&bytes).is_err());
+
+                let mut blank = report.clone();
+                blank.no_result_reason = Some(NoResultReason::RunFailed {
+                    run,
+                    failure,
+                    detail: " ".into(),
+                });
+                let bytes = serde_json::to_vec(&blank).unwrap();
+                assert!(VerificationReport::from_current_json_slice(&bytes).is_err());
+            }
+        }
     }
 
     #[test]
@@ -1041,6 +1247,7 @@ mod tests {
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
+            exact_branch_counter: None,
         }
     }
 

@@ -1,10 +1,5 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+/* Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved. Licensed under the BSD-style license in LICENSE. */
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -39,10 +34,22 @@ static void* worker(void* unused) {
   uint64_t previous = 0;
   for (unsigned sample = 0; sample < 2; ++sample) {
     volatile uint64_t work = 1;
-    /* 120k actual branches exceed the ordinary 100k-RCB maximum at 1ms;
-     * compact instructions bound precise-timer single-step TRACE output. */
+    /* 120k actual branches exceed the ordinary 100k-RCB maximum at 1ms.
+     * PAUSE is a nonblocking spin hint: the thread stays runnable while
+     * retiring branches less densely than a bare LOOP. LOOP still decrements
+     * RCX and conditionally branches in one instruction, so the finite branch
+     * count, and every printed value, is the same as a bare LOOP's.
+     *
+     * Hermit asks for each precise PMU timer interrupt a fixed number of
+     * branches (the skid margin) before its target and single-steps the rest
+     * of the way, one step per instruction. The interrupt lands some time
+     * late. A bare LOOP retires so many branches in that time that it
+     * occasionally overran the 3,072-RCB margin, which Hermit refuses with
+     * exit 122. With PAUSE the same timers land a few branches late. Each
+     * branch is now two instructions, so each single-step tail is about
+     * twice as long. */
     uint64_t remaining = 120000;
-    __asm__ volatile("1: loop 1b" : "+c"(remaining));
+    __asm__ volatile("1: pause\n loop 1b" : "+c"(remaining));
     CHECK(remaining == 0);
     work += 3 * (120000 - remaining);
     struct timespec now;

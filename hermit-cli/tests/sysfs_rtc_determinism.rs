@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -52,9 +55,7 @@ fn read_normalized_attribute(path: &str, epoch: Option<&str>) -> Vec<u8> {
     let mut command = hermit_command(epoch);
     command.arg(cat).arg(path);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
 
     assert!(
         output.status.success(),
@@ -94,9 +95,7 @@ fn assert_l2(case: &ProgramCase) {
         .args(case.args);
 
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -211,9 +210,7 @@ fn sysfs_rtc_tracks_custom_epoch_and_virtual_time() {
         "import time; time.sleep(2); print(open('/sys/class/rtc/rtc0/date').read().strip()); print(open('/sys/class/rtc/rtc0/time').read().strip()); print(open('/sys/class/rtc/rtc0/since_epoch').read().strip())",
     ]);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(
         output.status.success(),
         "custom-epoch RTC probe failed ({rendered})\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

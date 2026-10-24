@@ -1,11 +1,5 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+//
 // Assemble cumulative evidence from the exact selected plan and producer rows.
 
 use std::collections::BTreeMap;
@@ -106,17 +100,9 @@ impl SelectedEvidence {
                 .map_err(|error| format!("expected E2E plan is not UTF-8: {error}"))?,
         };
         let cfg = plan.constructed_dag()?;
+        // Refuses, among other things, a step that asks for the removed ptrace
+        // reference run (https://github.com/rrnewton/hermit/issues/3301).
         plan.planned_cells()?;
-        // Retained schema-10 plans may still carry ptrace parity relations and
-        // keep reading through the ledger; a plan constructed now never does
-        // (https://github.com/rrnewton/hermit/issues/3301).
-        let relations = plan.planned_backend_parity_relations()?;
-        if !relations.is_empty() {
-            return Err(format!(
-                "newly constructed plan selects {} backend parity relation(s); backend parity no longer decides a validation outcome (https://github.com/rrnewton/hermit/issues/3301)",
-                relations.len()
-            ));
-        }
         let producers = SelectedTestProducers::from_constructed_plan_steps(
             &cfg.steps,
             plan.compatibility_selected,
@@ -467,109 +453,6 @@ mod tests {
         }
     }
 
-    /// The relation-count refusal is reachable, and only by a step the plan
-    /// reader still recognizes as backend parity: a retained-tag step
-    /// (`e2e.manifest_backend_parity_c_on_host`) with its retained
-    /// backend-parity-c selector and `--parity-reference ptrace`. The planted
-    /// flag in the requalification test below cannot reach it any more,
-    /// because its owner node is now e2e.manifest_c_programs, which the reader
-    /// refuses earlier as an unrecognized policy
-    /// (https://github.com/rrnewton/hermit/issues/3301).
-    #[test]
-    fn publication_refuses_a_retained_parity_step_by_its_relation_count() {
-        let retained: ConstructedValidationPlanV10 =
-            serde_json::from_str(include_str!("fixtures/schema10-matched-plan.json")).unwrap();
-        assert_eq!(
-            retained.planned_backend_parity_relations().unwrap().len(),
-            1
-        );
-        let mut dag: serde_json::Value = serde_json::from_str(&retained.dag_json).unwrap();
-        let mut expected: serde_json::Value =
-            serde_json::from_str(&retained.expected_e2e_plan_json).unwrap();
-        let step = &mut dag["steps"][0];
-        assert_eq!(step["job"], "manifest_backend_parity_c_on_host");
-        assert_eq!(step["manifest"]["category"], "backend-parity-c");
-        // Widen the retained population so the count is not trivially one: a
-        // relation is a non-ptrace verify cell, so of these four added cells
-        // only the liteinst and SaBRe verify cells add relations.
-        for (test, mode, backend) in [
-            ("backend-parity-c/fixture", "verify", "ptrace"),
-            ("backend-parity-c/fixture", "verify", "liteinst"),
-            ("backend-parity-c/fixture", "chaos", "ptrace"),
-            ("backend-parity-c/second", "verify", "sabre"),
-        ] {
-            let cell = serde_json::json!({
-                "lane": "portable", "category": "backend-parity-c",
-                "test": test, "mode": mode, "backend": backend,
-            });
-            expected["cells"].as_array_mut().unwrap().push(cell.clone());
-            let manifests = step["result_manifests"].as_array_mut().unwrap();
-            let position = manifests.len() - 1;
-            assert_eq!(manifests[position]["kind"], "structured-test-results");
-            manifests.insert(position, cell);
-        }
-        let parity_dag = dag.to_string();
-        let flag = " --parity-reference ptrace ";
-        assert_eq!(parity_dag.matches(flag).count(), 1);
-        let ordinary_dag = parity_dag.replacen(flag, " ", 1);
-
-        let publish = |dag_text: &str, run_id: &str| {
-            let root = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(root.path().join("ci/dag")).unwrap();
-            let cfg = super::super::dag_from_json(dag_text).unwrap();
-            let bytes = super::super::dag_to_json(&cfg);
-            let path = root.path().join("ci/dag/validate.json");
-            std::fs::write(&path, &bytes).unwrap();
-            std::fs::write(
-                root.path().join("ci/expected-e2e-plan.json"),
-                expected.to_string(),
-            )
-            .unwrap();
-            let plan = super::super::finish_committed_selection(
-                Plan {
-                    cfg,
-                    profile: "full".into(),
-                    ..Plan::default()
-                },
-                path,
-                bytes.into_bytes(),
-            );
-            let result = SelectedEvidence::capture(root.path(), &plan)
-                .unwrap()
-                .publish(root.path(), &plan, run_id, &"a".repeat(40));
-            let published = root
-                .path()
-                .join(format!(
-                    "ignored/validate/artifacts/{run_id}/constructed-plan.json"
-                ))
-                .exists();
-            (result, published)
-        };
-
-        // Control: the retained ordinary spelling of the same step owns the
-        // same five cells, selects no relation and is published.
-        let (ordinary, published) = publish(&ordinary_dag, "retained-ordinary");
-        let ordinary = ordinary.unwrap();
-        assert!(published);
-        assert_eq!(ordinary.plan.planned_cells().unwrap().len(), 5);
-        assert_eq!(
-            ordinary.plan.planned_backend_parity_relations().unwrap(),
-            Vec::new()
-        );
-
-        // The retained parity spelling passes the policy check, selects the
-        // KVM, liteinst and SaBRe verify relations and is refused by count.
-        let (refusal, published) = publish(&parity_dag, "retained-parity");
-        let refusal = refusal
-            .err()
-            .expect("a new plan that selects backend parity must be refused");
-        assert_eq!(
-            refusal,
-            "newly constructed plan selects 3 backend parity relation(s); backend parity no longer decides a validation outcome (https://github.com/rrnewton/hermit/issues/3301)"
-        );
-        assert!(!published);
-    }
-
     #[test]
     fn requalification_captures_and_publishes_the_committed_owner_without_full_authority() {
         use super::super::DagManifest;
@@ -587,7 +470,7 @@ mod tests {
             "--requalify-cell".into(),
             "c-programs/pid-probe".into(),
             "verify".into(),
-            "liteinst".into(),
+            "sabre".into(),
             "--no-label-pr".into(),
         ])
         .unwrap();
@@ -602,7 +485,7 @@ mod tests {
             category: "c-programs".into(),
             test: Some("c-programs/pid-probe".into()),
             mode: Some("verify".into()),
-            backend: Some("liteinst".into()),
+            backend: Some("sabre".into()),
         };
         let committed = super::super::validate_plan::validation_config(root).unwrap();
         let lane =
@@ -632,13 +515,6 @@ mod tests {
                 .unwrap();
         expected.sort();
         assert_eq!(prepared.plan.planned_cells().unwrap(), expected);
-        // The requalified liteinst verify cell runs ordinary same-backend
-        // verification; no ptrace reference relation is selected
-        // (https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(
-            prepared.plan.planned_backend_parity_relations().unwrap(),
-            Vec::new()
-        );
         assert_eq!(
             std::fs::read(scratch.path().join(&prepared.reference.path)).unwrap(),
             prepared.bytes
@@ -660,8 +536,8 @@ mod tests {
         // Preserve the existing ptrace selection and mutation controls as well.
         super::super::requalification_plan_bracket(root).unwrap();
 
-        // A selection that still asks for the reference run stays readable as
-        // a retained plan, but publishing it as a new plan is refused.
+        // A selection that still asks for the removed reference run is
+        // refused, and nothing is published.
         let planted_scratch = tempfile::tempdir().unwrap();
         let mut planted = build_plan(root, &args, planted_scratch.path()).unwrap();
         let selection = planted.committed_selection.take().unwrap();
@@ -684,17 +560,9 @@ mod tests {
             )
             .err()
             .expect("a new plan that selects backend parity must be refused");
-        // Before backend-parity-c was folded into c-programs, the owner node was
-        // e2e.manifest_backend_parity_c, whose retained parity spelling the plan
-        // reader still recognizes, so the planted flag was read as 173 relations
-        // (liteinst 97, KVM 75 and SaBRe 1) and refused by count. The owner is
-        // now e2e.manifest_c_programs, which never had a parity spelling, so the
-        // same planted flag is refused earlier, as an unrecognized policy, and
-        // nothing is published either way
-        // (https://github.com/rrnewton/hermit/issues/3301).
         assert_eq!(
             refusal,
-            "e2e.manifest_c_programs has unrecognized backend parity policy"
+            "e2e.manifest_c_programs requests the retired ptrace reference run; plans that did are excluded (https://github.com/rrnewton/hermit/issues/3301)"
         );
         assert!(
             !planted_scratch

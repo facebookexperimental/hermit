@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -41,8 +44,8 @@ fn fairness_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root =
-                Path::new(env!("CARGO_TARGET_TMPDIR")).join("thread-scheduling-fairness");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("thread-scheduling-fairness-{}", std::process::id()));
             fs::create_dir_all(&build_root).expect("failed to create fairness build directory");
             let output = build_root.join("scheduling-fairness");
             let mut command = Command::new("rustc");
@@ -82,9 +85,7 @@ fn run_workload(workload: &str, run: usize) -> String {
         .arg(fairness_guest())
         .arg(workload);
     let rendered = format!("{command:?}");
-    let output = command.output().unwrap_or_else(|error| {
-        panic!("failed to start {workload} fairness run {run}: {rendered}: {error}")
-    });
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert!(
         output.status.success(),
         "{workload} fairness run {run} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

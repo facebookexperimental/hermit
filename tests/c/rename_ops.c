@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Backend-parity fixture: rename(2)/renameat(2) semantics.
 //
 // Drives file renames within a private mkdtemp root and confirms the standard

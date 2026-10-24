@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use std::collections::BTreeMap;
 use std::ops::Index;
 use std::str::FromStr;
@@ -175,6 +167,7 @@ test:
         dbt: reason
         kvm: reason
         liteinst: reason
+        in-guest-trap: reason
 "#
         .parse()
         .unwrap();

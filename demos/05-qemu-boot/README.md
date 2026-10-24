@@ -252,6 +252,18 @@ Archived snapshot: ignored/qemu-linux/boot-anchor/boot-snapshot.qcow2
 - The snapshot is published as `ignored/qemu-linux/hermit-boot.qcow2` (or under
   `QEMU_ASSETS`). [Demo 6](../06-qemu-resume/README.md) and
   [demo 7](../07-drgn-kernel/README.md) restore it instead of booting again.
+  Next to it, `hermit-boot.qcow2.producer.json` records the snapshot's SHA-256
+  and the `INITRAMFS_VERSION` and SHA-256 of the initramfs this boot started
+  from; demo 6 restores the snapshot only when that record matches the current
+  initramfs. A snapshot saved at `QEMU_SNAPSHOT_DISK` gets the same record.
+  The boot runs a copy of the kernel and initramfs made in its working
+  directory, and the SHA-256 recorded is the copy's, so a checkout that
+  rebuilds the shared initramfs during the boot cannot change what the record
+  names. The version recorded is the one that `demos/lib/qemu-assets.sh`
+  names for exactly those bytes in its build record, `.initramfs-build` next
+  to the initramfs (`<INITRAMFS_VERSION> <SHA-256>`, written after each
+  build); when that record names other bytes or another version, the demo
+  stops before booting and asks you to run it again.
 
 ## How it works
 
@@ -285,8 +297,11 @@ them once made two boots write different Hermit logs:
 - The per-run working directory has a random name. It is bound into the guest
   at the fixed path `/tmp/hermit-demo5-run` with `--bind`, and the controller
   is given that path, so the random name never reaches a guest command line.
-- The kernel and initramfs directory is bound at `/tmp/hermit-demo-assets`,
-  and the controller runs from `/tmp/hermit-demo-controller`, a copy of its two
+- The run's copies of the kernel and initramfs are bound at
+  `/tmp/hermit-demo-assets`, the path at which the asset directory itself was
+  bound before (a `QEMU_SNAPSHOT_DISK` in the asset directory is bound at its
+  old path inside it), and the controller runs from
+  `/tmp/hermit-demo-controller`, a copy of its two
   source files made for each run with fixed file modes and modification times.
   Their host paths depend on where the checkout is, and they appear on the
   controller's and QEMU's command lines, whose lengths change how many branches
@@ -334,11 +349,11 @@ Controls (environment variables):
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `QEMU_BOOT_REPEAT` | `1` | Set to `0` to skip the second boot of a first invocation, which then compares nothing. `demos/run-all.sh` always sets it to `1`. |
-| `QEMU_TIMEOUT` | `600` | Seconds before the boot is stopped: the demo then stops Hermit and every process still in Hermit's process group (the group is sent SIGTERM and then SIGKILL, at most 10 seconds apart) and fails. |
+| `QEMU_TIMEOUT` | `600` | Seconds the demo waits for the boot: it then signals Hermit's process group, the one it started the `hermit` command in (SIGTERM and then SIGKILL, at most 10 seconds apart), and fails. It does not report whether the group emptied, and a process outside the group is not signalled. |
 | `QEMU_ASSETS` | `ignored/qemu-linux` | Where the kernel, initramfs, snapshot, and run history are kept. A checkout under `/tmp` uses a directory under `/var/tmp` instead. |
 | `QEMU_BIN` | `qemu-system-x86_64` on `PATH` | The QEMU binary. |
 | `KERNEL_IMAGE` | (download) | Use a local copy of the pinned kernel; its SHA-256 must still match. |
 | `BUSYBOX` | `busybox` on `PATH` | A statically linked BusyBox for the initramfs. |
 | `QEMU_SNAPSHOT_NAME` | `hermit-boot` | The snapshot's name inside the qcow2 file. |
 | `QEMU_LOG_FILTER` | `warn,detcore=info,reverie_ptrace::task=info` | Hermit's log filter, passed to Hermit as `RUST_LOG`; the demo removes `HERMIT_LOG` and `HERMIT_LOG_FILE` from Hermit's environment. The repeat check needs Hermit's INFO records, so a filter that keeps none fails it. A different filter also changes the log, so a saved reference run no longer applies; run `demos/clean.sh`. |
-| `QEMU_MAX_LOG_BYTES` | 768 MiB | Stop the run if Hermit's event log grows past this size. The cap still holds while the demo waits, for up to 60 seconds after Hermit exits, for the rest of Hermit's output; processes Hermit left running are stopped when the cap or those 60 seconds run out. Eight healthy boots on 2026-09-30 wrote 457,618,652 bytes each (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote about 253 MB. |
+| `QEMU_MAX_LOG_BYTES` | 768 MiB | Signal Hermit's process group and fail if Hermit's event log grows past this size. The cap still holds while the demo waits, for up to 60 seconds after Hermit exits, for the rest of Hermit's output; when the cap or those 60 seconds run out, the demo signals Hermit's process group the same way, which reaches the processes Hermit left running in that group. Eight healthy boots on 2026-09-30 wrote 457,618,652 bytes each (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote about 253 MB. |

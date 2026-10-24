@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Wrap `test-harness parity export` rows as parity-ledger/v1 fixture rows.
 
 Usage: fixture_wrap.py <export.jsonl> <e2e-root> <rows.jsonl out> <report.json out>
@@ -32,28 +26,10 @@ TEAM = "hermit"
 HOST = "fixture-host-b"
 EMITTED_AT = "2026-09-29T04:10:00Z"
 PRODUCER = "validate"
-SOURCE_KEYS = [
-    "cell",
-    "test_id",
-    "backend",
-    "verdict",
-    "unavailable_class",
-    "operand",
-    "reason",
-    "run_id",
-    "hermit_sha",
-    "source",
-    "record",
-]
-ORIGIN_KEYS = [
-    "lane",
-    "node",
-    "post_pass_state",
-    "status_sha256",
-    "records_sha256",
-    "hermit_bin_sha256",
-    "scope_source",
-]
+SOURCE_KEYS = ["cell", "test_id", "backend", "verdict", "unavailable_class",
+               "operand", "reason", "run_id", "hermit_sha", "source", "record"]
+ORIGIN_KEYS = ["lane", "node", "post_pass_state", "status_sha256",
+               "records_sha256", "hermit_bin_sha256", "scope_source"]
 
 
 def sha256_hex(data: bytes) -> str:
@@ -67,59 +43,34 @@ def compact(value) -> str:
 def main():
     export_path, root, rows_out, report_out = map(Path, sys.argv[1:5])
     export_lines = [l for l in export_path.read_text().splitlines() if l.strip()]
-    records = {}  # (lane, node) -> list of (line, parsed, used)
+    records = {}   # (lane, node) -> list of (line, parsed, used)
     for status in sorted(root.glob("*/*/parity.status.json")):
         lane, node = status.parent.parent.name, status.parent.name
-        lines = [
-            l
-            for l in (status.parent / "parity.jsonl").read_text().splitlines()
-            if l.strip()
-        ]
+        lines = [l for l in (status.parent / "parity.jsonl").read_text().splitlines() if l.strip()]
         records[(lane, node)] = [[l, json.loads(l), 0] for l in lines]
     out = []
     per_source = Counter()
     for n, text in enumerate(export_lines, 1):
         row = json.loads(text)
         assert list(row) == SOURCE_KEYS, f"export row {n}: keys {list(row)}"
-        assert list(row["source"]) == ORIGIN_KEYS, (
-            f"export row {n}: source keys {list(row['source'])}"
-        )
-        assert row["record"] is not None, (
-            f"export row {n}: record-missing row {row['cell']}"
-        )
-        assert row["run_id"] and row["hermit_sha"], (
-            f"export row {n}: no run_id/hermit_sha"
-        )
+        assert list(row["source"]) == ORIGIN_KEYS, f"export row {n}: source keys {list(row['source'])}"
+        assert row["record"] is not None, f"export row {n}: record-missing row {row['cell']}"
+        assert row["run_id"] and row["hermit_sha"], f"export row {n}: no run_id/hermit_sha"
         lane, node = row["source"]["lane"], row["source"]["node"]
-        assert row["cell"] == f"{row['test_id']}@{row['backend']}", (
-            f"export row {n}: cell {row['cell']}"
-        )
+        assert row["cell"] == f"{row['test_id']}@{row['backend']}", f"export row {n}: cell {row['cell']}"
         matches = [r for r in records[(lane, node)] if r[1] == row["record"]]
-        assert len(matches) == 1, (
-            f"export row {n}: {len(matches)} matching record lines"
-        )
+        assert len(matches) == 1, f"export row {n}: {len(matches)} matching record lines"
         match = matches[0]
         match[2] += 1
         line = match[0]
-        for field in (
-            "test_id",
-            "backend",
-            "verdict",
-            "unavailable_class",
-            "operand",
-            "reason",
-            "run_id",
-            "hermit_sha",
-        ):
-            assert match[1][field] == row[field], (
-                f"export row {n}: {field} differs from its record"
-            )
+        for field in ("test_id", "backend", "verdict", "unavailable_class", "operand", "reason",
+                      "run_id", "hermit_sha"):
+            assert match[1][field] == row[field], f"export row {n}: {field} differs from its record"
         envelope = {
             "schema": "parity-ledger/v1",
             "event_type": "parity.record",
             "event_id": sha256_hex(
-                f"{PRODUCER}\0{row['run_id']}\0{row['cell']}\0{lane}\0{node}".encode()
-            ),
+                f"{PRODUCER}\0{row['run_id']}\0{row['cell']}\0{lane}\0{node}".encode()),
             "team": TEAM,
             "host": HOST,
             "emitted_at": EMITTED_AT,
@@ -161,22 +112,14 @@ def main():
         "sources": {
             f"{l}/{n}": {
                 "records": len(v),
-                "records_sha256": sha256_hex(
-                    (root / l / n / "parity.jsonl").read_bytes()
-                ),
-                "status_sha256": sha256_hex(
-                    (root / l / n / "parity.status.json").read_bytes()
-                ),
+                "records_sha256": sha256_hex((root / l / n / "parity.jsonl").read_bytes()),
+                "status_sha256": sha256_hex((root / l / n / "parity.status.json").read_bytes()),
             }
             for (l, n), v in sorted(records.items())
         },
         "verdicts": dict(Counter(json.loads(l)["verdict"] for l in out)),
-        "unavailable_classes": dict(
-            Counter(str(json.loads(l)["unavailable_class"]) for l in out)
-        ),
-        "test_id_prefixes": dict(
-            Counter(json.loads(l)["test_id"].split("/")[0] for l in out)
-        ),
+        "unavailable_classes": dict(Counter(str(json.loads(l)["unavailable_class"]) for l in out)),
+        "test_id_prefixes": dict(Counter(json.loads(l)["test_id"].split("/")[0] for l in out)),
     }
     Path(report_out).write_text(json.dumps(report, indent=1) + "\n")
     print(json.dumps(report, indent=1))

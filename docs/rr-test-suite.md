@@ -29,44 +29,62 @@ This mirrors the fbsource `RR_TEST_TARGETS` set defined in
 
 ## Running
 
-The programs are ptrace-heavy and depend on PMU branch counters plus working
-user/mount namespaces, so they are `#[ignore]`d by default (like the other Hermit
-integration suites) and run explicitly:
+Validation runs every case that is not `#[ignore]`d, in the pinned root:
+`test.rr_suite_contract` runs 190 rr programs plus the scratch-directory
+contract test, eight at a time (233 s of wall time when it ran serially,
+measured 2026-10-15). Its GitHub
+hosted twin leaves out `rr_no_mask_timeslice` by exact name. That program
+needs the PMU preemption timer, and hosted runners have no PMU. The programs
+are ptrace-heavy and need PMU branch counters plus working user and mount
+namespaces, so run them on such a host:
 
 ```sh
-cargo test -p hermit --test rr_suite -- --ignored          # all
-cargo test -p hermit --test rr_suite -- --ignored rr_hello # one
+cargo test -p hermit-run --test rr_suite              # every enabled case
+cargo test -p hermit-run --test rr_suite rr_hello     # one
+cargo test -p hermit-run --test rr_suite -- --ignored # only the known failures
 ```
-
-`scripts/validate.rs` runs the full suite as its "rr syscall suite" check.
 
 ## Coverage
 
 Starting from the fbsource `RR_TEST_TARGETS` minus the tests fbsource already
-disables under Hermit (its `wrap_test_suite(exclude=[...])` list), **218** rr
-programs build against this checkout and **214** pass when each program receives
-a fresh scratch directory.
-One of those (`rr_multiple_pending_signals_sequential`) turned out to be flaky
-(intermittently hangs), so the harness enables the remaining **213**. Each run is
-wrapped in `timeout(1)` (`120s`) with a `10s` TERM-to-KILL grace period so any
-future hang fails that test cleanly rather than blocking the serialized suite.
-Special cases carried over from fbsource:
+disables under Hermit (its `wrap_test_suite(exclude=[...])` list), **216** rr
+programs build against this checkout and have an `rr_test!` case. **190** run in
+validation; the 2026-10-17 test audit deleted one case, listed under
+"Programs with no case". Measured 2026-10-15 at main ec49cdd7, 25 of the then 217 had stopped
+passing while every case was `#[ignore]`d and no validation node ran them.
+Each now carries an `#[ignore = "..."]` naming its reason
+(https://github.com/rrnewton/hermit/issues/4257):
+
+- 19 are refusals by design that an E2E cell or Detcore policy already covers:
+  - `keyctl`;
+  - 8 `seccomp_*` cases that need `prctl(PR_SET_NO_NEW_PRIVS)`, and
+    `seccomp_desched`;
+  - `shm` and `shm_unmap`;
+  - `splice` and `vm_readv_writev`;
+  - `prctl_speculation_ctrl`, `rlimit`, `quotactl`, `setgroups` and `setuid`.
+- 6 are gaps:
+  - `fatal_init_signal` and `unexpected_exit_pid_ns`;
+  - `numa`;
+  - `sched_yield_to_lower_priority`;
+  - `intr_ppoll` and `multiple_pending_signals` (both refused with exit 122).
+- `spinlock_priorities` passes, in 43 s on a developer host, but spins past
+  validation's 22 CPU-second per-test budget.
+
+Each run is wrapped in `timeout(1)` (`120s`) with a `10s` TERM-to-KILL grace
+period, so any future hang fails that test cleanly rather than blocking the
+serialized suite. Special cases carried over from fbsource:
 
 - `rr_args` runs with `-no --force-syscall-buffer=foo -c 1000 hello` (exit 0).
 - `rr_pause` expects exit code 1 and must print its final `EXIT-SUCCESS` marker.
 
-## Known failures (not yet enabled) — bugs to file
+## Programs with no case
 
-These upstream rr programs build but do **not** pass under `hermit run` today.
-They are excluded from the harness and tracked here:
+These upstream rr programs build but have no `rr_test!` case:
 
 | rr test | symptom | likely Hermit gap |
 | --- | --- | --- |
-| `rr_rusage` | guest aborts: `rusage.c:10 !(r->ru_maxrss > 0)` | `getrusage` returns `ru_maxrss == 0` (rusage not virtualized) |
-| `rr_sigchld_interrupt_signal` | hangs (>60s timeout) | SIGCHLD interrupt/restart handling |
-| `rr_sigprocmask_in_syscallbuf_sighandler` | hangs (>60s timeout) | signal mask manipulation inside a signal handler |
-| `rr_spinlock_priorities` | hangs (>60s timeout) | priority-based scheduling / spin behavior |
-| `rr_multiple_pending_signals_sequential` | flaky: intermittently hangs (passed once, hung on a later run) | nondeterministic multi-signal delivery ordering |
+| `rr_multiple_pending_signals_sequential` | refused by name (exit 122): "process-directed signal 10 to process 3 by kill is not supported: the sending thread blocks the signal"; it used to hang intermittently | https://github.com/rrnewton/hermit/issues/4034, tracked for this test in https://github.com/rrnewton/hermit/issues/116 |
+| `rr_simple_threads_stress` | deleted by the same audit: `join_threads`'s 100-thread create/join loop without its `test_assert`s | none; `rr_join_threads` runs the same loop and asserts each call |
 
 `rr_arch_prctl` (fbsource `test_arch_prctl`) has no plain `src/test/arch_prctl.c`
 upstream — only `src/test/x86/arch_prctl_x86.c` and `arch_prctl_xstate.c` — so it

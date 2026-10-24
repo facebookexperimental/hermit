@@ -4,7 +4,6 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
 set -euo pipefail
 
 readonly TIMESTAMP_PATTERN='^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])_([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]_[0-9]{9}$'

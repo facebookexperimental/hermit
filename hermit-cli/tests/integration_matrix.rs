@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -20,6 +23,11 @@ use std::time::Instant;
 const GUEST_FIXTURE: &str = "/tmp/integration-matrix";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const EXPECTED_FAIL_TIMEOUT_SECONDS: u64 = 5;
+// Each case's two runs are separate Hermit processes compared byte for byte,
+// so they share one epoch: a host-drawn one differs per run, and Hermit then
+// reports the recording it saved on stderr
+// (https://github.com/rrnewton/hermit/issues/4321).
+const EPOCH: &str = "--epoch=2026-01-01T00:00:00Z";
 
 #[derive(Clone, Copy, Debug)]
 enum Expectation {
@@ -102,9 +110,7 @@ fn executable(candidates: &[&str]) -> Option<PathBuf> {
 
 fn run_host_command(mut command: Command, label: &str) {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -341,6 +347,7 @@ fn run_case(case: &Case, fixture: &Fixture) -> TimedRun {
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
+            EPOCH,
         ])
         .arg(format!("--bind={}:{GUEST_FIXTURE}", fixture.root.display()))
         .arg("--")

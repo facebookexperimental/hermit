@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Delegate a cgroup v2 subtree to the GitHub-hosted runner account and move one
 # process into it, so every descendant of that process can create child cgroups.
 #

@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Demo 9's initramfs stores the same modes, and bytes, under any umask.
 
 demos/09-qemu-busybox/build-initramfs.sh archives a BusyBox, its applet links,
@@ -144,9 +138,7 @@ class ArchiveModesTest(unittest.TestCase):
         )
         self.environment = dict(os.environ)
         self.environment.update(
-            PATH="{}:{}".format(
-                fake_bin, self.environment.get("PATH", "/usr/bin:/bin")
-            ),
+            PATH="{}:{}".format(fake_bin, self.environment.get("PATH", "/usr/bin:/bin")),
             BUSYBOX=str(self.busybox),
             LC_ALL="C",
         )

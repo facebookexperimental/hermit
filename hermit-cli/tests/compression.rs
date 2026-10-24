@@ -6,12 +6,22 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/skid_overshoot.rs"]
+mod skid_overshoot;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
+
+// Each harness attempt runs 15 strict Hermit processes, and a busy host
+// sometimes delivers a PMU interrupt late enough that Hermit refuses the run
+// (exit 122, cause=skid-overshoot). That measures the host, not the guest, so
+// such an attempt runs again; nothing else does
+// (https://github.com/rrnewton/hermit/issues/1845).
+const SKID_ATTEMPTS: u32 = 5;
 
 #[test]
 fn compression_tools_are_deterministic_under_strict_hermit() {
@@ -22,17 +32,25 @@ fn compression_tools_are_deterministic_under_strict_hermit() {
         .parent()
         .expect("hermit-cli should be inside the repository root");
     let runner = repo_root.join("hermit-cli/tests/fixtures/compression/run.sh");
-    let artifact_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("compression");
-    if artifact_root.exists() {
-        fs::remove_dir_all(&artifact_root).expect("failed to remove stale compression artifacts");
-    }
+    let artifact_root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("compression-{}", std::process::id()));
 
-    let output = Command::new(&runner)
-        .env("HERMIT_BIN", env!("CARGO_BIN_EXE_hermit"))
-        .env("COMPRESSION_ARTIFACT_ROOT", &artifact_root)
-        .env("COMPRESSION_INPUT_LINES", "12000")
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {}: {error}", runner.display()));
+    let (_, output, ()) =
+        skid_overshoot::retry_typed_skid_refusal("compression", SKID_ATTEMPTS, || {
+            if artifact_root.exists() {
+                fs::remove_dir_all(&artifact_root)
+                    .expect("failed to remove stale compression artifacts");
+            }
+            let output = Command::new(&runner)
+                .env("HERMIT_BIN", env!("CARGO_BIN_EXE_hermit"))
+                // The script's strict runs take their epoch from this.
+                .env("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)
+                .env("COMPRESSION_ARTIFACT_ROOT", &artifact_root)
+                .env("COMPRESSION_INPUT_LINES", "12000")
+                .output()
+                .unwrap_or_else(|error| panic!("failed to start {}: {error}", runner.display()));
+            (output, ())
+        });
 
     assert!(
         output.status.success(),

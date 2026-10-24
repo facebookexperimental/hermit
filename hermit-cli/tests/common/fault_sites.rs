@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Structural fault-site discovery for the CLI's actual container calls.
 //! Only literal strings and conditional literal branches are supported labels.
 //! Local identifiers fail closed; comments and string contents are never calls.

@@ -3,7 +3,7 @@
 [package]
 name = "hermit-test-workdir"
 description = "Per-run filesystem isolation for Hermit tests inside the pinned root."
-version = "0.4.1"
+version = "0.5.1"
 edition = "2024"
 readme = "README.md"
 homepage = "https://hermetic-infra.org"
@@ -12,7 +12,7 @@ keywords = ["linux", "hermit", "determinism", "debugging"]
 categories = ["development-tools::debugging", "development-tools::testing"]
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
-publish = true
+publish = false
 
 [dependencies]
 libc = "0.2.186"

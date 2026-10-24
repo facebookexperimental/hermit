@@ -314,6 +314,64 @@ fn container_init_dies_with_the_hermit_process_that_forked_it() {
     );
 }
 
+/// The same outright kill, landed while the container init is still in
+/// container setup, before it has armed its parent-death signal. The kernel
+/// never sends that signal for a parent that died first, so the init has to
+/// see for itself that its parent is gone. The init is held before it arms, as
+/// in `container_init_honours_signals_sent_before_it_arms`, the outer `hermit`
+/// is killed inside that hold, and the whole run must still disappear well
+/// before the hold would have ended. The test above lands in this window only
+/// by chance under load (2 of 180 runs on 4 loaded CPUs on 2026-10-16, each
+/// leaving the init and its guest running); this one lands in it every time.
+#[test]
+fn container_init_exits_when_its_hermit_parent_died_before_it_armed() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut argv = vec![hermit_bin(), "run", "--"];
+    argv.extend_from_slice(SPINNER);
+
+    let spawned = Instant::now();
+    let (mut hermit, guard, init) = start_hung_run(&argv, &[(ARMING_STALL_ENV, "1")]);
+    let outer = hermit.id() as i32;
+    assert_ne!(
+        outer, init,
+        "the container init must be a distinct process from the hermit CLI"
+    );
+    let stalled = poll_until(STARTUP_BUDGET, || {
+        let comm = fs::read_to_string(format!("/proc/{init}/comm")).ok()?;
+        (comm.trim_end() == ARMING_STALL_COMM).then_some(())
+    });
+    assert!(
+        stalled.is_some(),
+        "container init {init} never showed the {ARMING_STALL_COMM:?} thread name, so it \
+         is not waiting before it arms and this test cannot place the parent's death in \
+         that window. The hermit under test ignores {ARMING_STALL_ENV}; is it older than \
+         this test?"
+    );
+
+    // SAFETY: `kill` takes a pid and a signal number and touches no caller
+    // memory. `outer` is our own child and has not been reaped yet.
+    assert_eq!(
+        unsafe { libc::kill(outer, libc::SIGKILL) },
+        0,
+        "failed to kill the outer hermit process: {}",
+        io::Error::last_os_error()
+    );
+    let status = hermit.wait().expect("failed to wait for hermit");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+    assert_session_drains(
+        guard.0,
+        "container init whose hermit parent was killed before it armed its death signal",
+    );
+    let elapsed = spawned.elapsed();
+    assert!(
+        elapsed < ARMING_STALL,
+        "the run drained {elapsed:?} after spawn, which is not inside the {ARMING_STALL:?} \
+         hold, so this pass says nothing about the init noticing its parent was gone"
+    );
+}
+
 /// Isolates the stop-signal handlers: signal only the container init, leaving
 /// its `hermit` parent alive so the parent-death signal cannot be what ends the
 /// run. Each of these is discarded outright while the container init leaves the
@@ -428,4 +486,71 @@ fn container_init_honours_signals_sent_before_it_arms() {
             &format!("run after signal {signal} to its init before it armed"),
         );
     }
+}
+
+/// A run that Hermit itself must end: with a configured
+/// `--scheduler-turn-cost`, a scheduler turn whose charge would pass the end of
+/// representable virtual time ends the run with an internal-failure exit and
+/// the report, rather than saturating the clock or leaving every guest parked
+/// behind a panicked scheduler (https://github.com/rrnewton/hermit/pull/3885).
+/// The epoch starts the clock 51,615 ns before u64::MAX nanoseconds, so the
+/// first 1 s scheduler charge passes it, whatever the guest does.
+#[test]
+fn virtual_clock_exhaustion_under_a_scheduler_turn_cost_ends_the_run() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut stderr_file = tempfile::tempfile().expect("failed to create a stderr capture");
+    let mut command = Command::new(hermit_bin());
+    command.args([
+        "--backend=ptrace",
+        "run",
+        "--strict",
+        "--epoch=2554-07-21T23:34:33.7095Z",
+        "--max-timeslice=disabled",
+        "--scheduler-turn-cost=1000000000",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo unreachable >&2",
+    ]);
+    hermit_test::configure_guest_execution(&mut command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            stderr_file
+                .try_clone()
+                .expect("failed to clone the stderr capture"),
+        ));
+    // SAFETY: as in `spawn_in_new_session`.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("failed to start hermit");
+    let session = child.id() as i32;
+    let _guard = SessionGuard(session);
+    let status = poll_until(TEARDOWN_BUDGET, || child.try_wait().unwrap());
+    let mut stderr = String::new();
+    io::Seek::seek(&mut stderr_file, io::SeekFrom::Start(0))
+        .expect("failed to rewind the stderr capture");
+    io::Read::read_to_string(&mut stderr_file, &mut stderr)
+        .expect("failed to read the stderr capture");
+    let status = status.unwrap_or_else(|| {
+        panic!("the run did not end within {TEARDOWN_BUDGET:?}; stderr:\n{stderr}")
+    });
+    assert_eq!(
+        status.code(),
+        Some(hermit::HERMIT_INTERNAL_FAILURE_EXIT),
+        "clock exhaustion must end the run as an internal failure: {status}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_VIRTUAL_CLOCK_EXHAUSTED: virtual clock exhausted"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("unreachable"), "{stderr}");
+    assert_session_drains(session, "a run ended by clock exhaustion");
 }

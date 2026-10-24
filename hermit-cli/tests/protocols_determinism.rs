@@ -8,6 +8,9 @@
 
 //! End-to-end coverage for live counters exposed by /proc/net/protocols.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -62,9 +65,7 @@ fn assert_l2(case: &ProgramCase) {
         .args(case.args);
 
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -96,9 +97,7 @@ fn read_protocols() -> String {
         "/proc/net/protocols",
     ]);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "protocol table read failed ({rendered})\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

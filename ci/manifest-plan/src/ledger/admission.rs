@@ -1,14 +1,7 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Retained admission-floor transport. These values preserve a driver's already
 //! authenticated proof; parsing a value or checking its digest grants no authority.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -19,10 +12,15 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use super::HistoryRow;
+use super::RetainedJson;
 
 pub const ADMISSION_CONTEXT_CONTRACT: &str = "ci-hub-admission-floor/v1";
 pub const ADMISSION_CONTEXT_V2_CONTRACT: &str = "ci-hub-admission-floor/v2";
 pub const ADMISSION_CONTEXT_MAX_BYTES: usize = 1024 * 1024;
+
+/// The most first-parent main commits a `disjoint-main` floor may lag the main
+/// observed at admission by.
+pub const DISJOINT_MAIN_MAX_DELTA_COMMITS: u64 = 12;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +29,20 @@ pub struct AdmissionFloorV1 {
     pub sha: String,
     pub tree: String,
     pub observed_main_sha: String,
+    /// The first-parent commit count of `sha..observed_main_sha`. Present if
+    /// and only if `kind` is `disjoint-main`; every other kind keeps exactly
+    /// the four fields above, byte for byte. An explicit `null` is refused.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_u64"
+    )]
+    pub main_delta_commits: Option<u64>,
+}
+
+/// An optional field that, when present, must be an unsigned integer.
+fn present_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -192,14 +204,77 @@ struct CapturedValue {
     duplicate: bool,
 }
 
+/// Extensions large enough to keep as compact text when decoded from history.
+/// On the 2026-10-10 ledger `raw_result_input_census_v1` held 134 MB of JSON as
+/// 1.58 GB of `Value` (<https://github.com/rrnewton/dev-hermit/issues/552>).
+const RETAINED_EXTENSIONS: &[&str] = &["raw_result_input_census_v1"];
+
 /// The historical extension map plus private original-input metadata. The
 /// serialized form is exactly the BTreeMap; duplicate refusal state is exposed
 /// only by HistoryRow::admission_log_identity for checked transient delegation.
 /// Ordinary map mutation deliberately does not clear original bad metadata.
+///
+/// A decoded entry named in `RETAINED_EXTENSIONS` (today only
+/// `raw_result_input_census_v1`) that has no float lives in `retained`
+/// as compact text, NOT in the map that `Deref` exposes: read it with
+/// [`HistoryExtensions::value`] and remove it with
+/// [`HistoryExtensions::remove_value`]. Serialization and equality treat both
+/// stores as one map; an entry inserted through `DerefMut` replaces a retained
+/// one with the same key.
 #[derive(Clone, Debug, Default)]
 pub struct HistoryExtensions {
     values: BTreeMap<String, Value>,
+    retained: BTreeMap<String, RetainedJson>,
     duplicate_log_identities: Option<Vec<Value>>,
+}
+
+impl HistoryExtensions {
+    /// The value of `key` from either store.
+    pub fn value(&self, key: &str) -> Option<Cow<'_, Value>> {
+        if let Some(value) = self.values.get(key) {
+            return Some(Cow::Borrowed(value));
+        }
+        self.retained
+            .get(key)
+            .map(|retained| Cow::Owned(retained.value()))
+    }
+
+    /// Remove `key` from both stores, returning its value.
+    pub fn remove_value(&mut self, key: &str) -> Option<Value> {
+        let retained = self.retained.remove(key).map(|retained| retained.value());
+        self.values.remove(key).or(retained)
+    }
+
+    /// Every entry of both stores in key order; the map entry wins a tie.
+    fn merged(&self) -> impl Iterator<Item = (&String, Extension<'_>)> {
+        let mut values = self.values.iter().peekable();
+        let mut retained = self
+            .retained
+            .iter()
+            .filter(|(key, _)| !self.values.contains_key(*key))
+            .peekable();
+        std::iter::from_fn(move || match (values.peek(), retained.peek()) {
+            (Some((left, _)), Some((right, _))) if right < left => retained
+                .next()
+                .map(|(key, value)| (key, Extension::Retained(value))),
+            (Some(_), _) => values
+                .next()
+                .map(|(key, value)| (key, Extension::Value(value))),
+            (None, Some(_)) => retained
+                .next()
+                .map(|(key, value)| (key, Extension::Retained(value))),
+            (None, None) => None,
+        })
+    }
+
+    fn merged_len(&self) -> usize {
+        self.values.len()
+            + self
+                .retained
+                .keys()
+                .filter(|key| !self.values.contains_key(*key))
+                .count()
+    }
 }
 
 impl std::ops::Deref for HistoryExtensions {
@@ -215,16 +290,54 @@ impl std::ops::DerefMut for HistoryExtensions {
     }
 }
 
+/// One entry of either store. A retained entry serializes from its text.
+enum Extension<'a> {
+    Value(&'a Value),
+    Retained(&'a RetainedJson),
+}
+
+impl Extension<'_> {
+    fn value(&self) -> Cow<'_, Value> {
+        match self {
+            Self::Value(value) => Cow::Borrowed(value),
+            Self::Retained(retained) => Cow::Owned(retained.value()),
+        }
+    }
+}
+
+impl Serialize for Extension<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Value(value) => value.serialize(serializer),
+            Self::Retained(retained) => retained.serialize(serializer),
+        }
+    }
+}
+
 impl PartialEq for HistoryExtensions {
     fn eq(&self, other: &Self) -> bool {
-        self.values == other.values
+        self.merged_len() == other.merged_len()
+            && self
+                .merged()
+                .zip(other.merged())
+                .all(|((left_key, left), (right_key, right))| {
+                    left_key == right_key && left.value() == right.value()
+                })
     }
 }
 impl Eq for HistoryExtensions {}
 
 impl Serialize for HistoryExtensions {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.values.serialize(serializer)
+        if self.retained.is_empty() {
+            return self.values.serialize(serializer);
+        }
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.merged_len()))?;
+        for (key, value) in self.merged() {
+            map.serialize_entry(key, &value)?;
+        }
+        map.end()
     }
 }
 
@@ -591,6 +704,7 @@ where
             M: serde::de::MapAccess<'de>,
         {
             let mut result = BTreeMap::new();
+            let mut retained = BTreeMap::new();
             let mut log_identities = Vec::new();
             let mut duplicate_log_identity = false;
             while let Some(key) = map.next_key::<String>()? {
@@ -608,6 +722,19 @@ where
                     duplicate_log_identity |= captured.duplicate || !log_identities.is_empty();
                     log_identities.push(captured.value.clone());
                     captured.value
+                } else if RETAINED_EXTENSIONS.contains(&key.as_str()) {
+                    // A repeated key keeps the last value, as the map does.
+                    match RetainedJson::new(map.next_value()?) {
+                        Ok(text) => {
+                            result.remove(&key);
+                            retained.insert(key, text);
+                            continue;
+                        }
+                        Err(value) => {
+                            retained.remove(&key);
+                            value
+                        }
+                    }
                 } else {
                     map.next_value()?
                 };
@@ -615,6 +742,7 @@ where
             }
             Ok(HistoryExtensions {
                 values: result,
+                retained,
                 duplicate_log_identities: duplicate_log_identity.then_some(log_identities),
             })
         }
@@ -632,6 +760,8 @@ struct AdmissionIdentity<'a> {
     run_id: &'a str,
     started_at: &'a str,
     log_valid: bool,
+    /// Only the V2 contract carries a `disjoint-main` floor.
+    v2_contract: bool,
     authority: &'a AdmissionAuthorityV1,
     floor: &'a AdmissionFloorV1,
     canonical_plan_sha256: &'a str,
@@ -684,8 +814,38 @@ impl AdmissionIdentity<'_> {
         {
             return Err("admission context has inconsistent run/owner identity".into());
         }
+        if f.kind == "disjoint-main" && !self.v2_contract {
+            return Err("a disjoint-main floor requires the v2 admission context contract".into());
+        }
+        if (f.kind == "disjoint-main") != f.main_delta_commits.is_some() {
+            return Err(
+                "admission floor carries main_delta_commits if and only if it is disjoint-main"
+                    .into(),
+            );
+        }
         match (a.kind.as_str(), f.kind.as_str()) {
             ("validate", "current-main") if f.sha == f.observed_main_sha => {}
+            // A run admitted against the main E it entered the queue with,
+            // after main moved to M by a path-disjoint delta. The driver
+            // re-proves the ancestry, count, disjointness and floor-sensitive
+            // paths from Git; without Git this reader keeps what is decidable
+            // from the identities: E and M differ, the target is neither M (M
+            // is never contained in the target) nor E (that is a main-ancestor
+            // run), and the delta count is bounded. That E is on M's
+            // first-parent line needs Git, so only the proof checks it.
+            ("validate", "disjoint-main")
+                if f.sha != f.observed_main_sha
+                    && f.observed_main_sha != self.target_sha
+                    && f.sha != self.target_sha
+                    && f.main_delta_commits
+                        .is_some_and(|n| (1..=DISJOINT_MAIN_MAX_DELTA_COMMITS).contains(&n)) => {}
+            // A post-landing run of a commit that a later observed main
+            // contains: the floor is the target itself, the same floor a
+            // current-main run of that commit had while it was the tip.
+            ("validate", "main-ancestor")
+                if f.sha == self.target_sha
+                    && f.tree == self.target_tree
+                    && f.observed_main_sha != self.target_sha => {}
             ("frozen-validate", "frozen-target")
                 if f.sha == self.target_sha && f.tree == self.target_tree => {}
             _ => return Err("admission floor disagrees with its authority kind/identity".into()),
@@ -726,6 +886,7 @@ impl AdmissionContextV1 {
             execution_plan_sha256: &self.execution_plan_sha256,
             pin_bindings: &self.pin_bindings,
             log_valid: self.log_file.starts_with('/') && !self.log_file.contains('\0'),
+            v2_contract: false,
         }
         .validate()
     }
@@ -755,6 +916,7 @@ impl AdmissionContextV2 {
             execution_plan_sha256: &self.execution_plan_sha256,
             pin_bindings: &self.pin_bindings,
             log_valid: true,
+            v2_contract: true,
         }
         .validate()
     }
@@ -934,8 +1096,19 @@ impl AdmissionEvidence {
             Self::V2(e) => &e.context.authority,
         }
     }
+    /// Ordinary validation authority is canonical from the record alone when
+    /// the target was the observed main (`current-main`) or a commit that main
+    /// already contained (`main-ancestor`). Frozen validation is noncanonical.
+    ///
+    /// A `disjoint-main` floor (a target built on an earlier main E that the
+    /// observed main M moved past) is NOT canonical here. Its claim holds only
+    /// if [`super::disjoint_main_proof`] passes in a repository holding E, M
+    /// and the target, with the floor-sensitive list read from the target's
+    /// tree. This reader has no Git, so it cannot run that proof, and a shape
+    /// check is not the proof. A caller that has Git runs the proof itself.
     pub fn is_canonical(&self) -> bool {
-        self.validate().is_ok() && self.floor().kind == "current-main"
+        self.validate().is_ok()
+            && matches!(self.floor().kind.as_str(), "current-main" | "main-ancestor")
     }
     pub fn log_identity(&self) -> Option<&WorkspaceLocatorV2> {
         match self {
@@ -1029,6 +1202,7 @@ mod tests {
                 sha: "4".repeat(40),
                 tree: "5".repeat(40),
                 observed_main_sha: "4".repeat(40),
+                main_delta_commits: None,
             },
             canonical_plan_sha256: "6".repeat(64),
             execution_plan_sha256: "7".repeat(64),
@@ -1101,18 +1275,29 @@ mod tests {
         frozen.floor.sha = frozen.target_sha.clone();
         frozen.floor.tree = frozen.target_tree.clone();
         frozen.pin_bindings[0].base_sha = frozen.target_sha.clone();
+        let mut ancestor = basic.clone();
+        ancestor.floor.kind = "main-ancestor".into();
+        ancestor.floor.sha = ancestor.target_sha.clone();
+        ancestor.floor.tree = ancestor.target_tree.clone();
+        ancestor.pin_bindings[0].base_sha = ancestor.target_sha.clone();
+        let disjoint = disjoint_main_context();
         for (name, c) in [
             ("basic", basic),
             ("escaped", escaped),
             ("large-u64", large),
             ("frozen", frozen),
+            ("main-ancestor", ancestor),
+            ("disjoint-main", disjoint),
         ] {
             let bytes = admission_context_v2_bytes(&c).unwrap();
             assert_eq!(admission_context_v2_from_bytes(&bytes).unwrap(), c);
             assert!(!bytes.ends_with(b"\n"));
             let e = AdmissionEvidence::V2(evidence_v2(c));
             assert_eq!(e.context_bytes().unwrap(), bytes);
-            assert_eq!(e.is_canonical(), name != "frozen");
+            assert_eq!(
+                e.is_canonical(),
+                !matches!(name, "frozen" | "disjoint-main")
+            );
             assert_eq!(e.artifact_sha256(), admission_sha256(&bytes));
             assert_eq!(e.artifact_bytes(), bytes.len() as u64);
             e.artifact_locator()
@@ -1420,6 +1605,200 @@ mod tests {
                 .admission_evidence()
                 .is_err()
         );
+    }
+
+    /// A main-ancestor floor is canonical only as the target's own floor,
+    /// observed under a later main, with every pin binding based on it.
+    #[test]
+    fn main_ancestor_floor_is_canonical_only_as_the_targets_own_floor() {
+        let mut ancestor = context_v2();
+        ancestor.floor.kind = "main-ancestor".into();
+        ancestor.floor.sha = ancestor.target_sha.clone();
+        ancestor.floor.tree = ancestor.target_tree.clone();
+        ancestor.pin_bindings[0].base_sha = ancestor.target_sha.clone();
+        ancestor.validate().unwrap();
+        assert!(AdmissionEvidence::V2(evidence_v2(ancestor.clone())).is_canonical());
+
+        let refused = |c: AdmissionContextV2| c.validate().unwrap_err();
+        // An older main commit is not the target's own floor.
+        let mut older = ancestor.clone();
+        older.floor.sha = "a".repeat(40);
+        older.pin_bindings[0].base_sha = older.floor.sha.clone();
+        assert!(refused(older).contains("floor disagrees"));
+        let mut tree = ancestor.clone();
+        tree.floor.tree = "b".repeat(40);
+        assert!(refused(tree).contains("floor disagrees"));
+        // A target that is the observed main is a current-main run.
+        let mut tip = ancestor.clone();
+        tip.floor.observed_main_sha = tip.target_sha.clone();
+        assert!(refused(tip).contains("floor disagrees"));
+        // Frozen authority never selects it.
+        let mut frozen = ancestor.clone();
+        frozen.authority.kind = "frozen-validate".into();
+        assert!(refused(frozen).contains("floor disagrees"));
+        // A pin binding against the observed main instead of the floor.
+        let mut pin = ancestor;
+        pin.pin_bindings[0].base_sha = pin.floor.observed_main_sha.clone();
+        assert!(refused(pin).contains("pin binding"));
+    }
+
+    /// A disjoint-main context: the target contains the main E it queued
+    /// with (the floor and every pin base), and admission observed a later
+    /// main M three first-parent commits on.
+    fn disjoint_main_context() -> AdmissionContextV2 {
+        let mut c = context_v2();
+        c.floor.kind = "disjoint-main".into();
+        c.floor.observed_main_sha = "a".repeat(40);
+        c.floor.main_delta_commits = Some(3);
+        c
+    }
+
+    /// A disjoint-main floor is well formed with a bounded delta to a later
+    /// main the target does not equal, and every pin binding on the floor E.
+    #[test]
+    fn disjoint_main_floor_is_well_formed_only_with_a_bounded_main_delta() {
+        let disjoint = disjoint_main_context();
+        disjoint.validate().unwrap();
+        // The bound is inclusive at both ends.
+        for n in [1, DISJOINT_MAIN_MAX_DELTA_COMMITS] {
+            let mut edge = disjoint.clone();
+            edge.floor.main_delta_commits = Some(n);
+            edge.validate().unwrap();
+        }
+
+        let refused = |c: AdmissionContextV2| c.validate().unwrap_err();
+        // E == M is a current-main run.
+        let mut same = disjoint.clone();
+        same.floor.observed_main_sha = same.floor.sha.clone();
+        assert!(refused(same).contains("floor disagrees"));
+        // The target is never M: M is not contained in the target.
+        let mut tip = disjoint.clone();
+        tip.floor.observed_main_sha = tip.target_sha.clone();
+        assert!(refused(tip).contains("floor disagrees"));
+        // A target that is E itself is a main-ancestor run.
+        let mut own = disjoint.clone();
+        own.floor.sha = own.target_sha.clone();
+        own.floor.tree = own.target_tree.clone();
+        own.pin_bindings[0].base_sha = own.target_sha.clone();
+        assert!(refused(own).contains("floor disagrees"));
+        // The count is 1..=12 and is required.
+        for n in [0, DISJOINT_MAIN_MAX_DELTA_COMMITS + 1, u64::MAX] {
+            let mut count = disjoint.clone();
+            count.floor.main_delta_commits = Some(n);
+            assert!(refused(count).contains("floor disagrees"), "{n}");
+        }
+        let mut absent = disjoint.clone();
+        absent.floor.main_delta_commits = None;
+        assert!(refused(absent).contains("if and only if"));
+        // Only ordinary validation authority selects it.
+        let mut frozen = disjoint.clone();
+        frozen.authority.kind = "frozen-validate".into();
+        assert!(refused(frozen).contains("floor disagrees"));
+        // Pin bindings stay on E, never on the observed main.
+        let mut pin = disjoint.clone();
+        pin.pin_bindings[0].base_sha = pin.floor.observed_main_sha.clone();
+        assert!(refused(pin).contains("pin binding"));
+        // No other kind carries the count.
+        let mut current = context_v2();
+        current.floor.main_delta_commits = Some(1);
+        assert!(refused(current).contains("if and only if"));
+        let mut ancestor = context_v2();
+        ancestor.floor.kind = "main-ancestor".into();
+        ancestor.floor.sha = ancestor.target_sha.clone();
+        ancestor.floor.tree = ancestor.target_tree.clone();
+        ancestor.pin_bindings[0].base_sha = ancestor.target_sha.clone();
+        ancestor.validate().unwrap();
+        ancestor.floor.main_delta_commits = Some(1);
+        assert!(refused(ancestor).contains("if and only if"));
+    }
+
+    /// The count is the only optional floor field: absent from every other
+    /// kind's canonical bytes, an integer when present, and never `null`.
+    /// A well-formed disjoint-main record is never canonical from the record
+    /// alone: whether main's move since E is disjoint is a Git fact this
+    /// reader cannot check. The same record re-labelled current-main (with the
+    /// observed main as its floor) is canonical, so the refusal is the kind's.
+    #[test]
+    fn disjoint_main_floor_is_not_canonical_without_the_git_proof() {
+        let disjoint = disjoint_main_context();
+        disjoint.validate().unwrap();
+        let evidence = AdmissionEvidence::V2(evidence_v2(disjoint.clone()));
+        assert_eq!(evidence.floor().kind, "disjoint-main");
+        assert!(!evidence.is_canonical());
+        for n in [1, DISJOINT_MAIN_MAX_DELTA_COMMITS] {
+            let mut edge = disjoint.clone();
+            edge.floor.main_delta_commits = Some(n);
+            edge.validate().unwrap();
+            assert!(
+                !AdmissionEvidence::V2(evidence_v2(edge)).is_canonical(),
+                "{n}"
+            );
+        }
+        let current = context_v2();
+        current.validate().unwrap();
+        assert!(AdmissionEvidence::V2(evidence_v2(current)).is_canonical());
+    }
+
+    #[test]
+    fn disjoint_main_delta_field_is_strict_on_the_wire() {
+        let current = admission_context_v2_bytes(&context_v2()).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&current).contains("main_delta_commits"),
+            "a current-main floor keeps exactly its four fields"
+        );
+        let disjoint = admission_context_v2_bytes(&disjoint_main_context()).unwrap();
+        let text = String::from_utf8(disjoint.clone()).unwrap();
+        assert!(text.contains(r#""main_delta_commits":3,"observed_main_sha":"#));
+        assert_eq!(
+            admission_context_v2_from_bytes(&disjoint).unwrap(),
+            disjoint_main_context()
+        );
+        let swap = |from: &str, to: &str| {
+            assert!(text.contains(from), "{from}");
+            admission_context_v2_from_bytes(text.replacen(from, to, 1).as_bytes()).unwrap_err()
+        };
+        assert!(
+            swap(r#""main_delta_commits":3"#, r#""main_delta_commits":null"#)
+                .contains("invalid type: null")
+        );
+        assert!(
+            swap(r#""main_delta_commits":3"#, r#""main_delta_commits":"3""#)
+                .contains("invalid type")
+        );
+        assert!(
+            swap(r#""main_delta_commits":3"#, r#""main_delta_commits":-1"#)
+                .contains("invalid value")
+        );
+        // A current-main floor that grows the field is refused, not ignored.
+        let current = String::from_utf8(current).unwrap();
+        let grown = current.replacen(
+            r#""observed_main_sha":"#,
+            r#""main_delta_commits":1,"observed_main_sha":"#,
+            1,
+        );
+        assert_ne!(grown, current);
+        assert!(
+            admission_context_v2_from_bytes(grown.as_bytes())
+                .unwrap_err()
+                .contains("if and only if")
+        );
+    }
+
+    /// The v1 contract predates the kind: its contexts may not carry it.
+    #[test]
+    fn disjoint_main_floor_is_refused_under_the_v1_contract() {
+        let v2 = disjoint_main_context();
+        v2.validate().unwrap();
+        let mut v1 = context();
+        v1.floor = v2.floor.clone();
+        let e = v1.validate().unwrap_err();
+        assert!(
+            e.contains("requires the v2 admission context contract"),
+            "{e}"
+        );
+        assert!(admission_context_bytes(&v1).is_err());
+        // The other kinds are unchanged under v1.
+        context().validate().unwrap();
     }
 
     #[test]
@@ -1983,5 +2362,62 @@ mod tests {
                 "historical receipt bytes changed"
             );
         }
+    }
+
+    const CENSUS: &str = "raw_result_input_census_v1";
+
+    /// A repeated census key keeps its last value whichever store each
+    /// occurrence would land in (a float keeps it a `Value`), as decoding into
+    /// a map does, and is written once.
+    #[test]
+    fn a_repeated_census_key_keeps_the_last_value_in_either_store() {
+        let text = r#"{"version": 1}"#;
+        let float = r#"{"share": 0.5}"#;
+        for (first, last) in [(text, float), (float, text), (text, r#"{"version": 2}"#)] {
+            let raw = format!(r#"{{"{CENSUS}": {first}, "zeta": 1, "{CENSUS}": {last}}}"#);
+            let decoded: HistoryExtensions = serde_json::from_str(&raw).unwrap();
+            let expected: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                decoded.value(CENSUS).as_deref(),
+                expected.get(CENSUS),
+                "{raw}"
+            );
+            assert_eq!(decoded.merged_len(), 2, "{raw}");
+            assert!(
+                decoded.values.contains_key(CENSUS) != decoded.retained.contains_key(CENSUS),
+                "exactly one store holds the key: {raw}"
+            );
+            assert_eq!(
+                serde_json::to_string(&decoded).unwrap(),
+                serde_json::to_string(&expected).unwrap(),
+                "{raw}"
+            );
+        }
+    }
+
+    /// The entry count a serializer is told is the number of entries it is
+    /// then given, also when a map entry shadows a retained one.
+    #[test]
+    fn the_announced_extension_count_is_the_number_of_entries_written() {
+        let mut extensions: HistoryExtensions = serde_json::from_str(&format!(
+            r#"{{"alpha": 1, "{CENSUS}": {{"version": 1}}, "zeta": 2}}"#
+        ))
+        .unwrap();
+        assert!(extensions.retained.contains_key(CENSUS));
+        assert_eq!(extensions.merged_len(), 3);
+        assert_eq!(extensions.merged().count(), 3);
+
+        extensions.insert(CENSUS.into(), serde_json::json!({"version": 2}));
+        extensions.insert("beta".into(), serde_json::json!(3));
+        assert!(extensions.retained.contains_key(CENSUS));
+        assert_eq!(extensions.merged_len(), 4);
+        assert_eq!(extensions.merged().count(), 4);
+        assert_eq!(
+            serde_json::to_string(&extensions).unwrap(),
+            serde_json::to_string(&serde_json::json!({
+                "alpha": 1, "beta": 3, CENSUS: {"version": 2}, "zeta": 2,
+            }))
+            .unwrap()
+        );
     }
 }

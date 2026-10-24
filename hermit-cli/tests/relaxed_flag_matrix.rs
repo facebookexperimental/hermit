@@ -17,6 +17,9 @@
 //! program, and a threaded observation program that exercises clocks,
 //! metadata, CPUID, and randomness.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::env;
 use std::fs;
 use std::fs::File;
@@ -168,7 +171,8 @@ fn observation_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("relaxed-flag-matrix");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("relaxed-flag-matrix-{}", std::process::id()));
             fs::create_dir_all(&build_root)
                 .expect("failed to create relaxed flag matrix build directory");
             let output = build_root.join("observation-guest");
@@ -202,7 +206,7 @@ fn report_path() -> PathBuf {
             .expect("hermit-cli should be inside the repository")
             .join(path),
         None => Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("relaxed-flag-matrix")
+            .join(format!("relaxed-flag-matrix-{}", std::process::id()))
             .join("results.tsv"),
     }
 }
@@ -241,12 +245,7 @@ fn run_case(configuration: &Configuration, program: Program<'_>) -> (String, u12
         .env_remove("HERMIT_FAIL_CLOSED");
     let rendered = format!("{command:?}");
     let started = Instant::now();
-    let output = command.output().unwrap_or_else(|error| {
-        panic!(
-            "failed to start configuration {} / {}: {rendered}: {error}",
-            configuration.name, program.name,
-        )
-    });
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let elapsed_ms = started.elapsed().as_millis();
     let combined = format!(
         "{}\n{}",
@@ -368,9 +367,7 @@ fn invalid_matrix_states_are_rejected_without_panicking() {
             .arg("run")
             .args(args)
             .args(["--", "/bin/true"]);
-        let output = command.output().unwrap_or_else(|error| {
-            panic!("failed to start invalid-state probe {args:?}: {error}")
-        });
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         let combined = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),

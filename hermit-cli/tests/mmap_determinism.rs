@@ -32,9 +32,7 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
 fn command_output(mut command: Command, label: &str) -> Output {
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -50,7 +48,8 @@ fn mmap_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("mmap-determinism");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("mmap-determinism-{}", std::process::id()));
         fs::create_dir_all(&build_root).expect("failed to create mmap guest build directory");
         let output = build_root.join("mmap_determinism");
 

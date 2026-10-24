@@ -19,6 +19,17 @@
 # host: 0.3s with nothing touched, 1.0s after touching one source file, and 25s
 # from a cold CARGO_TARGET_DIR.
 #
+# It first runs scripts/check-doc-bare-urls.rs, which refuses a bare URL in a
+# doc comment that rustdoc lints. Validation node doc.rustdoc denies that lint,
+# and `make lint-checks` runs the same checker, but soft-green landing runs both
+# only after the push. This hook runs before the push, and ONLY for a push made
+# from a checkout that ran scripts/setup-hooks.sh. That is NOT the common case:
+# measured 2026-10-04 on the dev-hermit build host, 7 of 9 agent worktrees had
+# no pre-push hook installed, and ci-hub's land-pr.sh merges on GitHub
+# (`gh pr merge --rebase`), which runs no local hook. `--no-verify` also skips
+# it. Every one of those still reaches doc.rustdoc unchecked. It takes about a
+# second once the script is compiled.
+#
 # Escape hatch: `git push --no-verify`. It is deliberately the standard one
 # rather than a bespoke variable -- a project-specific override is one more
 # thing to learn, and anyone who wants past a hook already knows --no-verify.
@@ -49,6 +60,60 @@ done
 
 if [[ $has_content -eq 0 ]]; then
     exit 0
+fi
+
+# Like the build check below, this reads the WORKING TREE.
+doc_urls="$root/scripts/check-doc-bare-urls.rs"
+if [[ -x "$doc_urls" ]]; then
+    doc_urls_status=0
+    doc_urls_log=$(mktemp)
+    # rust-script builds every script into ONE Cargo target directory under
+    # $XDG_CACHE_HOME/rust-script and runs `cargo build` on each run (the
+    # checker's shebang passes --force), so the check waited out the whole of
+    # any other script's compile in that shared cache. Measured 2026-10-15 on
+    # the host recorded in docs/TESTING_ENVIRONMENTS.md: 0.56 s alone, 55.6 s
+    # beside a cold scripts/validate.rs compile; a push under load hit the
+    # 300 s timeout. A cache of its own leaves the check waiting only for
+    # another push's check, at the cost of one 4-5 s compile per new version.
+    doc_urls_cache="${XDG_CACHE_HOME:-$HOME/.cache}/hermit-pre-push"
+    (cd "$root" && XDG_CACHE_HOME="$doc_urls_cache" timeout 300 "$doc_urls") >"$doc_urls_log" 2>&1 || doc_urls_status=$?
+    cat "$doc_urls_log" >&2
+    # Exit 1 alone does not mean findings: rust-script also exits 1 when the
+    # checker fails to compile. Only the checker's own verdict line does.
+    doc_urls_found=0
+    grep -q '^check-doc-bare-urls: FAILED' "$doc_urls_log" && doc_urls_found=1
+    rm -f "$doc_urls_log"
+    if [[ $doc_urls_status -eq 1 && $doc_urls_found -eq 1 ]]; then
+        cat >&2 <<'MESSAGE'
+
+pre-push REFUSED: a doc comment above has a bare URL. rustdoc's bare_urls lint
+rejects it, and validation node doc.rustdoc runs that lint with -D warnings.
+Wrap the URL as <https://...> or write [text](https://...).
+
+Reproduce with:
+    ./scripts/check-doc-bare-urls.rs
+
+To push anyway: git push --no-verify
+
+MESSAGE
+        exit 1
+    fi
+    if [[ $doc_urls_status -ne 0 ]]; then
+        cat >&2 <<MESSAGE
+
+pre-push REFUSED: the bare-URL check COULD NOT RUN (exit $doc_urls_status), so
+it says nothing about your doc comments. Its own error is above. Exit 127
+usually means rust-script is not installed (cargo install rust-script); exit
+124 means it ran longer than 300 s.
+
+To push anyway: git push --no-verify
+
+MESSAGE
+        exit 1
+    fi
+else
+    echo "pre-push: $doc_urls missing or not executable; skipping the bare-URL check." >&2
+    echo "  This is a skip, NOT a pass." >&2
 fi
 
 if "$checker" --quiet; then

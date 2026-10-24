@@ -19,20 +19,18 @@ use clap::Parser;
 use hermit::Backend;
 use tracing::metadata::LevelFilter;
 
-use super::tracing::BoundedWriter;
-use super::tracing::LatchedWriter;
+use super::tracing::CappedWriter;
+use super::tracing::LogBudget;
 use super::tracing::TracingGuard;
-use super::tracing::WriteErrorLatch;
-use super::tracing::init_file_tracing;
-use super::tracing::init_file_tracing_with_evidence;
 use super::tracing::init_stderr_tracing;
-use super::tracing::init_stderr_tracing_with_evidence;
+use super::tracing::init_sync_file_tracing;
 use super::tracing::log_max_bytes;
+use super::tracing::parse_max_log_bytes;
 
 /// The target named by controller diagnostics written to `--log-file`. It is
 /// not a tracing target: these lines are written directly, before tracing
 /// starts, so `--log`/`RUST_LOG` filtering does not apply to them.
-const CONTROLLER_TARGET: &str = "hermit::controller";
+pub(crate) const CONTROLLER_TARGET: &str = "hermit::controller";
 
 /// Hermit provides a sandbox for deterministic and reproducible execution.
 /// Arbitrary programs run inside (guests) become deterministic
@@ -76,6 +74,50 @@ pub struct GlobalOpts {
     #[clap(long, value_name = "FILE", env = "HERMIT_LOG_FILE")]
     pub log_file: Option<PathBuf>,
 
+    /// Stop the run (exit 123) once hermit's tracing output exceeds SIZE bytes.
+    ///
+    /// Counted: every byte hermit's tracing writes to stderr, to --log-file, or
+    /// to the per-run logs of `run --verify` and `record --verify`, as one total
+    /// for the whole invocation, measured before the HERMIT_LOG_MAX_BYTES file
+    /// truncation.
+    ///
+    /// Not counted: stdout; the guest's own output, including the DETLOG
+    /// records the SaBRe backend writes from inside the guest; hermit messages
+    /// that do not go through tracing, such as error reports, the `--verify`
+    /// comparison and retention report, and everything `log-diff` prints.
+    ///
+    /// At the crossing hermit drops the write that crossed and every tracing
+    /// write after it. It waits at most 50 ms for tracing writes already in
+    /// progress to finish, then tries once, without waiting, to write "log
+    /// output exceeded --max-log-bytes=SIZE" followed by "HERMIT_LOG_CAP
+    /// class=log-cap" to stderr and to --log-file, and exits 123. When that
+    /// message is written, no tracing output follows it; the guest's output
+    /// and hermit's error report, which are not tracing output, can. The
+    /// message is best effort: it is missing when, for example, stderr is a
+    /// full pipe or has no reader, or a tracing write is still in progress
+    /// after the 50 ms. A hermit process killed in the middle of a tracing
+    /// write never finishes it, so if the cap is crossed later in that
+    /// invocation, the message is missing. The exit status is then the only
+    /// signal. Where the flag is accepted the guest dies with hermit, because
+    /// it runs inside hermit's PID namespace, which dies with hermit.
+    ///
+    /// Refused with exit 122, before any guest starts, where the guest could
+    /// outlive hermit: --backend=dbt; --no-namespace with every backend,
+    /// --gdbserver runs included, and so the trials of `analyze` and `bisect`
+    /// when their run arguments include --no-namespace; and `hermit
+    /// --backend=sabre strace`.
+    ///
+    /// SIZE is a byte count with an optional K/M/G/T suffix in powers of 1024,
+    /// e.g. 8G. Omit the flag for no cap.
+    #[clap(long, value_name = "SIZE", value_parser = parse_max_log_bytes)]
+    pub max_log_bytes: Option<u64>,
+
+    /// Process-shared byte total for `--max-log-bytes`, created by
+    /// [`GlobalOpts::prepare_log_budget`] before any container fork so the cap
+    /// is one total for the invocation. See [`LogBudget`].
+    #[clap(skip)]
+    pub(crate) log_budget: Option<LogBudget>,
+
     /// The log file, already opened in the HOST's filename namespace.
     ///
     /// WHY THE FILE IS CARRIED INSTEAD OF RE-OPENED FROM THE PATH. Tracing has to be
@@ -97,19 +139,20 @@ pub struct GlobalOpts {
     #[clap(skip)]
     pub log_file_handle: Option<Arc<File>>,
 
-    /// Fresh anonymous host file receiving the opt-in ordinary-run evidence log.
-    /// It is opened before entering the container and never replaces `--log-file`.
-    #[clap(skip)]
-    pub(crate) run_evidence_log_handle: Option<Arc<File>>,
-
-    /// Process-shared error state for the private run-evidence writer.
-    #[clap(skip)]
-    pub(crate) run_evidence_write_error: Option<WriteErrorLatch>,
-
     /// Select the process instrumentation backend. This is a global option and
     /// must come before the subcommand, e.g. `hermit --backend ptrace run ...`.
     #[clap(long, value_enum, value_name = "BACKEND")]
     pub backend: Option<Backend>,
+
+    /// UNSAFE: start the guest even though hermit inherited a seccomp filter from whatever
+    /// launched it, such as a container runtime's default profile. Without this option hermit
+    /// refuses (exit 122) when /proc/self/status reports such a filter: the filter is an input
+    /// hermit does not record, and it can make system calls fail in ways the guest observes, so
+    /// the run may not reproduce where the filter differs. With it, hermit prints a warning and
+    /// records the filter's mode and count in the INFO log. It may be given before or after the subcommand; a run config holds it as
+    /// `global: {unsafe-ignore-host-seccomp: true}`.
+    #[clap(long, global = true)]
+    pub unsafe_ignore_host_seccomp: bool,
 }
 
 impl GlobalOpts {
@@ -135,6 +178,33 @@ impl GlobalOpts {
             self.log_file_handle = Some(Arc::new(file));
         }
         Ok(())
+    }
+
+    /// Create the shared `--max-log-bytes` counter. Call from `main` before any
+    /// container exists, for the same fork reason as `open_log_file`.
+    pub fn prepare_log_budget(&mut self) -> Result<(), Error> {
+        if let (Some(limit), None) = (self.max_log_bytes, &self.log_budget) {
+            self.log_budget = Some(
+                LogBudget::new(limit).context("cannot map the shared --max-log-bytes counter")?,
+            );
+        }
+        Ok(())
+    }
+
+    /// The budget public log sinks charge, or `None` when uncapped.
+    ///
+    /// A caller that never ran `prepare_log_budget` still gets the cap it asked
+    /// for, counted per process rather than per invocation: silently dropping a
+    /// requested bound is the failure mode this flag exists to remove.
+    pub(crate) fn log_budget(&self) -> Option<LogBudget> {
+        match (&self.log_budget, self.max_log_bytes) {
+            (Some(budget), _) => Some(budget.clone()),
+            (None, Some(limit)) => Some(
+                LogBudget::new(limit)
+                    .unwrap_or_else(|e| panic!("cannot map the --max-log-bytes counter: {e}")),
+            ),
+            (None, None) => None,
+        }
     }
 
     /// Report controller context before tracing starts, using the selected host
@@ -168,6 +238,12 @@ impl GlobalOpts {
                 "{timestamp} DEBUG {CONTROLLER_TARGET}: {message}"
             )
             .context("cannot write to the host log file")?;
+        } else if hermit::nonwaiting_write::diagnostics_must_not_wait() {
+            // Under --max-log-bytes, termination must not depend on this
+            // write: RetryingStderr below waits as long as a full stderr pipe
+            // stays unread. One attempt that cannot block; the line is dropped
+            // when stderr cannot take it at once.
+            super::tracing::write_stderr_diagnostic(&format!("{message}\n"));
         } else {
             // A stopped stderr reader must not replace the command's primary
             // exit status. This shares the existing invocation-wide deadline
@@ -177,28 +253,42 @@ impl GlobalOpts {
         Ok(())
     }
 
-    pub(crate) fn set_run_evidence_log_handle(
-        &mut self,
-        handle: Arc<File>,
-        write_error: WriteErrorLatch,
-    ) {
-        self.run_evidence_log_handle = Some(handle);
-        self.run_evidence_write_error = Some(write_error);
-    }
+    /// Report, before tracing starts, something the user needs to know about
+    /// this invocation: that the run drew an input from the host, or how a
+    /// replay reruns its recording. It is a real tracing event on the
+    /// controller target, at `level`, written where the run's own log goes
+    /// and filtered by its `--log` level (see
+    /// [`super::tracing::emit_before_tracing`]); at the default level a WARN
+    /// shows.
+    ///
+    /// Comparisons do not exclude it. A run whose logs are compared passes
+    /// every input explicitly (`--strict` refuses one that would not), so it
+    /// never carries one of these events; one in a compared log is a defect.
+    pub(crate) fn report_event(
+        &self,
+        level: ::tracing::Level,
+        message: std::fmt::Arguments<'_>,
+    ) -> Result<(), Error> {
+        use super::tracing::EarlyLog;
 
-    fn run_evidence_writer(&self, limit: u64) -> Option<LatchedWriter<BoundedWriter<File>>> {
-        self.run_evidence_log_handle.as_ref().map(|evidence| {
-            let evidence = evidence
-                .try_clone()
-                .expect("cannot duplicate the private run-evidence descriptor");
-            let evidence = BoundedWriter::new(evidence, limit);
-            let write_error = self
-                .run_evidence_write_error
-                .as_ref()
-                .expect("private run-evidence writer is missing its error latch")
-                .clone();
-            LatchedWriter::new(evidence, write_error)
-        })
+        let log = match &self.log_file_handle {
+            Some(handle) => {
+                let file = handle
+                    .try_clone()
+                    .context("cannot duplicate the host log file descriptor")?;
+                let limit = log_max_bytes().map_err(Error::msg)?;
+                EarlyLog::File(CappedWriter::file(file, limit, self.log_budget()))
+            }
+            None => EarlyLog::Stderr(self.log_budget()),
+        };
+        super::tracing::emit_before_tracing(self.log, log, || {
+            if level == ::tracing::Level::WARN {
+                ::tracing::warn!(target: CONTROLLER_TARGET, "{message}");
+            } else {
+                ::tracing::info!(target: CONTROLLER_TARGET, "{message}");
+            }
+        });
+        Ok(())
     }
 
     /// Initalizes tracing. If using a container, this must be done *inside* of
@@ -220,6 +310,20 @@ impl GlobalOpts {
     /// Linux PID slot is needed.
     #[must_use = "This function returns a guard that should not be immediately dropped"]
     pub fn init_tracing_for_backend(&self, backend: Backend) -> Option<TracingGuard> {
+        let guard = self.install_tracing_for_backend(backend);
+        // A run admitted under --unsafe-ignore-host-seccomp says so in every
+        // log it writes, the run-evidence log included, from its first record.
+        if let Some(host) = crate::host_seccomp::unverified() {
+            ::tracing::info!(
+                target: "hermit::host_seccomp",
+                "unverified host seccomp filter: {} (admitted by --unsafe-ignore-host-seccomp)",
+                host.describe()
+            );
+        }
+        guard
+    }
+
+    fn install_tracing_for_backend(&self, backend: Backend) -> Option<TracingGuard> {
         if let Some(handle) = &self.log_file_handle {
             // Each subscriber needs an owned File; `try_clone` dups the descriptor,
             // so every run writes through the same host-side open file.
@@ -227,16 +331,8 @@ impl GlobalOpts {
                 .try_clone()
                 .expect("cannot duplicate the host log file descriptor");
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
-            let file_writer = BoundedWriter::new(file_writer, limit);
-            if let Some(evidence) = self.run_evidence_writer(limit) {
-                Some(init_file_tracing_with_evidence(
-                    self.log,
-                    file_writer,
-                    evidence,
-                ))
-            } else {
-                Some(init_file_tracing(self.log, file_writer))
-            }
+            let file_writer = CappedWriter::file(file_writer, limit, self.log_budget());
+            Some(init_sync_file_tracing(self.log, file_writer, backend))
         } else if let Some(path) = &self.log_file {
             // An internal caller set the path directly rather than going through
             // `open_log_file` -- today that is verify's double-run setup, which
@@ -251,26 +347,10 @@ impl GlobalOpts {
             // typo in the value meant to DISABLE the bound cannot quietly
             // re-enable it.
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
-            let file_writer = BoundedWriter::new(file_writer, limit);
-            if let Some(evidence) = self.run_evidence_writer(limit) {
-                Some(init_file_tracing_with_evidence(
-                    self.log,
-                    file_writer,
-                    evidence,
-                ))
-            } else {
-                Some(init_file_tracing(self.log, file_writer))
-            }
-        } else if self.run_evidence_log_handle.is_some() {
-            let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
-            let evidence = self
-                .run_evidence_writer(limit)
-                .expect("run-evidence handle was present");
-            Some(init_stderr_tracing_with_evidence(
-                self.log, evidence, backend,
-            ))
+            let file_writer = CappedWriter::file(file_writer, limit, self.log_budget());
+            Some(init_sync_file_tracing(self.log, file_writer, backend))
         } else {
-            init_stderr_tracing(self.log, backend);
+            init_stderr_tracing(self.log, backend, self.log_budget());
             None
         }
     }
@@ -286,11 +366,120 @@ mod tests {
         GlobalOpts {
             log: None,
             log_file: Some(path),
+            max_log_bytes: None,
+            log_budget: None,
             log_file_handle: None,
-            run_evidence_log_handle: None,
-            run_evidence_write_error: None,
+            unsafe_ignore_host_seccomp: false,
             backend: None,
         }
+    }
+
+    /// A reported event is a real tracing record in the run's log file, at
+    /// its level and on the controller target, and the run's `--log` level
+    /// filters it like any other.
+    #[test]
+    fn a_reported_event_is_a_tracing_record_in_the_log_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("run.log");
+        let mut options = log_options(path.clone());
+        options.open_log_file().unwrap();
+        options
+            .report_event(::tracing::Level::WARN, format_args!("drew a setting"))
+            .unwrap();
+        options
+            .report_event(::tracing::Level::INFO, format_args!("below the default"))
+            .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let (timestamp, rest) = written.split_once("  WARN ").unwrap();
+        assert!(
+            regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z$")
+                .unwrap()
+                .is_match(timestamp),
+            "{written:?}"
+        );
+        assert_eq!(rest, "hermit::controller: drew a setting\n");
+
+        let path = directory.path().join("quiet.log");
+        let mut options = log_options(path.clone());
+        options.log = Some(LevelFilter::ERROR);
+        options.open_log_file().unwrap();
+        options
+            .report_event(::tracing::Level::WARN, format_args!("filtered"))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    /// Names the log file `a_log_file_is_written_synchronously` gives the copy
+    /// of this test binary it starts.
+    const SYNCHRONOUS_LOG_CHILD_ENV: &str = "HERMIT_TEST_SYNCHRONOUS_LOG_FILE";
+
+    /// A `--log-file` log is synchronous: each line is in the file when the
+    /// call that logged it returns, and no queue can drop one. The
+    /// non-blocking queue it used before dropped lines once 128,000 were
+    /// waiting, which on a loaded host made run-to-run log comparisons report
+    /// divergences that were only missing lines
+    /// (https://github.com/rrnewton/hermit/issues/4427). The logger is global
+    /// and the log size bound reads the environment, so the check runs in a
+    /// fresh copy of this test binary
+    /// (`a_log_file_is_written_synchronously_in_its_own_process`), bounded by
+    /// `timeout`.
+    #[test]
+    fn a_log_file_is_written_synchronously() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("run.log");
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=5s", "60s"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "global_opts::tests::a_log_file_is_written_synchronously_in_its_own_process",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SYNCHRONOUS_LOG_CHILD_ENV, &path)
+            .env_remove(crate::tracing::LOG_MAX_BYTES_ENV)
+            .env_remove("RUST_LOG")
+            .output()
+            .unwrap();
+        let rendered = format!(
+            "status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{rendered}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the check did not run:\n{rendered}"
+        );
+    }
+
+    /// The body of `a_log_file_is_written_synchronously`, which runs it alone
+    /// in its own process; run directly, it does nothing.
+    #[test]
+    #[ignore = "run by a_log_file_is_written_synchronously in its own process"]
+    fn a_log_file_is_written_synchronously_in_its_own_process() {
+        let Some(path) = std::env::var_os(SYNCHRONOUS_LOG_CHILD_ENV) else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let mut options = log_options(path.clone());
+        options.log = Some(::tracing::metadata::LevelFilter::INFO);
+        options.open_log_file().unwrap();
+        let guard = options
+            .init_tracing_for_backend(Backend::Ptrace)
+            .expect("a log file installs a guard");
+        assert!(
+            guard.is_synchronous(),
+            "the log file's guard keeps a writer thread"
+        );
+        ::tracing::info!("the line under test");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("the line under test"),
+            "the line was not in the file when info! returned:\n{written}"
+        );
     }
 
     #[test]

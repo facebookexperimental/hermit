@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Standalone runner for the Hermit debugger (gdb / lldb) integration tests.
 #
 # It builds the hermit binary if needed, makes the `lldb` Python module
@@ -32,8 +32,8 @@ if [ -z "${HERMIT_BIN:-}" ]; then
   elif [ -x "$ROOT/target/release/hermit" ]; then
     HERMIT_BIN="$ROOT/target/release/hermit"
   else
-    echo ":: building hermit (cargo build -p hermit --bin hermit) ..."
-    cargo build -p hermit --bin hermit || exit 1
+    echo ":: building hermit (cargo build -p hermit-run --bin hermit) ..."
+    cargo build -p hermit-run --bin hermit || exit 1
     HERMIT_BIN="$ROOT/target/debug/hermit"
   fi
 fi

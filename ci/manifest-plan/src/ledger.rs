@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Validation ledger schema emitted by Hermit's validation driver and consumed
 //! by ci-hub.
 
@@ -31,6 +23,12 @@ pub use schema10::*;
 
 mod admission;
 pub use admission::*;
+
+mod disjoint_main;
+pub use disjoint_main::*;
+
+mod framework_retries;
+pub use framework_retries::*;
 
 /// The stable fields emitted by `validate/aggregate.py --json` and JSONL stores.
 /// Optional fields reflect honest reconstructed rows where a measurement was not
@@ -1140,6 +1138,13 @@ impl CellResultsEvidenceV8 {
 pub enum CellResultsValue {
     Typed(CellResultsEvidence),
     Other(Value),
+    /// An untyped shape decoded from history, held as its canonical compact
+    /// JSON text instead of a `Value` tree. A `Value` costs about 7 bytes of
+    /// heap per byte of JSON: on the 2026-10-10 ledger the 616 rows with cell
+    /// results held 728 MB of JSON as 4.9 GB of `Value`
+    /// (<https://github.com/rrnewton/dev-hermit/issues/552>). It reads,
+    /// compares and serializes exactly as `Other` holding the same value.
+    Retained(RetainedJson),
     /// Decode-only duplicate identity state. Historical serialization and typed
     /// access delegate to `value`; admission checks must inspect the original IDs.
     #[doc(hidden)]
@@ -1147,6 +1152,176 @@ pub enum CellResultsValue {
         value: Box<Self>,
         run_ids: Value,
     },
+}
+
+/// The canonical compact serialization of a JSON value that contains no
+/// floating-point number, plus its top-level `run_id`.
+///
+/// Without floats, parsing the text gives back a value equal to the original:
+/// integers and strings round-trip exactly and object keys are already in
+/// `Value`'s sorted order. A value with a float stays a `Value`, because the
+/// text of a float need not parse back to the same bits.
+#[derive(Clone, Debug)]
+pub struct RetainedJson {
+    text: Box<str>,
+    run_id: Option<Value>,
+}
+
+/// The deepest value kept as text. serde_json refuses to parse text nested
+/// more than 128 levels, so a deeper in-memory value could be written but not
+/// read back; it stays a `Value`.
+const RETAINED_MAX_DEPTH: usize = 100;
+
+impl RetainedJson {
+    pub(super) fn new(value: Value) -> Result<Self, Value> {
+        if !retainable(&value, 0) {
+            return Err(value);
+        }
+        let text = serde_json::to_string(&value)
+            .expect("a serde_json::Value is always serializable")
+            .into_boxed_str();
+        Ok(Self {
+            text,
+            run_id: value.get("run_id").cloned(),
+        })
+    }
+
+    /// The value this text was made from.
+    pub fn value(&self) -> Value {
+        serde_json::from_str(&self.text).expect("retained text is the serialization of a Value")
+    }
+}
+
+/// No float, and no deeper than [`RETAINED_MAX_DEPTH`].
+fn retainable(value: &Value, depth: usize) -> bool {
+    if depth > RETAINED_MAX_DEPTH {
+        return false;
+    }
+    match value {
+        Value::Number(number) => !number.is_f64(),
+        Value::Array(values) => values.iter().all(|value| retainable(value, depth + 1)),
+        Value::Object(fields) => fields.values().all(|value| retainable(value, depth + 1)),
+        Value::Null | Value::Bool(_) | Value::String(_) => true,
+    }
+}
+
+/// Serialization streams the text through serde_json's parser straight into
+/// the serializer, so no `Value` tree is built. Re-parsing into a `Value`
+/// made serializing every 2026-10-10 ledger row three times slower (5.1 s
+/// against 1.7 s) and `validate-status --show-all` 16% slower. The events are
+/// the ones serializing the original `Value` produces: keys in `Value`'s
+/// sorted order, because the text was written from a `Value`, and integers as
+/// u64 or i64. A retained value has no float.
+impl Serialize for RetainedJson {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        transcode::transcode(&self.text, serializer)
+    }
+}
+
+mod transcode {
+    use std::cell::RefCell;
+
+    use serde::Deserializer;
+    use serde::Serialize;
+    use serde::Serializer;
+    use serde::de;
+    use serde::de::DeserializeSeed;
+    use serde::de::Error as _;
+    use serde::ser::Error as _;
+    use serde::ser::SerializeMap;
+    use serde::ser::SerializeSeq;
+
+    pub(super) fn transcode<S: Serializer>(text: &str, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut deserializer = serde_json::Deserializer::from_str(text);
+        (&mut deserializer)
+            .deserialize_any(Visitor(serializer))
+            .map_err(S::Error::custom)
+    }
+
+    /// One value still to be read, serialized when the serializer asks for it.
+    struct Pending<D>(RefCell<Option<D>>);
+
+    impl<'de, D: Deserializer<'de>> Serialize for Pending<D> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let deserializer = self
+                .0
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| S::Error::custom("a transcoded value was serialized twice"))?;
+            deserializer
+                .deserialize_any(Visitor(serializer))
+                .map_err(S::Error::custom)
+        }
+    }
+
+    struct Visitor<S>(S);
+
+    impl<'de, S: Serializer> de::Visitor<'de> for Visitor<S> {
+        type Value = S::Ok;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("any JSON value")
+        }
+        fn visit_bool<E: de::Error>(self, value: bool) -> Result<S::Ok, E> {
+            self.0.serialize_bool(value).map_err(E::custom)
+        }
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<S::Ok, E> {
+            self.0.serialize_i64(value).map_err(E::custom)
+        }
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<S::Ok, E> {
+            self.0.serialize_u64(value).map_err(E::custom)
+        }
+        fn visit_f64<E: de::Error>(self, value: f64) -> Result<S::Ok, E> {
+            self.0.serialize_f64(value).map_err(E::custom)
+        }
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<S::Ok, E> {
+            self.0.serialize_str(value).map_err(E::custom)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<S::Ok, E> {
+            self.0.serialize_unit().map_err(E::custom)
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<S::Ok, A::Error> {
+            let mut out = self
+                .0
+                .serialize_seq(seq.size_hint())
+                .map_err(A::Error::custom)?;
+            while seq.next_element_seed(Element(&mut out))?.is_some() {}
+            out.end().map_err(A::Error::custom)
+        }
+        fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<S::Ok, A::Error> {
+            let mut out = self
+                .0
+                .serialize_map(map.size_hint())
+                .map_err(A::Error::custom)?;
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                out.serialize_key(key.as_ref()).map_err(A::Error::custom)?;
+                map.next_value_seed(Entry(&mut out))?;
+            }
+            out.end().map_err(A::Error::custom)
+        }
+    }
+
+    struct Element<'a, T>(&'a mut T);
+
+    impl<'de, T: SerializeSeq> DeserializeSeed<'de> for Element<'_, T> {
+        type Value = ();
+        fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+            self.0
+                .serialize_element(&Pending(RefCell::new(Some(deserializer))))
+                .map_err(D::Error::custom)
+        }
+    }
+
+    struct Entry<'a, T>(&'a mut T);
+
+    impl<'de, T: SerializeMap> DeserializeSeed<'de> for Entry<'_, T> {
+        type Value = ();
+        fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+            self.0
+                .serialize_value(&Pending(RefCell::new(Some(deserializer))))
+                .map_err(D::Error::custom)
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1244,7 +1419,10 @@ impl<'de> Deserialize<'de> for CellResultsValue {
         let raw = deserialize_result_value(deserializer, true)?;
         let value = match serde_json::from_value(raw.value.clone()) {
             Ok(value) => Self::Typed(value),
-            Err(_) => Self::Other(raw.value),
+            Err(_) => match RetainedJson::new(raw.value) {
+                Ok(retained) => Self::Retained(retained),
+                Err(value) => Self::Other(value),
+            },
         };
         Ok(match raw.duplicate_run_ids {
             Some(run_ids) => Self::WithDuplicateRunIds {
@@ -1261,6 +1439,7 @@ impl Serialize for CellResultsValue {
         match self {
             Self::Typed(value) => value.serialize(serializer),
             Self::Other(value) => value.serialize(serializer),
+            Self::Retained(retained) => retained.serialize(serializer),
             Self::WithDuplicateRunIds { value, .. } => value.serialize(serializer),
         }
     }
@@ -1275,6 +1454,10 @@ impl PartialEq for CellResultsValue {
             (value, Self::WithDuplicateRunIds { value: other, .. }) => value == other.as_ref(),
             (Self::Typed(value), Self::Typed(other)) => value == other,
             (Self::Other(value), Self::Other(other)) => value == other,
+            // Canonical text is equal exactly when the float-free values are.
+            (Self::Retained(value), Self::Retained(other)) => value.text == other.text,
+            (Self::Retained(retained), Self::Other(value))
+            | (Self::Other(value), Self::Retained(retained)) => retained.value() == *value,
             _ => false,
         }
     }
@@ -1284,7 +1467,7 @@ impl CellResultsValue {
     pub fn typed(&self) -> Option<&CellResultsEvidence> {
         match self {
             Self::Typed(evidence) => Some(evidence),
-            Self::Other(_) => None,
+            Self::Other(_) | Self::Retained(_) => None,
             Self::WithDuplicateRunIds { value, .. } => value.typed(),
         }
     }
@@ -1292,7 +1475,7 @@ impl CellResultsValue {
     pub fn typed_mut(&mut self) -> Option<&mut CellResultsEvidence> {
         match self {
             Self::Typed(evidence) => Some(evidence),
-            Self::Other(_) => None,
+            Self::Other(_) | Self::Retained(_) => None,
             Self::WithDuplicateRunIds { value, .. } => value.typed_mut(),
         }
     }
@@ -1300,6 +1483,7 @@ impl CellResultsValue {
     fn schema8(&self) -> Option<CellResultsEvidenceV8> {
         match self {
             Self::Other(value) => serde_json::from_value(value.clone()).ok(),
+            Self::Retained(retained) => serde_json::from_value(retained.value()).ok(),
             Self::Typed(_) => None,
             Self::WithDuplicateRunIds { value, .. } => value.schema8(),
         }
@@ -1312,6 +1496,7 @@ impl CellResultsValue {
         match self {
             Self::Typed(value) => Some(Value::String(value.run_id.clone())),
             Self::Other(value) => value.get("run_id").cloned(),
+            Self::Retained(retained) => retained.run_id.clone(),
             Self::WithDuplicateRunIds { run_ids, .. } => Some(run_ids.clone()),
         }
     }
@@ -2397,8 +2582,282 @@ mod tests {
         let mut newer = json;
         newer["future_field"] = serde_json::json!(true);
         let value: CellResultsValue = serde_json::from_value(newer.clone()).unwrap();
-        assert!(matches!(value, CellResultsValue::Other(_)));
+        assert!(matches!(value, CellResultsValue::Retained(_)));
         assert_eq!(serde_json::to_value(value).unwrap(), newer);
+    }
+
+    /// An untyped shape is kept as compact text, and every reader sees exactly
+    /// what it saw when the shape was a `Value`
+    /// (<https://github.com/rrnewton/dev-hermit/issues/552>).
+    #[test]
+    fn untyped_cell_results_are_retained_as_text_and_read_exactly_as_a_value() {
+        let json = serde_json::json!({
+            "run_id": "run-552",
+            "zeta": [1, -2, {"b": "\u{e9}\"\n", "a": null}],
+            "alpha": {"nested": [true, false], "count": 18446744073709551615u64},
+            "cells": [{"cell_verdict": {"state": "compared-and-matched"}}],
+        });
+        let retained: CellResultsValue = serde_json::from_value(json.clone()).unwrap();
+        let CellResultsValue::Retained(text) = &retained else {
+            panic!("an untyped float-free shape must be retained as text: {retained:?}");
+        };
+        assert_eq!(text.value(), json);
+        let other = CellResultsValue::Other(json.clone());
+
+        assert_eq!(
+            serde_json::to_vec(&retained).unwrap(),
+            serde_json::to_vec(&other).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec_pretty(&retained).unwrap(),
+            serde_json::to_vec_pretty(&other).unwrap()
+        );
+        assert_eq!(retained, other);
+        assert_eq!(other, retained);
+        assert_eq!(retained, retained.clone());
+        let mut changed = json.clone();
+        changed["zeta"][0] = 2.into();
+        assert_ne!(retained, CellResultsValue::Other(changed.clone()));
+        assert_ne!(
+            retained,
+            serde_json::from_value::<CellResultsValue>(changed).unwrap()
+        );
+        assert_eq!(retained.admission_run_id(), other.admission_run_id());
+        assert_eq!(
+            retained.admission_run_id(),
+            Some(Value::String("run-552".into()))
+        );
+        assert!(retained.typed().is_none());
+    }
+
+    #[test]
+    fn retained_cell_results_decode_schema8_exactly_as_a_value() {
+        let shape: Value = serde_json::from_str(
+            r#"{"path":"quick","run_id":"run-8","hermit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+               "source_tree_dirty":false,"selected_count":0,"recorded_count":0,
+               "population_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+               "artifact":{"path":"ignored/validate/artifacts/run-8/cell-results.jsonl",
+                           "sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","row_count":0},
+               "selected":[],"cells":[]}"#,
+        )
+        .unwrap();
+        let retained: CellResultsValue = serde_json::from_value(shape.clone()).unwrap();
+        assert!(matches!(retained, CellResultsValue::Retained(_)));
+        let other = CellResultsValue::Other(shape);
+        assert_eq!(
+            serde_json::to_value(retained.schema8().unwrap()).unwrap(),
+            serde_json::to_value(other.schema8().unwrap()).unwrap()
+        );
+        let row = |cell_results: CellResultsValue| {
+            let mut row: HistoryRow =
+                serde_json::from_value(serde_json::json!({"schema_version": 8})).unwrap();
+            row.cell_results = Some(cell_results);
+            row
+        };
+        let (retained_row, other_row) = (row(retained), row(other));
+        assert_eq!(
+            retained_row.cell_results_validate_path(),
+            Some(ValidatePath::Quick)
+        );
+        assert_eq!(
+            retained_row.cell_results_validate_path(),
+            other_row.cell_results_validate_path()
+        );
+        assert_eq!(
+            retained_row.cell_results_evidence(),
+            other_row.cell_results_evidence()
+        );
+    }
+
+    /// Retained text is written in `Value`'s sorted key order. Equality of two
+    /// retained shapes compares that text, so it depends on serde_json's
+    /// `preserve_order` feature staying off; this fails if it is ever turned on.
+    #[test]
+    fn retained_text_has_sorted_keys_whatever_order_they_arrived_in() {
+        let forward: CellResultsValue =
+            serde_json::from_str(r#"{"b":1,"a":{"y":2,"x":3},"run_id":"r"}"#).unwrap();
+        let backward: CellResultsValue =
+            serde_json::from_str(r#"{"run_id":"r","a":{"x":3,"y":2},"b":1}"#).unwrap();
+        let (CellResultsValue::Retained(left), CellResultsValue::Retained(right)) =
+            (&forward, &backward)
+        else {
+            panic!("both shapes must be retained");
+        };
+        assert_eq!(&*left.text, r#"{"a":{"x":3,"y":2},"b":1,"run_id":"r"}"#);
+        assert_eq!(left.text, right.text);
+        assert_eq!(forward, backward);
+    }
+
+    /// Retained text serializes by streaming it into the serializer. The
+    /// output must be the bytes serializing the parsed `Value` gives, compact
+    /// and pretty, for every JSON form a float-free value can take.
+    #[test]
+    fn retained_text_serializes_exactly_as_its_value() {
+        let json = serde_json::json!({
+            "run_id": "run-t",
+            "empty_object": {}, "empty_array": [],
+            "numbers": [0, -1, 18446744073709551615u64, -9223372036854775808i64],
+            "strings": ["", "quote \" slash \\ tab \t", "\u{1}", "\u{e9}\u{1f600}"],
+            "nested": [[[{"k": [null, true, false]}]], {"z": {}, "a": []}],
+        });
+        let retained: CellResultsValue = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(retained, CellResultsValue::Retained(_)));
+        assert_eq!(
+            serde_json::to_string(&retained).unwrap(),
+            serde_json::to_string(&json).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string_pretty(&retained).unwrap(),
+            serde_json::to_string_pretty(&json).unwrap()
+        );
+        assert_eq!(serde_json::to_value(&retained).unwrap(), json);
+    }
+
+    /// serde_json reads text nested at most 128 levels, so a deeper in-memory
+    /// value could be written as text but never read back. It stays a `Value`.
+    #[test]
+    fn an_untyped_shape_nested_too_deep_to_read_back_stays_a_value() {
+        let mut deep = serde_json::json!("leaf");
+        for _ in 0..RETAINED_MAX_DEPTH + 30 {
+            deep = serde_json::json!([deep]);
+        }
+        let shape = serde_json::json!({"run_id": "deep", "cells": deep});
+        let value: CellResultsValue = serde_json::from_value(shape.clone()).unwrap();
+        assert!(matches!(value, CellResultsValue::Other(_)));
+        assert_eq!(serde_json::to_value(&value).unwrap(), shape);
+
+        let mut shallow = serde_json::json!("leaf");
+        for _ in 0..RETAINED_MAX_DEPTH - 1 {
+            shallow = serde_json::json!([shallow]);
+        }
+        let value: CellResultsValue =
+            serde_json::from_value(serde_json::json!({"cells": shallow})).unwrap();
+        let CellResultsValue::Retained(retained) = &value else {
+            panic!("a shape within the depth limit is retained");
+        };
+        assert_eq!(serde_json::to_value(&value).unwrap(), retained.value());
+    }
+
+    /// The depth guard is exact: in `{"cells": ...}`, a leaf at
+    /// RETAINED_MAX_DEPTH is retained and one level deeper is not. So is the
+    /// deepest text serde_json reads (127 levels), which serializes unchanged.
+    #[test]
+    fn the_depth_guard_is_exact_up_to_the_deepest_readable_text() {
+        fn nested(arrays: usize) -> Value {
+            let mut value = serde_json::json!("leaf");
+            for _ in 0..arrays {
+                value = serde_json::json!([value]);
+            }
+            value
+        }
+        // The object is depth 0 and its value depth 1, so `arrays` arrays put
+        // the leaf at depth `arrays + 1`; the text nests `arrays + 1` levels.
+        for (arrays, retained) in [
+            (RETAINED_MAX_DEPTH - 1, true),
+            (RETAINED_MAX_DEPTH, false),
+            (126, false),
+        ] {
+            let text =
+                serde_json::to_string(&serde_json::json!({"cells": nested(arrays)})).unwrap();
+            let value: CellResultsValue = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                matches!(value, CellResultsValue::Retained(_)),
+                retained,
+                "{arrays}"
+            );
+            assert_eq!(serde_json::to_string(&value).unwrap(), text, "{arrays}");
+        }
+        let too_deep = serde_json::to_string(&serde_json::json!({"cells": nested(127)})).unwrap();
+        assert!(serde_json::from_str::<Value>(&too_deep).is_err());
+    }
+
+    /// raw_result_input_census_v1 decoded from history is kept as text outside
+    /// the map `extra` derefs to, and reads, compares and serializes as before.
+    #[test]
+    fn a_decoded_census_extension_is_retained_and_reads_exactly_as_a_value() {
+        let census = serde_json::json!({"files": [{"rows": [{"id": "a", "n": 1}]}], "version": 1});
+        let json = serde_json::json!({
+            "schema_version": 10, "zeta": "after", "alpha": "before",
+            "raw_result_input_census_v1": census,
+        });
+        let row: HistoryRow = serde_json::from_value(json.clone()).unwrap();
+        assert!(row.extra.get("raw_result_input_census_v1").is_none());
+        assert_eq!(
+            row.extra.value("raw_result_input_census_v1").as_deref(),
+            Some(&census)
+        );
+        let mut plain: HistoryRow = serde_json::from_value(serde_json::json!({
+            "schema_version": 10, "zeta": "after", "alpha": "before",
+        }))
+        .unwrap();
+        plain
+            .extra
+            .insert("raw_result_input_census_v1".into(), census.clone());
+        assert_eq!(row.extra, plain.extra);
+        assert_eq!(
+            serde_json::to_vec(&row).unwrap(),
+            serde_json::to_vec(&plain).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec_pretty(&row).unwrap(),
+            serde_json::to_vec_pretty(&plain).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&row).unwrap(),
+            serde_json::to_value(&plain).unwrap()
+        );
+
+        // An entry inserted through the map replaces the retained one.
+        let mut replaced = row.clone();
+        replaced.extra.insert(
+            "raw_result_input_census_v1".into(),
+            serde_json::json!("new"),
+        );
+        let text = serde_json::to_string(&replaced).unwrap();
+        assert_eq!(text.matches("raw_result_input_census_v1").count(), 1);
+        assert!(text.contains(r#""raw_result_input_census_v1":"new""#));
+
+        let mut removed = row.clone();
+        assert_eq!(
+            removed.extra.remove_value("raw_result_input_census_v1"),
+            Some(census)
+        );
+        assert!(removed.extra.value("raw_result_input_census_v1").is_none());
+        assert!(!serde_json::to_string(&removed).unwrap().contains("census"));
+    }
+
+    /// A float's text need not parse back to the same bits, so a shape that
+    /// holds one stays a `Value`.
+    #[test]
+    fn untyped_cell_results_with_a_float_stay_a_value() {
+        let json = serde_json::json!({"run_id": "run-f", "ratio": 0.1, "cells": []});
+        let value: CellResultsValue = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(value, CellResultsValue::Other(_)));
+        assert_eq!(serde_json::to_value(value).unwrap(), json);
+    }
+
+    /// The memory bound behind dev-hermit issue 552: a large untyped shape
+    /// keeps no `Value` tree, only text no longer than its own JSON. The
+    /// 2026-10-10 ledger held 728 MB of cell-results JSON as 4.9 GB of `Value`.
+    #[test]
+    fn a_large_untyped_shape_is_held_as_text_no_longer_than_its_json() {
+        let cells: Vec<Value> = (0..20_000)
+            .map(|index| {
+                serde_json::json!({
+                    "lane": "portable", "category": "c", "test": format!("t{index}"),
+                    "mode": "strict", "backend": "ptrace",
+                    "cell_verdict": {"state": "unavailable-with-reason", "reason": "r"},
+                })
+            })
+            .collect();
+        let text =
+            serde_json::to_string(&serde_json::json!({"run_id": "big", "cells": cells})).unwrap();
+        let value: CellResultsValue = serde_json::from_str(&text).unwrap();
+        let CellResultsValue::Retained(retained) = &value else {
+            panic!("a large untyped shape must be retained as text");
+        };
+        assert!(retained.text.len() <= text.len());
+        assert_eq!(serde_json::to_string(&value).unwrap(), text);
     }
 
     #[test]
@@ -2441,7 +2900,7 @@ mod tests {
             }
         }
         let value: CellResultsValue = serde_json::from_value(json.clone()).unwrap();
-        assert!(matches!(value, CellResultsValue::Other(_)));
+        assert!(matches!(value, CellResultsValue::Retained(_)));
         assert_eq!(serde_json::to_value(value).unwrap(), json);
 
         let row: HistoryRow = serde_json::from_value(serde_json::json!({

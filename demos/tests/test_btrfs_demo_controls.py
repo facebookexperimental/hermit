@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Tests for demo 8's result checks and for its seed calibration.
 
 Both scripts decide PASS or FAIL from what `hermit run --chaos` returns: the
@@ -426,7 +420,9 @@ def _write_executable(path, text):
 def _base_environment(stub_dir):
     """The caller's environment without DEMO08_* settings, stub first on PATH."""
     environment = {
-        key: value for key, value in os.environ.items() if not key.startswith("DEMO08_")
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("DEMO08_")
     }
     environment["PATH"] = "{}:{}".format(stub_dir, environment.get("PATH", ""))
     environment["LC_ALL"] = "C"
@@ -639,7 +635,9 @@ class DemoRunControlsTest(unittest.TestCase):
     def test_a_native_run_with_no_report_says_so(self):
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("native buggy: rc=0 with no use-after-free report", result.stdout)
+        self.assertIn(
+            "native buggy: rc=0 with no use-after-free report", result.stdout
+        )
         self.assertIn("the native run showed no use-after-free;", result.stdout)
 
     def test_a_native_partial_report_is_reported_not_called_clean(self):
@@ -737,9 +735,7 @@ class DemoRunControlsTest(unittest.TestCase):
     def test_a_second_run_refused_after_a_skid_overshoot_is_explained(self):
         """Step 4 explains a refusal as steps 2 and 3 do, and still exits 1."""
         result = self._run(buggy_mode="replay-skid-refusal")
-        self._assert_refused(
-            result, "replay did not complete with the ASAN abort: rc=122"
-        )
+        self._assert_refused(result, "replay did not complete with the ASAN abort: rc=122")
         self.assertIn("rc=122 means Hermit refused the run", result.stdout)
         self.assertIn("chaos-buggy-replay.out", result.stdout)
 
@@ -857,18 +853,14 @@ class DemoRunControlsTest(unittest.TestCase):
         shutil.rmtree(self.assets / "buggy")
         result = self._run(DEMO_SKIP_EXIT_STATUS="0")
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertIn(
-            "=== Demo 8: FAILURE -- required asset is missing:", result.stdout
-        )
+        self.assertIn("=== Demo 8: FAILURE -- required asset is missing:", result.stdout)
         self.assertNotIn("SKIPPED", result.stdout)
 
     def test_missing_assets_fail_when_required(self):
         shutil.rmtree(self.assets / "buggy")
         result = self._run()
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertIn(
-            "=== Demo 8: FAILURE -- required asset is missing:", result.stdout
-        )
+        self.assertIn("=== Demo 8: FAILURE -- required asset is missing:", result.stdout)
 
     def test_a_seed_recorded_for_another_binary_is_refused(self):
         (self.assets / ".crash-seed").write_text("15 {}\n".format("0" * 64))
@@ -915,13 +907,7 @@ class CalibrationControlsTest(unittest.TestCase):
         probe = scratch / "asan-probe.c"
         probe.write_text("int main(void) { return 0; }\n")
         linked = subprocess.run(
-            [
-                "gcc",
-                "-fsanitize=address",
-                str(probe),
-                "-o",
-                str(scratch / "asan-probe"),
-            ],
+            ["gcc", "-fsanitize=address", str(probe), "-o", str(scratch / "asan-probe")],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=120,
@@ -936,9 +922,7 @@ class CalibrationControlsTest(unittest.TestCase):
         ).stdout.strip()
         wanted = "libasan.so"
         try:
-            match = re.search(
-                r"libasan\.so\.[0-9.]+", Path(script).read_text(errors="replace")
-            )
+            match = re.search(r"libasan\.so\.[0-9.]+", Path(script).read_text(errors="replace"))
             if match:
                 wanted = match.group(0)
         except OSError:
@@ -969,17 +953,8 @@ class CalibrationControlsTest(unittest.TestCase):
         source.write_text(PLANTED_UAF_C)
         binary = scratch / "planted-uaf"
         subprocess.run(
-            [
-                "gcc",
-                "-O0",
-                "-g",
-                "-fsanitize=address",
-                "-fno-omit-frame-pointer",
-                str(source),
-                "-o",
-                str(binary),
-            ]
-            + cls._asan_link_flags(scratch),
+            ["gcc", "-O0", "-g", "-fsanitize=address", "-fno-omit-frame-pointer",
+             str(source), "-o", str(binary)] + cls._asan_link_flags(scratch),
             check=True,
             timeout=120,
         )
@@ -1070,9 +1045,7 @@ class CalibrationControlsTest(unittest.TestCase):
 
     def test_a_real_asan_crash_is_found_confirmed_and_recorded(self):
         """Positive control: calibration accepts a seed that run.sh would pass."""
-        result = self._calibrated(
-            self._prepare("planted-uaf", 3, DEMO08_TEST_UAF_SEED="1")
-        )
+        result = self._calibrated(self._prepare("planted-uaf", 3, DEMO08_TEST_UAF_SEED="1"))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("engagement=2/2 uaf_hits=1/2", result.stdout)
         self.assertIn("Demo 8 crash seed calibrated: 1", result.stdout)
@@ -1088,18 +1061,12 @@ class CalibrationControlsTest(unittest.TestCase):
             self._count_rows(r"^1\tcold\tbuggy\treached\tcomplete\t134\t\d+\tyes\t"), 1
         )
         self.assertEqual(
-            self._count_rows(
-                r"^1\tcold\tbuggy-replay\treached\tcomplete\t134\t\d+\tyes\t"
-            ),
-            1,
+            self._count_rows(r"^1\tcold\tbuggy-replay\treached\tcomplete\t134\t\d+\tyes\t"), 1
         )
         self.assertEqual(
             self._count_rows(r"^1\tcold\tfixed\treached\tnone\t0\t\d+\tn/a\t"), 1
         )
-        for name in (
-            "calibration-cold-seed-1.out",
-            "calibration-confirm-replay-seed-1.out",
-        ):
+        for name in ("calibration-cold-seed-1.out", "calibration-confirm-replay-seed-1.out"):
             self.assertIn(
                 "AddressSanitizer: heap-use-after-free",
                 (self.artifacts / name).read_text(errors="replace"),
@@ -1107,9 +1074,7 @@ class CalibrationControlsTest(unittest.TestCase):
 
     def test_a_recorded_seed_is_replayed_not_trusted(self):
         (self.assets / ".crash-seed").write_text("1 {}\n".format(self.fixture))
-        result = self._calibrated(
-            self._prepare("planted-uaf", 3, DEMO08_TEST_UAF_SEED="1")
-        )
+        result = self._calibrated(self._prepare("planted-uaf", 3, DEMO08_TEST_UAF_SEED="1"))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
             "engagement=1/1 uaf_hits=1/1 qualified=1/1 executed=1/1", result.stdout
@@ -1118,13 +1083,10 @@ class CalibrationControlsTest(unittest.TestCase):
         self.assertNotIn("Demo 8 crash seed calibrated:", result.stdout)
         self.assertEqual(len(self._rows()), 4)
         self.assertEqual(
-            self._count_rows(r"^1\tcached\tbuggy\treached\tcomplete\t134\t\d+\tyes\t"),
-            1,
+            self._count_rows(r"^1\tcached\tbuggy\treached\tcomplete\t134\t\d+\tyes\t"), 1
         )
         self.assertEqual(
-            self._count_rows(
-                r"^1\tcached\tbuggy-replay\treached\tcomplete\t134\t\d+\tyes\t"
-            ),
+            self._count_rows(r"^1\tcached\tbuggy-replay\treached\tcomplete\t134\t\d+\tyes\t"),
             1,
         )
         self.assertEqual(
@@ -1138,18 +1100,14 @@ class CalibrationControlsTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("never executed the guest: 0 of 2 seeds", result.stdout)
         self.assertEqual(len(self._rows()), 3)
-        self.assertEqual(
-            self._count_rows(r"^1\tcached\tbuggy\tdid-not-reach\tnone\t127\t"), 1
-        )
+        self.assertEqual(self._count_rows(r"^1\tcached\tbuggy\tdid-not-reach\tnone\t127\t"), 1)
 
     def test_runs_that_never_reach_the_progress_thread_are_no_result(self):
         result = self._prepare("no-engagement", 2)
         self._assert_refused(result, "NO-RESULT: path engagement 0/2")
         self.assertEqual(len(self._rows()), 3)
         self.assertEqual(self._count_rows(r"\tdid-not-reach\t"), 2)
-        self.assertEqual(
-            len(list(self.artifacts.glob("calibration-cold-seed-*.out"))), 2
-        )
+        self.assertEqual(len(list(self.artifacts.glob("calibration-cold-seed-*.out"))), 2)
 
     def test_engaged_runs_without_a_crash_are_not_called_no_result(self):
         result = self._prepare("engaged-no-hit", 2)
@@ -1172,9 +1130,7 @@ class CalibrationControlsTest(unittest.TestCase):
         """Only the exit status refuses this one: the report text is complete."""
         result = self._prepare("complete-uaf-rc0", 2)
         self._assert_refused(result, "uaf_hits=2/2 qualified=0/2")
-        self.assertEqual(
-            self._count_rows(r"\tbuggy\treached\tcomplete\t0\t\d+\tno\t"), 2
-        )
+        self.assertEqual(self._count_rows(r"\tbuggy\treached\tcomplete\t0\t\d+\tno\t"), 2)
         self.assertEqual(self._count_rows(r"\tyes\t"), 0)
         self.assertEqual(self._count_rows(r"\tbuggy-replay\t"), 0)
         self.assertEqual(self._count_rows(r"\tfixed\t"), 0)
@@ -1223,9 +1179,7 @@ class CalibrationControlsTest(unittest.TestCase):
 
     def test_a_fixed_variant_uaf_stops_the_calibration(self):
         result = self._prepare("fixed-uaf", 1)
-        self._assert_refused(
-            result, "fixed variant reported a use-after-free on seed 0"
-        )
+        self._assert_refused(result, "fixed variant reported a use-after-free on seed 0")
 
     def test_a_uaf_without_the_progress_thread_does_not_qualify(self):
         result = self._prepare("uaf-no-engagement", 1)
@@ -1257,9 +1211,7 @@ class CalibrationControlsTest(unittest.TestCase):
             "Hermit refused the fixed run on seed 0 (rc=122, attempt 1 of 3)",
             result.stdout,
         )
-        self.assertIn(
-            "executed=1/1 unconfirmed=0 refused=0/1 refused_runs=2", result.stdout
-        )
+        self.assertIn("executed=1/1 unconfirmed=0 refused=0/1 refused_runs=2", result.stdout)
         self.assertEqual(
             (self.assets / ".crash-seed").read_text(), "0 {}\n".format(self.fixture)
         )
@@ -1273,7 +1225,9 @@ class CalibrationControlsTest(unittest.TestCase):
             "calibration-cold-seed-0-refused-1.out",
             "calibration-confirm-fixed-seed-0-refused-1.out",
         ):
-            self.assertIn("HERMIT_POLICY_REFUSAL", (self.artifacts / name).read_text())
+            self.assertIn(
+                "HERMIT_POLICY_REFUSAL", (self.artifacts / name).read_text()
+            )
 
     def test_seeds_refused_on_every_attempt_are_reported_as_refused(self):
         result = self._prepare("always-refused", 2)
@@ -1325,9 +1279,7 @@ class CalibrationControlsTest(unittest.TestCase):
     def test_a_refused_fixed_run_with_a_uaf_is_not_retried_away(self):
         """The fixed variant's use-after-free stops calibration even when refused."""
         result = self._prepare("fixed-refused-uaf", 1)
-        self._assert_refused(
-            result, "fixed variant reported a use-after-free on seed 0"
-        )
+        self._assert_refused(result, "fixed variant reported a use-after-free on seed 0")
         self.assertEqual(self._count_rows(r"\tfixed\t"), 1)
 
 

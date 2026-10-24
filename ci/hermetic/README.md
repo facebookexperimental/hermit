@@ -43,6 +43,11 @@ raw probe status and stderr remain visible; store errors are distinct from
 Podman's absent-image status 1. Inspection has a 10-second bound and a 2-second
 forced-stop grace. Admission neither builds nor loads an image.
 
+Each node's wrapper call repeats the check just before its run. There, an
+absent image still fails the node, but a query that only timed out (a saturated
+host) is logged and the run proceeds: `podman run --pull=never` is itself the
+exact check, so a missing image fails at the run and nothing is fetched.
+
 ## Image provenance and repins
 
 `image.digest` is accepted only with the checked-in
@@ -58,25 +63,37 @@ checker is read-only and does not build, load, inspect, or silently repair an
 image. Both `-h` and `--help` describe this interface; its unit tests run with
 `rust-script --test ci/hermetic/check-image-provenance.rs`.
 
-The current d809 pin supersedes c607 because c607 was produced from a reused,
-mixed Nix store. Three same-path inputs in that store had NAR contents different
-from fresh realizations. A separately reviewed eight-combination fresh/shared
-matrix reported that its all-fresh cell produced the same 717144 archive as two
-new builds from commit
-`c549ee2642cd2bb670247453d8f69b7502346bf4`. Those builds used
-independent source snapshots, physical Nix stores, and Podman stores and loaded
-the same d809 image. The matrix did not match the recorded c607 archive SHA-256
-`e3655bf4a4e82753e39a74c838e03fbdb2e22dae7fc7568c2c4664d7639374db`;
-the original archive bytes were not retained and are unavailable, so the
-comparison is against PR #3172's recorded SHA-256 rather than present bytes.
+The current 29a8 pin supersedes d4e5, whose root had no `curl` executable, so
+`test.record_replay` skipped
+`network_trace::curl_recording_replays_offline_with_identical_logs`, the only
+pinned-root test that runs curl
+(https://github.com/rrnewton/hermit/issues/3786). The replacement adds
+`curl.bin` to `guestTools` and `/usr/bin/curl` to `guest-paths.txt`. Two builds
+from commit `b8981f6ac8da871ab68b4cb75a9736dd810b0af0` used independent source
+snapshots, physical Nix stores that did not exist before the build, and Podman
+stores; both produced archive
+`7aeffce338a79d601c7352c80acd1ceca67547efcc02fd44e169ac465be6cd39`
+and loaded the same 29a8 image. d4e5 itself replaced d809, whose root lacked
+liblzma, which libunwind's static pkg-config closure names after Reverie
+https://github.com/rrnewton/reverie/pull/942; d809
+(https://github.com/rrnewton/hermit/pull/3171) replaced c607
+(https://github.com/rrnewton/hermit/pull/3172), an image built from a reused,
+mixed Nix store.
 
 This proves same-host reproducibility for the recorded method only; it makes no
-cross-host reproducibility claim. The evidence also states what the experiment
-did not preserve: its exact launch command/environment, elapsed wall time,
-build-time Nix version, and a pre-build empty-store listing. `build-image.sh`
-remains useful for a local one-off build, but one such build is not sufficient
-evidence for another reviewed repin. A future repin must replace the digest and
-provenance together with two new agreeing isolated builds.
+cross-host reproducibility claim. Each build ran as a systemd user service
+bounded to 2 CPUs (`CPUQuota=200%`), 8 GiB of memory with no swap and 2400
+seconds of wall time, running `nix --store <build-root>/nix-root build .#image`
+without network access: the new store could substitute only from the build
+host's default store, only signed or content-addressed paths, and every
+unsigned path was rebuilt. The Nix build sandbox's `/bin/sh` was a static
+busybox recorded in the receipt. The receipt records the build-time Nix
+version; its evidence limitations name what it does not preserve: the service
+environment's values, the build logs and path-info records, and the superseded
+d4e5 archive bytes. `build-image.sh` remains useful for a local one-off build,
+but one such build is not sufficient evidence for another reviewed repin. A
+future repin must replace the digest and provenance together with two new
+agreeing isolated builds.
 
 `setup.pinned_root_fetch` fetches Cargo dependencies; it does not prepare the OCI
 image. Prepare that image explicitly with `build-image.sh` when needed. Each
@@ -91,13 +108,16 @@ explain later image loss.
 Before each canonical pinned-root DAG node starts, the wrapper checks the
 network boundary and four different dependency populations rather than folding
 them into one tool list: 18 executable build
-dependencies, four native library packages with their development headers, 24
+dependencies, five native library packages with their development headers, 24
 commands selected portable cells run as hermit guests, and 11 literal FHS paths
 those cells name. Some commands occur in both executable sets because they are
 used in both roles. `xxd` occurs only in the build set: e9patch runs `xxd -i`
 while generating two C sources, but no selected portable cell runs it as a
 guest. The assertion also checks the exact headers and libraries consumed from
-`nativeLibs`, so their absence is named before compilation begins.
+`nativeLibs`, so their absence is named before compilation begins. The fifth
+package, xz, supplies liblzma: libunwind's pkg-config metadata names `-llzma`
+in `Libs.private`, and reverie-ptrace's build script requests that `--static`
+closure, so a root without `liblzma.so` on `LIBRARY_PATH` fails at link time.
 
 ## V3 per-cell execution contract
 

@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 use std::path::Path;
 use std::process::Command;
 use std::process::Output;
@@ -152,6 +144,7 @@ fn every_test_harness_subcommand_has_conventional_help() {
         "audit-compile",
         "run",
         "parity",
+        "sync-cells",
         "selftest",
     ];
 
@@ -592,12 +585,13 @@ fn test_harness_selftest_scorecard_refuses_a_missing_helper() {
          `cargo build -p hermit-manifest-plan --bins`\n";
     let directory = non_repository_dir("selftest-missing-helper");
     // A copy, not a symlink: the helper is looked up beside the resolved
-    // executable, and a symlink resolves to the build directory.
+    // executable, and a symlink resolves to the build directory. Not a hard
+    // link either: a link changes the built binary's link count and ctime, and
+    // the validation runner refuses a prepared test input whose metadata moves
+    // while it hashes it (https://github.com/rrnewton/hermit/pull/3921).
     let harness = directory.join("test-harness");
     let built = env!("CARGO_BIN_EXE_test-harness");
-    std::fs::hard_link(built, &harness)
-        .or_else(|_| std::fs::copy(built, &harness).map(|_| ()))
-        .expect("place test-harness without its helper");
+    std::fs::copy(built, &harness).expect("place test-harness without its helper");
     let harness = harness.to_str().expect("UTF-8 temporary path");
     for helper_is_a_directory in [false, true] {
         if helper_is_a_directory {
@@ -721,6 +715,52 @@ fn test_harness_refuses_a_broad_probe_disabled_selection() {
     std::fs::remove_dir_all(&directory).expect("remove non-repository working directory");
 }
 
+/// `--parity-inputs` gives a probed disabled verify cell ptrace's inputs, so it
+/// is refused anywhere else: without `--probe-disabled`, and on a mode other
+/// than verify.
+#[test]
+fn test_harness_refuses_parity_inputs_outside_a_verify_probe() {
+    let harness = env!("CARGO_BIN_EXE_test-harness");
+    let directory = non_repository_dir("parity-inputs-outside-probe");
+    const REFUSED: &str =
+        "test-harness: --parity-inputs requires --probe-disabled on a verify cell\n";
+    for arguments in [
+        vec!["run", "--parity-inputs"],
+        vec![
+            "run",
+            "--include-manual",
+            "--test",
+            "fixture/probe",
+            "--mode",
+            "verify",
+            "--backend",
+            "kvm",
+            "--parity-inputs",
+        ],
+        vec![
+            "run",
+            "--probe-disabled",
+            "--test",
+            "fixture/probe",
+            "--mode",
+            "replay",
+            "--backend",
+            "kvm",
+            "--parity-inputs",
+        ],
+    ] {
+        let output = run_from(harness, &arguments, Some(&directory));
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            REFUSED,
+            "{arguments:?}"
+        );
+    }
+    std::fs::remove_dir_all(&directory).expect("remove non-repository working directory");
+}
+
 /// `--check --write` used to write the snapshot while `--write --check` was
 /// refused. Both orders, and a repeated mode flag, are now refused before the
 /// repository is located, so nothing is read or written. The run happens at
@@ -806,4 +846,59 @@ fn manifest_plan_no_arguments_remains_the_default_text_plan() {
         String::from_utf8_lossy(&output.stderr).contains("manifest(s)"),
         "default plan omitted its validation summary: {output:?}"
     );
+}
+
+/// `sync-cells` refuses a missing, repeated or unknown flag with exit 2 and a
+/// pointer to its help, and `--check` passes on the committed tree
+/// (https://github.com/rrnewton/hermit/issues/3606).
+#[test]
+fn sync_cells_refuses_bad_flags_and_checks_the_committed_tree() {
+    let harness = env!("CARGO_BIN_EXE_test-harness");
+    for (arguments, message) in [
+        (&[][..], "sync-cells needs --check or --write"),
+        (
+            &["--check", "--write"][..],
+            "takes one of --check and --write, once",
+        ),
+        (
+            &["--check", "--check"][..],
+            "takes one of --check and --write, once",
+        ),
+        (&["--check", "--force"][..], "does not accept --force"),
+        (
+            &["--check", "--repo-root"][..],
+            "--repo-root needs a directory",
+        ),
+    ] {
+        let mut command = vec!["sync-cells"];
+        command.extend_from_slice(arguments);
+        let output = run(harness, &command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{command:?}: {stderr}");
+        assert!(stderr.contains(message), "{command:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{command:?} wrote stdout");
+    }
+
+    let missing = non_repository_dir("sync-cells-missing");
+    let output = run(
+        harness,
+        &[
+            "sync-cells",
+            "--check",
+            "--repo-root",
+            missing.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("nothing was written"), "{stderr}");
+    std::fs::remove_dir_all(&missing).expect("remove non-repository working directory");
+
+    let output = run(harness, &["sync-cells", "--check"]);
+    assert!(
+        output.status.success(),
+        "the committed plan or optional-cell inventory is stale: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("are current"));
 }

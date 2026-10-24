@@ -35,14 +35,16 @@ int main(int argc, char** argv) {
       return 0;
     }
   }
-  if (!expect_passthrough && result == -1 && errno == ENOSYS) {
+  // The file name predates the refusal errno: a refused tee says EINVAL, the
+  // errno splice-family callers fall back to read/write on.
+  if (!expect_passthrough && result == -1 && errno == EINVAL) {
     puts("tee deterministically unavailable");
     return 0;
   }
   {
     fprintf(
         stderr,
-        "tee returned %ld with errno %d (%s), expected ENOSYS\n",
+        "tee returned %ld with errno %d (%s), expected EINVAL\n",
         result,
         errno,
         strerror(errno));

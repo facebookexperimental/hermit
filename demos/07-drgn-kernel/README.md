@@ -12,8 +12,24 @@ the same task lists and the same difference between them.
 
 ## Prerequisites
 
-- Everything [demo 5](../05-qemu-boot/README.md#prerequisites) needs. If the
-  boot snapshot is missing, this demo runs demo 5 first.
+- Everything [demo 5](../05-qemu-boot/README.md#prerequisites) needs. The
+  snapshot's memory holds the guest's `/init`, which runs this demo's command,
+  so the demo restores the boot snapshot only when demo 5's record of it
+  (`<snapshot>.producer.json`) names that snapshot and the initramfs that
+  `demos/lib/qemu-assets.sh` builds now, the same check demo 6 makes. That the
+  snapshot exists is not enough. If the default snapshot is missing or has no
+  such record, this demo runs demo 5 to build it again. If the snapshot was
+  missing and demo 5 exits non-zero, this demo stops with demo 5's failure,
+  even if demo 5 saved a snapshot first. If a snapshot was there but had no
+  such record, demo 5 can exit non-zero after it has saved a current snapshot,
+  because after an initramfs change its own reference run no longer applies
+  either. In that case only, this demo checks demo 5's record instead of its
+  exit status: it uses the rebuilt snapshot, with a note, when the record
+  matches, and otherwise asks you to run `demos/clean.sh` and then this demo
+  again. A snapshot named by
+  `DEMO07_SNAPSHOT_DISK` is never rebuilt: without a matching record the demo
+  stops and says how to rebuild it. Each pass checks its own copy of the
+  snapshot against the record again before QEMU restores it.
 - `drgn` on your `PATH` (see the [drgn documentation](https://drgn.readthedocs.io/)
   for installation).
 - `bpftool`, `gcc`, and `readelf`, used to turn the kernel's built-in type
@@ -58,7 +74,7 @@ before tasks (84 total; first 16 shown, pid comm):
      13 kworker/R-mm_pe
      14 kworker/u4:1
      15 ksoftirqd/0
-  ... 68 unchanged rows omitted from display
+  ... 68 rows omitted from display
 after tasks (85 total; first 16 shown, pid comm):
       0 swapper/0
       1 sh
@@ -76,7 +92,7 @@ after tasks (85 total; first 16 shown, pid comm):
      13 kworker/R-mm_pe
      14 kworker/u4:1
      15 ksoftirqd/0
-  ... 69 unchanged rows omitted from display
+  ... 69 rows omitted from display
 task-list diff (- before, + after):
   -     1 init
   -    95 sleep
@@ -88,10 +104,14 @@ RESULT: restored demo 5 boot snapshot; requested_sleep_us=1000; task_lists_diffe
 === Demo 7: drgn Kernel Task Evolution: SUCCESS ===
 ```
 
-Edited by hand: the `RESULT` field `requested_sleep_us` was named
-`fixed_virtual_advance_us` when this output was captured and was renamed on
-2026-10-02; its value 1000 and the rest of the block are as printed then, and
-the block is to be refreshed from the next verified run of this demo.
+Edited by hand: two parts of this block differ from the output as captured.
+The `RESULT` field `requested_sleep_us` was named `fixed_virtual_advance_us`
+and was renamed on 2026-10-02; its value 1000 is as printed. The two
+`rows omitted from display` lines said `68 unchanged rows` and
+`69 unchanged rows`; the word was dropped on 2026-10-04 because a row that is
+not shown can be in the difference (processes 95, 101 and 102 here). The rest
+of the block is as printed then, and the block is to be refreshed from the
+next verified run of this demo.
 
 Elided (`...`): your Hermit version and the path of the `hermit` on your
 `PATH`. Everything from `evolution 1` to `RESULT` was byte-identical in ten
@@ -135,10 +155,13 @@ The demo restores the snapshot with QEMU's virtual CPU paused, running QEMU
 under `hermit run --strict --no-rcb-time --target-timeslice 100000
 --max-timeslice disabled` (set in the shared
 [`lib/drgn_hermit.py`](../lib/drgn_hermit.py)). Unlike demos 5 and 6 it passes
-no `--epoch`, so Hermit's virtual clocks start at the host time of each run;
-the guest's own clock comes from QEMU (`-rtc base=2022-01-01T00:00:00,clock=vm`),
-and the demo compares the task lists rather than Hermit's log. Runs started at
-different host times produced the same result. Before
+no `--epoch`, and it passes the environment it runs in on to Hermit, so if
+`HERMIT_EPOCH` is set there, Hermit's virtual clocks start at that time, as
+they would with `--epoch`; otherwise they start at the host time of each run.
+The guest's own clock comes from QEMU
+(`-rtc base=2022-01-01T00:00:00,clock=vm`), and the demo compares the task
+lists rather than Hermit's log. Runs started at different host times produced
+the same result. Before
 QEMU starts, the fixed command
 (`for n in 1 2; do sleep 1000 & done; usleep 1000; echo ...`) is written to the
 guest's command disk, the same mechanism as
@@ -175,7 +198,7 @@ Controls (environment variables):
 | `DEMO07_RUNS` | `2` | Number of independent passes; at least 2. |
 | `DEMO07_TASK_LIMIT` | `16` | Number of task rows printed (all rows are compared). |
 | `DEMO07_TIMEOUT` | `240` | Seconds allowed for the restore and for the advance. |
-| `DEMO07_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The demo 5 snapshot to restore. |
+| `DEMO07_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The demo 5 snapshot to restore. It is used only with demo 5's matching record; see Prerequisites. |
 | `DEMO07_SNAPSHOT_NAME` | `hermit-boot` | The snapshot's name inside the qcow2 file. |
 | `DEMO07_VMLINUX` | extracted from `bzImage` | A kernel ELF image with type information matching the guest kernel. |
 | `DEMO07_QEMU_BIOS`, `DEMO07_QEMU_LIBRARY_PATH` | unset | Firmware directory and library path for a QEMU installed in a non-standard location. |

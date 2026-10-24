@@ -281,10 +281,13 @@ jobs:
     runs-on: ubuntu-latest
     # The five selected preflight_nodes form a 3900s committed critical path
     # (3780s until setup.manifest_plan's wall cap went from 180 to 300 in
-    # https://github.com/rrnewton/hermit/issues/3381).
-    # Keep 420s outside that bound for checkout, packages, tool install,
-    # artifact transfer, and runner teardown; test-harness audits both numbers.
-    timeout-minutes: 72
+    # https://github.com/rrnewton/hermit/issues/3381, then 3900s until
+    # build.rust_scripts' wall cap went from 900 to 1200, then 4200s until
+    # setup.manifest_plan stopped waiting for build.rust_scripts on 2026-10-16).
+    # Keep at least 420s outside that bound for checkout, packages, tool
+    # install, artifact transfer, and runner teardown; test-harness audits both
+    # numbers. The 77 minutes were sized for the 4200s path and still cover it.
+    timeout-minutes: 77
     steps:
       - uses: actions/checkout@v4
         with:
@@ -293,6 +296,11 @@ jobs:
           # selftest.scorecard node, which has full history. Depth two is kept
           # because no audit proves that no other preflight node reads HEAD^.
           fetch-depth: 2
+      # Hermit refuses to start a guest under an inherited seccomp filter
+      # (https://github.com/rrnewton/hermit/issues/3942); record that the hosted
+      # runner has none, so a refusal here would be explained by this line.
+      - name: Report the runner's seccomp state
+        run: grep -E '^(Seccomp|Seccomp_filters|NoNewPrivs):' /proc/self/status
       # The constructed preflight starts with pre.submodules, which verifies
       # every recorded submodule without repairing it. Materialize that exact
       # recorded set before asking the gate to inspect it.
@@ -491,17 +499,22 @@ jobs:
     needs: [select, preflight]
     if: needs.select.outputs.build_debug != 'false'
     runs-on: ubuntu-latest
-    # The selected debug DAG has a 1560s critical path after e2e.metadata's
-    # measured budget rose from 60s to 180s. Keep the hosted job
-    # outside that path plus at least 300s for setup and artifact overhead.
-    timeout-minutes: 35
+    # The selected debug DAG's critical path is setup.nextest (600s wall) then
+    # build.workspace_on_host (2100s wall since 2026-10-06; the measurement is
+    # in that node's description in ci/dag/validate.json), 2700s. Keep the
+    # hosted job outside that path plus at least 300s for setup and artifact
+    # overhead: 3000s.
+    timeout-minutes: 50
     outputs:
       e2e_matrix: ${{ steps.cells.outputs.matrix }}
       parity_archive_count: ${{ steps.cells.outputs.archive_count }}
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
+      # hermit-cli/tests/liteinst_allocator.rs compiles reverie/scripts/m1_artifact.rs
+      # from the pinned reverie submodule, so every job that builds workspace tests
+      # needs it checked out (run 38106386550 failed at build.workspace_on_host).
+      - name: Initialize dagrun and reverie submodules
+        run: git submodule update --init agent-utils reverie
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -598,12 +611,13 @@ jobs:
           echo "archive_count=$archive_count" >> "$GITHUB_OUTPUT"
           echo "Fanning out $count constructed portable E2E steps:" >&2
           jq -r '.include[] | "  - \(.node)"' <<<"$matrix" >&2
-      # build.workspace_on_host already builds detcore-dbt (its first command is
-      # `cargo build --locked --profile validate -p detcore-dbt`, followed by
-      # the feature-unified workspace build, both in the validate profile since
-      # the one-build change d44bbbb79ac) and then hashes
+      # build.workspace_on_host already builds detcore-dbt (in its
+      # feature-unified workspace build, in the validate profile since the
+      # one-build change d44bbbb79ac; until 2026-10-18 a separate first command
+      # also built `-p detcore-dbt`, which the workspace build then recompiled)
+      # and then hashes
       # target/validate/deps/libdetcore_dbt.{so,rlib} into the prepared-Nextest
-      # record as runtime files of every -p hermit and --workspace selection.
+      # record as runtime files of every -p hermit-run and --workspace selection.
       # A step here used to re-run
       # `cargo build -p detcore-dbt` to "stage" the DBT runtime. That build
       # resolves different dependency features from the workspace build (for
@@ -675,6 +689,12 @@ jobs:
           require -s target/install_pkg/rsrcs/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so.revision
+          # The in-guest LiteInst runtime. Hermit and the CLI tests look for it
+          # beside the Cargo-built hermit in target/validate; build.workspace
+          # builds it, but a consumer sees only what this tarball carries (run
+          # 37383177918: run_liteinst_finds_the_runtime_staged_as_an_installed_resource
+          # failed with "target/validate/libdetcore_liteinst.so is missing").
+          require -s target/validate/libdetcore_liteinst.so
           if ((missing > 0)); then
             echo "Pack debug prebuilt tree: $missing required input(s) missing; nothing was packed" >&2
             exit 1
@@ -711,6 +731,7 @@ jobs:
             target/validate/deps/libdetcore_dbt.so \
             target/validate/libreverie_liteinst.so \
             target/validate/libreverie_liteinst.so.revision \
+            target/validate/libdetcore_liteinst.so \
             target/install_pkg \
             target/ci/bin/cargo-nextest \
             target/ci/nextest-binaries \
@@ -923,8 +944,11 @@ jobs:
       matrix: ${{ fromJSON(needs.select.outputs.debug_matrix) }}
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
+      # hermit-cli/tests/liteinst_allocator.rs compiles reverie/scripts/m1_artifact.rs
+      # from the pinned reverie submodule, so every job that builds workspace tests
+      # needs it checked out (run 38106386550 failed at build.workspace_on_host).
+      - name: Initialize dagrun and reverie submodules
+        run: git submodule update --init agent-utils reverie
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: portable-parallel-debug
@@ -968,6 +992,20 @@ jobs:
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
+      # Every shard node runs inside ci/run-hosted-node.sh's network namespace,
+      # where Cargo cannot download anything. lint.clippy compiles against the
+      # locked registry crates and git checkouts, and every prepared-Nextest
+      # consumer recomputes the recorded source identity of each git
+      # dependency by running git inside its Cargo checkout. The rust-cache
+      # restore above is not a source for either: its key hashes the runner's
+      # installed toolchains, so an image whose default stable rustc differs
+      # from build-debug's misses. Run 37469056816 split across two images:
+      # the 1.98.1 shards hit, while clippy, modes and strict-verify ran on
+      # 1.99.0, missed, and failed (clippy could not clone dagrun, the others
+      # refused with "cannot inspect preparation source"). Fetch the locked
+      # inputs here, before the namespace, as build-complete does.
+      - name: Fetch locked workspace dependencies
+        run: cargo fetch --locked
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -1004,6 +1042,7 @@ jobs:
           test -x target/validate/verification-report
           test -x target/debug/nextest-cpu-wrapper
           test -f target/validate/deps/libdetcore_dbt.so
+          test -f target/validate/libdetcore_liteinst.so
           test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
           test -f target/ci/nextest-binaries/current.json
@@ -1051,6 +1090,19 @@ jobs:
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-hosted-node.sh portable "${{ matrix.nodes }}"
+      # strict-compat requires the success of exactly the legs that own its
+      # constructed predecessors (ci/debug-shard-success.sh), not of every leg.
+      - name: Record debug shard success
+        if: success()
+        run: ./ci/debug-shard-success.sh record "${{ matrix.slug }}" "${{ matrix.nodes }}"
+      - name: Upload debug shard success record
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-shard-ok-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slug }}
+          path: ignored/debug-shard-ok/${{ matrix.slug }}.json
+          if-no-files-found: error
+          retention-days: 1
       - name: Upload debug shard node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -1063,10 +1115,23 @@ jobs:
   # The strict compatibility bucket and its fixture producer depend on results
   # from several debug shards. Keep them in a later job so the hosted grouping
   # preserves those constructed edges.
+  #
+  # GitHub reports one result for the whole test-debug matrix, so with the
+  # default success() condition the failure of any leg skipped this job, also
+  # one that runs none of its predecessors. Its parity archive was then missing
+  # and the reducer failed with "expected 13 parity archives, found 12" rather
+  # than naming the failed leg (runs 38106386550 and 38110887257: the
+  # integration leg failed). The job now runs once both builds succeeded, and
+  # its first step requires the success records of exactly the legs that own a
+  # node in its dependency closure, so a real predecessor failure still fails it.
   strict-compat:
     name: Portable strict compatibility
     needs: [select, build-debug, build-complete, test-debug]
-    if: needs.select.outputs.run_strict_compat != 'false'
+    if: >-
+      !cancelled()
+      && needs.select.outputs.run_strict_compat != 'false'
+      && needs.build-debug.result == 'success'
+      && needs.build-complete.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # e2e.manifest_compat_on_host is a manifest bucket with portable cells, so
@@ -1076,6 +1141,14 @@ jobs:
       E2E_RESULT_ROOT: /results/compat
     steps:
       - uses: actions/checkout@v4
+      - name: Download debug shard success records
+        uses: actions/download-artifact@v4
+        with:
+          pattern: debug-shard-ok-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: ignored/debug-shard-ok
+          merge-multiple: true
+      - name: Require the debug shards this job depends on
+        run: ./ci/debug-shard-success.sh require ignored/debug-shard-ok "$(jq -r '.strict_compat_nodes|join(",")' ci/portable-shards.json)"
       - name: Initialize submodules
         run: git submodule update --init --recursive
       - uses: Swatinem/rust-cache@v2
@@ -1179,8 +1252,11 @@ jobs:
       matrix: ${{ fromJSON(needs.select.outputs.release_matrix) }}
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
+      # hermit-cli/tests/liteinst_allocator.rs compiles reverie/scripts/m1_artifact.rs
+      # from the pinned reverie submodule, so every job that builds workspace tests
+      # needs it checked out (run 38106386550 failed at build.workspace_on_host).
+      - name: Initialize dagrun and reverie submodules
+        run: git submodule update --init agent-utils reverie
       # build-debug saves the only workspace cache; the release-profile cache
       # lost its producer with build-release
       # (https://github.com/rrnewton/hermit/issues/3458).
@@ -1219,6 +1295,13 @@ jobs:
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
+      # test.sabre_examples_on_host verifies the prepared-Nextest record inside
+      # ci/run-hosted-node.sh's network namespace, which re-hashes each git
+      # dependency's Cargo checkout; see test-debug's fetch step for the
+      # rust-cache key miss that left those checkouts absent in run
+      # 37469056816.
+      - name: Fetch locked workspace dependencies
+        run: cargo fetch --locked
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -1454,6 +1537,12 @@ jobs:
       - name: Run known-red SaBRe exec probes
         run: |
           set -euo pipefail
+          # Each budgeted E2E invocation measures its CPU in a cgroup the
+          # runner creates below its own, which the root-owned hosted job
+          # cgroup refuses. Move this shell into a runner-owned child first, as
+          # the preflight step does for nextest-cpu-wrapper; without it every
+          # probe would stop on unmeasurable CPU instead of reaching SaBRe.
+          ./ci/delegate-hosted-cgroup.sh "$$"
           failures=0
           probe() {
             test_id=$1
@@ -1509,8 +1598,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize dagrun submodule
-        run: git submodule update --init agent-utils
+      # hermit-cli/tests/liteinst_allocator.rs compiles reverie/scripts/m1_artifact.rs
+      # from the pinned reverie submodule, so every job that builds workspace tests
+      # needs it checked out (run 38106386550 failed at build.workspace_on_host).
+      - name: Initialize dagrun and reverie submodules
+        run: git submodule update --init agent-utils reverie
       - name: Install rust-script
         env:
           RUSTFLAGS: ""
@@ -1559,6 +1651,15 @@ jobs:
           actual=$(find ignored/transport -maxdepth 1 -name '*.tar.zst' -type f | wc -l)
           [[ "$EXPECTED" =~ ^[0-9]+$ && "$actual" -eq "$EXPECTED" ]] || {
             echo "expected $EXPECTED parity archives, found $actual" >&2
+            # Name each absent archive: e2e matrix slugs keep _on_host, the
+            # strict-compat buckets' do not (ci/pack-parity-transport.sh calls).
+            jq -r '(.e2e_nodes[] | sub("^e2e\\.manifest_"; "")),
+                   (.strict_compat_nodes[] | select(startswith("e2e.manifest_"))
+                    | sub("^e2e\\.manifest_"; "") | sub("_on_host$"; ""))' ci/portable-shards.json |
+              while IFS= read -r slug; do
+                archive="ignored/transport/parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-$slug.tar.zst"
+                [[ -f "$archive" ]] || echo "missing parity archive: $archive" >&2
+              done
             exit 1
           }
 
@@ -1597,12 +1698,13 @@ jobs:
               and .lane == "portable"
               and .source_tree_dirty == false)
           ' ignored/reduced/results.jsonl >/dev/null
-          # GitHub-hosted runners have no PMU, so the hosted-portable profile
-          # omits KVM cells (HOSTED_PORTABLE_EXCLUDED_BACKENDS in
-          # ci/manifest-plan/src/validation_dag.rs). Local validate still
-          # requires every KVM cell.
+          # GitHub-hosted runners have no PMU and no CPUID faulting, so the
+          # hosted-portable profile omits KVM cells and the in-guest LiteInst
+          # cells of liteinst and in-guest-trap (HOSTED_PORTABLE_EXCLUDED_BACKENDS
+          # in ci/manifest-plan/src/validation_dag.rs). Local validate still
+          # requires every one of them.
           jq -S --argjson expected "$EXPECTED_CELLS" '
-            [.cells[] | select(.lane == "portable" and .backend != "kvm")
+            [.cells[] | select(.lane == "portable" and .backend != "kvm" and .backend != "liteinst" and .backend != "in-guest-trap")
               | [.lane, .category, .test, .mode, .backend]]
             | select(length == $expected) | sort
           ' ci/expected-e2e-plan.json > ignored/reduced/expected-identities.json

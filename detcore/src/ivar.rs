@@ -121,6 +121,24 @@ impl<T: Debug> Default for Ivar<T> {
     }
 }
 
+impl<T> Ivar<T> {
+    /// Whether the Ivar is filled right now, without cloning its contents.
+    /// The same caveat as [`Ivar::try_read`] applies.
+    pub fn is_full(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("Ivar is_full could not lock.")
+            .contents
+            .is_some()
+    }
+
+    /// Whether the Ivar is still empty right now, without cloning anything.
+    /// The same caveat as [`Ivar::try_read`] applies.
+    pub fn is_empty(&self) -> bool {
+        !self.is_full()
+    }
+}
+
 /// Equality on Ivars is pointer equality.
 impl<T: Debug> PartialEq for Ivar<T> {
     fn eq(&self, other: &Self) -> bool {
@@ -156,6 +174,16 @@ impl<T: Debug + Clone> Ivar<T> {
     pub fn try_read(&self) -> Option<T> {
         let shared = self.inner.lock().expect("Ivar try_read could not lock.");
         shared.contents.clone()
+    }
+
+    /// [`Ivar::try_read`] without the clone: apply `f` to the contents, if
+    /// filled. The same caveat applies.
+    pub fn try_read_with<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        let shared = self
+            .inner
+            .lock()
+            .expect("Ivar try_read_with could not lock.");
+        shared.contents.as_ref().map(f)
     }
     /// This has the same effect as calling .await directly on the ivar, however it is provided for
     /// two reasons:
@@ -212,7 +240,10 @@ mod tests {
         let iv = Ivar::new();
         let e = iv.try_read();
         assert_eq!(e, None);
+        // The presence checks agree with try_read without cloning.
+        assert!(iv.is_empty() && !iv.is_full());
         iv.put(33);
+        assert!(iv.is_full() && !iv.is_empty());
         let x = iv.clone().await;
         let z = iv.try_read();
         let y = iv.await;

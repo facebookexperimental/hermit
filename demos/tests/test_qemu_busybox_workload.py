@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Demo 9 passes only when every stage of its guest workload passed.
 
 Demo 9 boots Linux under Hermit and QEMU from an initramfs whose /init runs a
@@ -125,9 +119,7 @@ def commands_init_runs(text):
                 or (token.endswith("$") and following == "(")
                 or (at_command and token in UNREAD_WORDS)
             ):
-                raise ValueError(
-                    "line {}: unread shell syntax: {}".format(number, line)
-                )
+                raise ValueError("line {}: unread shell syntax: {}".format(number, line))
             if token in CONTROL_OPERATORS:
                 at_command = True
             elif token in (")", "()"):
@@ -142,9 +134,7 @@ def commands_init_runs(text):
                 at_command = False
                 if token == "busybox":
                     if following is None:
-                        raise ValueError(
-                            "line {}: busybox without an applet".format(number)
-                        )
+                        raise ValueError("line {}: busybox without an applet".format(number))
                     commands.add(following)
                     index += 1
                 elif token not in SHELL_BUILTINS and token not in functions:
@@ -155,9 +145,7 @@ def commands_init_runs(text):
 
 def init_pass_line(text):
     """The PASS line /init prints, read from its source."""
-    lines = re.findall(
-        r"^\s*echo '({}[^']*)'\s*$".format(BARE_MARKER), text, re.MULTILINE
-    )
+    lines = re.findall(r"^\s*echo '({}[^']*)'\s*$".format(BARE_MARKER), text, re.MULTILINE)
     if len(lines) != 1:
         raise ValueError("expected one PASS line in /init, found {!r}".format(lines))
     return lines[0]
@@ -270,9 +258,7 @@ class BuilderRefusesUnusableBusyBoxTest(unittest.TestCase):
         _write_executable(
             busybox,
             BUILD_BUSYBOX.replace("@NAMES@", " ".join(sorted(applets)))
-            .replace(
-                "@PATHS@", " ".join(APPLET_PATHS[name] for name in sorted(applets))
-            )
+            .replace("@PATHS@", " ".join(APPLET_PATHS[name] for name in sorted(applets)))
             .replace("@SH@", shell),
         )
         archive = scratch / "out" / "initramfs-busybox.cpio.gz"
@@ -331,7 +317,7 @@ class BuilderRefusesUnusableBusyBoxTest(unittest.TestCase):
 # Stands in for BusyBox when /init runs on the host. It records each call in
 # $STUB_RECORD, emulates the applets /init runs, and exits 3 for the call that
 # $STUB_FAIL names, or one that begins with it and a space.
-STAND_IN_BUSYBOX = r"""#!@PYTHON@
+STAND_IN_BUSYBOX = r'''#!@PYTHON@
 import hashlib
 import os
 import sys
@@ -373,7 +359,7 @@ elif args == ["bc", "-l"]:
 else:
     sys.stderr.write("stand-in busybox: unexpected call: " + call + "\n")
     sys.exit(127)
-"""
+'''
 
 # Stands in for mount, mknod, and poweroff: it records the call and succeeds.
 RECORDING_COMMAND = """#!/bin/sh
@@ -459,9 +445,7 @@ class InitStagesTest(unittest.TestCase):
                 "sh",
                 "-c",
                 "for name in {}; do command -v $name; done; "
-                "(set -o pipefail) 2>/dev/null && echo pipefail".format(
-                    " ".join(names)
-                ),
+                "(set -o pipefail) 2>/dev/null && echo pipefail".format(" ".join(names)),
             ],
             env={"PATH": str(stand_ins)},
             stdin=subprocess.DEVNULL,
@@ -543,9 +527,7 @@ class InitStagesTest(unittest.TestCase):
     def test_a_shell_without_pipefail_stops_before_the_workload(self):
         bash = shutil.which("bash")
         self.assertIsNotNone(bash, "bash is required")
-        result, calls = self._run_init(
-            [bash, "-c", SHELL_WITHOUT_PIPEFAIL_RUNNING_INIT]
-        )
+        result, calls = self._run_init([bash, "-c", SHELL_WITHOUT_PIPEFAIL_RUNNING_INIT])
         report = result.stdout + result.stderr
         self.assertEqual(
             ["{} stage=pipefail status=1".format(FAIL_PREFIX)],

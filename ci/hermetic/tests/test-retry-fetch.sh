@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Both-ways proof for the fetch phase's bounded retry.
 #
 # ⚠️ THIS SOURCES THE REAL HELPER, NOT A COPY. A test that reimplements the

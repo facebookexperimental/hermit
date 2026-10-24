@@ -17,7 +17,9 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use anyhow::bail;
-use clap::Parser;
+use clap::CommandFactory;
+use clap::FromArgMatches;
+use clap::parser::ValueSource;
 use colored::Colorize;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
@@ -185,9 +187,13 @@ impl RunData {
                 None
             },
             backend: self.analyze_opts.backend,
+            // Every trial charges the invocation's ONE budget, as verify's
+            // per-run logs do. Without --verbose/--selfcheck a trial traces to
+            // hermit's own stderr -- the public stream the cap exists to bound.
+            max_log_bytes: self.analyze_opts.max_log_bytes,
+            log_budget: self.analyze_opts.log_budget.clone(),
             log_file_handle: None,
-            run_evidence_log_handle: None,
-            run_evidence_write_error: None,
+            unsafe_ignore_host_seccomp: false,
         }
     }
 
@@ -219,6 +225,7 @@ impl RunData {
 
         let repro_file = self.root_path().with_extension("repro");
         std::fs::write(repro_file, self.to_repro() + "\n")?;
+        self.runopts.write_debug_options_dump()?;
 
         let (_, output) = self.runopts.run(&gopts, true)?;
         let output: Output = output.context("expected captured output")?;
@@ -391,44 +398,49 @@ impl RunData {
         for arg in &aopts.run_args {
             run_cmd.push(arg.to_string());
         }
-        let mut runopts = RunOpts::try_parse_from(run_cmd.iter()).unwrap_or_else(|error| {
-            if crate::misplaced_backend_argument(&error).is_some() {
-                // `--backend` is global. Point at the spelling that selects the
-                // trials' backend instead of letting clap suggest the unrelated
-                // `--backend-engagement-json`. clap reports only the flag name,
-                // so read the value from the run arguments themselves.
-                // The first `--backend` is the one clap refused; later tokens may
-                // be the guest's own arguments.
-                let value = run_cmd
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, arg)| {
-                        if arg == "--backend" {
-                            Some(run_cmd.get(index + 1).map(String::as_str).unwrap_or(""))
-                        } else {
-                            arg.strip_prefix("--backend=")
-                        }
-                    })
-                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
-                    .unwrap_or("<BACKEND>");
-                clap::Error::raw(
-                    clap::error::ErrorKind::UnknownArgument,
-                    format!(
-                        "`--backend` is not a `run` option, so it cannot be passed through \
+        let matches = RunOpts::command()
+            .try_get_matches_from(run_cmd.iter())
+            .unwrap_or_else(|error| {
+                if crate::misplaced_backend_argument(&error).is_some() {
+                    // `--backend` is global. Point at the spelling that selects the
+                    // trials' backend instead of letting clap suggest the unrelated
+                    // `--backend-engagement-json`. clap reports only the flag name,
+                    // so read the value from the run arguments themselves.
+                    // The first `--backend` is the one clap refused; later tokens may
+                    // be the guest's own arguments.
+                    let value = run_cmd
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, arg)| {
+                            if arg == "--backend" {
+                                Some(run_cmd.get(index + 1).map(String::as_str).unwrap_or(""))
+                            } else {
+                                arg.strip_prefix("--backend=")
+                            }
+                        })
+                        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                        .unwrap_or("<BACKEND>");
+                    clap::Error::raw(
+                        clap::error::ErrorKind::UnknownArgument,
+                        format!(
+                            "`--backend` is not a `run` option, so it cannot be passed through \
                          the run arguments of `hermit analyze` or `hermit bisect`. It is a \
                          global option: select the backend for every trial with `hermit \
                          --backend={value} analyze ...` or `hermit --backend={value} bisect \
                          ...`.\n"
-                    ),
-                )
-                .exit()
-            }
-            error.exit()
-        });
+                        ),
+                    )
+                    .exit()
+                }
+                error.exit()
+            });
+        let mut runopts = RunOpts::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        runopts.capture_max_timeslice_source(&matches);
         // Apply the global backend before `get_base_runopts` validates these
         // options, so backend-specific validation sees the backend the trials
         // will run on.
         runopts.set_backend(aopts.backend);
+        runopts.set_inexact_branch_counter(aopts.inexact_branch_counter);
         runopts
     }
 
@@ -564,15 +576,1027 @@ impl RunData {
     }
 }
 
+impl AnalyzeOpts {
+    /// Refuses `--max-log-bytes` (exit 122) where the cap's `_exit(123)` could
+    /// leave a trial's guest running (`RunOpts::log_cap_refusal`). `run` makes
+    /// this check in `RunOpts::main`, but trials go straight to `RunOpts::run`,
+    /// so `analyze` and `bisect` make it here, before any workspace or trial
+    /// exists.
+    pub fn refuse_unsupervised_log_cap(&self) -> anyhow::Result<()> {
+        let trial = RunData::get_raw_runopts(self);
+        trial.refuse_unsupervised_log_cap(self.max_log_bytes)
+    }
+
+    /// Refuses `--strict` in the run arguments (exit 122) where the trials'
+    /// backend reads its virtual clock from a retired-branch counter that
+    /// fails Reverie's validation, as `hermit run --strict` does in
+    /// `RunOpts::main`. Trials go straight to `RunOpts::run`, so `analyze` and
+    /// `bisect` make the check here, before any workspace or trial exists.
+    /// Without it a trial on a miscounting counter can disagree with another
+    /// for a hardware reason and be reported as a race
+    /// (https://github.com/rrnewton/hermit/issues/3810). Unlike `run`, a trial
+    /// with `--namespace-only` is not exempt: trials never reach the
+    /// namespace-only launcher, so they still run on ptrace.
+    pub fn refuse_strict_with_inexact_branch_counter(&self) -> anyhow::Result<()> {
+        RunData::get_raw_runopts(self).refuse_strict_trial_with_inexact_branch_counter()
+    }
+
+    /// Installs the trials' `--skid-margin`, as `RunOpts::main` does for a
+    /// run: Reverie's PMU configuration is per process, and every trial of
+    /// one `analyze` or `bisect` runs in this process with the same run
+    /// arguments. It must precede the strict counter refusal, whose
+    /// validation reads that configuration. Before this, trials accepted
+    /// `--skid-margin`, ran with the default margin, and printed a
+    /// reproducer that applied it.
+    pub fn install_trial_pmu_config(&self) -> anyhow::Result<()> {
+        RunData::get_raw_runopts(self).install_pmu_config()
+    }
+
+    /// Replay the given records from the virtual-time epoch they were
+    /// recorded under, as `hermit run` does when it replays one
+    /// (`RunOpts::adopt_replayed_schedule_epoch`): every trial gets that epoch
+    /// as `--epoch`. A record's times are absolute virtual times measured from
+    /// its own epoch, and trials start through `RunOpts::run`, which does not
+    /// reconcile epochs, so without this they would start from the run
+    /// arguments' epoch instead.
+    ///
+    /// A network trace that the run arguments replay (`--replay-networking`)
+    /// is reconciled with them: its inputs are released at absolute virtual
+    /// times too (https://github.com/rrnewton/hermit/issues/3875).
+    ///
+    /// Records stored under two different epochs, or an explicit epoch
+    /// (`--epoch` or `HERMIT_EPOCH`) that differs from theirs, are refused
+    /// before any trial. Records written before epochs were stored carry none
+    /// and change nothing. Each recording is named by its option, such as
+    /// `--good`, and its path.
+    pub fn adopt_recorded_epoch(&mut self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
+        let run_cmd = std::iter::once("hermit-run").chain(
+            self.run_arg
+                .iter()
+                .chain(&self.run_args)
+                .map(String::as_str),
+        );
+        let matches = RunOpts::command()
+            .try_get_matches_from(run_cmd)
+            .context("cannot parse the trials' run arguments")?;
+        let parsed = RunOpts::from_arg_matches(&matches)?;
+        let mut epochs = Vec::new();
+        for (option, path) in recordings {
+            let epoch =
+                detcore::preemptions::read_recorded_epoch(path).map_err(anyhow::Error::msg)?;
+            epochs.push((format!("{option} {}", path.display()), epoch));
+        }
+        // A network trace given in the run arguments releases its inputs at
+        // absolute virtual times too, and every trial replays it.
+        if let Some(path) = parsed.replay_networking_trace() {
+            let file = File::open(path)
+                .with_context(|| format!("cannot open network trace {}", path.display()))?;
+            let trace = detcore_model::network_trace::NetworkTraceV2::read_framed(
+                std::io::BufReader::new(file),
+            )
+            .with_context(|| format!("{} is not a valid network trace", path.display()))?;
+            epochs.push((
+                format!("--replay-networking {}", path.display()),
+                Some(trace.epoch),
+            ));
+        }
+        let mut recorded = None;
+        let mut sources: Vec<String> = Vec::new();
+        for (source, epoch) in epochs {
+            let Some(epoch) = epoch else {
+                continue;
+            };
+            match recorded {
+                None => recorded = Some(epoch),
+                Some(first) if first != epoch => {
+                    return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(
+                        format!(
+                            "{} was recorded under the virtual-time epoch {} and {source} \
+                             under {}. Each record's times are measured from its own epoch, \
+                             so no single replay epoch reproduces both. Record both with the \
+                             same --epoch.",
+                            sources[0],
+                            first.to_rfc3339(),
+                            epoch.to_rfc3339(),
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+            sources.push(source);
+        }
+        let Some(recorded) = recorded else {
+            return Ok(());
+        };
+        let recorded_text = recorded.to_rfc3339();
+        if matches.value_source("epoch") == Some(ValueSource::DefaultValue) {
+            self.run_arg.push(format!("--epoch={recorded_text}"));
+            return Ok(());
+        }
+        let explicit = parsed.det_opts.det_config.epoch;
+        if explicit == recorded {
+            return Ok(());
+        }
+        Err(
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "the explicit virtual-time epoch {} (from --epoch or HERMIT_EPOCH) differs from \
+                 the epoch {recorded_text} that {} {} recorded under. A record's times are \
+                 absolute virtual times measured from its own epoch, so replaying it from \
+                 another epoch cannot reproduce the run. Omit --epoch to replay from the \
+                 recorded epoch, or pass --epoch={recorded_text}.",
+                explicit.to_rfc3339(),
+                sources.join(" and "),
+                if sources.len() == 1 { "was" } else { "were" },
+            )),
+        )
+    }
+
+    /// The trials' `--pipe-wake-latency`, from their run arguments (`None`
+    /// for off).
+    pub fn trial_pipe_wake_latency(&self) -> Option<u64> {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .pipe_wake_latency
+    }
+
+    /// Whether the trials keep the signal-state copy (off with
+    /// `--no-signal-state-copy` in their run arguments).
+    pub fn trial_signal_state_copy(&self) -> bool {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .signal_state_copy
+    }
+
+    /// `record` stamped with the trials' `--pipe-wake-latency` and
+    /// signal-state copy setting, as every record analyze writes must be: a
+    /// record that omitted either would be accepted when replayed under
+    /// another value (<https://github.com/rrnewton/hermit/issues/4380>).
+    pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
+        record
+            .with_pipe_wake_latency(self.trial_pipe_wake_latency())
+            .with_signal_state_copy(Some(self.trial_signal_state_copy()))
+    }
+
+    /// Write the schedule `events` for a trial to replay, stamped
+    /// ([`Self::stamp_trial_record`]).
+    pub fn write_trial_schedule(&self, events: Vec<SchedEvent>, path: &Path) -> anyhow::Result<()> {
+        self.stamp_trial_record(PreemptionRecord::from_sched_events(events))
+            .write_to_disk(path)
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// Refuse, before any trial, recordings made under another
+    /// `--pipe-wake-latency` than the trials' own, including a different
+    /// latency (https://github.com/rrnewton/hermit/issues/4380). Trials start
+    /// through `RunOpts::run`, which skips `hermit run`'s own check, so the
+    /// check is made here, as `adopt_recorded_epoch` makes the epoch's. Besides
+    /// the named `recordings`, a record the run arguments replay
+    /// (`--replay-schedule-from`, `--replay-preemptions-from`) is checked.
+    /// A record without the field was made with the option off. The same
+    /// recordings are checked for the signal-state copy setting
+    /// (`--no-signal-state-copy`), which a record without that field does not
+    /// state, so it is accepted under either.
+    pub fn refuse_recordings_under_another_pipe_wake_latency(
+        &self,
+        recordings: &[(&str, &Path)],
+    ) -> anyhow::Result<()> {
+        let trial = RunData::get_raw_runopts(self);
+        let config = &trial.det_opts.det_config;
+        let in_run_arguments = [
+            (
+                "--replay-schedule-from",
+                config.replay_schedule_from.as_deref(),
+            ),
+            (
+                "--replay-preemptions-from",
+                config.replay_preemptions_from.as_deref(),
+            ),
+        ];
+        for (option, path) in recordings.iter().copied().chain(
+            in_run_arguments
+                .into_iter()
+                .filter_map(|(option, path)| Some((option, path?))),
+        ) {
+            let recorded = detcore::preemptions::read_recorded_pipe_wake_latency(path)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::pipe_wake_latency_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.pipe_wake_latency,
+            ) {
+                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+            }
+            let recorded = detcore::preemptions::read_recorded_signal_state_copy(path)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::signal_state_copy_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.signal_state_copy,
+            ) {
+                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
+    /// The virtual-time epoch the target trial (run 1) starts from, in
+    /// RFC 3339. It replays `--run1-preemptions` when that is given.
+    #[cfg(test)]
+    pub(crate) fn trial_epoch_for_test(&self) -> String {
+        RunData::new_run1_target(self, "epoch-probe".to_owned())
+            .unwrap()
+            .runopts
+            .det_opts
+            .det_config
+            .epoch
+            .to_rfc3339()
+    }
+
+    /// Refuses (exit 122) `--save-config` and `--summary-json` in the run
+    /// arguments, before any workspace, schedule read or trial exists. Every
+    /// trial writes its configuration and summary into the workspace under
+    /// its own name (`RunData::new` replaces both paths), so the requested
+    /// files would never be written. `--record-networking` is refused too:
+    /// it would put every trial on the host network and have every trial
+    /// write the same trace. So are the options `RunOpts::options_trials_refuse`
+    /// lists: host-network and namespace-less routes, and output paths every
+    /// trial would share.
+    pub fn refuse_outputs_trials_overwrite(&self) -> anyhow::Result<()> {
+        let trial = RunData::get_raw_runopts(self);
+        // A recording runs on the host network (`RunOpts::validate_args`), so
+        // the trials would stop being reproducible, and every trial would
+        // write the same trace path.
+        if let Some(path) = trial.record_networking_trace() {
+            return Err(
+                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                    "`hermit analyze` and `hermit bisect` refuse --record-networking={} in the \
+                     run arguments: it puts every trial on the host network, so the trials \
+                     are no longer reproducible, and every trial writes that same trace, so \
+                     only the last one would remain. Record the network once with `hermit run \
+                     --record-networking`, then pass the trace to the trials with \
+                     --replay-networking.",
+                    path.display()
+                )),
+            );
+        }
+        let refused = trial.options_trials_refuse();
+        if !refused.is_empty() {
+            return Err(
+                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                    "`hermit analyze` and `hermit bisect` refuse {} in the run arguments: {}. \
+                     Remove {} from the run arguments.",
+                    refused
+                        .iter()
+                        .map(|(option, _)| *option)
+                        .collect::<Vec<_>>()
+                        .join(" and "),
+                    refused
+                        .iter()
+                        .map(|(option, reason)| format!("with {option}, {reason}"))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    if refused.len() == 1 { "it" } else { "them" },
+                )),
+            );
+        }
+        let overwritten: Vec<&str> = [
+            (trial.save_config.is_some(), "--save-config"),
+            (trial.summary_json.is_some(), "--summary-json"),
+        ]
+        .into_iter()
+        .filter_map(|(set, option)| set.then_some(option))
+        .collect();
+        if overwritten.is_empty() {
+            return Ok(());
+        }
+        Err(
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "`hermit analyze` and `hermit bisect` write each trial's configuration and summary \
+             into their workspace, so {} would never be written. Remove {} from the run \
+             arguments; the workspace keeps both files for every trial.",
+                overwritten.join(" and "),
+                if overwritten.len() == 1 { "it" } else { "them" },
+            )),
+        )
+    }
+
+    /// Refuses `--timeout` (exit 122) on a trial backend where `hermit run`
+    /// refuses it (`RunOpts::ensure_timeout_supported`), before any workspace,
+    /// schedule read or trial exists. Trials never pass through
+    /// `RunOpts::main`, which makes that check for a run, so a KVM trial
+    /// accepted the bound that its printed `hermit --backend=kvm run
+    /// --timeout=N` reproducer is refused for.
+    pub fn refuse_unqualified_trial_timeout(&self) -> anyhow::Result<()> {
+        RunData::get_raw_runopts(self).ensure_timeout_supported()
+    }
+
+    /// Refuses (exit 122) run arguments that a trial would accept and run
+    /// without (`RunOpts::options_only_main_applies`), before any workspace,
+    /// schedule read or trial exists. Accepting them would run every trial
+    /// without them and print a reproducer that applies them, so the
+    /// reproducer would not reproduce the trial.
+    pub fn refuse_options_trials_do_not_apply(&self) -> anyhow::Result<()> {
+        let dropped = RunData::get_raw_runopts(self).options_only_main_applies();
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        Err(
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "`hermit analyze` and `hermit bisect` cannot apply {} to their trials: each trial \
+             starts through `RunOpts::run`, and only `hermit run` itself applies {}. Remove {} \
+             from the run arguments, or run the program with `hermit run`.",
+                dropped.join(", "),
+                if dropped.len() == 1 { "it" } else { "them" },
+                if dropped.len() == 1 { "it" } else { "them" },
+            )),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
+
+    /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding
+    /// 2: the refusal `RunOpts::main` makes never sees an analyze or bisect
+    /// trial, which goes straight to `RunOpts::run`. Those commands admit
+    /// ptrace and KVM, and `--no-namespace`, passed through the run arguments,
+    /// is refused with either (round-4c review, finding 1).
+    #[test]
+    fn log_cap_refusal_reaches_analyze_and_bisect_trials() {
+        let options = |argv: &[&str]| {
+            let args = crate::Args::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options
+        };
+        let kvm = "--backend=kvm and --no-namespace";
+        for (refused, named) in [
+            (
+                &[
+                    "hermit",
+                    "--max-log-bytes=4K",
+                    "--backend=kvm",
+                    "analyze",
+                    "--run-arg=--no-namespace",
+                    "--",
+                    "/bin/true",
+                ][..],
+                kvm,
+            ),
+            (
+                &[
+                    "hermit",
+                    "--max-log-bytes=4K",
+                    "--backend=kvm",
+                    "analyze",
+                    "--",
+                    "--no-namespace",
+                    "/bin/true",
+                ][..],
+                kvm,
+            ),
+            // The default (ptrace) backend: its tracer sets PTRACE_O_EXITKILL
+            // only after the trial's guest exists.
+            (
+                &[
+                    "hermit",
+                    "--max-log-bytes=4K",
+                    "analyze",
+                    "--run-arg=--no-namespace",
+                    "--",
+                    "/bin/true",
+                ][..],
+                "--no-namespace",
+            ),
+            (
+                &[
+                    "hermit",
+                    "--max-log-bytes=4K",
+                    "analyze",
+                    "--",
+                    "--no-namespace",
+                    "/bin/true",
+                ][..],
+                "--no-namespace",
+            ),
+        ] {
+            let error = options(refused)
+                .refuse_unsupervised_log_cap()
+                .expect_err("the trial's guest could outlive hermit");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{refused:?}: {error:#}"
+            );
+            assert!(
+                error.to_string().starts_with(&format!(
+                    "--max-log-bytes cannot be enforced with {named}: "
+                )),
+                "{refused:?}: {error:#}"
+            );
+        }
+        for accepted in [
+            &[
+                "hermit",
+                "--backend=kvm",
+                "analyze",
+                "--run-arg=--no-namespace",
+                "--",
+                "/bin/true",
+            ][..],
+            &[
+                "hermit",
+                "--max-log-bytes=4K",
+                "--backend=kvm",
+                "analyze",
+                "--",
+                "/bin/true",
+            ][..],
+            &[
+                "hermit",
+                "analyze",
+                "--run-arg=--no-namespace",
+                "--",
+                "/bin/true",
+            ][..],
+            &["hermit", "--max-log-bytes=4K", "analyze", "--", "/bin/true"][..],
+        ] {
+            options(accepted)
+                .refuse_unsupervised_log_cap()
+                .unwrap_or_else(|error| panic!("{accepted:?}: {error:#}"));
+        }
+    }
+
+    /// https://github.com/rrnewton/hermit/issues/3810: `hermit run --strict`
+    /// refuses an inexact retired-branch counter in `RunOpts::main`, which
+    /// analyze and bisect trials never reach, so the trial options make the
+    /// same refusal, with the same conditions: `--strict` in either spelling of
+    /// the run arguments, a backend that reads that counter, and a failed
+    /// validation.
+    #[test]
+    fn strict_trials_refuse_an_inexact_branch_counter() {
+        let options = |argv: &[&str], probe: fn() -> Option<String>| {
+            let args = crate::Args::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options.inexact_branch_counter = probe;
+            options
+        };
+        let inexact = || Some("SpecLockMap is enabled".to_string());
+        for refused in [
+            &["hermit", "analyze", "--run-arg=--strict", "--", "/bin/true"][..],
+            &["hermit", "analyze", "--", "--strict", "/bin/true"][..],
+            &[
+                "hermit",
+                "--backend=ptrace",
+                "analyze",
+                "--",
+                "--strict",
+                "/bin/true",
+            ][..],
+            // `RunOpts::run` ignores `--namespace-only`, so these trials still
+            // run on ptrace and its counter (rel-041 review of
+            // https://github.com/rrnewton/hermit/pull/3834).
+            &[
+                "hermit",
+                "analyze",
+                "--",
+                "--strict",
+                "--namespace-only",
+                "/bin/true",
+            ][..],
+            &[
+                "hermit",
+                "analyze",
+                "--run-arg=--strict",
+                "--run-arg=--lite",
+                "--",
+                "/bin/true",
+            ][..],
+        ] {
+            let error = options(refused, inexact)
+                .refuse_strict_with_inexact_branch_counter()
+                .expect_err("a strict trial on an inexact counter");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{refused:?}: {error:#}"
+            );
+            let message = error.to_string();
+            for expected in ["--strict", "`ptrace` backend", "SpecLockMap is enabled"] {
+                assert!(
+                    message.contains(expected),
+                    "{refused:?}: {expected:?}: {message}"
+                );
+            }
+        }
+        let unreachable: fn() -> Option<String> = || panic!("the counter is not consulted");
+        for (accepted, probe) in [
+            (&["hermit", "analyze", "--", "/bin/true"][..], unreachable),
+            (
+                &[
+                    "hermit",
+                    "--backend=kvm",
+                    "analyze",
+                    "--",
+                    "--strict",
+                    "/bin/true",
+                ][..],
+                unreachable,
+            ),
+            (
+                &["hermit", "analyze", "--", "--strict", "/bin/true"][..],
+                || None,
+            ),
+        ] {
+            options(accepted, probe)
+                .refuse_strict_with_inexact_branch_counter()
+                .unwrap_or_else(|error| panic!("{accepted:?}: {error:#}"));
+        }
+    }
+
+    /// Trials start through `RunOpts::run`, so run options that only
+    /// `RunOpts::main` applies are refused, each named, instead of being
+    /// dropped from every trial while the printed reproducer keeps them.
+    /// Options the trials do apply are admitted.
+    #[test]
+    fn trials_refuse_run_options_only_main_applies() {
+        let options = |argv: &[&str]| {
+            let args = crate::Args::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options
+        };
+        for (run_args, named) in [
+            (&["--namespace-only"][..], &["--namespace-only"][..]),
+            (&["--lite"][..], &["--namespace-only"][..]),
+            (&["--verify"][..], &["--verify"][..]),
+            (&["--verify", "--verify-strict"][..], &["--verify"][..]),
+            (&["--verify-run=vr"][..], &["--verify-run"][..]),
+            (
+                &["--backend-engagement-json=b.json"][..],
+                &["--backend-engagement-json"][..],
+            ),
+            (
+                &["--verify", "--happens-before=hb.txt"][..],
+                &["--verify", "--happens-before"][..],
+            ),
+            (
+                &["--cpu-profile", "x86-64-v3"][..],
+                &["--cpu-profile x86-64-v3"][..],
+            ),
+        ] {
+            let mut argv = vec!["hermit", "analyze", "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let error = options(&argv)
+                .refuse_options_trials_do_not_apply()
+                .expect_err("a dropped run option");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{argv:?}: {error:#}"
+            );
+            let message = error.to_string();
+            for option in named {
+                assert!(message.contains(option), "{argv:?}: {option}: {message}");
+            }
+        }
+        for run_args in [
+            &[][..],
+            &["--strict"][..],
+            &["--no-namespace"][..],
+            &["--timeout=5"][..],
+            &["--skid-margin=500"][..],
+            &["--summary"][..],
+        ] {
+            let mut argv = vec!["hermit", "analyze", "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            options(&argv)
+                .refuse_options_trials_do_not_apply()
+                .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+        }
+    }
+
+    /// rel-041's review of https://github.com/rrnewton/hermit/pull/3836: an
+    /// explicit `--save-config` or `--summary-json` is refused, each named,
+    /// because every trial writes both into the workspace under its own
+    /// name. Without them a trial still gets those workspace paths.
+    #[test]
+    fn trials_refuse_outputs_they_overwrite() {
+        let options = |run_args: &[&str]| {
+            let mut argv = vec!["analyze", "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            AnalyzeOpts::try_parse_from(&argv).unwrap()
+        };
+        for (run_args, named) in [
+            (
+                &["--save-config=requested.config"][..],
+                &["--save-config"][..],
+            ),
+            (
+                &["--summary-json=requested.summary"][..],
+                &["--summary-json"][..],
+            ),
+            (
+                &["--save-config=c", "--summary-json=s"][..],
+                &["--save-config", "--summary-json"][..],
+            ),
+        ] {
+            let error = options(run_args)
+                .refuse_outputs_trials_overwrite()
+                .expect_err("an overwritten output");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{run_args:?}: {error:#}"
+            );
+            let message = error.to_string();
+            for option in named {
+                assert!(
+                    message.contains(option),
+                    "{run_args:?}: {option}: {message}"
+                );
+            }
+        }
+        let mut admitted = options(&[]);
+        admitted.refuse_outputs_trials_overwrite().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        admitted.tmp_dir = Some(workspace.path().to_path_buf());
+        let run = RunData::new_baseline(&admitted, "outputs".to_owned()).unwrap();
+        for path in [&run.runopts.save_config, &run.runopts.summary_json] {
+            let path = path.as_ref().expect("the trial writes it");
+            assert!(path.starts_with(workspace.path()), "{}", path.display());
+        }
+        // A network recording would put every trial on the host network.
+        let error = options(&["--record-networking=requested.trace"])
+            .refuse_outputs_trials_overwrite()
+            .expect_err("a network recording");
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("refuse --record-networking=requested.trace")
+                && message.contains("host network")
+                && message.contains("--replay-networking"),
+            "{message}"
+        );
+        // Host-network and namespace-less routes, and output paths every
+        // trial would share (`RunOpts::options_trials_refuse`).
+        for (run_arg, named) in [
+            ("--strace-only", "--strace-only"),
+            ("--no-sequentialize-threads", "--no-sequentialize-threads"),
+            ("--network=host", "--network=host"),
+            ("--no-namespace", "--no-namespace"),
+            ("--gdbserver", "--gdbserver"),
+            ("--dap-listen=127.0.0.1:0", "--dap-listen"),
+            (
+                "--record-preemptions-to=requested.preempts",
+                "--record-preemptions-to",
+            ),
+            (
+                "--stacktrace-event=5,requested.stack",
+                "--stacktrace-event with a path",
+            ),
+            (
+                "--preemption-stacktrace-log-file=requested.log",
+                "--preemption-stacktrace-log-file",
+            ),
+        ] {
+            let error = options(&[run_arg])
+                .refuse_outputs_trials_overwrite()
+                .expect_err("an option the trials cannot take");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{run_arg}: {error:#}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("refuse {named} in the run arguments"))
+                    && message.contains(&format!("with {named}, ")),
+                "{run_arg}: {message}"
+            );
+        }
+        // A stack-trace event without a path prints to stderr, and local
+        // networking is the default: both stay admitted.
+        for admitted in ["--stacktrace-event=5", "--network=local"] {
+            options(&[admitted])
+                .refuse_outputs_trials_overwrite()
+                .unwrap_or_else(|error| panic!("{admitted}: {error:#}"));
+        }
+    }
+
+    /// rel-041's review of https://github.com/rrnewton/hermit/pull/3836:
+    /// `--timeout` on a trial backend where `hermit run` refuses it (KVM) is
+    /// refused the same way, while the ptrace trial keeps it.
+    #[test]
+    fn trials_refuse_a_timeout_their_backend_cannot_enforce() {
+        let options = |argv: &[&str]| {
+            let args = crate::Args::try_parse_from(argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options
+        };
+        let error = options(&[
+            "hermit",
+            "--backend=kvm",
+            "analyze",
+            "--",
+            "--timeout=3",
+            "/bin/true",
+        ])
+        .refuse_unqualified_trial_timeout()
+        .expect_err("KVM does not enforce --timeout");
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("--timeout is not qualified"),
+            "{error:#}"
+        );
+        for admitted in [
+            &["hermit", "analyze", "--", "--timeout=3", "/bin/true"][..],
+            &[
+                "hermit",
+                "--backend=ptrace",
+                "analyze",
+                "--",
+                "--timeout=3",
+                "/bin/true",
+            ][..],
+            &["hermit", "--backend=kvm", "analyze", "--", "/bin/true"][..],
+        ] {
+            options(admitted)
+                .refuse_unqualified_trial_timeout()
+                .unwrap_or_else(|error| panic!("{admitted:?}: {error:#}"));
+        }
+    }
+
+    /// Through `main`: the dropped-option, overwritten-output and
+    /// unqualified-timeout refusals are in analyze's preflight, before the
+    /// workspace and every trial. `--run1-schedule` stops a `main` that passed
+    /// them, with its own refusal right after that preflight, so each case
+    /// asserts which refusal fired and that it was not that one (see the
+    /// strict counter test below).
+    #[test]
+    fn trials_refuse_run_options_only_main_applies_before_their_workspace() {
+        for (backend, extra, named) in [
+            (None, "--namespace-only", "--namespace-only"),
+            (None, "--lite", "--namespace-only"),
+            (None, "--verify", "--verify"),
+            (None, "--save-config=requested.config", "--save-config"),
+            (None, "--summary-json=requested.summary", "--summary-json"),
+            (
+                Some("--backend=kvm"),
+                "--timeout=3",
+                "--timeout is not qualified",
+            ),
+            (
+                None,
+                "--record-networking=requested.trace",
+                "refuse --record-networking=requested.trace",
+            ),
+            (
+                None,
+                "--strace-only",
+                "refuse --strace-only in the run arguments",
+            ),
+            (
+                None,
+                "--no-sequentialize-threads",
+                "refuse --no-sequentialize-threads in the run arguments",
+            ),
+            (
+                None,
+                "--network=host",
+                "refuse --network=host in the run arguments",
+            ),
+            (
+                None,
+                "--no-namespace",
+                "refuse --no-namespace in the run arguments",
+            ),
+            (
+                None,
+                "--gdbserver",
+                "refuse --gdbserver in the run arguments",
+            ),
+            (
+                None,
+                "--dap-listen=127.0.0.1:0",
+                "refuse --dap-listen in the run arguments",
+            ),
+            (
+                None,
+                "--record-preemptions-to=requested.preempts",
+                "refuse --record-preemptions-to in the run arguments",
+            ),
+            (
+                None,
+                "--stacktrace-event=5,requested.stack",
+                "refuse --stacktrace-event with a path in the run arguments",
+            ),
+            (
+                None,
+                "--preemption-stacktrace-log-file=requested.log",
+                "refuse --preemption-stacktrace-log-file in the run arguments",
+            ),
+        ] {
+            let mut argv = vec!["hermit"];
+            argv.extend(backend);
+            argv.extend([
+                "analyze",
+                "--run1-schedule=/nonexistent/schedule.json",
+                "--",
+                extra,
+                "/bin/true",
+            ]);
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            let error = options.main(&args.global).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{argv:?}: {error:#}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(named), "{argv:?}: {error:#}");
+            assert!(
+                !message.contains("does not implement"),
+                "{argv:?}: main passed the preflight refusal: {error:#}"
+            );
+        }
+    }
+
+    /// Analyze's trials apply `--skid-margin`: its preflight records it as the
+    /// skid margin of Reverie's per-process PMU configuration, so a later
+    /// margin is refused. `main` refuses the unimplemented `--run1-schedule`
+    /// right after that preflight, which stops it before any workspace. This
+    /// relies on nextest running each test in a process of its own, as the
+    /// validation DAG does.
+    #[test]
+    fn analyze_installs_the_trials_skid_margin() {
+        let argv = [
+            "hermit",
+            "analyze",
+            "--run1-schedule=/nonexistent/schedule.json",
+            "--",
+            "--skid-margin=4321",
+            "/bin/true",
+        ];
+        let args = crate::Args::try_parse_from(argv).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        // The refusal that follows the preflight, not an earlier one.
+        let error = options.main(&args.global).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("hermit analyze does not implement --run1-schedule"),
+            "main stopped before reaching the --run1-schedule refusal: {error:#}"
+        );
+        // A second margin is refused once one is recorded. Neither recording
+        // reads the host's CPU, so this holds on a host Reverie has no PMU
+        // profile for, such as a GitHub-hosted runner's Emerald Rapids.
+        assert!(
+            reverie_ptrace::set_skid_margin_override(1).is_err(),
+            "analyze did not install the trials' --skid-margin"
+        );
+    }
+
+    /// The printed reproducer carries `--timeout`, which every trial applies
+    /// (`run_in_container` reads it), so the reproducer is bounded as the
+    /// trial was.
+    #[test]
+    fn analyzer_reproducer_retains_the_trial_timeout() {
+        use clap::CommandFactory;
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", "--", "--timeout=7", "/bin/true"]).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let run = RunData::new_baseline(&options, "timeout-repro".to_owned()).unwrap();
+        let repro = run.to_repro();
+        assert_eq!(repro.matches(" --timeout=7").count(), 1, "{repro}");
+        let matches = crate::Args::command()
+            .try_get_matches_from(shell_words::split(&repro).unwrap())
+            .unwrap();
+        let args = crate::args_from_matches_with_clock(&matches, || {
+            panic!("analyzer reproduction must retain its actual fixed input")
+        })
+        .unwrap();
+        let crate::Subcommand::Run(mut parsed) = args.command else {
+            panic!("expected run")
+        };
+        parsed.validate_args().unwrap();
+        assert_eq!(parsed.to_string(), run.runopts.to_string());
+    }
+
+    /// Through `main`: the refusal must be wired into analyze's preflight,
+    /// ahead of the workspace and every trial. `--run1-schedule` is not
+    /// implemented and `main` refuses it right after that preflight, so an
+    /// analyze that passed the counter refusal stops at that refusal instead,
+    /// before starting anything; the message assertion below tells them apart.
+    /// A trial with `--namespace-only` or `--lite` is refused earlier in that
+    /// preflight, for a dropped option
+    /// (`trials_refuse_run_options_only_main_applies_before_their_workspace`);
+    /// `strict_trials_refuse_an_inexact_branch_counter` keeps it covered at
+    /// the counter refusal itself.
+    #[test]
+    fn strict_analyze_refuses_an_inexact_branch_counter_before_its_workspace() {
+        let argv = [
+            "hermit",
+            "analyze",
+            "--run1-schedule=/nonexistent/schedule.json",
+            "--",
+            "--strict",
+            "/bin/true",
+        ];
+        let args = crate::Args::try_parse_from(argv).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        let error = options.main(&args.global).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("SpecLockMap is enabled"),
+            "{error:#}"
+        );
+    }
 
     /// `run` has no `--backend`, so `hermit --backend <BACKEND> analyze` is the
     /// only way to choose the trials' backend. The selection must pass the
     /// scope check and reach the options every trial is launched with: the
     /// `GlobalOpts` that `RunOpts::main` takes its backend from, the validated
     /// trial `RunOpts`, and the printed reproducer.
+    /// `hermit --max-log-bytes=N analyze` caps its trials with the
+    /// invocation's shared budget. A trial without --verbose/--selfcheck traces
+    /// to hermit's stderr, so an exempt trial would put uncapped output on the
+    /// public stream (review of https://github.com/rrnewton/hermit/pull/3686,
+    /// round 1).
+    #[test]
+    fn analyze_trials_charge_the_invocations_log_budget() {
+        let argv = ["hermit", "--max-log-bytes=4K", "analyze", "--", "/bin/true"];
+        let mut args = crate::Args::try_parse_from(argv).unwrap();
+        args.global.prepare_log_budget().unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        options.apply_global(&args.global);
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let run = RunData::new_baseline(&options, "budget".to_owned()).unwrap();
+        let trial = run.trial_global_opts();
+        assert!(trial.log_file.is_none(), "this trial traces to stderr");
+        assert_eq!(trial.max_log_bytes, Some(4096));
+        let invocation = args.global.log_budget().expect("the invocation is capped");
+        let charged = trial.log_budget().expect("the trial must be capped");
+        assert!(
+            charged.shares_counter_with(&invocation),
+            "the trial must charge the invocation's counter, not a fresh one"
+        );
+    }
+
     #[test]
     fn global_backend_reaches_every_trial_run() {
         for flag in ["ptrace", "kvm"] {
@@ -609,6 +1633,54 @@ mod tests {
                 repro.contains(&format!(" --backend={flag} run ")),
                 "{flag}: reproducer does not select the backend: {repro}"
             );
+        }
+    }
+
+    #[test]
+    fn trial_preemption_keeps_the_explicit_maximum_request() {
+        for maximum in [
+            None,
+            Some("--max-timeslice=disabled"),
+            Some("--max-timeslice=200000000"),
+        ] {
+            let mut argv = vec!["hermit", "--backend=kvm", "analyze", "--"];
+            argv.extend(maximum);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("expected analyze")
+            };
+            options.apply_global(&args.global);
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            let result = RunData::new_baseline(&options, "preemption".to_owned());
+            if maximum == Some("--max-timeslice=200000000") {
+                let error = result.err().expect("explicit maximum must refuse");
+                assert!(
+                    error
+                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .is_some()
+                );
+                assert!(
+                    format!("{error:#}")
+                        .contains("unsupported_preemption: --backend=kvm refuses --max-timeslice")
+                );
+            } else {
+                assert_eq!(
+                    result
+                        .unwrap()
+                        .runopts
+                        .det_opts
+                        .det_config
+                        .max_timeslice
+                        .map(u64::from),
+                    if maximum.is_none() {
+                        Some(200_000_000)
+                    } else {
+                        None
+                    }
+                );
+            }
         }
     }
 

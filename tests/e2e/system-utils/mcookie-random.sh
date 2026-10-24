@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # mcookie is the util-linux generator for X11 "magic cookie" authentication
 # tokens: a 128-bit value printed as 32 hex digits. It draws those 128 bits from
 # the kernel CSPRNG via getrandom(2) (confirmed by strace: an 8-byte GRND_NONBLOCK

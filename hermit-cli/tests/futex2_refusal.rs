@@ -32,7 +32,8 @@ fn futex2_feature_probes_receive_deterministic_enosys() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("futex2-refusal");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("futex2-refusal-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create futex2 guest build directory");
 
     for (source, marker, syscall) in CASES {
@@ -66,9 +67,7 @@ fn futex2_feature_probes_receive_deterministic_enosys() {
             ])
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut trace_command);
-        let trace = trace_command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to trace {source}: {error}"));
+        let trace = hermit_test::hermit_output(&format!("{trace_command:?}"), &mut trace_command);
         assert!(
             trace.status.success(),
             "{source} trace failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -103,9 +102,7 @@ fn futex2_feature_probes_receive_deterministic_enosys() {
             ])
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut command);
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to run {source}: {error}"));
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         assert!(
             output.status.success(),
             "{source} failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

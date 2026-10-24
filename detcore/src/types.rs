@@ -44,6 +44,20 @@ pub struct ChildWaitSpec {
     pub exit_class: ChildWaitExitClass,
 }
 
+/// What `timer_create`'s `sigev_notify_thread_id` names
+/// (`Scheduler::posix_timer_thread`).
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum PosixTimerThread {
+    /// A live thread of the calling process.
+    Thread(DetTid),
+    /// Anything else: Linux's `good_sigevent` answers EINVAL.
+    NotInGroup,
+    /// The caller is in a nested PID namespace, where the id is a pid of
+    /// that namespace, which Detcore does not translate yet
+    /// (<https://github.com/rrnewton/hermit/issues/4155>).
+    NestedNamespace,
+}
+
 /// Scheduler-owned lifecycle state for an exact child-process wait.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ExactChildWaitState {

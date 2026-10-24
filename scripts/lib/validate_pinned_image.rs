@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Read-only admission for the exact image consumed by selected DAG commands.
 //!
 //! This runs after plan/cache returns. It does not prepare images or reserve
@@ -287,6 +279,13 @@ exit 91
         let ran = f.run();
         assert!(ran.status.success(), "{ran:?}");
         assert!(f.dir.path().join("payload").exists());
+        assert!(
+            f.calls()
+                .lines()
+                .any(|line| line.starts_with("run --rm --pull=never ")),
+            "{}",
+            f.calls()
+        );
         let failed_payload = f
             .command()
             .args(["--src", ".", "--out", "out", "--", "true"])
@@ -429,11 +428,12 @@ exit 91
     }
 
     #[test]
-    fn term_ignoring_inspection_is_forced_to_stop_without_payload() {
+    fn term_ignoring_late_inspection_is_forced_to_stop_and_defers_to_the_run() {
         let f = Fixture::new();
         let started = std::time::Instant::now();
-        // Exercise the late caller too: even a forced-stop inspection error
-        // must not proceed to the payload or create its output directory.
+        // The late caller: a query that only timed out says nothing about the
+        // image, so after the forced stop the node's own run proceeds, and that
+        // run carries --pull=never, which refuses a missing image itself.
         let output = f
             .command()
             .args(["--src", ".", "--out", "out", "--", "true"])
@@ -447,16 +447,32 @@ exit 91
             "PINNED_IMAGE_FORCED_STOP_ELAPSED_SECONDS {}",
             elapsed.as_secs_f64()
         );
-        assert_eq!(output.status.code(), Some(137), "{output:?}");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
         assert!(elapsed >= std::time::Duration::from_secs(12), "{elapsed:?}");
         assert!(elapsed < std::time::Duration::from_secs(20), "{elapsed:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("sending signal TERM"), "{stderr}");
         assert!(stderr.contains("sending signal KILL"), "{stderr}");
-        assert!(stderr.contains("inspection unavailable"), "{stderr}");
+        assert!(stderr.contains("timed out (probe status 137"), "{stderr}");
+        assert!(f.dir.path().join("payload").exists());
+        let calls = f.calls();
+        let calls = calls.lines().collect::<Vec<_>>();
+        assert_eq!(calls[0], format!("image exists {}", f.reference));
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[1].starts_with("run --rm --pull=never "), "{calls:?}");
+
+        // Admission still refuses on the same forced stop.
+        std::fs::remove_file(f.dir.path().join("payload")).unwrap();
+        let admission = f
+            .command()
+            .arg("--check-image")
+            .env("PROBE_MODE", "ignore-term")
+            .output()
+            .unwrap();
+        let admission = observed("term-ignoring-admission-query", admission);
+        assert_eq!(admission.status.code(), Some(137), "{admission:?}");
+        assert!(String::from_utf8_lossy(&admission.stderr).contains("inspection unavailable"));
         assert!(!f.dir.path().join("payload").exists());
-        assert!(!f.dir.path().join("out").exists());
-        assert_eq!(f.calls(), format!("image exists {}\n", f.reference));
 
         let saved = std::fs::read_to_string(f.dir.path().join("generation")).unwrap();
         eprintln!("PINNED_IMAGE_FORCED_STOP_GENERATION {}", saved.trim());

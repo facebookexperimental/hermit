@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Touches one Detcore-sanitized leaf under each of the eight sysfs prefixes
 # that previously had no guest-level coverage. The assertions live here, in
 # the guest: a verify comparison cannot defend a control whose purpose is to
@@ -36,6 +36,22 @@ read_sysfs_text() {
     printf -v "$output_name" '%s' "$value"
 }
 
+# Detcore serves /sys/class/rtc/rtc*/since_epoch as the virtual wall clock in
+# whole seconds (detcore/src/procfs.rs, ProcfsKind::SysfsRtcEpoch), and that
+# clock advances between the two reads. A run's epoch is fixed for every cell
+# and every retry, so when it lies just below a whole second the second read
+# lands in the next second on every attempt
+# (https://github.com/rrnewton/hermit/issues/3969). A step of exactly one second
+# is that crossing and is accepted; any other change, and any change under
+# another prefix, still fails.
+rtc_crossed_one_second() {
+    local label=$1
+    local first=${2%$'\n'}
+    local second=${3%$'\n'}
+    [[ $label == rtc && $first =~ ^[0-9]+$ && $second =~ ^[0-9]+$ ]] || return 1
+    ((10#$second == 10#$first + 1))
+}
+
 probe_prefix() {
     local label=$1
     local root=$2
@@ -60,13 +76,13 @@ probe_prefix() {
         [[ -r $candidate ]] || continue
         if read_sysfs_text "$candidate" first; then
             if [[ ${SYSFS_PROBE_MUTATE_LABEL:-} == "$label" ]]; then
-                printf 'changed\n' >"$candidate"
+                printf '%s\n' "${SYSFS_PROBE_MUTATE_VALUE:-changed}" >"$candidate"
             fi
             if ! read_sysfs_text "$candidate" second; then
                 printf 'sysfs-sanitized-prefixes FAIL: %s second read failed at %s\n' "$label" "$candidate" >&2
                 return 1
             fi
-            if [[ $first != "$second" ]]; then
+            if [[ $first != "$second" ]] && ! rtc_crossed_one_second "$label" "$first" "$second"; then
                 printf 'sysfs-sanitized-prefixes FAIL: %s changed between reads at %s\n' "$label" "$candidate" >&2
                 return 1
             fi
@@ -142,7 +158,42 @@ self_test() {
         return 1
     }
 
+    # The RTC leaf may cross into the next whole second between its reads and
+    # nothing else: not two seconds, not backwards, not to text, and no other
+    # prefix may step by one.
+    printf '0\n' >"$fixture/sys/module/example/refcnt"
+    if ! self_test_step rtc 1767225601 "$fixture" >/dev/null; then
+        echo 'sysfs-sanitized-prefixes self-test rejected an RTC leaf that crossed one second' >&2
+        rm -rf "$fixture"
+        return 1
+    fi
+    local label_value label value
+    for label_value in rtc:1767225602 rtc:1767225599 rtc:changed module:1; do
+        label=${label_value%%:*}
+        value=${label_value#*:}
+        if output=$(self_test_step "$label" "$value" "$fixture" 2>&1); then
+            printf 'sysfs-sanitized-prefixes self-test accepted %s stepping to %s\n' "$label" "$value" >&2
+            rm -rf "$fixture"
+            return 1
+        fi
+        [[ $output == *"$label changed between reads"* ]] || {
+            printf 'sysfs-sanitized-prefixes self-test got the wrong failure for %s stepping to %s: %s\n' "$label" "$value" "$output" >&2
+            rm -rf "$fixture"
+            return 1
+        }
+    done
+
     rm -rf "$fixture"
+}
+
+# Runs every probe on the fixture with LABEL's leaf rewritten to VALUE between
+# its two reads, after restoring the fixture's starting values for the two
+# leaves the self-test mutates.
+self_test_step() {
+    local label=$1 value=$2 fixture=$3
+    printf '1767225600\n' >"$fixture/sys/class/rtc/rtc0/since_epoch"
+    printf '0\n' >"$fixture/sys/module/example/refcnt"
+    SYSFS_PROBE_MUTATE_LABEL=$label SYSFS_PROBE_MUTATE_VALUE=$value check_all_prefixes "$fixture"
 }
 
 case ${1:-} in

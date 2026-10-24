@@ -1,10 +1,5 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved. Licensed under the BSD-style license in LICENSE.
 
 //! A worker survives exec as the leader twice, retaining its clock and PMU work.
 
@@ -407,77 +402,111 @@ fn run_fixture(scenario: Scenario) {
         compile.display()
     );
     let mut previous_stdout = None;
+    // A late precise PMU interrupt makes Hermit refuse a run (exit 122 with a
+    // typed skid-overshoot report): a property of the host's interrupt latency
+    // at that moment, not of the guest. Such a refusal, and nothing else, is
+    // run again in a fresh directory, as the other PMU-node cases do
+    // (https://github.com/rrnewton/hermit/issues/1845); any other outcome is
+    // checked in full below. The runnable-leader case's first post-exec timer
+    // has 17 RCBs of slack at its 512-RCB margin (see its comment), and a
+    // validate of hermit dfce652d failed on such a refusal, in the same node
+    // run in which another PMU case needed a skid retry
+    // (https://github.com/rrnewton/hermit/issues/4397). Five attempts, as
+    // 0d7f16f3 and ec49cdd7 allow.
+    const SKID_ATTEMPTS: u32 = 5;
     for pair in 0..3 {
-        let directory = root.join(format!("pair-{pair}"));
+        let mut attempt = 0;
+        let (_, output, (directory, report_path, run2_log)) =
+            super::skid_overshoot::retry_typed_skid_refusal(
+                &format!("ptrace pair {pair}"),
+                SKID_ATTEMPTS,
+                || {
+                    attempt += 1;
+                    let directory = root.join(if attempt == 1 {
+                        format!("pair-{pair}")
+                    } else {
+                        format!("pair-{pair}-attempt-{attempt}")
+                    });
+                    let logs = directory.join("verify-logs");
+                    fs::create_dir_all(&logs).unwrap();
+                    let report_path = directory.join("verification.json");
+                    let mut args = vec![
+                        "--log=trace",
+                        "--backend=ptrace",
+                        "run",
+                        "--base-env=minimal",
+                        // CARGO_TARGET_TMPDIR may itself be under host /tmp. Keep that
+                        // fixture visible just as the neighboring CLI guest tests do.
+                        "--tmp=/tmp",
+                        "--strict",
+                        "--epoch=2026-01-01T00:00:00.123456789+00:00",
+                        if preempted {
+                            "--max-timeslice=1000000"
+                        } else {
+                            "--max-timeslice=200000000"
+                        },
+                        "--verify",
+                        "--verify-strict",
+                        "--verify-json",
+                        report_path.to_str().unwrap(),
+                        "--keep-logs",
+                        "--verify-log-dir",
+                        logs.to_str().unwrap(),
+                        "--",
+                        guest.to_str().unwrap(),
+                    ];
+                    if scenario == Scenario::RunnableLeader {
+                        // PAUSE slows branch retirement in both hot loops. A 512-RCB early
+                        // notification shortens each single-step correction tail while
+                        // retaining the same workload and repeated leader preemptions.
+                        // The precise target and refusal of every overshoot are unchanged.
+                        //
+                        // These runs never land on CPU 0, where ptrace stops cost about ten
+                        // times as much: traced_hermit_command removes it from the mask
+                        // Hermit picks a core from (https://github.com/rrnewton/hermit/issues/3265).
+                        // The CPU measurements behind this margin cover the other cores only.
+                        //
+                        // This margin is below the product's calibrated 1,000 RCBs for
+                        // EPYC 9D85. With glibc 2.34, the replacement's first post-exec PMU
+                        // timer had up to 495 RCBs of skid at the fixed relocation stop
+                        // rip 0x7ffff7fd42f3, leaving only 17 RCBs of slack. A glibc or host
+                        // change can reintroduce exit 122 at this timer.
+                        args.insert(8, "--skid-margin=512");
+                    } else if preempted {
+                        // Hermit requests each precise PMU timer interrupt this many RCBs
+                        // before its target and single-steps the rest of the way, one step
+                        // per instruction. A skid past the margin is refused with exit 122,
+                        // never delivered late, and the exit status assertion below does
+                        // not change. The value is explicit so the case costs the same on
+                        // hosts whose default margin is 10,000 RCBs.
+                        //
+                        // Each execution takes six precise timers: four in the fixture's
+                        // spin loops and two in the replacement image's dynamic loader, at
+                        // targets 138,460 and 142,760. With bare LOOP spins at
+                        // 3,072 RCBs the single steps took about 1.6 s of every execution,
+                        // and the case used 14.8-18.8 CPU-seconds of its 22 on a loaded
+                        // host. At 1,000 RCBs a bare LOOP skidded up to 4,666 RCBs and 4 of
+                        // 8 loaded runs refused, all at spin-loop timers. The spins now
+                        // PAUSE (`spin_work` in the fixture), and their timers skidded at
+                        // most 13 RCBs across 36 executions. 1,000 RCBs is the product's
+                        // calibrated default for EPYC 9D85 (reverie `pmu.rs`). The two
+                        // loader timers skidded at most 573 and 159 RCBs across 138
+                        // executions, and they take more than half of the single-step time.
+                        args.insert(8, "--skid-margin=1000");
+                    }
+                    let mut command = traced_hermit_command(&args);
+                    let (status, run2_log) =
+                        bounded_verify_command(&mut command, &directory, remaining());
+                    let output = std::process::Output {
+                        status,
+                        stdout: Vec::new(),
+                        stderr: bounded_read(&directory.join("stderr"), 16 * MIB),
+                    };
+                    (output, (directory, report_path, run2_log))
+                },
+            );
+        let status = output.status;
         let logs = directory.join("verify-logs");
-        fs::create_dir_all(&logs).unwrap();
-        let report_path = directory.join("verification.json");
-        let mut args = vec![
-            "--log=trace",
-            "--backend=ptrace",
-            "run",
-            "--base-env=minimal",
-            // CARGO_TARGET_TMPDIR may itself be under host /tmp. Keep that
-            // fixture visible just as the neighboring CLI guest tests do.
-            "--tmp=/tmp",
-            "--strict",
-            "--epoch=2026-01-01T00:00:00.123456789+00:00",
-            if preempted {
-                "--max-timeslice=1000000"
-            } else {
-                "--max-timeslice=200000000"
-            },
-            "--verify",
-            "--verify-strict",
-            "--verify-json",
-            report_path.to_str().unwrap(),
-            "--keep-logs",
-            "--verify-log-dir",
-            logs.to_str().unwrap(),
-            "--",
-            guest.to_str().unwrap(),
-        ];
-        if scenario == Scenario::RunnableLeader {
-            // PAUSE slows branch retirement in both hot loops. A 512-RCB early
-            // notification shortens each single-step correction tail while
-            // retaining the same workload and repeated leader preemptions.
-            // The precise target and refusal of every overshoot are unchanged.
-            //
-            // These runs never land on CPU 0, where ptrace stops cost about ten
-            // times as much: traced_hermit_command removes it from the mask
-            // Hermit picks a core from (https://github.com/rrnewton/hermit/issues/3265).
-            // The CPU measurements behind this margin cover the other cores only.
-            //
-            // This margin is below the product's calibrated 1,000 RCBs for
-            // EPYC 9D85. With glibc 2.34, the replacement's first post-exec PMU
-            // timer had up to 495 RCBs of skid at the fixed relocation stop
-            // rip 0x7ffff7fd42f3, leaving only 17 RCBs of slack. A glibc or host
-            // change can reintroduce exit 122 at this timer.
-            args.insert(8, "--skid-margin=512");
-        } else if preempted {
-            // Hermit requests each precise PMU timer interrupt this many RCBs
-            // before its target and single-steps the rest of the way, one step
-            // per instruction. A skid past the margin is refused with exit 122,
-            // never delivered late, and the exit status assertion below does
-            // not change. The value is explicit so the case costs the same on
-            // hosts whose default margin is 10,000 RCBs.
-            //
-            // Each execution takes six precise timers: four in the fixture's
-            // spin loops and two in the replacement image's dynamic loader, at
-            // targets 138,460 and 142,760. With bare LOOP spins at
-            // 3,072 RCBs the single steps took about 1.6 s of every execution,
-            // and the case used 14.8-18.8 CPU-seconds of its 22 on a loaded
-            // host. At 1,000 RCBs a bare LOOP skidded up to 4,666 RCBs and 4 of
-            // 8 loaded runs refused, all at spin-loop timers. The spins now
-            // PAUSE (`spin_work` in the fixture), and their timers skidded at
-            // most 13 RCBs across 36 executions. 1,000 RCBs is the product's
-            // calibrated default for EPYC 9D85 (reverie `pmu.rs`). The two
-            // loader timers skidded at most 573 and 159 RCBs across 138
-            // executions, and they take more than half of the single-step time.
-            args.insert(8, "--skid-margin=1000");
-        }
-        let mut command = traced_hermit_command(&args);
-        let (status, run2_log) = bounded_verify_command(&mut command, &directory, remaining());
         assert_eq!(
             status.code(),
             Some(0),

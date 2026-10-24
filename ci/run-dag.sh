@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # run-dag.sh — run a Hermit CI validation lane as a dagrun DAG.
 #
 # This entrypoint is the shared local/GitHub execution path for the centralized
@@ -38,6 +38,10 @@ set -uo pipefail
 # Cargo-only and must not let an inherited environment select another producer.
 unset HERMIT_VALIDATE_RELEASE_BUILD_MODE
 unset HERMIT_VALIDATE_BUCK_DOTSLASH
+# Likewise the E2E runner (--e2e-runner/--buck2): e2e.buck_cells refuses without it
+# (e2e.buck_stage does not read it).
+unset HERMIT_VALIDATE_E2E_RUNNER
+unset HERMIT_VALIDATE_BUCK2
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 2
@@ -74,6 +78,7 @@ esac
 # placing these options first would let a trailing caller argument replace the
 # committed DAG or select a different profile. Forward only runner controls
 # that cannot change graph contents or the selected node population.
+unsafe_no_cgroups=0
 validate_runner_args() {
     local arg
     while (($# > 0)); do
@@ -110,9 +115,12 @@ validate_runner_args() {
                     shift
                 fi
                 ;;
+            --unsafe-no-cgroups)
+                unsafe_no_cgroups=1
+                ;;
             --admission=*|--no-profile|--profile|--show-plan|\
             --no-profile-feedback|--profile-memory-feedback|-k|--keep-going|\
-            --no-color|--allow-cgroup-failure|--unsafe-no-cgroups|\
+            --no-color|--allow-cgroup-failure|\
             --allow-unwise-nest-dagruns|-v|-q|--quiet)
                 ;;
             *)
@@ -124,6 +132,18 @@ validate_runner_args() {
 }
 
 validate_runner_args "$@" || exit $?
+
+# Each budgeted E2E cell measures its live CPU in a cgroup of its own. Only a
+# run told to use no cgroups at all may let a cell fall back to the
+# process-group CPU scan when that cgroup cannot be created; its rows then name
+# the scan as their CPU source. `--allow-cgroup-failure` does not set the
+# marker: this script cannot tell whether dagrun then boxed the run, so such a
+# cell is stopped instead. A marker inherited from the caller never survives.
+if ((unsafe_no_cgroups)); then
+    export HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1
+else
+    unset HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN
+fi
 
 # Locate the runner. Prefer an explicit override, then the TRACKED, source-invoked
 # engine resolver (agent-utils/common/bin/dagrun -> engine-resolver),

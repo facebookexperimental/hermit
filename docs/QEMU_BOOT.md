@@ -31,11 +31,11 @@ Run the commands in this guide from the Hermit repository root unless stated
 otherwise. Build Hermit. This rebuilds `target/release/hermit`, which
 `target/install_pkg/hermit` links to, with default features; if you built the
 `dbt`, `sabre`, and `e9patch` backends from the README, use
-`cargo build --release --workspace --features hermit/third-party-backends`
+`cargo build --release --workspace --features hermit-run/third-party-backends`
 instead so the rebuild keeps them:
 
 ```bash
-cargo build --release -p hermit --bin hermit
+cargo build --release -p hermit-run --bin hermit
 ```
 
 On Debian or Ubuntu, the additional runtime tools are normally provided by:
@@ -99,7 +99,7 @@ After building the initramfs, run:
 
 ```bash
 timeout --kill-after=10s --signal=TERM 180s \
-  target/release/hermit --log error run --strict -- \
+  target/release/hermit --log error run --strict --epoch=2026-01-01T00:00:00Z -- \
   qemu-system-x86_64 \
   -nodefaults \
   -nic none \

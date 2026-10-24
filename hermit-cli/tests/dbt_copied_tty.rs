@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -15,7 +18,8 @@ fn copied_child_tiocgpgrp_verifies_under_dbt_strict() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-copied-tiocgpgrp");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("dbt-copied-tiocgpgrp-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create DBT TIOCGPGRP guest directory");
     let guest = build_root.join("dbt_copied_tiocgpgrp");
     let compile = Command::new("cc")
@@ -32,9 +36,10 @@ fn copied_child_tiocgpgrp_verifies_under_dbt_strict() {
         String::from_utf8_lossy(&compile.stderr),
     );
 
-    let output = Command::new("timeout")
+    let mut command = Command::new("timeout");
+    command
         .args(["--kill-after", "5s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log=info",
             "--backend=dbt",
@@ -44,9 +49,9 @@ fn copied_child_tiocgpgrp_verifies_under_dbt_strict() {
             "--base-env=minimal",
             "--",
         ])
-        .arg(&guest)
-        .output()
-        .expect("failed to run DBT TIOCGPGRP guest");
+        .arg(&guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

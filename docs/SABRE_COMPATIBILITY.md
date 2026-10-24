@@ -20,12 +20,12 @@ SaBRe is behind the non-default `third-party-backends` Cargo feature and needs
 the staged loader plus `libdetcore_sabre.so` beside the Hermit executable:
 
 ```bash
-cargo build --release --locked -p hermit \
+cargo build --release --locked -p hermit-run \
   --features third-party-backends -p detcore-sabre
 HERMIT_INSTALL_FORCE_RESTAGE=local-sabre \
   cargo build --release --locked -p hermit-install
 
-target/release/hermit --backend sabre run --strict --verify -- /bin/echo hello
+target/release/hermit --backend sabre run --strict --epoch=2026-01-01T00:00:00Z --verify -- /bin/echo hello
 ```
 
 An explicit SaBRe request fails closed if the feature or artifacts are absent.

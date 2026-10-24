@@ -6,7 +6,6 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-
 //! Require Hermit to supply every `reverie_dbt_runtime_*` callback the DBT
 //! client declares, before DynamoRIO discovers the gap at load time.
 //!

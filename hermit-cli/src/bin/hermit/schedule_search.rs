@@ -49,6 +49,13 @@ impl Default for Config {
     }
 }
 
+/// What one trial of the search reports: whether the replayed schedule passed,
+/// and the schedule the run actually realized. An `Err` is a trial that could
+/// not finish, for example one that `--max-log-bytes` ended; the search makes
+/// no further trial and returns that error unchanged, so its type (such as
+/// `LogCapExceeded`) still reaches the top-level handler.
+pub type TrialOutcome = anyhow::Result<(bool, Vec<SchedEvent>)>;
+
 struct EventLevelSearchResult {
     passing_schedule: Vec<SchedEvent>,
     failing_schedule: Vec<SchedEvent>,
@@ -86,6 +93,9 @@ pub fn scoring_function(first: SchedEvent, second: SchedEvent) -> i32 {
 
 #[allow(dead_code)]
 /// Search for a schedule which is failing the criteria, but is edit distance one from succeeding.
+///
+/// A trial that returns `Err` ends the search: no further trial runs and the
+/// error is returned as it is.
 pub fn search_for_critical_schedule<F>(
     mut tester: F,
     initial_passing_schedule: Vec<SchedEvent>,
@@ -93,14 +103,14 @@ pub fn search_for_critical_schedule<F>(
     cfg: &Config,
 ) -> anyhow::Result<CriticalSchedule>
 where
-    F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
+    F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
     eprintln!("Verifying pass/fail endpoints of the search, using schedule-trace replay:");
-    let (passing_endpoint_passes, _) = tester(&initial_passing_schedule);
+    let (passing_endpoint_passes, _) = tester(&initial_passing_schedule)?;
     if !passing_endpoint_passes {
         bail!("the passing schedule endpoint did not reproduce a passing outcome");
     }
-    let (failing_endpoint_passes, _) = tester(&initial_failing_schedule);
+    let (failing_endpoint_passes, _) = tester(&initial_failing_schedule)?;
     if failing_endpoint_passes {
         bail!("the failing schedule endpoint did not reproduce the target failure");
     }
@@ -115,14 +125,14 @@ where
             initial_passing_schedule,
             initial_failing_schedule,
             cfg,
-        )
+        )?
     } else {
         event_level_search(
             &mut tester,
             initial_passing_schedule,
             initial_failing_schedule,
             cfg,
-        )
+        )?
     };
 
     if cfg.refine_sub_events
@@ -130,7 +140,7 @@ where
             &mut tester,
             passing_schedule.clone(),
             failing_schedule.clone(),
-        )
+        )?
     {
         return Ok(critical_schedule);
     }
@@ -163,14 +173,14 @@ fn test_and_select_stable_point<F>(
     tester: &mut F,
     requested_schedule: &[SchedEvent],
     cfg: &Config,
-) -> (bool, Vec<SchedEvent>)
+) -> TrialOutcome
 where
-    F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
+    F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
-    let (passes, actual_schedule) = tester(requested_schedule);
+    let (passes, actual_schedule) = tester(requested_schedule)?;
     let jitter = just_distance(requested_schedule, &actual_schedule);
     if jitter.0 <= cfg.max_jitter_editdist && jitter.1 <= cfg.max_jitter_swapdist {
-        return (passes, actual_schedule);
+        return Ok((passes, actual_schedule));
     }
 
     eprintln!(
@@ -184,13 +194,13 @@ where
     );
 
     for attempt in 2..=cfg.max_replay_attempts.max(2) {
-        let (replayed_passes, replayed_actual) = tester(requested_schedule);
+        let (replayed_passes, replayed_actual) = tester(requested_schedule)?;
         if replayed_passes == passes && replayed_actual == actual_schedule {
             eprintln!(
                 ":: Jittered control schedule reproduced the same outcome and realized trace on attempt {}",
                 attempt,
             );
-            return (passes, requested_schedule.to_vec());
+            return Ok((passes, requested_schedule.to_vec()));
         }
     }
 
@@ -206,17 +216,17 @@ fn needleman_level_search<F>(
     mut passing_schedule: Vec<SchedEvent>,
     mut failing_schedule: Vec<SchedEvent>,
     cfg: &Config,
-) -> EventLevelSearchResult
+) -> anyhow::Result<EventLevelSearchResult>
 where
-    F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
+    F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
     for pass_number in 0..cfg.max_event_level_search_passes {
         let (edit_distance, swap_distance) = just_distance(&passing_schedule, &failing_schedule);
         if edit_distance == 1 && swap_distance == 1 {
-            return EventLevelSearchResult {
+            return Ok(EventLevelSearchResult {
                 passing_schedule,
                 failing_schedule,
-            };
+            });
         }
         if edit_distance != swap_distance {
             eprintln!(
@@ -269,7 +279,7 @@ where
         }
 
         let (midpoint_passes, selected_new_point) =
-            test_and_select_stable_point(tester, &requested_midpoint_schedule, cfg);
+            test_and_select_stable_point(tester, &requested_midpoint_schedule, cfg)?;
 
         if midpoint_passes {
             passing_schedule = selected_new_point;
@@ -329,9 +339,9 @@ fn event_level_search<F>(
     mut passing_schedule: Vec<SchedEvent>,
     mut failing_schedule: Vec<SchedEvent>,
     cfg: &Config,
-) -> EventLevelSearchResult
+) -> anyhow::Result<EventLevelSearchResult>
 where
-    F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
+    F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
     let orig_passing_schedule = passing_schedule.clone();
     let orig_failing_schedule = failing_schedule.clone();
@@ -373,10 +383,10 @@ where
         }
 
         if swap_dist == 1 && edit_dist == 1 {
-            return EventLevelSearchResult {
+            return Ok(EventLevelSearchResult {
                 passing_schedule,
                 failing_schedule,
-            };
+            });
         }
 
         if swap_dist == 1 {
@@ -387,7 +397,7 @@ where
         }
 
         let (midpoint_passes, selected_new_point) =
-            test_and_select_stable_point(tester, &requested_midpoint_schedule, cfg);
+            test_and_select_stable_point(tester, &requested_midpoint_schedule, cfg)?;
         if cfg.verbose {
             let (jitter_edit, jitter_swap) =
                 just_distance(&requested_midpoint_schedule, &selected_new_point);
@@ -485,9 +495,9 @@ fn sub_event_search<F>(
     tester: &mut F,
     passing_schedule: Vec<SchedEvent>,
     failing_schedule: Vec<SchedEvent>,
-) -> Option<CriticalSchedule>
+) -> anyhow::Result<Option<CriticalSchedule>>
 where
-    F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
+    F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
     let (prefix, postfix) = get_common_pre_and_postfix(&passing_schedule, &failing_schedule);
     if passing_schedule.len() != failing_schedule.len()
@@ -496,7 +506,7 @@ where
         eprintln!(
             ":: Skipping sub-event refinement: final schedules are not a single exact adjacent event reversal"
         );
-        return None;
+        return Ok(None);
     }
 
     let critical_range = Range {
@@ -520,7 +530,7 @@ where
         eprintln!(
             ":: Skipping sub-event refinement: adjacent events do not form the same reversed pair"
         );
-        return None;
+        return Ok(None);
     }
 
     let critical_pair_passing = [
@@ -551,38 +561,48 @@ where
         eprintln!(
             ":: Skipping sub-event refinement: critical pair has no splittable branch interval"
         );
-        return None;
+        return Ok(None);
     }
 
     // Find the first A branch count that passes. Its predecessor is the failing boundary.
-    let i_plus_one = binary_search(0..i_max, &mut |i| {
+    let Some(i_plus_one) = binary_search(0..i_max, &mut |i| {
         let schedule =
             create_schedule_with_critical_pair(prefix, postfix, &critical_pair_passing, i, j_max);
 
-        let passed = test_exact_replay(tester, &schedule)?;
+        let Some(passed) = test_exact_replay(tester, &schedule)? else {
+            return Ok(None);
+        };
 
         eprintln!("Binary Search of A at sample {} -> passed = {}", i, passed);
 
-        Some(!passed)
-    })?;
+        Ok(Some(!passed))
+    })?
+    else {
+        return Ok(None);
+    };
 
-    let i = i_plus_one.checked_sub(1).or_else(|| {
+    let Some(i) = i_plus_one.checked_sub(1) else {
         eprintln!(
             ":: Skipping sub-event refinement: A boundary is already passing at zero branches"
         );
-        None
-    })?;
+        return Ok(None);
+    };
 
     // Find the first B branch count that fails while holding A at its boundary.
-    let j = binary_search(1..j_max, &mut |j| {
+    let Some(j) = binary_search(1..j_max, &mut |j| {
         let schedule =
             create_schedule_with_critical_pair(prefix, postfix, &critical_pair_passing, i, j);
 
-        let passed = test_exact_replay(tester, &schedule)?;
+        let Some(passed) = test_exact_replay(tester, &schedule)? else {
+            return Ok(None);
+        };
         eprintln!("Binary Search of B at sample {} -> passed = {}", j, passed);
 
-        Some(passed)
-    })?;
+        Ok(Some(passed))
+    })?
+    else {
+        return Ok(None);
+    };
 
     // We are defining the critical event as the event index in the passing schedule
     // where the first branch in the event must come after the last branch in the previous
@@ -606,15 +626,23 @@ where
         eprintln!(
             ":: Skipping sub-event refinement: final schedules are not one verified adjacent swap apart"
         );
-        return None;
+        return Ok(None);
     }
-    if !test_exact_replay(tester, &passing_schedule)?
-        || test_exact_replay(tester, &failing_schedule)?
-    {
+    // The passing schedule is replayed first, and the failing one only when
+    // the passing one still passes.
+    let outcomes_preserved = match test_exact_replay(tester, &passing_schedule)? {
+        None => return Ok(None),
+        Some(false) => false,
+        Some(true) => match test_exact_replay(tester, &failing_schedule)? {
+            None => return Ok(None),
+            Some(failing_passes) => !failing_passes,
+        },
+    };
+    if !outcomes_preserved {
         eprintln!(
             ":: Skipping sub-event refinement: final A/B replay did not preserve passing/failing outcomes"
         );
-        return None;
+        return Ok(None);
     }
 
     eprintln!(
@@ -623,11 +651,11 @@ where
             .green()
             .bold()
     );
-    Some(CriticalSchedule {
+    Ok(Some(CriticalSchedule {
         failing_schedule,
         passing_schedule,
         critical_event_index,
-    })
+    }))
 }
 
 fn same_event_except_count(first: &SchedEvent, second: &SchedEvent) -> bool {
@@ -642,28 +670,29 @@ fn can_split_event(event: &SchedEvent) -> bool {
     event.count > 0 && (event.op == detcore::types::Op::Branch || event.count == 1)
 }
 
-fn test_exact_replay<F>(tester: &mut F, requested: &[SchedEvent]) -> Option<bool>
+fn test_exact_replay<F>(tester: &mut F, requested: &[SchedEvent]) -> anyhow::Result<Option<bool>>
 where
-    F: FnMut(&[SchedEvent]) -> (bool, Vec<SchedEvent>),
+    F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
-    let (passes, actual) = tester(requested);
+    let (passes, actual) = tester(requested)?;
     if actual != requested {
         eprintln!(
             ":: Skipping sub-event refinement: replay did not realize a requested branch boundary exactly (requested {} events, realized {})",
             requested.len(),
             actual.len(),
         );
-        None
+        Ok(None)
     } else {
-        Some(passes)
+        Ok(Some(passes))
     }
 }
 
 /// Binary search implementation specific to our problem. This will return the smallest value
-/// where the predicate returns false
-fn binary_search<F>(range: Range<u32>, predicate: &mut F) -> Option<u32>
+/// where the predicate returns false. `Ok(None)` means the predicate gave up on a sample; an
+/// `Err` from the predicate ends the search and is returned unchanged.
+fn binary_search<F>(range: Range<u32>, predicate: &mut F) -> anyhow::Result<Option<u32>>
 where
-    F: FnMut(u32) -> Option<bool>,
+    F: FnMut(u32) -> anyhow::Result<Option<bool>>,
 {
     let mut left = range.start;
     let mut right = range.end;
@@ -671,7 +700,9 @@ where
 
     while size > 0 {
         let mid = left + size / 2;
-        let test_res = predicate(mid)?;
+        let Some(test_res) = predicate(mid)? else {
+            return Ok(None);
+        };
 
         if test_res {
             left = mid + 1;
@@ -682,7 +713,7 @@ where
         size = right - left;
     }
 
-    Some(left)
+    Ok(Some(left))
 }
 
 /// Create a new SchedEvent with the size replaced with the given value
@@ -770,15 +801,18 @@ mod tests {
         // Check a bunch of close values to make sure we don't have an off-by-one problem.
         // I also did an exhaustive search up to 100,000 because I was sure this wouldn't work,
         // but it does. Thanks, Rust std library
-        assert_eq!(binary_search(0..10, &mut |i| Some(i < 4)), Some(4));
-        assert_eq!(binary_search(0..11, &mut |i| Some(i < 4)), Some(4));
-        assert_eq!(binary_search(0..10, &mut |i| Some(i < 5)), Some(5));
-        assert_eq!(binary_search(0..11, &mut |i| Some(i < 5)), Some(5));
-        assert_eq!(binary_search(1..100, &mut |i| Some(i < 49)), Some(49));
-        assert_eq!(binary_search(2..151, &mut |i| Some(i < 49)), Some(49));
-        assert_eq!(binary_search(3..100, &mut |i| Some(i < 58)), Some(58));
-        assert_eq!(binary_search(4..151, &mut |i| Some(i < 58)), Some(58));
-        assert_eq!(binary_search(0..10, &mut |_| None), None);
+        let search = |range: Range<u32>, below: u32| {
+            binary_search(range, &mut |i| Ok(Some(i < below))).unwrap()
+        };
+        assert_eq!(search(0..10, 4), Some(4));
+        assert_eq!(search(0..11, 4), Some(4));
+        assert_eq!(search(0..10, 5), Some(5));
+        assert_eq!(search(0..11, 5), Some(5));
+        assert_eq!(search(1..100, 49), Some(49));
+        assert_eq!(search(2..151, 49), Some(49));
+        assert_eq!(search(3..100, 58), Some(58));
+        assert_eq!(search(4..151, 58), Some(58));
+        assert_eq!(binary_search(0..10, &mut |_| Ok(None)).unwrap(), None);
     }
 
     #[test]
@@ -787,8 +821,9 @@ mod tests {
         let second = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
         let passing = vec![first.clone(), second.clone()];
         let failing = vec![second, first.clone()];
-        let tester =
-            |schedule: &[SchedEvent]| (schedule.first() == Some(&first), schedule.to_vec());
+        let tester = |schedule: &[SchedEvent]| -> TrialOutcome {
+            Ok((schedule.first() == Some(&first), schedule.to_vec()))
+        };
 
         let critical = search_for_critical_schedule(
             tester,
@@ -811,7 +846,7 @@ mod tests {
         let bad = vec![second, first];
 
         let error = search_for_critical_schedule(
-            |schedule| (false, schedule.to_vec()),
+            |schedule| Ok((false, schedule.to_vec())),
             good.clone(),
             bad.clone(),
             &Config::default(),
@@ -820,7 +855,7 @@ mod tests {
         assert!(error.to_string().contains("passing schedule endpoint"));
 
         let error = search_for_critical_schedule(
-            |schedule| (true, schedule.to_vec()),
+            |schedule| Ok((true, schedule.to_vec())),
             good,
             bad,
             &Config::default(),
@@ -836,13 +871,17 @@ mod tests {
         let passing = vec![branch.clone(), syscall.clone()];
         let failing = vec![syscall, branch];
         let extra = SchedEvent::syscall(DetTid::from_raw(7), Sysno::read, SyscallPhase::Prehook);
-        let mut tester = |schedule: &[SchedEvent]| {
+        let mut tester = |schedule: &[SchedEvent]| -> TrialOutcome {
             let mut actual = schedule.to_vec();
             actual.push(extra.clone());
-            (false, actual)
+            Ok((false, actual))
         };
 
-        assert!(sub_event_search(&mut tester, passing, failing).is_none());
+        assert!(
+            sub_event_search(&mut tester, passing, failing)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -852,15 +891,15 @@ mod tests {
         let requested = vec![first, second];
         let extra = SchedEvent::syscall(DetTid::from_raw(7), Sysno::getpid, SyscallPhase::Prehook);
         let mut calls = 0;
-        let mut tester = |schedule: &[SchedEvent]| {
+        let mut tester = |schedule: &[SchedEvent]| -> TrialOutcome {
             calls += 1;
             let mut actual = schedule.to_vec();
             actual.push(extra.clone());
-            (true, actual)
+            Ok((true, actual))
         };
 
         let (passes, selected) =
-            test_and_select_stable_point(&mut tester, &requested, &Config::default());
+            test_and_select_stable_point(&mut tester, &requested, &Config::default()).unwrap();
 
         assert!(passes);
         assert_eq!(selected, requested);
@@ -874,8 +913,9 @@ mod tests {
         let third = SchedEvent::syscall(DetTid::from_raw(7), Sysno::getpid, SyscallPhase::Prehook);
         let passing = vec![first.clone(), second.clone(), third.clone()];
         let failing = vec![third, second, first.clone()];
-        let tester =
-            |schedule: &[SchedEvent]| (schedule.first() == Some(&first), schedule.to_vec());
+        let tester = |schedule: &[SchedEvent]| -> TrialOutcome {
+            Ok((schedule.first() == Some(&first), schedule.to_vec()))
+        };
         let cfg = Config {
             max_needleman_matrix_cells: 0,
             needleman_search: true,
@@ -891,9 +931,9 @@ mod tests {
         );
     }
 
-    #[test]
-    /// This test runs a real search but with mocked out actual hermit runs.
-    fn flaky_cas_sequence_schedules() {
+    /// The flaky_cas fixture endpoints, `(passing, failing)`, with the two
+    /// critical events marked: `end_time` 0 on the first and 1 on the second.
+    fn flaky_cas_endpoints() -> (Vec<SchedEvent>, Vec<SchedEvent>) {
         let passing_preemptions: PreemptionRecord = serde_json::from_slice(include_bytes!(
             "../../../test-resources/flaky_cas_sequence_schedules-passing.json"
         ))
@@ -932,16 +972,27 @@ mod tests {
             }
         });
 
-        let mock_tester = |sched: &[SchedEvent]| {
-            let criticals = sched
-                .iter()
-                .filter(|e| e.end_time.is_some())
-                .collect::<Vec<_>>();
+        (passing_sched, failing_sched)
+    }
 
-            (
-                criticals[0].end_time.unwrap().as_nanos() == 0,
-                sched.to_owned(),
-            )
+    /// The mocked run's outcome: a schedule passes when the first marked event
+    /// it reaches is the first critical event.
+    fn flaky_cas_passes(sched: &[SchedEvent]) -> bool {
+        let criticals = sched
+            .iter()
+            .filter(|e| e.end_time.is_some())
+            .collect::<Vec<_>>();
+
+        criticals[0].end_time.unwrap().as_nanos() == 0
+    }
+
+    #[test]
+    /// This test runs a real search but with mocked out actual hermit runs.
+    fn flaky_cas_sequence_schedules() {
+        let (passing_sched, failing_sched) = flaky_cas_endpoints();
+
+        let mock_tester = |sched: &[SchedEvent]| -> TrialOutcome {
+            Ok((flaky_cas_passes(sched), sched.to_owned()))
         };
 
         let CriticalSchedule {
@@ -975,5 +1026,100 @@ mod tests {
         assert_eq!(thread_7_other_branches.dettid.as_raw(), 7);
         assert_eq!(thread_7_other_branches.op, Op::Branch,);
         assert_eq!(thread_7_other_branches.count, 16);
+    }
+
+    /// A trial that `--max-log-bytes` ended, as `classify_container_result`
+    /// reports it to the trial's caller.
+    fn log_cap_trial_error() -> anyhow::Error {
+        anyhow::Error::new(crate::container::LogCapExceeded)
+    }
+
+    /// The search over the flaky_cas fixture, with a trial that fails at every
+    /// position in turn: the two endpoint checks, the event-level midpoints,
+    /// and the sub-event binary searches and final checks. Each time the search
+    /// stops at the failing trial and returns its error, still a
+    /// `LogCapExceeded`. Before trials could fail, the analyze tester had to
+    /// panic instead (`expect("New run to succeed")`).
+    #[test]
+    fn a_failing_trial_ends_the_schedule_search_with_its_error() {
+        let (passing, failing) = flaky_cas_endpoints();
+        let mut total_trials = 0;
+        let critical = search_for_critical_schedule(
+            |sched| {
+                total_trials += 1;
+                Ok((flaky_cas_passes(sched), sched.to_vec()))
+            },
+            passing.clone(),
+            failing.clone(),
+            &Config::default(),
+        )
+        .unwrap();
+        // The sweep below covers the sub-event search only if this search
+        // reached it, as flaky_cas_sequence_schedules shows it does.
+        assert_eq!(critical.critical_event_index, 379);
+        assert!(
+            total_trials > 2,
+            "the fixture search made only {total_trials} trials"
+        );
+
+        for failing_trial in 1..=total_trials {
+            let mut trials = 0;
+            let result = search_for_critical_schedule(
+                |sched| {
+                    trials += 1;
+                    if trials == failing_trial {
+                        return Err(log_cap_trial_error());
+                    }
+                    Ok((flaky_cas_passes(sched), sched.to_vec()))
+                },
+                passing.clone(),
+                failing.clone(),
+                &Config::default(),
+            );
+            let error = result.expect_err("a failed trial must end the search with an error");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::LogCapExceeded>()
+                    .is_some(),
+                "trial {failing_trial} of {total_trials}: the error lost its type: {error:#}"
+            );
+            assert_eq!(
+                trials, failing_trial,
+                "the search ran more trials after trial {failing_trial} failed"
+            );
+        }
+    }
+
+    /// The replay of a jittered control schedule is a trial too: when that
+    /// replay fails, no further replay runs and its error is returned,
+    /// still a `LogCapExceeded`. The flaky_cas search above never needs this
+    /// replay, so this is the test that covers it.
+    #[test]
+    fn a_failing_jitter_replay_returns_its_error() {
+        let first = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let second = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let requested = vec![first, second];
+        let extra = SchedEvent::syscall(DetTid::from_raw(7), Sysno::getpid, SyscallPhase::Prehook);
+        let mut calls = 0;
+        let mut tester = |schedule: &[SchedEvent]| -> TrialOutcome {
+            calls += 1;
+            if calls == 2 {
+                return Err(log_cap_trial_error());
+            }
+            let mut actual = schedule.to_vec();
+            actual.push(extra.clone());
+            Ok((true, actual))
+        };
+
+        let error = test_and_select_stable_point(&mut tester, &requested, &Config::default())
+            .expect_err("a failed replay must be returned");
+
+        assert!(
+            error
+                .downcast_ref::<crate::container::LogCapExceeded>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert_eq!(calls, 2);
     }
 }

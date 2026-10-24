@@ -6,14 +6,23 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
 
+// Separately run Hermit processes are compared, so they share one epoch: a
+// host-drawn one differs per run, and Hermit then reports the recording it
+// saved on stderr (https://github.com/rrnewton/hermit/issues/4321).
+const EPOCH: &str = "--epoch=2026-01-01T00:00:00Z";
+
 fn sqlite3() -> PathBuf {
-    ["/usr/bin/sqlite3", "/usr/local/bin/sqlite3"]
+    // The pinned root has sqlite at /bin only.
+    ["/usr/bin/sqlite3", "/usr/local/bin/sqlite3", "/bin/sqlite3"]
         .into_iter()
         .map(PathBuf::from)
         .find(|path| path.is_file())
@@ -34,20 +43,22 @@ PRAGMA integrity_check;";
 
     // Compatibility workloads keep deterministic defaults while normal mode reports any
     // unsupported syscalls; strict fail-closed behavior is covered by dedicated tests.
-    Command::new(hermit)
-        .args(["--log", "off", "run", "--"])
-        .arg(sqlite)
-        .arg(database)
-        .arg(SQL)
-        .output()
-        .expect("failed to run the fast SQLite workload under Hermit")
+    hermit_test::hermit_output(
+        "hermit run",
+        Command::new(hermit)
+            .args(["--log", "off", "run", EPOCH, "--"])
+            .arg(sqlite)
+            .arg(database)
+            .arg(SQL),
+    )
 }
 
 #[test]
 fn sqlite_fast_subset_is_deterministic_under_hermit() {
     let hermit = Path::new(env!("CARGO_BIN_EXE_hermit"));
     let sqlite = sqlite3();
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sqlite-fast");
+    let root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sqlite-fast-{}", std::process::id()));
     if root.exists() {
         fs::remove_dir_all(&root).expect("failed to remove stale fast SQLite directory");
     }
@@ -77,13 +88,15 @@ fn sqlite_veryquick_is_deterministic_under_strict_hermit() {
     let runner = repo_root.join("hermit-cli/tests/fixtures/sqlite-veryquick/run.sh");
     let hermit =
         std::env::var_os("HERMIT_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_hermit").into());
-    let artifact_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("sqlite-veryquick");
+    let artifact_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sqlite-veryquick-{}", std::process::id()));
 
-    let output = Command::new(&runner)
-        .env("HERMIT_BIN", hermit)
-        .env("SQLITE_VERYQUICK_ARTIFACT_ROOT", artifact_root)
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {}: {error}", runner.display()));
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        Command::new(&runner)
+            .env("HERMIT_BIN", hermit)
+            .env("SQLITE_VERYQUICK_ARTIFACT_ROOT", artifact_root),
+    );
 
     assert!(
         output.status.success(),

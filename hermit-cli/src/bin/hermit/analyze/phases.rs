@@ -38,6 +38,7 @@ use crate::logdiff::LogDiffCLIOpts;
 use crate::run::RunOpts;
 use crate::schedule_search::Config;
 use crate::schedule_search::CriticalSchedule;
+use crate::schedule_search::TrialOutcome;
 use crate::schedule_search::search_for_critical_schedule;
 
 /// Compare only preemptions, not recorded schedules.
@@ -151,6 +152,28 @@ impl AnalyzeOpts {
             && self.target_exit_code == ExitStatusConstraint::NonZero
     }
 
+    /// Write analyze's final on-target and baseline schedules, stamped
+    /// ([`Self::stamp_trial_record`]), and say where.
+    pub fn write_final_schedules(
+        &self,
+        failing: Vec<SchedEvent>,
+        failing_path: &Path,
+        passing: Vec<SchedEvent>,
+        passing_path: &Path,
+    ) {
+        self.write_trial_schedule(failing, failing_path).unwrap();
+        eprintln!(
+            "Wrote final on-target ({}) schedule to {}",
+            self.display_criteria(),
+            failing_path.display()
+        );
+        self.write_trial_schedule(passing, passing_path).unwrap();
+        eprintln!(
+            "Wrote final baseline (off-target) schedule to {}",
+            passing_path.display()
+        );
+    }
+
     fn display_criteria(&self) -> String {
         let mut strs: Vec<String> = Vec::new();
         match &self.target_exit_code {
@@ -213,7 +236,7 @@ impl AnalyzeOpts {
                         .red()
                         .bold()
                 );
-                Ok(self.do_search())
+                self.do_search()
             } else {
                 bail!("FAILED. The run did not match the target criteria. Try --search.");
             }
@@ -440,16 +463,17 @@ impl AnalyzeOpts {
     ) -> anyhow::Result<CriticalSchedule> {
         let mut i = 0;
 
-        let test_fn = |sched: &[SchedEvent]| {
+        // Each call is one trial. A trial that cannot finish (for example, one
+        // that --max-log-bytes ended) returns its error unchanged, and the
+        // search stops there.
+        let test_fn = |sched: &[SchedEvent]| -> TrialOutcome {
             i += 1;
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
-            let mut newrun = RunData::new_baseline(self, runname)
-                .expect("RunData construction to suceed")
+            let mut newrun = RunData::new_baseline(self, runname)?
                 .with_schedule_replay() // Default input path
                 .with_schedule_recording(); // Default output path
             // Prepare the next synthetic schedule on disk:
-            let next_sched = PreemptionRecord::from_sched_events(sched.to_owned());
-            next_sched.write_to_disk(newrun.sched_path_in()).unwrap();
+            self.write_trial_schedule(sched.to_owned(), newrun.sched_path_in())?;
 
             if self.verbose {
                 eprintln!(
@@ -461,7 +485,7 @@ impl AnalyzeOpts {
                 );
             }
 
-            newrun.launch().expect("New run to succeed");
+            newrun.launch()?;
             let is_match = newrun.is_a_match();
             if is_match {
                 eprintln!(" => Target condition ({})", self.display_criteria());
@@ -470,7 +494,7 @@ impl AnalyzeOpts {
             }
 
             let sched_out = PreemptionReader::new(newrun.sched_path_out()).load_all();
-            (!is_match, sched_out.into_global())
+            Ok((!is_match, sched_out.into_global()))
         };
 
         let target = target.to_vec(); // TODO: have search_for_critical_schedule borrow only.
@@ -585,21 +609,12 @@ impl AnalyzeOpts {
             self.execution_context,
         );
 
-        {
-            let pr = PreemptionRecord::from_sched_events(failing_schedule);
-            pr.write_to_disk(&final_failing_path).unwrap();
-            eprintln!(
-                "Wrote final on-target ({}) schedule to {}",
-                self.display_criteria(),
-                final_failing_path.display()
-            );
-            let pr = PreemptionRecord::from_sched_events(passing_schedule);
-            pr.write_to_disk(&final_passing_path).unwrap();
-            eprintln!(
-                "Wrote final baseline (off-target) schedule to {}",
-                final_passing_path.display()
-            );
-        }
+        self.write_final_schedules(
+            failing_schedule,
+            &final_failing_path,
+            passing_schedule,
+            &final_passing_path,
+        );
 
         {
             let mut header = String::new();
@@ -725,22 +740,63 @@ impl AnalyzeOpts {
         }
     }
 
+    /// Everything `main` does before phase 0 creates the workspace: a
+    /// refusal here starts nothing.
+    fn prepare(&mut self, global: &GlobalOpts) -> anyhow::Result<()> {
+        self.apply_global(global);
+        self.refuse_unsupervised_log_cap()?;
+        self.refuse_options_trials_do_not_apply()?;
+        self.refuse_outputs_trials_overwrite()?;
+        self.refuse_unqualified_trial_timeout()?;
+        self.install_trial_pmu_config()?;
+        self.refuse_strict_with_inexact_branch_counter()?;
+        // `--run1-schedule` and `--run2-schedule` parse but have no
+        // implementation. Refuse them before any workspace or trial, rather
+        // than panicking here.
+        let unimplemented: Vec<&str> = [
+            (self.run1_schedule.is_some(), "--run1-schedule"),
+            (self.run2_schedule.is_some(), "--run2-schedule"),
+        ]
+        .into_iter()
+        .filter_map(|(given, option)| given.then_some(option))
+        .collect();
+        if !unimplemented.is_empty() {
+            return Err(
+                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                    "hermit analyze does not implement {}. Identify a run by a preemption record \
+                 (--run1-preemptions or --run2-preemptions, written by `hermit run \
+                 --record-preemptions-to`) or by a seed (--run1-seed or --run2-seed).",
+                    unimplemented.join(" or ")
+                )),
+            );
+        }
+        // The trials that replay these records start from the epoch they were
+        // recorded under (https://github.com/rrnewton/hermit/issues/3870).
+        let run1 = self.run1_preemptions.clone();
+        let run2 = self.run2_preemptions.clone();
+        let recordings: Vec<(&str, &Path)> = [
+            ("--run1-preemptions", run1.as_deref()),
+            ("--run2-preemptions", run2.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(option, path)| Some((option, path?)))
+        .collect();
+        self.adopt_recorded_epoch(&recordings)?;
+        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
+    }
+
     /// Take the settings `analyze` inherits from the global options: every
     /// trial runs on the globally selected backend
-    /// (`hermit --backend <BACKEND> analyze ...`).
+    /// (`hermit --backend <BACKEND> analyze ...`) and charges the invocation's
+    /// shared `--max-log-bytes` budget.
     pub fn apply_global(&mut self, global: &GlobalOpts) {
         self.backend = global.backend;
+        self.max_log_bytes = global.max_log_bytes;
+        self.log_budget = global.log_budget();
     }
 
     pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
-        self.apply_global(global);
-        // Not implemented yet:
-        if self.run1_schedule.is_some() {
-            unimplemented!()
-        }
-        if self.run2_schedule.is_some() {
-            unimplemented!()
-        }
+        self.prepare(global)?;
 
         self.phase0_initialize()?; // Need this early to set tmp_dir.
         {
@@ -899,7 +955,18 @@ impl AnalyzeOpts {
     }
 
     /// Search for a target run. Return the run when found.
-    fn do_search(&self) -> RunData {
+    fn do_search(&self) -> Result<RunData, Error> {
+        self.search_rounds(|round, sched_seed| self.launch_search(round, sched_seed))
+    }
+
+    /// The `--search` loop: one chaos trial per round, each with the next
+    /// schedule seed from the search RNG, until a trial matches. A trial that
+    /// cannot finish (for example, one that `--max-log-bytes` ended) ends the
+    /// search with its error unchanged, so main still reports it by its class.
+    fn search_rounds(
+        &self,
+        mut launch: impl FnMut(u64, u64) -> Result<Option<RunData>, Error>,
+    ) -> Result<RunData, Error> {
         let search_seed = self.analyze_seed.unwrap_or_else(|| {
             let seed: u64 = rand::random();
             yellow_msg(&format!("WARNING: performing --search with system randomness, use --analyze-seed={} to repro.", seed));
@@ -911,10 +978,7 @@ impl AnalyzeOpts {
         let mut round = 0;
         loop {
             let sched_seed = rng.random();
-            if let Some(mut rundat) = self
-                .launch_search(round, sched_seed)
-                .unwrap_or_else(|e| panic!("Error: {}", e))
-            {
+            if let Some(mut rundat) = launch(round, sched_seed)? {
                 if self.verbose {
                     let preempts = rundat.preempts_path_out();
                     let init_schedule: PreemptionRecord =
@@ -930,7 +994,7 @@ impl AnalyzeOpts {
                         ),
                     );
                 }
-                return rundat;
+                return Ok(rundat);
             }
             round += 1;
         }
@@ -969,5 +1033,440 @@ impl AnalyzeOpts {
             answer = false;
         }
         answer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::*;
+    use crate::container::LogCapExceeded;
+    use crate::container::PolicyRefusal;
+
+    /// A search round whose trial `--max-log-bytes` ended stops the `--search`
+    /// loop and returns that error, still a `LogCapExceeded`, so main reports
+    /// it as the cap (123). Before, the loop panicked on any round's error.
+    #[test]
+    fn a_failing_search_round_ends_the_search_with_its_error() {
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                .unwrap();
+        for failing_round in 1..=4 {
+            let mut rounds = 0;
+            let result = options.search_rounds(|round, _sched_seed| {
+                assert_eq!(round, rounds, "rounds are numbered from 0");
+                rounds += 1;
+                if rounds == failing_round {
+                    return Err(Error::new(LogCapExceeded));
+                }
+                // An earlier round finished and did not match.
+                Ok(None)
+            });
+            let Err(error) = result else {
+                panic!("round {failing_round} failed, yet the search returned a run")
+            };
+            assert!(
+                error.downcast_ref::<LogCapExceeded>().is_some(),
+                "round {failing_round}: the error lost its type: {error:#}"
+            );
+            assert_eq!(
+                rounds, failing_round,
+                "the search ran more rounds after round {failing_round} failed"
+            );
+        }
+    }
+
+    const RECORDED: &str = "2000-12-31T23:59:59.123456789Z";
+    const RECORDED_RFC3339: &str = "2000-12-31T23:59:59.123456789+00:00";
+    const OTHER: &str = "2026-01-01T00:00:00Z";
+
+    /// A preemption record written to `dir` under `name`, with the given
+    /// recorded epoch.
+    fn record_with_epoch(dir: &Path, name: &str, epoch: Option<&str>) -> PathBuf {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-resources/flaky_cas_sequence_schedules-passing.json");
+        let mut record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(source).unwrap()).unwrap();
+        if let Some(epoch) = epoch {
+            record["epoch"] = serde_json::Value::from(epoch);
+        }
+        let path = dir.join(format!("{name}.json"));
+        std::fs::write(&path, record.to_string()).unwrap();
+        path
+    }
+
+    /// Through `prepare`, which `main` runs before phase 0: the trial
+    /// configuration `hermit analyze` would use for these records, or its
+    /// refusal.
+    fn prepared_analysis(
+        dir: &Path,
+        run1: Option<&str>,
+        run2: Option<&str>,
+        run_args: &[&str],
+    ) -> anyhow::Result<AnalyzeOpts> {
+        let run1 = format!(
+            "--run1-preemptions={}",
+            record_with_epoch(dir, "run1", run1).display()
+        );
+        let run2 = run2.map(|epoch| {
+            format!(
+                "--run2-preemptions={}",
+                record_with_epoch(dir, "run2", Some(epoch)).display()
+            )
+        });
+        let mut argv = vec!["hermit", "analyze", run1.as_str()];
+        argv.extend(run2.as_deref());
+        argv.push("--");
+        argv.extend(run_args);
+        argv.push("/bin/true");
+        let args = crate::Args::try_parse_from(&argv).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        options.prepare(&args.global)?;
+        options.tmp_dir = Some(dir.to_path_buf());
+        Ok(*options)
+    }
+
+    /// Analyze refuses, before any trial, a `--run1-preemptions` record made
+    /// under another `--pipe-wake-latency` than the trials' own, or one its
+    /// run arguments replay; its final schedules carry the trials' value
+    /// (https://github.com/rrnewton/hermit/issues/4380).
+    #[test]
+    fn analyze_refuses_records_under_another_pipe_wake_latency() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |name: &str, latency: Option<u64>| {
+            let path = record_with_epoch(dir.path(), name, None);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            if let Some(latency) = latency {
+                value["pipe_wake_latency"] = serde_json::Value::from(latency);
+            }
+            std::fs::write(&path, value.to_string()).unwrap();
+            path
+        };
+        let prepare = |run1: &Path, run_args: &[&str]| {
+            let run1 = format!("--run1-preemptions={}", run1.display());
+            let mut argv = vec!["hermit", "analyze", run1.as_str(), "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.prepare(&args.global).map(|_| options)
+        };
+        let off = record("off", None);
+        let zero = record("zero", Some(0));
+        let options = prepare(&zero, &["--pipe-wake-latency=0"]).unwrap();
+        assert_eq!(options.trial_pipe_wake_latency(), Some(0));
+        // Every record analyze writes carries the trials' latency: the final
+        // schedules, each trial's schedule, and minimize's records.
+        let written = |options: &AnalyzeOpts| {
+            let (failing, passing, trial) = (
+                dir.path().join("final-failing.json"),
+                dir.path().join("final-passing.json"),
+                dir.path().join("trial.json"),
+            );
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
+            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            [failing, passing, trial]
+                .map(|path| detcore::preemptions::read_recorded_pipe_wake_latency(&path).unwrap())
+        };
+        assert_eq!(written(&options), [Some(0); 3]);
+        assert_eq!(
+            options
+                .stamp_trial_record(PreemptionRecord::from_vecs(&Default::default()))
+                .pipe_wake_latency(),
+            Some(0)
+        );
+        let options_off = prepare(&off, &[]).unwrap();
+        assert_eq!(written(&options_off), [None; 3]);
+        let replay_flag = format!("--replay-preemptions-from={}", zero.display());
+        for (run1, run_args, named) in [
+            (&zero, vec![], "--run1-preemptions"),
+            (&off, vec!["--pipe-wake-latency=0"], "--run1-preemptions"),
+            (
+                &off,
+                vec![replay_flag.as_str()],
+                "--replay-preemptions-from",
+            ),
+        ] {
+            let error = prepare(run1, &run_args).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(named) && message.contains("cannot reproduce the run"),
+                "{run_args:?}: {message}"
+            );
+        }
+    }
+
+    /// Every record analyze writes states the trials' signal-state copy
+    /// setting, and a recording made under the other setting is refused
+    /// before any trial; one that states no setting is accepted.
+    #[test]
+    fn analyze_stamps_and_checks_the_signal_state_copy_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |name: &str, copy: Option<bool>| {
+            let path = record_with_epoch(dir.path(), name, None);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            if let Some(copy) = copy {
+                value["signal_state_copy"] = serde_json::Value::from(copy);
+            }
+            std::fs::write(&path, value.to_string()).unwrap();
+            path
+        };
+        let prepare = |run1: &Path, run_args: &[&str]| {
+            let run1 = format!("--run1-preemptions={}", run1.display());
+            let mut argv = vec!["hermit", "analyze", run1.as_str(), "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.prepare(&args.global).map(|_| options)
+        };
+        let unsaid = record("unsaid", None);
+        let on = record("on", Some(true));
+        let off = record("off", Some(false));
+        let written = |options: &AnalyzeOpts| {
+            let trial = dir.path().join("copy-trial.json");
+            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            detcore::preemptions::read_recorded_signal_state_copy(&trial).unwrap()
+        };
+        let default = prepare(&on, &[]).unwrap();
+        assert!(default.trial_signal_state_copy());
+        assert_eq!(written(&default), Some(true));
+        let copy_off = prepare(&off, &["--no-signal-state-copy"]).unwrap();
+        assert_eq!(written(&copy_off), Some(false));
+        assert!(prepare(&unsaid, &[]).is_ok());
+        assert!(prepare(&unsaid, &["--no-signal-state-copy"]).is_ok());
+        for (run1, run_args) in [(&off, vec![]), (&on, vec!["--no-signal-state-copy"])] {
+            let error = prepare(run1, &run_args).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains("signal-state copy"),
+                "{error:#}"
+            );
+        }
+    }
+
+    /// Runs `test` (this module's test of that name) in two child processes,
+    /// once with `HERMIT_EPOCH` unset and once set to [`OTHER`], and returns
+    /// `None`. Inside such a child it returns the arm, `"unset"` or `"set"`.
+    /// `HERMIT_EPOCH` counts as an explicit epoch, so the validation's
+    /// forwarded value cannot decide the checks.
+    fn epoch_environment_arm(test: &str) -> Option<String> {
+        const CHILD: &str = "HERMIT_ANALYZE_EPOCH_TEST_CHILD";
+        if let Some(arm) = std::env::var_os(CHILD) {
+            return Some(arm.into_string().unwrap());
+        }
+        let name = format!("{}::{test}", module_path!().split_once("::").unwrap().1);
+        for arm in ["unset", "set"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, arm);
+            if arm == "set" {
+                child.env("HERMIT_EPOCH", OTHER);
+            } else {
+                child.env_remove("HERMIT_EPOCH");
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{arm}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{arm}: the child ran no test: {output:?}"
+            );
+        }
+        None
+    }
+
+    fn refused(error: anyhow::Error, expected: &str) {
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        assert!(error.to_string().contains(expected), "{error:#}");
+    }
+
+    /// The trial that replays `--run1-preemptions` starts from the epoch the
+    /// record was made under, as `hermit run` replaying it does
+    /// (https://github.com/rrnewton/hermit/issues/3870). Before, it started
+    /// from the run arguments' epoch, the default when none was given. The
+    /// checks run in a child process whose environment fixes `HERMIT_EPOCH`,
+    /// which counts as an explicit epoch: once unset, and once set to an epoch
+    /// other than the recorded one.
+    #[test]
+    fn analyze_replays_a_record_from_the_epoch_it_was_recorded_under() {
+        let Some(arm) =
+            epoch_environment_arm("analyze_replays_a_record_from_the_epoch_it_was_recorded_under")
+        else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        if arm == "set" {
+            refused(
+                prepared_analysis(dir, Some(RECORDED), None, &[]).unwrap_err(),
+                &format!(
+                    "the explicit virtual-time epoch 2026-01-01T00:00:00+00:00 (from --epoch or \
+                     HERMIT_EPOCH) differs from the epoch {RECORDED_RFC3339} that \
+                     --run1-preemptions"
+                ),
+            );
+            return;
+        }
+
+        // A record without an epoch keeps the default.
+        let analysis = prepared_analysis(dir, None, None, &[]).unwrap();
+        assert!(analysis.run_arg.is_empty(), "{:?}", analysis.run_arg);
+        assert_eq!(analysis.trial_epoch_for_test(), "2026-01-01T00:00:00+00:00");
+
+        // The recorded epoch reaches the trials, from either record.
+        let analysis = prepared_analysis(dir, Some(RECORDED), None, &[]).unwrap();
+        assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
+        let analysis = prepared_analysis(dir, None, Some(RECORDED), &[]).unwrap();
+        assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
+
+        // An explicit epoch equal to the recorded one adds no second --epoch.
+        let analysis =
+            prepared_analysis(dir, Some(RECORDED), None, &["--epoch", RECORDED]).unwrap();
+        assert!(analysis.run_arg.is_empty(), "{:?}", analysis.run_arg);
+        assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
+
+        // A different explicit epoch is refused, naming the remedy.
+        refused(
+            prepared_analysis(dir, Some(RECORDED), None, &["--epoch", OTHER]).unwrap_err(),
+            &format!("pass --epoch={RECORDED_RFC3339}"),
+        );
+
+        // Two records under different epochs are refused, naming both.
+        refused(
+            prepared_analysis(dir, Some(RECORDED), Some(OTHER), &[]).unwrap_err(),
+            &format!(
+                "was recorded under the virtual-time epoch {RECORDED_RFC3339} and \
+                 --run2-preemptions"
+            ),
+        );
+    }
+
+    /// A network trace the run arguments replay (`--replay-networking`)
+    /// releases its inputs at absolute virtual times measured from its own
+    /// epoch, and every trial replays it. The trials start from that epoch,
+    /// and a trace that disagrees with a preemption record or an explicit
+    /// epoch is refused before any trial, as `hermit run` refuses it
+    /// (https://github.com/rrnewton/hermit/issues/3875). Before, the trials
+    /// replayed it from the run arguments' epoch.
+    #[test]
+    fn analyze_replays_a_network_trace_from_the_epoch_it_was_recorded_under() {
+        let Some(arm) = epoch_environment_arm(
+            "analyze_replays_a_network_trace_from_the_epoch_it_was_recorded_under",
+        ) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let trace = |name: &str, epoch: &str| {
+            let path = dir.join(format!("{name}.trace"));
+            detcore_model::network_engine::NetworkEngine::new_record(epoch.parse().unwrap())
+                .finish()
+                .unwrap()
+                .write_framed(std::fs::File::create(&path).unwrap())
+                .unwrap();
+            format!("--replay-networking={}", path.display())
+        };
+        let recorded = trace("recorded", RECORDED);
+        if arm == "set" {
+            refused(
+                prepared_analysis(dir, None, None, &[&recorded]).unwrap_err(),
+                &format!(
+                    "the explicit virtual-time epoch 2026-01-01T00:00:00+00:00 (from --epoch or \
+                     HERMIT_EPOCH) differs from the epoch {RECORDED_RFC3339} that \
+                     --replay-networking"
+                ),
+            );
+            return;
+        }
+
+        // The trace alone sets the trials' epoch.
+        let analysis = prepared_analysis(dir, None, None, &[&recorded]).unwrap();
+        assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
+
+        // With a preemption record from the same epoch it is accepted.
+        let analysis = prepared_analysis(dir, Some(RECORDED), None, &[&recorded]).unwrap();
+        assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
+
+        // A trace from another epoch than the record is refused, naming both.
+        let other = trace("other", OTHER);
+        refused(
+            prepared_analysis(dir, Some(RECORDED), None, &[&other]).unwrap_err(),
+            &format!(
+                "was recorded under the virtual-time epoch {RECORDED_RFC3339} and \
+                 --replay-networking"
+            ),
+        );
+
+        // An explicit epoch other than the trace's is refused.
+        refused(
+            prepared_analysis(dir, None, None, &[&recorded, "--epoch", OTHER]).unwrap_err(),
+            &format!("pass --epoch={RECORDED_RFC3339}"),
+        );
+    }
+
+    /// Through `main`: `--run1-schedule` and `--run2-schedule` parse but have
+    /// no implementation, so `hermit analyze` refuses them before any
+    /// workspace or trial, naming the options that work. Before, `main`
+    /// reached `unimplemented!()` and the process panicked (exit 101).
+    #[test]
+    fn analyze_refuses_the_unimplemented_schedule_inputs_before_any_trial() {
+        for (options, named) in [
+            (
+                &["--run1-schedule=/nonexistent/run1.json"][..],
+                "--run1-schedule",
+            ),
+            (
+                &["--run2-schedule=/nonexistent/run2.json"][..],
+                "--run2-schedule",
+            ),
+            (
+                &[
+                    "--run1-schedule=/nonexistent/run1.json",
+                    "--run2-schedule=/nonexistent/run2.json",
+                ][..],
+                "--run1-schedule or --run2-schedule",
+            ),
+        ] {
+            let mut argv = vec!["hermit", "analyze"];
+            argv.extend(options);
+            argv.extend(["--", "/bin/true"]);
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut analyze) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            let error = analyze.main(&args.global).unwrap_err();
+            refused(
+                error,
+                &format!(
+                    "hermit analyze does not implement {named}. Identify a run by a preemption \
+                     record (--run1-preemptions or --run2-preemptions"
+                ),
+            );
+            assert!(
+                analyze.tmp_dir.is_none(),
+                "{options:?}: a workspace was created before the refusal"
+            );
+        }
     }
 }

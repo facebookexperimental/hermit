@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Backend-parity contract: fallocate(2) preallocation and hole punching.
 //
 // Exercises fallocate(2) on a self-created mkstemp file: default-mode

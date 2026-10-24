@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -67,19 +70,20 @@ fn executable(build_dir: &Path, name: &str) -> PathBuf {
 }
 
 fn strict_run(binary: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=info",
-            "run",
-            "--strict",
-            "--verify",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(binary)
-        .args(args)
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {} under Hermit: {error}", binary.display()))
+    hermit_test::hermit_output(
+        "hermit run",
+        Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(binary)
+            .args(args),
+    )
 }
 
 fn assert_success(output: &Output, label: &str) {

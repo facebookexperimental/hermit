@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -28,9 +31,7 @@ static THREAD_SYNC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -47,7 +48,8 @@ fn thread_sync_guest() -> &'static Path {
             let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("hermit-cli should be inside the repository");
-            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("thread-sync-determinism");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("thread-sync-determinism-{}", std::process::id()));
             fs::create_dir_all(&build_root)
                 .expect("failed to create thread synchronization build directory");
             let output = build_root.join("thread-sync-determinism");

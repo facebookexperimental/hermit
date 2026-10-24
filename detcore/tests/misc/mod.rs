@@ -13,7 +13,14 @@
     reason = "`fbcode_build` is supplied by the internal Buck build"
 )]
 
+mod cpuinfo_sessions;
+mod inode_reuse;
 mod notification_fds;
+mod procfs_caller_buffer;
+mod procfs_inode;
+mod raw_clone;
+mod readdir_order;
+mod subreaper;
 mod tight_stack_openat;
 mod vfork;
 
@@ -122,6 +129,21 @@ where
     F: Fn() + Send + Sync,
 {
     det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Child, f);
+}
+
+/// As [`det_test_fn_sequential_without_pmu`], at the `standard` /proc level,
+/// for a guest that reads a name only that level has.
+fn det_test_fn_sequential_without_pmu_at_standard<F>(f: F)
+where
+    F: Fn() + Send + Sync,
+{
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        proc_level: detcore_model::config::ProcLevel::Standard,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(true, f, config, detcore_testutils::expect_success)
 }
 
 fn det_test_fn_sequential_without_pmu_with_post_fork<F>(runs_post_fork: detcore::RunsPostFork, f: F)
@@ -306,14 +328,10 @@ fn prctl_keepcaps_round_trips_deterministically() {
     });
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
-)]
 #[test]
 fn timer_slack_prctl_and_procfs_share_virtual_state() {
     const DEFAULT_TIMER_SLACK_NS: libc::c_int = 50_000;
-    det_test_fn_sequential_without_pmu(|| unsafe {
+    det_test_fn_sequential_without_pmu_at_standard(|| unsafe {
         assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), DEFAULT_TIMER_SLACK_NS);
 
         // Detcore exposes one guest scheduling policy (SCHED_OTHER). Even a
@@ -439,13 +457,9 @@ fn timer_slack_prctl_and_procfs_share_virtual_state() {
     });
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
-)]
 #[test]
 fn timer_slack_procfs_vector_io_matches_linux() {
-    det_test_fn_sequential_without_pmu(|| unsafe {
+    det_test_fn_sequential_without_pmu_at_standard(|| unsafe {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -629,13 +643,9 @@ fn timer_slack_procfs_vector_io_matches_linux() {
     });
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
-)]
 #[test]
 fn timer_slack_procfs_binds_target_at_open() {
-    det_test_fn_sequential_without_pmu(|| unsafe {
+    det_test_fn_sequential_without_pmu_at_standard(|| unsafe {
         const PARENT_SLACK_NS: libc::c_int = 1_000_000;
         assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, PARENT_SLACK_NS), 0);
 
@@ -728,16 +738,13 @@ fn timer_slack_procfs_binds_target_at_open() {
     });
 }
 
-#[cfg_attr(
-    fbcode_build,
-    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
-)]
 #[test]
 fn timer_slack_is_mediated_under_passthru_opt() {
     let config = detcore::Config {
         max_timeslice: None,
         sequentialize_threads: true,
         passthru_opt: true,
+        proc_level: detcore_model::config::ProcLevel::Standard,
         ..Default::default()
     };
     detcore_testutils::det_test_fn_with_config(
@@ -805,6 +812,7 @@ fn timer_slack_virtual_state_is_isolated_from_physical_tracee() {
     let config = detcore::Config {
         max_timeslice: None,
         sequentialize_threads: true,
+        proc_level: detcore_model::config::ProcLevel::Standard,
         ..Default::default()
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -924,6 +932,29 @@ fn sched_affinity_is_normalized_to_virtual_cpu_zero() {
                 .iter()
                 .all(|byte| *byte == 0xaa),
             "sched_getaffinity must not overwrite bytes beyond its return value"
+        );
+
+        // An 8-byte set, which CPU_ALLOC gives for the one CPU that
+        // _SC_NPROCESSORS_CONF reports, covers the one virtual CPU: Linux
+        // copies min(len, its mask size) and returns that count.
+        mask.fill(0xaa);
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_sched_getaffinity, 0, 8, mask.as_mut_ptr()) },
+            8
+        );
+        assert_eq!(mask[0], 1);
+        assert!(mask[1..8].iter().all(|byte| *byte == 0));
+        assert!(
+            mask[8..].iter().all(|byte| *byte == 0xaa),
+            "sched_getaffinity must not overwrite bytes beyond its return value"
+        );
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_sched_getaffinity, 0, 0, mask.as_mut_ptr()) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
         );
 
         let mut short_mask = [0_u8; VIRTUAL_CPUSET_BYTES - 1];
@@ -1781,6 +1812,83 @@ fn netlink_autobind_port_ids_are_deterministic() {
     });
 }
 
+/// A `FUTEX_WAKE` of one reaches the longest waiter even when another
+/// waiter waits again after every wake it receives. Thread A waits once;
+/// thread B waits again each time it is woken; the main thread wakes one
+/// waiter at a time. Linux wakes waiters of equal priority in arrival order,
+/// so the first wake reaches A. When Detcore woke the most recent waiter, B
+/// took every wake and A never ran
+/// (https://github.com/rrnewton/hermit/issues/3917).
+#[test]
+fn a_futex_wake_reaches_the_longest_waiter_while_another_waits_again() {
+    det_test_fn_sequential_without_pmu(|| {
+        use std::sync::atomic::AtomicU32;
+        static WORD: AtomicU32 = AtomicU32::new(0);
+        static A_READY: AtomicU32 = AtomicU32::new(0);
+        static A_WOKEN: AtomicU32 = AtomicU32::new(0);
+        static B_READY: AtomicU32 = AtomicU32::new(0);
+        static B_WAKES: AtomicU32 = AtomicU32::new(0);
+        static DONE: AtomicU32 = AtomicU32::new(0);
+        fn futex(op: libc::c_int, val: u32) -> libc::c_long {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    WORD.as_ptr(),
+                    op | libc::FUTEX_PRIVATE_FLAG,
+                    val,
+                    std::ptr::null::<libc::timespec>(),
+                )
+            }
+        }
+        fn yield_turns(count: usize) {
+            for _ in 0..count {
+                assert_eq!(unsafe { libc::sched_yield() }, 0);
+            }
+        }
+        // The word stays 0, so every wait blocks until a wake.
+        let a = std::thread::spawn(|| {
+            A_READY.store(1, Ordering::SeqCst);
+            assert_eq!(futex(libc::FUTEX_WAIT, 0), 0);
+            A_WOKEN.store(1, Ordering::SeqCst);
+        });
+        while A_READY.load(Ordering::SeqCst) == 0 {
+            yield_turns(1);
+        }
+        yield_turns(3);
+        let b = std::thread::spawn(|| {
+            loop {
+                B_READY.store(1, Ordering::SeqCst);
+                assert_eq!(futex(libc::FUTEX_WAIT, 0), 0);
+                if DONE.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                B_WAKES.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        while B_READY.load(Ordering::SeqCst) == 0 {
+            yield_turns(1);
+        }
+        yield_turns(3);
+        let mut wakes = 0;
+        while A_WOKEN.load(Ordering::SeqCst) == 0 && wakes < 20 {
+            assert_eq!(futex(libc::FUTEX_WAKE, 1), 1);
+            wakes += 1;
+            yield_turns(3);
+        }
+        let a_woken = A_WOKEN.load(Ordering::SeqCst);
+        println!(
+            "wakes {wakes}, A woken {a_woken}, B woken {}",
+            B_WAKES.load(Ordering::SeqCst)
+        );
+        DONE.store(1, Ordering::SeqCst);
+        assert_eq!(futex(libc::FUTEX_WAKE, u32::MAX >> 1), 1);
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(a_woken, 1, "the longest waiter was never woken");
+        assert_eq!(wakes, 1, "the first wake did not reach the longest waiter");
+    });
+}
+
 #[test]
 fn shared_futex_modes_are_supported_and_validate_bitsets() {
     det_test_fn_sequential_without_pmu(|| {
@@ -2020,10 +2128,14 @@ fn futex_wait_bitset_timeout_is_absolute_and_removes_waiter() {
     });
 }
 
+// Interception of getrandom and the random devices needs no timer, so the
+// test runs without one: with the default timer it returned early on every
+// host without perf counters (every GitHub-hosted runner), and on a host
+// whose counters work but whose CPU Reverie has no PMU profile for it would
+// have panicked reading the clock.
 #[test]
 fn getrandom_intercepted() {
-    reverie_ptrace::ret_without_perf!();
-    detcore_testutils::det_test_fn(|| {
+    det_test_fn_without_pmu(|| {
         let mut got: u64 = 0;
         assert_eq!(
             unsafe { libc::syscall(libc::SYS_getrandom, &mut got as *const u64 as u64, 8, 0) },
@@ -2052,6 +2164,112 @@ fn getrandom_intercepted() {
         );
         println!("/dev/random result: {}", got);
         assert!(unistd::close(fd).is_ok());
+    })
+}
+
+/// Map two pages, unmap the second, protect the first as `prot`, and return
+/// the first page's start and the end of the mapping.
+fn page_before_a_hole(prot: i32) -> (*mut u8, *mut u8) {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            2 * page,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    let second_page = unsafe { mapping.cast::<u8>().add(page) };
+    assert_eq!(unsafe { libc::munmap(second_page.cast(), page) }, 0);
+    assert_eq!(unsafe { libc::mprotect(mapping, page, prot) }, 0);
+    (mapping.cast(), second_page)
+}
+
+const WRITE_ONLY: i32 = libc::PROT_WRITE;
+const READ_WRITE: i32 = libc::PROT_READ | libc::PROT_WRITE;
+
+/// A random read into a destination that ends right before an unmapped page
+/// gets its bytes, as natively, whether through `readv`, `preadv`, `read` or
+/// `getrandom`, and whether the page is readable or write-only. The digest of
+/// the moved bytes in the log must read them without crossing into the
+/// unmapped page, as an eight-byte `PTRACE_PEEKDATA` at the destination does
+/// for 1 or 4 bytes, and without needing `PROT_READ`, as `process_vm_readv`
+/// does (https://github.com/rrnewton/hermit/issues/3823).
+#[test]
+fn random_read_before_an_unmapped_page() {
+    det_test_fn_sequential_without_pmu(|| {
+        let fd = unsafe { libc::open(c"/dev/urandom".as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0);
+        for prot in [READ_WRITE, WRITE_ONLY] {
+            for count in [1_usize, 4, 8, 16] {
+                for call in ["readv", "preadv", "read", "getrandom"] {
+                    let (mapping, end) = page_before_a_hole(prot);
+                    let destination = unsafe { end.sub(count) };
+                    let iov = libc::iovec {
+                        iov_base: destination.cast(),
+                        iov_len: count,
+                    };
+                    let n = unsafe {
+                        match call {
+                            "readv" => libc::readv(fd, &iov, 1),
+                            "preadv" => libc::preadv(fd, &iov, 1, 0),
+                            "read" => libc::read(fd, destination.cast(), count),
+                            _ => libc::syscall(libc::SYS_getrandom, destination, count, 0) as isize,
+                        }
+                    };
+                    assert_eq!(n, count as isize, "{call} of {count} bytes, prot {prot}");
+                    assert_eq!(
+                        unsafe { libc::munmap(mapping.cast(), end as usize - mapping as usize) },
+                        0
+                    );
+                }
+            }
+        }
+        assert!(unistd::close(fd).is_ok());
+    })
+}
+
+/// A pipe read into a write-only destination, which the digest cannot read
+/// with `process_vm_readv`, returns its bytes, as natively, with or without a
+/// hole right after it (https://github.com/rrnewton/hermit/issues/3823).
+#[test]
+fn pipe_read_into_a_write_only_page() {
+    det_test_fn_sequential_without_pmu(|| {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        for count in [1_usize, 4, 8, 16, page] {
+            for call in ["read", "readv"] {
+                let mut fds = [0; 2];
+                assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+                let bytes: Vec<u8> = (0..count).map(|i| i as u8).collect();
+                let written = unsafe { libc::write(fds[1], bytes.as_ptr().cast(), count) };
+                assert_eq!(written, count as isize);
+                let (mapping, end) = page_before_a_hole(WRITE_ONLY);
+                let destination = unsafe { end.sub(count) };
+                let iov = libc::iovec {
+                    iov_base: destination.cast(),
+                    iov_len: count,
+                };
+                let n = unsafe {
+                    match call {
+                        "read" => libc::read(fds[0], destination.cast(), count),
+                        _ => libc::readv(fds[0], &iov, 1),
+                    }
+                };
+                assert_eq!(n, count as isize, "{call} of {count} bytes");
+                assert_eq!(
+                    unsafe { libc::mprotect(mapping.cast(), page, READ_WRITE) },
+                    0
+                );
+                let got = unsafe { std::slice::from_raw_parts(destination, count) };
+                assert_eq!(got, bytes.as_slice(), "{call} of {count} bytes");
+                assert_eq!(unsafe { libc::munmap(mapping.cast(), page) }, 0);
+                assert!(unistd::close(fds[0]).is_ok());
+                assert!(unistd::close(fds[1]).is_ok());
+            }
+        }
     })
 }
 

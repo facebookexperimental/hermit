@@ -18,7 +18,8 @@ fn proc_fdinfo_consumers_are_deterministic_under_strict_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("proc-fdinfo");
+    let build_root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("proc-fdinfo-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create proc-fdinfo build directory");
 
     for (name, source) in [("open", "1"), ("openat", "2"), ("memfd", "3")] {
@@ -53,9 +54,7 @@ fn proc_fdinfo_consumers_are_deterministic_under_strict_verify() {
             ])
             .arg(&guest);
         hermit_test::configure_guest_execution(&mut command);
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to verify {name}: {error}"));
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(

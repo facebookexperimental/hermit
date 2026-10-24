@@ -20,6 +20,16 @@
  * fix, sched_yield is treated as a chaos reprioritization point, so the worker
  * eventually runs and the program makes progress.
  *
+ * With timer preemption on, the same loop starved the worker under
+ * `--chaos --chaos-target-races`
+ * (https://github.com/rrnewton/hermit/issues/4068): the worker can start in
+ * the band that runs last, and chaos redraws a band only when a slice expires,
+ * which a sched_yield loop never reaches.
+ * `--two-spinners` adds a second thread spinning the same way, so two yielders
+ * can take turns ahead of the worker. `--yield-then-write` turns it around:
+ * main yields once, makes one ordinary syscall, then sets the flag that two
+ * pure spinners (no syscalls) wait for, so it is the yielder that is waited on.
+ *
  * Success is printing "sched-yield-progress-ok <value>" and exiting 0. Failure
  * is a hang (caught by the harness timeout).
  */
@@ -50,19 +60,63 @@ static void* worker(void* arg) {
   return NULL;
 }
 
-static int run_progress(void) {
+/* Spin waiting for the worker, yielding the CPU on every iteration. */
+static void* spinner(void* arg) {
+  (void)arg;
+  while (atomic_load_explicit(&g_ready, memory_order_acquire) == 0) {
+    sched_yield();
+  }
+  return NULL;
+}
+
+/* Spin without syscalls until main publishes the flag. */
+static void* silent_spinner(void* arg) {
+  (void)arg;
+  while (atomic_load_explicit(&g_ready, memory_order_acquire) == 0) {
+  }
+  return NULL;
+}
+
+static int run_yield_then_write(void) {
+  pthread_t spinners[2];
+  for (int i = 0; i < 2; i++) {
+    if (pthread_create(&spinners[i], NULL, silent_spinner, NULL) != 0) {
+      fprintf(stderr, "pthread_create failed\n");
+      return 2;
+    }
+  }
+  sched_yield();
+  const char msg[] = "yielded\n";
+  if (write(1, msg, strlen(msg)) < 0) {
+    return 8;
+  }
+  atomic_store_explicit(&g_ready, 1, memory_order_release);
+  for (int i = 0; i < 2; i++) {
+    if (pthread_join(spinners[i], NULL) != 0) {
+      fprintf(stderr, "pthread_join failed\n");
+      return 3;
+    }
+  }
+  printf("sched-yield-progress-ok yield-then-write\n");
+  return 0;
+}
+
+static int run_progress(int two_spinners) {
+  pthread_t second;
+  if (two_spinners && pthread_create(&second, NULL, spinner, NULL) != 0) {
+    fprintf(stderr, "pthread_create failed\n");
+    return 2;
+  }
   pthread_t t;
   if (pthread_create(&t, NULL, worker, NULL) != 0) {
     fprintf(stderr, "pthread_create failed\n");
     return 2;
   }
 
-  /* Spin waiting for the worker, yielding the CPU on every iteration. */
-  while (atomic_load_explicit(&g_ready, memory_order_acquire) == 0) {
-    sched_yield();
-  }
+  spinner(NULL);
 
-  if (pthread_join(t, NULL) != 0) {
+  if (pthread_join(t, NULL) != 0 ||
+      (two_spinners && pthread_join(second, NULL) != 0)) {
     fprintf(stderr, "pthread_join failed\n");
     return 3;
   }
@@ -75,10 +129,19 @@ static int run_progress(void) {
 
 int main(int argc, char** argv) {
   if (argc == 1 || (argc == 2 && strcmp(argv[1], "--vfork-child") == 0)) {
-    return run_progress();
+    return run_progress(0);
+  }
+  if (argc == 2 && strcmp(argv[1], "--two-spinners") == 0) {
+    return run_progress(1);
+  }
+  if (argc == 2 && strcmp(argv[1], "--yield-then-write") == 0) {
+    return run_yield_then_write();
   }
   if (argc != 2 || strcmp(argv[1], "--vfork") != 0) {
-    fprintf(stderr, "usage: %s [--vfork|--vfork-child]\n", argv[0]);
+    fprintf(stderr,
+            "usage: %s [--vfork|--vfork-child|--two-spinners|"
+            "--yield-then-write]\n",
+            argv[0]);
     return 4;
   }
 

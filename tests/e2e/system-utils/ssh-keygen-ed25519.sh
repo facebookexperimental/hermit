@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # `ssh-keygen -t ed25519` generates an Ed25519 keypair. OpenSSH draws the 32-byte
 # private seed from its own CSPRNG, which is seeded from the kernel entropy pool
 # (getrandom(2), /dev/urandom fallback). The public key is a pure function of

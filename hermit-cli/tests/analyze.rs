@@ -20,8 +20,11 @@
 //! explicitly by `scripts/validate.rs`. Run them with:
 //!
 //! ```text
-//! cargo test -p hermit --test analyze -- --ignored
+//! cargo test -p hermit-run --test analyze -- --ignored
 //! ```
+
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
 
 use std::fs;
 use std::path::Path;
@@ -50,9 +53,7 @@ struct AnalyzeWorkloads {
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -213,9 +214,7 @@ fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts
         .arg(guest);
 
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

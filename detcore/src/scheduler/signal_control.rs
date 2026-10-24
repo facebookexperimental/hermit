@@ -1,7 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
- *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
@@ -235,18 +234,70 @@ impl Scheduler {
         std::mem::take(&mut self.parked.failure_wakes)
     }
 
+    /// Answers the backend's offer of its process signal control, once per
+    /// run, before any guest thread exists.
+    ///
+    /// The offer and Detcore's own `sequentialize` decide. Detcore takes an
+    /// offered control when threads are sequentialized: real-timer signals then
+    /// travel through acknowledged shared dequeues, which only a serial
+    /// schedule can order. Without an offer, or without sequentialized
+    /// threads, the run stays `Unchanged`. A backend refuses a run that needs a
+    /// control it does not hold: Detcore reports the need through
+    /// [`reverie::Tool::requires_signal_control`]. Reverie's non-ELF KVM
+    /// runner, which has none to offer, returns ENOSYS after GlobalState is
+    /// initialized (so its startup records are kept) and before it is asked
+    /// to install anything; its runners that offer one return EINVAL when the
+    /// answer is not `ToolControlled`, which this method never gives for a
+    /// sequentialized run that it does not refuse itself.
+    ///
+    /// Two offers are refused with EINVAL rather than answered:
+    ///
+    /// - one that comes after a guest thread registered, after a turn, or after
+    ///   an earlier installation, because the answer is fixed before the first
+    ///   turn;
+    /// - one from a backend whose capabilities do not report
+    ///   `provides_process_signal_control`. That capability is what
+    ///   [`reverie::Tool::may_observe_signal_dequeues`] reads before any Tool
+    ///   state exists, and the backend observes dequeues only within that
+    ///   bound, so a control taken outside it would never see the dequeues it
+    ///   orders. The contradiction is refused, never resolved silently either
+    ///   way;
+    /// - one from a backend whose process exits complete asynchronously
+    ///   (`process_exits_complete_asynchronously`). The controlled turn loop
+    ///   releases the scheduler mutex between its phases, so an exit barrier
+    ///   installed between them would escape the hold in `step2_drain_prefix`.
+    ///   No backend reports both today; the combination is refused rather
+    ///   than run.
     pub(crate) fn install_signal_control(
         &mut self,
         control: Option<BackendSignalControl>,
+        sequentialize: bool,
     ) -> Result<BackendSignalControlMode, reverie::Error> {
-        if !self.kvm_shared_dequeue_timers {
+        let Some(control) = control else {
+            return Ok(BackendSignalControlMode::Unchanged);
+        };
+        if !sequentialize {
             return Ok(BackendSignalControlMode::Unchanged);
         }
-        if self.parked.control.is_some() || !self.next_turns.is_empty() {
+        if !self.backend.provides_process_signal_control
+            || self.backend.process_exits_complete_asynchronously
+            || self.parked.control.is_some()
+            || !self.next_turns.is_empty()
+            || self.turn != 0
+            || self.started_up.is_full()
+        {
             return Err(reverie::syscalls::Errno::EINVAL.into());
         }
-        self.parked.control = Some(control.ok_or(reverie::syscalls::Errno::ENOSYS)?);
+        self.parked.control = Some(control);
         Ok(BackendSignalControlMode::ToolControlled)
+    }
+
+    /// Whether this run installed the backend's process signal control: the
+    /// scheduler then runs the controlled turn loop and real-timer SIGALRM
+    /// goes through acknowledged shared dequeues. Fixed before the first turn
+    /// by [`Self::install_signal_control`].
+    pub(crate) fn signal_control_installed(&self) -> bool {
+        self.parked.control.is_some()
     }
 
     pub(crate) fn authorize_signal_boundary(
@@ -795,6 +846,70 @@ impl Scheduler {
         })
     }
 
+    /// The thread-group leader of `tid` (itself when it leads, or when it is
+    /// unknown), as `fail_parked` names a thread's process.
+    fn permit_leader(&self, tid: DetTid) -> DetTid {
+        self.thread_tree
+            .thread_to_leader
+            .get(&tid)
+            .copied()
+            .unwrap_or(tid)
+    }
+
+    /// Whether `tid`'s controlled exit must wait because another thread of its
+    /// process holds a delivery permit: that thread is at a signal boundary,
+    /// waiting for its `InboundSignal` turn, and the protocol allows one
+    /// boundary per process at a time, so `reserve_exit_boundary` would refuse
+    /// the exit as a protocol failure. The exit waits instead, and the
+    /// permit's release re-admits it (`admit_exits_released_by`), as Linux
+    /// lets a thread exit while a sibling handles a signal
+    /// (https://github.com/rrnewton/hermit/issues/4367).
+    pub(crate) fn exit_awaits_sibling_permit(&self, tid: DetTid, process: DetPid) -> bool {
+        if self.parked.control.is_none() {
+            return false;
+        }
+        let Some((_, task)) = self.real_timers.task_identity(process, tid) else {
+            return false;
+        };
+        self.parked
+            .permits
+            .iter()
+            .any(|(holder, permit)| *holder != tid && permit.task.process == task.process)
+    }
+
+    /// Admit, at the next drain and at the front of its band, every exit that
+    /// waited (`exit_awaits_sibling_permit`) for the permit `holder` just
+    /// released, once no other permit of `process` remains. Called at every
+    /// release of a permit, so no waiter outlives the permits it waits for.
+    /// Each release is ordered before the next selection, so the drain that
+    /// admits the exit is a deterministic one (`admit_to_run_queue`): the
+    /// delivery receipt arrives while `holder` holds its turn, before it files
+    /// its next request, and an observation's release runs in the scheduler's
+    /// own control drain, while the observed thread's empty request holds the
+    /// scheduler.
+    pub(super) fn admit_exits_released_by(&mut self, holder: DetTid, process: SignalProcessId) {
+        if self
+            .parked
+            .permits
+            .values()
+            .any(|permit| permit.task.process == process)
+        {
+            return;
+        }
+        let leader = self.permit_leader(holder);
+        let ready: Vec<DetTid> = self
+            .parked
+            .exits_awaiting_permit
+            .iter()
+            .copied()
+            .filter(|waiter| self.permit_leader(*waiter) == leader)
+            .collect();
+        for waiter in ready {
+            self.parked.exits_awaiting_permit.remove(&waiter);
+            self.admit_to_run_queue(waiter, super::AdmitIntent::Fixed(super::AdmitSide::Front));
+        }
+    }
+
     /// Fence one scheduler-committed exit until KVM reports the exact terminal
     /// boundary after committing its process-family snapshot. The selected
     /// `(tid, request, response)` transaction is the authority here: step 5
@@ -960,7 +1075,9 @@ impl Scheduler {
         // Cleanup/failure may already have logically killed the task. Exact
         // duplicates remain recognizable after timer/task retirement. No turn
         // or membership is created by this consuming notification.
-        self.parked.permits.remove(&tid);
+        if let Some(released) = self.parked.permits.remove(&tid) {
+            self.admit_exits_released_by(tid, released.task.process);
+        }
         if exit_fence.is_some() {
             self.parked.exit_fences.remove(&tid);
         }

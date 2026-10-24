@@ -14,7 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-enum { THREADS = 4, ROUNDS = 500 };
+enum { THREADS = 4, DEFAULT_ROUNDS = 500 };
+
+static unsigned rounds = DEFAULT_ROUNDS;
 
 struct worker {
   unsigned id;
@@ -30,7 +32,7 @@ static void* run_worker(void* opaque) {
   sigaddset(&blocked, SIGUSR1);
 
   uint64_t value = worker->id + 1;
-  for (unsigned round = 0; round < ROUNDS; ++round) {
+  for (unsigned round = 0; round < rounds; ++round) {
     int error = pthread_sigmask(SIG_BLOCK, &blocked, &previous);
     if (error == 0) {
       error = pthread_sigmask(SIG_SETMASK, &previous, NULL);
@@ -45,7 +47,20 @@ static void* run_worker(void* opaque) {
   return NULL;
 }
 
-int main(void) {
+/* An optional first argument replaces the default round count. */
+int main(int argc, char** argv) {
+  if (argc > 2) {
+    return 2;
+  }
+  if (argc == 2) {
+    char* end = NULL;
+    unsigned long requested = strtoul(argv[1], &end, 10);
+    if (*argv[1] == '\0' || *end != '\0' || requested == 0 ||
+        requested > DEFAULT_ROUNDS) {
+      return 2;
+    }
+    rounds = (unsigned)requested;
+  }
   pthread_t threads[THREADS];
   struct worker workers[THREADS] = {0};
   uint64_t checksum = 0;
@@ -66,9 +81,9 @@ int main(void) {
   }
 
   printf(
-      "sigmask-stress threads=%d rounds=%d checksum=%016lx\n",
+      "sigmask-stress threads=%d rounds=%u checksum=%016lx\n",
       THREADS,
-      ROUNDS,
+      rounds,
       (unsigned long)checksum);
   return EXIT_SUCCESS;
 }

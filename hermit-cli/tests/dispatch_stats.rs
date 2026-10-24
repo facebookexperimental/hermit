@@ -9,10 +9,10 @@
 //! The ptrace and e9patch dispatch records, and the DEBUG-only rule.
 //!
 //! The harness in `common/dispatch_stats.rs` checks what every backend's
-//! record must satisfy; the SaBRe and LiteInst cases live in
-//! `sabre_examples.rs` and `liteinst_advanced.rs`, whose validation nodes
-//! stage those backends' artifacts. The record must stay out of the INFO log
-//! that `--verify` compares.
+//! record must satisfy; the SaBRe case lives in `sabre_examples.rs`, whose
+//! validation node stages that backend's artifacts, and the in-guest LiteInst
+//! case in the `cli` binary (`common/liteinst_in_guest_programs.rs`). The record
+//! must stay out of the INFO log that `--verify` compares.
 
 #[path = "common/dispatch_stats.rs"]
 mod dispatch_stats;
@@ -31,6 +31,7 @@ fn ptrace_reports_seccomp_stops_and_no_patching() {
     let record = dispatch_record(
         "ptrace",
         Path::new(env!("CARGO_BIN_EXE_hermit")),
+        &[],
         &[],
         &guest,
     );
@@ -61,6 +62,7 @@ fn debug_log_carries_the_report_without_a_summary_file() {
         "hermit::backend_stats=debug",
         None,
         &[],
+        &[],
         &guest,
     );
     for marker in REPORT_MARKERS {
@@ -87,6 +89,7 @@ fn e9patch_reports_rewrite_sites_and_tracer_dispatch() {
     let record = dispatch_record(
         "e9patch",
         Path::new(env!("CARGO_BIN_EXE_hermit")),
+        &[],
         &[],
         &guest,
     );

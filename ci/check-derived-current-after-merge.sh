@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # check-derived-current-after-merge.sh — assert the DERIVED compatibility
 # artifacts are current for the tree that will exist AFTER this branch merges,
 # not merely for the tree the author built on.

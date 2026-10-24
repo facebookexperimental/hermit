@@ -1,12 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/*
  * POSIX advisory record-lock (fcntl F_SETLK / F_GETLK) parity fixture.
  *
  * Exercises the byte-range advisory-locking fcntl command family on a single

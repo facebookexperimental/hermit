@@ -14,6 +14,7 @@ use std::io;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
@@ -27,13 +28,18 @@ use std::sync::atomic::Ordering;
 
 use anyhow::anyhow;
 use detcore_model::config::MountInfoRootRewrite;
+use detcore_model::container_mounts::ContainerMountTable;
+use detcore_model::container_mounts::Installation;
+use detcore_model::container_mounts::assign_installed_rows;
+use detcore_model::container_mounts::check_installed_rows;
+use detcore_model::container_mounts::owned_mounts;
 use hermit::Context;
 use hermit::Error;
 use hermit::FailureKind;
 use hermit::HERMIT_DEADLINE_EXIT;
+use hermit::HERMIT_LOG_CAP_EXIT;
 use hermit::SerializableError;
 use hermit::SkidOvershootError;
-use hermit::capture_mountinfo_identity_order;
 use nix::sched::CpuSet;
 use nix::sched::sched_getaffinity;
 use nix::sys::signal::SaFlags;
@@ -52,7 +58,6 @@ use reverie::process::RunError;
 
 const GROUP_FILE: &str = "/etc/group";
 const NSCD_DIR: &str = "/var/run/nscd";
-const OVERFLOW_GID: &str = "65534";
 const DETERMINISTIC_GROUP_ROOT: &[u8] = b"/tmpvol/.hermit/etc/group";
 const DETERMINISTIC_NSCD_ROOT: &[u8] = b"/tmpvol/.hermit/run/nscd";
 const DETERMINISTIC_TMP_ROOT: &[u8] = b"/tmpvol/.hermit/tmp";
@@ -82,7 +87,7 @@ fn open_path(path: &Path) -> io::Result<File> {
 }
 
 fn mount_id_for_fd(fd: i32) -> io::Result<u64> {
-    let contents = fs::read(format!("/proc/self/fdinfo/{fd}"))?;
+    let contents = fs::read(format!("/proc/thread-self/fdinfo/{fd}"))?;
     detcore_model::procfs::parse_fdinfo_mount_id(&contents).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -92,7 +97,7 @@ fn mount_id_for_fd(fd: i32) -> io::Result<u64> {
 }
 
 fn mountinfo_root_for_id(raw_mount_id: u64) -> io::Result<Vec<u8>> {
-    let contents = fs::read("/proc/self/mountinfo")?;
+    let contents = fs::read("/proc/thread-self/mountinfo")?;
     let rows = detcore_model::procfs::parse_mountinfo(&contents).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "mountinfo has a malformed row")
     })?;
@@ -119,6 +124,334 @@ fn mountinfo_escape_path(path: &Path) -> Vec<u8> {
         }
     }
     encoded
+}
+
+/// One `/proc/self/mountinfo` row's mount ID, device (`major:minor`), root and
+/// mountpoint, the last two as the kernel escapes them.
+struct MountRow {
+    id: u64,
+    device: Vec<u8>,
+    root: Vec<u8>,
+    mountpoint: Vec<u8>,
+}
+
+/// This process's mount table, as [`MountRow`]s.
+fn mount_rows() -> io::Result<Vec<MountRow>> {
+    let contents = fs::read("/proc/thread-self/mountinfo")?;
+    contents
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
+            let id = (fields.len() > 4)
+                .then(|| std::str::from_utf8(fields[0]).ok()?.parse().ok())
+                .flatten();
+            match id {
+                Some(id) => Ok(MountRow {
+                    id,
+                    device: fields[2].to_vec(),
+                    root: fields[3].to_vec(),
+                    mountpoint: fields[4].to_vec(),
+                }),
+                None => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "mountinfo has a malformed row",
+                )),
+            }
+        })
+        .collect()
+}
+
+/// This process's mount namespace, every row of it (host FUSE seed rows
+/// included).
+fn namespace_rows() -> Result<Vec<detcore_model::container_mounts::ContainerMount>, Error> {
+    let contents = fs::read("/proc/thread-self/mountinfo")
+        .context("Failed to read the guest mount table for its container mount table")?;
+    detcore_model::container_mounts::parse_container_mounts(&contents)
+        .ok_or_else(|| anyhow!("the guest mount table has a malformed row"))
+}
+
+/// Whether `row`, the row the walk took for the plan's first mount, is the
+/// container's own `/proc`: a procfs, and, where `/proc` reaches it, the
+/// procfs of this process's PID namespace (its `self` names this process's
+/// own PID, which a copy of the host's `/proc` does not). Where a later mount
+/// covers `/proc` (a user's mount at `/` or `/proc`), no path reaches the row,
+/// and only its filesystem type is checked.
+fn is_this_namespaces_proc(row: &detcore_model::container_mounts::ContainerMount) -> bool {
+    if row.fstype.as_slice() != b"proc" {
+        return false;
+    }
+    let Ok(proc_dir) = open_path(Path::new("/proc")) else {
+        return true;
+    };
+    if mount_id_for_fd(proc_dir.as_raw_fd()).ok() != Some(row.raw_mount_id) {
+        return true;
+    }
+    // SAFETY: getpid has no preconditions and cannot fail.
+    let me = unsafe { libc::getpid() };
+    fs::read_link("/proc/self").is_ok_and(|link| link.as_os_str() == me.to_string().as_str())
+}
+
+/// Where the contents at a guest path come from, for [`InstallTimeTree`]:
+/// a host directory or file, or a filesystem the plan mounted fresh (tmpfs,
+/// procfs, an overlay), which holds no symbolic link a target could cross.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Backing {
+    Host(PathBuf),
+    Fresh,
+}
+
+/// The guest's directory tree as each mount of the plan finds it when the
+/// container's setup installs it: the host's tree (which the container's
+/// mount namespace starts as a copy of) with the plan's earlier mounts laid
+/// over it. It resolves a target the way the kernel's `mount(2)` does at that
+/// moment, following symbolic links component by component, so that the
+/// mountpoint the kernel lists for each installation is known before any
+/// later mount can change how the same name resolves (a later bind that
+/// replaces a directory holding a symbolic link the target crossed).
+#[derive(Debug, Default)]
+struct InstallTimeTree {
+    /// The plan's mounts so far: where each was mounted, and what it shows.
+    layers: Vec<(PathBuf, Backing)>,
+}
+
+impl InstallTimeTree {
+    /// The most symbolic links one resolution follows, as Linux's `MAXSYMLINKS`.
+    const MAX_LINKS: usize = 40;
+
+    /// Where the contents at the resolved guest path `path` come from: the
+    /// latest of the plan's mounts at `path` or above it, or the host.
+    fn backing_of(&self, path: &Path) -> Backing {
+        let layer = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (mountpoint, backing))| {
+                let rest = path.strip_prefix(mountpoint).ok()?;
+                Some((mountpoint.components().count(), index, rest, backing))
+            })
+            .max_by_key(|(depth, index, _, _)| (*depth, *index));
+        match layer {
+            None => Backing::Host(path.to_path_buf()),
+            Some((_, _, rest, Backing::Host(source))) => {
+                Backing::Host(if rest.as_os_str().is_empty() {
+                    source.clone()
+                } else {
+                    source.join(rest)
+                })
+            }
+            Some((_, _, _, Backing::Fresh)) => Backing::Fresh,
+        }
+    }
+
+    /// `path` resolved as the kernel resolves it now: absolute, with every
+    /// symbolic link it crosses followed (a final one too), and its missing
+    /// components kept as named (Reverie creates a missing target).
+    fn resolve(&self, path: &Path) -> PathBuf {
+        let mut resolved = PathBuf::from("/");
+        let mut pending: std::collections::VecDeque<std::ffi::OsString> = path
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name.to_os_string()),
+                std::path::Component::ParentDir => Some("..".into()),
+                _ => None,
+            })
+            .collect();
+        let mut links = 0;
+        while let Some(name) = pending.pop_front() {
+            if name == ".." {
+                resolved.pop();
+                continue;
+            }
+            let candidate = resolved.join(&name);
+            if let Backing::Host(host) = self.backing_of(&candidate)
+                && links < Self::MAX_LINKS
+                && fs::symlink_metadata(&host).is_ok_and(|meta| meta.file_type().is_symlink())
+                && let Ok(target) = fs::read_link(&host)
+            {
+                links += 1;
+                if target.is_absolute() {
+                    resolved = PathBuf::from("/");
+                }
+                let mut front: std::collections::VecDeque<std::ffi::OsString> = target
+                    .components()
+                    .filter_map(|component| match component {
+                        std::path::Component::Normal(name) => Some(name.to_os_string()),
+                        std::path::Component::ParentDir => Some("..".into()),
+                        _ => None,
+                    })
+                    .collect();
+                front.extend(pending);
+                pending = front;
+                continue;
+            }
+            resolved = candidate;
+        }
+        resolved
+    }
+
+    /// Install `mount` in the tree, and return what the kernel will list for
+    /// it: its mountpoint (none for a remount, which creates no mount) and,
+    /// for a recursive bind, the resolved source whose mounts it copies.
+    fn install(&mut self, mount: &Mount) -> (Option<PathBuf>, Option<PathBuf>) {
+        if mount.clone().flags(MountFlags::MS_REMOUNT) == *mount {
+            return (None, None);
+        }
+        let mountpoint = self.resolve(mount.get_target());
+        let (backing, source) = match mount.get_source().filter(|_| is_bind_mount(mount)) {
+            Some(source) => {
+                let source = self.resolve(source);
+                let recursive = mount.clone().flags(MountFlags::MS_REC) == *mount;
+                (self.backing_of(&source), recursive.then_some(source))
+            }
+            None => (Backing::Fresh, None),
+        };
+        self.layers.push((mountpoint.clone(), backing));
+        (Some(mountpoint), source)
+    }
+}
+
+/// What the kernel will list for each mount of `plan`, as the container's
+/// setup installs them in order over the host's current tree
+/// ([`InstallTimeTree`]), as installations with no rows yet.
+fn installations_of(plan: &[PlannedMount]) -> Vec<Installation> {
+    let mut tree = InstallTimeTree::default();
+    plan.iter()
+        .map(|planned| {
+            let (mountpoint, source) = tree.install(&planned.mount);
+            Installation {
+                ids: Vec::new(),
+                mountpoints: mountpoint
+                    .iter()
+                    .map(|path| mountinfo_escape_path(path))
+                    .collect(),
+                sources: source
+                    .iter()
+                    .map(|path| mountinfo_escape_path(path))
+                    .collect(),
+                backend: planned.backend,
+            }
+        })
+        .collect()
+}
+
+/// Whether `field` is one Detcore's mountinfo sanitizer accepts: an absolute
+/// path with no ASCII control byte or space (the kernel escapes space, tab,
+/// newline and backslash; other control bytes it leaves, and the sanitizer
+/// refuses them).
+fn mountinfo_field_is_canonical(field: &[u8]) -> bool {
+    field.first() == Some(&b'/')
+        && field
+            .iter()
+            .all(|byte| !byte.is_ascii_control() && *byte != b' ')
+}
+
+/// A user's bind mount (`--bind`, or `--mount` of type bind), whose
+/// mountinfo rows show its target as their root rather than the host source
+/// path, which differs from run to run and host to host
+/// (https://github.com/rrnewton/hermit/issues/4266).
+///
+/// Its rows are those, in the completed guest namespace, at a mountpoint the
+/// kernel may show for the bind that are not the guest's copies of the host's
+/// own mounts ([`IdentityGuard::host_rows`]) and do not show a filesystem's
+/// own root, `/`, which names no host path (a mount of another type there,
+/// such as a tmpfs, keeps it). The mountpoints are the target as named, as
+/// the host resolves it before setup (earlier mounts may change that
+/// resolution), and as the guest resolves it after, and, for a bind under
+/// `/tmp`, its staging path in Hermit's private `/tmp`. A row at a bind's
+/// target or staging path as named belongs to that bind before any other
+/// bind's resolved spelling claims it. Every layer of the bind at its
+/// mountpoint matches, including one a later mount covers, whatever path
+/// the source was reached through. No row at another mountpoint changes. It
+/// claims no Hermit ownership: the root is the guest's own path, not a
+/// `/tmpvol/.hermit` name.
+struct UserBind {
+    /// The guest path the user named, which its rows show as their root.
+    target: PathBuf,
+    /// The mountpoints, escaped, at which the bind is installed as named:
+    /// its target and, under `/tmp`, its staging path.
+    named: Vec<Vec<u8>>,
+    /// Further mountpoints, escaped, the kernel may show for the bind, as the
+    /// host resolves the named ones before setup.
+    resolved: Vec<Vec<u8>>,
+}
+
+impl UserBind {
+    /// The bind at guest path `target`, staged at `staging` for a bind under
+    /// `/tmp`. `None` for a target this cannot show as a root: a relative
+    /// one, one with a `..`, or one the mountinfo grammar cannot carry.
+    fn new(target: &Path, staging: Option<&Path>) -> Option<Self> {
+        let named = |path: &Path| {
+            path.is_absolute()
+                && !path
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir)
+        };
+        if !named(target) || staging.is_some_and(|staging| !named(staging)) {
+            return None;
+        }
+        // As the kernel spells a mountpoint: no `.` and no trailing `/` (a
+        // bind at exactly `/tmp` is staged at the private tmp directory
+        // itself).
+        let target: PathBuf = target.components().collect();
+        if !mountinfo_field_is_canonical(&mountinfo_escape_path(&target)) {
+            return None;
+        }
+        let staging: Option<PathBuf> = staging.map(|staging| staging.components().collect());
+        let mut named = vec![mountinfo_escape_path(&target)];
+        named.extend(staging.as_deref().map(mountinfo_escape_path));
+        let mut resolved = vec![mountinfo_escape_path(&canonical_mount_target(&target))];
+        resolved.extend(
+            staging
+                .as_deref()
+                .map(|staging| mountinfo_escape_path(&canonical_mount_target(staging))),
+        );
+        resolved.retain(|mountpoint| !named.contains(mountpoint));
+        Some(Self {
+            target,
+            named,
+            resolved,
+        })
+    }
+
+    /// The rows of the completed guest namespace `rows` at this bind's
+    /// mountpoints as named (`named`) or as resolved, which are neither the
+    /// host's own (`host_rows`) nor a filesystem's root.
+    fn rows<'rows>(
+        &self,
+        rows: &'rows [MountRow],
+        host_rows: &[(Vec<u8>, Vec<u8>, Vec<u8>)],
+        named: bool,
+    ) -> impl Iterator<Item = &'rows MountRow> {
+        let mountpoints = if named {
+            self.named.clone()
+        } else {
+            let mut resolved = self.resolved.clone();
+            // The kernel shows a mountpoint with its symbolic links resolved.
+            if let Ok(target) = fs::canonicalize(&self.target) {
+                resolved.push(mountinfo_escape_path(&target));
+            }
+            resolved
+        };
+        let host_rows = host_rows.to_vec();
+        rows.iter().filter(move |row| {
+            mountpoints.contains(&row.mountpoint)
+                && row.root != b"/"
+                && !host_rows.iter().any(|(mountpoint, root, device)| {
+                    *mountpoint == row.mountpoint && *root == row.root && *device == row.device
+                })
+        })
+    }
+}
+
+/// Say that a user bind's mountinfo rows keep the host source path as their
+/// root: Hermit could not identify them, so the guest can see that path.
+fn warn_unrewritten_bind(target: &Path) {
+    crate::tracing::diagnostic_eprintln!(
+        "WARNING: /proc/self/mountinfo shows the host source path of the bind at {}: \
+         Hermit could not identify its rows (https://github.com/rrnewton/hermit/issues/4266).",
+        target.display()
+    );
 }
 
 impl MountInfoRootSource {
@@ -236,6 +569,72 @@ pub(super) struct IdentityGuard {
     _nscd_dir: Option<tempfile::TempDir>,
     mountinfo_roots: Vec<MountInfoRootSource>,
     user_mount_targets: Vec<PathBuf>,
+    user_binds: Vec<UserBind>,
+    /// The host's mount table before setup, as (mountpoint, root, device):
+    /// the guest's copies of these rows are not any user bind's.
+    host_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    /// The container's mount plan, which the container's setup installs, in
+    /// order, as the last of its mounts, and what each installation created,
+    /// recorded in the container's init before the guest starts
+    /// ([`Self::record_plan`]).
+    plan: MountPlan,
+}
+
+/// One mount of the container's mount plan.
+#[derive(Clone, Debug)]
+pub(super) struct PlannedMount {
+    /// The mount, at the target it is installed at (a mount below guest
+    /// `/tmp` is installed in Hermit's private tmp directory first).
+    pub(super) mount: Mount,
+    /// Whether it is a backend's own mount (DBT's statistics bind, e9patch's
+    /// overlay of the rewritten program), which the guest's mount table leaves
+    /// out by this identity, not by its path. DBT's tmpfs at the test workdir
+    /// is not one: it is the guest's working directory, shown as the caller's
+    /// mount there is on every other backend.
+    pub(super) backend: bool,
+}
+
+impl PlannedMount {
+    /// One of the plan's own mounts.
+    pub(super) fn hermit(mount: Mount) -> Self {
+        Self {
+            mount,
+            backend: false,
+        }
+    }
+
+    /// A backend's own mount.
+    pub(super) fn backend(mount: Mount) -> Self {
+        Self {
+            mount,
+            backend: true,
+        }
+    }
+}
+
+/// Where the guest's container mount table learns which mounts are Hermit's.
+#[derive(Debug, Default)]
+enum MountPlan {
+    /// No table: the container's mounts were installed by its setup, without
+    /// a record of what each one made (a native exec domain's container, whose
+    /// declared-input mounts must follow the plan's in that setup).
+    #[default]
+    Unrecorded,
+    /// The plan, given to the container's setup to install; what the kernel
+    /// will list for each of its mounts, resolved over the host's tree before
+    /// the container starts ([`installations_of`]); and, once the rows each
+    /// installation created are recorded in them
+    /// ([`IdentityGuard::record_plan`]), the namespace's rows as read then,
+    /// which nothing changes afterwards (a container's namespace can hold
+    /// hundreds of rows, so it is read and parsed once per launch).
+    Recorded(
+        Vec<PlannedMount>,
+        Vec<Installation>,
+        Option<Vec<detcore_model::container_mounts::ContainerMount>>,
+    ),
+    /// An image root (`--image`): every mount the guest's root can see is one
+    /// the container's setup installed into the image, so all are Hermit's.
+    ImageRoot,
 }
 
 impl IdentityGuard {
@@ -248,7 +647,200 @@ impl IdentityGuard {
             _nscd_dir: None,
             mountinfo_roots: Vec::new(),
             user_mount_targets: Vec::new(),
+            user_binds: Vec::new(),
+            host_rows: Vec::new(),
+            plan: MountPlan::Unrecorded,
         }
+    }
+
+    /// Give `plan` to `container`'s setup, which installs it after every
+    /// mount the container already has, and keep it to record what each
+    /// mount makes ([`Self::record_plan`]). The plan's first mount must be
+    /// the container's own `/proc` ([`container_proc_mount`]), whose row
+    /// marks where the plan's rows begin. Mounts the container already has
+    /// come before it: `/` made private, and for `--network=local` Reverie's
+    /// fresh `/sys`, which rule 2 shows as a base mountpoint.
+    pub(super) fn set_plan(
+        &mut self,
+        container: &mut Container,
+        plan: Vec<PlannedMount>,
+    ) -> Result<(), Error> {
+        if plan.first().map(|planned| &planned.mount) != Some(&container_proc_mount()) {
+            anyhow::bail!("a container's mount plan must begin with its own /proc");
+        }
+        container.mounts(plan.iter().map(|planned| planned.mount.clone()));
+        let installations = installations_of(&plan);
+        self.plan = MountPlan::Recorded(plan, installations, None);
+        Ok(())
+    }
+
+    /// Append `mounts`, a backend's own, to the plan and to `container`'s
+    /// setup. There must be a plan, not yet recorded: a backend's mount
+    /// dropped silently would run the guest without it.
+    pub(super) fn add_backend_mounts(
+        &mut self,
+        container: &mut Container,
+        mounts: impl IntoIterator<Item = Mount>,
+    ) -> Result<(), Error> {
+        let MountPlan::Recorded(plan, installations, None) = &mut self.plan else {
+            anyhow::bail!("a backend's own mounts need the container's mount plan");
+        };
+        for mount in mounts {
+            container.mount(mount.clone());
+            plan.push(PlannedMount::backend(mount));
+        }
+        *installations = installations_of(plan);
+        Ok(())
+    }
+
+    /// The container's mounts were installed into an image root, every one
+    /// of them Hermit's.
+    pub(super) fn set_image_root(&mut self) {
+        self.plan = MountPlan::ImageRoot;
+    }
+
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4213):
+    // Review the provenance of the container mount table's rule 1: the mount
+    // IDs each installation of the plan created.
+    /// Record what each mount of the plan created, in the container's init,
+    /// after its setup installed the plan and before the guest starts or
+    /// anything else changes the namespace (the guest cannot mount). The
+    /// setup installs the plan with Reverie's own mount operation, one mount
+    /// after another, as its last mounts, and the kernel lists rows in
+    /// creation order. The premise: the setup makes `/` recursively private
+    /// (`namespace_container`) before the plan's first mount, the
+    /// container's `/proc`, so no host mount or unmount propagates into the
+    /// namespace after that, and no row can follow that `/proc` but the
+    /// plan's own. So the plan's rows are the end of the namespace's list,
+    /// each installation's together and in plan order:
+    /// `detcore_model::container_mounts::assign_installed_rows` walks them
+    /// back from the end, giving each to the installation that made it (a
+    /// recursive bind's copies included), until it reaches the plan's first
+    /// row, the container's `/proc`. A row is matched by the mountpoint its
+    /// installation's target resolved to when the setup installed it
+    /// ([`installations_of`], resolved before the container starts), never by
+    /// how the target resolves after later mounts. Then
+    /// `check_installed_rows` refuses the record unless every mount that
+    /// creates a row got one at its recorded target and the first row is
+    /// this namespace's own procfs ([`is_this_namespaces_proc`]): a walk that
+    /// ran past the plan into the host's rows (which hold a copy of the
+    /// host's `/proc` at the same path) is refused, not trusted. No process
+    /// is created for this, so no guest PID moves. Nothing for a plan with
+    /// no record.
+    pub(super) fn record_plan(&mut self) -> Result<(), Error> {
+        let MountPlan::Recorded(_, installations, recorded) = &mut self.plan else {
+            return Ok(());
+        };
+        if recorded.is_some() {
+            return Ok(());
+        }
+        let rows = namespace_rows()?;
+        if !assign_installed_rows(&rows, installations) {
+            anyhow::bail!(
+                "the container's mount table has no row for the plan's first mount, its /proc, \
+                 so the plan's rows cannot be told from the host's"
+            );
+        }
+        check_installed_rows(&rows, installations, is_this_namespaces_proc)
+            .map_err(|refusal| anyhow!("refusing the container's mount table: {refusal}"))?;
+        *recorded = Some(rows);
+        Ok(())
+    }
+
+    /// Forget the record of a plan whose container's setup is followed by
+    /// more mounts (a native exec domain's declared inputs), so that the
+    /// plan's rows are not the end of the namespace's list: no table.
+    #[cfg(feature = "native-exec")]
+    pub(super) fn forget_plan(&mut self) {
+        self.plan = MountPlan::Unrecorded;
+    }
+
+    /// The container mount table ([`Self::container_mount_table_of`]) and the
+    /// namespace's identity order (the order Detcore validates guest
+    /// mountinfo views against), from ONE read of the namespace's rows, with
+    /// the namespace they were read in (`hermit::current_mount_namespace`).
+    /// Two reads need not agree: when a host process removes the directory a
+    /// host mount was on, Linux detaches the mounts on that dentry in every
+    /// mount namespace (`detach_mounts`, from `vfs_rmdir`, `vfs_unlink` and
+    /// rename), this private one included, so a copied host row can leave
+    /// between them. One read gives a table whose every row is in the order.
+    pub(super) fn container_mount_view(&self) -> Result<ContainerMountView, Error> {
+        let namespace = hermit::current_mount_namespace()?;
+        let contents = fs::read("/proc/thread-self/mountinfo")
+            .context("Failed to read the guest mount table for its identity order")?;
+        let table = match &self.plan {
+            MountPlan::Unrecorded => None,
+            _ => {
+                let rows = detcore_model::container_mounts::parse_container_mounts(&contents)
+                    .ok_or_else(|| anyhow!("the guest mount table has a malformed row"))?;
+                self.container_mount_table_of(rows)?
+            }
+        };
+        let order = hermit::mountinfo_identity_order_keeping_from_raw(
+            &contents,
+            &table
+                .as_ref()
+                .map(ContainerMountTable::shown_mount_ids)
+                .unwrap_or_default(),
+        )
+        .context("Failed to capture guest mountinfo identity order")?;
+        if hermit::current_mount_namespace()? != namespace {
+            anyhow::bail!("the guest mount table was read across a change of mount namespace");
+        }
+        let root_rewrites = rewrites_of_snapshot(self.mountinfo_root_rewrites()?, &order);
+        Ok(ContainerMountView {
+            table,
+            order,
+            namespace,
+            root_rewrites,
+        })
+    }
+
+    /// The guest's container mount table
+    /// (`detcore_model::container_mounts::ContainerMountTable::select`) over
+    /// `current`, the rows of this process's mount namespace, which must be
+    /// the completed, quiescent guest namespace (with the guest's root), after
+    /// [`Self::record_plan`]. `None` where the plan has no record
+    /// ([`MountPlan::Unrecorded`]).
+    ///
+    /// Rule 1's rows are those the installations recorded
+    /// (`detcore_model::container_mounts::owned_mounts`, over the rows the
+    /// plan was recorded from), a backend's own excepted, and every row under
+    /// an image root. Rule 2's are the top mounts at the base mountpoints,
+    /// proven by a descriptor held on each. Host FUSE seed rows stay in the
+    /// topology, for ancestry and for the mount a file on one reports, and are
+    /// only never shown (`is_ephemeral_host_seed`), unless the plan installed
+    /// one. A row of the record that `current` no longer has is simply absent.
+    fn container_mount_table_of(
+        &self,
+        current: Vec<detcore_model::container_mounts::ContainerMount>,
+    ) -> Result<Option<ContainerMountTable>, Error> {
+        let (rows, installed, backend) = match &self.plan {
+            MountPlan::Unrecorded => return Ok(None),
+            MountPlan::Recorded(_, _, None) => {
+                anyhow::bail!(
+                    "the container mount table was asked for before the plan was recorded"
+                )
+            }
+            MountPlan::Recorded(_, installations, Some(rows)) => {
+                let (installed, backend) = owned_mounts(rows, installations);
+                (current, installed, backend)
+            }
+            MountPlan::ImageRoot => {
+                let installed = current.iter().map(|row| row.raw_mount_id).collect();
+                (current, installed, std::collections::BTreeSet::new())
+            }
+        };
+        let never = rows
+            .iter()
+            .filter(|row| row.is_ephemeral_host_seed() && !installed.contains(&row.raw_mount_id))
+            .map(|row| row.raw_mount_id)
+            .chain(backend)
+            .collect();
+        let base = hermit::base_mountpoint_mount_ids();
+        Ok(Some(ContainerMountTable::select(
+            &rows, &installed, &base, &never,
+        )))
     }
 
     /// Include an automatically-created private `/tmp` in mountinfo provenance.
@@ -257,6 +849,27 @@ impl IdentityGuard {
         self.mountinfo_roots
             .push(MountInfoRootSource::private_tmp(source)?);
         Ok(())
+    }
+
+    /// Show a user's bind at guest path `target` (staged at `staging` for a
+    /// bind under `/tmp`) with the target as its mountinfo root
+    /// ([`UserBind`]).
+    pub(super) fn add_user_bind(&mut self, target: &Path, staging: Option<&Path>) {
+        if self.user_binds.is_empty() {
+            match mount_rows() {
+                Ok(rows) => {
+                    self.host_rows = rows
+                        .into_iter()
+                        .map(|row| (row.mountpoint, row.root, row.device))
+                        .collect();
+                }
+                Err(_) => return warn_unrewritten_bind(target),
+            }
+        }
+        match UserBind::new(target, staging) {
+            Some(bind) => self.user_binds.push(bind),
+            None => warn_unrewritten_bind(target),
+        }
     }
 
     /// Translate the internal staging path used for an explicit user mount at
@@ -307,18 +920,108 @@ impl IdentityGuard {
     /// descriptors plus the target fd's `mnt_id` avoid both pathname TOCTOU and
     /// ambiguity from stacked mounts sharing one textual mountpoint.
     pub(super) fn mountinfo_root_rewrites(&self) -> Result<Vec<MountInfoRootRewrite>, Error> {
-        self.mountinfo_roots
+        let mut rewrites = self
+            .mountinfo_roots
             .iter()
             .map(MountInfoRootSource::resolve)
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        if self.user_binds.is_empty() {
+            return Ok(rewrites);
+        }
+        let rows = mount_rows().context("Failed to read the guest mount table")?;
+        // A row at a bind's target or staging path as named is that bind's;
+        // only a row no bind names may go to a bind's resolved spelling.
+        let mut found = std::collections::BTreeMap::<u64, Vec<u8>>::new();
+        for named in [true, false] {
+            for bind in &self.user_binds {
+                let root = mountinfo_escape_path(&bind.target);
+                for row in bind.rows(&rows, &self.host_rows, named) {
+                    found.entry(row.id).or_insert_with(|| root.clone());
+                }
+            }
+        }
+        for bind in &self.user_binds {
+            let root = mountinfo_escape_path(&bind.target);
+            if !found.values().any(|found| *found == root) {
+                warn_unrewritten_bind(&bind.target);
+            }
+        }
+        for (raw_mount_id, deterministic_root) in found {
+            // A row already carries a rewrite as one of Hermit's own mounts,
+            // which keeps its fixed name, or as the staging translation of a
+            // user mount at `/tmp`, which kept the mount's root: that root
+            // becomes the target. Two binds at one mountpoint name the same
+            // rows with the same root.
+            match rewrites
+                .iter_mut()
+                .find(|rewrite| rewrite.raw_mount_id == raw_mount_id)
+            {
+                Some(rewrite) if rewrite.deterministic_root.starts_with(b"/tmpvol/.hermit/") => {}
+                Some(rewrite) => rewrite.deterministic_root = deterministic_root,
+                None => rewrites.push(MountInfoRootRewrite {
+                    raw_mount_id,
+                    deterministic_root,
+                    raw_root_prefix: None,
+                    deterministic_root_prefix: None,
+                    raw_mountpoint_prefix: None,
+                    deterministic_mountpoint_prefix: None,
+                }),
+            }
+        }
+        Ok(rewrites)
     }
 
-    /// Capture the exact raw mount-ID order used by Detcore's snapshot-local
-    /// canonicalizer. This runs in the completed, quiescent guest namespace.
-    pub(super) fn mountinfo_identity_order(&self) -> Result<Vec<u64>, Error> {
-        capture_mountinfo_identity_order()
-            .context("Failed to capture guest mountinfo identity order")
+    /// What a recording takes from the completed, quiescent recording
+    /// namespace: the proven roots of Hermit's mounts
+    /// ([`Self::mountinfo_root_rewrites`]), and the guest's container mount
+    /// table with the namespace's identity order, from one read
+    /// ([`Self::container_mount_view`]).
+    pub(super) fn mount_provenance(&self) -> Result<hermit::MountProvenance, Error> {
+        let view = self.container_mount_view()?;
+        Ok(hermit::MountProvenance {
+            root_rewrites: view.root_rewrites,
+            container_mount_table: view.table,
+            mount_ids: Some(view.order),
+        })
     }
+}
+
+/// One read of a container's mount namespace
+/// ([`IdentityGuard::container_mount_view`]).
+pub(super) struct ContainerMountView {
+    /// The container mount table, if the plan was recorded.
+    pub(super) table: Option<ContainerMountTable>,
+    /// The namespace's identity order (`DetConfig::mountinfo_mount_ids`).
+    pub(super) order: Vec<u64>,
+    /// The namespace read (`DetConfig::mountinfo_mount_namespace`).
+    pub(super) namespace: detcore_model::config::MountNamespaceIdentity,
+    /// The proven roots of Hermit's mounts ([`IdentityGuard::mountinfo_root_rewrites`])
+    /// that name a mount of `order` (`rewrites_of_snapshot`).
+    pub(super) root_rewrites: Vec<MountInfoRootRewrite>,
+}
+
+/// `rewrites` less any that names a mount `order` does not have. The rewrites
+/// come from their own reads of the namespace (a user bind's rows, its
+/// recursive copies of host submounts included), and a host process that
+/// removes such a copy's directory detaches it from this namespace too
+/// (Linux's `detach_mounts`). A rewrite for a mount that left before the
+/// snapshot applies to no row any later view can show, and Detcore refuses a
+/// snapshot whose rewrites name a mount outside its order.
+fn rewrites_of_snapshot(
+    rewrites: Vec<MountInfoRootRewrite>,
+    order: &[u64],
+) -> Vec<MountInfoRootRewrite> {
+    rewrites
+        .into_iter()
+        .filter(|rewrite| order.contains(&rewrite.raw_mount_id))
+        .collect()
+}
+
+/// Whether `mount` is a bind mount: `--mount` without a `type`, or of type
+/// `bind`, which sets `MS_BIND` (flags only accumulate, so adding it again
+/// changes nothing exactly when it is already there).
+pub(super) fn is_bind_mount(mount: &Mount) -> bool {
+    mount.clone().flags(MountFlags::MS_BIND) == *mount
 }
 
 fn canonical_mount_target(path: &Path) -> PathBuf {
@@ -338,24 +1041,35 @@ pub(super) fn mount_target_is_shadowed(target: &Path, overriding_target: &Path) 
     canonical_mount_target(target).starts_with(canonical_mount_target(overriding_target))
 }
 
+/// The overflow group ID of the guest's machine (`kernel/overflowgid`), which
+/// the frozen group database must name. It does not depend on the run's
+/// configuration.
+fn overflow_gid() -> String {
+    detcore::machine::MachineDescription::default()
+        .limits
+        .overflow_gid
+        .to_string()
+}
+
 /// Snapshot the host group database into a private temp file, appending a
-/// synthetic overflow group (`nobody:x:65534`) when the host lacks one. Binding
-/// this frozen copy read-only over `/etc/group` keeps guest group-name
-/// resolution stable across otherwise-identical runs.
+/// synthetic overflow group (`nobody:x:<overflow gid>`) when the host lacks
+/// one. Binding this frozen copy read-only over `/etc/group` keeps guest
+/// group-name resolution stable across otherwise-identical runs.
 fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
+    let overflow_gid = overflow_gid();
     let mut contents = fs::read_to_string(GROUP_FILE)
         .context("Failed to read the host group database for the guest")?;
     let has_overflow_group = contents.lines().any(|line| {
         line.split(':')
             .nth(2)
-            .is_some_and(|gid| gid == OVERFLOW_GID)
+            .is_some_and(|gid| gid == overflow_gid)
     });
     if !has_overflow_group {
         if !contents.ends_with('\n') {
             contents.push('\n');
         }
         contents.push_str("nobody:x:");
-        contents.push_str(OVERFLOW_GID);
+        contents.push_str(&overflow_gid);
         contents.push_str(":\n");
     }
 
@@ -406,6 +1120,7 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
         None
     };
 
+    // The container's own `/proc` (`default_container`) and the mounts above.
     Ok((
         mounts,
         IdentityGuard {
@@ -413,6 +1128,9 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
             _nscd_dir: nscd_dir,
             mountinfo_roots,
             user_mount_targets: Vec::new(),
+            user_binds: Vec::new(),
+            host_rows: Vec::new(),
+            plan: MountPlan::Unrecorded,
         },
     ))
 }
@@ -440,16 +1158,33 @@ pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
 }
 
 pub fn default_container(pin_threads: bool) -> Container {
+    let mut container = namespace_container(pin_threads);
+    container.mount(container_proc_mount());
+    container
+}
+
+/// [`default_container`] without its `/proc`: the namespaces and the private
+/// `/`, for a container given a mount plan, `/proc` first, which its setup
+/// installs and its init records (`IdentityGuard::set_plan`).
+pub(super) fn namespace_container(pin_threads: bool) -> Container {
     let mut container = Container::new();
     container
         .unshare(Namespace::PID)
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local")
-        .mount(Mount::proc().allow_readonly_fallback());
+        // A mount namespace created inside a user namespace starts as a slave
+        // of the host's, so host mounts and unmounts would keep changing the
+        // guest's mount table during a run. Cut that propagation first.
+        .mount(Mount::new("/").rprivate());
 
     apply_affinity(&mut container, pin_threads);
     container
+}
+
+/// The container's own `/proc`, a new procfs of its PID namespace.
+pub(super) fn container_proc_mount() -> Mount {
+    Mount::proc().allow_readonly_fallback()
 }
 
 /// PROTOTYPE: a container whose root filesystem is a materialized OCI image
@@ -482,7 +1217,9 @@ pub(super) fn image_container(
         .unshare(Namespace::PID)
         .map_root()
         .hostname("hermetic-container.local")
-        .domainname("local");
+        .domainname("local")
+        // As in `default_container`: stop host mount propagation.
+        .mount(Mount::new("/").rprivate());
 
     // The cache is a deterministic input, not a writable container layer. Bind
     // it onto itself and remount it read-only so a guest cannot poison later
@@ -562,7 +1299,2624 @@ pub(super) fn image_container(
     if private_tmp {
         identity_sources.add_private_tmp(tmpfs)?;
     }
+    identity_sources.set_image_root();
     Ok((container, identity_sources))
+}
+
+/// Common declared-input root setup. This is filesystem setup data, never an
+/// InstalledExecDomain, NativeExecProof, or permission to invoke an exec leaf.
+#[cfg(feature = "native-exec")]
+pub(super) mod declared_inputs {
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::os::fd::AsFd;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::BorrowedFd;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use anyhow::Context;
+    use anyhow::Result;
+    use anyhow::bail;
+    use reverie::process::Container;
+    use reverie::process::Mount;
+    use reverie::process::MountFlags;
+    use reverie::process::PinnedMountSource;
+    use sha2::Digest;
+    use sha2::Sha256;
+
+    use super::super::native_exec_inputs::CapturedIdentity;
+    use super::super::native_exec_inputs::GuestPath;
+    use super::super::native_exec_inputs::HeldDynamicInputs;
+    use super::super::native_exec_inputs::InputRole;
+
+    /// The exact independently retained original interpreter object. The
+    /// bootstrap replaces PT_INTERP; this separate role preserves its identity.
+    pub(crate) const STOCK_LOADER_PATH: &[u8] = b"/run/hermit/native/stock-loader";
+
+    const SEALS: i32 = libc::F_SEAL_SEAL
+        | libc::F_SEAL_SHRINK
+        | libc::F_SEAL_GROW
+        | libc::F_SEAL_WRITE
+        | libc::F_SEAL_FUTURE_WRITE
+        | 0x0020; // F_SEAL_EXEC
+    // Linux statvfs uses 0x1000 for ST_RELATIME, distinct from MS_RELATIME.
+    const ROOT_ST_RELATIME: libc::c_ulong = 0x1000;
+
+    /// Distinguishes an addition from a deliberate literal PT_INTERP
+    /// substitution. Original loader and bootstrap identities remain separate.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum FilePlacement {
+        Additional,
+        InterpreterReplacement,
+    }
+
+    pub(crate) struct RuntimeFile {
+        path: GuestPath,
+        file: File,
+        identity: CapturedIdentity,
+        executable: bool,
+        placement: FilePlacement,
+    }
+
+    impl RuntimeFile {
+        /// Check and duplicate the real sealed object. Runtime provenance,
+        /// DT_NEEDED coverage and launch authorization belong to its consumer.
+        pub(crate) fn new(
+            path: GuestPath,
+            descriptor: BorrowedFd<'_>,
+            executable: bool,
+            placement: FilePlacement,
+        ) -> Result<Self> {
+            let fd = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.len() > 64 * 1024 * 1024
+                || metadata.mode() & 0o6000 != 0
+                || unsafe { libc::fcntl(fd, libc::F_GET_SEALS) } != SEALS
+                || (metadata.mode() & 0o111 != 0) != executable
+            {
+                bail!("runtime root file is not an exact sealed object with the requested mode");
+            }
+            use std::os::unix::fs::FileExt;
+            let mut bytes = vec![0; usize::try_from(metadata.len())?];
+            file.read_exact_at(&mut bytes, 0)?;
+            Ok(Self {
+                path,
+                file,
+                identity: CapturedIdentity {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    size: metadata.len(),
+                    digest: Sha256::digest(&bytes).into(),
+                },
+                executable,
+                placement,
+            })
+        }
+        pub(crate) fn try_clone(&self) -> Result<Self> {
+            Ok(Self {
+                path: self.path.clone(),
+                file: self.file.try_clone()?,
+                identity: self.identity,
+                executable: self.executable,
+                placement: self.placement,
+            })
+        }
+        pub(crate) fn path(&self) -> &GuestPath {
+            &self.path
+        }
+        pub(crate) fn identity(&self) -> CapturedIdentity {
+            self.identity
+        }
+        pub(crate) fn executable(&self) -> bool {
+            self.executable
+        }
+        pub(crate) fn placement(&self) -> FilePlacement {
+            self.placement
+        }
+        pub(crate) fn descriptor(&self) -> BorrowedFd<'_> {
+            use std::os::fd::AsFd;
+            self.file.as_fd()
+        }
+    }
+
+    /// Only named protected control channels have endpoint additions.
+    /// Observer and DETLOG use distinct reserved descriptors instead.
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    pub(crate) enum Endpoint {
+        Rpc,
+        Provision,
+        Statistics,
+    }
+    impl Endpoint {
+        fn path(self) -> &'static str {
+            match self {
+                Self::Rpc => "/run/rpc.sock",
+                Self::Provision => "/run/provision.sock",
+                Self::Statistics => "/run/stats.sock",
+            }
+        }
+    }
+
+    /// Parent-owned until actual reaping. No proc path or child PID is accepted
+    /// here: those are derived inside the real child after namespace setup.
+    #[derive(Default)]
+    pub(crate) struct DeclaredRootAdditions {
+        files: Vec<RuntimeFile>,
+        endpoints: Vec<(Endpoint, PinnedMountSource, u64, u64)>,
+        common_group: Option<Arc<RuntimeFile>>,
+    }
+    impl DeclaredRootAdditions {
+        pub(crate) fn try_clone(&self) -> Result<Self> {
+            Ok(Self {
+                files: self
+                    .files
+                    .iter()
+                    .map(RuntimeFile::try_clone)
+                    .collect::<Result<_>>()?,
+                endpoints: self.endpoints.clone(),
+                common_group: self.common_group.as_ref().map(Arc::clone),
+            })
+        }
+        /// Capture the existing common identity policy once before either
+        /// verify plan is cloned. Both plans retain this exact sealed owner.
+        pub(crate) fn capture_common_inputs(&mut self) -> Result<()> {
+            if self.common_group.is_some() {
+                bail!("common identity inputs already captured");
+            }
+            let group = super::frozen_group_file()?;
+            let sealed = super::super::native_exec_inputs::seal_bytes(
+                &std::fs::read(group.path())?,
+                InputRole::Data,
+            )?;
+            self.common_group = Some(Arc::new(RuntimeFile::new(
+                GuestPath::new(b"/etc/group".to_vec())?,
+                sealed.as_fd(),
+                false,
+                FilePlacement::Additional,
+            )?));
+            Ok(())
+        }
+        pub(crate) fn common_group(&self) -> Result<&RuntimeFile> {
+            self.common_group
+                .as_deref()
+                .context("common identity input is absent")
+        }
+        pub(crate) fn adopt_common_group(&mut self, descriptor: BorrowedFd<'_>) -> Result<()> {
+            if self.common_group.is_some() {
+                bail!("common identity inputs already captured");
+            }
+            self.common_group = Some(Arc::new(RuntimeFile::new(
+                GuestPath::new(b"/etc/group".to_vec())?,
+                descriptor,
+                false,
+                FilePlacement::Additional,
+            )?));
+            Ok(())
+        }
+        pub(crate) fn add_file(&mut self, file: RuntimeFile) -> Result<()> {
+            if file.path.as_bytes() == b"/etc/group"
+                || self.files.len() == 256
+                || self.files.iter().any(|old| old.path == file.path)
+            {
+                bail!("duplicate or excessive runtime root files");
+            }
+            self.files.push(file);
+            Ok(())
+        }
+        pub(crate) fn add_endpoint(&mut self, kind: Endpoint, source: &Path) -> Result<()> {
+            if self.endpoints.iter().any(|(old, _, _, _)| *old == kind) {
+                bail!("duplicate protected endpoint");
+            }
+            let metadata = std::fs::symlink_metadata(source)?;
+            use std::os::unix::fs::FileTypeExt;
+            if !metadata.file_type().is_socket() {
+                bail!("protected endpoint is not a socket");
+            }
+            let pin =
+                PinnedMountSource::open(source).map_err(|error| anyhow::anyhow!("{error}"))?;
+            self.endpoints
+                .push((kind, pin, metadata.dev(), metadata.ino()));
+            Ok(())
+        }
+    }
+
+    /// One root plan per physical run, held by its parent through actual reap.
+    /// Both verify plans share the same Arc<HeldDynamicInputs>; additions can
+    /// duplicate immutable held descriptors via try_clone, never recapture them.
+    pub(crate) struct DeclaredInputRoot {
+        inputs: Arc<HeldDynamicInputs>,
+        additions: DeclaredRootAdditions,
+        stage: tempfile::TempDir,
+        stage_parent: Option<File>,
+        stage_name: CString,
+        stage_pin: PinnedMountSource,
+        parent_namespace: (u64, u64),
+        stage_identity: (u64, u64),
+        configured: bool,
+        materialized: bool,
+    }
+
+    fn reserved(path: &Path) -> bool {
+        ["/proc", "/dev", "/run", "/tmp", "/tool"]
+            .iter()
+            .any(|reserved| path.starts_with(reserved))
+            || path == Path::new("/etc/group")
+    }
+
+    impl DeclaredInputRoot {
+        /// Stage in an existing caller-owned directory that the common mount
+        /// plan does not cover. The caller retains/excludes external writers to
+        /// this directory through reap; its pathname is never native authority.
+        pub(crate) fn prepare(
+            inputs: Arc<HeldDynamicInputs>,
+            mut additions: DeclaredRootAdditions,
+            staging_parent: &Path,
+        ) -> Result<Self> {
+            inputs.recheck()?;
+            for file in inputs.files() {
+                if reserved(file.path.as_path()) || reserved(file.resolved_path.as_path()) {
+                    bail!("declared input collides with common runtime-owned paths");
+                }
+            }
+            for alias in inputs.aliases() {
+                if reserved(alias.path.as_path()) {
+                    bail!("declared alias shadows a runtime-owned path");
+                }
+                if inputs
+                    .resolve_path(&alias.path)
+                    .is_ok_and(|target| reserved(target.as_path()))
+                {
+                    bail!("declared alias redirects into runtime-owned paths");
+                }
+            }
+            // No host input is recaptured here. Per-run plans consume clones
+            // of the same pre-verify sealed common identity owner.
+            let group = additions
+                .common_group
+                .as_ref()
+                .context("common identity inputs were not captured before verify")?;
+            let checked = RuntimeFile::new(
+                group.path.clone(),
+                group.descriptor(),
+                group.executable,
+                group.placement,
+            )?;
+            if checked.identity != group.identity
+                || group.path.as_bytes() != b"/etc/group"
+                || group.executable
+                || group.placement != FilePlacement::Additional
+                || additions.files.len() == 256
+            {
+                bail!("retained common identity object differs or root file bound exceeded");
+            }
+            additions.files.push(group.try_clone()?);
+            let mut endpoints = BTreeSet::new();
+            for file in inputs.files() {
+                endpoints.insert(file.resolved_path.clone());
+            }
+            for file in &additions.files {
+                let resolved = inputs.resolve_path(&file.path)?;
+                match file.placement {
+                    FilePlacement::InterpreterReplacement => {
+                        if !file.executable
+                            || !inputs.is_interpreter(&file.path)
+                            || !endpoints.remove(&resolved)
+                        {
+                            bail!("bootstrap replacement does not name an enrolled PT_INTERP");
+                        }
+                    }
+                    FilePlacement::Additional => {}
+                }
+                if !endpoints.insert(resolved) {
+                    bail!("runtime file collides with declared input");
+                }
+            }
+            for (endpoint, _, _, _) in &additions.endpoints {
+                if !endpoints.insert(GuestPath::new(endpoint.path().as_bytes().to_vec())?) {
+                    bail!("protected endpoint collides with a runtime file");
+                }
+            }
+            for path in &endpoints {
+                if endpoints.iter().any(|other| {
+                    other.as_bytes().len() > path.as_bytes().len()
+                        && other.as_bytes().starts_with(path.as_bytes())
+                        && other.as_bytes()[path.as_bytes().len()] == b'/'
+                }) {
+                    bail!("root file shadows another endpoint parent");
+                }
+            }
+            for replacement in additions
+                .files
+                .iter()
+                .filter(|file| file.placement == FilePlacement::InterpreterReplacement)
+            {
+                let resolved = inputs.resolve_path(&replacement.path)?;
+                let original = inputs
+                    .files()
+                    .iter()
+                    .find(|file| file.resolved_path == resolved && file.role == InputRole::Loader)
+                    .context("original interpreter object missing")?;
+                if !additions.files.iter().any(|file| {
+                    file.path.as_bytes() == STOCK_LOADER_PATH
+                        && file.placement == FilePlacement::Additional
+                        && file.executable
+                        && file.identity == original.identity
+                }) {
+                    bail!("bootstrap replacement lacks the exact independently held stock loader");
+                }
+            }
+            let namespace = std::fs::metadata("/proc/self/ns/mnt")?;
+            let parent_namespace = (namespace.dev(), namespace.ino());
+            // This owner-selected directory must remain visible through the
+            // common mount plan. PinnedMountSource reopens/checks the actual
+            // child path; covered or replaced source paths are refusals.
+            if !staging_parent.is_absolute() {
+                bail!("declared root staging parent must be absolute");
+            }
+            let stage = tempfile::Builder::new()
+                .prefix("hermit-declared-root-")
+                .tempdir_in(staging_parent)?;
+            let stage_parent = File::open(
+                stage
+                    .path()
+                    .parent()
+                    .context("root staging parent missing")?,
+            )?;
+            let stage_name = CString::new(stage.path().file_name().unwrap().as_bytes())?;
+            let stage_pin =
+                PinnedMountSource::open(stage.path()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let stage_meta = std::fs::metadata(stage.path())?;
+            let stage_identity = (stage_meta.dev(), stage_meta.ino());
+            Ok(Self {
+                inputs,
+                additions,
+                stage,
+                stage_parent: Some(stage_parent),
+                stage_name,
+                stage_pin,
+                parent_namespace,
+                stage_identity,
+                configured: false,
+                materialized: false,
+            })
+        }
+
+        pub(crate) fn runtime_files(&self) -> &[RuntimeFile] {
+            &self.additions.files
+        }
+
+        /// Add only root mounts to the existing common Container. PID/UTS,
+        /// network, affinity, signals, cleanup and launch remain its existing
+        /// owners. The checked staging bind precedes the fresh tmpfs cover.
+        pub(crate) fn configure(&mut self, container: &mut Container) -> Result<()> {
+            if self.configured {
+                bail!("declared root configured twice");
+            }
+            container.mount(Mount::bind_pinned(&self.stage_pin, self.stage.path()));
+            container.mount(
+                Mount::tmpfs(self.stage.path())
+                    .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV)
+                    .data("mode=0755,size=384m"),
+            );
+            container.mount(
+                Mount::tmpfs(self.stage.path().join("tmp"))
+                    .touch_target()
+                    .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC)
+                    .data("mode=1777,size=64m"),
+            );
+            for (kind, source, _, _) in &self.additions.endpoints {
+                container.mount(
+                    Mount::bind_pinned(source, self.stage.path().join(&kind.path()[1..]))
+                        .readonly()
+                        .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC)
+                        .touch_target(),
+                );
+            }
+            self.configured = true;
+            Ok(())
+        }
+
+        /// Materialize the static graph in the actual common Container init,
+        /// before coordinator workers. Current-task proc files are deliberately
+        /// deferred to the actual guest Command child.
+        ///
+        /// # Safety
+        /// The existing Container must have executed this exact mount plan in
+        /// a private mount namespace with a private descriptor table. The caller
+        /// must exclude external writers to the held staging parent/name during
+        /// setup, retain the parent guard through reap, and close/retire every
+        /// other outside-root descriptor before guest entry. The prepared root
+        /// remains writable only until the one trusted actual guest operation;
+        /// no untrusted child may run during this interval. This receipt does
+        /// not establish those launch/writer/birth premises on its own.
+        pub(crate) unsafe fn materialize(&mut self) -> Result<PreparedDeclaredRoot> {
+            if !self.configured || self.materialized {
+                bail!("declared root setup order or reuse");
+            }
+            self.materialized = true; // any partial setup is terminal for this child
+            let namespace = std::fs::metadata("/proc/self/ns/mnt")?;
+            if unsafe { libc::getpid() } <= 0
+                || unsafe { libc::syscall(libc::SYS_gettid) }
+                    != i64::from(unsafe { libc::getpid() })
+            {
+                bail!("common root materialization requires the actual current main task");
+            }
+            if (namespace.dev(), namespace.ino()) == self.parent_namespace {
+                bail!("declared root was not installed in a fresh child mount namespace");
+            }
+            let held_parent = self
+                .stage_parent
+                .as_ref()
+                .context("child staging descriptor retired")?;
+            // Inherited descriptors can refer to a pre-namespace mount even
+            // after a lexical path is covered. Resolve the current parent and
+            // check the same held object before opening the child tmpfs.
+            let parent_path = CString::new(
+                self.stage
+                    .path()
+                    .parent()
+                    .context("staging parent missing")?
+                    .as_os_str()
+                    .as_bytes(),
+            )?;
+            let parent_fd = unsafe {
+                libc::open(
+                    parent_path.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if parent_fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let parent = unsafe { File::from_raw_fd(parent_fd) };
+            let held = held_parent.metadata()?;
+            let actual = parent.metadata()?;
+            if (held.dev(), held.ino()) != (actual.dev(), actual.ino()) {
+                bail!("common mounts covered or replaced the declared staging parent");
+            }
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    self.stage_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let root = unsafe { File::from_raw_fd(fd) };
+            let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            if unsafe { libc::fstatfs(fd, fs.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let root_meta = root.metadata()?;
+            if unsafe { fs.assume_init() }.f_type != libc::TMPFS_MAGIC
+                || (root_meta.dev(), root_meta.ino()) == self.stage_identity
+            {
+                bail!("declared root is not the new child tmpfs");
+            }
+            self.inputs.recheck()?;
+            for (kind, _, device, inode) in &self.additions.endpoints {
+                let target = root_relative(&root, kind.path().as_bytes(), libc::O_PATH)?;
+                let actual = target.metadata()?;
+                use std::os::unix::fs::FileTypeExt;
+                if actual.dev() != *device
+                    || actual.ino() != *inode
+                    || !actual.file_type().is_socket()
+                {
+                    bail!("bound protected endpoint changed from its parent-held object");
+                }
+            }
+            let mut copies = Vec::new();
+            for file in self.inputs.files() {
+                if self.additions.files.iter().any(|replacement| {
+                    replacement.placement == FilePlacement::InterpreterReplacement
+                        && self.inputs.resolve_path(&replacement.path).ok().as_ref()
+                            == Some(&file.resolved_path)
+                }) {
+                    continue;
+                }
+                copies.push(RootCopy {
+                    path: file.resolved_path.clone(),
+                    source: File::from(file.descriptor().try_clone_to_owned()?),
+                    executable: file.role != InputRole::Data,
+                    expected: file.identity,
+                });
+            }
+            for file in &self.additions.files {
+                copies.push(RootCopy {
+                    path: self.inputs.resolve_path(&file.path)?,
+                    source: file.file.try_clone()?,
+                    executable: file.executable,
+                    expected: file.identity,
+                });
+            }
+            let copies = copy_root_groups(&root, copies)?;
+            // Every hardlink has been created before any path becomes a file
+            // mount. No writable copy FD remains when these mounts are made.
+            let mut backings = BTreeMap::new();
+            for copy in copies {
+                let path = copy.request.path.clone();
+                let backing = bind_root_copy(&root, copy)?;
+                if backings.insert(path, backing).is_some() {
+                    bail!("duplicate readonly root placement");
+                }
+            }
+            // Hold the actual common proc mount, but do not bind init's task.
+            // The guest operation resolves numeric leaves only after its real
+            // PID exists; it never accepts a supplied PID.
+            let proc_root = super::open_path(Path::new("/proc"))?;
+            let mut proc_fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            if unsafe { libc::fstatfs(proc_root.as_raw_fd(), proc_fs.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if unsafe { proc_fs.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
+                bail!("common proc source is not procfs");
+            }
+            let proc_mount = observed_mount_id(proc_root.as_fd())?;
+            let namespace_fd = super::open_path(Path::new("/proc/self/ns/mnt"))?;
+            for node in ["null", "zero", "full", "random", "urandom"] {
+                let source = super::open_path(Path::new(&format!("/dev/{node}")))?;
+                bind_fd(
+                    &root,
+                    &GuestPath::new(format!("/dev/{node}").into_bytes())?,
+                    source.as_fd(),
+                    false,
+                    None,
+                )?;
+            }
+            mkdir_parents(&root, b"/run/nscd/empty")?;
+            for alias in self.inputs.aliases() {
+                create_link(&root, &alias.path, &alias.target)?;
+            }
+            // The static graph is complete. The root stays writable only for
+            // trusted same-namespace guest setup, which creates exact numeric
+            // proc endpoints and then makes it read-only before entry/ACK.
+            let identity = root.metadata()?;
+            let mount_id = observed_mount_id(root.as_fd())?;
+            self.stage_pin
+                .retire()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for (_, source, _, _) in &self.additions.endpoints {
+                source.retire().map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            self.stage_parent.take(); // child only; parent guard remains live
+            self.materialized = true;
+            Ok(PreparedDeclaredRoot {
+                inputs: self.inputs.clone(),
+                backings,
+                root,
+                proc_root,
+                namespace_fd,
+                device: identity.dev(),
+                inode: identity.ino(),
+                mount_id,
+                proc_mount,
+                setup_pid: unsafe { libc::getpid() },
+                namespace: (namespace.dev(), namespace.ino()),
+                guest_prepared: false,
+            })
+        }
+    }
+
+    struct RootCopy {
+        path: GuestPath,
+        source: File,
+        expected: CapturedIdentity,
+        executable: bool,
+    }
+
+    struct CopiedRootFile {
+        request: RootCopy,
+        identity: CapturedIdentity,
+        links: u64,
+    }
+
+    /// A retained source-to-named-copy owner, not an immutable-root ACK. The
+    /// guest must still freeze the root and the installer must join that actual
+    /// root/namespace/birth independently. Clones retain these exact files and
+    /// path bindings through reaping; scalar identities cannot construct it.
+    #[derive(Clone)]
+    pub(crate) struct ReadonlyRootBacking(Arc<ReadonlyRootBackingOwner>);
+
+    struct ReadonlyRootBackingOwner {
+        source: File,
+        expected: CapturedIdentity,
+        source_mode: u32,
+        backing: File,
+        identity: CapturedIdentity,
+        mount_id: u64,
+        flags: libc::c_ulong,
+        executable: bool,
+        links: u64,
+        root: File,
+        root_identity: (u64, u64),
+        root_mount: u64,
+        namespace: File,
+        namespace_identity: (u64, u64),
+        path: GuestPath,
+    }
+
+    impl ReadonlyRootBacking {
+        pub(crate) fn source_identity(&self) -> CapturedIdentity {
+            self.0.expected
+        }
+        pub(crate) fn identity(&self) -> CapturedIdentity {
+            self.0.identity
+        }
+        #[cfg(test)]
+        pub(crate) fn mount_id(&self) -> u64 {
+            self.0.mount_id
+        }
+        pub(crate) fn descriptor(&self) -> BorrowedFd<'_> {
+            self.0.backing.as_fd()
+        }
+        pub(crate) fn executable(&self) -> bool {
+            self.0.executable
+        }
+        pub(crate) fn verify(&self) -> Result<()> {
+            let owner = &self.0;
+            let root_meta = owner.root.metadata()?;
+            let namespace = owner.namespace.metadata()?;
+            let current_namespace = std::fs::metadata("/proc/thread-self/ns/mnt")?;
+            let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            if unsafe { libc::fstatfs(owner.root.as_raw_fd(), fs.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if (root_meta.dev(), root_meta.ino()) != owner.root_identity
+                || (namespace.dev(), namespace.ino()) != owner.namespace_identity
+                || (current_namespace.dev(), current_namespace.ino()) != owner.namespace_identity
+                || observed_mount_id(owner.root.as_fd())? != owner.root_mount
+                || unsafe { fs.assume_init() }.f_type != libc::TMPFS_MAGIC
+                || checked_file_identity(&owner.source, owner.executable, true)? != owner.expected
+                || owner.source.metadata()?.mode() != owner.source_mode
+            {
+                bail!("retained root backing source or root changed");
+            }
+            // This walk neither creates paths nor follows a substituted parent
+            // or leaf symlink. Also inspect the descriptor itself: a pathname
+            // re-open is not a replacement for the retained actual owner.
+            let current = open_root_file(&owner.root, owner.path.as_bytes())?;
+            for file in [&owner.backing, &current] {
+                if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE
+                    != libc::O_RDONLY
+                    || checked_file_identity(file, owner.executable, false)? != owner.identity
+                    || file.metadata()?.nlink() != owner.links
+                    || observed_mount_id(file.as_fd())? != owner.mount_id
+                    || raw_statvfs(file.as_raw_fd())?.f_flag != owner.flags
+                {
+                    bail!("readonly root backing bytes, path or mount changed");
+                }
+            }
+            let required = libc::ST_RDONLY | libc::ST_NOSUID | libc::ST_NODEV;
+            if owner.flags & required != required
+                || (owner.flags & libc::ST_NOEXEC != 0) == owner.executable
+            {
+                bail!("readonly root backing role policy differs");
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    impl ReadonlyRootBackingOwner {
+        fn try_clone_for_test(&self) -> Result<Self> {
+            Ok(Self {
+                source: self.source.try_clone()?,
+                expected: self.expected,
+                source_mode: self.source_mode,
+                backing: self.backing.try_clone()?,
+                identity: self.identity,
+                mount_id: self.mount_id,
+                flags: self.flags,
+                executable: self.executable,
+                links: self.links,
+                root: self.root.try_clone()?,
+                root_identity: self.root_identity,
+                root_mount: self.root_mount,
+                namespace: self.namespace.try_clone()?,
+                namespace_identity: self.namespace_identity,
+                path: self.path.clone(),
+            })
+        }
+    }
+
+    fn checked_file_identity(
+        file: &File,
+        executable: bool,
+        sealed: bool,
+    ) -> Result<CapturedIdentity> {
+        let before = file.metadata()?;
+        let mode = if executable { 0o555 } else { 0o444 };
+        if !before.is_file()
+            || before.len() > 64 * 1024 * 1024
+            || before.mode() & 0o6000 != 0
+            || (before.mode() & 0o111 != 0) != executable
+            || (!sealed && before.mode() & 0o7777 != mode)
+            || (sealed && unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) } != SEALS)
+        {
+            bail!("root copy file kind, size, mode or source seals differ");
+        }
+        let mut hash = Sha256::new();
+        let mut bytes = [0u8; 64 * 1024];
+        let mut offset = 0;
+        while offset < before.len() {
+            let count = usize::try_from((before.len() - offset).min(bytes.len() as u64))?;
+            file.read_exact_at(&mut bytes[..count], offset)?;
+            hash.update(&bytes[..count]);
+            offset += count as u64; // bounded by the checked file length
+        }
+        if file.read_at(&mut bytes[..1], before.len())? != 0 {
+            bail!("root copy file grew during readback");
+        }
+        let after = file.metadata()?;
+        if (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mode(),
+            before.nlink(),
+        ) != (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mode(),
+            after.nlink(),
+        ) || (sealed && unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) } != SEALS)
+        {
+            bail!("root copy file metadata changed during readback");
+        }
+        Ok(CapturedIdentity {
+            device: after.dev(),
+            inode: after.ino(),
+            size: after.len(),
+            digest: hash.finalize().into(),
+        })
+    }
+
+    fn path_leaf(path: &[u8]) -> Result<CString> {
+        Ok(CString::new(
+            path.rsplit(|byte| *byte == b'/')
+                .next()
+                .context("missing root leaf")?,
+        )?)
+    }
+
+    fn open_root_file(root: &File, path: &[u8]) -> Result<File> {
+        open_root_file_with_flags(root, path, libc::O_RDONLY)
+    }
+
+    fn open_root_file_with_flags(root: &File, path: &[u8], flags: i32) -> Result<File> {
+        let mut parent = root.try_clone()?;
+        let parts: Vec<_> = path[1..].split(|byte| *byte == b'/').collect();
+        for part in &parts[..parts.len() - 1] {
+            let component = CString::new(*part)?;
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    component.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            parent = unsafe { File::from_raw_fd(fd) };
+        }
+        let leaf = path_leaf(path)?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn open_new_root_file(root: &File, path: &[u8], mode: libc::mode_t) -> Result<File> {
+        let parent = mkdir_parents(root, path)?;
+        let leaf = path_leaf(path)?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        // Set the final exact mode independently of the inherited umask.
+        if unsafe { libc::fchmod(fd, mode) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(file)
+    }
+
+    fn copy_root_groups(root: &File, requests: Vec<RootCopy>) -> Result<Vec<CopiedRootFile>> {
+        let mut groups: BTreeMap<(u64, u64), Vec<RootCopy>> = BTreeMap::new();
+        let mut names = BTreeSet::new();
+        for request in requests {
+            if !names.insert(request.path.clone())
+                || checked_file_identity(&request.source, request.executable, true)?
+                    != request.expected
+            {
+                bail!("duplicate root path or changed sealed copy source");
+            }
+            let key = (request.expected.device, request.expected.inode);
+            let group = groups.entry(key).or_default();
+            if let Some(first) = group.first()
+                && (first.expected != request.expected
+                    || first.executable != request.executable
+                    || first.source.metadata()?.mode() != request.source.metadata()?.mode())
+            {
+                bail!("same-source root placements disagree about bytes or role");
+            }
+            group.push(request);
+        }
+        let mut copies = Vec::new();
+        for group in groups.into_values() {
+            let first = &group[0];
+            let mode = if first.executable { 0o555 } else { 0o444 };
+            let writable = open_new_root_file(root, first.path.as_bytes(), mode)?;
+            let mut bytes = [0u8; 64 * 1024];
+            let mut offset = 0;
+            while offset < first.expected.size {
+                let count =
+                    usize::try_from((first.expected.size - offset).min(bytes.len() as u64))?;
+                first.source.read_exact_at(&mut bytes[..count], offset)?;
+                writable.write_all_at(&bytes[..count], offset)?;
+                offset += count as u64;
+            }
+            let readback = open_root_file(root, first.path.as_bytes())?;
+            let before_close = checked_file_identity(&readback, first.executable, false)?;
+            if before_close.size != first.expected.size
+                || before_close.digest != first.expected.digest
+                || checked_file_identity(&first.source, first.executable, true)? != first.expected
+            {
+                bail!("root copy differs before writer retirement");
+            }
+            drop(writable); // no write FD or shared mapping escapes this scope
+            let after_close = checked_file_identity(&readback, first.executable, false)?;
+            if after_close != before_close {
+                bail!("root copy changed at writer retirement");
+            }
+            let primary_parent = mkdir_parents(root, first.path.as_bytes())?;
+            let primary_leaf = path_leaf(first.path.as_bytes())?;
+            for other in &group[1..] {
+                let parent = mkdir_parents(root, other.path.as_bytes())?;
+                let leaf = path_leaf(other.path.as_bytes())?;
+                if unsafe {
+                    libc::linkat(
+                        primary_parent.as_raw_fd(),
+                        primary_leaf.as_ptr(),
+                        parent.as_raw_fd(),
+                        leaf.as_ptr(),
+                        0,
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+            let links = u64::try_from(group.len())?;
+            for request in group {
+                let file = open_root_file(root, request.path.as_bytes())?;
+                if checked_file_identity(&file, request.executable, false)? != after_close
+                    || file.metadata()?.nlink() != links
+                    || checked_file_identity(&request.source, request.executable, true)?
+                        != request.expected
+                {
+                    bail!("root hardlink or sealed source changed before binding");
+                }
+                copies.push(CopiedRootFile {
+                    request,
+                    identity: after_close,
+                    links,
+                });
+            }
+        }
+        Ok(copies)
+    }
+
+    fn bind_root_copy(root: &File, copy: CopiedRootFile) -> Result<ReadonlyRootBacking> {
+        let request = copy.request;
+        let parent = mkdir_parents(root, request.path.as_bytes())?;
+        let leaf = path_leaf(request.path.as_bytes())?;
+        let source = open_root_file(root, request.path.as_bytes())?;
+        if checked_file_identity(&source, request.executable, false)? != copy.identity
+            || source.metadata()?.nlink() != copy.links
+        {
+            bail!("root copy changed before self bind");
+        }
+        let source_flags = raw_statvfs(source.as_raw_fd())?.f_flag;
+        if source_flags & libc::ST_RDONLY != 0 || source_flags & libc::ST_NOEXEC != 0 {
+            bail!("new root copy is not on the fresh writable executable tmpfs");
+        }
+        let from = CString::new(format!("/proc/self/fd/{}", source.as_raw_fd()))?;
+        let mut target = format!("/proc/self/fd/{}/", parent.as_raw_fd()).into_bytes();
+        target.extend_from_slice(leaf.as_bytes());
+        let target = CString::new(target)?;
+        if unsafe {
+            libc::mount(
+                from.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut mount_flags =
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV;
+        let mut expected_flags = source_flags | libc::ST_RDONLY | libc::ST_NOSUID | libc::ST_NODEV;
+        if !request.executable {
+            mount_flags |= libc::MS_NOEXEC;
+            expected_flags |= libc::ST_NOEXEC;
+        }
+        // Preserve actual source atime policy; these libc ST and MS constants
+        // are different namespaces and cannot be cast interchangeably.
+        for (observed, flag) in [
+            (libc::ST_NOATIME, libc::MS_NOATIME),
+            (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+            (ROOT_ST_RELATIME, libc::MS_RELATIME),
+        ] {
+            if source_flags & observed != 0 {
+                mount_flags |= flag;
+            }
+        }
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                target.as_ptr(),
+                std::ptr::null(),
+                mount_flags,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let backing = open_root_file(root, request.path.as_bytes())?;
+        let metadata = root.metadata()?;
+        let namespace = File::open("/proc/thread-self/ns/mnt")?;
+        let namespace_metadata = namespace.metadata()?;
+        let owner = ReadonlyRootBacking(Arc::new(ReadonlyRootBackingOwner {
+            source_mode: request.source.metadata()?.mode(),
+            source: request.source,
+            expected: request.expected,
+            identity: copy.identity,
+            mount_id: observed_mount_id(backing.as_fd())?,
+            flags: expected_flags,
+            backing,
+            executable: request.executable,
+            links: copy.links,
+            root: root.try_clone()?,
+            root_identity: (metadata.dev(), metadata.ino()),
+            root_mount: observed_mount_id(root.as_fd())?,
+            namespace,
+            namespace_identity: (namespace_metadata.dev(), namespace_metadata.ino()),
+            path: request.path,
+        }));
+        owner.verify()?;
+        Ok(owner)
+    }
+
+    /// Static graph observed in the common coordinator namespace. This is not
+    /// the guest root receipt: no guest PID, proc binding or entry is claimed.
+    pub(crate) struct PreparedDeclaredRoot {
+        inputs: Arc<HeldDynamicInputs>,
+        backings: BTreeMap<GuestPath, ReadonlyRootBacking>,
+        root: File,
+        proc_root: File,
+        namespace_fd: File,
+        device: u64,
+        inode: u64,
+        mount_id: u64,
+        proc_mount: u64,
+        setup_pid: i32,
+        namespace: (u64, u64),
+        guest_prepared: bool,
+    }
+    impl PreparedDeclaredRoot {
+        pub(crate) fn inputs(&self) -> &Arc<HeldDynamicInputs> {
+            &self.inputs
+        }
+        /// Only an actually materialized resolved name and its retained sealed
+        /// source may select a receipt. A digest/path supplied by a request is
+        /// not a source-to-copy admission.
+        pub(crate) fn backing(
+            &self,
+            path: &GuestPath,
+            expected: CapturedIdentity,
+        ) -> Result<&ReadonlyRootBacking> {
+            let backing = self
+                .backings
+                .get(path)
+                .context("unregistered root backing path")?;
+            if backing.source_identity() != expected {
+                bail!("root backing does not belong to the retained source");
+            }
+            backing.verify()?;
+            Ok(backing)
+        }
+        pub(crate) fn descriptor(&self) -> BorrowedFd<'_> {
+            self.root.as_fd()
+        }
+        pub(crate) fn device(&self) -> u64 {
+            self.device
+        }
+        pub(crate) fn inode(&self) -> u64 {
+            self.inode
+        }
+        pub(crate) fn mount_id(&self) -> u64 {
+            self.mount_id
+        }
+        pub(crate) fn namespace(&self) -> (u64, u64) {
+            self.namespace
+        }
+
+        /// Prebuild exactly one guest operation before coordinator workers.
+        /// `cwd` is the original Command's exact effective absolute cwd, not
+        /// the runner's cwd. Its empty directories are part of the closed root;
+        /// this data operation never attests original-directory permissions.
+        /// The parent retains this root and all held inputs until actual reap.
+        pub(crate) fn prepare_guest_setup(&mut self, cwd: &Path) -> Result<GuestDeclaredRootSetup> {
+            if self.guest_prepared {
+                bail!("guest root setup prepared twice");
+            }
+            self.guest_prepared = true;
+            let cwd_bytes = cwd.as_os_str().as_bytes();
+            let mut working_directory = [0u8; 4096];
+            if cwd_bytes != b"/" {
+                let path = GuestPath::new(cwd_bytes.to_vec())?;
+                let resolved = self.inputs.resolve_path(&path)?;
+                let mut directory = resolved.as_bytes().to_vec();
+                directory.extend_from_slice(b"/.cwd-endpoint");
+                // mkdir_parents creates/checks only the containing directory;
+                // no placeholder file is inserted into the declared root.
+                mkdir_parents(&self.root, &directory)?;
+            }
+            working_directory[..cwd_bytes.len()].copy_from_slice(cwd_bytes);
+            Ok(GuestDeclaredRootSetup {
+                root: Some(self.root.try_clone()?),
+                proc_root: Some(self.proc_root.try_clone()?),
+                namespace_fd: Some(self.namespace_fd.try_clone()?),
+                device: self.device,
+                inode: self.inode,
+                mount_id: self.mount_id,
+                proc_mount: self.proc_mount,
+                setup_pid: self.setup_pid,
+                namespace: self.namespace,
+                working_directory,
+                attempted: false,
+            })
+        }
+    }
+
+    /// Only fixed fields and owned descriptors: the child operation has no
+    /// allocation, formatting, Rust TLS, mutex, callback or heap-owned drop.
+    /// One actual guest spawn may consume it; a forked copy is not authority.
+    pub(crate) struct GuestDeclaredRootSetup {
+        root: Option<File>,
+        proc_root: Option<File>,
+        namespace_fd: Option<File>,
+        device: u64,
+        inode: u64,
+        mount_id: u64,
+        proc_mount: u64,
+        setup_pid: i32,
+        namespace: (u64, u64),
+        working_directory: [u8; 4096],
+        attempted: bool,
+    }
+    impl GuestDeclaredRootSetup {
+        /// Bind the actual guest task's proc leaves, seal the root and enter it.
+        /// All paths are fixed stack buffers; errors retain raw OS errno.
+        ///
+        /// # Safety
+        /// Run only in the existing Command's real post-fork/pre-exec child,
+        /// with the exact common mount plan and private FD table. The trusted
+        /// coordinator must exclude root/mount writers, retain the setup and
+        /// input owners through physical reap, and consume this token in only
+        /// one spawn. The launcher must transfer the observed root FD/identity,
+        /// join it to an actual watched birth and obtain the raw startup ACK,
+        /// retire all other setup/outside-root FDs, and install its qualified
+        /// filter before original exec. Every error is terminal for that child.
+        /// This performs filesystem setup only, never NativeExecProof/admission.
+        pub(crate) unsafe fn bind_and_enter(
+            &mut self,
+        ) -> std::io::Result<MaterializedDeclaredRoot> {
+            if self.attempted {
+                return Err(raw_refusal());
+            }
+            self.attempted = true;
+            let root = self.root.as_ref().ok_or_else(raw_refusal)?.as_raw_fd();
+            let proc_root = self.proc_root.as_ref().ok_or_else(raw_refusal)?.as_raw_fd();
+            let namespace_fd = self
+                .namespace_fd
+                .as_ref()
+                .ok_or_else(raw_refusal)?
+                .as_raw_fd();
+            let pid = unsafe { libc::getpid() };
+            if pid <= 0
+                || pid == self.setup_pid
+                || unsafe { libc::syscall(libc::SYS_gettid) } != i64::from(pid)
+            {
+                return Err(raw_refusal());
+            }
+            let namespace = raw_stat(namespace_fd)?;
+            if (namespace.st_dev, namespace.st_ino) != self.namespace {
+                return Err(raw_refusal());
+            }
+            let current_namespace = unsafe {
+                libc::openat(
+                    proc_root,
+                    c"self/ns/mnt".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            if current_namespace < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let current_namespace = unsafe { File::from_raw_fd(current_namespace) };
+            let current = raw_stat(current_namespace.as_raw_fd())?;
+            if (current.st_dev, current.st_ino) != self.namespace {
+                return Err(raw_refusal());
+            }
+            drop(current_namespace);
+            let root_stat = raw_stat(root)?;
+            let root_view = raw_statvfs(root)?;
+            if (root_stat.st_dev, root_stat.st_ino) != (self.device, self.inode)
+                || raw_mount_id(root)? != self.mount_id
+                || root_view.f_flag & libc::ST_RDONLY != 0
+                || raw_mount_id(proc_root)? != self.proc_mount
+            {
+                return Err(raw_refusal());
+            }
+            let mut proc_fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            if unsafe { libc::fstatfs(proc_root, proc_fs.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if unsafe { proc_fs.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
+                return Err(raw_refusal());
+            }
+            let mut number = RawPath::new();
+            number.number(pid as u32)?;
+            let mut self_target = [0u8; 32];
+            let length = unsafe {
+                libc::readlinkat(
+                    proc_root,
+                    c"self".as_ptr(),
+                    self_target.as_mut_ptr().cast(),
+                    self_target.len(),
+                )
+            };
+            if length < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if length as usize != number.len
+                || self_target[..length as usize] != number.bytes[..number.len]
+            {
+                return Err(raw_refusal());
+            }
+            raw_mkdir(root, c"proc".as_ptr(), true)?;
+            raw_mkdir(root, number.prefixed(b"proc/")?.as_ptr(), false)?;
+            let mut task = RawPath::new();
+            task.push(b"proc/")?;
+            task.push(number.as_bytes())?;
+            task.push(b"/task")?;
+            raw_mkdir(root, task.as_ptr(), false)?;
+            task.push(b"/")?;
+            task.push(number.as_bytes())?;
+            raw_mkdir(root, task.as_ptr(), false)?;
+            for leaf in [
+                b"maps".as_slice(),
+                b"smaps",
+                b"status",
+                b"auxv",
+                b"comm",
+                b"fd",
+            ] {
+                let mut source = RawPath::new();
+                source.push(number.as_bytes())?;
+                source.push(b"/")?;
+                source.push(leaf)?;
+                let mut target = source.prefixed(b"proc/")?;
+                raw_bind_proc(
+                    root,
+                    proc_root,
+                    &source,
+                    &target,
+                    leaf == b"fd",
+                    self.proc_mount,
+                )?;
+                target = RawPath::new();
+                target.push(task.as_bytes())?;
+                target.push(b"/")?;
+                target.push(leaf)?;
+                raw_bind_proc(
+                    root,
+                    proc_root,
+                    &source,
+                    &target,
+                    leaf == b"fd",
+                    self.proc_mount,
+                )?;
+            }
+            if unsafe { libc::symlinkat(number.as_ptr(), root, c"proc/self".as_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut thread = RawPath::new();
+            thread.push(number.as_bytes())?;
+            thread.push(b"/task/")?;
+            thread.push(number.as_bytes())?;
+            if unsafe { libc::symlinkat(thread.as_ptr(), root, c"proc/thread-self".as_ptr()) } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let root_path = RawPath::descriptor(root)?;
+            if unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    root_path.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+                    std::ptr::null(),
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if raw_statvfs(root)?.f_flag & libc::ST_RDONLY == 0
+                || raw_mount_id(root)? != self.mount_id
+            {
+                return Err(raw_refusal());
+            }
+            // Validate the namespace immediately before entry. Sharing it with
+            // the coordinator is intended; a changed namespace is a refusal.
+            let actual_ns = unsafe {
+                libc::openat(
+                    proc_root,
+                    c"self/ns/mnt".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            if actual_ns < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let actual_ns = unsafe { File::from_raw_fd(actual_ns) };
+            let actual = raw_stat(actual_ns.as_raw_fd())?;
+            if (actual.st_dev, actual.st_ino) != self.namespace {
+                return Err(raw_refusal());
+            }
+            drop(actual_ns);
+            if unsafe { libc::fchdir(root) } != 0
+                || unsafe { libc::chroot(c".".as_ptr()) } != 0
+                || unsafe { libc::chdir(self.working_directory.as_ptr().cast()) } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Close only these child's inherited setup descriptors. Parent
+            // copies retain ownership; root itself is supplied to the raw hook.
+            self.proc_root.take();
+            self.namespace_fd.take();
+            Ok(MaterializedDeclaredRoot {
+                root: self.root.take().ok_or_else(raw_refusal)?,
+                device: self.device,
+                inode: self.inode,
+                mount_id: self.mount_id,
+                visible_pid: pid,
+                namespace: self.namespace,
+            })
+        }
+    }
+
+    /// Actual same-guest root identity after proc binding and chroot. Transfer
+    /// the held FD itself with the bounded startup protocol; supplied scalars
+    /// alone never authorize a launch. All accessors are allocation-free.
+    pub(crate) struct MaterializedDeclaredRoot {
+        root: File,
+        device: u64,
+        inode: u64,
+        mount_id: u64,
+        visible_pid: i32,
+        namespace: (u64, u64),
+    }
+    impl MaterializedDeclaredRoot {
+        pub(crate) fn device(&self) -> u64 {
+            self.device
+        }
+        pub(crate) fn inode(&self) -> u64 {
+            self.inode
+        }
+        pub(crate) fn mount_id(&self) -> u64 {
+            self.mount_id
+        }
+        pub(crate) fn visible_pid(&self) -> i32 {
+            self.visible_pid
+        }
+        pub(crate) fn namespace(&self) -> (u64, u64) {
+            self.namespace
+        }
+        pub(crate) fn descriptor(&self) -> BorrowedFd<'_> {
+            self.root.as_fd()
+        }
+    }
+
+    fn raw_refusal() -> std::io::Error {
+        std::io::Error::from_raw_os_error(libc::EINVAL)
+    }
+    fn raw_stat(fd: i32) -> std::io::Result<libc::stat> {
+        let mut value = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, value.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { value.assume_init() })
+    }
+    fn raw_statvfs(fd: i32) -> std::io::Result<libc::statvfs> {
+        let mut value = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::fstatvfs(fd, value.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { value.assume_init() })
+    }
+    fn raw_mount_id(fd: i32) -> std::io::Result<u64> {
+        let mut value = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        if unsafe {
+            libc::statx(
+                fd,
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_MNT_ID,
+                value.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let value = unsafe { value.assume_init() };
+        if value.stx_mask & libc::STATX_MNT_ID == 0 || value.stx_mnt_id == 0 {
+            return Err(raw_refusal());
+        }
+        Ok(value.stx_mnt_id)
+    }
+    /// Small bounded C paths for kernel-derived PID/FD numbers, not user data.
+    struct RawPath {
+        bytes: [u8; 128],
+        len: usize,
+    }
+    impl RawPath {
+        fn new() -> Self {
+            Self {
+                bytes: [0; 128],
+                len: 0,
+            }
+        }
+        fn as_ptr(&self) -> *const libc::c_char {
+            self.bytes.as_ptr().cast()
+        }
+        fn as_bytes(&self) -> &[u8] {
+            &self.bytes[..self.len]
+        }
+        fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            if self.len + bytes.len() >= self.bytes.len() || bytes.contains(&0) {
+                return Err(raw_refusal());
+            }
+            self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+            self.bytes[self.len] = 0;
+            Ok(())
+        }
+        fn number(&mut self, mut value: u32) -> std::io::Result<()> {
+            let mut digits = [0u8; 10];
+            let mut start = digits.len();
+            loop {
+                start -= 1;
+                digits[start] = b'0' + (value % 10) as u8;
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+            self.push(&digits[start..])
+        }
+        fn prefixed(&self, prefix: &[u8]) -> std::io::Result<Self> {
+            let mut result = Self::new();
+            result.push(prefix)?;
+            result.push(self.as_bytes())?;
+            Ok(result)
+        }
+        fn descriptor(fd: i32) -> std::io::Result<Self> {
+            if fd < 0 {
+                return Err(raw_refusal());
+            }
+            let mut result = Self::new();
+            result.push(b"/proc/self/fd/")?;
+            result.number(fd as u32)?;
+            Ok(result)
+        }
+    }
+    fn raw_mkdir(
+        root: i32,
+        path: *const libc::c_char,
+        allow_existing: bool,
+    ) -> std::io::Result<()> {
+        if unsafe { libc::mkdirat(root, path, 0o755) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if !allow_existing || error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(error);
+        }
+        let fd = unsafe {
+            libc::openat(
+                root,
+                path,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        drop(unsafe { File::from_raw_fd(fd) });
+        Ok(())
+    }
+    fn raw_bind_proc(
+        root: i32,
+        proc_root: i32,
+        source_path: &RawPath,
+        target_path: &RawPath,
+        directory: bool,
+        mount_id: u64,
+    ) -> std::io::Result<()> {
+        let source = unsafe {
+            libc::openat(
+                proc_root,
+                source_path.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if source < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let source = unsafe { File::from_raw_fd(source) };
+        let metadata = raw_stat(source.as_raw_fd())?;
+        if raw_mount_id(source.as_raw_fd())? != mount_id
+            || (metadata.st_mode & libc::S_IFMT)
+                != if directory {
+                    libc::S_IFDIR
+                } else {
+                    libc::S_IFREG
+                }
+        {
+            return Err(raw_refusal());
+        }
+        if directory {
+            raw_mkdir(root, target_path.as_ptr(), false)?;
+        } else {
+            let target = unsafe {
+                libc::openat(
+                    root,
+                    target_path.as_ptr(),
+                    libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_WRONLY
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o444,
+                )
+            };
+            if target < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            drop(unsafe { File::from_raw_fd(target) });
+        }
+        let from = RawPath::descriptor(source.as_raw_fd())?;
+        let mut to = RawPath::descriptor(root)?;
+        to.push(b"/")?;
+        to.push(target_path.as_bytes())?;
+        if unsafe {
+            libc::mount(
+                from.as_ptr(),
+                to.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let source_flags = raw_statvfs(source.as_raw_fd())?.f_flag;
+        let mut flags = libc::MS_BIND
+            | libc::MS_REMOUNT
+            | libc::MS_RDONLY
+            | libc::MS_NOSUID
+            | libc::MS_NODEV
+            | libc::MS_NOEXEC;
+        for (probe, flag) in [
+            (libc::ST_NOATIME, libc::MS_NOATIME),
+            (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+        ] {
+            if source_flags & probe != 0 {
+                flags |= flag;
+            }
+        }
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                to.as_ptr(),
+                std::ptr::null(),
+                flags,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let target = unsafe {
+            libc::openat(
+                root,
+                target_path.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if target < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let target = unsafe { File::from_raw_fd(target) };
+        let actual = raw_stat(target.as_raw_fd())?;
+        let required = libc::ST_RDONLY | libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC;
+        if (actual.st_dev, actual.st_ino) != (metadata.st_dev, metadata.st_ino)
+            || raw_statvfs(target.as_raw_fd())?.f_flag & required != required
+        {
+            return Err(raw_refusal());
+        }
+        Ok(())
+    }
+
+    fn observed_mount_id(descriptor: BorrowedFd<'_>) -> Result<u64> {
+        let mut observed = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        if unsafe {
+            libc::statx(
+                descriptor.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_MNT_ID,
+                observed.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let observed = unsafe { observed.assume_init() };
+        if observed.stx_mask & libc::STATX_MNT_ID == 0 || observed.stx_mnt_id == 0 {
+            bail!("kernel did not report an actual mount identity");
+        }
+        Ok(observed.stx_mnt_id)
+    }
+
+    fn root_relative(root: &File, path: &[u8], flags: i32) -> Result<File> {
+        // Paths are validated GuestPath spellings, and parent resolution never
+        // follows graph symlinks while inspecting setup-created endpoints.
+        let parent = mkdir_parents(root, path)?;
+        let name = CString::new(path.rsplit(|byte| *byte == b'/').next().unwrap())?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn mkdir_parents(root: &File, path: &[u8]) -> Result<File> {
+        let mut parent = root.try_clone()?;
+        let parts: Vec<_> = path[1..].split(|byte| *byte == b'/').collect();
+        for part in &parts[..parts.len() - 1] {
+            let name = CString::new(*part)?;
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) } != 0
+                && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let next = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if next < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            parent = unsafe { File::from_raw_fd(next) };
+        }
+        Ok(parent)
+    }
+
+    fn create_link(root: &File, path: &GuestPath, target: &[u8]) -> Result<()> {
+        let parent = mkdir_parents(root, path.as_bytes())?;
+        let name = CString::new(path.as_bytes().rsplit(|byte| *byte == b'/').next().unwrap())?;
+        let target = CString::new(target)?;
+        if unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    fn bind_fd(
+        root: &File,
+        path: &GuestPath,
+        source: BorrowedFd<'_>,
+        executable: bool,
+        expected: Option<CapturedIdentity>,
+    ) -> Result<()> {
+        let metadata = File::from(source.try_clone_to_owned()?).metadata()?;
+        let parent = mkdir_parents(root, path.as_bytes())?;
+        let name = CString::new(path.as_bytes().rsplit(|byte| *byte == b'/').next().unwrap())?;
+        if metadata.is_dir() {
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o555) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        } else {
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_WRONLY
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o444,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            drop(unsafe { File::from_raw_fd(fd) });
+        }
+        let from = CString::new(format!("/proc/self/fd/{}", source.as_raw_fd()))?;
+        let mut target = format!("/proc/self/fd/{}/", parent.as_raw_fd()).into_bytes();
+        target.extend_from_slice(name.as_bytes());
+        let target = CString::new(target)?;
+        if unsafe {
+            libc::mount(
+                from.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut source_view = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::fstatvfs(source.as_raw_fd(), source_view.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let source_flags = unsafe { source_view.assume_init() }.f_flag;
+        // Character devices need their device semantics; the root itself stays
+        // nodev and only these explicit child mounts can expose supported nodes.
+        use std::os::unix::fs::FileTypeExt;
+        let mut flags = libc::MS_BIND
+            | libc::MS_REMOUNT
+            | libc::MS_RDONLY
+            | libc::MS_NOSUID
+            | if metadata.file_type().is_char_device() {
+                0
+            } else {
+                libc::MS_NODEV
+            }
+            | if executable { 0 } else { libc::MS_NOEXEC };
+        for (probe, flag) in [
+            (libc::ST_NOSUID, libc::MS_NOSUID),
+            (libc::ST_NODEV, libc::MS_NODEV),
+            (libc::ST_NOEXEC, libc::MS_NOEXEC),
+            (libc::ST_NOATIME, libc::MS_NOATIME),
+            (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+        ] {
+            if source_flags & probe != 0 {
+                flags |= flag;
+            }
+        }
+        if executable && flags & libc::MS_NOEXEC != 0 {
+            bail!("executable held source is on a noexec mount");
+        }
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                target.as_ptr(),
+                std::ptr::null(),
+                flags,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let actual = unsafe { File::from_raw_fd(fd) };
+        let actual_meta = actual.metadata()?;
+        let mut actual_view = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::fstatvfs(actual.as_raw_fd(), actual_view.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let actual_flags = unsafe { actual_view.assume_init() }.f_flag;
+        if actual_flags & libc::ST_RDONLY == 0
+            || (actual_flags & libc::ST_NOEXEC != 0) == executable
+        {
+            bail!("bound root object mount policy differs");
+        }
+        if actual_meta.dev() != metadata.dev() || actual_meta.ino() != metadata.ino() {
+            bail!("bound root object identity changed");
+        }
+        if let Some(expected) = expected
+            && (actual_meta.dev() != expected.device
+                || actual_meta.ino() != expected.inode
+                || actual_meta.len() != expected.size
+                || unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GET_SEALS) } != SEALS)
+        {
+            bail!("bound sealed object changed");
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::super::super::native_exec_inputs::OpenedGuestRoot;
+        use super::*;
+
+        fn requested_copy(path: &[u8], source: &File, executable: bool) -> RootCopy {
+            let source_identity = checked_file_identity(source, executable, true).unwrap();
+            RootCopy {
+                path: GuestPath::new(path.to_vec()).unwrap(),
+                source: source.try_clone().unwrap(),
+                expected: source_identity,
+                executable,
+            }
+        }
+
+        #[test]
+        fn readonly_root_copy_checks_real_seals_bytes_and_conflicting_roles() {
+            let source = super::super::super::native_exec_inputs::seal_bytes(
+                b"captured copy",
+                InputRole::Data,
+            )
+            .unwrap();
+            let root_dir = tempfile::tempdir().unwrap();
+            let root = File::open(root_dir.path()).unwrap();
+            let request = requested_copy(b"/input", &source, false);
+            let expected = request.expected;
+            let copied = copy_root_groups(&root, vec![request]).unwrap();
+            let copy = open_root_file(&root, b"/input").unwrap();
+            let identity = checked_file_identity(&copy, false, false).unwrap();
+            assert_eq!(identity.size, expected.size);
+            assert_eq!(identity.digest, expected.digest);
+            assert_ne!(
+                (identity.device, identity.inode),
+                (expected.device, expected.inode)
+            );
+            assert_eq!(copied.len(), 1);
+            assert_eq!(
+                unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GET_SEALS) },
+                SEALS
+            );
+            assert_eq!(
+                source.write_at(b"X", 0).unwrap_err().raw_os_error(),
+                Some(libc::EPERM)
+            );
+            let mut wrong = requested_copy(b"/other", &source, false);
+            wrong.expected.digest[0] ^= 1;
+            assert!(copy_root_groups(&root, vec![wrong]).is_err());
+            let mut wrong = requested_copy(b"/role", &source, false);
+            wrong.executable = true;
+            assert!(copy_root_groups(&root, vec![wrong]).is_err());
+            let ordinary = tempfile::tempfile().unwrap();
+            ordinary.write_all_at(b"captured copy", 0).unwrap();
+            assert!(checked_file_identity(&ordinary, false, true).is_err());
+            copy.write_at(b"X", 0).unwrap_err(); // actual retained copy is O_RDONLY
+            assert_eq!(unsafe { libc::fchmod(copy.as_raw_fd(), 0o644) }, 0);
+            let writable = File::options()
+                .write(true)
+                .open(root_dir.path().join("input"))
+                .unwrap();
+            writable.write_all_at(b"X", 0).unwrap();
+            assert_eq!(unsafe { libc::fchmod(copy.as_raw_fd(), 0o444) }, 0);
+            assert_ne!(
+                checked_file_identity(&copy, false, false).unwrap().digest,
+                expected.digest
+            );
+        }
+
+        #[test]
+        fn actual_readonly_root_backings_group_aliases_and_refuse_changed_owners() {
+            let inputs = data_inputs();
+            let source =
+                super::super::super::native_exec_inputs::seal_bytes(b"same bytes", InputRole::Data)
+                    .unwrap();
+            let distinct =
+                super::super::super::native_exec_inputs::seal_bytes(b"same bytes", InputRole::Data)
+                    .unwrap();
+            let code = super::super::super::native_exec_inputs::seal_bytes(
+                b"executable bytes",
+                InputRole::Executable,
+            )
+            .unwrap();
+            let mut additions = DeclaredRootAdditions::default();
+            for (path, file) in [
+                (b"/a".as_slice(), &source),
+                (b"/b", &source),
+                (b"/c", &distinct),
+            ] {
+                additions
+                    .add_file(
+                        RuntimeFile::new(
+                            GuestPath::new(path.to_vec()).unwrap(),
+                            file.as_fd(),
+                            false,
+                            FilePlacement::Additional,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            additions
+                .add_file(
+                    RuntimeFile::new(
+                        GuestPath::new(b"/exec".to_vec()).unwrap(),
+                        code.as_fd(),
+                        true,
+                        FilePlacement::Additional,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let expected = checked_file_identity(&source, false, true).unwrap();
+            let mut plan = root_plan(inputs, additions).unwrap();
+            let mut container = super::super::default_container(false);
+            plan.configure(&mut container).unwrap();
+            let result: Result<(), String> = container
+                .run(|| {
+                    let mut work = || -> Result<()> {
+                        let prepared = unsafe { plan.materialize()? };
+                        let a_path = GuestPath::new(b"/a".to_vec())?;
+                        let a = prepared.backing(&a_path, expected)?.clone();
+                        let b = prepared.backing(&GuestPath::new(b"/b".to_vec())?, expected)?;
+                        let c = prepared.backing(
+                            &GuestPath::new(b"/c".to_vec())?,
+                            checked_file_identity(&distinct, false, true)?,
+                        )?;
+                        assert_eq!(a.identity(), b.identity());
+                        assert_ne!(a.identity().inode, c.identity().inode);
+                        assert_eq!(a.identity().digest, c.identity().digest);
+                        assert_ne!(a.mount_id(), b.mount_id());
+                        for backing in [&a, b, c] {
+                            backing.verify()?;
+                        }
+                        // Exercise the same literal symlink helper used for
+                        // declared aliases, without treating the alias itself
+                        // as a separately registered source receipt.
+                        let alias = GuestPath::new(b"/alias".to_vec())?;
+                        create_link(&prepared.root, &alias, b"a")?;
+                        let alias_fd = unsafe {
+                            libc::openat(
+                                prepared.root.as_raw_fd(),
+                                c"alias".as_ptr(),
+                                libc::O_RDONLY | libc::O_CLOEXEC,
+                            )
+                        };
+                        if alias_fd < 0 {
+                            return Err(std::io::Error::last_os_error().into());
+                        }
+                        let alias_file = unsafe { File::from_raw_fd(alias_fd) };
+                        assert_eq!(
+                            checked_file_identity(&alias_file, false, false)?,
+                            a.identity()
+                        );
+                        assert!(prepared.backing(&alias, expected).is_err());
+                        assert!(open_root_file(&prepared.root, b"/alias").is_err());
+                        let executable = prepared.backing(
+                            &GuestPath::new(b"/exec".to_vec())?,
+                            checked_file_identity(&code, true, true)?,
+                        )?;
+                        executable.verify()?;
+                        assert!(executable.executable());
+                        assert_eq!(
+                            raw_statvfs(executable.descriptor().as_raw_fd())?.f_flag
+                                & libc::ST_NOEXEC,
+                            0
+                        );
+                        let flags = raw_statvfs(a.descriptor().as_raw_fd())?.f_flag;
+                        assert_eq!(
+                            flags
+                                & (libc::ST_RDONLY
+                                    | libc::ST_NOSUID
+                                    | libc::ST_NODEV
+                                    | libc::ST_NOEXEC),
+                            libc::ST_RDONLY | libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC
+                        );
+                        let mut wrong_source = expected;
+                        wrong_source.inode ^= 1;
+                        assert!(prepared.backing(&a_path, wrong_source).is_err());
+                        assert!(
+                            prepared
+                                .backing(&GuestPath::new(b"/absent".to_vec())?, expected)
+                                .is_err()
+                        );
+                        let readonly_write = a.0.backing.write_at(b"X", 0).unwrap_err();
+                        assert_eq!(readonly_write.raw_os_error(), Some(libc::EBADF));
+                        let mut wrong_mount = (*a.0).try_clone_for_test()?;
+                        wrong_mount.mount_id ^= 1;
+                        assert!(ReadonlyRootBacking(Arc::new(wrong_mount)).verify().is_err());
+                        let mut wrong_namespace = (*a.0).try_clone_for_test()?;
+                        wrong_namespace.namespace_identity.1 ^= 1;
+                        assert!(
+                            ReadonlyRootBacking(Arc::new(wrong_namespace))
+                                .verify()
+                                .is_err()
+                        );
+                        let parent = mkdir_parents(&prepared.root, b"/a")?;
+                        let c_target =
+                            CString::new(format!("/proc/self/fd/{}/c", parent.as_raw_fd()))?;
+                        assert_eq!(
+                            unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) },
+                            0
+                        );
+                        assert_eq!(
+                            unsafe { libc::unlinkat(parent.as_raw_fd(), c"c".as_ptr(), 0) },
+                            0
+                        );
+                        let replacement = open_new_root_file(&prepared.root, b"/c", 0o444)?;
+                        replacement.write_all_at(b"same bytes", 0)?;
+                        drop(replacement);
+                        assert!(c.verify().is_err()); // equal-byte replacement is a different owner
+                        a.verify()?; // the separate same-source a/b group remains sound
+                        let target =
+                            CString::new(format!("/proc/self/fd/{}/a", parent.as_raw_fd()))?;
+                        let mut atime_flags = 0;
+                        for (observed, flag) in [
+                            (libc::ST_NOATIME, libc::MS_NOATIME),
+                            (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+                            (ROOT_ST_RELATIME, libc::MS_RELATIME),
+                        ] {
+                            if flags & observed != 0 {
+                                atime_flags |= flag;
+                            }
+                        }
+                        let remount = |flags| -> Result<()> {
+                            if unsafe {
+                                libc::mount(
+                                    std::ptr::null(),
+                                    target.as_ptr(),
+                                    std::ptr::null(),
+                                    flags | atime_flags,
+                                    std::ptr::null(),
+                                )
+                            } != 0
+                            {
+                                return Err(std::io::Error::last_os_error().into());
+                            }
+                            Ok(())
+                        };
+                        // Each refusal follows a real kernel policy/path mutation.
+                        remount(
+                            libc::MS_BIND
+                                | libc::MS_REMOUNT
+                                | libc::MS_RDONLY
+                                | libc::MS_NOSUID
+                                | libc::MS_NODEV,
+                        )?;
+                        assert!(a.verify().is_err()); // missing noexec alone
+                        remount(
+                            libc::MS_BIND
+                                | libc::MS_REMOUNT
+                                | libc::MS_RDONLY
+                                | libc::MS_NOSUID
+                                | libc::MS_NODEV
+                                | libc::MS_NOEXEC,
+                        )?;
+                        a.verify()?;
+                        remount(
+                            libc::MS_BIND
+                                | libc::MS_REMOUNT
+                                | libc::MS_NOSUID
+                                | libc::MS_NODEV
+                                | libc::MS_NOEXEC,
+                        )?;
+                        assert!(a.verify().is_err());
+                        let writable =
+                            open_root_file_with_flags(&prepared.root, b"/a", libc::O_WRONLY)?;
+                        writable.write_all_at(b"X", 0)?;
+                        drop(writable);
+                        remount(
+                            libc::MS_BIND
+                                | libc::MS_REMOUNT
+                                | libc::MS_RDONLY
+                                | libc::MS_NOSUID
+                                | libc::MS_NODEV
+                                | libc::MS_NOEXEC,
+                        )?;
+                        assert!(a.verify().is_err()); // corrupt destination survives restored policy
+                        assert!(b.verify().is_err()); // physical a/b aliases share the changed bytes
+                        remount(
+                            libc::MS_BIND
+                                | libc::MS_REMOUNT
+                                | libc::MS_NOSUID
+                                | libc::MS_NODEV
+                                | libc::MS_NOEXEC,
+                        )?;
+                        let writable =
+                            open_root_file_with_flags(&prepared.root, b"/a", libc::O_WRONLY)?;
+                        writable.set_len(1)?;
+                        drop(writable);
+                        remount(
+                            libc::MS_BIND
+                                | libc::MS_REMOUNT
+                                | libc::MS_RDONLY
+                                | libc::MS_NOSUID
+                                | libc::MS_NODEV
+                                | libc::MS_NOEXEC,
+                        )?;
+                        assert!(a.verify().is_err()); // actual truncation, separately restored mount policy
+                        Ok(())
+                    };
+                    work().map_err(|error| format!("{error:#}"))
+                })
+                .unwrap();
+            result.unwrap();
+        }
+
+        fn root_plan(
+            inputs: Arc<HeldDynamicInputs>,
+            mut additions: DeclaredRootAdditions,
+        ) -> Result<DeclaredInputRoot> {
+            if additions.common_group.is_none() {
+                additions.capture_common_inputs()?;
+            }
+            DeclaredInputRoot::prepare(inputs, additions, &std::env::temp_dir())
+        }
+
+        fn data_inputs() -> Arc<HeldDynamicInputs> {
+            let source = tempfile::tempdir().unwrap();
+            std::fs::write(source.path().join("input"), b"sealed input").unwrap();
+            let opened = OpenedGuestRoot::open(source.path()).unwrap();
+            Arc::new(
+                HeldDynamicInputs::capture_data_control(
+                    &opened,
+                    GuestPath::new(b"/input".to_vec()).unwrap(),
+                )
+                .unwrap(),
+            )
+        }
+
+        #[test]
+        fn verify_plans_retain_one_actual_common_group_owner() {
+            let inputs = data_inputs();
+            assert!(
+                DeclaredInputRoot::prepare(
+                    inputs.clone(),
+                    DeclaredRootAdditions::default(),
+                    &std::env::temp_dir(),
+                )
+                .is_err()
+            );
+            let mut additions = DeclaredRootAdditions::default();
+            additions.capture_common_inputs().unwrap();
+            assert!(additions.capture_common_inputs().is_err());
+            let second_additions = additions.try_clone().unwrap();
+            assert!(Arc::ptr_eq(
+                additions.common_group.as_ref().unwrap(),
+                second_additions.common_group.as_ref().unwrap(),
+            ));
+            let first =
+                DeclaredInputRoot::prepare(inputs.clone(), additions, &std::env::temp_dir())
+                    .unwrap();
+            let second =
+                DeclaredInputRoot::prepare(inputs, second_additions, &std::env::temp_dir())
+                    .unwrap();
+            let group = |plan: &DeclaredInputRoot| {
+                plan.runtime_files()
+                    .iter()
+                    .find(|file| file.path().as_bytes() == b"/etc/group")
+                    .unwrap()
+                    .identity()
+            };
+            // Device/inode, size and SHA all match one actual sealed object;
+            // equal generated text alone cannot satisfy this comparison.
+            assert_eq!(group(&first), group(&second));
+            assert_ne!(first.stage.path(), second.stage.path());
+            assert_eq!(
+                unsafe {
+                    libc::fcntl(
+                        first
+                            .additions
+                            .common_group
+                            .as_ref()
+                            .unwrap()
+                            .descriptor()
+                            .as_raw_fd(),
+                        libc::F_GET_SEALS,
+                    )
+                },
+                SEALS
+            );
+        }
+
+        #[test]
+        fn runtime_additions_require_real_seals_and_exact_executable_mode() {
+            let ordinary = tempfile::NamedTempFile::new().unwrap();
+            assert!(
+                RuntimeFile::new(
+                    GuestPath::new(b"/tool/config".to_vec()).unwrap(),
+                    ordinary.as_file().as_fd(),
+                    false,
+                    FilePlacement::Additional
+                )
+                .is_err()
+            );
+            let sealed = super::super::super::native_exec_inputs::seal_bytes(
+                b"runtime bytes",
+                InputRole::Data,
+            )
+            .unwrap();
+            assert!(
+                RuntimeFile::new(
+                    GuestPath::new(b"/tool/config".to_vec()).unwrap(),
+                    sealed.as_fd(),
+                    true,
+                    FilePlacement::Additional
+                )
+                .is_err()
+            );
+            let actual = RuntimeFile::new(
+                GuestPath::new(b"/tool/config".to_vec()).unwrap(),
+                sealed.as_fd(),
+                false,
+                FilePlacement::Additional,
+            )
+            .unwrap();
+            let cloned = actual.try_clone().unwrap();
+            assert_eq!(actual.identity(), cloned.identity());
+            assert_ne!(
+                actual.descriptor().as_raw_fd(),
+                cloned.descriptor().as_raw_fd()
+            );
+        }
+
+        #[test]
+        fn root_plan_refuses_duplicate_files_and_unenrolled_interpreter_replacement() {
+            let inputs = data_inputs();
+            let sealed = super::super::super::native_exec_inputs::seal_bytes(
+                b"bootstrap",
+                InputRole::Executable,
+            )
+            .unwrap();
+            let replacement = RuntimeFile::new(
+                GuestPath::new(b"/loader".to_vec()).unwrap(),
+                sealed.as_fd(),
+                true,
+                FilePlacement::InterpreterReplacement,
+            )
+            .unwrap();
+            let mut additions = DeclaredRootAdditions::default();
+            additions.add_file(replacement).unwrap();
+            assert!(root_plan(inputs.clone(), additions).is_err());
+            let mut additions = DeclaredRootAdditions::default();
+            additions
+                .add_file(
+                    RuntimeFile::new(
+                        GuestPath::new(b"/input".to_vec()).unwrap(),
+                        sealed.as_fd(),
+                        true,
+                        FilePlacement::Additional,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            assert!(root_plan(inputs, additions).is_err());
+        }
+
+        #[test]
+        fn root_setup_refuses_parent_materialization_and_duplicate_configuration() {
+            fn requires_send_sync<T: Send + Sync>() {}
+            requires_send_sync::<GuestDeclaredRootSetup>();
+            let mut plan = root_plan(data_inputs(), DeclaredRootAdditions::default()).unwrap();
+            let mut container = super::super::default_container(false);
+            assert!(unsafe { plan.materialize() }.is_err());
+            plan.configure(&mut container).unwrap();
+            assert!(plan.configure(&mut container).is_err());
+            // The host staging directory has not been covered by the actual
+            // child tmpfs. Data/configuration alone cannot manufacture a root.
+            assert!(unsafe { plan.materialize() }.is_err());
+            assert!(unsafe { plan.materialize() }.is_err());
+        }
+
+        #[test]
+        fn actual_native_endpoints_survive_declared_root_mount_namespace() {
+            use std::os::unix::fs::FileTypeExt;
+            use std::os::unix::net::UnixListener;
+
+            use super::super::super::native_exec_run::NativeEndpoints;
+
+            fn socket_view(path: &Path) -> (u64, u64, u32, libc::c_ulong) {
+                let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+                let raw = unsafe {
+                    libc::open(
+                        path.as_ptr(),
+                        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                assert!(
+                    raw >= 0,
+                    "socket open failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                let fd = unsafe { File::from_raw_fd(raw) };
+                let metadata = fd.metadata().unwrap();
+                assert!(metadata.file_type().is_socket());
+                let mut view = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+                assert_eq!(
+                    unsafe { libc::fstatvfs(fd.as_raw_fd(), view.as_mut_ptr()) },
+                    0
+                );
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mode() & libc::S_IFMT,
+                    unsafe { view.assume_init() }.f_flag,
+                )
+            }
+
+            // Use actual endpoint binding and root planning. The long lexical
+            // source path cannot be an AF_UNIX bind spelling; the real binder
+            // must retain its short procfd spelling without using it as a
+            // child-namespace mount source. No native Tool or memfd file bind
+            // is exercised: this control stops at the actual setup boundary.
+            let backing = tempfile::Builder::new()
+                .prefix(&format!("native-endpoint-{}", "x".repeat(120)))
+                .tempdir()
+                .unwrap();
+            let endpoints = NativeEndpoints::bind(backing.path()).unwrap();
+            let socket_directory = std::fs::read_dir(backing.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .as_bytes()
+                        .starts_with(b"native-sockets-")
+                })
+                .unwrap();
+            let rpc = socket_directory.join("rpc.sock");
+            let unix_address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            assert!(rpc.as_os_str().as_bytes().len() >= unix_address.sun_path.len());
+            let short_stats = reverie_inguest::initial_image_stats::initial_image_stats_endpoint(
+                Path::new("/run/rpc.sock"),
+            )
+            .unwrap();
+            let stats = socket_directory.join(short_stats.file_name().unwrap());
+            let sources = [
+                (Endpoint::Rpc, rpc.clone()),
+                (Endpoint::Statistics, stats),
+                (Endpoint::Provision, socket_directory.join("provision.sock")),
+            ];
+            let mut additions = DeclaredRootAdditions::default();
+            additions.capture_common_inputs().unwrap();
+            endpoints.add_to(&mut additions).unwrap();
+            assert_eq!(additions.endpoints.len(), 3);
+            let expected = sources.map(|(kind, source)| {
+                let identity = socket_view(&source);
+                let (_, _, device, inode) = additions
+                    .endpoints
+                    .iter()
+                    .find(|(candidate, _, _, _)| *candidate == kind)
+                    .unwrap();
+                assert_eq!((identity.0, identity.1), (*device, *inode));
+                (kind, identity)
+            });
+            let inputs = data_inputs();
+            let mut plan = DeclaredInputRoot::prepare(
+                inputs.clone(),
+                additions.try_clone().unwrap(),
+                backing.path(),
+            )
+            .unwrap();
+            let namespace = std::fs::metadata("/proc/self/ns/mnt").unwrap();
+            let parent_namespace = (namespace.dev(), namespace.ino());
+            let mut container = super::super::default_container(false);
+            plan.configure(&mut container).unwrap();
+            container
+                .run(|| {
+                    let namespace = std::fs::metadata("/proc/self/ns/mnt").unwrap();
+                    assert_ne!((namespace.dev(), namespace.ino()), parent_namespace);
+                    for (kind, source) in expected {
+                        let actual = socket_view(&plan.stage.path().join(&kind.path()[1..]));
+                        assert_eq!(
+                            (actual.0, actual.1, actual.2),
+                            (source.0, source.1, source.2)
+                        );
+                        assert_eq!(
+                            actual.3,
+                            source.3
+                                | libc::ST_RDONLY
+                                | libc::ST_NOSUID
+                                | libc::ST_NODEV
+                                | libc::ST_NOEXEC,
+                        );
+                    }
+                    for (_, pin, _, _) in &plan.additions.endpoints {
+                        pin.retire().unwrap();
+                    }
+                    plan.stage_pin.retire().unwrap();
+                })
+                .unwrap();
+            // Actual wait/reap has completed. A new socket at the same lexical
+            // name must still be refused before the child workload, rather
+            // than gaining admission from the retained directory alone.
+            let mut replaced =
+                DeclaredInputRoot::prepare(inputs, additions, backing.path()).unwrap();
+            std::fs::rename(&rpc, socket_directory.join("held-rpc.sock")).unwrap();
+            let directory = File::open(&socket_directory).unwrap();
+            let short_rpc = format!("/proc/self/fd/{}/rpc.sock", directory.as_raw_fd());
+            let _replacement = UnixListener::bind(&short_rpc).unwrap();
+            let mut container = super::super::default_container(false);
+            replaced.configure(&mut container).unwrap();
+            match container.run(|| -> () { panic!("replacement endpoint reached workload") }) {
+                Err(reverie::process::RunError::Spawn(error)) => {
+                    assert_eq!(error.context(), reverie::process::Context::Mount);
+                    assert_eq!(
+                        std::io::Error::from(error).raw_os_error(),
+                        Some(libc::ESTALE)
+                    );
+                }
+                other => panic!("expected exact endpoint replacement refusal, received {other:?}"),
+            }
+            drop(endpoints);
+        }
+
+        #[test]
+        fn actual_common_container_materializes_readonly_data_and_same_task_proc() {
+            // Filesystem component only: no Tool installation/native filter,
+            // InstalledExecDomain or native exec success is represented here.
+            // Init builds the graph; a real forked guest child binds its proc.
+            let inputs = data_inputs();
+            let mut plan = root_plan(inputs.clone(), DeclaredRootAdditions::default()).unwrap();
+            let mut container = super::super::default_container(false);
+            plan.configure(&mut container).unwrap();
+            let result: Result<(i32, i32, [u8; 8]), String> = container
+                .run(|| {
+                    let mut work = || -> Result<_> {
+                        let mut prepared = unsafe { plan.materialize()? };
+                        assert_ne!(prepared.mount_id(), 0);
+                        let setup_pid = unsafe { libc::getpid() };
+                        let mut guest = prepared.prepare_guest_setup(Path::new("/work"))?;
+                        assert!(prepared.prepare_guest_setup(Path::new("/work")).is_err());
+                        let mut pair = [-1; 2];
+                        if unsafe { libc::pipe2(pair.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                            return Err(std::io::Error::last_os_error().into());
+                        }
+                        let read = unsafe { File::from_raw_fd(pair[0]) };
+                        let write = unsafe { File::from_raw_fd(pair[1]) };
+                        let pid = unsafe { libc::fork() };
+                        if pid < 0 {
+                            return Err(std::io::Error::last_os_error().into());
+                        }
+                        if pid == 0 {
+                            // The production operation itself uses no allocation.
+                            // Raw fixture observations execute only after it returns.
+                            let mut check = || -> std::io::Result<()> {
+                                let receipt = unsafe { guest.bind_and_enter()? };
+                                if receipt.visible_pid() != unsafe { libc::getpid() }
+                                    || receipt.visible_pid() == setup_pid
+                                    || receipt.namespace() != prepared.namespace()
+                                    || receipt.device() != prepared.device()
+                                    || receipt.inode() != prepared.inode()
+                                    || receipt.mount_id() != prepared.mount_id()
+                                {
+                                    return Err(raw_refusal());
+                                }
+                                assert_eq!(
+                                    unsafe { guest.bind_and_enter() }
+                                        .err()
+                                        .unwrap()
+                                        .raw_os_error(),
+                                    Some(libc::EINVAL)
+                                );
+                                let mut actual_cwd = [0u8; 32];
+                                if unsafe {
+                                    libc::getcwd(actual_cwd.as_mut_ptr().cast(), actual_cwd.len())
+                                }
+                                .is_null()
+                                    || &actual_cwd[..6] != b"/work\0"
+                                {
+                                    return Err(raw_refusal());
+                                }
+                                let input = unsafe {
+                                    libc::open(c"/input".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+                                };
+                                if input < 0 {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                                let input = unsafe { File::from_raw_fd(input) };
+                                let mut bytes = [0; 32];
+                                let n = unsafe {
+                                    libc::read(
+                                        input.as_raw_fd(),
+                                        bytes.as_mut_ptr().cast(),
+                                        bytes.len(),
+                                    )
+                                };
+                                if n != 12 || &bytes[..12] != b"sealed input" {
+                                    return Err(raw_refusal());
+                                }
+                                let denied = unsafe {
+                                    libc::open(c"/input".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
+                                };
+                                if denied >= 0 {
+                                    unsafe {
+                                        libc::close(denied);
+                                    }
+                                    return Err(raw_refusal());
+                                }
+                                if std::io::Error::last_os_error().raw_os_error()
+                                    != Some(libc::EROFS)
+                                {
+                                    return Err(raw_refusal());
+                                }
+                                let scratch = unsafe {
+                                    libc::open(
+                                        c"/tmp/scratch".as_ptr(),
+                                        libc::O_WRONLY
+                                            | libc::O_CREAT
+                                            | libc::O_EXCL
+                                            | libc::O_CLOEXEC,
+                                        0o600,
+                                    )
+                                };
+                                if scratch < 0 {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                                let scratch = unsafe { File::from_raw_fd(scratch) };
+                                if unsafe {
+                                    libc::write(scratch.as_raw_fd(), b"scratch".as_ptr().cast(), 7)
+                                } != 7
+                                {
+                                    return Err(raw_refusal());
+                                }
+                                let status = unsafe {
+                                    libc::open(
+                                        c"/proc/self/status".as_ptr(),
+                                        libc::O_RDONLY | libc::O_CLOEXEC,
+                                    )
+                                };
+                                if status < 0 {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                                let status = unsafe { File::from_raw_fd(status) };
+                                let mut text = [0u8; 4096];
+                                let n = unsafe {
+                                    libc::read(
+                                        status.as_raw_fd(),
+                                        text.as_mut_ptr().cast(),
+                                        text.len(),
+                                    )
+                                };
+                                if n <= 0 {
+                                    return Err(raw_refusal());
+                                }
+                                let mut expected = RawPath::new();
+                                expected.push(b"Pid:\t")?;
+                                expected.number(receipt.visible_pid() as u32)?;
+                                expected.push(b"\n")?;
+                                if !text[..n as usize]
+                                    .windows(expected.len)
+                                    .any(|row| row == expected.as_bytes())
+                                {
+                                    return Err(raw_refusal());
+                                }
+                                for alias in [c"/proc/self/status", c"/proc/thread-self/status"] {
+                                    let fd = unsafe {
+                                        libc::open(alias.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+                                    };
+                                    if fd < 0 {
+                                        return Err(std::io::Error::last_os_error());
+                                    }
+                                    drop(unsafe { File::from_raw_fd(fd) });
+                                }
+                                let missing = unsafe {
+                                    libc::open(
+                                        c"/usr/bin/unlisted".as_ptr(),
+                                        libc::O_RDONLY | libc::O_CLOEXEC,
+                                    )
+                                };
+                                if missing >= 0 {
+                                    unsafe {
+                                        libc::close(missing);
+                                    }
+                                    return Err(raw_refusal());
+                                }
+                                if std::io::Error::last_os_error().raw_os_error()
+                                    != Some(libc::ENOENT)
+                                {
+                                    return Err(raw_refusal());
+                                }
+                                let mut packet = [0u8; 8];
+                                packet[..4].copy_from_slice(&receipt.visible_pid().to_ne_bytes());
+                                packet[4..].copy_from_slice(b"PASS");
+                                if unsafe {
+                                    libc::write(
+                                        write.as_raw_fd(),
+                                        packet.as_ptr().cast(),
+                                        packet.len(),
+                                    )
+                                } != packet.len() as isize
+                                {
+                                    return Err(raw_refusal());
+                                }
+                                Ok(())
+                            };
+                            let code = if check().is_ok() { 0 } else { 96 };
+                            unsafe {
+                                libc::_exit(code);
+                            }
+                        }
+                        drop(write);
+                        let mut status = 0;
+                        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid || status != 0 {
+                            bail!("actual guest root child {pid} failed: wait={status:#x}");
+                        }
+                        let mut packet = [0u8; 8];
+                        use std::io::Read;
+                        (&read).read_exact(&mut packet)?;
+                        Ok((setup_pid, pid, packet))
+                    };
+                    work().map_err(|error| format!("{error:#}"))
+                })
+                .unwrap();
+            let (setup_pid, pid, packet) = result.unwrap();
+            assert_eq!(setup_pid, 1);
+            assert!(pid > setup_pid);
+            assert_eq!(i32::from_ne_bytes(packet[..4].try_into().unwrap()), pid);
+            assert_eq!(&packet[4..], b"PASS");
+            inputs.recheck().unwrap();
+        }
+    }
 }
 
 /// A [`default_container`] hardened with the deterministic identity mounts
@@ -605,14 +3959,20 @@ pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Er
 /// Reverie uses the same idiom for exec'd untraced members in
 /// `safeptrace/src/notifier.rs`.
 ///
-/// One residual gap: if the parent somehow died between the fork and this call,
-/// no death signal will ever arrive. The usual `getppid()` guard for that race
-/// is unavailable here, because inside a new PID namespace the out-of-namespace
-/// parent is not mapped and `getppid()` reports 0 whether or not it is alive.
-/// Closing it completely would mean arming the signal inside
-/// `Container::run` before container setup, which is a Reverie-side change.
-/// The window is a few milliseconds of container setup, and the case this
-/// guards against is a supervisor deadline seconds or minutes later.
+/// If the parent died between the fork and this call, no death signal will
+/// ever arrive, so the callers check right after it whether the parent is
+/// already gone. A parent that crossed `--max-log-bytes` set the shared
+/// crossing bit before it exited 123 (`exit_if_log_cap_already_crossed`, which
+/// carries the ordering argument). A parent that died for any other reason in
+/// the window (killed from outside, OOM, a crash) is seen through the pidfd it
+/// opened for itself before it forked (`exit_if_parent_already_gone`). The
+/// usual `getppid()` guard is unavailable here, because inside a new PID
+/// namespace the out-of-namespace parent is not mapped and `getppid()` reports
+/// 0 whether or not it is alive. Under load that window, container setup
+/// between the clone and this call, was long enough for an outright SIGKILL of
+/// the hermit CLI to land in it: 2 of 180 runs of
+/// `container_init_dies_with_the_hermit_process_that_forked_it` on 4 loaded
+/// CPUs (2026-10-16), each leaving the init and its guest running.
 fn arm_parent_death_signal() -> Result<(), Error> {
     // SAFETY: `PR_SET_PDEATHSIG` only sets the calling thread's parent-death
     // signal attribute. It reads and writes no caller memory, and the remaining
@@ -915,9 +4275,89 @@ pub(super) fn stall_container_init_before_arming_if_asked() {
         libc::prctl(libc::PR_GET_NAME, name.as_mut_ptr());
         libc::prctl(libc::PR_SET_NAME, c"unarmed-init".as_ptr());
     }
-    std::thread::sleep(CONTAINER_INIT_ARMING_STALL);
+    // The stall ends early if the parent exits, so a test can place the
+    // parent's death in this window without waiting out the whole stall.
+    wait_for_parent_exit(CONTAINER_INIT_ARMING_STALL);
     // SAFETY: as above; `name` is still NUL-terminated.
     unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
+}
+
+/// A pidfd for this hermit process, opened in `main` before anything can fork,
+/// with the device and inode it had then. Every container init this process
+/// forks inherits the descriptor (it is closed only at exec), so the init can
+/// tell whether the process that forked it is still alive: a pidfd becomes
+/// readable once its process has exited. `None` when the kernel has no
+/// `pidfd_open` (before Linux 5.3); the death signal is then all there is.
+static PARENT_PIDFD: OnceLock<Option<(OwnedFd, u64, u64)>> = OnceLock::new();
+
+/// Open [`PARENT_PIDFD`]. Called from `main` before anything can fork.
+pub(super) fn open_parent_pidfd_for_container_inits() {
+    PARENT_PIDFD.get_or_init(|| {
+        // SAFETY: `pidfd_open` takes a pid and flags and touches no caller
+        // memory. The descriptor it returns is close-on-exec.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `fd` was just returned by `pidfd_open` and nothing else owns it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+        let (dev, ino) = fd_identity(fd.as_raw_fd())?;
+        Some((fd, dev, ino))
+    });
+}
+
+/// The device and inode of `fd`, by `fstat`, which is async-signal-safe.
+fn fd_identity(fd: libc::c_int) -> Option<(u64, u64)> {
+    // SAFETY: an all-zero `stat` is a valid value for `fstat` to overwrite.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `stat` is a valid, writable `struct stat`.
+    (unsafe { libc::fstat(fd, &mut stat) } == 0).then_some((stat.st_dev, stat.st_ino))
+}
+
+/// The inherited [`PARENT_PIDFD`], if this process still holds that very file.
+fn inherited_parent_pidfd() -> Option<libc::c_int> {
+    let (fd, dev, ino) = PARENT_PIDFD.get()?.as_ref()?;
+    let fd = fd.as_raw_fd();
+    (fd_identity(fd) == Some((*dev, *ino))).then_some(fd)
+}
+
+/// Wait up to `timeout` for the process that forked this one to exit, and say
+/// whether it has. Without an inherited pidfd it cannot tell: it waits the
+/// whole `timeout` and says no. Async-signal-safe: `fstat`, `poll` and
+/// `nanosleep` only.
+fn wait_for_parent_exit(timeout: std::time::Duration) -> bool {
+    let Some(fd) = inherited_parent_pidfd() else {
+        let pause = libc::timespec {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
+        };
+        // SAFETY: `pause` is a valid `timespec`; the remainder is not wanted.
+        unsafe { libc::nanosleep(&pause, std::ptr::null_mut()) };
+        return false;
+    };
+    let mut ready = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: one valid `pollfd`.
+    (unsafe { libc::poll(&mut ready, 1, millis) } == 1) && ready.revents & libc::POLLIN != 0
+}
+
+/// Exit now if the hermit process that forked this container init has already
+/// exited. Called right after `prctl(PR_SET_PDEATHSIG)`: a parent that died
+/// before that call will never deliver the signal, and nothing else would end
+/// this init or the guest it is about to start. The exit status is the
+/// `128 + SIGKILL` a shell reports for the death signal that never came; a
+/// namespace init cannot be killed by a signal it sends itself.
+///
+/// Async-signal-safe (`fstat`, `poll`, `_exit`), so it is sound in `pre_exec`.
+pub(super) fn exit_if_parent_already_gone() {
+    if wait_for_parent_exit(std::time::Duration::ZERO) {
+        // SAFETY: `_exit` has no preconditions and is async-signal-safe.
+        unsafe { libc::_exit(128 + libc::SIGKILL) }
+    }
 }
 
 /// See [`stall_container_init_before_arming_if_asked`].
@@ -929,6 +4369,25 @@ pub(super) const CONTAINER_INIT_ARMING_STALL_ENV: &str =
 /// the thread name the stall sets.
 pub(super) const CONTAINER_INIT_ARMING_STALL: std::time::Duration =
     std::time::Duration::from_secs(60);
+
+/// Set inside a container init by [`exit_init_after_publication`].
+static EXIT_AFTER_PUBLICATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called by work running in a container init that leaves a thread behind (a
+/// detached stdin reader that may stay blocked): the init exits as soon as its
+/// result is published instead of waiting for that thread, with the status
+/// the init returns anyway. Each init is its own process, so this never
+/// affects the caller.
+#[cfg(feature = "dbt")]
+pub(super) fn exit_init_after_publication() {
+    EXIT_AFTER_PUBLICATION.store(true, Ordering::Release);
+}
+
+/// Whether [`exit_init_after_publication`] was called in this process.
+pub(super) fn exits_init_after_publication() -> bool {
+    EXIT_AFTER_PUBLICATION.load(Ordering::Acquire)
+}
 
 /// Arm both container-init guards. Call this as the FIRST statement inside any
 /// `Container::run` closure that is not going through [`with_container`].
@@ -945,12 +4404,339 @@ pub(super) const CONTAINER_INIT_ARMING_STALL: std::time::Duration =
 /// deadline most needs to be able to end.
 ///
 /// The structurally better home for this is reverie's `Container::run`, before
-/// `setup()`, which would also close the fork-to-prctl window. That is a
-/// reverie-side change plus a pin bump; this closes the six sites now.
+/// `setup()`, which would also close the rest of the fork-to-prctl window (the
+/// part `--max-log-bytes` opens is closed here, by the check right after the
+/// `prctl`). That is a reverie-side change plus a pin bump; this closes the six
+/// sites now.
 pub(super) fn arm_container_init_guards() -> Result<(), SerializableError> {
     arm_parent_death_signal().map_err(SerializableError::from)?;
+    // A parent that died before the `prctl` above will never send its death
+    // signal; nothing would end this init, so end it here.
+    exit_if_parent_already_gone();
+    // Right after the death signal and before anything can start a guest: a
+    // parent that crossed --max-log-bytes and exited 123 before the `prctl`
+    // above will never send it, so stop here instead.
+    super::tracing::exit_if_log_cap_already_crossed();
     install_container_init_stop_handlers().map_err(SerializableError::from)?;
     Ok(())
+}
+
+/// The `run --namespace-only` counterpart of [`arm_container_init_guards`], run
+/// from Reverie's `pre_exec` in the forked child that then execs the guest as
+/// PID 1 of its namespace. Only the death signal is armed; see the launch
+/// site in `run.rs` for why the stop handlers are not.
+///
+/// It runs between fork and exec, so it must stay async-signal-safe: `prctl`,
+/// `poll` and `fstat` on the inherited pidfd, one atomic read-modify-write,
+/// `_exit` and the error value only.
+pub(super) fn arm_namespace_only_guest() -> Result<(), reverie::Errno> {
+    // SAFETY: as in `arm_parent_death_signal`: it reads and writes no caller
+    // memory.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
+        return Err(reverie::Errno::last());
+    }
+    exit_if_parent_already_gone();
+    // In this mode the parent is the only hermit process and holds the log
+    // subscriber, so it is the likeliest crosser: see
+    // `exit_if_log_cap_already_crossed`.
+    super::tracing::exit_if_log_cap_already_crossed();
+    Ok(())
+}
+
+/// The i386 syscall number of `kill`, reached by `int $0x80` from any process.
+const I386_KILL: i32 = 37;
+/// `AUDIT_ARCH_I386`, the architecture seccomp reports for an i386 syscall.
+const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+
+/// The seccomp filter for a `--namespace-only` guest: every `kill` stops for
+/// [`police_group_kills`], and so does every i386 syscall (the filter cannot
+/// single out the i386 `kill`; without a rule the filter would kill a process
+/// that makes one); every other syscall runs untouched. On a kernel with the
+/// x32 ABI enabled, an x32 `kill` is not seen.
+pub(super) fn group_kill_filter() -> reverie::process::seccomp::Filter {
+    use reverie::process::seccomp::Action;
+    use reverie::process::seccomp::TargetArch;
+    reverie::process::seccomp::FilterBuilder::new()
+        .default_action(Action::Allow)
+        .syscall(reverie::syscalls::Sysno::kill, Action::Notify)
+        .alternate_arch(TargetArch::x86, Action::Notify)
+        .build()
+}
+
+/// Whether a seccomp notification is a `kill`: the x86_64 one, or the i386 one.
+fn is_kill(nr: i32, arch: u32) -> bool {
+    if arch == AUDIT_ARCH_I386 {
+        nr == I386_KILL
+    } else {
+        nr == libc::SYS_kill as i32
+    }
+}
+
+/// Whether to refuse a guest's `kill` with these arguments: a signal to the
+/// caller's own process group (`pid` 0, `sig` a valid signal number; the
+/// kernel answers an invalid one with EINVAL) while that group is
+/// Hermit's (`caller_group`, read from `/proc`; `None` when it could not be).
+///
+/// Under `--namespace-only` the guest shares Hermit's process group, and
+/// nothing else intercepts it, so such a `kill(0, sig)` would reach Hermit, the
+/// rest of Hermit's pipeline and, run without job control, the shell, make or
+/// test runner that started it (https://github.com/rrnewton/hermit/issues/4065).
+/// No other form can reach outside: inside its PID namespace the guest cannot
+/// name Hermit's group (`getpgrp` reads 0 there), so `kill(-pgid)` and
+/// `kill(-1)` stay in the namespace. A guest process that leads a group of its
+/// own keeps its `kill(0)`.
+pub(super) fn refuses_group_kill(
+    args: [u64; 6],
+    caller_group: Option<i32>,
+    hermit_group: i32,
+) -> bool {
+    args[0] as i32 == 0
+        && (1..=libc::SIGRTMAX()).contains(&(args[1] as i32))
+        && caller_group.is_none_or(|group| group == hermit_group)
+}
+
+/// The process group of host `pid`, from `/proc/<pid>/stat`, or `None`.
+fn process_group(pid: u32) -> Option<i32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name may hold spaces and parentheses: fields resume after
+    // the last ')', as state, ppid, pgrp.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
+}
+
+/// Install [`group_kill_filter`] in the forked `--namespace-only` guest and
+/// send its listener to Hermit over `socket` ([`receive_group_kill_listener`]).
+///
+/// Run from Reverie's `pre_exec`, after its mounts and `chdir`. Hermit
+/// installs the filter here, not through Reverie's own seccomp support, whose
+/// parent waits without end for a listener that a child failing earlier in its
+/// setup (a missing `--workdir`) never publishes. A child that fails before
+/// this point closes its end of `socket` as it exits, and Reverie reports its
+/// error. The guest's copy of the listener is closed before it returns, so the
+/// guest cannot answer its own notifications.
+///
+/// It sets no `no_new_privs`, which the guest would see: the guest is root of
+/// its own user namespace (`map_root`), and that capability is what installing
+/// a filter without `no_new_privs` requires. The filter is still visible to
+/// the guest (`Seccomp: 2` in `/proc/self/status`), a seccomp listener of its
+/// own fails with EBUSY, and a Hermit run inside it refuses the inherited
+/// filter; the `--namespace-only` help and the user guide say so.
+///
+/// It runs between fork and exec, so it must stay async-signal-safe:
+/// `seccomp`, `sendmsg` and `close`. The filter stops only `kill`, so these
+/// calls run untouched after it is installed.
+pub(super) fn install_group_kill_filter(
+    filter: &reverie::process::seccomp::Filter,
+    socket: i32,
+) -> Result<(), reverie::Errno> {
+    let listener = match filter.load_and_listen() {
+        Ok(listener) => listener,
+        Err(errno) => {
+            // Tell Hermit which step failed (`group_kill_filter_failure`):
+            // Reverie reports only that a `pre_exec` callback failed.
+            let raw = errno.into_raw().to_le_bytes();
+            let record = [GROUP_KILL_FILTER_FAILED, raw[0], raw[1], raw[2], raw[3]];
+            // SAFETY: `send` reads the five bytes of a local.
+            unsafe { libc::send(socket, record.as_ptr().cast(), record.len(), 0) };
+            return Err(errno);
+        }
+    };
+    let fd = listener.as_raw_fd();
+    let mut byte = 0u8;
+    let mut iov = libc::iovec {
+        iov_base: (&mut byte as *mut u8).cast(),
+        iov_len: 1,
+    };
+    let mut control = [0u64; 4];
+    // SAFETY: an all-zero msghdr is a valid empty message.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    // SAFETY: CMSG_SPACE only computes a size.
+    message.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
+    // SAFETY: the control buffer holds one header and one descriptor
+    // (CMSG_SPACE(4) is 24 of its 32 bytes), and the message points only at
+    // locals that outlive the call.
+    let sent = unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+        std::ptr::write(libc::CMSG_DATA(header).cast::<i32>(), fd);
+        libc::sendmsg(socket, &message, 0)
+    };
+    if sent != 1 {
+        return Err(reverie::Errno::last());
+    }
+    drop(listener);
+    Ok(())
+}
+
+/// The first byte of the record [`install_group_kill_filter`] sends when the
+/// filter cannot be installed, followed by the errno, little-endian.
+const GROUP_KILL_FILTER_FAILED: u8 = b'F';
+
+/// The errno with which the guest failed to install [`group_kill_filter`],
+/// when that is why its launch failed: read from the record
+/// [`install_group_kill_filter`] sent over `socket`. `None` when the launch
+/// failed for another reason, before the filter was attempted.
+pub(super) fn group_kill_filter_failure(socket: &OwnedFd) -> Option<i32> {
+    let mut record = [0u8; 8];
+    // SAFETY: `recv` writes at most the buffer's length into a local.
+    let received = unsafe {
+        libc::recv(
+            socket.as_raw_fd(),
+            record.as_mut_ptr().cast(),
+            record.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    (received == 5 && record[0] == GROUP_KILL_FILTER_FAILED)
+        .then(|| i32::from_le_bytes([record[1], record[2], record[3], record[4]]))
+}
+
+/// The listener [`install_group_kill_filter`] sent over `socket`, once the
+/// guest has started: the message is already queued, so this does not wait.
+pub(super) fn receive_group_kill_listener(socket: &OwnedFd) -> std::io::Result<OwnedFd> {
+    let mut byte = 0u8;
+    let mut iov = libc::iovec {
+        iov_base: (&mut byte as *mut u8).cast(),
+        iov_len: 1,
+    };
+    let mut control = [0u64; 4];
+    // SAFETY: as in `install_group_kill_filter`.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = std::mem::size_of_val(&control);
+    // SAFETY: the message points only at locals that outlive the call.
+    let received = unsafe {
+        libc::recvmsg(
+            socket.as_raw_fd(),
+            &mut message,
+            libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    if received != 1 {
+        return Err(if received < 0 {
+            std::io::Error::last_os_error()
+        } else {
+            std::io::Error::other("the guest sent no seccomp listener")
+        });
+    }
+    // SAFETY: the kernel filled the control buffer; a header with SCM_RIGHTS
+    // carries one descriptor, now owned here.
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        if header.is_null()
+            || (*header).cmsg_level != libc::SOL_SOCKET
+            || (*header).cmsg_type != libc::SCM_RIGHTS
+        {
+            return Err(std::io::Error::other(
+                "the guest's message carried no seccomp listener",
+            ));
+        }
+        Ok(OwnedFd::from_raw_fd(std::ptr::read(
+            libc::CMSG_DATA(header).cast::<i32>(),
+        )))
+    }
+}
+
+/// Answer the `--namespace-only` guest's `kill` calls on `listener` until no
+/// task the filter covers is left ([`group_kill_filter`]) or `stop` becomes
+/// readable: refuse with EPERM the ones [`refuses_group_kill`] names, saying
+/// so on Hermit's stderr, and let every other one run as issued.
+pub(super) fn police_group_kills(listener: OwnedFd, stop: OwnedFd) {
+    use reverie::process::seccomp::SECCOMP_IOCTL_NOTIF_ID_VALID;
+    use reverie::process::seccomp::SECCOMP_IOCTL_NOTIF_RECV;
+    use reverie::process::seccomp::SECCOMP_IOCTL_NOTIF_SEND;
+    use reverie::process::seccomp::SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+    use reverie::process::seccomp::seccomp_notif;
+    use reverie::process::seccomp::seccomp_notif_resp;
+    // SAFETY: getpgrp reads no memory.
+    let hermit_group = unsafe { libc::getpgrp() };
+    let fd = listener.as_raw_fd();
+    loop {
+        let mut ready = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two pollfds that live across the call.
+        if unsafe { libc::poll(ready.as_mut_ptr(), 2, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            // Every later guest `kill` then fails with ENOSYS.
+            tracing::warn!(
+                "hermit stopped answering the --namespace-only guest's kill calls: polling \
+                 their seccomp listener failed ({error}); each one now fails with ENOSYS \
+                 (https://github.com/rrnewton/hermit/issues/4065)"
+            );
+            return;
+        }
+        if ready[1].revents != 0 || ready[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            return;
+        }
+        if ready[0].revents & libc::POLLIN == 0 {
+            continue;
+        }
+        // SAFETY: the kernel requires a zeroed notification, which it fills.
+        let mut notification: seccomp_notif = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        if unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as _, &mut notification) } < 0 {
+            // ENOENT: the caller died after the listener became readable.
+            continue;
+        }
+        let args = notification.data.args;
+        let refuse = is_kill(notification.data.nr, notification.data.arch)
+            && refuses_group_kill(args, process_group(notification.pid), hermit_group);
+        // The caller may have died while its group was read.
+        // SAFETY: the ioctl reads the id it is given.
+        if unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID as _, &notification.id) } < 0 {
+            continue;
+        }
+        let response = if refuse {
+            tracing::warn!(
+                "hermit refused the guest's kill(0, {}) from pid {} under --namespace-only \
+                 with EPERM: its process group is Hermit's, so the signal would reach Hermit and \
+                 the processes that started it, where Linux would deliver it \
+                 (https://github.com/rrnewton/hermit/issues/4065)",
+                args[1] as i32,
+                notification.pid,
+            );
+            seccomp_notif_resp {
+                id: notification.id,
+                val: 0,
+                error: -libc::EPERM,
+                flags: 0,
+            }
+        } else {
+            seccomp_notif_resp {
+                id: notification.id,
+                val: 0,
+                error: 0,
+                flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+            }
+        };
+        // SAFETY: the ioctl reads the response it is given.
+        unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND as _, &response) };
+    }
 }
 
 /// Where the most recent panic inside the container child happened.
@@ -1051,6 +4837,11 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 ///
 /// Unset `..._SITE` keeps the previous behaviour exactly: fault at whichever site
 /// is reached first. Existing callers and tests are unaffected.
+///
+/// `block` is not a fault of its own: the child announces the site on stderr
+/// and waits there until something outside kills it. That gives a test a
+/// fixed point at which to kill a container child from outside, instead of
+/// racing a stage that may already have finished.
 fn inject_test_fault(site: &str) {
     if std::env::var("HERMIT_TEST_CONTAINER_CHILD_FAULT_SITE").is_ok_and(|want| want != site) {
         return;
@@ -1065,6 +4856,12 @@ fn inject_test_fault(site: &str) {
         Some("segv") => {
             // A genuine memory fault, NOT a panic. catch_unwind must not touch this.
             unsafe { std::ptr::null_mut::<u8>().write_volatile(1) };
+        }
+        Some("block") => {
+            eprintln!("hermit: test fault: container child blocked at site {site}");
+            loop {
+                std::thread::park();
+            }
         }
         _ => {}
     }
@@ -1209,6 +5006,29 @@ impl std::fmt::Display for RunTimeoutMarker {
 
 impl std::error::Error for RunTimeoutMarker {}
 
+/// The container child exited [`hermit::HERMIT_LOG_CAP_EXIT`]: hermit's own
+/// log output crossed `--max-log-bytes` and the writer that crossed it ended
+/// the run. Before exiting, the child attempts one message with the bound and
+/// byte count, and only if the writes admitted before the crossing finish
+/// within the drain bound; it writes without waiting for its sink, so even an
+/// attempted message is best effort and can be missing (see `CappedWriter` in
+/// `tracing.rs`). This carries no number for the same reason
+/// [`RunTimeoutMarker`] does not.
+#[derive(Debug)]
+pub struct LogCapExceeded;
+
+impl std::fmt::Display for LogCapExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hermit's log output exceeded --max-log-bytes and the run was aborted; \
+             lower the log verbosity or raise --max-log-bytes"
+        )
+    }
+}
+
+impl std::error::Error for LogCapExceeded {}
+
 /// Carries the signal, unlike [`PolicyRefusal`], because there is more than one
 /// and the number is the whole content of the report.
 #[derive(Debug)]
@@ -1255,21 +5075,6 @@ impl std::fmt::Display for ContainerChildPanic {
 
 impl std::error::Error for ContainerChildPanic {}
 
-/// Helper to run a function inside a container, taking care to display any
-/// errors and propagate the exit status.
-#[cfg(test)]
-pub fn with_container<F, T>(container: &mut Container, mut f: F) -> Result<T, Error>
-where
-    F: FnMut() -> Result<T, Error>,
-    T: serde::Serialize + serde::de::DeserializeOwned,
-{
-    classify_container_result(container.run(|| {
-        // Runs in the freshly forked container init, not in the caller.
-        arm_container_init_guards()?;
-        catch_child_panic(&mut f)
-    }))
-}
-
 /// Preserve the primary class from a settled container result. The owned CLI
 /// adapter also calls this for its strict error-only failed-child channel.
 pub fn classify_container_result<T>(
@@ -1312,6 +5117,11 @@ pub fn classify_container_result<T>(
                 // operator sees the bound; only the machine-readable class is
                 // reconstructed here.
                 FailureKind::RunTimeout => error.context(RunTimeoutMarker),
+                // The marker goes UNDER the child's message, as it was in the
+                // child: the first `Error:` line keeps naming the failure.
+                FailureKind::BackendRunFailure => {
+                    Error::new(hermit::BackendRunFailure).context(format!("{error:#}"))
+                }
                 FailureKind::Error => error,
             })
         }
@@ -1335,6 +5145,14 @@ pub fn classify_container_result<T>(
         // `run --timeout` fallback exited the init 124 and the run reported 125.
         Err(RunError::ExitStatus(status)) if status.code() == Some(HERMIT_DEADLINE_EXIT) => {
             Err(Error::new(RunTimeoutMarker))
+        }
+        // The --max-log-bytes cap, chosen by `CappedWriter` in the init. Same
+        // reason as the deadline arm: without it a working bound reports 125.
+        // From here this process must exit 123 within a fixed bound even if a
+        // later diagnostic blocks on a stderr nobody reads.
+        Err(RunError::ExitStatus(status)) if status.code() == Some(HERMIT_LOG_CAP_EXIT) => {
+            super::tracing::bound_log_cap_exit();
+            Err(Error::new(LogCapExceeded))
         }
         // A signal death, before the catch-all for the same reason the refusal arm
         // is: falling through would report a signal-terminated run as an
@@ -1367,6 +5185,78 @@ mod readonly_proc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rewrite for a mount the snapshot lacks (a user bind's recursive copy
+    /// whose host directory was removed, detaching it) is dropped; every
+    /// other rewrite stays, in order (minibeads dh-dt0n).
+    #[test]
+    fn rewrites_of_snapshot_drop_a_mount_that_left_the_namespace() {
+        let rewrite = |raw_mount_id| MountInfoRootRewrite {
+            raw_mount_id,
+            deterministic_root: b"/".to_vec(),
+            raw_root_prefix: None,
+            deterministic_root_prefix: None,
+            raw_mountpoint_prefix: None,
+            deterministic_mountpoint_prefix: None,
+        };
+        let kept = rewrites_of_snapshot(vec![rewrite(30), rewrite(40), rewrite(10)], &[10, 30, 1]);
+        assert_eq!(
+            kept.iter()
+                .map(|rewrite| rewrite.raw_mount_id)
+                .collect::<Vec<_>>(),
+            [30, 10]
+        );
+    }
+
+    /// Each installation's mountpoint is the one its target resolved to when
+    /// the setup installed it, over the plan's earlier mounts: a bind at
+    /// opt/x crosses the symbolic link x -> foo in the first bind at opt, so
+    /// it is recorded at foo, and the later bind that replaces opt (whose x
+    /// links to bar) changes nothing recorded (the provenance finding of
+    /// round 2 of https://github.com/rrnewton/hermit/issues/4213, K3a). Only
+    /// a recursive bind records its source, and a remount records nothing.
+    #[test]
+    fn installations_record_their_install_time_mountpoints() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(scratch.path()).unwrap();
+        for dir in ["a", "c", "item", "foo", "bar", "opt"] {
+            fs::create_dir(root.join(dir)).unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("foo"), root.join("a/x")).unwrap();
+        std::os::unix::fs::symlink(root.join("bar"), root.join("c/x")).unwrap();
+        let plan = [
+            PlannedMount::hermit(container_proc_mount()),
+            PlannedMount::hermit(Mount::bind(root.join("a"), root.join("opt")).recursive()),
+            PlannedMount::hermit(Mount::bind(root.join("item"), root.join("opt/x"))),
+            PlannedMount::hermit(Mount::bind(root.join("c"), root.join("opt"))),
+            PlannedMount::backend(
+                Mount::new(root.join("opt"))
+                    .flags(MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY),
+            ),
+        ];
+        let installations = installations_of(&plan);
+        let escaped = |path: &Path| vec![mountinfo_escape_path(path)];
+        assert_eq!(installations[0].mountpoints, escaped(Path::new("/proc")));
+        assert_eq!(installations[1].mountpoints, escaped(&root.join("opt")));
+        assert_eq!(installations[1].sources, escaped(&root.join("a")));
+        assert_eq!(installations[2].mountpoints, escaped(&root.join("foo")));
+        assert!(
+            installations[2].sources.is_empty(),
+            "a plain bind copies nothing"
+        );
+        assert_eq!(installations[3].mountpoints, escaped(&root.join("opt")));
+        assert!(
+            installations[4].mountpoints.is_empty(),
+            "a remount makes no row"
+        );
+        assert!(installations[4].backend);
+        // After the replacement, the same target would resolve to bar.
+        let mut tree = InstallTimeTree::default();
+        for planned in &plan[..4] {
+            tree.install(&planned.mount);
+        }
+        assert_eq!(tree.resolve(&root.join("opt/x")), root.join("bar"));
+    }
 
     /// How long a signalled test child may take to exit before it counts as
     /// having ignored the signal. A child that honours it exits within
@@ -1806,6 +5696,58 @@ mod tests {
         assert!(classified.downcast_ref::<PolicyRefusal>().is_none());
     }
 
+    #[tokio::test]
+    async fn typed_terminal_refusal_and_io_keep_distinct_container_classes() {
+        use detcore::preemptions::PreemptionRecord;
+        use detcore::preemptions::boundary_recording::BoundaryRecording;
+        use detcore::preemptions::boundary_recording::Recording;
+        use detcore_model::pid::DetTid;
+        use detcore_model::schedule::SchedEvent;
+        use detcore_model::schedule::boundary::Record;
+        use detcore_model::schedule::boundary::Schedule;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("terminal.json");
+        let recording = Recording::Boundaries(
+            BoundaryRecording::new(
+                PreemptionRecord::default(),
+                Schedule::new(vec![Record::Event(SchedEvent::branches(
+                    DetTid::from_raw(1),
+                    1,
+                ))])
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        std::fs::write(&path, recording.encode().unwrap()).unwrap();
+        let error = detcore::GlobalState::init_for_external_scheduler(&detcore::Config {
+            sequentialize_threads: true,
+            strict_schedule_boundaries: true,
+            replay_schedule_from: Some(path),
+            record_preemptions: false,
+            ..detcore::Config::default()
+        })
+        .clean_up(false, &None)
+        .await
+        .unwrap_err();
+        assert!(error.is::<detcore::TerminalReplayRefusal>());
+        let serialized = SerializableError::from(Error::new(reverie::Error::Tool(error)));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        let classified = classify_container_result::<()>(Ok(Err(serialized))).unwrap_err();
+        assert!(classified.is::<PolicyRefusal>());
+        assert!(!classified.is::<ContainerChildPanic>());
+        assert!(format!("{classified:#}").contains("Incomplete"));
+        for error in [
+            Error::new(std::io::Error::other("summary output failed")),
+            Error::msg("terminal replay refusal: slice-boundary protocol refusal"),
+        ] {
+            let serialized = SerializableError::from(error);
+            assert_eq!(serialized.kind(), FailureKind::Error);
+            let classified = classify_container_result::<()>(Ok(Err(serialized))).unwrap_err();
+            assert!(!classified.is::<PolicyRefusal>());
+            assert!(!classified.is::<ContainerChildPanic>());
+        }
+    }
+
     #[test]
     fn skid_overshoot_count_survives_the_container_boundary() {
         let reported = SerializableError::from(Error::new(SkidOvershootError::new(3)));
@@ -1942,11 +5884,13 @@ mod tests {
             .expect("identity hardening must produce a frozen group file");
         let contents = fs::read_to_string(group_file.path())
             .expect("frozen group database should be readable");
+        let overflow_gid = overflow_gid();
+        assert_eq!(overflow_gid, "65534");
         assert!(
             contents
                 .lines()
-                .any(|line| line.split(':').nth(2) == Some(OVERFLOW_GID)),
-            "frozen group database must resolve overflow gid {OVERFLOW_GID}:\n{contents}"
+                .any(|line| line.split(':').nth(2) == Some(overflow_gid.as_str())),
+            "frozen group database must resolve overflow gid {overflow_gid}:\n{contents}"
         );
     }
 
@@ -1961,6 +5905,9 @@ mod tests {
             _nscd_dir: None,
             mountinfo_roots: vec![matching],
             user_mount_targets: Vec::new(),
+            user_binds: Vec::new(),
+            host_rows: Vec::new(),
+            plan: MountPlan::Unrecorded,
         };
 
         let rewrites = guard.mountinfo_root_rewrites().unwrap();
@@ -2032,6 +5979,9 @@ mod tests {
             _nscd_dir: None,
             mountinfo_roots: vec![same_target_wrong_source],
             user_mount_targets: Vec::new(),
+            user_binds: Vec::new(),
+            host_rows: Vec::new(),
+            plan: MountPlan::Unrecorded,
         };
 
         let error = guard.mountinfo_root_rewrites().unwrap_err().to_string();
@@ -2121,5 +6071,199 @@ mod tests {
             assert!(allowed.contains(&selected), "selected CPU {selected}");
         }
         assert_eq!(choose_affinity_core(&[]), None);
+    }
+
+    /// How the candidate init in [`arm_after_the_parent_crossed`] ended: its
+    /// raw wait status, and whether it wrote the byte a guest start would
+    /// follow.
+    type ArmOutcome = (i32, bool);
+
+    /// The fork-to-`prctl` window, made deterministic. H (this isolated
+    /// process) is a child subreaper and forks P, which holds the invocation's
+    /// capped budget; P forks C, the candidate init, then crosses the cap
+    /// through the production `CappedWriter` path, which exits 123. C waits
+    /// until its parent is no longer P -- that is, until P has run `exit_notify`
+    /// and C was re-parented to H -- so `arm` deterministically runs after the
+    /// parent that crossed is gone. (EOF on a pipe would not do: P's descriptors
+    /// close before `exit_notify`, so C could arm in time and be killed by the
+    /// death signal with or without the guard, and the test would pass either
+    /// way.) If `arm` returns, C writes the marker byte and exits 0.
+    fn arm_after_the_parent_crossed(arm: fn() -> bool) -> ArmOutcome {
+        use std::io::Read as _;
+
+        in_isolated_process(move || {
+            let budget = crate::tracing::LogBudget::new(100).map_err(|e| e.to_string())?;
+            // Only in this isolated process; the harness registers nothing.
+            crate::tracing::register_invocation_log_budget(Some(budget.clone()));
+            // SAFETY: `prctl` touches no caller memory; this process is a fresh
+            // fork, so the attribute reaches no other test.
+            if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } == -1 {
+                return Err(format!("subreaper: {}", io::Error::last_os_error()));
+            }
+            let mut fds = [0; 2];
+            // SAFETY: `fds` is a correctly sized out-parameter.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+                return Err(format!("pipe: {}", io::Error::last_os_error()));
+            }
+            let (read_fd, marker_fd) = (fds[0], fds[1]);
+            // SAFETY: this process has one thread. P and C call only the code
+            // under test, write(2), usleep and _exit, and never return.
+            let p = unsafe { libc::fork() };
+            if p == -1 {
+                return Err(format!("fork P: {}", io::Error::last_os_error()));
+            }
+            if p == 0 {
+                unsafe {
+                    libc::close(read_fd);
+                    let parent = libc::getpid();
+                    let c = libc::fork();
+                    if c == -1 {
+                        libc::_exit(70);
+                    }
+                    if c == 0 {
+                        // At most 10 s, so a regression cannot hang the suite.
+                        let mut waits = 0;
+                        while libc::getppid() == parent {
+                            waits += 1;
+                            if waits > 10_000 {
+                                libc::_exit(71);
+                            }
+                            libc::usleep(1000);
+                        }
+                        if !arm() {
+                            libc::_exit(72);
+                        }
+                        libc::write(marker_fd, b"G".as_ptr().cast(), 1);
+                        libc::_exit(0);
+                    }
+                    libc::close(marker_fd);
+                    let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                    let mut writer = crate::tracing::CappedWriter::file(
+                        std::fs::File::from_raw_fd(null),
+                        0,
+                        Some(budget.clone()),
+                    );
+                    let _ = writer.write_all(&[b'a'; 60]);
+                    let _ = writer.write_all(&[b'b'; 60]);
+                    // Not reached: the second write crosses and exits 123.
+                    libc::_exit(73);
+                }
+            }
+            // SAFETY: `marker_fd` came from the pipe above and is not used
+            // again in this process.
+            unsafe { libc::close(marker_fd) };
+            let mut status = 0;
+            // SAFETY: P is our own child, and `status` outlives the call.
+            if unsafe { libc::waitpid(p, &mut status, 0) } != p {
+                return Err(format!("waitpid P: {}", io::Error::last_os_error()));
+            }
+            if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != hermit::HERMIT_LOG_CAP_EXIT
+            {
+                return Err(format!(
+                    "P did not cross the cap and exit 123: status {status:#x}"
+                ));
+            }
+            // C was re-parented to this subreaper when P ran `exit_notify`,
+            // which happened before P could be reaped.
+            let mut c_status = 0;
+            // SAFETY: as above; C is now our only child.
+            if unsafe { libc::waitpid(-1, &mut c_status, 0) } <= 0 {
+                return Err(format!("waitpid C: {}", io::Error::last_os_error()));
+            }
+            let mut marker = Vec::new();
+            // SAFETY: `read_fd` came from the pipe above; every write end is
+            // closed now that P and C have exited.
+            unsafe { std::fs::File::from_raw_fd(read_fd) }
+                .read_to_end(&mut marker)
+                .map_err(|e| e.to_string())?;
+            Ok((c_status, !marker.is_empty()))
+        })
+    }
+
+    fn assert_stopped_by_the_crossing(name: &str, (status, marker): ArmOutcome) {
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == hermit::HERMIT_LOG_CAP_EXIT,
+            "{name}: armed after its parent crossed --max-log-bytes and exited 123, so its death \
+             signal can never arrive; it must exit 123 itself, but its wait status was \
+             {status:#x} (exit code {}){}",
+            libc::WEXITSTATUS(status),
+            if marker {
+                ", and it went on to the guest start"
+            } else {
+                ""
+            },
+        );
+        assert!(
+            !marker,
+            "{name}: it exited 123 but wrote the guest-start marker first"
+        );
+    }
+
+    /// A container init whose parent crossed the cap before the init armed its
+    /// death signal must not go on to start a guest.
+    #[test]
+    fn log_cap_crossed_before_the_container_init_arms_stops_the_init() {
+        let outcome = arm_after_the_parent_crossed(|| arm_container_init_guards().is_ok());
+        assert_stopped_by_the_crossing("arm_container_init_guards", outcome);
+    }
+
+    /// The same window on the `run --namespace-only` launch path, whose child
+    /// arms in `pre_exec` and then execs the guest itself.
+    #[test]
+    fn log_cap_crossed_before_the_namespace_only_guest_arms_stops_the_exec() {
+        let outcome = arm_after_the_parent_crossed(|| arm_namespace_only_guest().is_ok());
+        assert_stopped_by_the_crossing("arm_namespace_only_guest", outcome);
+    }
+
+    /// Hermit refuses a `--namespace-only` guest's `kill(0, sig)` only while
+    /// the caller is in Hermit's process group, or its group is unknown; a
+    /// signal 0, any other pid, and a caller that leads its own group pass
+    /// (https://github.com/rrnewton/hermit/issues/4065). The i386 `kill`
+    /// counts too.
+    #[test]
+    fn only_a_group_kill_from_hermits_group_is_refused() {
+        let args = |pid: i64, sig: i64| [pid as u64, sig as u64, 0, 0, 0, 0];
+        let hermit = 40;
+        assert!(refuses_group_kill(
+            args(0, libc::SIGUSR1 as i64),
+            Some(hermit),
+            hermit
+        ));
+        assert!(refuses_group_kill(
+            args(0, libc::SIGKILL as i64),
+            None,
+            hermit
+        ));
+        assert!(!refuses_group_kill(args(0, 0), Some(hermit), hermit));
+        // An invalid signal number is the kernel's EINVAL, not a refusal.
+        assert!(!refuses_group_kill(args(0, 100), Some(hermit), hermit));
+        // Real-time signals are refused too: SIGRTMIN and SIGRTMAX.
+        assert!(refuses_group_kill(args(0, 34), Some(hermit), hermit));
+        assert!(refuses_group_kill(args(0, 64), Some(hermit), hermit));
+        assert!(!refuses_group_kill(
+            args(0, libc::SIGUSR1 as i64),
+            Some(7),
+            hermit
+        ));
+        assert!(!refuses_group_kill(
+            args(-1, libc::SIGUSR1 as i64),
+            Some(hermit),
+            hermit
+        ));
+        assert!(!refuses_group_kill(
+            args(5, libc::SIGTERM as i64),
+            Some(hermit),
+            hermit
+        ));
+        // The register holds the pid in its low 32 bits.
+        assert!(refuses_group_kill(
+            args(1 << 32, libc::SIGUSR1 as i64),
+            Some(hermit),
+            hermit
+        ));
+        assert!(is_kill(libc::SYS_kill as i32, 0xc000_003e));
+        assert!(is_kill(I386_KILL, AUDIT_ARCH_I386));
+        assert!(!is_kill(I386_KILL, 0xc000_003e));
+        assert!(!is_kill(libc::SYS_getpid as i32, 0xc000_003e));
     }
 }

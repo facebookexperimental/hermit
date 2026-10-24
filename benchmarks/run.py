@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Measure native versus Hermit wall-clock time for representative workloads."""
 
 from __future__ import annotations
@@ -129,7 +123,7 @@ def run_setup(command: Sequence[str]) -> None:
 
 def build_hermit(hermit: Path, skip_build: bool) -> None:
     if not skip_build:
-        run_setup(["cargo", "build", "--release", "-p", "hermit", "--bin", "hermit"])
+        run_setup(["cargo", "build", "--release", "-p", "hermit-run", "--bin", "hermit"])
     if not hermit.is_file() or not os.access(hermit, os.X_OK):
         raise BenchmarkError(
             f"Hermit executable is missing or not executable: {hermit}"

@@ -1,12 +1,4 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
-/*
  * Inherited stdout is a container output stream, even when the outer Hermit
  * process is redirected to a regular log file.  Its physical file offset also
  * includes Hermit's diagnostic writes and must not be guest-visible.  A file

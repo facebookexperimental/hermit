@@ -1135,8 +1135,12 @@ if [ "$binding_inputs_ok" -eq 1 ]; then
     done <<< "$malformed_seen"
 fi
 
-# (c) Required PR-body sections.
-for section in "Summary" "Determinism" "Linux Semantics" "Validation" "Human Review Required"; do
+# (c) Required PR-body sections. AGENTS.md requires the first section of every
+# PR description to be "Plain Language Summary and Project Impact"; a section
+# titled "Summary" is still accepted, as before that rule.
+has_section "Plain Language Summary and Project Impact" || has_section "Summary" \
+    || fail "PR body is missing the required \"Plain Language Summary and Project Impact\" (or \"Summary\") section."
+for section in "Determinism" "Linux Semantics" "Validation" "Human Review Required"; do
     has_section "$section" \
         || fail "PR body is missing the required \"${section}\" section."
 done

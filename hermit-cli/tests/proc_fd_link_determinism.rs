@@ -6,15 +6,20 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-#[path = "common/liteinst.rs"]
-mod liteinst_runtime;
-
 const STDOUT_LINK: &str = "/proc/self/fd/1";
+
+/// The line Hermit prints when it runs the guest under in-guest LiteInst.
+#[cfg(feature = "liteinst")]
+const IN_GUEST_SELECTED: &str =
+    "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool";
 
 struct ProgramCase {
     name: &'static str,
@@ -34,7 +39,7 @@ fn hermit_output(case: &ProgramCase, verify: bool) -> std::process::Output {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log", "DEBUG", "--backend=ptrace", "run", "--strict"]);
     if verify {
         command.arg("--verify");
@@ -43,11 +48,10 @@ fn hermit_output(case: &ProgramCase, verify: bool) -> std::process::Output {
         .arg("--")
         .arg(required_program(case))
         .args(case.args);
+    hermit_test::configure_guest_execution(&mut command);
 
     let rendered = format!("{command:?}");
-    command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"))
+    hermit_test::hermit_output(&rendered, &mut command)
 }
 
 fn assert_l2(case: &ProgramCase) {
@@ -113,11 +117,11 @@ fn proc_fd_link_consumers_verify() {
 
 #[test]
 fn proc_fd_link_aliases_and_truncation_verify() {
-    liteinst_runtime::ensure_liteinst_runtime();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("proc-fd-link-aliases");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("proc-fd-link-aliases-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create proc-fd link build directory");
     let guest = build_root.join("proc-fd-link-aliases");
     let compile = Command::new("cc")
@@ -138,25 +142,30 @@ fn proc_fd_link_aliases_and_truncation_verify() {
         candidates: &[],
         args: &[],
     };
+    // The guest reads the links of a file it creates, not of its stdout pipe:
+    // c7531a837a65 ("Stabilize proc-fd alias parity fixture", 2026-08-01)
+    // changed it so that harness capture names could not become guest output,
+    // and left this expectation naming the old pipe target.
     let expected = concat!(
-        "canonical=pipe:[1001]\n",
-        "truncated=pipe:[1001\n",
-        "numeric=pipe:[1001]\n",
-        "dev-fd=pipe:[1001]\n",
-        "lexical=pipe:[1001]\n",
-        "readlinkat=pipe:[1001]\n",
+        "canonical=/tmp/hermit-proc-fd-link-aliases\n",
+        "truncated=/tmp/hermi\n",
+        "numeric=/tmp/hermit-proc-fd-link-aliases\n",
+        "dev-fd=/tmp/hermit-proc-fd-link-aliases\n",
+        "lexical=/tmp/hermit-proc-fd-link-aliases\n",
+        "readlinkat=/tmp/hermit-proc-fd-link-aliases\n",
     );
-    for backend in ["ptrace", "dbt", "liteinst"] {
-        let output = Command::new("timeout")
+    for backend in ["ptrace", "dbt"] {
+        let mut command = Command::new("timeout");
+        command
             .args(["--kill-after", "10s", "90s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args(["--log", "DEBUG"])
             .arg(format!("--backend={backend}"))
             .arg("run")
             .args(["--strict", "--verify", "--"])
-            .arg(&guest)
-            .output()
-            .expect("failed to start Hermit");
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut command);
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -170,5 +179,39 @@ fn proc_fd_link_aliases_and_truncation_verify() {
             case.name
         );
         assert_eq!(stdout, expected, "{} differed on {backend}", case.name);
+    }
+
+    // In-guest LiteInst (https://github.com/rrnewton/hermit/issues/3520) runs
+    // the same guest and must print the same aliases. It refuses a maximum
+    // timeslice until it can deliver Detcore's preemption timer, so this run
+    // has none, and it does not pass `--verify` yet.
+    #[cfg(feature = "liteinst")]
+    {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "10s", "90s"])
+            .arg(hermit_test::hermit_binary())
+            .args(["--log", "DEBUG", "--backend=liteinst", "run"])
+            .args(["--strict", "--max-timeslice=disabled", "--"])
+            .arg(&guest);
+        hermit_test::configure_guest_execution(&mut command);
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{} failed under in-guest LiteInst\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            case.name
+        );
+        assert!(
+            stderr.lines().any(|line| line == IN_GUEST_SELECTED),
+            "{} did not run under in-guest LiteInst\nstderr:\n{stderr}",
+            case.name
+        );
+        assert_eq!(
+            stdout, expected,
+            "{} differed on in-guest LiteInst",
+            case.name
+        );
     }
 }

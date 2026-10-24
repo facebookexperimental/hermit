@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Authentic producer/runner/ledger coverage. The fixture's evidence (bounds,
 //! per-case logs, results and ledger rows) remains in the script harness's
 //! retained directory, outside product inventory. Its Cargo build does not:
@@ -22,10 +14,12 @@ use super::super::Plan;
 use super::super::dag_to_json;
 use super::super::env_u64;
 use super::super::finish_committed_selection;
+use super::super::ledger_gate_attempts;
 use super::super::libtest_counts;
 use super::super::monotonic_now_ns;
 use super::super::nextest_test_observations;
 use super::super::run_lane_once;
+use super::super::seeded_lane_log;
 use super::super::step_with_caps;
 use super::super::test_id_summary;
 use super::super::utc_now;
@@ -59,33 +53,56 @@ const FIXTURE_WALL_SECONDS: u64 = 1200;
 /// Stable name of every fixture tree inside the harness log directory.
 const FIXTURE_ROOT_PREFIX: &str = "real-nextest-results-";
 
+/// Stable name of every fixture's Cargo build directory under `$TMPDIR`.
+const FIXTURE_BUILD_PREFIX: &str = "real-nextest-build-";
+
 /// One run's fixture tree, `<DAGRUN_LOG_DIR>/real-nextest-results-XXXXXX`.
 ///
 /// The harness retains its log directory on purpose, so the small evidence
 /// files stay. The generated crate and its Cargo target directory are only
 /// inputs to the five cases, and the target directory is a complete Cargo
-/// build: until 2026-10-03 the tree was kept whole, and one host held 70 of
-/// them using 43.5e9 bytes (https://github.com/rrnewton/hermit/issues/3622).
+/// build of about 1.7 GiB. Kept in the retained directory, it leaked: one host
+/// held 70 of them using 43.5e9 bytes
+/// (https://github.com/rrnewton/hermit/issues/3622), and after the first fix
+/// every failing run still kept one
+/// (https://github.com/rrnewton/hermit/issues/3867).
 ///
-/// [`FixtureTree::finish`] removes both when every case has passed. A failing
-/// case unwinds past `finish`; the whole tree is then kept for diagnosis and
-/// its path printed. A killed test runs neither, and no validation cleanup
-/// sweeps the harness log directory, so the leftover is found by this name:
-/// `<DAGRUN_LOG_DIR>/real-nextest-results-*/target`.
+/// So the target directory is not in this tree at all. It lives under
+/// `$TMPDIR` (`real-nextest-build-XXXXXX/target`) and is removed whether the
+/// cases pass or fail. A local validation run's `$TMPDIR` is its per-run
+/// runtime root, which validation's cleanup removes after the run's checkout
+/// and Cargo home (or its sweep does later), so even a killed test leaves no
+/// build in retained evidence. Elsewhere `$TMPDIR` is usually `/tmp` (a tmpfs
+/// on hosted runners), where a killed test's build is left to that
+/// filesystem's own cleanup.
+///
+/// [`FixtureTree::finish`] also removes the generated crate when every case
+/// has passed. A failing case unwinds past `finish`; the crate and the
+/// evidence are then kept for diagnosis and the path printed.
 struct FixtureTree {
     root: PathBuf,
+    build: Option<tempfile::TempDir>,
     finished: bool,
 }
 
 impl FixtureTree {
     fn create(parent: &Path) -> Self {
+        Self::create_with_build_parent(parent, &std::env::temp_dir())
+    }
+
+    fn create_with_build_parent(parent: &Path, build_parent: &Path) -> Self {
         let root = tempfile::Builder::new()
             .prefix(FIXTURE_ROOT_PREFIX)
             .tempdir_in(parent)
             .unwrap()
             .keep();
+        let build = tempfile::Builder::new()
+            .prefix(FIXTURE_BUILD_PREFIX)
+            .tempdir_in(build_parent)
+            .unwrap();
         Self {
             root,
+            build: Some(build),
             finished: false,
         }
     }
@@ -99,19 +116,32 @@ impl FixtureTree {
     }
 
     fn target_dir(&self) -> PathBuf {
-        self.root.join("target")
+        self.build
+            .as_ref()
+            .expect("the build directory lives until the tree is dropped")
+            .path()
+            .join("target")
     }
 
     /// Called after the last assertion. A removal failure fails the test: a
     /// silent one is exactly the leak this type exists to prevent.
     fn finish(mut self) {
         self.finished = true;
-        for directory in [self.target_dir(), self.crate_dir()] {
-            match fs::remove_dir_all(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("cannot remove fixture {}: {error}", directory.display()),
-            }
+        let build = self.build.take().unwrap();
+        let build_path = build.path().to_path_buf();
+        if let Err(error) = build.close() {
+            panic!(
+                "cannot remove fixture build {}: {error}",
+                build_path.display()
+            );
+        }
+        let crate_dir = self.crate_dir();
+        match fs::remove_dir_all(&crate_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot remove fixture {}: {error}", crate_dir.display()),
+        }
+        for directory in [&build_path, &crate_dir] {
             assert!(
                 !directory.exists(),
                 "{} survived removal",
@@ -123,58 +153,134 @@ impl FixtureTree {
 
 impl Drop for FixtureTree {
     fn drop(&mut self) {
+        if let Some(build) = self.build.take() {
+            let build_path = build.path().to_path_buf();
+            if let Err(error) = build.close() {
+                eprintln!(
+                    "cannot remove the fixture's Cargo build {}: {error}",
+                    build_path.display()
+                );
+            }
+        }
         if !self.finished {
             eprintln!(
-                "authentic Nextest fixture failed; its whole tree is kept for diagnosis: {}. \
-                 Delete its target/ (a full Cargo build) when done.",
-                self.root.display()
+                "authentic Nextest fixture failed; its crate and evidence are kept for \
+                 diagnosis: {root}. Its Cargo build was removed; rebuild it with \
+                 `cargo build --manifest-path {root}/crate/Cargo.toml --target-dir <dir>`.",
+                root = self.root.display()
             );
         }
     }
 }
 
 #[test]
-fn fixture_tree_drops_its_build_on_success_and_keeps_it_on_failure() {
-    fn populate(tree: &FixtureTree) -> PathBuf {
+fn fixture_tree_never_keeps_its_build_and_keeps_its_crate_only_on_failure() {
+    /// Fills the tree as the fixture does and returns its root and target.
+    fn populate(tree: &FixtureTree) -> (PathBuf, PathBuf) {
         let root = tree.root().to_path_buf();
-        fs::create_dir_all(tree.target_dir().join("debug/deps")).unwrap();
-        fs::write(tree.target_dir().join("debug/deps/fixture-binary"), b"x").unwrap();
+        let target = tree.target_dir();
+        fs::create_dir_all(target.join("debug/deps")).unwrap();
+        fs::write(target.join("debug/deps/fixture-binary"), b"x").unwrap();
         fs::create_dir_all(tree.crate_dir().join("src")).unwrap();
         fs::write(tree.crate_dir().join("Cargo.toml"), b"[package]\n").unwrap();
         fs::write(root.join("bounds.json"), b"{}").unwrap();
         fs::create_dir_all(root.join("writable-pass")).unwrap();
         fs::write(root.join("writable-pass/producer.stderr"), b"log").unwrap();
-        root
+        (root, target)
+    }
+    /// No directory below `root` holds the build, at any depth.
+    fn holds_no_build(root: &Path) -> bool {
+        walkdir_names(root)
+            .iter()
+            .all(|name| name != "target" && name != "fixture-binary")
+    }
+    fn walkdir_names(root: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            names.push(entry.file_name().into_string().unwrap());
+            if entry.file_type().unwrap().is_dir() {
+                names.extend(walkdir_names(&entry.path()));
+            }
+        }
+        names
     }
     let parent = tempfile::tempdir().unwrap();
+    let build_parent = tempfile::tempdir().unwrap();
 
-    let passed = FixtureTree::create(parent.path());
-    let root = populate(&passed);
+    let passed = FixtureTree::create_with_build_parent(parent.path(), build_parent.path());
+    let (root, target) = populate(&passed);
     assert_eq!(root.parent(), Some(parent.path()));
     let name = root.file_name().unwrap().to_str().unwrap();
     assert!(name.starts_with(FIXTURE_ROOT_PREFIX), "{name}");
+    assert!(
+        target.starts_with(build_parent.path()) && !target.starts_with(parent.path()),
+        "the Cargo build {} must live outside the retained directory",
+        target.display()
+    );
+    assert!(holds_no_build(&root), "the retained tree holds a build");
     passed.finish();
     assert!(
-        !root.join("target").exists(),
+        !target.exists(),
         "a passing run must not keep its Cargo build"
     );
     assert!(!root.join("crate").exists());
     assert!(root.join("bounds.json").is_file(), "evidence is retained");
     assert!(root.join("writable-pass/producer.stderr").is_file());
 
-    let failed = FixtureTree::create(parent.path());
-    let root = populate(&failed);
+    let failed = FixtureTree::create_with_build_parent(parent.path(), build_parent.path());
+    let (root, target) = populate(&failed);
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _failed = failed;
         panic!("simulated fixture assertion failure");
     }));
     assert!(unwound.is_err());
     assert!(
-        root.join("target/debug/deps/fixture-binary").is_file(),
-        "a failing run keeps its whole tree for diagnosis"
+        !target.exists(),
+        "a failing run must not keep its Cargo build either"
     );
-    assert!(root.join("crate/Cargo.toml").is_file());
+    assert!(holds_no_build(&root), "the retained tree holds a build");
+    assert!(
+        root.join("crate/Cargo.toml").is_file(),
+        "the crate is kept for diagnosis"
+    );
     assert!(root.join("bounds.json").is_file());
+    assert_eq!(
+        fs::read_dir(build_parent.path()).unwrap().count(),
+        0,
+        "a fixture build directory was left under the build parent"
+    );
+}
+
+#[test]
+fn the_fixture_builds_under_tmpdir_which_validation_deletes() {
+    // Stands in for DAGRUN_LOG_DIR. It is itself under $TMPDIR here, so the
+    // check that matters is that the build is not under it: neither beside
+    // the evidence nor inside the retained root.
+    let parent = tempfile::tempdir().unwrap();
+    let tree = FixtureTree::create(parent.path());
+    let target = tree.target_dir();
+    assert!(
+        !target.starts_with(parent.path()),
+        "{} is under the retained log directory {}",
+        target.display(),
+        parent.path().display()
+    );
+    assert_eq!(
+        target.parent().unwrap().parent(),
+        Some(std::env::temp_dir().as_path()),
+        "{} is not directly in $TMPDIR",
+        target.display()
+    );
+    let build = target
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(build.starts_with(FIXTURE_BUILD_PREFIX), "{build}");
+    tree.finish();
 }
 
 /// This fixture owns a local clock, not a replacement scheduler epoch. A real
@@ -260,8 +366,15 @@ fn ensure_prepared_helpers(source: &Path, root: &Path, deadline: u64) {
 
 /// Wall-clock cap of [`prepare_cpu_wrapper`]'s one Cargo build, in seconds.
 const CPU_WRAPPER_WALL_SECONDS: i64 = 600;
-/// CPU cap of the same build. It runs at one Cargo job, like the cases.
+/// CPU cap of the same build.
 const CPU_WRAPPER_CPU_SECONDS: i64 = 900;
+/// Cargo width of the same build. The cases still run at one job; this build
+/// only prepares the wrapper they check for freshness. Cold, under an 8-core
+/// quota, at a25b3fcd3805 on 2026-10-06: 136 s wall at one job, 48 s at four
+/// and 33 s at eight, for 134 to 146 CPU-seconds and a 2.37 to 2.62 GB cgroup
+/// memory peak (page cache included) in all three. At one job it was about
+/// 128 of the 185 seconds this fixture took inside the full script-test run.
+const CPU_WRAPPER_CARGO_JOBS: u32 = 8;
 
 /// Build the standalone Nextest CPU wrapper once, before the timed cases, with
 /// the cases' own environment and private Cargo target directory.
@@ -284,7 +397,7 @@ fn prepare_cpu_wrapper(source: &Path, root: &Path, target: &Path, deadline: u64)
     fs::create_dir_all(prepare.join("tmp")).unwrap();
     let command = format!(
         "cd {} || exit $?; export PATH={}:\"$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT={}; \
-         export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=1; \
+         export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS={CPU_WRAPPER_CARGO_JOBS}; \
          export CARGO_TARGET_DIR={} TMPDIR={}; unset HERMIT_PREPARED_NEXTEST_REQUIRED; set +e; \
          {} --force {} build-cpu-wrapper >{} 2>{}; \
          prepare_status=$?; cat {}; cat {} >&2; exit \"$prepare_status\"",
@@ -345,7 +458,7 @@ fn run_preparation_step(dir: &Path, step: dagrun::model::Step, deadline: u64) {
         true,
         0,
         None,
-        &dir.join("driver.log"),
+        &seeded_lane_log(dir.join("driver.log")),
         Some(deadline),
         false,
     );
@@ -399,10 +512,11 @@ fn context(source: &Path, outcomes: &[StepOutcome], run_id: &str) -> LedgerCtx {
         profile: "full".into(),
         selection_mode: "only".into(),
         release_builder: super::super::RELEASE_BUILDER_CARGO,
+        e2e_runner: super::super::E2E_RUNNER_CARGO,
         cache_state: "fixture-owned".into(),
         commit: git_text(source, &["rev-parse", "HEAD"]),
         tree: git_text(source, &["rev-parse", "HEAD^{tree}"]),
-        git_depth: 0,
+        git_depth: Some(0),
         git_ahead: Some(0),
         git_behind: Some(0),
         commit_anchored: false,
@@ -471,13 +585,20 @@ fn actual_nextest_results_and_publication_failures() {
     let fixture = tree.crate_dir();
     fs::create_dir_all(fixture.join("src")).unwrap();
     fs::write(fixture.join("Cargo.toml"), concat!(
-        "[package]\nname = \"hermit\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n",
+        "[package]\nname = \"hermit-run\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n",
         "[lib]\nname = \"hermit_structured_results_fixture\"\n[workspace]\n",
     )).unwrap();
     fs::write(fixture.join("src/lib.rs"), concat!(
         "#[test]\nfn passes() { assert_eq!(2 + 2, 4); }\n",
         "#[test]\nfn fails() { assert_eq!(2 + 2, 5, \"intentional structured-result fixture assertion\"); }\n",
     )).unwrap();
+    // The canonical .config/nextest.toml names the `cli` test binary of
+    // package `hermit-run`, and nextest refuses a config whose package() or
+    // binary() matcher names nothing in the workspace. So the fixture package is
+    // `hermit-run`, and an empty `cli` target keeps the copied config loadable;
+    // it has no tests, so nothing it adds is selected or counted.
+    fs::create_dir_all(fixture.join("tests")).unwrap();
+    fs::write(fixture.join("tests/cli.rs"), b"").unwrap();
     let target = tree.target_dir();
     // Cargo's standard explicit/default home remains in force. Only the target
     // and temp directories below are fixture-owned; a test must not silently
@@ -490,6 +611,7 @@ fn actual_nextest_results_and_publication_failures() {
         "per_case_wall_seconds":180,"per_case_cpu_seconds":300,
         "cpu_wrapper_wall_seconds":CPU_WRAPPER_WALL_SECONDS,
         "cpu_wrapper_cpu_seconds":CPU_WRAPPER_CPU_SECONDS,
+        "cpu_wrapper_cargo_jobs":CPU_WRAPPER_CARGO_JOBS,
         "declared_memory_bytes":2_u64*1024*1024*1024,"dag_width":1,"cargo_jobs":1,"nextest_retries":0,
         "per_case_cgroup_binding":null,"cargo_home_env":cargo_home,
         "cargo_home_policy":"conventional explicit/default Cargo home; ownership not inferred",
@@ -636,7 +758,7 @@ fn actual_nextest_results_and_publication_failures() {
             true,
             0,
             None,
-            &case.join("driver.log"),
+            &seeded_lane_log(case.join("driver.log")),
             Some(deadline),
             false,
         );
@@ -666,7 +788,7 @@ fn actual_nextest_results_and_publication_failures() {
         assert_eq!(outcome.returncode, Some(wrapper_status));
         let actual: BTreeMap<String, bool> = names
             .iter()
-            .map(|name| (format!("hermit${name}"), name == "passes"))
+            .map(|name| (format!("hermit-run${name}"), name == "passes"))
             .collect();
         assert_eq!(
             node_classification(outcome, &result.attempts),
@@ -803,7 +925,7 @@ fn actual_nextest_results_and_publication_failures() {
         if name == "publish-after-failure" {
             let summary = test_id_summary(observations, &result.attempts, &fixture_node);
             assert_eq!(summary.failed.len(), 1);
-            assert_eq!(summary.failed[0].id, "hermit$fails");
+            assert_eq!(summary.failed[0].id, "hermit-run$fails");
             assert!(summary.failed_nodes_without_test_ids.is_empty());
         }
         if let Some(retained) = retained {
@@ -833,10 +955,11 @@ fn actual_nextest_results_and_publication_failures() {
             assert!(row["executed_tests"].is_null() && row["passed_tests"].is_null());
             assert!(row.get("test_results").is_none());
             assert_eq!(row["gates"][0]["test_results_error_kind"], "read_io");
-            assert_eq!(
-                row["gates"][0]["attempts"][0]["test_results_error_kind"],
-                "read_io"
-            );
+            // The written gate may omit an attempt list it states itself;
+            // the history read back is the same either way.
+            let attempts = ledger_gate_attempts(&row["gates"][0]).unwrap();
+            assert_eq!(attempts.len(), 1, "{attempts:?}");
+            assert_eq!(attempts[0]["test_results_error_kind"], "read_io");
         }
         fs::write(
             case.join("checked.json"),

@@ -39,9 +39,6 @@ use crate::event_stream::EventStreamId;
 use crate::metadata::Metadata;
 use crate::metadata::RECORD_VERSION;
 use crate::metadata::record_or_replay_config;
-use crate::replayer::Replayer;
-
-type ReplayTool = detcore::Detcore<Replayer>;
 type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 
 /// Represents a replay that is currently running.
@@ -55,7 +52,7 @@ pub struct Replay {
 
     // Retires this replay root's physical-file trust entries on every exit
     // path, including cancellation or a spawn/wait error.
-    _materialization_scope: crate::replayer::ReplayMaterializationScope,
+    _materialization_scope: hermit_replay::ReplayMaterializationScope,
 }
 
 impl Replay {
@@ -68,6 +65,12 @@ impl Replay {
         mounts: &[Mount],
     ) -> Result<Self, Error> {
         let metadata = Metadata::load(dir)?;
+        crate::cpu_profile_admission::check_record_or_replay(metadata.cpu_profile)?;
+        if let Some(reason) = &metadata.replay_refused {
+            return Err(anyhow::anyhow!(
+                "This recording cannot be replayed faithfully: {reason}"
+            ));
+        }
 
         let recording_version = &metadata.version;
         let replayer_version = &RECORD_VERSION;
@@ -87,13 +90,45 @@ impl Replay {
         }
 
         let mut config = record_or_replay_config(dir);
+        config.replaying = true;
+        // A v3 recording replays only on a host that qualifies with the same
+        // host facts, under the same table
+        // (https://github.com/rrnewton/hermit/issues/4243).
+        if metadata.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
+            let refuse = |why: String| {
+                crate::cpu_profile_admission::CpuProfileRefusal::new(metadata.cpu_profile, why)
+            };
+            let recorded = crate::cpu_profile_admission::precheck_replay(
+                metadata.cpu_profile,
+                metadata.cpu_profile_host.as_ref(),
+                metadata.cpu_table_digest.as_deref(),
+            )?;
+            let request =
+                crate::cpu_profile_admission::record_or_replay_request(gdbserver.is_some());
+            let (_probe, host) = crate::cpu_profile_admission::admit(&request).map_err(refuse)?;
+            if let Some(fact) = crate::cpu_profile_admission::first_difference(&recorded, &host) {
+                return Err(refuse(format!(
+                    "this host differs from the recording's in {fact}, so the guest would see a \
+                     different CPU"
+                ))
+                .into());
+            }
+            config.cpu_profile = metadata.cpu_profile;
+            config.cpu_profile_host = Some(recorded);
+        }
         // Recorder events contain the raw bytes from the recording namespace.
         // Reapply Detcore's sanitizer with the recording-time mount IDs, not
         // the unrelated IDs of this fresh replay namespace.
         config.mountinfo_root_rewrites = metadata.mountinfo_root_rewrites.clone();
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
         config.mountinfo_mount_ids_captured = metadata.mountinfo_mount_ids_captured;
-        config.fdinfo_unlisted_mount_ids = metadata.fdinfo_unlisted_mount_ids.clone();
+        config.mount_id_assignment_order = metadata.mount_id_assignment_order.clone();
+        // The recording container's mount table: the guest's mountinfo and
+        // mounts read the bytes they read at recording.
+        config.container_mount_table = metadata.container_mount_table.clone();
+        // The recording's `/proc` level: a replay sees the names its recording
+        // saw.
+        config.proc_level = metadata.proc_level.unwrap_or_default();
         let sequentialize_threads = config.sequentialize_threads;
 
         let (chroot, bootstrap_program, materialization_scope, replay_mounts) =
@@ -144,16 +179,11 @@ impl Replay {
 
         command.chroot(chroot.path());
 
-        let mut builder = reverie_ptrace::TracerBuilder::<ReplayTool>::new(command).config(config);
-        if let Some(port) = gdbserver {
-            builder = builder.gdbserver(port);
-        }
-        if sequentialize_threads {
-            // Inform gdbserver not to serialize guests because this is
-            // done by detcore already.
-            builder = builder.sequentialized_guest();
-        }
-        let tracer = builder.spawn().await?;
+        crate::cpu_profile_admission::refuse_unadmitted_launch(&config, true)?;
+        // A sequentialized replay tells gdbserver not to serialize guests,
+        // because Detcore already does.
+        let tracer =
+            hermit_replay::spawn_tracer(command, config, gdbserver, sequentialize_threads).await?;
         let proc_readonly = crate::proc_mount::guest_proc_readonly(tracer.guest_pid());
         crate::proc_mount::report_proc_mode(metadata.proc_readonly, proc_readonly);
 
@@ -175,8 +205,8 @@ impl Replay {
             _materialization_scope,
         } = self;
         let (exit_status, global_state) = crate::ptrace_completion::wait(tracer, control).await?;
-        global_state.clean_up(false, &None).await;
-        chroot.remove()?;
+        let finalized = global_state.clean_up(false, &None).await;
+        finish_replay_chroot(finalized, chroot)?;
         Ok(exit_status)
     }
 
@@ -192,10 +222,16 @@ impl Replay {
         } = self;
         let (output, global_state) =
             crate::ptrace_completion::wait_with_output(tracer, control).await?;
-        global_state.clean_up(false, &None).await;
-        chroot.remove()?;
+        let finalized = global_state.clean_up(false, &None).await;
+        finish_replay_chroot(finalized, chroot)?;
         Ok(output)
     }
+}
+
+// Explicit close still runs on finalization failure; retain its failure too.
+fn finish_replay_chroot(finalized: Result<(), Error>, chroot: TempChroot) -> Result<(), Error> {
+    let removed = chroot.remove().map_err(Error::from);
+    detcore::combine_finalization(finalized, removed)
 }
 
 fn prepare_replay_mounts(chroot: &TempChroot, mounts: &[Mount]) -> io::Result<Vec<Mount>> {
@@ -246,7 +282,7 @@ fn prepare_chroot(
 ) -> io::Result<(
     TempChroot,
     PathBuf,
-    crate::replayer::ReplayMaterializationScope,
+    hermit_replay::ReplayMaterializationScope,
     Vec<Mount>,
 )> {
     let chroot = TempChroot::new_in(dir)?;
@@ -262,7 +298,7 @@ fn prepare_chroot(
     }
     let replay_root = crate::record_replay_path::open_directory_path(chroot.path())?;
     let materialization_scope =
-        crate::replayer::ReplayMaterializationScope::new(replay_root.as_raw_fd())?;
+        hermit_replay::ReplayMaterializationScope::new(replay_root.as_raw_fd())?;
 
     // These are replay-owned mount/alias points, so create them while the
     // chroot is still empty. No recorded symlink topology has been installed
@@ -541,15 +577,78 @@ fn stage_recorded_exec_image(
     )?;
     let staged =
         crate::record_replay_path::resolve_existing_path(replay_root, start, guest_path, false)?;
-    crate::replayer::remember_materialized_object(
-        replay_root.as_raw_fd(),
-        staged.object.as_raw_fd(),
-    )
+    hermit_replay::remember_materialized_object(replay_root.as_raw_fd(), staged.object.as_raw_fd())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replay refuses a recording from before the inode numbering change
+    /// (RECORD_VERSION 0x123) as soon as it reads the metadata, before it
+    /// starts the guest, whose procfs reads would otherwise be re-rendered
+    /// with numbers the recording's guest never saw.
+    #[tokio::test]
+    async fn replay_refuses_a_recording_from_before_inode_request_ordinals() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = serde_json::json!({
+            "exe": "/bin/true",
+            "program": "true",
+            "arg0": "true",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": 0x122,
+        });
+        fs::write(
+            dir.path().join(crate::consts::METADATA_NAME),
+            metadata.to_string(),
+        )
+        .unwrap();
+        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+            Ok(_) => panic!("replay accepted a 0x122 recording"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("Version mismatch, recording version RecordVersion(290)"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    /// A recording whose run recorded a replay refusal is refused before the
+    /// guest starts, with the recorded reason
+    /// (https://github.com/rrnewton/hermit/issues/3994).
+    #[tokio::test]
+    async fn replay_refuses_a_recording_that_recorded_a_replay_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = serde_json::json!({
+            "exe": "/bin/true",
+            "program": "true",
+            "arg0": "true",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": serde_json::to_value(RECORD_VERSION).unwrap(),
+            "replay_refused": "a SIGKILL victim had a background operation outstanding",
+        });
+        fs::write(
+            dir.path().join(crate::consts::METADATA_NAME),
+            metadata.to_string(),
+        )
+        .unwrap();
+        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+            Ok(_) => panic!("replay accepted a recording that refuses replay"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("cannot be replayed faithfully: a SIGKILL victim had a background operation outstanding"),
+            "unexpected refusal: {error}"
+        );
+    }
 
     #[test]
     fn private_bootstrap_path_is_long_enough_without_oversized_components() {
@@ -609,7 +708,7 @@ mod tests {
         };
 
         let result: io::Result<()> = (|| {
-            let _scope = crate::replayer::ReplayMaterializationScope::new(replay_root.as_raw_fd())?;
+            let _scope = hermit_replay::ReplayMaterializationScope::new(replay_root.as_raw_fd())?;
             stage_recorded_exec_image(
                 &replay_root,
                 &replay_root,
@@ -620,7 +719,7 @@ mod tests {
                 false,
             )?;
             assert_eq!(
-                crate::replayer::registered_materialized_count(replay_root.as_raw_fd()),
+                hermit_replay::registered_materialized_count(replay_root.as_raw_fd()),
                 1
             );
             Err(io::Error::other("forced post-staging failure"))
@@ -628,7 +727,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(
-            crate::replayer::registered_materialized_count(replay_root.as_raw_fd()),
+            hermit_replay::registered_materialized_count(replay_root.as_raw_fd()),
             0
         );
     }
@@ -699,5 +798,46 @@ mod tests {
             fs::read(chroot.path().join("mounted-file")).unwrap(),
             b"existing"
         );
+    }
+}
+
+#[cfg(test)]
+mod finalization_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn terminal_error_does_not_skip_explicit_chroot_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let chroot = TempChroot::new_in(directory.path()).unwrap();
+        let path = chroot.path().to_owned();
+        fs::write(path.join("backing"), b"owned until finalization").unwrap();
+        let error = finish_replay_chroot(
+            Err(crate::error::terminal_replay_refusal_for_test().await),
+            chroot,
+        )
+        .unwrap_err();
+        assert!(error.is::<detcore::TerminalReplayRefusal>());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn terminal_and_explicit_close_errors_are_both_retained() {
+        let directory = tempfile::tempdir().unwrap();
+        let chroot = TempChroot::new_in(directory.path()).unwrap();
+        let path = chroot.path().to_owned();
+        let moved = directory.path().join("original-root");
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"not a directory").unwrap();
+        let error = finish_replay_chroot(
+            Err(crate::error::terminal_replay_refusal_for_test().await),
+            chroot,
+        )
+        .unwrap_err();
+        let pair = error
+            .downcast_ref::<detcore::FinalizationFailure>()
+            .unwrap();
+        assert!(pair.primary().is::<detcore::TerminalReplayRefusal>());
+        assert!(pair.secondary().is::<io::Error>());
+        assert!(moved.is_dir());
     }
 }

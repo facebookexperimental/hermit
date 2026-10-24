@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Tests for hermit_supports_cpuid_faulting in demos/lib/common.sh.
 
 Demo 4 uses this probe to decide whether to pass --no-virtualize-cpuid to the
@@ -62,10 +56,7 @@ SET_CPUID_ENODEV = PREFIX + (
     "hosts, use Linux 6.17+ upstream or a kernel with CPUID faulting backported; "
     "continuing without CPUID interception"
 )
-OLDER = (
-    PREFIX
-    + "Unable to intercept CPUID: Underlying hardware does not support CPUID faulting"
-)
+OLDER = PREFIX + "Unable to intercept CPUID: Underlying hardware does not support CPUID faulting"
 
 
 class CpuidFaultingProbeTest(unittest.TestCase):
@@ -82,9 +73,7 @@ class CpuidFaultingProbeTest(unittest.TestCase):
         # from running them.
         for name in ("cargo", "cc"):
             tool = self.bin / name
-            tool.write_text(
-                "#!/bin/sh\necho 'unexpected {} call' >&2\nexit 99\n".format(name)
-            )
+            tool.write_text("#!/bin/sh\necho 'unexpected {} call' >&2\nexit 99\n".format(name))
             tool.chmod(0o755)
         self.guest = self.directory / "guest"
         self.guest.write_text("#!/bin/sh\nexit 99\n")
@@ -116,9 +105,7 @@ class CpuidFaultingProbeTest(unittest.TestCase):
             timeout=60,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        decisions = [
-            line for line in result.stdout.splitlines() if line.startswith("PROBE=")
-        ]
+        decisions = [line for line in result.stdout.splitlines() if line.startswith("PROBE=")]
         self.assertEqual(len(decisions), 1, result.stdout + result.stderr)
         return decisions[0]
 
@@ -135,9 +122,7 @@ class CpuidFaultingProbeTest(unittest.TestCase):
         self.assertEqual(self._probe(""), "PROBE=supported")
 
     def test_an_unrelated_error_means_faulting(self):
-        self.assertEqual(
-            self._probe(PREFIX + "something else went wrong"), "PROBE=supported"
-        )
+        self.assertEqual(self._probe(PREFIX + "something else went wrong"), "PROBE=supported")
 
 
 if __name__ == "__main__":

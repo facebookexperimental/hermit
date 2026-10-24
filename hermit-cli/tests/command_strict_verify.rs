@@ -9,6 +9,9 @@
 //! End-to-end L2 coverage for standard command-line tools that are expected on
 //! the portable CI runner.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::Write;
@@ -73,6 +76,16 @@ fn configure_pinned_root(command: &mut Command) {
 }
 
 fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
+    assert_l2_under_strict_verify_with(case, &[]);
+}
+
+/// As [`assert_l2_under_strict_verify`], at the `standard` `/proc` level, for
+/// a command that reads a name only that level has.
+fn assert_l2_under_strict_verify_at_standard(case: &StrictCommandCase) {
+    assert_l2_under_strict_verify_with(case, &["--proc=standard"]);
+}
+
+fn assert_l2_under_strict_verify_with(case: &StrictCommandCase, run_args: &[&str]) {
     let program = required_command(case);
     let home = tempfile::tempdir().expect("failed to create isolated command HOME");
     std::fs::create_dir_all(home.path().join(".config/procps"))
@@ -89,7 +102,14 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
             HERMIT_VERIFY_TIMEOUT,
         ])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=info", "run", "--strict", "--verify"])
+        .args([
+            "--log=info",
+            "run",
+            "--strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            "--verify",
+        ])
+        .args(run_args)
         .arg(format!("--env=HOME={}", home.path().display()))
         .arg(format!(
             "--env=XDG_CONFIG_HOME={}",
@@ -111,20 +131,24 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
         .stderr(Stdio::piped());
 
     let rendered = format!("{command:?}");
-    let mut child = command
-        .spawn()
-        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
-    if let Some(input) = case.stdin {
-        child
-            .stdin
-            .take()
-            .expect("piped stdin should be available")
-            .write_all(input)
-            .unwrap_or_else(|error| panic!("failed to write stdin for {rendered}: {error}"));
-    }
-    let output = child
-        .wait_with_output()
-        .unwrap_or_else(|error| panic!("failed to collect {rendered}: {error}"));
+    // A typed PMU skid-overshoot refusal, and nothing else, runs it again.
+    let (output, ()) = hermit_test::hermit_output_with(&rendered, || {
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+        if let Some(input) = case.stdin {
+            child
+                .stdin
+                .take()
+                .expect("piped stdin should be available")
+                .write_all(input)
+                .unwrap_or_else(|error| panic!("failed to write stdin for {rendered}: {error}"));
+        }
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|error| panic!("failed to collect {rendered}: {error}"));
+        (output, ())
+    });
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -433,12 +457,6 @@ fn process_accounting_commands_are_deterministic_under_strict_verify() {
             stdin: None,
         },
         StrictCommandCase {
-            name: "vmstat -s",
-            candidates: &["/usr/bin/vmstat", "/bin/vmstat"],
-            args: &["-s"],
-            stdin: None,
-        },
-        StrictCommandCase {
             name: "top batch",
             candidates: &["/usr/bin/top", "/bin/top"],
             args: &["-b", "-n", "1", "-p", "1", "-w", "80"],
@@ -449,6 +467,17 @@ fn process_accounting_commands_are_deterministic_under_strict_verify() {
     for case in &cases {
         assert_l2_under_strict_verify(case);
     }
+
+    // These read names only the `standard` /proc level has.
+    let standard_cases = [StrictCommandCase {
+        name: "vmstat -s",
+        candidates: &["/usr/bin/vmstat", "/bin/vmstat"],
+        args: &["-s"],
+        stdin: None,
+    }];
+    for case in &standard_cases {
+        assert_l2_under_strict_verify_at_standard(case);
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -457,13 +486,19 @@ fn process_accounting_commands_are_deterministic_under_strict_verify() {
 #[ignore = "e2e: requires hermit + PMU/mount namespaces + sysstat tools"]
 fn io_accounting_commands_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
-    let cases = [
-        StrictCommandCase {
-            name: "iostat disk",
-            candidates: &["/usr/bin/iostat"],
-            args: &["-d", "-x", "1", "1"],
-            stdin: None,
-        },
+    let cases = [StrictCommandCase {
+        name: "iostat disk",
+        candidates: &["/usr/bin/iostat"],
+        args: &["-d", "-x", "1", "1"],
+        stdin: None,
+    }];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+
+    // These read names only the `standard` /proc level has.
+    let standard_cases = [
         StrictCommandCase {
             name: "vmstat disk",
             candidates: &["/usr/bin/vmstat"],
@@ -477,9 +512,8 @@ fn io_accounting_commands_are_deterministic_under_strict_verify() {
             stdin: None,
         },
     ];
-
-    for case in &cases {
-        assert_l2_under_strict_verify(case);
+    for case in &standard_cases {
+        assert_l2_under_strict_verify_at_standard(case);
     }
 }
 
@@ -508,16 +542,21 @@ fn kernel_pseudofile_commands_are_deterministic_under_strict_verify() {
             args: &["kernel.random.uuid"],
             stdin: None,
         },
-        StrictCommandCase {
-            name: "sar resource tables",
-            candidates: &["/usr/bin/sar"],
-            args: &["-v", "1", "1"],
-            stdin: None,
-        },
     ];
 
     for case in &cases {
         assert_l2_under_strict_verify(case);
+    }
+
+    // These read names only the `standard` /proc level has.
+    let standard_cases = [StrictCommandCase {
+        name: "sar resource tables",
+        candidates: &["/usr/bin/sar"],
+        args: &["-v", "1", "1"],
+        stdin: None,
+    }];
+    for case in &standard_cases {
+        assert_l2_under_strict_verify_at_standard(case);
     }
 }
 
@@ -542,7 +581,19 @@ fn ionice_query_is_deterministic_under_strict_verify() {
 #[ignore = "e2e: requires hermit + util-linux/sysstat/kmod"]
 fn kernel_activity_commands_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
-    let cases = [
+    let cases = [StrictCommandCase {
+        name: "lsmod",
+        candidates: &["/usr/sbin/lsmod", "/usr/bin/lsmod"],
+        args: &[],
+        stdin: None,
+    }];
+
+    for case in &cases {
+        assert_l2_under_strict_verify(case);
+    }
+
+    // These read names only the `standard` /proc level has.
+    let standard_cases = [
         StrictCommandCase {
             name: "lsirq",
             candidates: &["/usr/bin/lsirq"],
@@ -559,16 +610,9 @@ fn kernel_activity_commands_are_deterministic_under_strict_verify() {
             args: &["-I", "SCPU", "-P", "0", "1", "1"],
             stdin: None,
         },
-        StrictCommandCase {
-            name: "lsmod",
-            candidates: &["/usr/sbin/lsmod", "/usr/bin/lsmod"],
-            args: &[],
-            stdin: None,
-        },
     ];
-
-    for case in &cases {
-        assert_l2_under_strict_verify(case);
+    for case in &standard_cases {
+        assert_l2_under_strict_verify_at_standard(case);
     }
 }
 
@@ -625,13 +669,14 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=off", "run", "--strict"]);
     configure_pinned_root(&mut strict_command);
-    let strict_output = strict_command
-        .arg("--")
-        .arg(&python)
-        .args(["-c", query])
-        .current_dir(working_directory.path())
-        .output()
-        .expect("failed to start Python prlimit64 strict-mode value regression");
+    let strict_output = hermit_test::hermit_output(
+        "hermit run",
+        strict_command
+            .arg("--")
+            .arg(&python)
+            .args(["-c", query])
+            .current_dir(working_directory.path()),
+    );
     let strict_stdout = String::from_utf8_lossy(&strict_output.stdout);
     let strict_stderr = String::from_utf8_lossy(&strict_output.stderr);
     assert!(
@@ -656,13 +701,14 @@ fn python_prlimit64_query_is_deterministic_under_strict_verify() {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=info", "run", "--strict", "--verify"]);
     configure_pinned_root(&mut command);
-    let output = command
-        .arg("--")
-        .arg(&python)
-        .args(["-c", query])
-        .current_dir(working_directory.path())
-        .output()
-        .expect("failed to start Python prlimit64 strict/verify regression");
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        command
+            .arg("--")
+            .arg(&python)
+            .args(["-c", query])
+            .current_dir(working_directory.path()),
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

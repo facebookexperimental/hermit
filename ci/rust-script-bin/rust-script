@@ -184,6 +184,11 @@ case $mode in
     run) selected=$run_path ;;
     test)
         [[ $test_path != - ]] || die "$source_rel has no test harness in the producer manifest"
+        # ci/prepare-rust-scripts.sh --release-only (the pinned-root producer)
+        # publishes no harnesses; a test request against it is refused here, never
+        # resolved to a missing path or a stale harness.
+        [[ $test_path != release-only ]] ||
+            die "$source_rel was published release-only (ci/prepare-rust-scripts.sh --release-only, the pinned-root producer), which builds no test harness; run its tests against the host producer's output (build.rust_scripts)"
         selected=$test_path
         ;;
 esac

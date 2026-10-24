@@ -58,6 +58,19 @@ pub struct TraceReplayOpts {
     args: Vec<String>,
 }
 
+impl TraceReplayOpts {
+    fn record_replay_args(&self) -> Vec<String> {
+        let mut args = self.hermit_arg.clone();
+        // These modes retain their existing editing/recovery contract. The
+        // non-chaos, unsplit path compares every selected DETLOG and refuses
+        // DESYNC, so it needs the complete actual software-boundary stream.
+        if !self.chaos && !self.split_branches {
+            args.push("--strict-schedule-boundaries".to_owned());
+        }
+        args
+    }
+}
+
 impl UseCase for TraceReplayOpts {
     fn build_temp_env(
         &self,
@@ -79,7 +92,7 @@ impl UseCase for TraceReplayOpts {
             .log_level(tracing::Level::TRACE)
             .log_file(current_run.log_file_path.clone())
             .run(self.guest_program.clone(), self.args.clone())
-            .hermit_args(self.hermit_arg.clone())
+            .hermit_args(self.record_replay_args())
             .chaos(self.chaos)
             .bind(temp_env.path().to_owned())
             .workdir_isolate(current_run.workdir.clone(), self.isolate_workdir)
@@ -104,7 +117,7 @@ impl UseCase for TraceReplayOpts {
             .log_level(tracing::Level::TRACE)
             .log_file(current_run.log_file_path.clone())
             .run(self.guest_program.clone(), self.args.clone())
-            .hermit_args(self.hermit_arg.clone())
+            .hermit_args(self.record_replay_args())
             .chaos(false) // We don't need chaos on replay.
             .bind(temp_env.path().to_owned())
             .workdir_isolate(current_run.workdir.clone(), self.isolate_workdir)
@@ -218,5 +231,27 @@ mod tests {
                 .iter()
                 .any(|line| line == "inbound syscall: exit_group")
         );
+    }
+    #[test]
+    fn complete_boundaries_are_requested_only_by_the_strict_unedited_path() {
+        for (chaos, split, expected) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let mut opts = trace_replay_opts(chaos);
+            opts.split_branches = split;
+            opts.hermit_arg = vec!["--seed=7".into()];
+            let args = opts.record_replay_args();
+            assert_eq!(args[0], "--seed=7");
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| *arg == "--strict-schedule-boundaries")
+                    .count(),
+                usize::from(expected)
+            );
+            assert!(opts.options().verify_desync);
+            assert!(opts.options().verify_exit_statuses);
+        }
     }
 }

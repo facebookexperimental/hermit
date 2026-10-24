@@ -37,12 +37,24 @@ static int write_all(int fd, const char* bytes, size_t length) {
 }
 
 int main(void) {
-  const char* dir = "/var/tmp/hermit-record-file-state";
-  const char* file = "/var/tmp/hermit-record-file-state/data";
-  const char* source = "/var/tmp/hermit-record-file-state/source";
-  const char* clone = "/var/tmp/hermit-record-file-state/clone";
+  // Work under the guest's /tmp, not the host-shared /var/tmp. `hermit run`,
+  // which every verify-mode manifest cell uses, binds a fresh private host
+  // directory (created under the host's temporary directory) over /tmp for
+  // each execution, including each of the two verify runs. Concurrent copies
+  // of this test therefore no longer race on one host directory, and the fixed
+  // name keeps the two verify runs identical. FICLONE is still exercised when
+  // the filesystem holding that host directory supports reflinks; where it
+  // does not, the existing "clone unsupported" branch is taken. The relative
+  // working directory is not used: the hermetic lane mounts it as a tmpfs,
+  // where FICLONE is always unsupported. `hermit record` does not privatise
+  // /tmp, so concurrent runs of the cargo record test still share the host
+  // directory.
+  const char* dir = "/tmp/hermit-record-file-state";
+  const char* file = "/tmp/hermit-record-file-state/data";
+  const char* source = "/tmp/hermit-record-file-state/source";
+  const char* clone = "/tmp/hermit-record-file-state/clone";
   const char* write_only_clone =
-      "/var/tmp/hermit-record-file-state/write-only-clone";
+      "/tmp/hermit-record-file-state/write-only-clone";
 
   unlink(write_only_clone);
   unlink(clone);

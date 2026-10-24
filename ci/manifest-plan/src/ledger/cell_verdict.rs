@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Shared interpretation of one producer-written raw cell's ordinary comparison.
 //! This is the unchanged validator policy, reused by public evidence derivation.
 
@@ -58,6 +50,9 @@ fn canonical_report(
         return Err(match report.infrastructure_error.as_ref() {
             Some(InfrastructureError::SkidOvershoot { count }) => {
                 format!("recorded infrastructure_error: {count} HERMIT_SKID_OVERSHOOT report(s)")
+            }
+            Some(change @ InfrastructureError::HostInputChanged { .. }) => {
+                format!("recorded infrastructure_error: {change}")
             }
             None => unreachable!("typed report parser requires an infrastructure error"),
         });

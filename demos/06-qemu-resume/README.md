@@ -17,7 +17,17 @@ post-command snapshot.
 ## Prerequisites
 
 - Everything [demo 5](../05-qemu-boot/README.md#prerequisites) needs.
-- The boot snapshot from demo 5. If it is missing, this demo runs demo 5 first.
+- The boot snapshot from demo 5, booted from the initramfs that
+  `demos/lib/qemu-assets.sh` builds now. If it is missing, or demo 5's record
+  of it does not show that, this demo runs demo 5 first to rebuild it. If the
+  snapshot was missing and demo 5 exits non-zero, this demo stops with demo 5's
+  failure, even if demo 5 saved a snapshot first. If a snapshot was there but
+  its record did not show that, demo 5 may end `PARTIAL` and exit non-zero
+  after it has saved a current snapshot, because after an initramfs change its
+  own reference run no longer applies either. In that case only, this demo
+  checks demo 5's record instead of its exit status: it uses the rebuilt
+  snapshot, with a note, when the record matches, and otherwise stops and asks
+  you to run `demos/clean.sh` and then this demo again.
 
 The resume itself does not use the hardware performance counters (see "How it
 works"), but demo 5 does if it has to run first.
@@ -259,8 +269,8 @@ line `| __HERMIT_COMMAND_END__`, followed by `| FINISHED`, and the demo
 reports exit status 3 from the real END line after them. A command that never
 exits, for example `echo __HERMIT_COMMAND_END__; sleep 1000000`, shows
 nothing: `/init` prints the output only after the command exits, so neither
-its output nor an END line reaches the serial port, and the run fails when a
-bound stops it (see "A run that does not finish" below).
+its output nor an END line reaches the serial port, and the run fails when it
+reaches a bound (see "A run that does not finish" below).
 
 The command cannot print a frame line by another route either:
 
@@ -307,15 +317,29 @@ The framing has these consequences and limits:
   bytes are not preserved. Output that a background job writes after the
   command has exited is not shown.
 - A kernel message printed in the middle of the END line hides that line, so
-  the controller keeps waiting until a bound stops the run, which then fails
-  (see "A run that does not finish" below); it never ends with a cut-off
+  the controller keeps waiting until the run reaches a bound and fails (see
+  "A run that does not finish" below); it never ends with a cut-off
   output.
 - A boot snapshot saved before this change still runs an old `/init`, which
-  prints a bare `__HERMIT_COMMAND_BEGIN__` line or one ending in `format=2`.
-  The controller stops as soon as it sees such a line, names it, and the demo
-  says to run `demos/clean.sh` and then demo 5 again. `demos/lib/qemu-assets.sh`
-  rebuilds the initramfs by itself (its `.initramfs-version` is now 9), but
-  only demo 5 saves a new boot snapshot.
+  runs the command as root with the console as its standard input, so the
+  command could print a frame of its own. `demos/lib/qemu-assets.sh` rebuilds
+  the initramfs by itself (its `.initramfs-version` is now 9), but only demo 5
+  saves a new boot snapshot. Demo 5 therefore writes a record next to each boot
+  snapshot it saves, `hermit-boot.qcow2.producer.json`, naming the snapshot's
+  SHA-256 and the `INITRAMFS_VERSION` and SHA-256 of the initramfs it booted.
+  This demo restores the default snapshot only when that record matches the
+  snapshot and the current initramfs, and otherwise runs demo 5 again to
+  rebuild it; if demo 5 then exits non-zero, the rebuilt snapshot is used only
+  when its record matches. That allowance is only for a snapshot that was
+  there and did not match: when the snapshot is missing and demo 5 exits
+  non-zero, the demo stops with demo 5's failure (see Prerequisites). A
+  snapshot named by `QEMU_BOOT_SNAPSHOT_DISK` without such a record is refused,
+  with the reason and how to rebuild it. Because demo 5 does not take this demo's lock, the
+  copy that QEMU restores is checked against the record too. As a second line
+  of defence, the controller stops as soon as it sees the BEGIN line of
+  another `/init`, a bare `__HERMIT_COMMAND_BEGIN__` line or one ending in
+  `format=2`, also when a kernel message is printed right after it, names it,
+  and the demo says to run `demos/clean.sh` and then demo 5 again.
 - A reference run saved before this change was started with another kernel
   command line, without `printk.time=1`, so its comparison reports
   `WARN: QEMU argv differs from first run` and the run ends `PARTIAL`, never
@@ -339,52 +363,76 @@ another directory resumed to a different post-command snapshot after 288657
 scheduler turns instead of 287149.
 
 A run that does not finish. The guest-side controller has no deadline of its
-own, because time inside Hermit is virtual. Two bounds outside Hermit stop a
-resume that does not end by itself (a command that never exits, or an END
-line that a kernel message hid), and whichever is reached first wins:
+own, because time inside Hermit is virtual. Two bounds outside Hermit end the
+demo's wait for a resume that does not end by itself (a command that never
+exits, or an END line that a kernel message hid). The demo checks both
+repeatedly, the size first, and the first check that finds a bound passed
+ends the wait, and the run fails:
 
 - `QEMU_MAX_LOG_BYTES`, the size of Hermit's INFO log. At the default log
   filter Hermit wrote 18.5 to 19.2 MB of INFO log per second of resume on
-  2026-10-03, so the 512 MiB cap stops the run after about 29 seconds. With
-  the defaults this is the bound that stops a command that runs longer than
-  that: a `sleep 1000000` failed after 31.1 seconds in one run and 30.9
-  seconds in another.
+  2026-10-03, so a run reaches the 512 MiB cap after about 29 seconds. With
+  the defaults this is the bound that ends the wait for a command that runs
+  longer than that: a `sleep 1000000` failed after 31.1 seconds in one run
+  and 30.9 seconds in another.
 - `QEMU_TIMEOUT`, the wall-clock seconds of the resume (120 by default). With
   the default cap it is reached only by a resume that logs more slowly.
 
 Either way the demo prints a FAILURE line that names the bound, the size or
 time it reached, and how far the guest had got, read from the serial log: no
-BEGIN line yet, a BEGIN line with no END line (the command had not finished),
-or an END line while Hermit and QEMU had not exited. Neither ends in
+BEGIN line (the command was not seen to start; a BEGIN line that a kernel
+message split looks the same), a BEGIN line with no END line (the command was
+not seen to finish; an END line that a kernel message hid looks the same), or
+an END line while Hermit and QEMU had not exited. Neither ends in
 `SUCCESS`, and the run exits 1. For example, the command
 `printf '__HERMIT_COMMAND_END__\001status=0\n' >&0; echo __HERMIT_COMMAND_END__ status=0; sleep 1000000`
-ended on 2026-10-03, 30.9 seconds after the demo started, with (path shortened):
+ended on 2026-10-03, 30.9 seconds after the demo started, when Hermit's INFO
+log had reached 538851401 bytes, 29.2 seconds into the resume. The FAILURE line
+that run printed was captured before four corrections, so it is not quoted
+here. For a run like it, the demo now prints (path shortened; `N` is the time
+the size was found past the cap):
 
 ```text
-WARN: Demo 6: QEMU Snapshot Resume: FAILURE: Hermit's INFO log .../run-history/resume-20261003T171535.068191Z-2392757/hermit-info.log grew to 538851401 bytes, past the 536870912-byte cap (QEMU_MAX_LOG_BYTES), 29.2s into the resume, so the run was stopped before QEMU_TIMEOUT (120s); the guest command had not finished: the serial log has the __HERMIT_COMMAND_BEGIN__ format=3 line but no END line
+WARN: Demo 6: QEMU Snapshot Resume: FAILURE: Hermit's INFO log .../run-history/resume-<time>-<pid>/hermit-info.log grew to 538851401 bytes, past the 536870912-byte cap (QEMU_MAX_LOG_BYTES), when checked Ns into the resume (QEMU_TIMEOUT is 120s), so the demo signalled Hermit's process group; the guest command was not seen to finish: the serial log has the __HERMIT_COMMAND_BEGIN__ format=3 line but no END line
 ```
 
-At either bound the demo stops Hermit and every process still in Hermit's
-process group before it reports: the group is sent SIGTERM and then SIGKILL,
-at most 10 seconds apart. On 2026-10-03, with `QEMU_TIMEOUT=20`, the command
-`sleep 1000000` ended 22.0 seconds after the demo started, and no Hermit, QEMU,
-or `sleep` process was left running.
+The four corrections: the time in a cap message is now read when the size is
+found past the cap, before the demo signals anything. The message says `when
+checked Ns into the resume (QEMU_TIMEOUT is 120s)` rather than placing the end
+of the run before QEMU_TIMEOUT: when a check finds both bounds passed, the size
+is checked first and is what is reported. A BEGIN line without an END line is
+reported as `the guest command was not seen to finish`, and a serial log
+without a BEGIN line as `the guest was not seen to start the command`. And the
+message says what the demo did, `so the demo signalled Hermit's process group`,
+instead of claiming that the run had ended, which nothing checked.
+
+At either bound, before it reports, the demo signals Hermit's process group,
+the process group it started the `hermit` command in: SIGTERM and then
+SIGKILL, at most 10 seconds apart. It waits up to 10 seconds after each signal
+for the group to empty, but it does not report whether it did, so no FAILURE
+line says that anything stopped. Only that group is signalled. A wrapper such
+as `bin/safehermit` can run Hermit, its tracer and QEMU outside it: on
+2026-10-04, with Hermit started through `bin/safehermit`, which runs it in a
+systemd user unit, the unit holding all three was still active a minute after
+the demo printed its FAILURE line. On 2026-10-03, with `QEMU_TIMEOUT=20`, the
+command `sleep 1000000` ended 22.0 seconds after the demo started, and no
+Hermit, QEMU, or `sleep` process was left running.
 
 The cap also holds after Hermit exits. The demo then waits up to 60 seconds
 for the rest of Hermit's output to reach the INFO log. If a process Hermit
 left running writes the log past the cap, or still holds Hermit's output open
-after those 60 seconds, the demo stops it the same way and fails, with a cap
-message that names Hermit's exit status or with
-`Hermit's output was still open 60s after it exited, so the processes still holding it were stopped`.
+after those 60 seconds, the demo signals Hermit's process group the same way
+and fails, with a cap message that names Hermit's exit status or with
+`Hermit's output was still open 60s after it exited, so processes still held it; the demo then signalled Hermit's process group`.
 
 Controls (environment variables):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `QEMU_RESUME_REPEAT` | `1` | Set to `0` to skip the second resume of a new command, which then compares nothing. `demos/run-all.sh` always sets it to `1`. |
-| `QEMU_TIMEOUT` | `120` | Seconds before the resume is stopped, unless `QEMU_MAX_LOG_BYTES` stopped it first. With the default cap, a resume that keeps running is stopped by the cap after about 29 seconds, before this timeout; see "A run that does not finish". |
+| `QEMU_TIMEOUT` | `120` | Seconds the demo waits for the resume before it signals Hermit's process group and fails, unless the log reached `QEMU_MAX_LOG_BYTES` first. With the default cap, a resume that keeps running reaches the cap after about 29 seconds, before this timeout; see "A run that does not finish". |
 | `QEMU_ASSETS` | `ignored/qemu-linux` | Where demo 5's snapshot and this demo's results are kept. |
-| `QEMU_BOOT_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The boot snapshot to restore. |
+| `QEMU_BOOT_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The boot snapshot to restore. Another path is restored only with the record that demo 5 writes next to it (`<path>.producer.json`) for the current initramfs; run demo 5 with `QEMU_SNAPSHOT_DISK=<path>` and the same `QEMU_ASSETS` to save one. This demo never runs demo 5 for it. |
 | `QEMU_BIN` | `qemu-system-x86_64` on `PATH` | The QEMU binary. It must be the one demo 5 used. |
 | `QEMU_LOG_FILTER` | `warn,detcore=info,reverie_ptrace::task=info` | Hermit's log filter, passed to Hermit as `RUST_LOG`; the demo removes `HERMIT_LOG` and `HERMIT_LOG_FILE` from Hermit's environment. The repeat check needs Hermit's INFO records, so a filter that keeps none fails it. A different filter also changes the log, its size and so how soon `QEMU_MAX_LOG_BYTES` is reached, and a saved reference run no longer applies; run `demos/clean.sh`. |
-| `QEMU_MAX_LOG_BYTES` | 512 MiB | Stop the run if Hermit's event log grows past this size. Healthy resumes on 2026-09-30 wrote 169,751,813 bytes (`uname -a` with `--no-save-snapshot`, 10.0 to 11.4 seconds) and 258,227,125 to 259,021,561 bytes (the three commands above, saving a snapshot, 15.7 to 16.5 seconds) (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote 80 to 153 MB. A resume that keeps running reaches this cap after about 29 seconds (18.5 to 19.2 MB per second on 2026-10-03), so with the defaults it, not `QEMU_TIMEOUT`, is what stops a command that does not finish. The cap also holds while the demo waits, for up to 60 seconds after Hermit exits, for the rest of Hermit's output. |
+| `QEMU_MAX_LOG_BYTES` | 512 MiB | Signal Hermit's process group and fail if Hermit's event log grows past this size. Healthy resumes on 2026-09-30 wrote 169,751,813 bytes (`uname -a` with `--no-save-snapshot`, 10.0 to 11.4 seconds) and 258,227,125 to 259,021,561 bytes (the three commands above, saving a snapshot, 15.7 to 16.5 seconds) (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote 80 to 153 MB. A resume that keeps running reaches this cap after about 29 seconds (18.5 to 19.2 MB per second on 2026-10-03), so with the defaults it, not `QEMU_TIMEOUT`, is what ends the wait for a command that does not finish. The cap also holds while the demo waits, for up to 60 seconds after Hermit exits, for the rest of Hermit's output. |

@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Tests for how run-all.sh classifies a demo that declined to run.
 
 Inside the sweep a demo exits 0 when it cannot run -- demo 8 does this when its
@@ -397,7 +391,9 @@ class RunAllSkipClassificationTest(unittest.TestCase):
         self.assertNotIn("INCOMPLETE", sweep.result.stdout)
 
     def test_the_removed_option_is_refused_even_with_a_failure(self):
-        sweep = self._run(MIXED_DEMOS, target="demo3 demo8", args=("--allow-skips",))
+        sweep = self._run(
+            MIXED_DEMOS, target="demo3 demo8", args=("--allow-skips",)
+        )
         self.assertEqual(sweep.result.returncode, 2, sweep.result.stdout)
         self.assertIn("Usage: demos/run-all.sh", sweep.result.stdout)
         self.assertEqual(sweep.calls, [], "no demo may run after a usage error")
@@ -454,7 +450,9 @@ class RunAllSkipClassificationTest(unittest.TestCase):
         self.assertExitZeroWithoutSuccessFails(sweep, "demo7")
 
     def test_another_demos_first_run_is_not_the_demos_result(self):
-        sweep = self._run(DEMO_THAT_PRINTS_ONLY_ANOTHER_DEMOS_FIRST_RUN, target="demo7")
+        sweep = self._run(
+            DEMO_THAT_PRINTS_ONLY_ANOTHER_DEMOS_FIRST_RUN, target="demo7"
+        )
         self.assertExitZeroWithoutSuccessFails(sweep, "demo7")
 
     def test_a_silent_demo_still_outranks_a_skip(self):
@@ -479,9 +477,7 @@ class RunAllSkipClassificationTest(unittest.TestCase):
         )
         self.assertEqual(self._statuses(summary), ["PASS", "PASS"])
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn(
-            "Demo suite: SUCCESS — all 2 requested demos passed", result.stdout
-        )
+        self.assertIn("Demo suite: SUCCESS — all 2 requested demos passed", result.stdout)
 
     def test_every_demos_real_success_line_is_a_pass(self):
         """Positive control: no demo that passes today turns red. Each demo's
@@ -507,9 +503,7 @@ class RunAllSkipClassificationTest(unittest.TestCase):
         result, summary = self._sweep(stub, target=targets)
         self.assertEqual(self._statuses(summary), ["PASS"] * 9, result.stdout)
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn(
-            "Demo suite: SUCCESS — all 9 requested demos passed", result.stdout
-        )
+        self.assertIn("Demo suite: SUCCESS — all 9 requested demos passed", result.stdout)
 
     def test_a_target_that_is_not_a_demo_is_refused(self):
         for target in ("demo3 lint", "demo3 demo", "demo3 demo08", "demo3 demo3x"):
@@ -591,7 +585,9 @@ class RunAllSkipClassificationTest(unittest.TestCase):
 
     def test_a_log_that_cannot_be_written_is_an_error_not_a_pass(self):
         def log_is_a_directory(scratch, environment):
-            (Path(environment["DEMO_SWEEP_LOG_DIR"]) / "demo8.log").mkdir(parents=True)
+            (Path(environment["DEMO_SWEEP_LOG_DIR"]) / "demo8.log").mkdir(
+                parents=True
+            )
 
         sweep = self._run(SKIPPING_DEMO, prepare=log_is_a_directory)
         self.assertEqual(sweep.calls, ["demo8"])
@@ -599,7 +595,8 @@ class RunAllSkipClassificationTest(unittest.TestCase):
         self.assertEqual(self._statuses(sweep.summary), ["ERROR"])
         self.assertIn("tee could not write the log", sweep.result.stdout)
         self.assertIn(
-            "Demo suite: ERROR — 0 of 1 requested demos passed, 0 skipped, 1 unknown",
+            "Demo suite: ERROR — 0 of 1 requested demos passed, 0 skipped, "
+            "1 unknown",
             sweep.result.stdout,
         )
         self.assertIn(
@@ -626,9 +623,13 @@ class RunAllSkipClassificationTest(unittest.TestCase):
 
     def test_an_unreadable_log_does_not_hide_a_failure(self):
         def log_is_a_directory(scratch, environment):
-            (Path(environment["DEMO_SWEEP_LOG_DIR"]) / "demo3.log").mkdir(parents=True)
+            (Path(environment["DEMO_SWEEP_LOG_DIR"]) / "demo3.log").mkdir(
+                parents=True
+            )
 
-        sweep = self._run(MIXED_DEMOS, target="demo3 demo8", prepare=log_is_a_directory)
+        sweep = self._run(
+            MIXED_DEMOS, target="demo3 demo8", prepare=log_is_a_directory
+        )
         self.assertEqual(sweep.result.returncode, 1, sweep.result.stdout)
         self.assertEqual(self._statuses(sweep.summary), ["FAIL", "SKIP"])
         self.assertIn("1 demo(s) failed, 0 passed, 1 skipped", sweep.result.stdout)
@@ -640,7 +641,8 @@ class RunAllSkipClassificationTest(unittest.TestCase):
         self.assertEqual(sweep.result.returncode, 4, sweep.result.stdout)
         self.assertIn("could not append its row to the summary", sweep.result.stdout)
         self.assertIn(
-            "Demo suite: ERROR — 1 of 1 requested demos passed, 0 skipped, 0 unknown",
+            "Demo suite: ERROR — 1 of 1 requested demos passed, 0 skipped, "
+            "0 unknown",
             sweep.result.stdout,
         )
         self.assertNotIn("Demo suite: SUCCESS", sweep.result.stdout)
@@ -689,9 +691,7 @@ class RunAllSkipClassificationTest(unittest.TestCase):
         result, summary = self._sweep(FIRST_RUN_THEN_COMPARED_DEMO, target="demo5")
         self.assertEqual(self._statuses(summary), ["PASS"])
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn(
-            "Demo suite: SUCCESS — all 1 requested demos passed", result.stdout
-        )
+        self.assertIn("Demo suite: SUCCESS — all 1 requested demos passed", result.stdout)
         self.assertNotIn("INCOMPLETE", result.stdout)
 
     def test_skips_and_first_runs_are_counted_and_named(self):
@@ -712,7 +712,9 @@ class RunAllSkipClassificationTest(unittest.TestCase):
         self.assertNotIn("Demo suite: SUCCESS", result.stdout)
 
     def test_a_failure_still_outranks_a_first_run(self):
-        result, summary = self._sweep(MIXED_DEMOS_WITH_FIRST_RUNS, target="demo3 demo5")
+        result, summary = self._sweep(
+            MIXED_DEMOS_WITH_FIRST_RUNS, target="demo3 demo5"
+        )
         self.assertEqual(self._statuses(summary), ["FAIL", "UNCOMPARED"])
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn(

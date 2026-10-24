@@ -44,7 +44,7 @@ At `2b38d8e629ee582db6a59f340b1a3c8980fd85c5` the strict run aborted (ptrace
 backend, default log level, relaxations: none):
 
 ```text
-$ timeout 10s target/release/hermit run --strict -- ./robust_futex_test
+$ timeout 10s target/release/hermit run --strict --epoch=2026-01-01T00:00:00Z -- ./robust_futex_test
 Deadlock detected: thread(s) waiting on futex, but no runnable threads left.
   turn 11, committed time 1_767_225_600.010_326_205s
   run queue: 0 runnable
@@ -71,7 +71,7 @@ alongside the existing `--stop-after-*` exits.
 A DEBUG capture makes the missing bridge explicit:
 
 ```bash
-timeout 20s target/release/hermit --log debug run --strict -- \
+timeout 20s target/release/hermit --log debug run --strict --epoch=2026-01-01T00:00:00Z -- \
   ./robust_futex_test 2>/tmp/robust-futex-owner-death-debug.log
 ```
 
@@ -97,7 +97,7 @@ on Detcore's precise waiter queue. It passes Stripped verification, not L2
 relaxations):
 
 ```text
-$ timeout 20s target/release/hermit --log error run --strict --verify \
+$ timeout 20s target/release/hermit --log error run --strict --epoch=2026-01-01T00:00:00Z --verify \
     --debug-futex-mode polling -- ./robust_futex_test
 :: Success: deterministic. Determinism verified.
 ```
@@ -109,7 +109,7 @@ On the ptrace backend, Detcore now follows Linux's `exit_robust_list()` walk
 futex model:
 
 ```text
-$ target/release/hermit run --strict -- ./robust_futex_test
+$ target/release/hermit run --strict --epoch=2026-01-01T00:00:00Z -- ./robust_futex_test
 PASS: robust mutex waiter received EOWNERDEAD
 ```
 
@@ -166,7 +166,7 @@ The ptrace backend synthesizes the configured signal when the virtual timer
 expires. With default logging and no relaxations, this command:
 
 ```sh
-target/release/hermit run --strict -- ./posix_timer_test
+target/release/hermit run --strict --epoch=2026-01-01T00:00:00Z -- ./posix_timer_test
 ```
 
 exits 0 and prints:

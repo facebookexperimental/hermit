@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 // Included only in real_random's isolated tests. Linux capability ABI v3 and
 // CAP_SYS_PTRACE=19 come from linux/capability.h; 21 is CAP_SYS_ADMIN.
 const SYS_PTRACE_CAP: u32 = 19;

@@ -76,10 +76,19 @@ use timeouts::MAX_TIMEOUT_SECONDS;
 use timeouts::MIN_TIMEOUT_SECONDS;
 use timeouts::resolve_timeout_seconds;
 
-const HERMIT_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const HERMIT_BACKENDS: [&str; 6] = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
 const NAKED_BACKENDS: [&str; 1] = ["native"];
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
-const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+// The epoch the manifest runner gives every Hermit cell: `--strict` refuses
+// an epoch drawn from the host clock.
+#[allow(dead_code)]
+#[path = "../detcore-model/src/canonical_test_epoch.rs"]
+mod canonical_test_epoch;
+const HERMIT_RUN_ENV: &str = concat!(
+    "env HERMIT_EPOCH=",
+    crate::canonical_test_epoch!(),
+    " LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\""
+);
 const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 
 fn fail(message: impl AsRef<str>) -> ! {
@@ -306,6 +315,8 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     let cell = format!("ignored/e2e-commands/work/{}", slug(id));
     let mut commands = vec![
         format!("cell={}", shell_quote(&cell)),
+        // Shell argv expansion precedes the env command below.
+        "XDG_CONFIG_HOME=\"$PWD/$cell/xdg-config\"".to_owned(),
         "hermit_bin=${HERMIT_BIN:-target/release/hermit}".to_owned(),
         "run_verify_strict=; if run_help=$(\"$hermit_bin\" run --help 2>&1); then case \"$run_help\" in *--verify-strict*) run_verify_strict=--verify-strict;; esac; fi".to_owned(),
         "record_verify_strict=; if record_help=$(\"$hermit_bin\" record start --help 2>&1); then case \"$record_help\" in *--verify-strict*) record_verify_strict=--verify-strict;; esac; fi".to_owned(),
@@ -952,6 +963,15 @@ fn build_full_command(
     } else {
         None
     };
+    // The test's `/proc` level, when it declares one, goes first among the
+    // injected flags.
+    let extra: Vec<String> = test
+        .get("proc")
+        .and_then(Value::as_str)
+        .map(|level| format!("--proc={level}"))
+        .into_iter()
+        .chain(args.passthrough.iter().cloned())
+        .collect();
     let run = if mode == "naked" {
         format!("{RUN_ENV} {guest}")
     } else {
@@ -963,7 +983,7 @@ fn build_full_command(
             &mode_args,
             verify_bitwise_parity,
             &log,
-            &args.passthrough,
+            &extra,
             &guest,
         )
     };
@@ -1042,6 +1062,56 @@ modes:
         }
         assert_eq!(output.stdout, expected);
     }
+    // Exercise this adapter's actual command constructor as well as the CI
+    // renderer: an inherited XDG path must not supply a nested argv operand.
+    let nested: Value = r#"
+direct: ["/bin/cat", "{{XDG_CONFIG_HOME}}/git/config"]
+lane: portable
+modes:
+  naked:
+    ci: false
+    backends_enabled: [native]
+"#
+    .parse()
+    .unwrap();
+    let seed = work.join("tests/e2e/xdg-config/git/config");
+    fs::create_dir_all(seed.parent().unwrap()).unwrap();
+    fs::write(&seed, "cell-private nested input\n").unwrap();
+    let ambient = work.join("ambient xdg");
+    fs::create_dir_all(ambient.join("git")).unwrap();
+    fs::write(ambient.join("git/config"), "wrong ambient input\n").unwrap();
+    let (command, _, _) = build_full_command(&nested, "fixture/nested-xdg", 15, &options);
+    for inherited in [None, Some(&ambient)] {
+        let mut process = Command::new("sh");
+        process
+            .args(["-c", &command])
+            .env("HERMIT_BIN", "/bin/false")
+            .env_remove("XDG_CONFIG_HOME")
+            .current_dir(&work);
+        if let Some(path) = inherited {
+            process.env("XDG_CONFIG_HOME", path);
+        }
+        let output = process.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"cell-private nested input\n");
+    }
+    // With both the seed and prepared copy absent, a valid ambient file
+    // cannot make the invocation succeed. This checks /bin/cat, not whether
+    // readlink/realpath reject missing or empty files.
+    fs::remove_file(seed).unwrap();
+    fs::remove_file(
+        work.join("ignored/e2e-commands/work/fixture-nested-xdg/xdg-config/git/config"),
+    )
+    .unwrap();
+    let output = Command::new("sh")
+        .args(["-c", &command])
+        .env("HERMIT_BIN", "/bin/false")
+        .env("XDG_CONFIG_HOME", &ambient)
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
     fs::remove_dir_all(work).unwrap();
 }
 
@@ -1227,7 +1297,7 @@ backends_disabled: {}
     );
     assert_eq!(
         validate_requested_backend(&outside_partition, "verify", "native", "fixture").unwrap_err(),
-        "fixture: backend `native` is invalid for mode `verify`; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+        "fixture: backend `native` is invalid for mode `verify`; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\", \"in-guest-trap\"]"
     );
     let naked_partition: Value = r#"
 backends_enabled: [native]
@@ -1272,18 +1342,8 @@ replay:
     );
     assert!(cell_guest_args(inherited_modes, "replay", "liteinst", "fixture").is_empty());
     assert!(
-        hermit_command(
-            "replay",
-            "ptrace",
-            "portable",
-            None,
-            &[],
-            false,
-            "info",
-            &[],
-            "g"
-        )
-        .contains("record start --base-env=minimal ")
+        hermit_command("replay", "ptrace", "portable", None, &[], false, "info", &[], "g")
+            .contains("record start --base-env=minimal ")
     );
     let nul_guest_args: Value = r#"
 backends_enabled: [ptrace]
@@ -1319,7 +1379,7 @@ guest_args:
     .unwrap();
     assert_eq!(
         validate_mode_guest_args(&unknown_guest_args, "verify", "fixture").unwrap_err(),
-        "fixture: modes.verify.guest_args.ptrcae names an invalid backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+        "fixture: modes.verify.guest_args.ptrcae names an invalid backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\", \"in-guest-trap\"]"
     );
     let wrong_naked_guest_args: Value = r#"
 backends_enabled: [native]
@@ -1452,7 +1512,8 @@ USAGE:
 
 FILTERS (list):
   --bucket   manifest bucket (e.g. system-utils, c-programs)
-  --backend  a backend enabled in some mode (ptrace, dbt, kvm, sabre, liteinst, native)
+  --backend  a backend enabled in some mode (ptrace, dbt, kvm, sabre, liteinst, in-guest-trap,
+             native)
   --tag      a `requires` capability token (e.g. python3, bash, kvm, cpuid)
   --mode     verify | naked | replay | chaos | custom
   --lane     portable | privileged

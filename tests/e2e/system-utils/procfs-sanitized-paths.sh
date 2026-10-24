@@ -91,6 +91,24 @@ self_test() {
         return 1
     }
 
+    # A CPU without AVX-512 has an empty arch_status: accepted, as nothing
+    # leaks. A positive elapsed time is still refused.
+    populate_fixture "$work/root"
+    : >"$work/root/proc/self/arch_status"
+    "$work/probe" --fixture-root "$work/root" >/dev/null || {
+        echo 'procfs-sanitized-paths self-test refused an empty arch_status (a CPU without AVX-512)' >&2
+        return 1
+    }
+    printf 'AVX512_elapsed_ms:\t17\n' >"$work/root/proc/self/arch_status"
+    if output=$("$work/probe" --fixture-root "$work/root" 2>&1); then
+        echo 'procfs-sanitized-paths self-test accepted a positive AVX-512 elapsed time' >&2
+        return 1
+    fi
+    [[ $output == *'self-arch-status retained positive AVX-512 elapsed time'* ]] || {
+        printf 'procfs-sanitized-paths self-test got the wrong arch_status failure: %s\n' "$output" >&2
+        return 1
+    }
+
     populate_fixture "$work/root"
     if output=$(PROCFS_PROBE_MUTATE_LABEL=loadavg "$work/probe" --fixture-root "$work/root" 2>&1); then
         echo 'procfs-sanitized-paths self-test accepted an unstable fixed snapshot' >&2

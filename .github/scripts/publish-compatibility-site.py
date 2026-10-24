@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Validate and assemble release-pinned compatibility-site publications.
 
 This standard-library Python is a semantic-preserving extraction of the
@@ -13,6 +7,7 @@ would be a separate behavior change and is deliberately not part of this fix.
 """
 
 import hashlib
+import html
 import json
 import os
 import re
@@ -20,7 +15,9 @@ import stat
 import subprocess
 import sys
 import tarfile
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from zoneinfo import ZoneInfo
 
 
 def refuse(message: str) -> None:
@@ -61,6 +58,21 @@ BOOTSTRAP_PIN_SHA256 = {
 }
 RELEASE_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 DIRECTORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+UTC_TIMESTAMP_PATTERN = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
+# The builder config states this rule in words beside its numbers. The words
+# must match the rule implemented by retention_plan below.
+RETENTION_FIELDS = {"budget_bytes", "max_builds", "not_before", "rule"}
+RETENTION_RULE = (
+    "Keep the newest N builds published at or after not_before, where "
+    "N = min(max_builds, floor(budget_bytes / file_bytes of the latest build)), "
+    "and at least 1. The latest build is always kept and counts toward N. "
+    "Every build stays downloadable as its GitHub release asset."
+)
+BUILDS_DIRECTORY = "builds"
+REGISTRY_FILE = "releases.json"
 
 
 def is_hex_digest(value: object) -> bool:
@@ -365,13 +377,16 @@ if MODE == "extract":
     EXPECTED_COUNTS = PIN["counts"]
 elif MODE not in (
     "finalize",
+    "retain",
     "validate",
     "describe",
     "validate-update",
     "select-registry",
+    "check-retention",
 ):
     refuse(
-        "expected validate, validate-update, select-registry, describe, extract, or finalize mode"
+        "expected validate, validate-update, select-registry, describe, extract, "
+        "check-retention, retain, or finalize mode"
     )
 
 
@@ -525,17 +540,237 @@ def copy_regular_tree(source_root: Path, destination_root: Path) -> None:
         os.chmod(destination, source_mode, follow_symlinks=False)
 
 
-def finalize_publication(registry: dict, publication_root: Path) -> None:
+def reject_duplicate_config_key(pairs: list[tuple[str, object]]) -> dict:
+    value = {}
+    for key, member in pairs:
+        if key in value:
+            refuse(f"builder config contains duplicate object key {key!r}")
+        value[key] = member
+    return value
+
+
+def parse_utc_timestamp(value: object, source: str) -> datetime:
+    if not isinstance(value, str) or UTC_TIMESTAMP_PATTERN.fullmatch(value) is None:
+        refuse(f"{source} is not a UTC timestamp like 2026-10-04T08:00:00Z")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        refuse(f"{source} is not a valid UTC timestamp: {error}")
+    return parsed.replace(tzinfo=timezone.utc)
+
+
+def load_retention(path: Path) -> dict:
+    try:
+        config = json.loads(
+            path.read_bytes(), object_pairs_hook=reject_duplicate_config_key
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        refuse(f"cannot read builder config {path}: {error}")
+    retention = config.get("retention") if isinstance(config, dict) else None
+    if not isinstance(retention, dict) or set(retention) != RETENTION_FIELDS:
+        refuse("builder config retention fields are not exact")
+    if retention["rule"] != RETENTION_RULE:
+        refuse("builder config retention rule is not the rule this publisher applies")
+    for field in ("budget_bytes", "max_builds"):
+        value = retention[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            refuse(f"builder config retention {field} is not a positive integer")
+    parse_utc_timestamp(retention["not_before"], "builder config retention not_before")
+    return retention
+
+
+def load_release_dates(registry: dict, metadata_root: Path) -> dict[str, str]:
+    """Read each pin's GitHub release publication time, bound to its tag."""
+    if not metadata_root.is_dir() or metadata_root.is_symlink():
+        refuse("release metadata root is not a regular directory")
+    published = {}
+    for pin in registry["releases"]:
+        path = metadata_root / f"{pin['identity']}.json"
+        try:
+            release = json.loads(path.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            refuse(f"cannot read release metadata for {pin['identity']}: {error}")
+        if (
+            not isinstance(release, dict)
+            or release.get("tag_name") != pin["tag"]
+            or release.get("name") != pin["release_title"]
+            or release.get("draft") is not False
+            or release.get("prerelease") is not False
+        ):
+            refuse(f"release metadata disagrees with the pin {pin['identity']}")
+        value = release.get("published_at")
+        parse_utc_timestamp(value, f"release {pin['tag']} published_at")
+        published[pin["identity"]] = value
+    return published
+
+
+def retention_plan(
+    registry: dict, metadata_root: Path, retention: dict
+) -> tuple[int, list[tuple[int, dict, str]]]:
+    """Return N and the kept (registry index, pin, published_at), newest first."""
+    published = load_release_dates(registry, metadata_root)
     releases = registry["releases"]
-    identities = [pin["identity"] for pin in releases]
     latest_identity = registry["latest_identity"]
+    latest_index = next(
+        index for index, pin in enumerate(releases) if pin["identity"] == latest_identity
+    )
+    latest_pin = releases[latest_index]
+    limit = max(
+        1,
+        min(
+            retention["max_builds"],
+            retention["budget_bytes"] // latest_pin["file_bytes"],
+        ),
+    )
+    # Fixed-width UTC timestamps order correctly as strings; identity breaks ties.
+    eligible = sorted(
+        (
+            index
+            for index, pin in enumerate(releases)
+            if pin["identity"] != latest_identity
+            and published[pin["identity"]] >= retention["not_before"]
+        ),
+        key=lambda index: (published[releases[index]["identity"]], releases[index]["identity"]),
+        reverse=True,
+    )
+    kept = [latest_index, *eligible[: limit - 1]]
+    kept.sort(
+        key=lambda index: (published[releases[index]["identity"]], releases[index]["identity"]),
+        reverse=True,
+    )
+    return limit, [
+        (index, releases[index], published[releases[index]["identity"]])
+        for index in kept
+    ]
+
+
+def eastern_time(value: str) -> str:
+    moment = parse_utc_timestamp(value, "publication time")
+    try:
+        zone = ZoneInfo("America/New_York")
+    except Exception as error:  # zoneinfo raises several types for missing data
+        refuse(f"cannot load the America/New_York time zone: {error}")
+    return moment.astimezone(zone).strftime("%Y-%m-%d %H:%M ET")
+
+
+def megabytes(value: int) -> str:
+    return f"{value / 1_000_000:.1f} MB"
+
+
+def build_hermit_main_commit(tree: Path, pin: dict) -> str | None:
+    """Read the Hermit main commit a build recorded, from its verified build.json."""
+    build_bytes = (tree / "build.json").read_bytes()
+    if hashlib.sha256(build_bytes).hexdigest() != pin["build_sha256"]:
+        refuse(f"retained build.json disagrees with its pin {pin['identity']}")
+    build = json.loads(build_bytes)
+    provenance = build.get("provenance") if isinstance(build, dict) else None
+    value = provenance.get("hermit_main_commit") if isinstance(provenance, dict) else None
+    if isinstance(value, str) and COMMIT_PATTERN.fullmatch(value):
+        return value
+    return None
+
+
+def builds_index_html(
+    registry: dict,
+    retention: dict,
+    limit: int,
+    kept: list[tuple[int, dict, str]],
+    commits: dict[str, str | None],
+) -> bytes:
+    repository = registry["release_repository"]
+    latest_identity = registry["latest_identity"]
+    latest_pin = next(
+        pin for _, pin, _ in kept if pin["identity"] == latest_identity
+    )
+    escape = html.escape
+    rows = []
+    for _, pin, published in kept:
+        identity = pin["identity"]
+        commit = commits[identity]
+        commit_cell = (
+            f'<a href="https://github.com/{escape(repository)}/commit/{commit}">'
+            f"<code>{commit[:12]}</code></a>"
+            if commit
+            else "not recorded"
+        )
+        marker = " (latest)" if identity == latest_identity else ""
+        rows.append(
+            "<tr>"
+            f"<td>{escape(eastern_time(published))}</td>"
+            f"<td>{commit_cell}</td>"
+            f'<td class="number">{escape(megabytes(pin["file_bytes"]))}</td>'
+            f'<td class="number">{pin["file_count"]:,}</td>'
+            f'<td><a href="../{identity}/"><code>{identity[:12]}</code></a>{marker}</td>'
+            f'<td><a href="https://github.com/{escape(repository)}/releases/tag/'
+            f'{escape(pin["tag"])}">release</a></td>'
+            "</tr>"
+        )
+    kept_bytes = sum(pin["file_bytes"] for _, pin, _ in kept)
+    if len(kept) == 1:
+        holding = (
+            "This site keeps 1 compatibility website build. It is a complete copy "
+            "of the website as it was published, and it holds "
+            f"{escape(megabytes(kept_bytes))}."
+        )
+    else:
+        holding = (
+            f"This site keeps {len(kept)} compatibility website builds, newest "
+            "first. Each one is a complete copy of the website as it was "
+            f"published, and together they hold {escape(megabytes(kept_bytes))}."
+        )
+    page = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermit compatibility website builds</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 64rem; padding: 0 1rem; line-height: 1.5; color: #1f2328; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th, td {{ border-bottom: 1px solid #d0d7de; padding: 0.4rem 0.6rem; text-align: left; }}
+td.number {{ text-align: right; }}
+code {{ font-size: 0.95em; }}
+</style>
+</head>
+<body>
+<p><a href="../../">Hermetic Infra</a> &middot; <a href="../latest/">Latest compatibility scorecard</a></p>
+<h1>Compatibility website builds</h1>
+<p>{holding}</p>
+<p>Retention rule: {escape(retention["rule"])}</p>
+<p>Here the budget is {escape(megabytes(retention["budget_bytes"]))}, max_builds is {retention["max_builds"]}, and the latest build holds {escape(megabytes(latest_pin["file_bytes"]))}, so N = {limit}. N uses only the latest build's size, so the kept builds together can hold more or less than the budget, and the extra <a href="../latest/">latest</a> copy of the newest build is not counted. Apart from the latest build, builds published before {escape(eastern_time(retention["not_before"]))} are not kept here.</p>
+<p>All {len(registry["releases"])} builds, including those not kept here, are listed in <a href="../{REGISTRY_FILE}">{REGISTRY_FILE}</a> and stay downloadable from <a href="https://github.com/{escape(repository)}/releases">the GitHub releases</a>.</p>
+<table>
+<thead><tr><th>Published</th><th>Hermit main</th><th>Size</th><th>Files</th><th>Build</th><th>Release</th></tr></thead>
+<tbody>
+{chr(10).join(rows)}
+</tbody>
+</table>
+</body>
+</html>
+"""
+    return page.encode()
+
+
+def finalize_publication(
+    registry: dict,
+    publication_root: Path,
+    metadata_root: Path,
+    retention: dict,
+) -> tuple[int, list[tuple[int, dict, str]]]:
+    latest_identity = registry["latest_identity"]
+    limit, kept = retention_plan(registry, metadata_root, retention)
+    kept_pins = [pin for _, pin, _ in kept]
+    identities = sorted(pin["identity"] for pin in kept_pins)
     if not publication_root.is_dir() or publication_root.is_symlink():
         refuse("compatibility publication root is not a regular directory")
     observed_children = sorted(path.name for path in publication_root.iterdir())
     if observed_children != identities:
-        refuse("retained publication paths do not exactly match the release registry")
+        refuse(
+            "retained publication paths do not exactly match the release "
+            "registry's retention plan"
+        )
 
-    for pin in releases:
+    for pin in kept_pins:
         verify_pinned_tree(publication_root / pin["identity"], pin)
 
     pinned_latest = publication_root / latest_identity
@@ -551,11 +786,31 @@ def finalize_publication(registry: dict, publication_root: Path) -> None:
         [*identities, "latest"]
     ):
         refuse("final publication path inventory is not exact")
-    # Nightly publication extends the same immutable registry. Retain it beside
-    # the trees so the next rebuild cannot erase an earlier nightly identity.
-    registry_path = publication_root / "releases.json"
+    commits = {
+        pin["identity"]: build_hermit_main_commit(
+            publication_root / pin["identity"], pin
+        )
+        for pin in kept_pins
+    }
+    # Nightly publication extends the same immutable registry. Publish all of
+    # it beside the kept trees so the next rebuild cannot erase an earlier
+    # nightly identity, including builds this site no longer serves.
+    registry_path = publication_root / REGISTRY_FILE
     registry_path.write_bytes(canonical(registry) + b"\n")
     registry_path.chmod(0o444)
+    builds = publication_root / BUILDS_DIRECTORY
+    builds.mkdir(mode=0o700)
+    index_path = builds / "index.html"
+    index_path.write_bytes(
+        builds_index_html(registry, retention, limit, kept, commits)
+    )
+    index_path.chmod(0o444)
+    builds.chmod(0o555)
+    if sorted(path.name for path in publication_root.iterdir()) != sorted(
+        [*identities, "latest", REGISTRY_FILE, BUILDS_DIRECTORY]
+    ):
+        refuse("final publication path inventory is not exact")
+    return limit, kept
 
 
 if MODE == "describe":
@@ -633,13 +888,48 @@ if MODE == "validate":
     raise SystemExit(0)
 
 
-if MODE == "finalize":
-    if len(sys.argv) != 4:
-        refuse("finalize mode requires release-pin and publication-root paths")
+if MODE == "check-retention":
+    # The rebuild adapter asks here before an expensive rebuild, so one
+    # function decides what retention settings are acceptable.
+    if len(sys.argv) != 3:
+        refuse("check-retention mode requires one builder-config path")
+    load_retention(Path(sys.argv[2]))
+    print("builder config retention is the rule this publisher applies")
+    raise SystemExit(0)
+
+
+if MODE == "retain":
+    if len(sys.argv) != 5:
+        refuse(
+            "retain mode requires release-pin, release-metadata, and builder-config paths"
+        )
     registry = load_registry(Path(sys.argv[2]))
-    finalize_publication(registry, Path(sys.argv[3]))
+    retention = load_retention(Path(sys.argv[4]))
+    limit, kept = retention_plan(registry, Path(sys.argv[3]), retention)
     print(
-        f"verified {len(registry['releases'])} retained compatibility websites; "
+        f"keeping {len(kept)} of {len(registry['releases'])} compatibility websites "
+        f"(N = {limit}); every release asset stays published",
+        file=sys.stderr,
+    )
+    for index, pin, _ in kept:
+        print(f"{index} {pin['identity']}")
+    raise SystemExit(0)
+
+
+if MODE == "finalize":
+    if len(sys.argv) != 6:
+        refuse(
+            "finalize mode requires release-pin, publication-root, release-metadata, "
+            "and builder-config paths"
+        )
+    registry = load_registry(Path(sys.argv[2]))
+    retention = load_retention(Path(sys.argv[5]))
+    limit, kept = finalize_publication(
+        registry, Path(sys.argv[3]), Path(sys.argv[4]), retention
+    )
+    print(
+        f"verified {len(kept)} retained compatibility websites of "
+        f"{len(registry['releases'])} released (N = {limit}); "
         f"latest is {registry['latest_identity']}"
     )
     raise SystemExit(0)

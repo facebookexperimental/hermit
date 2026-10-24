@@ -61,12 +61,51 @@ pub(crate) struct MemoryMetadata {
     /// The guest's most recently observed program break.
     #[serde(default)]
     brk_current: Option<u64>,
+    /// Detcore's model of the program break, where Detcore answers `brk(2)`
+    /// itself ([`BrkModel`]); `None` elsewhere, and where the image's layout
+    /// could not be read.
+    #[serde(default)]
+    pub(crate) brk_model: Option<BrkModel>,
+    /// Why there is no [`BrkModel`] where Detcore answers `brk(2)` itself
+    /// (`Detcore::handle_brk` refuses a brk by this name).
+    #[serde(default)]
+    pub(crate) brk_unmodeled: Option<String>,
+}
+
+/// Detcore's model of a process's program break: where Linux starts it for
+/// the image the process exec'd (`crate::exec_record::ElfLayout`) and where
+/// it stands now. Detcore keeps one, and answers `brk(2)` from it, only where
+/// the run declares a launcher, whose break the kernel's is
+/// (`Detcore::handle_brk`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BrkModel {
+    /// `mm->start_brk`.
+    pub(crate) start: u64,
+    /// `mm->brk`, as `brk(2)` last set it (not page-aligned).
+    pub(crate) current: u64,
+    /// `mm->end_data - mm->start_data`
+    /// (`crate::exec_record::ElfLayout::data_span`).
+    pub(crate) data_span: u64,
+    /// The kernel's break when the model was made, the launcher's: what a
+    /// libc that queried the break before Detcore's first callback holds
+    /// as the guest's (`Detcore::handle_brk`).
+    pub(crate) launcher_break: u64,
 }
 
 impl MemoryMetadata {
     /// Create an empty address-space model.
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Inspect the actual replacement model without erasing old observations.
+    pub(crate) fn is_fresh_for_native_exec(&self) -> bool {
+        self.next_anonymous_sequence == 0
+            && self.shared_mappings.is_empty()
+            && self.brk_start.is_none()
+            && self.brk_current.is_none()
+            && self.brk_model.is_none()
+            && self.brk_unmodeled.is_none()
     }
 
     /// Record a program break reported by a `brk(2)` return.
@@ -91,8 +130,15 @@ impl MemoryMetadata {
     /// belongs to the loader, the kernel tags nothing, and the guest's heap is
     /// an ordinary anonymous mapping. Binding to the observed break keeps the
     /// heap identifiable on every backend.
+    ///
+    /// Where Detcore models the break, the heap is the model's: its start is
+    /// known before any brk returns, which the first observation is not when
+    /// the guest's first brk already grows the break.
     pub(crate) fn brk_heap_range(&self) -> Option<(u64, u64)> {
-        let (start, current) = (self.brk_start?, self.brk_current?);
+        let (start, current) = match self.brk_model {
+            Some(model) => (model.start, model.current),
+            None => (self.brk_start?, self.brk_current?),
+        };
         (current > start).then_some((start, current))
     }
 
@@ -203,12 +249,18 @@ impl MemoryMetadata {
     }
 
     /// Move or resize a mapping after a successful `mremap`.
+    /// Record a successful `mremap` from `old_start` to `new_start`. The new
+    /// range keeps the source's backing object and offset. The source range
+    /// is dropped unless `keep_source` (`MREMAP_DONTUNMAP`), with which Linux
+    /// leaves the old mapping in place (mm/mremap.c), so both ranges then
+    /// alias the same object.
     pub(crate) fn remap(
         &mut self,
         old_start: usize,
         old_len: usize,
         new_start: usize,
         new_len: usize,
+        keep_source: bool,
     ) {
         let old_len = page_aligned_len(old_len);
         let new_len = page_aligned_len(new_len);
@@ -224,7 +276,9 @@ impl MemoryMetadata {
                     .then_some((mapping.object, mapping.offset_at(mapping_start, old_start)))
             });
 
-        self.unmap(old_start, old_len);
+        if !keep_source {
+            self.unmap(old_start, old_len);
+        }
         self.unmap(new_start, new_len);
         if let Some((object, object_offset)) = source {
             self.insert_mapping(new_start, new_len, object, object_offset);
@@ -235,6 +289,29 @@ impl MemoryMetadata {
 #[cfg(test)]
 mod brk_tests {
     use super::*;
+
+    #[test]
+    fn native_exec_fresh_memory_requires_sequence_mappings_and_brk_to_be_empty() {
+        let owner = crate::types::DetTid::from_raw(42);
+        let mut memory = MemoryMetadata::new();
+        assert!(memory.is_fresh_for_native_exec());
+        memory.map_anonymous(MmId::initial(owner), 0x5000, 0x1000);
+        assert!(!memory.is_fresh_for_native_exec());
+        memory.unmap(0x5000, 0x1000);
+        assert!(memory.shared_mappings.is_empty());
+        assert!(
+            !memory.is_fresh_for_native_exec(),
+            "the old allocator sequence remains"
+        );
+        let mut brk = MemoryMetadata::new();
+        brk.observe_brk(0x405000);
+        assert_eq!(brk.brk_heap_range(), None);
+        assert!(
+            !brk.is_fresh_for_native_exec(),
+            "even an unexpanded old heap has observations"
+        );
+        assert!(MemoryMetadata::new().is_fresh_for_native_exec());
+    }
 
     #[test]
     fn brk_range_tracks_the_observed_program_break() {
@@ -263,6 +340,26 @@ mod brk_tests {
 
         // Back to the base means an empty heap again, not an inverted range.
         mm.observe_brk(0x405000);
+        assert_eq!(mm.brk_heap_range(), None);
+    }
+
+    #[test]
+    fn a_modeled_heap_is_the_models_from_the_first_growth() {
+        // A guest whose first brk grows the break: the observations alone
+        // would take its result as the base and report no heap.
+        let mut mm = MemoryMetadata::new();
+        mm.brk_model = Some(BrkModel {
+            start: 0x405000,
+            current: 0x426000,
+            data_span: 0x1000,
+            launcher_break: 0x555555580000,
+        });
+        mm.observe_brk(0x426000);
+        assert_eq!(mm.brk_heap_range(), Some((0x405000, 0x426000)));
+        mm.brk_model = Some(BrkModel {
+            current: 0x405000,
+            ..mm.brk_model.unwrap()
+        });
         assert_eq!(mm.brk_heap_range(), None);
     }
 
@@ -354,12 +451,26 @@ mod tests {
 
         mappings.map_anonymous(mm(10), 0x5000, 0x1000);
         let before_remap = mappings.futex_id(mm(10), 0x5010);
-        mappings.remap(0x5000, 0x1000, 0x9000, 0x1000);
+        mappings.remap(0x5000, 0x1000, 0x9000, 0x1000, false);
         assert_eq!(
             before_remap,
             mappings.futex_id(mm(10), 0x9010),
             "mremap must retain the backing-object offset"
         );
         assert_ne!(original, before_remap);
+    }
+
+    /// `MREMAP_DONTUNMAP` leaves the old mapping in place, so the old and new
+    /// ranges both resolve to the same backing object
+    /// (https://github.com/rrnewton/hermit/pull/4020).
+    #[test]
+    fn a_dontunmap_remap_keeps_both_aliases_of_the_object() {
+        let mut mappings = MemoryMetadata::new();
+        mappings.map_anonymous(mm(10), 0x5000, 0x1000);
+        let before = mappings.futex_id(mm(10), 0x5010);
+        mappings.remap(0x5000, 0x1000, 0x9000, 0x1000, true);
+        assert!(matches!(before, FutexID::Shared { .. }));
+        assert_eq!(mappings.futex_id(mm(10), 0x5010), before);
+        assert_eq!(mappings.futex_id(mm(10), 0x9010), before);
     }
 }

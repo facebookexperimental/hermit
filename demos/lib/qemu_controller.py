@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Run QEMU plus its serial/QMP controller inside Hermit's boundary."""
 
 import argparse
+from pathlib import Path
 import re
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
 
 from demo_common import qmp_command, stop_process, wait_for_socket
@@ -63,6 +57,19 @@ CONSOLE_LINE_MARK = b"[console] "
 # marker, and format 2 printed "format=2". Only whole lines count, so a kernel
 # message printed onto the end of the current BEGIN line does not look stale.
 STALE_BEGIN_RE = re.compile(re.escape(BEGIN_MARKER.encode()) + rb"(?: format=[0-9]+)?")
+# A whole BEGIN line of some /init, then at once a kernel message, which starts
+# with "[" (the console may already have sent the CR that goes before the
+# line's LF). The current /init sends CR LF right after "format=3", so only an
+# /init with another frame format prints a line starting with the bare marker
+# and CR, or with "format=N" where N is not 3, before the "[". Any other split
+# BEGIN line, such as "...BEGIN__[", "format=[" or "format=3[", can be the
+# current BEGIN line split by a kernel message; it is ignored, the frame then
+# never starts, and the run stops at a bound. What keeps an older /init out of
+# a resume is that demo 6 restores only a boot snapshot booted from the current
+# initramfs (verify_boot_snapshot in demo_common).
+STALE_BEGIN_PREFIX_RE = re.compile(
+    re.escape(BEGIN_MARKER.encode()) + rb"(?: format=([0-9]+)\r?|\r)\["
+)
 # The guest kernel's command line, for the boot and for every restore of the
 # boot snapshot. printk.time=1 makes the kernel start every line it prints with
 # a "[seconds]" timestamp, whatever its configuration, so no kernel line can
@@ -127,14 +134,15 @@ class CommandTranscriptParser:
     CR before the LF is removed and any other CR is kept.
 
     Lines before BEGIN_LINE are ignored, except a whole line matching
-    STALE_BEGIN_RE, the BEGIN line of an /init with another frame format, which
-    raises StaleGuestInitError at once. After BEGIN_LINE, a line starting with
-    OUTPUT_PREFIX is a line of the command's output, a line that is exactly an
-    END line ends the frame, and any other line, including an END line of an
-    older frame format or a bare END_MARKER, is kept in the output after
-    CONSOLE_LINE_MARK and listed in console_lines, so it is shown and compared
-    rather than dropped. Frame lines match only as whole lines. Do not feed a
-    parser again after it has raised.
+    STALE_BEGIN_RE, the BEGIN line of an /init with another frame format, and a
+    line in which a kernel message follows such a BEGIN line
+    (STALE_BEGIN_PREFIX_RE); either raises StaleGuestInitError at once. After
+    BEGIN_LINE, a line starting with OUTPUT_PREFIX is a line of the command's
+    output, a line that is exactly an END line ends the frame, and any other
+    line, including an END line of an older frame format or a bare END_MARKER,
+    is kept in the output after CONSOLE_LINE_MARK and listed in console_lines,
+    so it is shown and compared rather than dropped. Frame lines match only as
+    whole lines. Do not feed a parser again after it has raised.
     """
 
     def __init__(self) -> None:
@@ -171,8 +179,21 @@ class CommandTranscriptParser:
         if not self._started:
             if line == BEGIN_LINE:
                 self._started = True
-            elif STALE_BEGIN_RE.fullmatch(line):
+                return
+            if STALE_BEGIN_RE.fullmatch(line):
                 raise StaleGuestInitError(stale_guest_init_message(line))
+            interrupted = STALE_BEGIN_PREFIX_RE.match(line)
+            if interrupted is None:
+                return
+            frame_format = interrupted.group(1)
+            if frame_format is None:
+                raise StaleGuestInitError(
+                    stale_guest_init_message(line[: len(BEGIN_MARKER)])
+                )
+            if frame_format != str(COMMAND_FRAME_FORMAT).encode():
+                raise StaleGuestInitError(
+                    stale_guest_init_message(line[: interrupted.end(1)])
+                )
             return
         if line.startswith(OUTPUT_PREFIX):
             self._output.extend(line[len(OUTPUT_PREFIX) :] + b"\n")

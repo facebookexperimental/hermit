@@ -1,0 +1,29 @@
+{
+  "name": "hermit-debug",
+  "displayName": "Hermit Debug (prototype)",
+  "publisher": "hermit-dev",
+  "version": "0.0.1",
+  "engines": {"vscode": "^1.80.0"},
+  "main": "./extension.js",
+  "activationEvents": ["onDebug"],
+  "contributes": {
+    "debuggers": [{
+      "type": "hermit",
+      "label": "Hermit",
+      "configurationAttributes": {
+        "attach": {
+          "required": ["program", "target"],
+          "properties": {
+            "program": {"type": "string", "description": "Guest executable with debug information"},
+            "target": {"type": "string", "description": "Hermit GDB server address", "default": "127.0.0.1:1234"},
+            "port": {"type": "number", "description": "Connect to a running `hermit-dap --listen` or `hermit replay --dap-listen` on this port instead of starting hermit-dap"},
+            "replay": {"type": "string", "description": "Recording ID: hermit-dap manages the replay and supports Step Back"},
+            "dataDir": {"type": "string"},
+            "gdbserverPort": {"type": "number", "default": 1234},
+            "dapPath": {"type": "string", "default": "hermit-dap"}
+          }
+        }
+      }
+    }]
+  }
+}

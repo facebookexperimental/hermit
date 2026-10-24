@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Concurrency tests for the demo 5 atomic anchor claim.
 
 These exercise the primitive that makes ``05-qemu-boot.py`` safe to run in 2+
@@ -184,11 +178,9 @@ class ConcurrentAnchorTest(unittest.TestCase):
 
         # Exactly one boot-anchor exists; losers landed in run-history.
         self.assertEqual(len(list(assets.glob("boot-anchor"))), 1)
-        history = (
-            list((assets / "run-history").glob("boot-*"))
-            if (assets / "run-history").is_dir()
-            else []
-        )
+        history = list((assets / "run-history").glob("boot-*")) if (
+            assets / "run-history"
+        ).is_dir() else []
         self.assertEqual(len(history), len(losers))
         return winners, losers
 
@@ -197,7 +189,9 @@ class ConcurrentAnchorTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 assets = Path(tmp) / "qemu-linux"
                 outcomes = _run_race(assets, count, divergent=False)
-                _winners, losers = self._assert_single_complete_anchor(assets, outcomes)
+                _winners, losers = self._assert_single_complete_anchor(
+                    assets, outcomes
+                )
                 for loser in losers:
                     self.assertTrue(
                         loser["passed"],
@@ -209,7 +203,9 @@ class ConcurrentAnchorTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 assets = Path(tmp) / "qemu-linux"
                 outcomes = _run_race(assets, count, divergent=True)
-                _winners, losers = self._assert_single_complete_anchor(assets, outcomes)
+                _winners, losers = self._assert_single_complete_anchor(
+                    assets, outcomes
+                )
                 for loser in losers:
                     self.assertFalse(
                         loser["passed"],
@@ -253,7 +249,8 @@ class InfoLogAdmissionTest(unittest.TestCase):
 
     def test_logs_that_differ_only_in_the_wallclock_prefix_match(self):
         body = (
-            "INFO detcore: launcher read FileContents(DetInode(4)) at 0x7fffffffa210\n"
+            "INFO detcore: launcher read FileContents(DetInode(4)) "
+            "at 0x7fffffffa210\n"
         )
         with tempfile.TemporaryDirectory() as tmp:
             passed, report = self._compare_logs(
@@ -292,10 +289,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
 
                 self.assertFalse(passed, "a changed resource id must fail the repeat")
                 self.assertTrue(
-                    any(
-                        "canonical repeat verification failed" in entry
-                        for entry in report
-                    ),
+                    any("canonical repeat verification failed" in entry for entry in report),
                     report,
                 )
 
@@ -393,9 +387,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
                 passed, "the same input must print the same guest addresses"
             )
             self.assertTrue(
-                any(
-                    "canonical repeat verification failed" in entry for entry in report
-                ),
+                any("canonical repeat verification failed" in entry for entry in report),
                 report,
             )
 
@@ -410,8 +402,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
             )
 
             self.assertFalse(
-                passed,
-                "one guest address moving to an unrelated value is a real change",
+                passed, "one guest address moving to an unrelated value is a real change"
             )
 
     def test_two_guest_addresses_moved_to_fresh_values_are_refused(self):
@@ -423,8 +414,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
             )
 
             self.assertFalse(
-                passed,
-                "two guest addresses moving to unrelated values is a real change",
+                passed, "two guest addresses moving to unrelated values is a real change"
             )
 
     def test_two_guest_addresses_swapped_everywhere_are_refused(self):
@@ -626,8 +616,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
                 report,
             )
             self.assertFalse(
-                any(entry.startswith("PASS: Hermit INFO log") for entry in report),
-                report,
+                any(entry.startswith("PASS: Hermit INFO log") for entry in report), report
             )
 
     def test_identical_logs_without_an_info_record_are_refused(self):
@@ -655,8 +644,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
                     report,
                 )
             self.assertFalse(
-                any(entry.startswith("PASS: Hermit INFO log") for entry in report),
-                report,
+                any(entry.startswith("PASS: Hermit INFO log") for entry in report), report
             )
 
     def test_an_empty_current_log_is_refused_beside_a_full_first_run(self):
@@ -665,9 +653,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
 
             self.assertFalse(passed)
             self.assertTrue(
-                any(
-                    "canonical repeat verification failed" in entry for entry in report
-                ),
+                any("canonical repeat verification failed" in entry for entry in report),
                 report,
             )
             self.assertTrue(
@@ -680,10 +666,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
                 report,
             )
             self.assertFalse(
-                any(
-                    "the first-run Hermit INFO log holds no" in entry
-                    for entry in report
-                ),
+                any("the first-run Hermit INFO log holds no" in entry for entry in report),
                 report,
             )
 
@@ -784,22 +767,14 @@ class InfoLogAdmissionTest(unittest.TestCase):
     # The logs are compared as bytes, a line ending only at a newline byte.
 
     def test_bytes_that_are_not_utf8_are_compared(self):
-        anchor = (
-            BASE_LOG.encode()
-            + b"2026-08-17T04:27:14.000004Z  INFO detcore: read \xff\n"
-        )
-        current = (
-            BASE_LOG.encode()
-            + b"2026-08-17T04:29:10.000004Z  INFO detcore: read \xfe\n"
-        )
+        anchor = BASE_LOG.encode() + b"2026-08-17T04:27:14.000004Z  INFO detcore: read \xff\n"
+        current = BASE_LOG.encode() + b"2026-08-17T04:29:10.000004Z  INFO detcore: read \xfe\n"
         with tempfile.TemporaryDirectory() as tmp:
             passed, report = self._compare_log_bytes(tmp, anchor, current)
 
             self.assertFalse(passed, "\\xff and \\xfe are different bytes")
             self.assertTrue(
-                any(
-                    "canonical repeat verification failed" in entry for entry in report
-                ),
+                any("canonical repeat verification failed" in entry for entry in report),
                 report,
             )
 
@@ -864,10 +839,9 @@ class RunMetadataContractTest(unittest.TestCase):
             info_log.write_text("INFO deterministic run\n")
             qcow2.write_bytes(b"qcow2")
             serial_log.write_text("serial\n")
-            with (
-                mock.patch.object(dc, "_tool_version", return_value="test-version"),
-                mock.patch.object(dc, "_tool_sha256", return_value="b" * 64),
-            ):
+            with mock.patch.object(
+                dc, "_tool_version", return_value="test-version"
+            ), mock.patch.object(dc, "_tool_sha256", return_value="b" * 64):
                 metadata = dc.save_metadata(
                     run,
                     qcow2,
@@ -897,10 +871,9 @@ class RunMetadataContractTest(unittest.TestCase):
             qcow2.write_bytes(b"qcow2")
             serial_log.write_text("serial\n")
             missing_qemu = run / "missing-qemu"
-            with (
-                mock.patch.object(dc, "_tool_version", return_value="test-version"),
-                mock.patch.dict(dc.os.environ, {"QEMU_BIN": str(missing_qemu)}),
-            ):
+            with mock.patch.object(
+                dc, "_tool_version", return_value="test-version"
+            ), mock.patch.dict(dc.os.environ, {"QEMU_BIN": str(missing_qemu)}):
                 with self.assertRaisesRegex(
                     ValueError, "qemu-run-metadata-qemu_binary_sha256"
                 ):
@@ -1088,12 +1061,8 @@ class RunMetadataContractTest(unittest.TestCase):
     def test_boot_rows_report_the_guest_command_fields_as_not_compared(self):
         with tempfile.TemporaryDirectory() as tmp:
             info_log = self._info_log(tmp)
-            anchor = dc.parse_run_metadata(
-                _boot_record(Path(tmp), 0, info_log=info_log)
-            )
-            current = dc.parse_run_metadata(
-                _boot_record(Path(tmp), 1, info_log=info_log)
-            )
+            anchor = dc.parse_run_metadata(_boot_record(Path(tmp), 0, info_log=info_log))
+            current = dc.parse_run_metadata(_boot_record(Path(tmp), 1, info_log=info_log))
             passed, report = dc.compare_runs(anchor, current)
 
             self.assertTrue(passed, report)
@@ -1108,9 +1077,7 @@ class RunMetadataContractTest(unittest.TestCase):
                 report,
             )
 
-    def test_resume_rows_without_a_snapshot_report_the_snapshot_fields_as_not_compared(
-        self,
-    ):
+    def test_resume_rows_without_a_snapshot_report_the_snapshot_fields_as_not_compared(self):
         with tempfile.TemporaryDirectory() as tmp:
             row = dc.parse_run_metadata(_resume_record(3, self._info_log(tmp)))
             passed, report = dc.compare_runs(row, row)
@@ -1142,19 +1109,14 @@ class RunMetadataContractTest(unittest.TestCase):
             (resume, "guest_exit_status", "guest command exit status"),
         )
         for description, field, label in cases:
-            with (
-                self.subTest(row=description, field=field),
-                tempfile.TemporaryDirectory() as tmp,
-            ):
+            with self.subTest(row=description, field=field), tempfile.TemporaryDirectory() as tmp:
                 info_log = self._info_log(tmp)
                 record = (
                     _boot_record(Path(tmp), info_log=info_log)
                     if description == boot
                     else _resume_record(3, info_log)
                 )
-                row = dataclasses.replace(
-                    dc.parse_run_metadata(record), **{field: None}
-                )
+                row = dataclasses.replace(dc.parse_run_metadata(record), **{field: None})
                 passed, report = dc.compare_runs(row, row)
 
                 self.assertFalse(passed, report)
@@ -1263,15 +1225,11 @@ class RuntimePathRewriteTest(unittest.TestCase):
                     dc.canonicalize_qemu_runtime_paths_in_file(log, run_dir, qmp_socket)
 
                     self.assertEqual(
-                        dc.canonicalize_qemu_runtime_path(
-                            text, run_dir, qmp_socket
-                        ).encode()
+                        dc.canonicalize_qemu_runtime_path(text, run_dir, qmp_socket).encode()
                         + b"\xff\n",
                         log.read_bytes(),
                     )
-                    self.assertEqual(
-                        ["hermit-info.log"], sorted(p.name for p in run_dir.iterdir())
-                    )
+                    self.assertEqual(["hermit-info.log"], sorted(p.name for p in run_dir.iterdir()))
 
 
 if __name__ == "__main__":

@@ -39,10 +39,10 @@ instrumented Hermit binary:
 
 ```sh
 scripts/hermit-code-coverage.rs collect --name echo-original -- \
-  --backend ptrace run --strict -- /bin/echo coverage
+  --backend ptrace run --strict --epoch=2026-01-01T00:00:00Z -- /bin/echo coverage
 
 scripts/hermit-code-coverage.rs collect --name true-shrunk --no-build -- \
-  --backend ptrace run --strict -- /bin/true
+  --backend ptrace run --strict --epoch=2026-01-01T00:00:00Z -- /bin/true
 ```
 
 Omit `--no-build` when Hermit source may have changed. The build is

@@ -1,35 +1,57 @@
 [workspace]
-# fbsource: ci/manifest-plan, detcore-dbt, detcore-sabre and hermit-install
-# are OSS workspace members whose manifests the import leaves out
-# (hermetic_infra/hermit_import/README.md), so they are not members here.
 members = [
   "common/test-allocator",
   "common/test-workdir",
+  "ci/manifest-plan",
   "detcore",
   "detcore-model",
+  "detcore-dbt",
+  "detcore-dbt-cdylib",
+  "detcore-liteinst",
+  "detcore-sabre",
+  "detcore/tests",
+  "detcore/tests/lit-guests",
   "detcore/tests/testutils",
   "flaky-tests",
+  "hermit-cdylib",
   "hermit-cli",
+  "hermit-install",
+  "hermit-record",
+  "hermit-record-format",
+  "hermit-replay",
+  "hermit-run-kvm",
+  "hermit-run-ptrace",
   "hermit-resources",
   "hermit-verify",
   "tests",
 ]
 exclude = ["agent-utils"]
 # Bare `cargo build`/`cargo test` (no `--workspace`) builds only these members.
-# The three third-party-dependency crates -- `detcore-dbt` and `hermit-install`
-# (pull `reverie-dbt`/DynamoRIO) and `detcore-sabre` (pulls `reverie-sabre`) --
+# The third-party-dependency crates -- `detcore-dbt`, its shared object
+# `detcore-dbt-cdylib`, and `hermit-install` (pull `reverie-dbt`/DynamoRIO) and
+# `detcore-sabre` (pulls `reverie-sabre`) --
 # are deliberately excluded so the default developer build produces the
 # `hermit` binary (ptrace/kvm) with no DynamoRIO/e9patch/SaBRe third-party
 # dependencies; LiteInst is likewise behind hermit-cli's `liteinst` feature. CI opts them back in with `--workspace` plus
-# `cargo ... -p hermit --features third-party-backends`.
+# `cargo ... -p hermit-run --features third-party-backends`. `detcore-liteinst` (the
+# in-guest LiteInst Detcore preload, which pulls `reverie-liteinst`) is excluded
+# for the same reason; build it with `cargo build -p detcore-liteinst`.
 default-members = [
   "common/test-allocator",
   "common/test-workdir",
+  "ci/manifest-plan",
   "detcore",
   "detcore-model",
+  "detcore/tests",
   "detcore/tests/testutils",
   "flaky-tests",
+  "hermit-cdylib",
   "hermit-cli",
+  "hermit-record",
+  "hermit-record-format",
+  "hermit-replay",
+  "hermit-run-kvm",
+  "hermit-run-ptrace",
   "hermit-resources",
   "hermit-verify",
   "tests",
@@ -92,6 +114,30 @@ overflow-checks = false
 inherits = "release"
 debug-assertions = true
 overflow-checks = true
+# No thin-local LTO. Release's default (`lto = false`) still runs ThinLTO
+# across each crate's codegen units, and in build.workspace_compile_in_pinned_root
+# that was the serial tail: the `hermit` library spent 59 s of its 139 s in
+# LLVM_thinlto (-Z time-passes), and that crate is the critical path of the
+# workspace build (hermit-detcore -> detcore-dbt -> hermit -> the cli test).
+# Measured 2026-10-17 at b5d3f0f0, the node's two cargo commands, cold, 32
+# jobs: 290.5 s -> 227.2 s. Hermit's run time: no wall difference on a
+# timer-stepping guest or a 200,000-syscall loop, and +2.4% and +1.4% CPU for
+# the whole run (Hermit, guest and kernel). More codegen units do not help: 64
+# or 256 for hermit left it at 96-132 s. Release builds keep their LTO, and so
+# does the LiteInst runtime the producers qualify: [profile.liteinst-runtime].
+lto = "off"
+
+# The validate profile's code generation with ThinLTO, for the in-guest LiteInst
+# runtime (detcore-liteinst) that liteinst-runtime-build/artifact.rs and
+# ci/build-liteinst-allocator-fixtures.rs build and qualify. Their qualifier
+# authenticates exact machine code: Detcore's `fixed_patch_alloc` must be 241
+# bytes and read its TLS cell at one of a fixed set of offsets. Without ThinLTO
+# it compiled to 232 bytes (validate of ac9299fb, 2026-10-17, reverted as
+# 7005205c). Everything Cargo reports for the artifact's profile (opt level,
+# debuginfo, debug assertions, overflow checks) is the validate profile's.
+[profile.liteinst-runtime]
+inherits = "validate"
+lto = false
 
 # The Rust guest programs keep the unoptimised code generation they had when the
 # prepared tests were built in the dev profile, so an optimiser cannot change

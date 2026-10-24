@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 # Provision the pinned Linux kernel and the BusyBox initramfs that demos 5, 6,
 # and 7 boot. Run with --check to report missing prerequisites only.
 
@@ -25,6 +19,14 @@ PYTHON="${QEMU_DEMO_PYTHON:-$(command -v python3 || true)}"
 # Bump when the initramfs contents change, so cached copies are rebuilt.
 INITRAMFS_VERSION=9
 INITRAMFS_VERSION_FILE="$ARTIFACT_DIR/.initramfs-version"
+# The build record: one line, "<INITRAMFS_VERSION> <SHA-256>", naming the
+# initramfs this script built by its SHA-256 and the version it built it at.
+# Checkouts of different versions may share ARTIFACT_DIR, so the version file
+# and the archive can each be replaced at any time; the record names the bytes
+# it is about, so it stays true whatever replaces the archive later. Demo 5
+# boots a private copy of the archive and records the version only when this
+# record names that copy's SHA-256 (demo_common.booted_initramfs_producer).
+INITRAMFS_BUILD_FILE="$ARTIFACT_DIR/.initramfs-build"
 CHECK_ONLY=0
 
 fail() {
@@ -113,11 +115,13 @@ mkdir -p "$ARTIFACT_DIR" "$HERMIT_REPO/target"
 kernel_tmp=""
 initrd_tmp=""
 version_tmp=""
+build_tmp=""
 workdir=""
 cleanup() {
   [ -z "$kernel_tmp" ] || rm -f "$kernel_tmp"
   [ -z "$initrd_tmp" ] || rm -f "$initrd_tmp"
   [ -z "$version_tmp" ] || rm -f "$version_tmp"
+  [ -z "$build_tmp" ] || rm -f "$build_tmp"
   [ -z "$workdir" ] || rm -rf "$workdir"
 }
 trap cleanup EXIT
@@ -160,8 +164,17 @@ else
 fi
 
 cached_initramfs_version="$(cat "$INITRAMFS_VERSION_FILE" 2>/dev/null || true)"
+cached_initramfs_build="$(cat "$INITRAMFS_BUILD_FILE" 2>/dev/null || true)"
+cached_initramfs_sha=""
+if [ -r "$ARTIFACT_DIR/initramfs.cpio.gz" ]; then
+  cached_initramfs_sha="$(sha256sum "$ARTIFACT_DIR/initramfs.cpio.gz" | cut -d' ' -f1)"
+fi
+# A cached archive is reused only when the build record names its SHA-256 at
+# this version. An archive that a checkout without build records built, or that
+# was replaced after its record was written, is rebuilt, and gets a record.
 if [ ! -r "$ARTIFACT_DIR/initramfs.cpio.gz" ] || \
-   [ "$cached_initramfs_version" != "$INITRAMFS_VERSION" ]; then
+   [ "$cached_initramfs_version" != "$INITRAMFS_VERSION" ] || \
+   [ "$cached_initramfs_build" != "$INITRAMFS_VERSION $cached_initramfs_sha" ]; then
   workdir="$(mktemp -d "$HERMIT_REPO/target/qemu-demo-assets.XXXXXX")"
   root="$workdir/initramfs"
   mkdir -p "$root"/{bin,sbin,etc,proc,sys,dev,tmp,usr/bin,usr/sbin}
@@ -299,12 +312,18 @@ INIT
     find . -print0 | LC_ALL=C sort -z |
       cpio --quiet --null --create --format=newc --owner=0:0 --reproducible
   ) | gzip -n -9 >"$initrd_tmp"
+  # Hashed before the rename, while only this script can have written it.
+  initrd_sha="$(sha256sum "$initrd_tmp" | cut -d' ' -f1)"
   mv "$initrd_tmp" "$ARTIFACT_DIR/initramfs.cpio.gz"
   initrd_tmp=""
   version_tmp="$ARTIFACT_DIR/.initramfs-version.$$"
   printf '%s\n' "$INITRAMFS_VERSION" >"$version_tmp"
   mv "$version_tmp" "$INITRAMFS_VERSION_FILE"
   version_tmp=""
+  build_tmp="$ARTIFACT_DIR/.initramfs-build.$$"
+  printf '%s %s\n' "$INITRAMFS_VERSION" "$initrd_sha" >"$build_tmp"
+  mv "$build_tmp" "$INITRAMFS_BUILD_FILE"
+  build_tmp=""
   printf 'Initramfs ready (%sMB)\n' \
     "$(size_mb "$(stat -c%s "$ARTIFACT_DIR/initramfs.cpio.gz")")"
 else

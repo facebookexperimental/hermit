@@ -64,8 +64,12 @@ static int print_proc_identity(void) {
       status_pid,
       status_ppid,
       tracer_pid);
-  return stat_pid == 6 && stat_ppid == 3 && status_pid == 6 &&
-          status_ppid == 3 && tracer_pid == 1
+  // Hermit renders these proc files from shared task identity. This checks
+  // agreement with the getters, not an independent kernel identity witness.
+  long pid = (long)getpid();
+  long ppid = (long)getppid();
+  return stat_pid == pid && stat_ppid == ppid && status_pid == pid &&
+          status_ppid == ppid && tracer_pid == 1
       ? 0
       : 3;
 }
@@ -159,6 +163,9 @@ int main(int argc, char** argv) {
   int null_fd = open("/dev/null", O_WRONLY);
   if (null_fd < 0)
     return 7;
+  int observation_pipe[2];
+  if (pipe(observation_pipe) != 0)
+    return 8;
   pid_t vfork_child = vfork();
   if (vfork_child < 0)
     return 8;
@@ -167,20 +174,38 @@ int main(int argc, char** argv) {
     long ppid = syscall(SYS_getppid);
     long tid = syscall(SYS_gettid);
     long written = syscall(SYS_write, null_fd, "x", 1);
+    // Send the complete observation before exiting. The parent compares this
+    // child's own identity with the PID returned by vfork; no dense numbering
+    // assumption or shared-stack value substitutes for that observation.
+    long observation[4] = {pid, ppid, tid, written};
+    long observed = syscall(
+        SYS_write, observation_pipe[1], observation, sizeof(observation));
     _exit(
-        (pid == 8 ? 0 : 1) | (ppid == 3 ? 0 : 2) | (tid == 8 ? 0 : 4) |
-        (written == 1 ? 0 : 8));
+        (pid > 3 ? 0 : 1) | (ppid == 3 ? 0 : 2) | (tid == pid ? 0 : 4) |
+        (written == 1 ? 0 : 8) |
+        (observed == (long)sizeof(observation) ? 0 : 16));
   }
   int vfork_status = 0;
   pid_t vfork_waited = waitpid(vfork_child, &vfork_status, 0);
+  close(observation_pipe[1]);
+  long observation[4] = {0};
+  if (read(observation_pipe[0], observation, sizeof(observation)) !=
+      (ssize_t)sizeof(observation))
+    return 9;
+  close(observation_pipe[0]);
   dprintf(
       STDOUT_FILENO,
-      "root vfork=%ld waited=%ld exit=%d pid=%ld tid=%ld\n",
+      "root vfork=%ld waited=%ld exit=%d pid=%ld tid=%ld "
+      "child=%ld/%ld/%ld written=%ld\n",
       (long)vfork_child,
       (long)vfork_waited,
       WIFEXITED(vfork_status) ? WEXITSTATUS(vfork_status) : -1,
       (long)getpid(),
-      syscall(SYS_gettid));
+      syscall(SYS_gettid),
+      observation[0],
+      observation[1],
+      observation[2],
+      observation[3]);
   close(null_fd);
 
   pid_t vfork_exec_child = vfork();

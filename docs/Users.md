@@ -21,14 +21,20 @@ And here's a minimal demo of running inside hermit's deterministic environment:
 $ cd ~/fbsource/fbcode/hermetic_infra/hermit/
 $ ./examples/race.sh
 bbbbbbaa (... nondeterministic output...)
-$ ./hermit run --strict ./examples/race.sh
+$ ./hermit run --strict --epoch=2026-01-01T00:00:00Z ./examples/race.sh
 abababab (... deterministic racing processes...)
 ```
 
-Strict deterministic execution is the default: `./hermit run ./examples/race.sh`
-behaves the same as the `--strict` form above. The `--strict` flag is retained
-for command-line compatibility and does not make the default any stricter. See
+Deterministic execution is the default: `./hermit run ./examples/race.sh`
+runs the same way, taking its virtual-time epoch from the host clock and
+reporting it so the run can be repeated. `--strict` also requires every input
+of the run on the command line, so it needs `--epoch` (or `HERMIT_EPOCH`). See
 [USER_GUIDE.md](USER_GUIDE.md) for the full set of mode-selection options.
+
+Hermit preserves standard input, output and error at CLI entry and closes other
+unsolicited file descriptors inherited from its caller. Pass guest inputs through
+the documented file, mount and standard-stream options. An operating system that
+cannot perform this descriptor cleanup is refused before a guest starts.
 
 ## Further reading
 

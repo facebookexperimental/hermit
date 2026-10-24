@@ -4,7 +4,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+#
 # Probe whether user-space retired-branch hardware performance counters are
 # actually usable on this host. Hermit's chaos mode and --max-timeslice
 # depend on these counters.

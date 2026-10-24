@@ -33,6 +33,98 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ -n $mode ]] || { echo "usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR] | --bundle DIR" >&2; exit 2; }
+# The host packages --from-cargo needs (docs/BUCK2_OSS.md, "Host prerequisites for Buck
+# validation"), checked before the previous staging is removed. Tests point
+# HERMIT_STAGE_HOST_LIBDIR elsewhere.
+host_libdir=${HERMIT_STAGE_HOST_LIBDIR:-/usr/lib64}
+if [[ $mode == cargo ]]; then
+    # Fixture compilation shares Cargo's admitted width. Keep the existing
+    # default for callers that do not supply a build budget.
+    fixture_jobs=${CARGO_BUILD_JOBS:-32}
+    [[ $fixture_jobs =~ ^[1-9][0-9]*$ ]] || {
+        echo "ci/buck-e2e/stage: CARGO_BUILD_JOBS must be a positive integer" >&2
+        exit 2
+    }
+    need() { # need WHAT PACKAGE
+        echo "ci/buck-e2e/stage: $1 is missing; install it with  sudo dnf install -y $2" \
+            "(docs/BUCK2_OSS.md, \"Host prerequisites for Buck validation\")" >&2
+        exit 1
+    }
+    command -v patchelf >/dev/null || need patchelf patchelf
+    command -v readelf >/dev/null || need readelf binutils
+    command -v strip >/dev/null || need strip binutils
+    command -v "${CMAKE:-cmake}" >/dev/null || need "${CMAKE:-cmake}" cmake
+    for lib in libunwind.so.8 libunwind-x86_64.so.8; do
+        [[ -e $host_libdir/$lib ]] || need "$host_libdir/$lib" libunwind-devel
+    done
+fi
+
+# REPRODUCIBLE STAGING. Every RE-routed cell takes the whole staged bundle as an
+# input, so Buck can answer a cell from Meta RE's action cache only when the
+# bundle is byte-identical to an earlier one. Built in place it never was: every
+# compiled file embedded the run's own checkout path (validate checkouts are
+# named per run), its private CARGO_HOME and build-time __DATE__/__TIME__, and 0
+# of 25,957 remote test executions over 76 runs were cache hits. So --from-cargo
+# re-runs itself in one fixed directory, the same path on every host and run:
+#   - the checkout is reflink-copied to $HERMIT_BUCK_STAGE_DIR/src (default
+#     $HOME/.cache/hermit-buck-stage/src) and built there, target dir included,
+#     so checkout, target and fixture paths are constant;
+#   - CARGO_HOME, which stays where it is, is reached through a symlink at
+#     $HERMIT_BUCK_STAGE_DIR/cargo, so every crate and vendored C source path
+#     (SaBRe's build ignores CFLAGS) is constant too. Remapping it with
+#     RUSTFLAGS instead would not work: Cargo hashes RUSTFLAGS into each
+#     crate's metadata, so a per-run path there changes every symbol hash;
+#   - SOURCE_DATE_EPOCH is HEAD's commit time, which fixes __DATE__/__TIME__;
+#   - git reads (HEAD, the commit-first check, the src/ archive) go to this
+#     checkout through HERMIT_BUCK_STAGE_GIT_ROOT, not to the copy: a submodule
+#     whose .git file names its gitdir by a relative path (agent-utils) does not
+#     resolve from the copy, and `git status` there fails;
+#   - the build is still cold every run: the fixed directory is wiped before and
+#     removed after, and only staged/ is copied back into this checkout.
+# One stage at a time holds the fixed directory: concurrent validations on a host
+# wait for the lock (about three minutes, one stage's length), up to
+# HERMIT_BUCK_STAGE_LOCK_TIMEOUT seconds (default 1200). flock releases the lock
+# when its holder dies, so only a holder that hangs can make others wait out the
+# timeout, and then they fail naming it. The default stays well under the
+# e2e.buck_stage node's 1800-s wall timeout less one stage (about 180 s), so the
+# message naming the holder is printed before the node itself is killed. HERMIT_BUCK_STAGE_REPRODUCIBLE=0 stages
+# in place, as before.
+if [[ $mode == cargo && -z ${HERMIT_BUCK_STAGE_INNER:-} && ${HERMIT_BUCK_STAGE_REPRODUCIBLE:-1} != 0 ]]; then
+    fixed=${HERMIT_BUCK_STAGE_DIR:-$HOME/.cache/hermit-buck-stage}
+    fixed_src=$fixed/src
+    [[ $target_dir == "$root/target" ]] ||
+        echo "ci/buck-e2e/stage: --target-dir is ignored for reproducible staging; it builds in $fixed_src/target" >&2
+    mkdir -p "$fixed"
+    lock=$fixed.lock
+    exec 9>>"$lock"
+    lock_timeout=${HERMIT_BUCK_STAGE_LOCK_TIMEOUT:-1200}
+    if ! flock -w "$lock_timeout" 9; then
+        echo "ci/buck-e2e/stage: timed out after ${lock_timeout}s waiting for $lock;" \
+            "the stage holding it is: $(cat "$fixed.holder" 2>/dev/null || echo unknown)" >&2
+        exit 1
+    fi
+    echo "pid $$ since $(date -u +%FT%TZ) for $root" >"$fixed.holder"
+    cleanup_fixed() { rm -rf "${fixed_src:?}" "${fixed:?}/cargo" "${fixed:?}.holder"; }
+    trap cleanup_fixed EXIT
+    rm -rf "${fixed_src:?}"
+    mkdir -p "$fixed_src"
+    # Everything but build outputs and local state. The copy keeps .git, so the
+    # inner stage reads this checkout's commit and status.
+    for entry in "$root"/* "$root"/.[!.]*; do
+        case ${entry##*/} in target | ignored) continue ;; esac
+        cp -a --reflink=auto "$entry" "$fixed_src/"
+    done
+    ln -sfn "$(realpath -m "${CARGO_HOME:-$HOME/.cargo}")" "$fixed/cargo"
+    status=0
+    HERMIT_BUCK_STAGE_INNER=1 HERMIT_BUCK_STAGE_GIT_ROOT=$root CARGO_HOME=$fixed/cargo \
+        SOURCE_DATE_EPOCH=$(git -C "$root" log -1 --format=%ct HEAD) \
+        "$fixed_src/ci/buck-e2e/stage" --from-cargo --target-dir "$fixed_src/target" || status=$?
+    if [[ $status -eq 0 ]]; then
+        rm -rf "${staged:?}"
+        cp -a --reflink=auto "$fixed_src/ci/buck-e2e/staged" "$staged"
+    fi
+    exit "$status"
+fi
 rm -rf "${staged:?}"
 mkdir -p "$staged"
 
@@ -42,51 +134,101 @@ if [[ $mode == bundle ]]; then
     done
     cp -a --reflink=auto "$bundle/hermit/install" "$staged/install"
     cp -a --reflink=auto "$bundle/hermit/hermit" "$staged/hermit"
+    python3 "$root/ci/verify-packaged-detcore.py" "$staged/install"
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_sha"])' "$bundle/PROVENANCE.json" >"$staged/SOURCE_SHA"
     echo "staged $(du -sh "$staged" | cut -f1) from $bundle (source $(cat "$staged/SOURCE_SHA"))"
     exit 0
 fi
 
-sha=$(git -C "$root" rev-parse HEAD)
-[[ -z $(git -C "$root" status --porcelain --untracked-files=no) ]] ||
+# Under reproducible staging this tree is a copy; git reads go to the checkout.
+git_root=${HERMIT_BUCK_STAGE_GIT_ROOT:-$root}
+sha=$(git -C "$git_root" rev-parse HEAD)
+# A failed status prints nothing, so it must not read as a clean tree.
+dirty=$(git -C "$git_root" status --porcelain --untracked-files=no) ||
+    { echo "ci/buck-e2e/stage: cannot read the status of $git_root" >&2; exit 2; }
+[[ -z $dirty ]] ||
     { echo "ci/buck-e2e/stage: commit first; cells record SOURCE_SHA=$sha" >&2; exit 2; }
 tmp=$(mktemp -d)
-trap 'rm -rf "${tmp:?}"' EXIT
-
-# patchelf sets the staged hermit's runtime search path. Hosts without it (the host
-# recorded in docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" has no
-# patchelf package) use the static binary from the pinned PyPI wheel, fetched
-# once into ignored/host-tools/ and checked against its sha256.
-patchelf=${PATCHELF:-$(command -v patchelf || true)}
-if [[ -z $patchelf ]]; then
-    wheel=patchelf-0.19.1.0-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.musllinux_1_1_x86_64.whl
-    wheel_sha256=a8f6331ccf40c345507279f755f4a38c2cb00b9efda746fd43c17713cce0aba4
-    tools=$root/ignored/host-tools/patchelf-0.19.1.0
-    patchelf=$tools/patchelf-0.19.1.0.data/scripts/patchelf
-    if [[ ! -x $patchelf ]]; then
-        proxy=()
-        command -v with-proxy >/dev/null && proxy=(with-proxy)
-        mkdir -p "$tmp/wheel"
-        "${proxy[@]}" python3 -m pip download --quiet --no-deps --only-binary=:all: \
-            --dest "$tmp/wheel" patchelf==0.19.1.0
-        echo "$wheel_sha256  $tmp/wheel/$wheel" | sha256sum --check --quiet ||
-            { echo "ci/buck-e2e/stage: downloaded $wheel does not match its pinned sha256" >&2; exit 1; }
-        rm -rf "$tools"
-        mkdir -p "$tools"
-        python3 -m zipfile -e "$tmp/wheel/$wheel" "$tools"
-        chmod +x "$patchelf"
-    fi
-fi
+release_build= hermit_build= liteinst_build=
+# Each background build runs in a process group of its own (setsid), and stopping it
+# signals the whole group: cargo does not pass SIGTERM on, so killing cargo alone would
+# leave its rustc, build-script and cmake processes writing into target/.
+stop_background_builds() {
+    local pid tries
+    for pid in $release_build $hermit_build $liteinst_build; do
+        kill -TERM -- "-$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        for ((tries = 0; tries < 50; tries++)); do
+            kill -0 -- "-$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL -- "-$pid" 2>/dev/null || true
+    done
+}
+trap 'stop_background_builds; rm -rf "${tmp:?}"' EXIT
 
 # 1. Binaries: the release harness, the validate-profile hermit and its install bundle.
-cargo build --manifest-path "$root/Cargo.toml" --locked --release -p hermit-manifest-plan --bins --target-dir "$target_dir"
-cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt --target-dir "$target_dir"
-cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit --bin hermit \
-    --features hermit/third-party-backends --target-dir "$target_dir"
+# Cargo locks each profile directory (target/release, target/validate), so builds that
+# share one run one at a time. Three run at once instead: the release harness in
+# target/release; the validate-profile hermit, the longest build, in a target directory
+# of its own (its dependencies are built a second time there); and detcore-dbt then the
+# install bundle in target/validate, as before. The two background builds' output is
+# shown once each finishes, so the logs do not interleave. Each command is main's
+# except for the hermit build's --target-dir, so no feature set changes; the hermit
+# binary differs from a target/validate build only in the build-time DynamoRIO paths
+# reverie-dbt bakes in as a fallback (hermit finds its runtime through install_pkg).
+hermit_target_dir=$target_dir/stage-hermit
+# Both target directories exist before any build starts. Cargo creates a missing target
+# directory by renaming a temporary directory onto it, and rename() replaces an empty
+# directory, so with neither present a build in $target_dir could replace the empty
+# $target_dir another build had just made as the parent of its own target directory;
+# that build then fails with "No such file or directory" at its temporary directory
+# under the replaced one. Reproducible staging always starts with neither present.
+mkdir -p "$hermit_target_dir"
+# Every cargo build here reruns once if the compiler itself crashed (ci/retry-on-compiler-crash.sh).
+retry=$root/ci/retry-on-compiler-crash.sh
+setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --release -p hermit-manifest-plan --bins \
+    --target-dir "$target_dir" >"$tmp/release-build.log" 2>&1 &
+release_build=$!
+setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-run --bin hermit \
+    --features hermit-run/third-party-backends --target-dir "$hermit_target_dir" >"$tmp/hermit-build.log" 2>&1 &
+hermit_build=$!
+# The ordinary in-guest Detcore runtime in the liteinst-runtime profile: the Cargo
+# command the packaging finalizer below runs, started here so it compiles beside the
+# other builds (Cargo locks each profile directory separately) instead of after them.
+# The finalizer is unchanged: it still runs last, its own invocation of the command is
+# answered from these artifacts (its receipt records cargo_artifact.fresh), and it
+# qualifies what Cargo reports. Unlike the finalizer, this build is not --offline: the
+# stage's other builds are still fetching the git dependencies when it starts, and
+# Cargo's fingerprints do not include --offline. A cold build of it took 97-100 s of
+# the finalizer's 107-110 s at eight jobs (main 359ab376).
+setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked -p detcore-liteinst --lib --profile liteinst-runtime \
+    --target-dir "$target_dir" >"$tmp/liteinst-runtime-build.log" 2>&1 &
+liteinst_build=$!
+"$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt -p detcore-dbt-cdylib --target-dir "$target_dir"
 # hermit-install's build script stages install_pkg/ next to the profile directories and
-# links libdetcore_sabre.so into it (`--bin hermit` above filters both packages out).
-cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install -p detcore-sabre \
-    --target-dir "$target_dir"
+# links libdetcore_sabre.so into it. The ordinary LiteInst resource is finalized
+# below, after the last Cargo invocation; publish-hermit-e2e-artifact.sh requires
+# every one of them. Its hermit link, to ../validate/hermit, resolves once the hermit
+# build is copied there below.
+"$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install -p detcore-sabre \
+    -p detcore-liteinst --target-dir "$target_dir"
+finish_build() { # finish_build WHAT PID-VARIABLE LOG
+    local status=0
+    wait "${!2}" || status=$?
+    printf -v "$2" ''
+    cat "$3" >&2
+    if [[ $status -ne 0 ]]; then
+        echo "ci/buck-e2e/stage: the $1 failed (exit $status)" >&2
+        exit "$status"
+    fi
+}
+finish_build "release build of hermit-manifest-plan" release_build "$tmp/release-build.log"
+finish_build "validate-profile build of hermit" hermit_build "$tmp/hermit-build.log"
+finish_build "liteinst-runtime build of the ordinary Detcore runtime" liteinst_build "$tmp/liteinst-runtime-build.log"
+# All outer Cargo commands have released the target before the one finalizer.
+"$target_dir/validate/stage-detcore-liteinst" --source-copy "$target_dir"
+install -m 755 "$hermit_target_dir/validate/hermit" "$target_dir/validate/hermit"
 mkdir -p "$staged/bin"
 for b in test-harness hermit-manifest-plan; do
     strip --strip-debug -o "$staged/bin/$b" "$target_dir/release/$b"
@@ -96,10 +238,10 @@ done
 cp -aL "$target_dir/install_pkg" "$tmp/install_pkg"
 mkdir -p "$tmp/install_pkg/rsrcs/hermit-runtime"
 for lib in libunwind.so.8 libunwind-x86_64.so.8; do
-    install -m 644 "$(readlink -f "/usr/lib64/$lib")" "$tmp/install_pkg/rsrcs/hermit-runtime/$lib"
+    install -m 644 "$(readlink -f "$host_libdir/$lib")" "$tmp/install_pkg/rsrcs/hermit-runtime/$lib"
 done
 install -m 755 "$target_dir/validate/hermit" "$tmp/hermit"
-"$patchelf" --force-rpath --set-rpath '$ORIGIN/../install_pkg/rsrcs/hermit-runtime:$ORIGIN/install/rsrcs/hermit-runtime' "$tmp/hermit"
+patchelf --force-rpath --set-rpath '$ORIGIN/../install_pkg/rsrcs/hermit-runtime:$ORIGIN/install/rsrcs/hermit-runtime' "$tmp/hermit"
 "$root/ci/publish-hermit-e2e-artifact.sh" "$tmp/hermit" "$tmp/published" "$tmp/pointer" "$tmp/install_pkg" >/dev/null
 published=$(cat "$tmp/pointer")
 cp -a "$published/install" "$staged/install"
@@ -107,10 +249,10 @@ cp -a "$published/hermit" "$staged/hermit"
 
 # 3. The source snapshot, and fixtures built from it exactly as a cell sees it.
 mkdir -p "$staged/src" "$staged/build"
-git -C "$root" archive "$sha" | tar x -C "$staged/src"
+git -C "$git_root" archive "$sha" | tar x -C "$staged/src"
 for lane in portable privileged; do
     VALIDATE_RUN_STATE="$staged/run-state" E2E_RESULT_ROOT="$tmp/results" E2E_BUILD_ROOT="$staged/build" E2E_RUN_ID=buck-e2e-stage \
-        "$staged/bin/test-harness" build --repo-root "$staged/src" --source-sha "$sha" --ci-only --lane "$lane" --jobs 32 >/dev/null
+        "$staged/bin/test-harness" build --repo-root "$staged/src" --source-sha "$sha" --ci-only --lane "$lane" --jobs "$fixture_jobs" >/dev/null
 done
 env -C "$staged/src" ./tests/compat/prepare_real_compat_fixtures.sh "$staged/run-state/strict-compat/real-compat-fixtures" >/dev/null
 echo "$sha" >"$staged/SOURCE_SHA"

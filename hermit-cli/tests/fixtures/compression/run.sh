@@ -29,12 +29,15 @@ run_strict() {
   local stderr_file=$4
   shift 4
 
-  if ! "$hermit_bin" --log off run --strict \
+  local status=0
+  "$hermit_bin" --log off run --strict \
     --base-env=minimal --env=LC_ALL=C --workdir="$workdir" -- \
-    "$@" >"$stdout_file" 2>"$stderr_file"; then
+    "$@" >"$stdout_file" 2>"$stderr_file" || status=$?
+  if ((status != 0)); then
     printf '%s failed under strict Hermit:\n' "$label" >&2
     cat "$stderr_file" >&2
-    return 1
+    # Hermit's own status, so a caller can tell a typed refusal (122) apart.
+    return "$status"
   fi
 }
 
@@ -58,7 +61,7 @@ bzip2recover_bin=$(command -v bzip2recover)
 gzip_bin=$(command -v gzip)
 
 if [[ ! -x $hermit_bin ]]; then
-  cargo build --manifest-path "$repo_root/Cargo.toml" --release -p hermit --bin hermit
+  cargo build --manifest-path "$repo_root/Cargo.toml" --release -p hermit-run --bin hermit
 fi
 [[ -x $hermit_bin ]] || fail "Hermit binary is not executable: $hermit_bin"
 

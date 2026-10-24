@@ -42,9 +42,19 @@ impl ListOpts {
 
         let hermit = HermitData::from(self.data_dir.as_ref());
 
+        // A directory holding only a run manifest is not a syscall
+        // recording: a run that drew an input from the host leaves one, and
+        // `hermit run --from` reruns it
+        // (https://github.com/rrnewton/hermit/issues/4271).
+        let manifest_only = |id: &hermit::Id| {
+            let directory = hermit.data_dir().join(id.to_string());
+            !directory.join(hermit::RECORDING_METADATA_NAME).exists()
+                && directory.join(hermit::MANIFEST_NAME).exists()
+        };
         let mut recordings = hermit
             .try_recordings()?
             .into_iter()
+            .filter(|id| !manifest_only(id))
             .map(|id| {
                 let metadata = hermit.recording_metadata(id)?;
                 Ok(RecordingInfo {

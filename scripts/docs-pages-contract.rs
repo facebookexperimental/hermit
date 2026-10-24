@@ -6,7 +6,6 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-
 //! Guard the GitHub Pages compatibility-site publication contract.
 //!
 //! This checker owns orchestration facts. The Python publisher owns registry,
@@ -30,6 +29,8 @@ const BUILDER_CHECKOUT_STEP: &str = "Check out reviewed website builder";
 const SERVED_REGISTRY_QUERY: &str = "if jq -e 'any(.[]; .name == \"releases.json\" and .type == \"file\")' \"$scratch/served.json\" >/dev/null; then";
 const BOOTSTRAP_INVENTORY_QUERY: &str = "jq -e --slurpfile pins \"$pins\" \\\n    '([.[] | .name] | sort) == ([$pins[0].releases[].identity, \"latest\"] | sort)' \\\n    \"$scratch/served.json\" >/dev/null";
 const LANDING_ALIAS: &str = "href=\"compatibility/latest/\"";
+const REBUILD_COMMAND: &str = "rebuild-compatibility-site.py rebuild";
+const PHASE_TIMING: &str = "COMPATIBILITY_WEBSITE_PHASE_TIMING";
 
 fn repository_root() -> PathBuf {
     let script = Path::new(file!());
@@ -179,19 +180,16 @@ fn checkout_steps(workflow: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn require_checkout_input(
-    errors: &mut Vec<String>,
-    scope: &str,
-    step: &str,
-    key: &str,
-    value: &str,
-) {
+/// Does `step` declare `key: value` exactly once, directly inside its single
+/// `mapping:` block (for example `with:` or `env:`)?
+fn step_mapping_declares(step: &str, mapping: &str, key: &str, value: &str) -> bool {
     let lines = step.lines().collect::<Vec<_>>();
     let expected_indent = indentation(lines[0]) + 4;
+    let header = format!("{mapping}:");
     let mappings = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| indentation(line) + 2 == expected_indent && line.trim() == "with:")
+        .filter(|(_, line)| indentation(line) + 2 == expected_indent && line.trim() == header)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let input_range = mappings.first().map(|start| {
@@ -207,15 +205,84 @@ fn require_checkout_input(
         .enumerate()
         .filter(|(_, line)| line.trim_start().starts_with(&prefix))
         .collect::<Vec<_>>();
-    if fields.len() != 1
-        || mappings.len() != 1
-        || !input_range.is_some_and(|range| range.contains(&fields[0].0))
-        || indentation(fields[0].1) != expected_indent
-        || fields[0].1.trim() != format!("{key}: {value}")
-    {
+    fields.len() == 1
+        && mappings.len() == 1
+        && input_range.is_some_and(|range| range.contains(&fields[0].0))
+        && indentation(fields[0].1) == expected_indent
+        && fields[0].1.trim() == format!("{key}: {value}")
+}
+
+fn require_checkout_input(
+    errors: &mut Vec<String>,
+    scope: &str,
+    step: &str,
+    key: &str,
+    value: &str,
+) {
+    if !step_mapping_declares(step, "with", key, value) {
         errors.push(format!(
             "{scope} must declare exactly one `{key}: {value}` checkout input"
         ));
+    }
+}
+
+/// The one workflow step whose shell runs `command`, located by the command
+/// rather than by the step's display name.
+fn step_running(workflow: &str, command: &str) -> Result<String, String> {
+    let lines = workflow.lines().collect::<Vec<_>>();
+    let uses = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(command))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if uses.len() != 1 {
+        return Err(format!(
+            "workflow must run `{command}` on exactly one line, found {}",
+            uses.len()
+        ));
+    }
+    let name = lines[..uses[0]]
+        .iter()
+        .rev()
+        .find(|line| {
+            indentation(line) < indentation(lines[uses[0]])
+                && line.trim_start().starts_with("- name: ")
+        })
+        .map(|line| line.trim_start().trim_start_matches("- name: "))
+        .ok_or_else(|| format!("`{command}` is not inside a named workflow step"))?;
+    // A step that lost its `- name:` line would otherwise resolve to the step
+    // before it.
+    let step = named_step(workflow, name)?;
+    if !step.contains(command) {
+        return Err(format!("`{command}` is not inside a named workflow step"));
+    }
+    Ok(step)
+}
+
+/// Below the builder's 12 GiB warning line, the hosted rebuild logs its peak
+/// memory only because this step turns phase timing on
+/// (https://github.com/rrnewton/dev-hermit/issues/515). Dropping or overriding
+/// the variable would silently remove that log line.
+fn require_phase_timing(errors: &mut Vec<String>, workflow: &str) {
+    let step = match step_running(workflow, REBUILD_COMMAND) {
+        Ok(step) => step,
+        Err(error) => {
+            errors.push(error);
+            return;
+        }
+    };
+    if !step_mapping_declares(&step, "env", PHASE_TIMING, "\"1\"") {
+        errors.push(format!(
+            "compatibility rebuild step must declare exactly one `{PHASE_TIMING}: \"1\"` in its env"
+        ));
+    }
+    match literal_block(&step, "run") {
+        Ok(shell) if shell.contains(PHASE_TIMING) => errors.push(format!(
+            "compatibility rebuild shell must not mention `{PHASE_TIMING}`"
+        )),
+        Ok(_) => {}
+        Err(error) => errors.push(error),
     }
 }
 
@@ -284,6 +351,7 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
         }
         (Err(error), _) | (_, Err(error)) => errors.push(error),
     }
+    require_phase_timing(&mut errors, workflow);
     let step = match named_step(workflow, PUBLICATION_STEP) {
         Ok(step) => step,
         Err(error) => return Err(vec![error]),
@@ -320,12 +388,23 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
         &shell,
         "python3 .github/scripts/publish-compatibility-site.py extract \"$archive\"",
     );
+    // The publisher, not this file, decides which builds are served: it reads
+    // the retention rule from the builder config and the publication times
+    // from the release metadata the loop above checked against each pin.
     require_once(
         &mut errors,
-        "publication orchestration",
+        "retention",
         &shell,
-        "python3 .github/scripts/publish-compatibility-site.py \\\n  finalize \"$pins\" target/doc/compatibility",
+        "release_json=\"$releases/$identity.json\"",
     );
+    for statement in [
+        "python3 .github/scripts/publish-compatibility-site.py retain \\\n  \"$pins\" \"$releases\" .github/compatibility-site-builder.json > \"$retained\"",
+        "while read -r index identity <&3; do",
+        "done 3< \"$retained\"",
+        "python3 .github/scripts/publish-compatibility-site.py \\\n  finalize \"$pins\" target/doc/compatibility \"$releases\" \\\n  .github/compatibility-site-builder.json",
+    ] {
+        require_statement(&mut errors, "retention", &shell, statement);
+    }
     require_once(
         &mut errors,
         "release iteration",
@@ -366,8 +445,16 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
     let network = shell.find("gh api");
     let extract = shell.find("publish-compatibility-site.py extract");
     let finalize = shell.find("publish-compatibility-site.py \\\n  finalize");
+    let metadata = shell.find("gh api \"repos/$release_repository/releases/tags/$tag\"");
+    let retain = shell.find("publish-compatibility-site.py retain");
     if !matches!((validate, network), (Some(left), Some(right)) if left < right) {
         errors.push("registry validation must run before any release API request".into());
+    }
+    if !matches!((metadata, retain, extract), (Some(left), Some(middle), Some(right)) if left < middle && middle < right)
+    {
+        errors.push(
+            "retention must read every checked release before any archive is extracted".into(),
+        );
     }
     if !matches!((extract, finalize), (Some(left), Some(right)) if left < right) {
         errors.push("all pinned archives must be extracted before finalization".into());
@@ -499,6 +586,8 @@ fn main() {
 mod tests {
     use super::*;
 
+    const BUILDER_CONFIG: &str = ".github/compatibility-site-builder.json";
+
     const BLACK_BOX_FIXTURE: &str = r#"
 import copy
 import hashlib
@@ -516,6 +605,7 @@ import tempfile
 helper = pathlib.Path(sys.argv[1]).resolve()
 checked_in_registry = pathlib.Path(sys.argv[2]).resolve()
 landing = pathlib.Path(sys.argv[3]).read_text()
+builder_config = pathlib.Path(sys.argv[4]).resolve()
 landing_alias = 'href="compatibility/latest/"'
 
 def run_helper(arguments, *, cwd=None, expected=None):
@@ -678,6 +768,28 @@ def install_landing(document_root, contents=landing):
 def git(repository, *arguments):
     subprocess.run(["git", *arguments], cwd=repository, check=True, stdout=subprocess.DEVNULL)
 
+# Release metadata as the workflow saves it from the releases API, which the
+# publisher reads for each build's publication time.
+published_at = {"b" * 64: "2030-01-01T00:00:00Z", "a" * 64: "2030-01-02T00:00:00Z"}
+
+def write_metadata(directory, registry):
+    directory.mkdir(parents=True)
+    for pin in registry["releases"]:
+        (directory / f"{pin['identity']}.json").write_text(json.dumps({
+            "tag_name": pin["tag"],
+            "name": pin["release_title"],
+            "draft": False,
+            "prerelease": False,
+            "published_at": published_at[pin["identity"]],
+        }))
+    return directory
+
+def write_config(path, **changes):
+    retention = json.loads(builder_config.read_text())["retention"]
+    retention.update(changes)
+    path.write_text(json.dumps({"retention": retention}))
+    return path
+
 with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as temporary:
     base = pathlib.Path(temporary)
 
@@ -688,12 +800,16 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
     latest_archive, latest_pin = make_archive(base, latest_identity, "latest")
 
     first_registry_path = base / "first-registry.json"
-    write_registry(first_registry_path, [retained_pin], retained_identity)
+    first_metadata = write_metadata(
+        base / "first-metadata",
+        write_registry(first_registry_path, [retained_pin], retained_identity),
+    )
     first_document = base / "first-document"
     install_landing(first_document)
     run_helper(["extract", retained_archive, first_document / "compatibility" / retained_identity,
                 first_registry_path, 0])
-    run_helper(["finalize", first_registry_path, first_document / "compatibility"])
+    run_helper(["finalize", first_registry_path, first_document / "compatibility",
+                first_metadata, builder_config])
     retained_before = inventory(first_document / "compatibility" / retained_identity)
     assert inventory(first_document / "compatibility" / "latest") == retained_before
 
@@ -722,14 +838,18 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
     assert inventory(target) == retained_before
 
     second_registry_path = base / "second-registry.json"
-    write_registry(second_registry_path, [retained_pin, latest_pin], latest_identity)
+    second_metadata = write_metadata(
+        base / "second-metadata",
+        write_registry(second_registry_path, [retained_pin, latest_pin], latest_identity),
+    )
     second_document = base / "second-document"
     install_landing(second_document)
     sorted_archives = {latest_identity: latest_archive, retained_identity: retained_archive}
     for index, identity in enumerate((latest_identity, retained_identity)):
         run_helper(["extract", sorted_archives[identity], second_document / "compatibility" / identity,
                     second_registry_path, index])
-    run_helper(["finalize", second_registry_path, second_document / "compatibility"])
+    run_helper(["finalize", second_registry_path, second_document / "compatibility",
+                second_metadata, builder_config])
     assert inventory(second_document / "compatibility" / retained_identity) == retained_before
     assert inventory(second_document / "compatibility" / latest_identity) == inventory(
         second_document / "compatibility" / "latest"
@@ -739,7 +859,39 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
     install_landing(missing_document)
     run_helper(["extract", latest_archive, missing_document / "compatibility" / latest_identity,
                 second_registry_path, 0])
-    run_helper(["finalize", second_registry_path, missing_document / "compatibility"],
+    run_helper(["finalize", second_registry_path, missing_document / "compatibility",
+                second_metadata, builder_config],
+               expected="do not exactly match")
+
+    # The builder config's retention rule decides which builds are served.
+    # Every build stays listed in the served registry and as a release asset.
+    keep_one = write_config(base / "keep-one.json", max_builds=1)
+    retained_text = run_helper(["retain", second_registry_path, second_metadata, keep_one])
+    assert retained_text.startswith(f"0 {latest_identity}\n"), retained_text
+    assert "keeping 1 of 2 compatibility websites (N = 1)" in retained_text, retained_text
+    pruned = base / "pruned-document"
+    install_landing(pruned)
+    run_helper(["extract", latest_archive, pruned / "compatibility" / latest_identity,
+                second_registry_path, 0])
+    run_helper(["finalize", second_registry_path, pruned / "compatibility",
+                second_metadata, keep_one])
+    served = pruned / "compatibility"
+    assert sorted(path.name for path in served.iterdir()) == sorted(
+        [latest_identity, "latest", "releases.json", "builds"]
+    )
+    assert json.loads((served / "releases.json").read_text()) == json.loads(
+        second_registry_path.read_text()
+    )
+    index_page = (served / "builds" / "index.html").read_text()
+    assert index_page.count(f'href="../{latest_identity}/"') == 1, index_page
+    assert retained_identity not in index_page, index_page
+    overfull = base / "overfull-document"
+    install_landing(overfull)
+    for index, identity in enumerate((latest_identity, retained_identity)):
+        run_helper(["extract", sorted_archives[identity], overfull / "compatibility" / identity,
+                    second_registry_path, index])
+    run_helper(["finalize", second_registry_path, overfull / "compatibility",
+                second_metadata, keep_one],
                expected="do not exactly match")
 
     unsafe_document = base / "unsafe-document"
@@ -750,7 +902,8 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
     )
     os.chmod(unsafe_document / "compatibility" / retained_identity, 0o755)
     os.symlink("index.html", unsafe_document / "compatibility" / retained_identity / "alias")
-    run_helper(["finalize", first_registry_path, unsafe_document / "compatibility"],
+    run_helper(["finalize", first_registry_path, unsafe_document / "compatibility",
+                first_metadata, builder_config],
                expected="link or special")
 
     # Validation reads first-parent history, with the first registry allowed to
@@ -917,6 +1070,7 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
                 root.join(PUBLISHER).to_str().unwrap(),
                 root.join(RELEASE_PINS).to_str().unwrap(),
                 root.join(LANDING_PAGE).to_str().unwrap(),
+                root.join(BUILDER_CONFIG).to_str().unwrap(),
             ])
             .output()
             .expect("python3 should run black-box publisher fixtures");
@@ -1092,6 +1246,130 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
             1,
         );
         assert_rejected(&removed_extract, &landing, "extract");
+    }
+
+    #[test]
+    fn served_builds_must_come_from_the_publishers_retention_plan() {
+        let (workflow, landing) = actual();
+        let step = named_step(&workflow, PUBLICATION_STEP).unwrap();
+        let retain = "        python3 .github/scripts/publish-compatibility-site.py retain \\\n          \"$pins\" \"$releases\" .github/compatibility-site-builder.json > \"$retained\"\n";
+        let finalize =
+            "        python3 .github/scripts/publish-compatibility-site.py \\\n          finalize";
+        assert_eq!(step.matches(retain).count(), 1);
+        assert_eq!(step.matches(finalize).count(), 1);
+        let late_retain =
+            step.replacen(retain, "", 1)
+                .replacen(finalize, &format!("{retain}{finalize}"), 1);
+        for (changed_step, diagnostic) in [
+            (
+                step.replacen(
+                    "release_json=\"$releases/$identity.json\"",
+                    "release_json=\"$scratch/release-$identity.json\"",
+                    1,
+                ),
+                "retention must contain `release_json=",
+            ),
+            (
+                step.replacen("> \"$retained\"\n", "> \"$retained\" || true\n", 1),
+                "retention must contain exactly one complete statement",
+            ),
+            (
+                step.replacen(
+                    "publish-compatibility-site.py retain",
+                    "publish-compatibility-site.py plan",
+                    1,
+                ),
+                "retention must contain exactly one complete statement",
+            ),
+            (
+                step.replacen("done 3< \"$retained\"", "done 3< \"$pins\"", 1),
+                "retention must contain exactly one complete statement `done 3<",
+            ),
+            (
+                step.replacen(
+                    "target/doc/compatibility \"$releases\" \\\n          .github/compatibility-site-builder.json",
+                    "target/doc/compatibility",
+                    1,
+                ),
+                "retention must contain exactly one complete statement `python3 .github/scripts/publish-compatibility-site.py \\\n  finalize",
+            ),
+            (
+                late_retain,
+                "retention must read every checked release before any archive is extracted",
+            ),
+        ] {
+            assert_ne!(
+                changed_step, step,
+                "opponent must mutate the actual publication step"
+            );
+            assert_rejected(
+                &workflow.replacen(&step, &changed_step, 1),
+                &landing,
+                diagnostic,
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_step_must_turn_phase_timing_on() {
+        let (workflow, landing) = actual();
+        let rebuild = step_running(&workflow, REBUILD_COMMAND).unwrap();
+        let declared = format!("{PHASE_TIMING}: \"1\"");
+        assert_eq!(rebuild.matches(&declared).count(), 1);
+        let mutate = |changed: &str| workflow.replacen(&rebuild, changed, 1);
+        let env_diagnostic = "must declare exactly one `COMPATIBILITY_WEBSITE_PHASE_TIMING: \"1\"`";
+        for (changed, diagnostic) in [
+            // Dropped, turned off, unquoted, or declared twice.
+            (
+                rebuild.replacen(&format!("        {declared}\n"), "", 1),
+                env_diagnostic,
+            ),
+            (
+                rebuild.replacen(&declared, &format!("{PHASE_TIMING}: \"0\""), 1),
+                env_diagnostic,
+            ),
+            (
+                rebuild.replacen(&declared, &format!("{PHASE_TIMING}: 1"), 1),
+                env_diagnostic,
+            ),
+            (
+                rebuild.replacen(&declared, &format!("{declared}\n        {declared}"), 1),
+                env_diagnostic,
+            ),
+            // Moved out of the step's env mapping.
+            (
+                rebuild.replacen("      env:\n", "      with:\n", 1),
+                env_diagnostic,
+            ),
+            // Overridden in the shell after the env sets it.
+            (
+                rebuild.replacen(
+                    "set -euo pipefail\n",
+                    &format!("set -euo pipefail\n        export {PHASE_TIMING}=0\n"),
+                    1,
+                ),
+                "must not mention",
+            ),
+            // The step lost its name, so the nearest name belongs to another step.
+            (
+                rebuild.replacen("    - name: ", "    - title: ", 1),
+                "is not inside a named workflow step",
+            ),
+            // The rebuild no longer runs, or runs from a second step.
+            (
+                rebuild.replacen(REBUILD_COMMAND, "rebuild-compatibility-site.py build", 1),
+                "on exactly one line, found 0",
+            ),
+            (
+                format!(
+                    "{rebuild}\n    - name: Second rebuild\n      run: python3 .github/scripts/{REBUILD_COMMAND}"
+                ),
+                "on exactly one line, found 2",
+            ),
+        ] {
+            assert_ne!(changed, rebuild, "mutation did not apply: {diagnostic}");
+            assert_rejected(&mutate(&changed), &landing, diagnostic);
+        }
     }
 
     #[test]

@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Measure targeted native, ptrace, DBT, and KVM backend workloads."""
 
 from __future__ import annotations
@@ -29,6 +23,8 @@ BENCHMARK_DIR = ROOT / "benchmarks"
 WORK_DIR = ROOT / "target" / "hermit-targeted-benchmarks"
 DEFAULT_OUTPUT_DIR = BENCHMARK_DIR / "results" / "targeted"
 BACKEND_NAMES = ("native", "ptrace", "dbt", "kvm")
+# `hermit run --strict` refuses an epoch drawn from the host clock.
+EPOCH = "2026-01-01T00:00:00Z"
 
 
 class BenchmarkError(RuntimeError):
@@ -155,7 +151,7 @@ def require_tool(name: str) -> str:
 
 def build_hermit(hermit: Path, skip_build: bool) -> None:
     if not skip_build:
-        run_setup(["cargo", "build", "--release", "-p", "hermit", "--bin", "hermit"])
+        run_setup(["cargo", "build", "--release", "-p", "hermit-run", "--bin", "hermit"])
     if not hermit.is_file() or not os.access(hermit, os.X_OK):
         raise BenchmarkError(f"Hermit executable is not executable: {hermit}")
 
@@ -216,6 +212,8 @@ def backend_command(
         backend,
         "run",
         "--strict",
+        "--epoch",
+        EPOCH,
         "--",
         *benchmark.command,
     )

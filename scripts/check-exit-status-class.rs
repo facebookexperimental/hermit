@@ -6,7 +6,6 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-
 //! Refuse a BARE exit-status integer in a test, for the values that changed meaning.
 //!
 //! ⚠️ WHAT THIS CAN AND CANNOT DECIDE, because the difference is the whole design.
@@ -565,10 +564,16 @@ mod tests {
     /// It used to require `hermit-cli/tests/liteinst_advanced.rs` to contain the
     /// literal `Some(HERMIT_INTERNAL_FAILURE_EXIT)`, because the LiteInst clone
     /// boundary made that file assert a hermit-internal failure and the number
-    /// had been written as a bare literal. Reverie now follows `clone`,
-    /// `clone3` and `fork` under the LiteInst hybrid, so those tests assert the
-    /// guest's own success instead and the file has no hermit exit class left to
-    /// name. The old assertion pinned a premise that no longer holds.
+    /// had been written as a bare literal. Reverie then followed `clone`,
+    /// `clone3` and `fork` under the LiteInst hybrid, so those tests asserted the
+    /// guest's own success instead and the file had no hermit exit class left to
+    /// name. The old assertion pinned a premise that no longer held.
+    ///
+    /// When Hermit's LiteInst became in-guest only
+    /// (https://github.com/rrnewton/hermit/issues/3520), those tests moved,
+    /// retargeted to the in-guest runtime, into
+    /// `hermit-cli/tests/common/liteinst_in_guest_programs.rs`, and this pin moved
+    /// with them.
     ///
     /// What the pin was buying survives here, and is TIGHTER than the
     /// repository-wide scan below rather than a relaxation of it: that scan
@@ -585,9 +590,9 @@ mod tests {
     /// places and missed this one; the gate caught it. Search for the behaviour,
     /// not only the symbol.
     #[test]
-    fn liteinst_advanced_spells_no_reserved_exit_code_as_a_literal() {
-        let file = "hermit-cli/tests/liteinst_advanced.rs";
-        let body = include_str!("../hermit-cli/tests/liteinst_advanced.rs");
+    fn liteinst_in_guest_programs_spell_no_reserved_exit_code_as_a_literal() {
+        let file = "hermit-cli/tests/common/liteinst_in_guest_programs.rs";
+        let body = include_str!("../hermit-cli/tests/common/liteinst_in_guest_programs.rs");
         for (value, meaning) in COLLIDING {
             assert!(
                 !body.contains(&format!("Some({value})")),
@@ -596,7 +601,7 @@ mod tests {
         }
         assert!(
             scan_text(file, &body).is_empty(),
-            "LiteInst advanced tests contain an undeclared colliding exit status"
+            "LiteInst in-guest program tests contain an undeclared colliding exit status"
         );
     }
 

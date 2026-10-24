@@ -17,6 +17,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -575,12 +576,7 @@ fn prepare_in_impl(
         )
     })?;
     let rewritten = rewrite_artifact_path(cache_dir, &rewrite_key, output_digest);
-    fs::rename(&temporary_binary, &rewritten).with_context(|| {
-        format!(
-            "failed to persist rewritten executable {}",
-            rewritten.display()
-        )
-    })?;
+    publish_executable(&temporary_binary, &rewritten, output_digest, snapshot.mode)?;
     let rewritten_metadata = fs::symlink_metadata(&rewritten).with_context(|| {
         format!(
             "failed to stat persisted rewritten executable {}",
@@ -705,9 +701,10 @@ fn snapshot_binary(binary: &Path, cache_dir: &Path) -> Result<BinarySnapshot, Er
         let mut permissions = temporary.as_file().metadata()?.permissions();
         permissions.set_mode(0o500);
         temporary.as_file().set_permissions(permissions)?;
-        temporary
-            .persist(&snapshot)
-            .with_context(|| format!("failed to persist binary snapshot {}", snapshot.display()))?;
+        // Close the writable descriptor before publication: another process
+        // may execute the snapshot as soon as its final name exists.
+        let temporary = temporary.into_temp_path();
+        publish_executable(&temporary, &snapshot, digest, 0o500)?;
     }
 
     Ok(BinarySnapshot {
@@ -764,6 +761,59 @@ fn valid_cached_coverage(metadata: &RewriteMetadata, expected: &RewriteIdentity)
             expected.candidate_sites,
         )
         .is_ok()
+}
+
+/// Publish a completed, closed executable without replacing an existing inode.
+///
+/// Concurrent cold misses can produce identical bytes. Renaming over the
+/// winner would nevertheless unlink an image already executing in another
+/// container; e9patch's loader then sees "/proc/self/exe" ending in " (deleted)"
+/// and cannot reopen it. A hard link atomically claims the final name, while
+/// the caller retains responsibility for removing its private staging name.
+fn publish_executable(
+    source: &Path,
+    destination: &Path,
+    digest: Digest,
+    mode: u32,
+) -> Result<(), Error> {
+    match fs::hard_link(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to publish e9patch executable {}",
+                    destination.display()
+                )
+            });
+        }
+    }
+
+    // The private cache admits concurrent Hermit writers, not arbitrary
+    // replacements. Authenticate a winning publication through one descriptor;
+    // never follow a symlink or block on a non-regular destination.
+    let existing = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(destination)
+        .with_context(|| {
+            format!(
+                "e9patch executable publication collision: cannot inspect {}",
+                destination.display()
+            )
+        })?;
+    let metadata = existing.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != mode
+        || Digest::digest_reader(&existing)? != digest
+    {
+        return Err(Error::msg(format!(
+            "e9patch executable publication collision: {} differs in type, owner, mode or digest",
+            destination.display()
+        )));
+    }
+    Ok(())
 }
 
 fn rewrite_artifact_path(cache_dir: &Path, rewrite_key: &str, digest: Digest) -> PathBuf {
@@ -1174,6 +1224,9 @@ fn validate_patch_coverage(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod publication_tests;
 
 #[cfg(test)]
 mod tests {

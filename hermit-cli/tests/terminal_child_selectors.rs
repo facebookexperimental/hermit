@@ -8,6 +8,9 @@
 
 //! Runtime coverage for scheduler-owned terminal child selectors.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,7 +33,8 @@ fn selector_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("terminal-child-selectors");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("terminal-child-selectors-{}", std::process::id()));
         fs::create_dir_all(&build_root).expect("failed to create selector guest build directory");
         let guest = build_root.join("terminal_child_selectors");
         let source = repository.join("tests/c/terminal_child_selectors.c");
@@ -59,9 +63,7 @@ fn run_selector_guest(backend: &str, guest_args: &[&str]) -> std::process::Outpu
     }
     command.arg("--tmp=/tmp");
     command.arg("--").arg(selector_guest()).args(guest_args);
-    command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run selector guest under {backend}: {error}"))
+    hermit_test::hermit_output(&format!("{command:?}"), &mut command)
 }
 
 #[test]

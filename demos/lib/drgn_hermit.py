@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """Read a paused Hermit/QEMU Linux guest through drgn without ptrace attach.
 
 The helper restores demo 5's QEMU boot snapshot with its CPUs paused.  Hermit's
@@ -13,9 +7,12 @@ guest physical reads are served from QEMU's RAM mmap through
 ``/proc/<qemu-pid>/mem``.  Only :meth:`advance` resumes the tracer and guest.
 """
 
+from contextlib import contextmanager
+from dataclasses import dataclass
 import json
 import lzma
 import os
+from pathlib import Path
 import re
 import shutil
 import signal
@@ -25,12 +22,15 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from demo_common import hermit_tmp_args, make_socket_path
+from demo_common import (
+    accept_snapshot_after_failed_rebuild,
+    BootSnapshotMismatch,
+    hermit_tmp_args,
+    make_socket_path,
+    verify_boot_snapshot,
+)
 from qemu_controller import KERNEL_COMMAND_LINE
 
 
@@ -49,11 +49,15 @@ MAX_GUEST_COMMAND_BYTES = GUEST_COMMAND_READ_BYTES - 1
 # QEMU's own reason is in the log.
 FAILED_LOG_TAIL_LINES = 40
 FAILED_LOG_TAIL_BYTES = 64 << 10
-# close() kills QEMU and Hermit's tracer by pid and waits at most this long for
-# both to exit, then at most HERMIT_EXIT_SECONDS for the process the demo
-# started (Hermit, or a wrapper that runs it) to exit by itself.
+# close() kills QEMU and Hermit's tracer one by one, each through a pidfd, and
+# waits at most this long for both to exit, then at most HERMIT_EXIT_SECONDS
+# for the process the demo started (Hermit, or a wrapper that runs it) to exit
+# by itself.
 OWNED_PROCESS_EXIT_SECONDS = 10.0
 HERMIT_EXIT_SECONDS = 10.0
+# The demo's virtual-time epoch, as demos 05 and 06 pass theirs: `hermit run
+# --strict` refuses an epoch drawn from the host clock.
+EPOCH = "2026-01-01T00:00:00Z"
 
 
 def _write_command_image(path: Path, command: str) -> None:
@@ -81,10 +85,17 @@ class GuestConfig:
     kernel: Path
     initrd: Path
     vmlinux: Path
+    # The boot snapshot, by the name ensure_boot_snapshot checked. Demo 5's
+    # record of it is read next to this name (verify_boot_snapshot reads
+    # <snapshot_disk>.producer.json), so a symlinked name must not be resolved:
+    # the record next to the symlink's target is not the one that was checked.
     snapshot_disk: Path
     snapshot_name: str
     advance_command: str
     artifact_dir: Path
+    # The asset directory whose initramfs.cpio.gz demo 5's record of
+    # snapshot_disk must name (verify_boot_snapshot).
+    assets: Path
     qemu_bios: Optional[Path] = None
     qemu_library_path: Optional[Path] = None
     timeout: float = 240.0
@@ -133,9 +144,7 @@ class QmpClient:
                 last_error = error
                 connection.close()
                 time.sleep(0.05)
-        raise TimeoutError(
-            "QMP socket did not become ready: {} ({})".format(path, last_error)
-        )
+        raise TimeoutError("QMP socket did not become ready: {} ({})".format(path, last_error))
 
     def _read_message(self):
         while True:
@@ -157,9 +166,7 @@ class QmpClient:
             if "event" in response:
                 continue
             if "error" in response:
-                raise RuntimeError(
-                    "QMP {} failed: {}".format(command, response["error"])
-                )
+                raise RuntimeError("QMP {} failed: {}".format(command, response["error"]))
             if "return" in response:
                 return response["return"]
 
@@ -189,6 +196,76 @@ def _atomic_write(path: Path, data: bytes) -> None:
             pass
 
 
+def ensure_boot_snapshot(
+    snapshot: Path, root: Path, assets: Path, rebuild: Callable[[], None]
+) -> None:
+    """Use demo 5's boot snapshot only if it was booted from the current initramfs.
+
+    These are demo 6's rules (ensure_boot_snapshot in
+    demos/06-qemu-resume/run.py). The snapshot's memory holds the guest /init
+    that runs demo 7's command, so a snapshot booted from another initramfs runs
+    another /init (see verify_boot_snapshot). The default snapshot,
+    ``assets``/hermit-boot.qcow2, is built, or rebuilt, by ``rebuild``, which
+    runs demo 5. A snapshot named by DEMO07_SNAPSHOT_DISK is never built or
+    replaced here: if it is missing or does not match, this refuses and says how
+    to rebuild it. Its existence alone is never enough.
+    """
+    snapshot = Path(snapshot)
+    default_snapshot = Path(assets) / "hermit-boot.qcow2"
+    custom = snapshot != default_snapshot
+    stale = False
+    if not snapshot.is_file():
+        if custom:
+            raise RuntimeError(
+                "missing custom boot snapshot: {}; produce it before demo 7".format(
+                    snapshot
+                )
+            )
+        print("Demo 5 boot snapshot missing; running demo 5 first...", flush=True)
+    else:
+        try:
+            verify_boot_snapshot(snapshot, root, assets)
+            return
+        except BootSnapshotMismatch as mismatch:
+            if custom:
+                raise RuntimeError(
+                    "refusing to restore the custom boot snapshot {} "
+                    "(DEMO07_SNAPSHOT_DISK): {}. The snapshot's memory holds the "
+                    "guest /init that runs demo 7's command, so a snapshot booted "
+                    "from another initramfs runs another /init; an /init from an "
+                    "older initramfs runs the command as root with the console as "
+                    "its standard input. Rebuild it by running demo 5 with "
+                    "QEMU_SNAPSHOT_DISK={} and the same QEMU_ASSETS, or unset "
+                    "DEMO07_SNAPSHOT_DISK to use the default snapshot, which demo 7 "
+                    "rebuilds itself".format(snapshot, mismatch, snapshot)
+                ) from mismatch
+            print(
+                "Demo 5 boot snapshot {} is not from the current initramfs: {}; "
+                "running demo 5 again to rebuild it...".format(snapshot, mismatch),
+                flush=True,
+            )
+            stale = True
+    try:
+        rebuild()
+    except subprocess.CalledProcessError as failure:
+        if not stale:
+            raise
+        # As in demo 6: demo 5 can exit non-zero after it saved a current
+        # snapshot, when its own reference run was made from an older
+        # initramfs. Its record, not its exit status, is the verdict.
+        accept_snapshot_after_failed_rebuild(snapshot, root, assets, failure, "demo 7")
+        return
+    if not snapshot.is_file():
+        raise RuntimeError("Demo 5 did not produce {}".format(snapshot))
+    try:
+        verify_boot_snapshot(snapshot, root, assets)
+    except BootSnapshotMismatch as mismatch:
+        raise RuntimeError(
+            "Demo 5 ran, but {} still does not match the current initramfs: "
+            "{}".format(snapshot, mismatch)
+        ) from mismatch
+
+
 def ensure_vmlinux(kernel: Path, vmlinux: Path) -> Path:
     """Extract the ELF-with-BTF payload from the fixed XZ bzImage if needed."""
     if vmlinux.is_file():
@@ -206,9 +283,7 @@ def ensure_vmlinux(kernel: Path, vmlinux: Path) -> Path:
     try:
         extracted = lzma.decompress(compressed[offset:])
     except lzma.LZMAError as error:
-        raise RuntimeError(
-            "could not extract vmlinux from {}: {}".format(kernel, error)
-        )
+        raise RuntimeError("could not extract vmlinux from {}: {}".format(kernel, error))
     if not extracted.startswith(ELF_MAGIC):
         raise RuntimeError("extracted kernel payload is not ELF")
     _atomic_write(vmlinux, extracted)
@@ -227,9 +302,7 @@ def _elf_build_id(path: Path) -> str:
     except FileNotFoundError:
         raise RuntimeError("readelf is required to verify the kernel BuildID")
     except subprocess.CalledProcessError as error:
-        raise RuntimeError(
-            "readelf failed for {}: {}".format(path, error.stderr.strip())
-        )
+        raise RuntimeError("readelf failed for {}: {}".format(path, error.stderr.strip()))
     match = re.search(r"Build ID:\s*([0-9a-fA-F]+)", result.stdout)
     if match is None:
         raise RuntimeError("vmlinux has no GNU BuildID: {}".format(path))
@@ -246,7 +319,9 @@ def _register_vmcoreinfo_symbols(program, vmcoreinfo: bytes, drgn) -> None:
             drgn.SymbolBinding.GLOBAL,
             drgn.SymbolKind.UNKNOWN,
         )
-        for match in re.finditer(rb"(?m)^SYMBOL\(([^)]+)\)=([0-9a-fA-F]+)$", vmcoreinfo)
+        for match in re.finditer(
+            rb"(?m)^SYMBOL\(([^)]+)\)=([0-9a-fA-F]+)$", vmcoreinfo
+        )
     )
     if not symbols:
         raise RuntimeError("guest VMCOREINFO contains no SYMBOL entries")
@@ -263,7 +338,9 @@ def _register_vmcoreinfo_symbols(program, vmcoreinfo: bytes, drgn) -> None:
         ]
         return matches[:1] if one else matches
 
-    program.register_symbol_finder("guest-vmcoreinfo", find_symbols, enable_index=0)
+    program.register_symbol_finder(
+        "guest-vmcoreinfo", find_symbols, enable_index=0
+    )
 
 
 def _btf_dwarf_cache(vmlinux: Path, artifact_dir: Path) -> Path:
@@ -350,7 +427,9 @@ def _load_btf_dwarf(program, vmlinux: Path, artifact_dir: Path) -> None:
 def _vmcoreinfo_symbol_addresses(vmcoreinfo: bytes) -> dict[str, int]:
     return {
         match.group(1).decode("ascii"): int(match.group(2), 16)
-        for match in re.finditer(rb"(?m)^SYMBOL\(([^)]+)\)=([0-9a-fA-F]+)$", vmcoreinfo)
+        for match in re.finditer(
+            rb"(?m)^SYMBOL\(([^)]+)\)=([0-9a-fA-F]+)$", vmcoreinfo
+        )
     }
 
 
@@ -371,7 +450,9 @@ def _kallsyms_address(program, vmcoreinfo: bytes, wanted: str) -> int:
             "guest VMCOREINFO lacks kallsyms metadata: {}".format(", ".join(missing))
         )
 
-    number = struct.unpack("<I", program.read(addresses["kallsyms_num_syms"], 4))[0]
+    number = struct.unpack(
+        "<I", program.read(addresses["kallsyms_num_syms"], 4)
+    )[0]
     if not 0 < number <= 4_000_000:
         raise RuntimeError("invalid guest kallsyms count: {}".format(number))
 
@@ -420,7 +501,11 @@ def _kallsyms_address(program, vmcoreinfo: bytes, wanted: str) -> int:
         # The first expanded character is the kallsyms type code.
         if expanded[1:].decode("ascii", "replace") == wanted:
             offset = offsets[index]
-            return relative_base + offset if offset >= 0 else relative_base - 1 - offset
+            return (
+                relative_base + offset
+                if offset >= 0
+                else relative_base - 1 - offset
+            )
     raise RuntimeError("guest kallsyms has no {} symbol".format(wanted))
 
 
@@ -432,7 +517,9 @@ def _register_init_task_object(program, address: int, drgn) -> None:
             return drgn.Object(program, task_type, address=address)
         return None
 
-    program.register_object_finder("guest-init-task", find_object, enable_index=0)
+    program.register_object_finder(
+        "guest-init-task", find_object, enable_index=0
+    )
 
 
 def _log_tail(path: Path, lines: int, max_bytes: int) -> Optional[List[str]]:
@@ -493,28 +580,45 @@ def _is_running(pid: int, start_time: int) -> bool:
     )
 
 
-def _kill_if_running(pid: int, start_time: int) -> None:
-    """Send SIGKILL to ``pid`` only if it is still the process that started at ``start_time``."""
-    try:
-        # A pidfd refers to the process that had the pid when it was opened, so
-        # a start time that still matches after opening it identifies the
-        # process the signal reaches, even if the pid is reused meanwhile.
-        pidfd = os.pidfd_open(pid)  # type: Optional[int]
-    except ProcessLookupError:
+class _NoSignalSent(Exception):
+    """A process that needed SIGKILL could not be signalled through a pidfd, so got no signal."""
+
+
+def _kill_if_running(pid: int, start_time: int, pidfd: Optional[int] = None) -> None:
+    """Send SIGKILL to ``pid`` only if it is still the process that started at ``start_time``.
+
+    The signal goes only through a pidfd: ``pidfd`` when the caller holds one
+    for this process (see _HeldTracer), else one opened here. A process that has
+    exited, even if not yet reaped, or whose pid now belongs to a process with a
+    different start time, is not signalled. Any other failure to open or use
+    the pidfd raises _NoSignalSent, and no signal is sent by pid instead: these
+    processes are not this process's children, so nothing keeps their pids from
+    being given to another process between a check and a signal by pid.
+    """
+    if not _is_running(pid, start_time):
         return
-    except (AttributeError, OSError):
-        pidfd = None  # No pidfd support: check, then signal by pid.
+    held = pidfd is not None
+    if pidfd is None:
+        try:
+            # A pidfd refers to the process that had the pid when it was opened, so
+            # a start time that still matches after opening it identifies the
+            # process the signal reaches, even if the pid is reused meanwhile.
+            pidfd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return  # ESRCH: it has exited.
+        except (AttributeError, OSError) as error:
+            raise _NoSignalSent("pidfd_open failed: {}".format(error)) from error
     try:
         if not _is_running(pid, start_time):
             return
-        if pidfd is None:
-            os.kill(pid, signal.SIGKILL)
-        else:
+        try:
             signal.pidfd_send_signal(pidfd, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+        except ProcessLookupError:
+            return  # ESRCH: it exited after the check.
+        except (AttributeError, OSError) as error:
+            raise _NoSignalSent("pidfd_send_signal failed: {}".format(error)) from error
     finally:
-        if pidfd is not None:
+        if not held:
             os.close(pidfd)
 
 
@@ -536,23 +640,38 @@ def _tracer_of(pid: int, start_time: int) -> Optional[int]:
 
 
 def _kill_and_wait(
-    processes: List[Tuple[str, int, int]], timeout: float
-) -> List[Tuple[str, int, int]]:
+    processes: List[Tuple[str, int, int]],
+    timeout: float,
+    pidfds: Optional[Dict[Tuple[str, int], int]] = None,
+) -> Tuple[List[Tuple[str, int, int]], List[Tuple[str, int, int, str]]]:
     """SIGKILL each (name, pid, start time) and wait up to ``timeout`` seconds for all to exit.
 
-    Returns the processes still running when the wait ends. A process that has
-    exited, even if not yet reaped, or whose pid now belongs to a process with a
-    different start time, counts as gone and is not signalled.
+    Returns the processes still running when the wait ends, and, each with the
+    reason, those that could not be signalled through a pidfd and so were sent
+    no signal; the wait is not spent on these. A process that has exited, even
+    if not yet reaped, or whose pid now belongs to a process with a different
+    start time, counts as gone and is not signalled. ``pidfds`` maps (name,
+    pid) to a pidfd already held for that process, which is used instead of a
+    new one.
     """
-    for _, pid, start_time in processes:
-        _kill_if_running(pid, start_time)
+    signalled = []  # type: List[Tuple[str, int, int]]
+    not_signalled = []  # type: List[Tuple[str, int, int, str]]
+    for name, pid, start_time in processes:
+        held = (pidfds or {}).get((name, pid))
+        try:
+            if held is None:
+                _kill_if_running(pid, start_time)
+            else:
+                _kill_if_running(pid, start_time, held)
+        except _NoSignalSent as error:
+            not_signalled.append((name, pid, start_time, str(error)))
+        else:
+            signalled.append((name, pid, start_time))
     deadline = time.monotonic() + timeout
     while True:
-        running = [
-            process for process in processes if _is_running(process[1], process[2])
-        ]
+        running = [process for process in signalled if _is_running(process[1], process[2])]
         if not running or time.monotonic() >= deadline:
-            return running
+            return running, not_signalled
         time.sleep(0.02)
 
 
@@ -568,10 +687,7 @@ def _find_qemu(qmp_socket: Path) -> Optional[int]:
             if not (comm.startswith("qemu-system") or comm == "qemu-kvm"):
                 continue
             with open("/proc/{}/cmdline".format(pid), "rb") as command_file:
-                arguments = [
-                    part.decode(errors="replace")
-                    for part in command_file.read().split(b"\0")
-                ]
+                arguments = [part.decode(errors="replace") for part in command_file.read().split(b"\0")]
             if qmp_argument in arguments:
                 return pid
         except OSError:
@@ -584,9 +700,7 @@ def _wait_for_qemu(process: subprocess.Popen, qmp_socket: Path, timeout: float) 
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(
-                "Hermit exited before QEMU appeared (status {})".format(
-                    process.returncode
-                )
+                "Hermit exited before QEMU appeared (status {})".format(process.returncode)
             )
         qemu_pid = _find_qemu(qmp_socket)
         if qemu_pid is not None:
@@ -630,24 +744,113 @@ def _open_serial_pipe(
             time.sleep(0.05)
 
 
-def _freeze_exact_tracer(qemu_pid: int, timeout: float = 20.0) -> Tuple[int, int]:
+def _qemu_tracer_tgid(qemu_pid: int) -> int:
+    """The thread-group id of the process that ptrace-traces QEMU."""
     tracer_tid = int(_proc_status_value(qemu_pid, "TracerPid"))
     if tracer_tid == 0:
         raise RuntimeError("QEMU is not ptrace-traced by Hermit")
-    tracer_tgid = int(_proc_status_value(tracer_tid, "Tgid"))
+    return int(_proc_status_value(tracer_tid, "Tgid"))
+
+
+class _HeldTracer:
+    """Hermit's tracer, found as QEMU's tracer, held through a pidfd opened once.
+
+    The demo did not start the tracer, so nothing keeps its pid from being given
+    to another process once it exits. Every signal the demo sends it, SIGSTOP,
+    SIGCONT and SIGKILL, goes through this pidfd, which names the process that
+    had the pid when it was opened; none is ever sent by pid.
+    """
+
+    def __init__(self, tgid: int, start_time: int, pidfd: int) -> None:
+        self.tgid = tgid
+        self.start_time = start_time
+        self.pidfd = pidfd  # type: Optional[int]
+
+    def send(self, sig: int) -> bool:
+        """Send ``sig`` through the pidfd; False if the tracer has exited (ESRCH).
+
+        Any other failure raises, and no signal is sent by pid instead.
+        """
+        if self.pidfd is None:
+            raise RuntimeError("Hermit's tracer (pid {}) is no longer held".format(self.tgid))
+        try:
+            signal.pidfd_send_signal(self.pidfd, sig)
+        except ProcessLookupError:
+            return False
+        except (AttributeError, OSError) as error:
+            raise RuntimeError(
+                "could not send {} to Hermit's tracer (pid {}) through its pidfd: {}; "
+                "no signal was sent by pid".format(signal.Signals(sig).name, self.tgid, error)
+            ) from error
+        return True
+
+    def close(self) -> None:
+        if self.pidfd is not None:
+            os.close(self.pidfd)
+            self.pidfd = None
+
+
+def _hold_exact_tracer(qemu_pid: int) -> _HeldTracer:
+    """Open a pidfd for QEMU's tracer and check that it names the tracer found.
+
+    The start time is read before the pidfd is opened, and checked again after,
+    with the tracer still QEMU's: a pid given to another process meanwhile has
+    a different start time, so the pidfd is then closed unused.
+    """
+    tracer_tgid = _qemu_tracer_tgid(qemu_pid)
+    identity = _proc_identity(tracer_tgid)
+    if identity is None:
+        raise RuntimeError("Hermit's tracer (pid {}) exited before it was held".format(tracer_tgid))
+    try:
+        pidfd = os.pidfd_open(tracer_tgid)
+    except ProcessLookupError as error:
+        raise RuntimeError(
+            "Hermit's tracer (pid {}) exited before it was held".format(tracer_tgid)
+        ) from error
+    except (AttributeError, OSError) as error:
+        raise RuntimeError(
+            "could not open a pidfd for Hermit's tracer (pid {}): {}; it is not signalled "
+            "by pid".format(tracer_tgid, error)
+        ) from error
+    tracer = _HeldTracer(tracer_tgid, identity[1], pidfd)
+    try:
+        current = _qemu_tracer_tgid(qemu_pid)
+        held = _is_running(tracer_tgid, identity[1])
+    except BaseException:
+        tracer.close()
+        raise
+    if current != tracer_tgid or not held:
+        tracer.close()
+        raise RuntimeError(
+            "Hermit's tracer changed while it was being held: pid {} started at {}, and QEMU's "
+            "tracer is now pid {}".format(tracer_tgid, identity[1], current)
+        )
+    return tracer
+
+
+def _freeze_exact_tracer(qemu_pid: int, tracer: _HeldTracer, timeout: float = 20.0) -> None:
+    """Stop ``tracer``, QEMU's tracer, while QEMU is in a trace-stop."""
+    current = _qemu_tracer_tgid(qemu_pid)
+    if current != tracer.tgid:
+        raise RuntimeError(
+            "QEMU's tracer is now pid {}, not Hermit's tracer pid {} that the demo "
+            "holds".format(current, tracer.tgid)
+        )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _proc_state(qemu_pid) != "t":
             time.sleep(0.002)
             continue
-        os.kill(tracer_tgid, signal.SIGSTOP)
+        if not tracer.send(signal.SIGSTOP):
+            raise RuntimeError("Hermit's tracer (pid {}) exited".format(tracer.tgid))
         for _ in range(1000):
-            if _proc_state(tracer_tgid) == "T":
+            if _proc_state(tracer.tgid) == "T":
                 break
             time.sleep(0.001)
-        if _proc_state(qemu_pid) == "t" and _proc_state(tracer_tgid) == "T":
-            return tracer_tid, tracer_tgid
-        os.kill(tracer_tgid, signal.SIGCONT)
+        if _proc_state(qemu_pid) == "t" and _proc_state(tracer.tgid) == "T":
+            return
+        if not tracer.send(signal.SIGCONT):
+            raise RuntimeError("Hermit's tracer (pid {}) exited".format(tracer.tgid))
     raise TimeoutError("could not freeze Hermit's exact tracer at a QEMU trace-stop")
 
 
@@ -663,9 +866,7 @@ def _ram_region(qemu_pid: int, wanted: int) -> Tuple[int, int]:
             if wanted // 2 <= size <= wanted * 2:
                 candidates.append((abs(size - wanted), first, last))
     if not candidates:
-        raise RuntimeError(
-            "could not identify the {} MiB QEMU RAM mmap".format(wanted >> 20)
-        )
+        raise RuntimeError("could not identify the {} MiB QEMU RAM mmap".format(wanted >> 20))
     _, first, last = min(candidates)
     return first, last
 
@@ -714,7 +915,8 @@ class HermitGuestProgram:
         self._process_group = None  # type: Optional[int]
         self._qemu_pid = None  # type: Optional[int]
         self._tracer_tgid = None  # type: Optional[int]
-        # (name, pid, start time) of each process close() must kill by pid.
+        self._tracer = None  # type: Optional[_HeldTracer]
+        # (name, pid, start time) of each process close() must kill through a pidfd.
         self._owned_processes = []  # type: List[Tuple[str, int, int]]
         self._memory = None  # type: Optional[int]
         self._qmp = None  # type: Optional[QmpClient]
@@ -746,9 +948,7 @@ class HermitGuestProgram:
                 raise FileNotFoundError(str(path))
         self._vmlinux = ensure_vmlinux(self.config.kernel, self.config.vmlinux)
         self.config.artifact_dir.mkdir(parents=True, exist_ok=True)
-        self.run_dir = Path(
-            tempfile.mkdtemp(prefix="run.", dir=str(self.config.artifact_dir))
-        )
+        self.run_dir = Path(tempfile.mkdtemp(prefix="run.", dir=str(self.config.artifact_dir)))
         self.serial_log = self.run_dir / "serial.log"
         hermit_log = self.run_dir / "hermit.log"
         # QEMU, under Hermit, creates the QMP socket at this path and this
@@ -771,6 +971,25 @@ class HermitGuestProgram:
             os.mkfifo(str(serial_pipe) + suffix)
         working_snapshot = self.run_dir / "snapshot.qcow2"
         shutil.copyfile(str(self.config.snapshot_disk), str(working_snapshot))
+        # Demo 5 does not take a lock, so it may have replaced the boot
+        # snapshot, or its record, after ensure_boot_snapshot checked them.
+        # Check the copy that QEMU restores, as demo 6 does, against the record
+        # next to config.snapshot_disk, the name ensure_boot_snapshot checked.
+        try:
+            verify_boot_snapshot(
+                self.config.snapshot_disk,
+                self.config.root,
+                self.config.assets,
+                disk=working_snapshot,
+            )
+        except BootSnapshotMismatch as mismatch:
+            raise RuntimeError(
+                "the copy {} of the boot snapshot {} does not match demo 5's "
+                "record: {}; demo 5 may have replaced the boot snapshot after "
+                "demo 7 checked it, so run demo 7 again".format(
+                    working_snapshot, self.config.snapshot_disk, mismatch
+                )
+            ) from mismatch
         # Demo 5 records this virtio-blk device in the saved VM topology, and the
         # current initramfs waits for its command here rather than on serial. Supply
         # the real deterministic advance command before -loadvm, with the same
@@ -780,47 +999,29 @@ class HermitGuestProgram:
 
         qemu_command = [
             str(self.config.qemu),
-            "-machine",
-            "q35",
-            "-accel",
-            "tcg",
-            "-cpu",
-            "max",
-            "-smp",
-            "1",
-            "-m",
-            "512M",
-            "-display",
-            "none",
-            "-monitor",
-            "none",
-            "-serial",
-            "pipe:{}".format(serial_pipe),
-            "-qmp",
-            "unix:{},server=on,wait=off".format(qmp_socket),
-            "-drive",
-            "if=none,id=hermit-snapshot-store,file={},format=qcow2".format(
+            "-machine", "q35",
+            "-accel", "tcg",
+            "-cpu", "max",
+            "-smp", "1",
+            "-m", "512M",
+            "-display", "none",
+            "-monitor", "none",
+            "-serial", "pipe:{}".format(serial_pipe),
+            "-qmp", "unix:{},server=on,wait=off".format(qmp_socket),
+            "-drive", "if=none,id=hermit-snapshot-store,file={},format=qcow2".format(
                 working_snapshot
             ),
-            "-drive",
-            "if=none,id=hermit-command,file={},format=raw,readonly=on".format(
+            "-drive", "if=none,id=hermit-command,file={},format=raw,readonly=on".format(
                 command_image
             ),
-            "-device",
-            "virtio-blk-pci,drive=hermit-command",
-            "-loadvm",
-            self.config.snapshot_name,
+            "-device", "virtio-blk-pci,drive=hermit-command",
+            "-loadvm", self.config.snapshot_name,
             "-S",
-            "-icount",
-            "shift=0,sleep=off",
-            "-rtc",
-            "base=2022-01-01T00:00:00,clock=vm",
-            "-kernel",
-            str(self.config.kernel),
-            "-initrd",
-            str(self.config.initrd),
-            "-append",
-            KERNEL_COMMAND_LINE,
+            "-icount", "shift=0,sleep=off",
+            "-rtc", "base=2022-01-01T00:00:00,clock=vm",
+            "-kernel", str(self.config.kernel),
+            "-initrd", str(self.config.initrd),
+            "-append", KERNEL_COMMAND_LINE,
         ]
         if self.config.qemu_bios is not None:
             qemu_command[1:1] = ["-L", str(self.config.qemu_bios)]
@@ -853,11 +1054,11 @@ class HermitGuestProgram:
             "run",
             *tmp_args,
             "--strict",
+            "--epoch",
+            EPOCH,
             "--no-rcb-time",
-            "--target-timeslice",
-            "100000",
-            "--max-timeslice",
-            "disabled",
+            "--target-timeslice", "100000",
+            "--max-timeslice", "disabled",
             "--",
         ] + qemu_command
         environment = os.environ.copy()
@@ -891,8 +1092,12 @@ class HermitGuestProgram:
 
         self._qemu_pid = _wait_for_qemu(self._process, qmp_socket, self.config.timeout)
         self._own_process("QEMU", self._qemu_pid)
-        _, self._tracer_tgid = _freeze_exact_tracer(self._qemu_pid)
-        self._own_process("Hermit's tracer", self._tracer_tgid)
+        self._tracer = _hold_exact_tracer(self._qemu_pid)
+        self._tracer_tgid = self._tracer.tgid
+        self._owned_processes.append(
+            ("Hermit's tracer", self._tracer.tgid, self._tracer.start_time)
+        )
+        _freeze_exact_tracer(self._qemu_pid, self._tracer)
         self._frozen = True
         first, last = _ram_region(self._qemu_pid, self.config.ram_bytes)
         self._ram_first = first
@@ -1043,7 +1248,7 @@ class HermitGuestProgram:
         """Run the preloaded guest command, then freeze the guest at its completion marker."""
         if not self._frozen or self._qmp is None:
             raise RuntimeError("guest is not ready for deterministic advance")
-        if self._tracer_tgid is None or self._qemu_pid is None:
+        if self._tracer is None or self._qemu_pid is None:
             raise RuntimeError("traced processes are unavailable")
         if b"\n" in marker or "\n" in command or "\r" in command:
             raise ValueError("advance command and marker must each be one line")
@@ -1053,14 +1258,17 @@ class HermitGuestProgram:
         # The deterministic input was preloaded on the command disk before QEMU
         # restored the snapshot. Resume the frozen tracee, then wait on serial only
         # for the guest's completion marker.
-        os.kill(self._tracer_tgid, signal.SIGCONT)
+        if not self._tracer.send(signal.SIGCONT):
+            raise RuntimeError(
+                "Hermit's tracer (pid {}) exited before the advance".format(self._tracer.tgid)
+            )
         self._frozen = False
         self._qmp.execute("cont")
         self._wait_for_serial(marker)
         self._qmp.execute("stop")
         if self._qmp.status() != "paused":
             raise RuntimeError("QEMU did not pause after deterministic advance")
-        _, self._tracer_tgid = _freeze_exact_tracer(self._qemu_pid)
+        _freeze_exact_tracer(self._qemu_pid, self._tracer)
         self._frozen = True
 
     def close(self, failed: bool = False) -> None:
@@ -1070,7 +1278,9 @@ class HermitGuestProgram:
         printed, and its snapshot copy is removed (demo 5's is 94 MB).
 
         QEMU or Hermit's tracer still running after close() has killed it and
-        waited is reported; after a pass that finished, close() then raises.
+        waited is reported, and so is one that close() could not signal through
+        a pidfd, which it then sends no signal at all; after a pass that
+        finished, close() then raises.
         """
         if self._memory is not None:
             os.close(self._memory)
@@ -1089,34 +1299,50 @@ class HermitGuestProgram:
                 except OSError:
                     pass
                 setattr(self, attribute, None)
-        # Kill QEMU and Hermit's tracer by pid. The process-group SIGKILL below
-        # does not reach them when `hermit` is a wrapper that runs Hermit
+        # Kill QEMU and Hermit's tracer one by one. The process-group SIGKILL
+        # below does not reach them when `hermit` is a wrapper that runs Hermit
         # elsewhere: safehermit runs it as a systemd user unit, where the
         # tracer, stopped since the last observation, and QEMU outlived every
-        # pass. A pid is signalled only while it still has the start time
-        # recorded when start(), or here a pass that failed first, found it,
-        # so a reused pid is left alone.
+        # pass. Each is signalled only through a pidfd, and only while its pid
+        # still has the start time recorded when start(), or here a pass that
+        # failed first, found it, so a reused pid is left alone. One that cannot
+        # be signalled through a pidfd is sent no signal, and that is reported.
         if self._process is not None and self._process.poll() is None:
             self._own_unrecorded_processes()
         stopped = []  # type: List[str]
-        survivors = []  # type: List[Tuple[str, int, int]]
+        unstopped = []  # type: List[Tuple[str, int, int]]
         if self._owned_processes:
-            stopped = [
-                name
+            running = [
+                (name, pid)
                 for name, pid, start_time in self._owned_processes
                 if _is_running(pid, start_time)
             ]
-            survivors = _kill_and_wait(
-                self._owned_processes, OWNED_PROCESS_EXIT_SECONDS
+            held = {}  # type: Dict[Tuple[str, int], int]
+            if self._tracer is not None and self._tracer.pidfd is not None:
+                held[("Hermit's tracer", self._tracer.tgid)] = self._tracer.pidfd
+            survivors, not_signalled = _kill_and_wait(
+                self._owned_processes, OWNED_PROCESS_EXIT_SECONDS, held
             )
-            self._owned_processes = survivors
-            for name, pid, _ in survivors:
-                print(
-                    "{} (pid {}) is still running {:g} s after SIGKILL.".format(
+            reasons = {(name, pid): reason for name, pid, _, reason in not_signalled}
+            stopped = [name for name, pid in running if (name, pid) not in reasons]
+            unstopped = [
+                process
+                for process in self._owned_processes
+                if process in survivors or process[:2] in reasons
+            ]
+            self._owned_processes = unstopped
+            for name, pid, _ in unstopped:
+                if (name, pid) in reasons:
+                    message = (
+                        "Could not stop {} (pid {}): {}. It was sent no signal: a "
+                        "signal sent by pid alone could reach another process given "
+                        "that pid.".format(name, pid, reasons[(name, pid)])
+                    )
+                else:
+                    message = "{} (pid {}) is still running {:g} s after SIGKILL.".format(
                         name, pid, OWNED_PROCESS_EXIT_SECONDS
-                    ),
-                    file=sys.stderr,
-                )
+                    )
+                print(message, file=sys.stderr)
             # Without its tracer Hermit exits, and a wrapper then finishes its
             # own cleanup (safehermit stops and resets its unit), which the
             # process-group SIGKILL below would cut short.
@@ -1131,6 +1357,8 @@ class HermitGuestProgram:
                         ),
                         file=sys.stderr,
                     )
+        if self._tracer is not None:
+            self._tracer.close()
         # Hermit runs in its own process group (start_new_session); this stops
         # whatever is still running in it, Hermit included.
         if (
@@ -1158,13 +1386,11 @@ class HermitGuestProgram:
             self.qmp_socket.unlink(missing_ok=True)
         if failed:
             self._report_failed_pass(stopped)
-        elif survivors:
+        elif unstopped:
             # A failed pass is already raising; this would replace its error.
             raise RuntimeError(
                 "could not stop {} after the pass".format(
-                    ", ".join(
-                        "{} (pid {})".format(name, pid) for name, pid, _ in survivors
-                    )
+                    ", ".join("{} (pid {})".format(name, pid) for name, pid, _ in unstopped)
                 )
             )
 
@@ -1187,9 +1413,7 @@ class HermitGuestProgram:
             qemu_pid = _find_qemu(self.qmp_socket)
             if qemu_pid is not None:
                 self._own_process("QEMU", qemu_pid)
-                recorded = {
-                    name: (pid, start) for name, pid, start in self._owned_processes
-                }
+                recorded = {name: (pid, start) for name, pid, start in self._owned_processes}
         if "QEMU" in recorded and "Hermit's tracer" not in recorded:
             tracer_tgid = _tracer_of(*recorded["QEMU"])
             if tracer_tgid is not None:
@@ -1206,20 +1430,11 @@ class HermitGuestProgram:
         hermit_log = self.run_dir / "hermit.log"
         tail = _log_tail(hermit_log, FAILED_LOG_TAIL_LINES, FAILED_LOG_TAIL_BYTES)
         if tail is None:
-            print(
-                "The failed pass has no Hermit log at {}.".format(hermit_log),
-                file=sys.stderr,
-            )
+            print("The failed pass has no Hermit log at {}.".format(hermit_log), file=sys.stderr)
         elif not tail:
-            print(
-                "The failed pass's Hermit log {} is empty.".format(hermit_log),
-                file=sys.stderr,
-            )
+            print("The failed pass's Hermit log {} is empty.".format(hermit_log), file=sys.stderr)
         else:
-            print(
-                "End of the failed pass's Hermit log, {}:".format(hermit_log),
-                file=sys.stderr,
-            )
+            print("End of the failed pass's Hermit log, {}:".format(hermit_log), file=sys.stderr)
             for line in tail:
                 print("  " + line, file=sys.stderr)
         if stopped:

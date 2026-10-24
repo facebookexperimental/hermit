@@ -9,6 +9,8 @@
 #   shim/third-party/cmake/staged         a self-contained cmake (PyPI manylinux wheel,
 #                                         pinned by sha256) for reverie-dbt's DynamoRIO build
 # Idempotent; reflinks when it can. Both paths are gitignored.
+# Host packages it needs (docs/BUCK2_OSS.md, "Host prerequisites for Buck validation"):
+#   sudo dnf install -y libunwind-devel xz-devel
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 src=$(cd "$root" && rustc --print sysroot)
@@ -25,20 +27,25 @@ else
     echo "$dst: $want"
 fi
 
+missing() {
+    echo "shim/modes/stage-re-inputs: /usr/lib64/$1 is missing; install it with" \
+        "sudo dnf install -y $2 (docs/BUCK2_OSS.md, \"Host prerequisites for Buck validation\")" >&2
+    exit 1
+}
+
 lu=$root/shim/third-party/libunwind/staged
 mkdir -p "$lu"
 for f in libunwind-ptrace.a libunwind-generic.so libunwind-x86_64.so libunwind-x86_64.so.8 libunwind.so libunwind.so.8; do
-    [[ -e /usr/lib64/$f ]] || { echo "missing /usr/lib64/$f: install libunwind-devel" >&2; exit 1; }
+    [[ -e /usr/lib64/$f ]] || missing "$f" libunwind-devel
     cmp -s "/usr/lib64/$f" "$lu/$f" || cp -L "/usr/lib64/$f" "$lu/$f"
 done
 echo "$lu: $(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}' libunwind-devel 2>/dev/null || echo libunwind)"
 
 xz=$root/shim/third-party/xz/staged
 mkdir -p "$xz"
-xzlib=${XZ_LIBDIR:-/usr/lib64}
 for f in liblzma.so liblzma.so.5; do
-    [[ -e $xzlib/$f ]] || { echo "missing $xzlib/$f: install xz-devel (or set XZ_LIBDIR)" >&2; exit 1; }
-    cmp -s "$xzlib/$f" "$xz/$f" || cp -L "$xzlib/$f" "$xz/$f"
+    [[ -e /usr/lib64/$f ]] || missing "$f" xz-devel
+    cmp -s "/usr/lib64/$f" "$xz/$f" || cp -L "/usr/lib64/$f" "$xz/$f"
 done
 echo "$xz: $(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}' xz-devel 2>/dev/null || echo liblzma)"
 

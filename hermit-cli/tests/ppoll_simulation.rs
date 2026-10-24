@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -13,9 +16,7 @@ use std::process::Output;
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -31,7 +32,10 @@ fn ppoll_readonly_zero_timeout_preserves_ready_result() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ppoll-readonly-zero-timeout");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ppoll-readonly-zero-timeout-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
     let guest = build_root.join("ppoll_simulation");
 
@@ -95,13 +99,169 @@ fn ppoll_readonly_zero_timeout_preserves_ready_result() {
     );
 }
 
+/// A masked ppoll that would block, under `run --strict` on the ptrace
+/// backend, polls under its mask until it times out or a signal the mask lets
+/// in ends it, where it used to return ENOSYS
+/// (https://github.com/rrnewton/hermit/issues/4042). Each mode passes natively,
+/// and under Hermit passes with canonical INFO parity:
+///
+/// - `masked-simulated-wait`: the drained pipe's wait times out with 0;
+/// - `masked-signal-interrupts`: the thread blocks SIGUSR1 and only the
+///   call's mask lets it in; the wait ends with EINTR after the handler ran
+///   under the call's mask;
+/// - `masked-signal-thread-admits`: the thread's mask lets SIGUSR1 in too, so
+///   the backend can take it before a probe installs the call's mask; the
+///   wait still ends with EINTR rather than running on to its timeout;
+/// - `masked-signal-blocked-by-call`: a signal the thread's mask lets in and
+///   the call's mask blocks arrives during the wait, which goes on to report
+///   the pipe the sibling then makes ready; the handler runs after the call,
+///   with the pipe ready;
+/// - `masked-raw-timeout-remaining`, `masked-raw-signal-remaining`: the raw
+///   system call, which gets the guest's own timeout, writes back the time
+///   left after a timeout (zero) and after an interruption (above zero and
+///   below the 5 s timeout).
+#[test]
+fn ppoll_masked_waits_poll_under_their_mask() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ppoll-masked-waits-{}", std::process::id()));
+    fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
+    let guest = build_root.join("ppoll_simulation");
+
+    let mut compile = Command::new("cc");
+    compile
+        .args([
+            "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+        ])
+        .arg(repository.join("tests/c/ppoll_simulation.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "ppoll guest compilation");
+
+    for mode in [
+        "masked-simulated-wait",
+        "masked-signal-interrupts",
+        "masked-signal-thread-admits",
+        "masked-signal-blocked-by-call",
+        "masked-raw-timeout-remaining",
+        "masked-raw-signal-remaining",
+    ] {
+        let mut native = Command::new("timeout");
+        native
+            .args(["--kill-after", "5s", "30s"])
+            .arg(&guest)
+            .arg(mode);
+        let native_output = command_output(native, &format!("native {mode} ppoll"));
+        let native_stdout = String::from_utf8_lossy(&native_output.stdout);
+        let native_stderr = String::from_utf8_lossy(&native_output.stderr);
+        assert!(
+            native_stdout.contains("ppoll-simulation-ok"),
+            "native {mode} ppoll omitted its success marker\nstdout:\n{native_stdout}\nstderr:\n{native_stderr}",
+        );
+
+        let verdict_directory =
+            tempfile::tempdir().expect("failed to create masked ppoll verdict directory");
+        let verdict = verdict_directory.path().join("verify.json");
+        let mut verify_command = Command::new("timeout");
+        verify_command
+            .args(["--kill-after", "5s", "60s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log=info",
+                "--backend=ptrace",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+            ])
+            .arg(format!("--verify-json={}", verdict.display()))
+            .args(["--base-env=minimal", "--"])
+            .arg(&guest)
+            .arg(mode);
+        let verify_output = command_output(
+            verify_command,
+            &format!("strict ptrace {mode} ppoll verification"),
+        );
+        let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
+        let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
+        assert!(
+            verify_stdout.contains("ppoll-simulation-ok"),
+            "{mode} ppoll guest failed under Hermit\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
+        );
+        assert!(
+            verify_stdout.contains("Determinism verified")
+                || verify_stderr.contains("Determinism verified"),
+            "Hermit omitted its {mode} ppoll determinism marker\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
+        );
+        let verdict =
+            fs::read_to_string(&verdict).expect("failed to read masked ppoll verification verdict");
+        assert!(
+            verdict.contains("\"bitwise_parity\":true"),
+            "{mode} ppoll did not meet canonical INFO parity: {verdict}",
+        );
+    }
+}
+
+/// On a backend whose kernel does not report the guest's signal state, Hermit
+/// cannot tell whether the backend holds a signal that should end a masked
+/// ppoll's wait, so under `run --strict` such a call that would block still
+/// fails closed with ENOSYS (`masked-fail-closed`), where the ptrace backend
+/// waits under the mask (`ppoll_masked_waits_poll_under_their_mask`).
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_masked_ppoll_that_would_block_fails_closed() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ppoll-dbt-fail-closed-{}", std::process::id()));
+    fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
+    let guest = build_root.join("ppoll_simulation");
+    let mut compile = Command::new("cc");
+    compile
+        .args([
+            "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+        ])
+        .arg(repository.join("tests/c/ppoll_simulation.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "ppoll guest compilation");
+
+    let mut run = Command::new("timeout");
+    run.args(["--kill-after", "5s", "60s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--backend=dbt",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("masked-fail-closed");
+    // Validation runs guests in an empty working directory, which DBT needs
+    // named on its command line.
+    hermit_test::configure_guest_execution(&mut run);
+    let output = command_output(run, "strict dbt masked ppoll fail-closed run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ppoll-simulation-ok"),
+        "a blocking masked ppoll did not fail closed with ENOSYS under dbt\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 #[test]
 fn ppoll_nonsequentialized_kernel_wait_checks_mask_access() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("ppoll-inaccessible-kernel-wait-mask");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ppoll-inaccessible-kernel-wait-mask-{}",
+        std::process::id()
+    ));
     fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
     let guest = build_root.join("ppoll_simulation");
 
@@ -171,7 +331,8 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ppoll-simulation");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ppoll-simulation-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
     let guest = build_root.join("ppoll_simulation");
 
@@ -290,35 +451,53 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
         .arg(format!("--data-dir={}", trace_recording.path().display()))
         .arg("--")
         .arg(&guest)
-        .arg("masked-fail-closed");
+        .arg("masked-record-kernel-wait");
     let record_trace_output = command_output(record_trace_command, "strict ppoll record trace");
     let record_trace_stdout = String::from_utf8_lossy(&record_trace_output.stdout);
     let record_trace_stderr = String::from_utf8_lossy(&record_trace_output.stderr);
+    // Under record a masked ppoll that may wait is a kernel wait outside the
+    // turn, as a masked pselect6 is (https://github.com/rrnewton/hermit/issues/4042):
+    // the Recorder sees the guest's own non-zero timeout, not a zero-time
+    // probe, and the call holds a BlockingExternalIO resource. The guest
+    // requires the drained pipe's wait to time out with 0, as on Linux, as a
+    // sequentialized ptrace run does (`ppoll_masked_waits_poll_under_their_mask`).
+    assert!(
+        record_trace_stdout.contains("ppoll-simulation-ok"),
+        "masked record ppoll guest failed\nstdout:\n{record_trace_stdout}\nstderr:\n{record_trace_stderr}",
+    );
     assert!(
         record_trace_stderr.lines().any(|line| {
             line.contains("Recorder observed ppoll input")
                 && line.contains("has_signal_mask=true")
-                && line.contains("timeout_is_zero=true")
+                && line.contains("timeout_is_zero=false")
         }),
-        "masked zero-time ppoll probe did not reach Recorder\nstdout:\n{record_trace_stdout}\nstderr:\n{record_trace_stderr}",
+        "masked ppoll kernel wait did not reach Recorder\nstdout:\n{record_trace_stdout}\nstderr:\n{record_trace_stderr}",
     );
     assert!(
-        !record_trace_stderr
+        record_trace_stderr
             .lines()
             .any(|line| { line.contains("BlockingExternalIO") && line.contains("ppoll") }),
-        "masked ppoll used a BlockingExternalIO resource\nstdout:\n{record_trace_stdout}\nstderr:\n{record_trace_stderr}",
+        "masked ppoll did not wait outside the turn\nstdout:\n{record_trace_stdout}\nstderr:\n{record_trace_stderr}",
     );
 
+    // The default workload at L2 on both backends. DBT ran only the lossy
+    // default comparator until its clone SETTID words held the virtual TID
+    // (https://github.com/rrnewton/hermit/issues/3147).
     for backend in ["ptrace", "dbt"] {
+        let verdict_directory =
+            tempfile::tempdir().expect("failed to create ppoll verdict directory");
+        let verdict = verdict_directory.path().join("verify.json");
         let mut verify_command = Command::new("timeout");
         verify_command
-            .args(["--kill-after", "5s", "30s"])
+            .args(["--kill-after", "5s", "60s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .arg("--log=info")
             .arg(format!("--backend={backend}"))
-            .arg("run")
-            .args(["--strict", "--verify", "--base-env=minimal", "--"])
+            .args(["run", "--strict", "--verify", "--verify-strict"])
+            .arg(format!("--verify-json={}", verdict.display()))
+            .args(["--base-env=minimal", "--"])
             .arg(&guest);
+        hermit_test::configure_guest_execution(&mut verify_command);
         let verify_output = command_output(
             verify_command,
             &format!("strict {backend} ppoll verification"),
@@ -326,9 +505,19 @@ fn ppoll_waits_use_nonblocking_probes_and_verify() {
         let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
         let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
         assert!(
-            verify_stdout.contains("Determinism verified")
-                || verify_stderr.contains("Determinism verified"),
-            "Hermit omitted its {backend} determinism marker\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
+            verify_stdout.contains("ppoll-simulation-ok"),
+            "{backend} ppoll guest failed under Hermit\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
+        );
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the ppoll verdict"))
+                .expect("the ppoll verdict must be JSON");
+        assert_eq!(verdict["verdict"], "matched", "{backend}: {verdict}");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        assert!(
+            verdict["compared_log_messages"]["left"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "{backend}: {verdict}"
         );
     }
 

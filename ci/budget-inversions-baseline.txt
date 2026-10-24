@@ -18,7 +18,6 @@
 # Both are CI policy calls. The guard deliberately does not choose.
 #
 # Format: <node> <declared>s >= <bound>s (<what bounds it>)
-test.liteinst_strict 900s >= 900s (job test-release timeout-minutes)
 test.sabre_examples 900s >= 900s (job test-release timeout-minutes)
 #
 # REMOVED 2026-08-10, and this is what a shrink looks like:
@@ -27,3 +26,9 @@ test.sabre_examples 900s >= 900s (job test-release timeout-minutes)
 # 720s so it now fits inside its own 900s job. The line is deleted rather than
 # amended because the node no longer inverts at all -- and leaving it would trip
 # this guard's own "fixed but still listed" refusal. 17 -> 16.
+#
+# REMOVED 2026-10-04, and this is NOT a fix:
+#   test.liteinst_strict 900s >= 900s (job test-release timeout-minutes)
+# The node was deleted with the LiteInst host hybrid
+# (https://github.com/rrnewton/hermit/issues/3520). Its line goes because
+# the node no longer exists; no wall or job timeout changed. 2 -> 1.

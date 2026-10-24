@@ -42,6 +42,14 @@ pub(crate) fn request(summary_json: &Option<std::path::PathBuf>) -> BackendStats
 /// here at DEBUG with the snapshot, for the same reason: dispatch counts
 /// describe the harness, and differ between backends by design.
 ///
+/// The source must be the one of the runtime that executes the selected
+/// backend ([`Backend::runtime_name`]). `in-guest-trap` runs the in-guest
+/// LiteInst runtime, so its source is LiteInst's; the returned record is
+/// relabelled with the selected backend's name, `in-guest-trap`, so a reader
+/// of the summary can tell the two columns apart. Its counters are LiteInst's
+/// own, unchanged: with site patching off, `sites.patched` is 0 and every
+/// dispatch is a `signal_traps` delivery (no `patched_direct_calls`).
+///
 /// Measured on a real `ptrace` run before this change: of 303 INFO records, this
 /// was the ONE record naming a backend. So two backends executing an identical
 /// guest could never agree under the Info envelope, however correct the backends
@@ -73,12 +81,15 @@ where
     // unconditional. Reporting and checking are two different questions; only
     // the first belongs behind the gate.
     assert_eq!(
-        selected_backend.as_str(),
+        selected_backend.runtime_name(),
         S::Snapshot::BACKEND_NAME,
         "backend statistics source does not match selected backend"
     );
     let snapshot = request.collect(source)?;
-    let dispatch = snapshot.dispatch_stats();
+    let dispatch = snapshot.dispatch_stats().map(|mut record| {
+        record.backend = selected_backend.as_str().to_owned();
+        record
+    });
     tracing::debug!(
         target: TARGET,
         backend = %selected_backend.as_str(),
@@ -259,5 +270,78 @@ mod tests {
         };
 
         report(Backend::Liteinst, BackendStatsRequest::DISABLED, &source);
+    }
+
+    /// A LiteInst-named source that returns a dispatch record: one patch
+    /// candidate measured and none patched, as an in-guest-trap run reports.
+    struct LiteinstRecordSource;
+
+    struct LiteinstRecordSnapshot;
+
+    impl fmt::Display for LiteinstRecordSnapshot {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("liteinst-record")
+        }
+    }
+
+    impl BackendStatsSnapshot for LiteinstRecordSnapshot {
+        const BACKEND_NAME: &'static str = "liteinst";
+
+        fn dispatch_stats(&self) -> Option<DispatchStats> {
+            Some(DispatchStats::new(
+                Self::BACKEND_NAME,
+                reverie::DispatchCounters {
+                    signal_traps: Some(5),
+                    ..reverie::DispatchCounters::ZERO
+                },
+                reverie::SiteCounters::from_rewrite(1, 0),
+            ))
+        }
+    }
+
+    impl BackendStatsSource for LiteinstRecordSource {
+        type Snapshot = LiteinstRecordSnapshot;
+
+        fn backend_stats(&self) -> Self::Snapshot {
+            LiteinstRecordSnapshot
+        }
+    }
+
+    /// `in-guest-trap` runs the in-guest LiteInst runtime: Hermit accepts that
+    /// runtime's source for it and names the record after the selected
+    /// backend, keeping LiteInst's counters as they are. `liteinst` keeps its
+    /// own name.
+    #[test]
+    fn in_guest_trap_reports_the_liteinst_source_under_its_own_name() {
+        let record = report(
+            Backend::InGuestTrap,
+            BackendStatsRequest::ENABLED,
+            &LiteinstRecordSource,
+        )
+        .expect("an enabled report returns the runtime's dispatch record");
+        assert_eq!(record.backend, "in-guest-trap");
+        assert_eq!(record.counters.signal_traps, Some(5));
+        assert_eq!(record.sites.patched, Some(0));
+        assert_eq!(record.sites.candidates, Some(1));
+        let liteinst = report(
+            Backend::Liteinst,
+            BackendStatsRequest::ENABLED,
+            &LiteinstRecordSource,
+        )
+        .expect("an enabled report returns the runtime's dispatch record");
+        assert_eq!(liteinst.backend, "liteinst");
+        assert_eq!(liteinst.counters, record.counters);
+    }
+
+    /// `in-guest-trap` does not accept the source of a runtime other than
+    /// in-guest LiteInst.
+    #[test]
+    #[should_panic(expected = "backend statistics source does not match selected backend")]
+    fn in_guest_trap_rejects_a_source_of_another_runtime() {
+        let source = CountingSource {
+            snapshots: Cell::new(0),
+        };
+
+        report(Backend::InGuestTrap, BackendStatsRequest::DISABLED, &source);
     }
 }

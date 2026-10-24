@@ -70,6 +70,23 @@ impl AnalyzeOpts {
         preempts_path: &Path,
         _global: &GlobalOpts,
     ) -> anyhow::Result<(PreemptionRecord, PathBuf, PathBuf)> {
+        self.minimize_with(preempts_path, |runname, new_preempts_path| {
+            Ok(self
+                .launch_from_preempts_to_sched(runname, new_preempts_path, None)?
+                .0)
+        })
+    }
+
+    /// The minimization loop behind [`Self::minimize`]. `trial_matches` runs
+    /// one trial with the preemptions in the given file and says whether it
+    /// met the criteria. A trial that cannot finish (for example, one that
+    /// `--max-log-bytes` ended) ends the minimization with its error
+    /// unchanged, so main still reports it by its class.
+    fn minimize_with(
+        &self,
+        preempts_path: &Path,
+        mut trial_matches: impl FnMut(&str, &Path) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<(PreemptionRecord, PathBuf, PathBuf)> {
         let pr = PreemptionReader::new(preempts_path);
         let mut tmp_dir = preempts_path.to_path_buf();
         assert!(tmp_dir.pop());
@@ -224,7 +241,7 @@ impl AnalyzeOpts {
                             }
                             Ok(())
                         })?;
-                    PreemptionRecord::from_vecs(&btmap)
+                    self.stamp_trial_record(PreemptionRecord::from_vecs(&btmap))
                 };
                 if let Err(e) = pr_new.validate() {
                     bail!(
@@ -243,17 +260,13 @@ impl AnalyzeOpts {
                 }
                 pr_new
                     .write_to_disk(&new_preempts_path)
-                    .expect("write of preempts file to succeed");
+                    .map_err(anyhow::Error::msg)?;
                 last_attempt = Some(pr_new);
 
                 let batch = batch_sizes.get_mut(&selected_tid).unwrap();
                 let runname = format!("round_{:0wide$}", round, wide = 3);
                 let log_path = tmp_dir.join(&runname).with_extension("log");
-                if self
-                    .launch_from_preempts_to_sched(&runname, &new_preempts_path, None)
-                    .unwrap()
-                    .0
-                {
+                if trial_matches(&runname, &new_preempts_path)? {
                     eprintln!(
                         ":: {}",
                         "New run matches criteria, continuing.".green().bold()
@@ -300,5 +313,70 @@ impl AnalyzeOpts {
             last_matching_pr_file.expect("at least one run to match the criteria"),
             last_matching_log.expect("at least one run to match the criteria"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::*;
+    use crate::container::LogCapExceeded;
+
+    /// A minimization trial that `--max-log-bytes` ended stops the
+    /// minimization and returns that error, still a `LogCapExceeded`, so main
+    /// reports it as the cap (123). Before, any trial's error panicked here.
+    #[test]
+    fn a_failing_minimize_trial_ends_minimization_with_its_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let preempts_path = workspace.path().join("target.preempts");
+        // One thread with eight interventions: increasing times, ordinary
+        // priorities. When every trial matches, minimizing it takes three
+        // trials (batches of 2, 3 and 3 interventions).
+        let history: Vec<(LogicalTime, Priority)> = (1..=8)
+            .map(|k| (LogicalTime::from_nanos(k * 1000), FIRST_PRIORITY + k))
+            .collect();
+        PreemptionRecord::from_vecs(&BTreeMap::from([(DetTid::from_raw(3), history)]))
+            .write_to_disk(&preempts_path)
+            .unwrap();
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                .unwrap();
+
+        let mut total_trials = 0;
+        options
+            .minimize_with(&preempts_path, |_runname, _trial_preempts| {
+                total_trials += 1;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(total_trials, 3);
+
+        for failing_trial in 1..=total_trials {
+            let mut trials = 0;
+            let result = options.minimize_with(&preempts_path, |_runname, trial_preempts| {
+                trials += 1;
+                assert!(
+                    trial_preempts.exists(),
+                    "each trial's preemption file is written before it runs"
+                );
+                if trials == failing_trial {
+                    return Err(anyhow::Error::new(LogCapExceeded));
+                }
+                // An earlier trial finished and still met the criteria.
+                Ok(true)
+            });
+            let Err(error) = result else {
+                panic!("trial {failing_trial} failed, yet minimization returned a record")
+            };
+            assert!(
+                error.downcast_ref::<LogCapExceeded>().is_some(),
+                "trial {failing_trial}: the error lost its type: {error:#}"
+            );
+            assert_eq!(
+                trials, failing_trial,
+                "minimization ran more trials after trial {failing_trial} failed"
+            );
+        }
     }
 }

@@ -17,9 +17,7 @@ use std::process::Output;
 fn command_output(mut command: Command, label: &str) -> Output {
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -35,7 +33,8 @@ fn perf_event_refusals_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("perf-event-refusal");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("perf-event-refusal-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
 
     let cases = [

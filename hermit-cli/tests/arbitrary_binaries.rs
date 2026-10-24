@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -111,8 +114,10 @@ fn available_tools(allowed: &[&str]) -> Vec<Tool> {
         tool(
             "curl",
             &["/usr/bin/curl", "/usr/local/bin/curl"],
-            &["--silent", "--show-error", "file:///etc/os-release"],
-            "NAME=",
+            // The pinned root has no /etc/os-release; its flake writes this
+            // passwd line, which hosts share.
+            &["--silent", "--show-error", "file:///etc/passwd"],
+            "root:x:0:0:",
         ),
         tool(
             "git",
@@ -159,9 +164,7 @@ fn bounded_command(program: &Path, timeout: Duration) -> Command {
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
         output.status.success(),
         "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",

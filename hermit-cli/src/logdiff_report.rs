@@ -1,11 +1,3 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
 //! Typed machine-readable reports produced by `hermit log-diff --json`.
 //!
 //! This lives in the library rather than the CLI module because the manifest
@@ -46,7 +38,7 @@ pub enum RecordEnvelopePolicy {
     /// (`evidence_emit_image_initialization`, reverie-dbt native/client.c).
     /// Offline `hermit log-diff` applies this selection to archived evidence
     /// logs when asked. Live DBT verification does not select it: it compares
-    /// under `AllRecordsV1`, with initialization records at their arrival
+    /// under `AllRecordsV1`, with initialization records at their stream
     /// positions, and also compares Reverie's authenticated initialization
     /// count as separate typed evidence.
     DbtEvidenceTransportV1,

@@ -14,6 +14,9 @@
 //! read. A dedicated reader drains Hermit's stderr while this thread polls the
 //! process and an independent wall-clock deadline.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -74,7 +77,8 @@ fn waitid_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("waitid-signal-interrupt");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("waitid-signal-interrupt-{}", std::process::id()));
         fs::create_dir_all(&build_root).expect("failed to create waitid guest build directory");
 
         // The guest must not live under /tmp: Hermit replaces guest /tmp with
@@ -223,6 +227,28 @@ fn run_bounded_for_backend_with_limits(
     verify_report: Option<&Path>,
     limits: WatchdogLimits,
 ) -> GuestRun {
+    // A typed PMU skid-overshoot refusal, and nothing else, runs it again.
+    let label = format!("{backend} {args:?}");
+    hermit_test::hermit_output_with(&label, || {
+        let run = run_bounded_attempt(backend, args, trace_retries, verify_report, limits);
+        let output = std::process::Output {
+            status: run.status,
+            stdout: run.stdout.clone().into_bytes(),
+            stderr: run.stderr.clone().into_bytes(),
+        };
+        (output, run)
+    })
+    .1
+}
+
+/// One attempt of [`run_bounded_for_backend_with_limits`].
+fn run_bounded_attempt(
+    backend: &str,
+    args: &[&str],
+    trace_retries: bool,
+    verify_report: Option<&Path>,
+    limits: WatchdogLimits,
+) -> GuestRun {
     let build_root = waitid_guest()
         .parent()
         .expect("waitid guest should have a parent");
@@ -235,7 +261,7 @@ fn run_bounded_for_backend_with_limits(
         .reopen()
         .expect("failed to reopen guest stdout file");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     if args.contains(&"--wait4-live-sibling-signal-blocked") {
         // The regression is an internal ERESTARTSYS followed by a transparent
         // kernel restart, so guest exit alone cannot distinguish old from new.
@@ -261,10 +287,9 @@ fn run_bounded_for_backend_with_limits(
             .arg("--verify-json")
             .arg(report_name);
     }
+    command.arg("--").arg(waitid_guest()).args(args);
+    hermit_test::configure_guest_execution(&mut command);
     command
-        .arg("--")
-        .arg(waitid_guest())
-        .args(args)
         .process_group(0)
         .stdout(Stdio::from(stdout_writer))
         .stderr(Stdio::piped());

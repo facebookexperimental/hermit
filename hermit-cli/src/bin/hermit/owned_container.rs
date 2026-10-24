@@ -1,10 +1,4 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+/* Copyright (c) Meta Platforms, Inc. and affiliates. */
 
 //! CLI-only original container ownership. Library failures never exit the process.
 //! Initial workload/result draining is blocking. The two explicit settlement
@@ -133,7 +127,10 @@ impl ParentCleanupUnconfirmed {
         // The copied headline is display-only. Keep the original typed error
         // underneath this typed retention context for classification/downcasts.
         self.primary_display = Some(primary.to_string());
-        eprintln!("HERMIT_CLEANUP_UNCONFIRMED: {self}");
+        // Not `eprintln!`, which panics when stderr's reader has gone (EPIPE)
+        // and would replace the primary failure's status with 101.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "HERMIT_CLEANUP_UNCONFIRMED: {self}");
         primary.context(self)
     }
 }
@@ -171,6 +168,12 @@ impl Drop for PublishedFailureExit {
         }
         if self.unresolved {
             unsafe { libc::_exit(125) }
+        }
+        if super::container::exits_init_after_publication() {
+            // The result is encoded, flushed and closed. An unwind still means
+            // publication failed, never a success.
+            let status = if std::thread::panicking() { 125 } else { 0 };
+            unsafe { libc::_exit(status) }
         }
     }
 }

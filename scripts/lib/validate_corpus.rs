@@ -1,10 +1,8 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
 
 //! Compatibility-corpus tables for the validate driver.
 //!
@@ -23,7 +21,8 @@
 //! `strict` dumped **191** rows against `STRICT_COMPAT_TOTAL=191`, and `sabre`
 //! dumped **212** against `SABRE_COMPAT_TOTAL=212` — exact, independent matches.
 //! (The SaBRe rows have since moved into tests/e2e/manifests/compat.yaml as the
-//! sabre-compat-only run type's cells, and `corpus-sabre.json` is gone.)
+//! sabre-compat-only run type's cells, and `corpus-sabre.json` is gone; the
+//! strict rows are that file's own rows, and `corpus-strict.json` is gone too.)
 //! `rr` dumped 174 admitted rows which the driver then filtered to the 139
 //! `RR_COMPAT_PASSING_LABELS` (the bash filtered at the same point, inside
 //! `rr_compatibility_probe`), and `e9patch` dumps 172 admitted rows. (The rr
@@ -37,7 +36,6 @@
 //! change is a reviewable data diff, and it keeps the driver's control flow
 //! readable instead of burying it under 750 argv literals.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 /// One corpus probe: a stable label and the exact guest argv to run under Hermit.
@@ -120,77 +118,8 @@ pub fn load(root: &Path, mode: &str, paths: &CorpusPaths) -> Result<Vec<CorpusRo
 
 // ------------------------------------------------------------------ ratchets
 
-/// `STRICT_COMPAT_TOTAL` (validate.sh:1108). The corpus contains semantic
-/// workloads only; banner-only probes were removed when the E2E harness landed.
-///
-/// 191 at extraction. 193 since the `netlink-route` and `netlink-sock-diag`
-/// rows were added: the corpus reached netlink only incidentally through `ip`,
-/// `ss`, and every `python3` row, none of which asserted anything about a reply,
-/// so no cell would have failed if detcore stopped normalizing netlink at all.
-///
-/// The strict-compat-only run type no longer reads this file: since
-/// 2026-10-02 its rows are the compat.yaml `variants` cells compat/strict-<row>.
-/// The super suite's portable strict rows still do.
-pub const STRICT_COMPAT_TOTAL: usize = 193;
-
 /// `E9PATCH_COMPAT_TOTAL` (validate.sh:1125).
 pub const E9PATCH_COMPAT_TOTAL: usize = 155;
-
-/// `COMPAT_SUMMARY_KNOWN_FAILURES` (validate.sh:1135). Tracked gaps excluded from
-/// the executable corpus but retained in the canonical denominator and table.
-/// Under `strict` these are NONBLOCKING: the row keeps running so the gap stays
-/// visible, mirroring the gcc vfork precedent.
-///
-/// Empty today. `make` was listed for a fail-closed `setresuid` refusal; that syscall has
-/// been determinized, and the exact `compat.make` command now passes (validate run 213,
-/// measured at a pre-rebase commit of this change, plus five focused reruns and a
-/// `--verify-strict` L2 match), so its row was a stale expectation that only produced a
-/// STALE warning. A `make` failure now blocks.
-pub fn known_failclosed() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::new()
-}
-
-/// `PORTABLE_STRICT_DIAGNOSTIC_FAILURES` (validate.sh:1147). Bounded diagnostics
-/// on the GitHub-managed portable runner: a failure here is nonblocking and the
-/// probe is given a shortened 20s budget.
-pub fn portable_diagnostic() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([
-        // TODO(#2801): remove once mountinfo source paths are deterministic.
-        (
-            "df",
-            "tracked in #2801: mountinfo exposes Hermit's host-TMPDIR backing paths",
-        ),
-        // TODO(#2897): remove once the temporary-directory getdents64 payload is deterministic.
-        (
-            "ranlib",
-            "tracked in #2897: ranlib's temporary-directory getdents64 payload diverges",
-        ),
-        (
-            "top",
-            "live process-table reads differ on the GitHub-managed portable runner",
-        ),
-        (
-            "zstd",
-            "timed out on the GitHub-managed portable no-PMU runner",
-        ),
-        (
-            "zstd-roundtrip",
-            "timed out on the GitHub-managed portable no-PMU runner",
-        ),
-    ])
-}
-
-/// `PORTABLE_STRICT_SUPER_ONLY` (validate.sh:1152). Heavy runtime/compiler
-/// workloads deferred out of the portable profile into the scheduled super suite;
-/// they stay in the table as `N/A` rather than costing 20s per row on every PR.
-pub fn portable_super_only() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([
-        ("rustc", "full compile-link-run workload"),
-        ("javac", "JVM startup and compile-run workload"),
-        ("java", "threaded JVM filesystem and digest workload"),
-        ("node", "Node.js runtime startup workload"),
-    ])
-}
 
 /// `COMPAT_SUMMARY_CATEGORIES` (validate.sh:1160), in the bash's print order.
 pub const CATEGORIES: &[&str] = &[

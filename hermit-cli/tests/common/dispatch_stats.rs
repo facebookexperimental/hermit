@@ -39,10 +39,20 @@ int main(void) {
 }
 "#;
 
+/// A directory under `CARGO_TARGET_TMPDIR` owned by this test process. Nextest
+/// runs every test in its own process, so with a shared path two tests running
+/// at once would write, or run, the same file.
+fn process_build_root() -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("dispatch-stats")
+        .join("build")
+        .join(std::process::id().to_string())
+}
+
 /// Compile the guest under `CARGO_TARGET_TMPDIR`, which Hermit can see: it
 /// isolates the host `/tmp`.
 pub(super) fn build_guest(name: &str, extra_flags: &[&str]) -> PathBuf {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dispatch-stats");
+    let build_root = process_build_root();
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     // One source per guest: the tests run in parallel.
     let source = build_root.join(format!("{name}.c"));
@@ -73,12 +83,14 @@ pub(super) const REPORT_MARKERS: [&str; 3] = [
 ];
 
 /// Run `guest` under `backend` at `--log=info` plus the `RUST_LOG` directives
-/// `rust_log` (none when empty) and return the run's stderr.
+/// `rust_log` (none when empty) and return the run's stderr. `run_args` are
+/// extra `run` options, placed before the guest.
 pub(super) fn run_guest(
     backend: &str,
     hermit: &Path,
     rust_log: &str,
     summary: Option<&Path>,
+    run_args: &[&str],
     env: &[(&str, &Path)],
     guest: &Path,
 ) -> String {
@@ -89,7 +101,13 @@ pub(super) fn run_guest(
         .arg(hermit)
         .arg("--log=info")
         .arg(format!("--backend={backend}"))
-        .args(["run", "--strict", "--base-env=minimal"]);
+        .args([
+            "run",
+            "--strict",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            "--base-env=minimal",
+        ])
+        .args(run_args);
     if let Some(summary) = summary {
         command.arg(format!("--summary-json={}", summary.display()));
     }
@@ -112,19 +130,19 @@ pub(super) fn run_guest(
 }
 
 /// Run `guest` under `backend` with a summary JSON and return the record.
+/// `run_args` are extra `run` options, as for [`run_guest`].
 pub(super) fn dispatch_record(
     backend: &str,
     hermit: &Path,
+    run_args: &[&str],
     env: &[(&str, &Path)],
     guest: &Path,
 ) -> DispatchStats {
-    let summary_dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("dispatch-stats")
-        .join(format!("{backend}-summary"));
+    let summary_dir = process_build_root().join(format!("{backend}-summary"));
     fs::create_dir_all(&summary_dir).expect("failed to create summary directory");
     let summary = summary_dir.join("summary.json");
     let _ = fs::remove_file(&summary);
-    let stderr = run_guest(backend, hermit, "", Some(&summary), env, guest);
+    let stderr = run_guest(backend, hermit, "", Some(&summary), run_args, env, guest);
     // The record is DEBUG and JSON only: the INFO log that --verify compares
     // and the human summary never see it.
     for marker in REPORT_MARKERS {

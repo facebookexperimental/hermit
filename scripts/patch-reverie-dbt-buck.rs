@@ -6,7 +6,6 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-
 //! Give reverie-dbt's build script a declared, materialized manifest directory.
 
 #[path = "lib/reverie_dbt_inventory.rs"]
@@ -26,14 +25,14 @@ use std::process::ExitCode;
 use reverie_dbt_inventory::REVERIE_DBT_FILES;
 
 const CRATE_RELATIVE: &str = "reverie-dbt";
-const VENDORED_CRATE: &str = "shim/third-party/rust/vendor/reverie-dbt-0.4.0";
-const TARGET_NAME: &str = "reverie-dbt-0.4-materialized-manifest";
+const VENDORED_CRATE: &str = "shim/third-party/rust/vendor/reverie-dbt-0.5.1";
+const TARGET_NAME: &str = "reverie-dbt-0.5-materialized-manifest";
 const PRELUDE_LOAD: &str = "load(\"@prelude//rust:cargo_buildscript.bzl\", \"buildscript_run\")\n";
 const MATERIALIZED_LOAD: &str =
     "load(\"@shim//build_defs:materialized_manifest.bzl\", \"materialized_manifest\")\n";
 const BUILDSCRIPT_START: &str =
-    "buildscript_run(\n    name = \"reverie-dbt-0.4-build-script-run\",\n";
-const MANIFEST_ARGUMENT: &str = "    manifest_dir = \":reverie-dbt-0.4-materialized-manifest\",\n";
+    "buildscript_run(\n    name = \"reverie-dbt-0.5-build-script-run\",\n";
+const MANIFEST_ARGUMENT: &str = "    manifest_dir = \":reverie-dbt-0.5-materialized-manifest\",\n";
 /// A file only a Hermit checkout's root has; check-buck-reindeer-features.rs
 /// reads it first too.
 const CHECKOUT_MARKER: &str = "shim/third-party/rust/reindeer.toml";
@@ -248,7 +247,7 @@ fn render_target(files: &[String]) -> String {
         target.push_str(&starlark_string(relative));
         target.push_str(": ");
         target.push_str(&starlark_string(&format!(
-            "vendor/reverie-dbt-0.4.0/{relative}"
+            "vendor/reverie-dbt-0.5.1/{relative}"
         )));
         target.push_str(",\n");
     }
