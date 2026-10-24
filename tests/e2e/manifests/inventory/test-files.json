@@ -3638,6 +3638,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/debugger/guests/spawner.c",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "tests/debugger/guests/spawner.c is owned by tests/debugger/run_debugger_tests.sh: The debugger guest for fork, vfork and exec stop negotiation, compiled with -pthread by harness.compile_guest. A multithreaded process spawns /bin/true twice with posix_spawn (a vfork) under a live gdbserver, so test_gdb_fork_events.py can check which stops gdb gets and that its breakpoint survives the spawns, which a standalone manifest program cannot supply."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/debugger/harness.py",
       "runner": "tests/debugger/run_debugger_tests.sh",
       "why": "tests/debugger/harness.py is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `harness.py` is the shared gdb-remote protocol harness imported by the debugger cases. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
@@ -3647,6 +3653,12 @@
       "path": "tests/debugger/run_debugger_tests.sh",
       "runner": "scripts/validate.rs privileged debugger gate",
       "why": "tests/debugger/run_debugger_tests.sh is owned by scripts/validate.rs privileged debugger gate: This driver allocates gdbserver sessions and runs four GDB/LLDB live/replay Python cases with shared cleanup. The privileged multi-process protocol cannot be reduced to the generic single-program manifest lifecycle."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/debugger/test_gdb_fork_events.py",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "tests/debugger/test_gdb_fork_events.py is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `test_gdb_fork_events.py` is a debugger-specific Python case requiring a live gdbserver and GDB/LLDB client. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
     },
     {
       "disposition": "guest-fixture",
