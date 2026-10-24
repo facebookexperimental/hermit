@@ -540,10 +540,14 @@ struct Dump {
 ///   device;
 /// - hugetlb and shared mappings only if the filter bit for their kind is set
 ///   (shared file mappings are off by default);
-/// - anonymous memory, and a writable private file mapping, whose written
-///   pages the kernel holds as anonymous, under the anonymous-private bit; a
-///   read-only private file mapping under the file-private bit (off by
-///   default);
+/// - anonymous memory, and a private file mapping that is writable or holds
+///   pages the guest wrote, under the anonymous-private bit. The kernel keeps
+///   a private mapping whole once it has an `anon_vma`, which its first
+///   written page creates; smaps shows written pages as anonymous (see
+///   [`holds_anonymous_pages`]). That covers a table the dynamic linker
+///   relocated and then made read-only, such as the executable's `.dynamic`,
+///   through which a debugger finds the loaded libraries. Any other private
+///   file mapping is kept under the file-private bit (off by default);
 /// - the first page of a file mapped from offset 0 under the ELF-headers bit.
 fn dump_rule(map: &MemoryMap, flags: Option<VmFlags>, filter: CoredumpFlags) -> Dump {
     const NOTHING: Dump = Dump {
@@ -570,7 +574,7 @@ fn dump_rule(map: &MemoryMap, flags: Option<VmFlags>, filter: CoredumpFlags) -> 
         } else {
             CoredumpFlags::ANONYMOUS_SHARED_MAPPINGS
         })
-    } else if !file || map.perms.contains(MMPermissions::WRITE) {
+    } else if !file || map.perms.contains(MMPermissions::WRITE) || holds_anonymous_pages(map) {
         filter.contains(CoredumpFlags::ANONYMOUS_PRIVATE_MAPPINGS)
             || (file && filter.contains(CoredumpFlags::FILEBACKED_PRIVATE_MAPPINGS))
     } else {
@@ -580,6 +584,18 @@ fn dump_rule(map: &MemoryMap, flags: Option<VmFlags>, filter: CoredumpFlags) -> 
         whole,
         elf_header: file && map.offset == 0 && filter.contains(CoredumpFlags::ELF_HEADERS),
     }
+}
+
+/// Whether smaps counts anonymous pages in `map`: pages the guest wrote to a
+/// private file mapping. Such a page means the mapping has an `anon_vma`, but
+/// not the other way round: a mapping keeps its `anon_vma` after
+/// `MADV_DONTNEED` drops its pages, and shares it when `mprotect` splits it,
+/// so this misses a written mapping that holds no written page now.
+fn holds_anonymous_pages(map: &MemoryMap) -> bool {
+    map.extension
+        .map
+        .get("Anonymous")
+        .is_some_and(|&bytes| bytes > 0)
 }
 
 /// The thread's `/proc/<tid>/coredump_filter`, or the kernel default (0x33:
@@ -1216,6 +1232,16 @@ mod tests {
         let text = map(lib(), P::READ | P::EXECUTE | P::PRIVATE, 0);
         let rule = dump_rule(&text, Some(rd | VmFlags::EX), default);
         assert!(!rule.whole && rule.elf_header, "{rule:?}");
+        let mut relro = map(lib(), P::READ | P::PRIVATE, 0x3000);
+        assert!(
+            !whole(&relro, rd, default),
+            "an unwritten read-only file mapping"
+        );
+        relro.extension.map.insert("Anonymous".to_string(), 4096);
+        assert!(
+            whole(&relro, rd, default),
+            "a read-only file mapping the guest wrote, such as relocated .dynamic"
+        );
         let no_headers = default - CoredumpFlags::ELF_HEADERS;
         assert!(!dump_rule(&text, Some(rd | VmFlags::EX), no_headers).elf_header);
         assert!(!dump_rule(&text, Some(rd | VmFlags::DD), default).elf_header);
