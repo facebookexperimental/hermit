@@ -10,13 +10,16 @@
 //!
 //! The ptrace backend offers each thread of such a process at its exit stop
 //! ([`reverie::GlobalTool::on_fatal_signal_exit`]), after the kernel's fatal
-//! decision. [`capture`] keeps a core only for the one thread that ran the
-//! kernel's core dump step (`exit.dumping`), so the registers in the core are
-//! those of the thread that took the signal. A process the kernel would not
-//! dump, for example one that is not dumpable, gets no core. It writes one ELF
-//! core, compressed as a sequence of zstd frames, into
-//! [`FatalCoreCapture::dir`]. It only reads the stopped guest, through procfs,
-//! so the guest observes nothing and its exit status is already fixed.
+//! decision. The first thread of the process to be offered keeps one core for
+//! the whole process, if one of its threads ran the kernel's core dump step
+//! ([`Death::of`]); the threads offered after it keep nothing ([`Kept`]). A
+//! process the kernel would not dump, for example one that is not dumpable,
+//! gets no core. The core holds the registers of every thread the kernel's
+//! own dump would hold, the thread that took the signal first ([`gather`]).
+//! It is one ELF core, compressed as a sequence of zstd frames, in
+//! [`FatalCoreCapture::dir`]. The capture only reads the stopped guest,
+//! through procfs and ptrace register reads, so the guest observes nothing and
+//! its exit status is already fixed.
 //!
 //! The thread's memory is normally still mapped at the exit stop, but nothing
 //! pins it: it can be reaped before or during the capture. A page that cannot
@@ -39,7 +42,7 @@
 //! writer takes. It never runs past `time_limit`, nor past `exit.deadline`
 //! when the run has already failed and the backend must finish cleaning up.
 //! A core that would break either cap, or that takes too long, is retried
-//! with less memory: first only the stack the thread was running on, then
+//! with less memory: first only the live part of each thread's stack, then
 //! only the notes (registers, signal, process identity, auxiliary vector and
 //! mapped files) and the mapping layout. A core that cannot fit even then is
 //! not written. Once a Full core runs out of time, later captures in the same
@@ -49,15 +52,19 @@
 //! before it sizes the remaining total. Every failure is returned for the
 //! caller to log.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
+use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::RecvTimeoutError;
@@ -85,6 +92,9 @@ const CHUNK: usize = 1 << 20;
 fn core_page() -> u64 {
     crate::page::page_size()
 }
+/// The bytes below its stack pointer that a function may use without moving
+/// it, which the x86-64 System V ABI calls the red zone.
+const RED_ZONE: u64 = 128;
 static ZEROS: [u8; CHUNK] = [0; CHUNK];
 
 /// What one [`capture`] did.
@@ -92,9 +102,6 @@ static ZEROS: [u8; CHUNK] = [0; CHUNK];
 pub(crate) enum Outcome {
     /// A core was written to `path`.
     Written { path: PathBuf },
-    /// The thread did not run the kernel's core dump step, so it gets no
-    /// core: another thread of its process did, or none did.
-    NotDumping,
     /// No tier fitted in `budget` bytes before the capture's end.
     NoRoom { budget: u64 },
 }
@@ -106,28 +113,44 @@ pub(crate) enum Tier {
     /// Every mapping the kernel would dump whole, and the first page of each
     /// file mapped from offset 0 (its ELF header).
     Full,
-    /// Of those, only the mapping holding the stack pointer and the main
-    /// stack, plus the ELF header pages.
+    /// Of those, only the main stack and, of each mapping holding a thread's
+    /// stack pointer, the part from just below that pointer up (see
+    /// [`Snapshot::stored`]), plus the ELF header pages.
     Stack,
     /// No memory: notes and the mapping layout only.
     NotesOnly,
 }
 
-/// Captures `exit` under `cfg` and reports the outcome on stderr. Never fails
-/// the run.
+/// Keeps a core for the death of `exit`'s process under `cfg`, if `exit`'s
+/// thread is the first of that death to be offered and one of the process's
+/// threads ran the kernel's core dump step, and reports the outcome on
+/// stderr. Never fails the run.
+///
+/// The first offer decides for the whole death, so a later offer neither
+/// writes a second core nor scans the process's threads again; the core is
+/// written while no thread of the process has left its exit stop.
 ///
 /// The report goes to stderr, not to the tracing log, which a `--verify` run
 /// compares. Hermit's stderr can still be the guest's stderr, which `--verify`
-/// also compares, so the report names only the file: the core's size and tier
-/// depend on host timing and memory pressure and would make two identical runs
+/// also compares, so the report names only the dumping thread and the file:
+/// the core's size and tier depend on host timing and memory pressure, and so
+/// does which thread is offered first, and they would make two identical runs
 /// differ.
-pub(crate) fn capture_and_log(cfg: &FatalCoreCapture, exit: &FatalSignalExit) {
-    let report = match capture(cfg, exit) {
+pub(crate) fn capture_and_log(cfg: &FatalCoreCapture, exit: &FatalSignalExit, kept: &Kept) {
+    let Some(process) = ProcessKey::of(exit.tid.as_raw()) else {
+        return;
+    };
+    if !kept.claim(process) {
+        return;
+    }
+    let Some(death) = Death::of(exit, process.tgid) else {
+        return;
+    };
+    let report = match capture(cfg, exit, &death) {
         Ok(Outcome::Written { path }) => format!(
             "kept as {}",
             path.file_name().unwrap_or_default().to_string_lossy()
         ),
-        Ok(Outcome::NotDumping) => return,
         Ok(Outcome::NoRoom { .. }) => {
             "not kept: no core fits within its size and time limits".to_string()
         }
@@ -135,30 +158,118 @@ pub(crate) fn capture_and_log(cfg: &FatalCoreCapture, exit: &FatalSignalExit) {
     };
     let line = format!(
         "hermit: fatal core for thread {} ({}): {report}\n",
-        exit.tid, exit.signal
+        death.dumper, exit.signal
     );
     crate::nonwaiting_write::write_without_waiting(libc::STDERR_FILENO, line.as_bytes());
 }
 
-/// Writes a core for the thread `exit` names, held at its exit stop, if it is
-/// the thread that ran the kernel's core dump step.
-///
-/// The work runs on a helper thread that the tracer waits for only until the
-/// capture's end, plus [`HELPER_SLACK`]. The capture checks its end between
-/// frames, but one read of a file mapping on a hung network filesystem, or a
-/// write into a core directory on one, can block in the kernel past any
-/// check. The tracer then gives up, so the guest waits no longer, and the
-/// helper deletes what it was writing if it ever returns.
-pub(crate) fn capture(cfg: &FatalCoreCapture, exit: &FatalSignalExit) -> anyhow::Result<Outcome> {
-    if !exit.dumping {
-        return Ok(Outcome::NotDumping);
+/// A guest process, named by its TGID and its leader's start time
+/// (`/proc/<tgid>/stat` field 22), which no later process that reuses the TGID
+/// shares. The leader stays readable, as a zombie if need be, until every
+/// other thread of the process has exited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ProcessKey {
+    tgid: i32,
+    started: u64,
+}
+
+impl ProcessKey {
+    /// The process of the thread `tid`.
+    fn of(tid: i32) -> Option<Self> {
+        let tgid = Process::new(tid).ok()?.status().ok()?.tgid;
+        let started = Process::new(tgid).ok()?.stat().ok()?.starttime;
+        Some(Self { tgid, started })
     }
-    let end = capture_end(Instant::now(), cfg.time_limit, exit.deadline) + HELPER_SLACK;
-    let (cfg, exit) = (cfg.clone(), *exit);
-    run_within(end, move |abandoned| {
+}
+
+/// The processes whose death this run has already decided on, with or without
+/// a core.
+#[derive(Debug, Default)]
+pub(crate) struct Kept(Mutex<BTreeSet<ProcessKey>>);
+
+impl Kept {
+    /// Records `process`, and returns whether it was not recorded before.
+    fn claim(&self, process: ProcessKey) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(process)
+    }
+}
+
+/// A process a core-dumping signal is ending, one of whose threads ran the
+/// kernel's core dump step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Death {
+    tgid: i32,
+    /// The thread that took the signal and ran the core dump step.
+    dumper: i32,
+}
+
+impl Death {
+    /// The death of `exit`'s process `tgid`, if one of its threads ran the
+    /// core dump step: `exit`'s own thread, or another one marked
+    /// `PF_DUMPCORE`.
+    ///
+    /// When `exit`'s thread is the first of its process to be offered, no
+    /// thread of the process has left its exit stop, so the dumping thread is
+    /// still there to be found: the kernel marks it in `zap_threads`
+    /// (fs/coredump.c) before any other thread dies. No thread is marked when
+    /// the kernel skipped the dump step, for a process that is not dumpable.
+    fn of(exit: &FatalSignalExit, tgid: i32) -> Option<Self> {
+        let dumper = if exit.dumping {
+            exit.tid.as_raw()
+        } else {
+            dumper_among(thread_ids(tgid), task_flags)?
+        };
+        Some(Self { tgid, dumper })
+    }
+}
+
+/// The first of `tids` whose kernel flags, as `flags_of` reads them, carry
+/// `PF_DUMPCORE`.
+fn dumper_among(
+    tids: impl IntoIterator<Item = i32>,
+    flags_of: impl Fn(i32) -> Option<u32>,
+) -> Option<i32> {
+    tids.into_iter()
+        .find(|&tid| flags_of(tid).is_some_and(|flags| flags & PF_DUMPCORE != 0))
+}
+
+/// Writes one core for `death`, from the thread `exit` names, held at its
+/// exit stop as the first of its process to be offered.
+///
+/// The threads' registers are read here, on the tracing thread, which alone
+/// may make ptrace requests of the guest ([`gather`]). The rest of the work
+/// runs on a helper thread that the tracer waits for only until the capture's
+/// end, plus [`HELPER_SLACK`]. The capture checks its end between frames, but
+/// one read of a file mapping on a hung network filesystem, or a write into a
+/// core directory on one, can block in the kernel past any check. The tracer
+/// then gives up, so the guest waits no longer, and the helper deletes what it
+/// was writing if it ever returns.
+pub(crate) fn capture(
+    cfg: &FatalCoreCapture,
+    exit: &FatalSignalExit,
+    death: &Death,
+) -> anyhow::Result<Outcome> {
+    let start = Instant::now();
+    let end = capture_end(start, cfg.time_limit, exit.deadline);
+    let threads = gather(
+        exit,
+        death,
+        start + end.saturating_duration_since(start) / 10,
+    )?;
+    let (cfg, exit, death) = (cfg.clone(), *exit, *death);
+    run_within(end + HELPER_SLACK, move |abandoned| {
         // A memory that is already gone still leaves the notes worth keeping.
         let mem = File::open(format!("/proc/{}/mem", exit.tid.as_raw())).ok();
-        capture_abandonable(&cfg, &exit, mem.as_ref(), &FULL_TIER_TIMED_OUT, abandoned)
+        let dying = Dying {
+            exit: &exit,
+            death: &death,
+            threads: &threads,
+            start,
+        };
+        capture_abandonable(&cfg, &dying, mem.as_ref(), &FULL_TIER_TIMED_OUT, abandoned)
     })
 }
 
@@ -205,10 +316,22 @@ fn run_within(
 /// smaller tiers instead of each spending most of the time limit again.
 static FULL_TIER_TIMED_OUT: AtomicBool = AtomicBool::new(false);
 
-/// [`capture`] with the thread's memory, or `None` when it cannot be read at
-/// all, in which case only the notes and the mapping layout are kept.
-/// `full_timed_out` is [`FULL_TIER_TIMED_OUT`] outside tests. Tests call it
-/// directly; [`capture`] goes through [`capture_abandonable`].
+/// What [`capture_abandonable`] writes a core from.
+struct Dying<'a> {
+    /// The thread held at its exit stop whose memory is read.
+    exit: &'a FatalSignalExit,
+    death: &'a Death,
+    /// The core's threads, in the order the core lists them ([`gather`]).
+    threads: &'a [ThreadNotes],
+    /// When the capture started; it ends at [`capture_end`] from here.
+    start: Instant,
+}
+
+/// [`capture`] of a test's own thread, which is the dumping thread of its
+/// death, with `mem`, or `None` when memory cannot be read at all, in which
+/// case only the notes and the mapping layout are kept. `full_timed_out` is
+/// [`FULL_TIER_TIMED_OUT`] outside tests. Tests call it directly; [`capture`]
+/// goes through [`capture_abandonable`].
 #[cfg(test)]
 fn capture_from(
     cfg: &FatalCoreCapture,
@@ -216,23 +339,28 @@ fn capture_from(
     mem: Option<&File>,
     full_timed_out: &AtomicBool,
 ) -> anyhow::Result<Outcome> {
-    capture_abandonable(cfg, exit, mem, full_timed_out, &AtomicBool::new(false))
+    let death = Death::of(exit, std::process::id() as i32).expect("not a dumping thread");
+    let threads = gather(exit, &death, Instant::now())?;
+    let dying = Dying {
+        exit,
+        death: &death,
+        threads: &threads,
+        start: Instant::now(),
+    };
+    capture_abandonable(cfg, &dying, mem, full_timed_out, &AtomicBool::new(false))
 }
 
 /// [`capture_from`] for a helper the tracer may give up on: once `abandoned`
 /// is set, a finished core is deleted instead of kept.
 fn capture_abandonable(
     cfg: &FatalCoreCapture,
-    exit: &FatalSignalExit,
+    dying: &Dying<'_>,
     mem: Option<&File>,
     full_timed_out: &AtomicBool,
     abandoned: &AtomicBool,
 ) -> anyhow::Result<Outcome> {
-    let start = Instant::now();
-    let end = capture_end(start, cfg.time_limit, exit.deadline);
-    let tid = exit.tid.as_raw();
-    let process = Process::new(tid)?;
-    let snapshot = Snapshot::read(&process, exit)?;
+    let end = capture_end(dying.start, cfg.time_limit, dying.exit.deadline);
+    let snapshot = Snapshot::read(dying)?;
     fs::create_dir_all(&cfg.dir)?;
     let _lock = DirLock::acquire(&cfg.dir, end)?;
     remove_orphaned_temps(&cfg.dir, cfg.time_limit * 2)?;
@@ -241,10 +369,11 @@ fn capture_abandonable(
         .max_core_bytes
         .min(cfg.max_total_bytes.saturating_sub(used));
     let stem = format!(
-        "{}core.{}.{tid}.{}",
+        "{}core.{}.{}.{}",
         cfg.file_prefix,
-        snapshot.tgid,
-        exit.signal.as_str()
+        dying.death.tgid,
+        dying.death.dumper,
+        dying.exit.signal.as_str()
     );
     let name = free_name(&cfg.dir, &stem)?;
     let path = cfg.dir.join(&name);
@@ -252,7 +381,7 @@ fn capture_abandonable(
     let written = try_tiers(
         mem.is_some(),
         full_timed_out,
-        start,
+        dying.start,
         end,
         |tier, deadline| {
             let segments = snapshot.segments(tier);
@@ -416,10 +545,186 @@ fn regular_file_bytes(dir: &Path) -> std::io::Result<u64> {
     }
 }
 
+/// `PF_DUMPCORE` and `PF_SIGNALED` from include/linux/sched.h: the kernel
+/// marks the thread that ran the core dump step, and every thread a fatal
+/// signal ends.
+const PF_DUMPCORE: u32 = 0x200;
+const PF_SIGNALED: u32 = 0x400;
+
+/// One thread's part of a core: the fields of its `NT_PRSTATUS` that are its
+/// own, and the further register notes the kernel writes for it.
+struct ThreadNotes {
+    tid: i32,
+    regs: libc::user_regs_struct,
+    /// Its own pending signals (`SigPnd`, without the process's shared ones)
+    /// and its blocked ones, as `fill_prstatus` (fs/binfmt_elf.c) takes them.
+    sigpend: u64,
+    sighold: u64,
+    /// Its regset notes after `NT_PRSTATUS`, in the kernel's regset order.
+    regsets: Vec<RegsetNote>,
+}
+
+/// One note holding a regset as `PTRACE_GETREGSET` returns it.
+struct RegsetNote {
+    kind: u32,
+    name: &'static [u8],
+    desc: Vec<u8>,
+}
+
+/// The threads of `death` a core holds, each read at its exit stop, with
+/// the dumping thread first and the others by TID.
+///
+/// They are the threads the kernel's own dump holds: those that waited in
+/// `coredump_task_exit` (kernel/exit.c) during the dump, which are the ones
+/// marked `PF_SIGNALED`. `exit`'s thread, which the backend has already found
+/// to be one, is always among them. The kernel lists the dumping thread first
+/// and the others in the order they reached that wait (`fill_note_info`,
+/// fs/binfmt_elf.c), which host timing decides; ordering them by TID instead
+/// makes the list a function of the guest's schedule.
+///
+/// Runs on the tracing thread, whose ptrace requests the guest's threads
+/// answer. The dumping thread wakes the others from that wait
+/// (`coredump_finish`, fs/coredump.c) and goes on to exit, so each of them
+/// reaches its exit stop without the tracer, and none leaves it while the
+/// tracer is held here: their registers are read there. Another thread not
+/// held by `deadline` is left out, and so is a regset ptrace refuses, as the
+/// kernel leaves out an inactive one. A dumping thread not held by then fails
+/// the capture: without it the core would name another thread as the one that
+/// took the signal.
+fn gather(
+    exit: &FatalSignalExit,
+    death: &Death,
+    deadline: Instant,
+) -> anyhow::Result<Vec<ThreadNotes>> {
+    let offered = exit.tid.as_raw();
+    let mut tids: Vec<i32> = thread_ids(death.tgid)
+        .into_iter()
+        .filter(|&tid| {
+            tid != offered && task_flags(tid).is_some_and(|flags| flags & PF_SIGNALED != 0)
+        })
+        .collect();
+    tids.push(offered);
+    let threads: Vec<ThreadNotes> = in_core_order(tids, death.dumper)
+        .into_iter()
+        .filter_map(|tid| {
+            let regs = if tid == offered {
+                exit.regs
+            } else {
+                regs_at_exit_stop(tid, deadline)?
+            };
+            let status = Process::new(tid).and_then(|thread| thread.status()).ok();
+            Some(ThreadNotes {
+                tid,
+                regs,
+                sigpend: status.as_ref().map_or(0, |status| status.sigpnd),
+                sighold: status.as_ref().map_or(0, |status| status.sigblk),
+                regsets: arch::REGSETS
+                    .iter()
+                    .filter_map(|&(kind, name)| {
+                        let desc = getregset(tid, kind).ok()?;
+                        Some(RegsetNote { kind, name, desc })
+                    })
+                    .collect(),
+            })
+        })
+        .collect();
+    if threads.first().map(|thread| thread.tid) != Some(death.dumper) {
+        anyhow::bail!(
+            "the dumping thread {} was not held at its exit stop",
+            death.dumper
+        );
+    }
+    Ok(threads)
+}
+
+/// `tids` with `dumper` first and the others by TID.
+fn in_core_order(mut tids: Vec<i32>, dumper: i32) -> Vec<i32> {
+    tids.sort_by_key(|&tid| (tid != dumper, tid));
+    tids
+}
+
+/// The TIDs listed in `/proc/<tgid>/task`, or none when it cannot be read.
+fn thread_ids(tgid: i32) -> Vec<i32> {
+    let mut tids = Vec::new();
+    let _ = crate::util::find_in_directory(Path::new(&format!("/proc/{tgid}/task")), |name| {
+        tids.extend(name.to_str().and_then(|name| name.parse::<i32>().ok()));
+        None::<()>
+    });
+    tids
+}
+
+/// The kernel's `task_struct::flags` of `tid`.
+fn task_flags(tid: i32) -> Option<u32> {
+    Some(Process::new(tid).ok()?.stat().ok()?.flags)
+}
+
+/// `tid`'s general registers once it is held at its exit stop, or `None`
+/// when it is gone or still not held at `deadline`. Until it stops, a ptrace
+/// request of it fails, as of any thread that is not stopped.
+fn regs_at_exit_stop(tid: i32, deadline: Instant) -> Option<libc::user_regs_struct> {
+    loop {
+        if let Ok(regs) = general_regs(tid) {
+            return Some(regs);
+        }
+        let gone = Process::new(tid)
+            .and_then(|thread| thread.stat())
+            .map_or(true, |stat| matches!(stat.state, 'Z' | 'X'));
+        if gone || Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+}
+
+/// Bytes [`getregset`] offers the kernel: more than any x86-64 regset needs,
+/// the largest being the XSAVE area, under 12 KiB even with AMX tile data.
+const REGSET_BUFFER: usize = 32 << 10;
+
+/// The regset `kind` of `tid`, a thread this thread traces and holds at a
+/// ptrace stop, as `PTRACE_GETREGSET` returns it.
+fn getregset(tid: i32, kind: u32) -> std::io::Result<Vec<u8>> {
+    let mut bytes = vec![0u8; REGSET_BUFFER];
+    let len = getregset_into(tid, kind, &mut bytes)?;
+    bytes.truncate(len);
+    Ok(bytes)
+}
+
+/// `tid`'s general registers, the regset `NT_PRSTATUS` stores.
+fn general_regs(tid: i32) -> std::io::Result<libc::user_regs_struct> {
+    let mut bytes = [0u8; std::mem::size_of::<libc::user_regs_struct>()];
+    if getregset_into(tid, NT_PRSTATUS, &mut bytes)? != bytes.len() {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    // SAFETY: user_regs_struct is plain old data of exactly these bytes.
+    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) })
+}
+
+/// `PTRACE_GETREGSET` of `kind` into `buf`; returns the bytes written.
+fn getregset_into(tid: i32, kind: u32, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: the kernel writes at most `iov_len` bytes to `buf`, which is
+    // writable for that long, and stores how many it wrote in `iov_len`.
+    let result = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGSET,
+            tid,
+            kind as usize as *mut libc::c_void,
+            &mut iov as *mut libc::iovec,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(iov.iov_len)
+}
+
 /// Everything a core needs except memory contents, read before writing.
 struct Snapshot {
-    tgid: i32,
-    stack_pointer: u64,
+    /// Every thread's stack pointer, for [`Tier::Stack`].
+    stack_pointers: Vec<u64>,
     notes: Vec<u8>,
     maps: Vec<MemoryMap>,
     /// What may be stored of each of `maps`, by [`dump_rule`].
@@ -427,16 +732,19 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn read(process: &Process, exit: &FatalSignalExit) -> anyhow::Result<Self> {
-        let status = process.status()?;
-        let stat = process.stat()?;
+    /// Reads the process through `dying.exit`'s thread, held at its exit stop.
+    /// The other threads of the process may still be on their way to theirs,
+    /// but they share its memory and mappings.
+    fn read(dying: &Dying<'_>) -> anyhow::Result<Self> {
+        let tid = dying.exit.tid.as_raw();
+        let process = Process::new(tid)?;
         // smaps carries the kernel's VmFlags, which say what a dump must skip;
         // without them, keep the layout and store no memory at all.
         let (maps, flags_known) = match process.smaps() {
             Ok(maps) => (maps.0, true),
             Err(_) => (process.maps()?.0, false),
         };
-        let filter = coredump_filter(exit.tid.as_raw());
+        let filter = coredump_filter(tid);
         let rules = maps
             .iter()
             .map(|map| {
@@ -449,76 +757,96 @@ impl Snapshot {
             })
             .collect();
         let cmdline = process.cmdline().unwrap_or_default().join(" ");
-        let auxv = fs::read(format!("/proc/{}/auxv", exit.tid.as_raw())).ok();
-        let identity = Identity {
-            tid: exit.tid.as_raw(),
-            tgid: status.tgid,
-            ppid: stat.ppid,
-            pgrp: stat.pgrp,
-            sid: stat.session,
-            uid: status.ruid,
-            gid: status.rgid,
-            sigpend: status.sigpnd | status.shdpnd,
-            sighold: status.sigblk,
-            state: stat.state,
-            nice: stat.nice,
-            flags: stat.flags,
-            comm: stat.comm,
-            cmdline,
-        };
+        let auxv = fs::read(format!("/proc/{tid}/auxv")).ok();
+        let identity = Identity::read(dying.death, cmdline)?;
         let mut notes = Vec::new();
-        note(
-            &mut notes,
-            NT_PRSTATUS,
-            &arch::prstatus(exit.signal as i32, &identity, &exit.regs),
-        );
-        note(&mut notes, NT_PRPSINFO, &prpsinfo(&identity));
-        if let Some(auxv) = auxv {
-            note(&mut notes, NT_AUXV, &auxv);
+        for (index, thread) in dying.threads.iter().enumerate() {
+            note(
+                &mut notes,
+                CORE,
+                NT_PRSTATUS,
+                &arch::prstatus(dying.exit.signal as i32, &identity, thread),
+            );
+            // The process-wide notes follow the first thread's NT_PRSTATUS
+            // (`write_note_info`, fs/binfmt_elf.c).
+            if index == 0 {
+                note(&mut notes, CORE, NT_PRPSINFO, &prpsinfo(&identity));
+                if let Some(auxv) = &auxv {
+                    note(&mut notes, CORE, NT_AUXV, auxv);
+                }
+                note(&mut notes, CORE, NT_FILE, &nt_file(&maps));
+            }
+            for regset in &thread.regsets {
+                note(&mut notes, regset.name, regset.kind, &regset.desc);
+            }
         }
-        note(&mut notes, NT_FILE, &nt_file(&maps));
         Ok(Self {
-            tgid: status.tgid,
-            stack_pointer: arch::stack_pointer(&exit.regs),
+            stack_pointers: dying
+                .threads
+                .iter()
+                .map(|thread| arch::stack_pointer(&thread.regs))
+                .collect(),
             notes,
             maps,
             rules,
         })
     }
 
+    /// One `PT_LOAD` per mapping, holding the bytes [`Snapshot::stored`]
+    /// keeps from its start, and a second, unstored one before it for the
+    /// bottom of a mapping kept only from part way up.
     fn segments(&self, tier: Tier) -> Vec<Segment> {
-        self.maps
-            .iter()
-            .zip(&self.rules)
-            .filter(|(map, _)| dumpable(map))
-            .map(|(map, rule)| {
-                let (start, end) = map.address;
-                let len = end - start;
-                let all = rule.whole
-                    && match tier {
-                        Tier::Full => true,
-                        Tier::Stack => {
-                            (start..end).contains(&self.stack_pointer)
-                                || matches!(map.pathname, MMapPath::Stack)
-                        }
-                        Tier::NotesOnly => false,
-                    };
-                let elf_header = tier != Tier::NotesOnly && rule.elf_header;
-                let filesz = if all {
-                    len
-                } else if elf_header {
-                    len.min(core_page())
-                } else {
-                    0
-                };
-                Segment {
+        let mut segments = Vec::new();
+        for (map, rule) in self.maps.iter().zip(&self.rules) {
+            if !dumpable(map) {
+                continue;
+            }
+            let (start, end) = map.address;
+            let stored = self.stored(map, *rule, tier);
+            let flags = segment_flags(map.perms);
+            if stored.start > start {
+                segments.push(Segment {
                     vaddr: start,
-                    memsz: len,
-                    filesz,
-                    flags: segment_flags(map.perms),
-                }
-            })
-            .collect()
+                    memsz: stored.start - start,
+                    filesz: 0,
+                    flags,
+                });
+            }
+            segments.push(Segment {
+                vaddr: stored.start,
+                memsz: end - stored.start,
+                filesz: stored.end - stored.start,
+                flags,
+            });
+        }
+        segments
+    }
+
+    /// The bytes of `map` that `tier` stores. The Stack tier keeps the main
+    /// stack whole, and a mapping that holds a thread's stack pointer from
+    /// just below that pointer (its red zone included, rounded down to a page)
+    /// to its top: the part that holds the thread's frames.
+    fn stored(&self, map: &MemoryMap, rule: Dump, tier: Tier) -> Range<u64> {
+        let (start, end) = map.address;
+        let from = match tier {
+            _ if !rule.whole => None,
+            Tier::Full => Some(start),
+            Tier::Stack if matches!(map.pathname, MMapPath::Stack) => Some(start),
+            Tier::Stack => self
+                .stack_pointers
+                .iter()
+                .filter(|sp| (start..end).contains(*sp))
+                .min()
+                .map(|sp| (sp.saturating_sub(RED_ZONE) / core_page() * core_page()).max(start)),
+            Tier::NotesOnly => None,
+        };
+        match from {
+            Some(from) => from..end,
+            None if tier != Tier::NotesOnly && rule.elf_header => {
+                start..start + (end - start).min(core_page())
+            }
+            None => start..start,
+        }
     }
 }
 
@@ -652,33 +980,74 @@ const NT_PRSTATUS: u32 = 1;
 const NT_PRPSINFO: u32 = 3;
 const NT_AUXV: u32 = 6;
 const NT_FILE: u32 = 0x4649_4c45;
+/// The name of the notes every architecture shares, with the terminating NUL
+/// its size counts.
+const CORE: &[u8] = b"CORE\0";
 const EHDR_SIZE: u64 = 64;
 const PHDR_SIZE: u64 = 56;
 
-/// The fields of the notes that do not come from registers.
+/// The fields of the notes that describe the process rather than one thread.
+/// `NT_PRPSINFO` describes the thread group leader (`fill_psinfo`,
+/// fs/binfmt_elf.c), and every thread's `NT_PRSTATUS` names the same parent,
+/// process group and session.
 struct Identity {
-    tid: i32,
     tgid: i32,
     ppid: i32,
     pgrp: i32,
     sid: i32,
     uid: u32,
     gid: u32,
-    sigpend: u64,
-    sighold: u64,
-    state: char,
+    /// `pr_state` and `pr_sname`: see [`leader_state`].
+    state: (u8, u8),
     nice: i64,
     flags: u32,
     comm: String,
     cmdline: String,
 }
 
-fn note(out: &mut Vec<u8>, kind: u32, desc: &[u8]) {
-    const NAME: &[u8] = b"CORE\0";
-    out.extend_from_slice(&(NAME.len() as u32).to_le_bytes());
+impl Identity {
+    /// Reads the leader of `death`'s process, with the process's `cmdline`.
+    fn read(death: &Death, cmdline: String) -> anyhow::Result<Self> {
+        let leader = Process::new(death.tgid)?;
+        let status = leader.status()?;
+        let stat = leader.stat()?;
+        Ok(Self {
+            tgid: death.tgid,
+            ppid: stat.ppid,
+            pgrp: stat.pgrp,
+            sid: stat.session,
+            uid: status.ruid,
+            gid: status.rgid,
+            state: leader_state(death, stat.flags),
+            nice: stat.nice,
+            flags: stat.flags,
+            comm: stat.comm,
+            cmdline,
+        })
+    }
+}
+
+/// `pr_state` and `pr_sname` of the leader as the kernel's dump records them
+/// (`fill_psinfo`, fs/binfmt_elf.c): 0 (`R`) when the leader runs the dump,
+/// 2 (`D`) when it waits in `coredump_task_exit` (`TASK_IDLE`), and 8 (`.`,
+/// `TASK_DEAD`) when it exited before the signal. Taken from the leader's
+/// part in the dump rather than its state now, which is its exit stop's once
+/// it gets there, so it does not depend on when the capture looks.
+fn leader_state(death: &Death, leader_flags: u32) -> (u8, u8) {
+    if death.dumper == death.tgid {
+        (0, b'R')
+    } else if leader_flags & PF_SIGNALED != 0 {
+        (2, b'D')
+    } else {
+        (8, b'.')
+    }
+}
+
+fn note(out: &mut Vec<u8>, name: &[u8], kind: u32, desc: &[u8]) {
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
     out.extend_from_slice(&(desc.len() as u32).to_le_bytes());
     out.extend_from_slice(&kind.to_le_bytes());
-    out.extend_from_slice(NAME);
+    out.extend_from_slice(name);
     pad4(out);
     out.extend_from_slice(desc);
     pad4(out);
@@ -692,13 +1061,12 @@ fn put(out: &mut [u8], offset: usize, bytes: &[u8]) {
     out[offset..offset + bytes.len()].copy_from_slice(bytes);
 }
 
-/// `struct elf_prpsinfo` for a 64-bit process (136 bytes).
+/// `struct elf_prpsinfo` for a 64-bit process (136 bytes). Its `pr_zomb`
+/// stays 0: the kernel sets it only for a `pr_sname` of `Z`, which
+/// [`leader_state`] never gives.
 fn prpsinfo(id: &Identity) -> Vec<u8> {
     let mut out = vec![0u8; 136];
-    let state = id.state as u8;
-    out[0] = b"RSDTZW".iter().position(|&c| c == state).unwrap_or(0) as u8;
-    out[1] = state;
-    out[2] = u8::from(state == b'Z');
+    (out[0], out[1]) = id.state;
     out[3] = id.nice as i8 as u8;
     put(&mut out, 8, &u64::from(id.flags).to_le_bytes());
     put(&mut out, 16, &id.uid.to_le_bytes());
@@ -748,12 +1116,12 @@ fn nt_file(maps: &[MemoryMap]) -> Vec<u8> {
     not(any(target_arch = "x86_64", target_arch = "aarch64")),
     allow(dead_code, reason = "no other architecture has a prstatus layout here")
 )]
-fn prstatus_common(out: &mut [u8], signal: i32, id: &Identity) {
+fn prstatus_common(out: &mut [u8], signal: i32, id: &Identity, thread: &ThreadNotes) {
     put(out, 0, &signal.to_le_bytes()); // pr_info.si_signo
     put(out, 12, &(signal as i16).to_le_bytes()); // pr_cursig
-    put(out, 16, &id.sigpend.to_le_bytes());
-    put(out, 24, &id.sighold.to_le_bytes());
-    put(out, 32, &id.tid.to_le_bytes());
+    put(out, 16, &thread.sigpend.to_le_bytes());
+    put(out, 24, &thread.sighold.to_le_bytes());
+    put(out, 32, &thread.tid.to_le_bytes());
     put(out, 36, &id.ppid.to_le_bytes());
     put(out, 40, &id.pgrp.to_le_bytes());
     put(out, 44, &id.sid.to_le_bytes());
@@ -762,23 +1130,51 @@ fn prstatus_common(out: &mut [u8], signal: i32, id: &Identity) {
 #[cfg(target_arch = "x86_64")]
 mod arch {
     use super::Identity;
+    use super::ThreadNotes;
     use super::put;
 
     pub(super) const MACHINE: u16 = 62; // EM_X86_64
+
+    pub(super) const NT_PRFPREG: u32 = 2;
+    const NT_386_IOPERM: u32 = 0x201;
+    pub(super) const NT_X86_XSTATE: u32 = 0x202;
+    const NT_X86_SHSTK: u32 = 0x204;
+    /// The name the kernel gives every regset note but `NT_PRFPREG`.
+    pub(super) const LINUX: &[u8] = b"LINUX\0";
+
+    /// The regsets after `NT_PRSTATUS` that the kernel's x86-64 dump writes
+    /// for each thread, in its order (`x86_64_regsets`,
+    /// arch/x86/kernel/ptrace.c), with their note names. It writes one only
+    /// while it is active, which for each of these is exactly when
+    /// `PTRACE_GETREGSET` returns it.
+    pub(super) const REGSETS: &[(u32, &[u8])] = &[
+        (NT_PRFPREG, super::CORE),
+        (NT_386_IOPERM, LINUX),
+        (NT_X86_XSTATE, LINUX),
+        (NT_X86_SHSTK, LINUX),
+    ];
 
     pub(super) fn stack_pointer(regs: &libc::user_regs_struct) -> u64 {
         regs.rsp
     }
 
-    /// `struct elf_prstatus` for x86-64 (336 bytes).
-    pub(super) fn prstatus(signal: i32, id: &Identity, regs: &libc::user_regs_struct) -> Vec<u8> {
+    /// `struct elf_prstatus` for x86-64 (336 bytes), as `fill_prstatus`
+    /// (fs/binfmt_elf.c) fills it, without the CPU times: every thread's
+    /// `pr_cursig` is the signal ending the process.
+    pub(super) fn prstatus(signal: i32, id: &Identity, thread: &ThreadNotes) -> Vec<u8> {
         const REGS: usize = std::mem::size_of::<libc::user_regs_struct>();
         const _: () = assert!(REGS == 216);
         let mut out = vec![0u8; 336];
-        super::prstatus_common(&mut out, signal, id);
+        super::prstatus_common(&mut out, signal, id, thread);
         // SAFETY: user_regs_struct is plain old data of exactly REGS bytes.
-        let bytes = unsafe { std::slice::from_raw_parts(regs as *const _ as *const u8, REGS) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(&thread.regs as *const _ as *const u8, REGS) };
         put(&mut out, 112, bytes);
+        let fpvalid = thread
+            .regsets
+            .iter()
+            .any(|regset| regset.kind == NT_PRFPREG);
+        put(&mut out, 328, &i32::from(fpvalid).to_le_bytes()); // pr_fpvalid
         out
     }
 }
@@ -786,9 +1182,14 @@ mod arch {
 #[cfg(target_arch = "aarch64")]
 mod arch {
     use super::Identity;
+    use super::ThreadNotes;
     use super::put;
 
     pub(super) const MACHINE: u16 = 183; // EM_AARCH64
+
+    /// The regsets after `NT_PRSTATUS` written for each thread: none on
+    /// arm64 yet, so its core holds each thread's general registers alone.
+    pub(super) const REGSETS: &[(u32, &[u8])] = &[];
 
     pub(super) fn stack_pointer(regs: &libc::user_regs_struct) -> u64 {
         regs.sp
@@ -797,13 +1198,14 @@ mod arch {
     /// `struct elf_prstatus` for arm64 (392 bytes): the common fields, then
     /// `pr_reg`, the 34 words of `struct user_pt_regs` (x0-x30, sp, pc,
     /// pstate), then `pr_fpvalid`.
-    pub(super) fn prstatus(signal: i32, id: &Identity, regs: &libc::user_regs_struct) -> Vec<u8> {
+    pub(super) fn prstatus(signal: i32, id: &Identity, thread: &ThreadNotes) -> Vec<u8> {
         const REGS: usize = std::mem::size_of::<libc::user_regs_struct>();
         const _: () = assert!(REGS == 272);
         let mut out = vec![0u8; 392];
-        super::prstatus_common(&mut out, signal, id);
+        super::prstatus_common(&mut out, signal, id, thread);
         // SAFETY: user_regs_struct is plain old data of exactly REGS bytes.
-        let bytes = unsafe { std::slice::from_raw_parts(regs as *const _ as *const u8, REGS) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(&thread.regs as *const _ as *const u8, REGS) };
         put(&mut out, 112, bytes);
         out
     }
@@ -812,14 +1214,17 @@ mod arch {
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod arch {
     use super::Identity;
+    use super::ThreadNotes;
 
     pub(super) const MACHINE: u16 = 0;
+
+    pub(super) const REGSETS: &[(u32, &[u8])] = &[];
 
     pub(super) fn stack_pointer(regs: &libc::user_regs_struct) -> u64 {
         regs.sp
     }
 
-    pub(super) fn prstatus(_: i32, _: &Identity, _: &libc::user_regs_struct) -> Vec<u8> {
+    pub(super) fn prstatus(_: i32, _: &Identity, _: &ThreadNotes) -> Vec<u8> {
         Vec::new()
     }
 }
@@ -1019,6 +1424,11 @@ fn read_fully(mem: &File, buf: &mut [u8], addr: u64) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// The TGID of this test process, whose threads the tests offer.
+    fn own_tgid() -> i32 {
+        std::process::id() as i32
+    }
+
     /// The number of names in `dir`, read with std as an independent oracle.
     #[allow(clippy::disallowed_methods)]
     fn entries(dir: &std::path::Path) -> usize {
@@ -1071,7 +1481,7 @@ mod tests {
     #[test]
     fn notes_are_four_byte_aligned() {
         let mut notes = Vec::new();
-        note(&mut notes, NT_AUXV, &[1, 2, 3]);
+        note(&mut notes, CORE, NT_AUXV, &[1, 2, 3]);
         assert_eq!(notes.len(), 12 + 8 + 4);
         assert_eq!(&notes[12..17], b"CORE\0");
         assert_eq!(&notes[20..23], &[1, 2, 3]);
@@ -1321,8 +1731,7 @@ mod tests {
         mem.write_all_at(&vec![0xa5; core_page() as usize], 2 * core_page())
             .unwrap();
         let snapshot = Snapshot {
-            tgid: 1,
-            stack_pointer: 2 * core_page(),
+            stack_pointers: vec![2 * core_page()],
             notes: Vec::new(),
             maps: vec![heap, stack],
             rules: vec![
@@ -1409,15 +1818,264 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_that_did_not_dump_gets_no_core() {
+    fn a_process_without_a_dumping_thread_gets_no_core() {
         let dir = tempfile::tempdir().unwrap();
         let cores = dir.path().join("cores");
-        let outcome = capture(&config(&cores), &own_exit(false, None)).unwrap();
-        assert_eq!(outcome, Outcome::NotDumping);
+        let exit = own_exit(false, None);
+        assert_eq!(
+            Death::of(&exit, own_tgid()),
+            None,
+            "this process has no dumping thread"
+        );
+        capture_and_log(&config(&cores), &exit, &Kept::default());
         assert!(
             !cores.exists(),
-            "a non-dumping thread created the directory"
+            "a process without a dumping thread created the directory"
         );
+    }
+
+    #[test]
+    fn a_death_keeps_one_core_however_many_of_its_threads_are_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let exit = own_exit(true, None);
+        let kept = Kept::default();
+        capture_and_log(&cfg, &exit, &kept);
+        capture_and_log(&cfg, &exit, &kept);
+        assert_eq!(entries(dir.path()), 1, "a second offer kept another core");
+        // A new run's registry knows nothing of this death.
+        capture_and_log(&cfg, &exit, &Kept::default());
+        assert_eq!(entries(dir.path()), 2);
+    }
+
+    #[test]
+    fn the_dumping_thread_is_the_one_marked_pf_dumpcore() {
+        let flags = |tid| Some(PF_SIGNALED | if tid == 5 { PF_DUMPCORE } else { 0 });
+        assert_eq!(dumper_among([3, 5, 7], flags), Some(5));
+        assert_eq!(dumper_among([3, 7], flags), None);
+        assert_eq!(dumper_among([5], |_| None), None, "unreadable flags");
+    }
+
+    #[test]
+    fn the_stack_tier_keeps_every_threads_frames() {
+        let mapping = |pathname, start: u64| {
+            let mut stack = map(
+                pathname,
+                MMPermissions::READ | MMPermissions::WRITE | MMPermissions::PRIVATE,
+                0,
+            );
+            stack.address = (start, start + 4 * core_page());
+            stack
+        };
+        let whole = Dump {
+            whole: true,
+            elf_header: false,
+        };
+        let snapshot = Snapshot {
+            // A thread deep in its stack, one whose red zone reaches into the
+            // page below, and one whose red zone reaches below its mapping.
+            stack_pointers: vec![0x12100, 0x22040, 0x30040],
+            notes: Vec::new(),
+            maps: vec![
+                mapping(MMapPath::Anonymous, 0x10000),
+                mapping(MMapPath::Anonymous, 0x20000),
+                mapping(MMapPath::Anonymous, 0x30000),
+                mapping(MMapPath::Anonymous, 0x40000),
+                mapping(MMapPath::Stack, 0x50000),
+            ],
+            rules: vec![whole; 5],
+        };
+        let layout = |tier| -> Vec<(u64, u64, u64)> {
+            snapshot
+                .segments(tier)
+                .iter()
+                .map(|segment| (segment.vaddr, segment.memsz, segment.filesz))
+                .collect()
+        };
+        assert_eq!(
+            layout(Tier::Stack),
+            [
+                (0x10000, 0x2000, 0),
+                (0x12000, 0x2000, 0x2000),
+                (0x20000, 0x1000, 0),
+                (0x21000, 0x3000, 0x3000),
+                (0x30000, 0x4000, 0x4000),
+                (0x40000, 0x4000, 0),
+                (0x50000, 0x4000, 0x4000),
+            ]
+        );
+        assert!(
+            layout(Tier::Full)
+                .iter()
+                .all(|&(_, memsz, filesz)| memsz == 4 * core_page() && filesz == memsz)
+        );
+    }
+
+    #[test]
+    fn a_reused_tgid_is_a_new_process() {
+        let kept = Kept::default();
+        let process = ProcessKey {
+            tgid: 3,
+            started: 100,
+        };
+        assert!(kept.claim(process));
+        assert!(!kept.claim(process));
+        assert!(kept.claim(ProcessKey {
+            started: 200,
+            ..process
+        }));
+    }
+
+    #[test]
+    fn the_dumping_thread_comes_first_and_the_others_by_tid() {
+        assert_eq!(in_core_order(vec![9, 3, 12, 5], 9), [9, 3, 5, 12]);
+        assert_eq!(in_core_order(vec![12, 5, 3], 3), [3, 5, 12]);
+    }
+
+    #[test]
+    fn the_leaders_state_is_its_part_in_the_dump() {
+        let death = |dumper| Death { tgid: 3, dumper };
+        assert_eq!(leader_state(&death(3), PF_SIGNALED), (0, b'R'));
+        assert_eq!(leader_state(&death(5), PF_SIGNALED), (2, b'D'));
+        assert_eq!(leader_state(&death(5), 0), (8, b'.'));
+    }
+
+    /// The `(name, type, contents)` of each note in `notes`.
+    #[cfg(target_arch = "x86_64")]
+    fn parse_notes(mut notes: &[u8]) -> Vec<(Vec<u8>, u32, Vec<u8>)> {
+        let mut parsed = Vec::new();
+        let u32_at = |bytes: &[u8], at: usize| {
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+        };
+        while !notes.is_empty() {
+            let (namesz, descsz) = (u32_at(notes, 0), u32_at(notes, 4));
+            let kind = u32_at(notes, 8) as u32;
+            let desc = 12 + namesz.next_multiple_of(4);
+            parsed.push((
+                notes[12..12 + namesz].to_vec(),
+                kind,
+                notes[desc..desc + descsz].to_vec(),
+            ));
+            notes = &notes[desc + descsz.next_multiple_of(4)..];
+        }
+        parsed
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn notes_follow_the_kernels_order_with_every_thread() {
+        use super::arch::LINUX;
+        use super::arch::NT_PRFPREG;
+        use super::arch::NT_X86_XSTATE;
+        let exit = own_exit(true, None);
+        let death = Death::of(&exit, own_tgid()).unwrap();
+        let thread = |tid, r12, regsets| {
+            // SAFETY: user_regs_struct is plain old data; zero is a valid value.
+            let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+            regs.r12 = r12;
+            ThreadNotes {
+                tid,
+                regs,
+                sigpend: 0,
+                sighold: u64::from(r12 as u32),
+                regsets,
+            }
+        };
+        let fp = |byte| RegsetNote {
+            kind: NT_PRFPREG,
+            name: CORE,
+            desc: vec![byte; 512],
+        };
+        let xstate = |byte| RegsetNote {
+            kind: NT_X86_XSTATE,
+            name: LINUX,
+            desc: vec![byte; 832],
+        };
+        let threads = [
+            thread(death.dumper, 0xd0, vec![fp(1), xstate(2)]),
+            thread(death.dumper + 1, 0xd1, vec![fp(3), xstate(4)]),
+            thread(death.dumper + 2, 0xd2, Vec::new()),
+        ];
+        let dying = Dying {
+            exit: &exit,
+            death: &death,
+            threads: &threads,
+            start: Instant::now(),
+        };
+        let snapshot = Snapshot::read(&dying).unwrap();
+        let notes = parse_notes(&snapshot.notes);
+        let layout: Vec<(&[u8], u32)> = notes
+            .iter()
+            .map(|(name, kind, _)| (name.as_slice(), *kind))
+            .collect();
+        assert_eq!(
+            layout,
+            [
+                (CORE, NT_PRSTATUS),
+                (CORE, NT_PRPSINFO),
+                (CORE, NT_AUXV),
+                (CORE, NT_FILE),
+                (CORE, NT_PRFPREG),
+                (LINUX, NT_X86_XSTATE),
+                (CORE, NT_PRSTATUS),
+                (CORE, NT_PRFPREG),
+                (LINUX, NT_X86_XSTATE),
+                (CORE, NT_PRSTATUS),
+            ]
+        );
+        let i32_at =
+            |desc: &[u8], at: usize| i32::from_le_bytes(desc[at..at + 4].try_into().unwrap());
+        let statuses: Vec<&Vec<u8>> = notes
+            .iter()
+            .filter(|(_, kind, _)| *kind == NT_PRSTATUS)
+            .map(|(_, _, desc)| desc)
+            .collect();
+        for (status, thread) in statuses.iter().zip(&threads) {
+            assert_eq!(status.len(), 336);
+            assert_eq!(i32_at(status, 32), thread.tid, "pr_pid");
+            assert_eq!(i32_at(status, 0), libc::SIGSEGV, "pr_info.si_signo");
+            assert_eq!(i32_at(status, 24), thread.sighold as i32, "pr_sighold");
+            let r12 = u64::from_le_bytes(status[112 + 3 * 8..112 + 4 * 8].try_into().unwrap());
+            assert_eq!(r12, thread.regs.r12);
+            assert_eq!(
+                i32_at(status, 328),
+                i32::from(!thread.regsets.is_empty()),
+                "pr_fpvalid"
+            );
+        }
+        let (_, _, fp_of_second) = &notes[7];
+        assert_eq!(
+            fp_of_second,
+            &vec![3u8; 512],
+            "a thread's FP state went to another"
+        );
+    }
+
+    #[test]
+    fn a_core_without_its_dumping_thread_is_refused() {
+        let exit = own_exit(false, None);
+        // A dumping thread that never reaches an exit stop this test holds.
+        let death = Death {
+            tgid: own_tgid(),
+            dumper: i32::MAX,
+        };
+        let error = gather(&exit, &death, Instant::now())
+            .err()
+            .expect("a core without its dumping thread was gathered");
+        assert!(error.to_string().contains("dumping thread"), "{error:#}");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_offered_thread_is_kept_with_its_backend_registers() {
+        let mut exit = own_exit(true, None);
+        exit.regs.r12 = 0x1234;
+        let death = Death::of(&exit, own_tgid()).unwrap();
+        // This test process has no thread a fatal signal ended.
+        let threads = gather(&exit, &death, Instant::now()).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].tid, exit.tid.as_raw());
+        assert_eq!(threads[0].regs.r12, 0x1234);
     }
 
     #[test]
@@ -1442,9 +2100,13 @@ mod tests {
     #[test]
     fn readable_memory_is_stored() {
         let dir = tempfile::tempdir().unwrap();
-        let Outcome::Written { path } =
-            capture(&config(dir.path()), &own_exit(true, None)).unwrap()
-        else {
+        let exit = own_exit(true, None);
+        let Outcome::Written { path } = capture(
+            &config(dir.path()),
+            &exit,
+            &Death::of(&exit, own_tgid()).unwrap(),
+        )
+        .unwrap() else {
             panic!("no core was kept");
         };
         assert!(stored_memory(&path) > 0, "the core stores no memory");
@@ -1520,7 +2182,7 @@ mod tests {
             // Stands in for a read blocked in the kernel.
             std::thread::sleep(Duration::from_millis(600));
             tell.send(abandoned.load(Ordering::SeqCst)).unwrap();
-            Ok(Outcome::NotDumping)
+            Ok(Outcome::NoRoom { budget: 0 })
         });
         let waited = start.elapsed();
         let error = outcome.expect_err("a blocked capture was reported as done");
@@ -1538,9 +2200,9 @@ mod tests {
     #[test]
     fn a_capture_that_finishes_in_time_is_returned_and_a_panic_is_an_error() {
         let done = run_within(Instant::now() + Duration::from_secs(5), |_| {
-            Ok(Outcome::NotDumping)
+            Ok(Outcome::NoRoom { budget: 0 })
         });
-        assert_eq!(done.unwrap(), Outcome::NotDumping);
+        assert_eq!(done.unwrap(), Outcome::NoRoom { budget: 0 });
         let panicked = run_within(Instant::now() + Duration::from_secs(5), |_| panic!("boom"));
         assert!(panicked.unwrap_err().to_string().contains("panicked"));
     }
@@ -1549,9 +2211,18 @@ mod tests {
     fn an_abandoned_capture_deletes_its_core_instead_of_keeping_it() {
         let dir = tempfile::tempdir().unwrap();
         let abandoned = AtomicBool::new(true);
+        let exit = own_exit(true, None);
+        let death = Death::of(&exit, own_tgid()).unwrap();
+        let threads = gather(&exit, &death, Instant::now()).unwrap();
+        let dying = Dying {
+            exit: &exit,
+            death: &death,
+            threads: &threads,
+            start: Instant::now(),
+        };
         let outcome = capture_abandonable(
             &config(dir.path()),
-            &own_exit(true, None),
+            &dying,
             None,
             &AtomicBool::new(false),
             &abandoned,

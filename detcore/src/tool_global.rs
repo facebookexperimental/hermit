@@ -1356,6 +1356,10 @@ pub struct GlobalState {
     root_image_marked: AtomicBool,
     /// The device and inode of `Config::launch_image`'s launcher, read once.
     launcher_identity: OnceLock<Option<(u64, u64)>>,
+    /// The guest process deaths whose fatal core this run already captured
+    /// (`Config::fatal_core_capture`): only the first of a dying process's
+    /// threads to reach its exit stop keeps one.
+    fatal_cores_kept: crate::fatal_core::Kept,
 
     sched_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -1973,6 +1977,7 @@ impl GlobalState {
             root_dettid: OnceLock::new(),
             root_image_marked: AtomicBool::new(false),
             launcher_identity: OnceLock::new(),
+            fatal_cores_kept: Default::default(),
             native_exec_registry: OnceLock::new(),
             inodes: Arc::new(Mutex::new(InodePool::new())),
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3026,7 +3031,7 @@ impl GlobalTool for GlobalState {
 
     fn on_fatal_signal_exit(&self, exit: &reverie::FatalSignalExit) {
         if let Some(capture) = &self.cfg.fatal_core_capture {
-            crate::fatal_core::capture_and_log(capture, exit);
+            crate::fatal_core::capture_and_log(capture, exit, &self.fatal_cores_kept);
         }
     }
 

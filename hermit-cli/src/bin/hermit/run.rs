@@ -1504,7 +1504,9 @@ pub struct RunOpts {
     /// core-dumping signal (SIGSEGV, SIGABRT, SIGBUS, ...) kills. The core is
     /// written zstd-compressed into DIR as
     /// `hermit-<HERMIT PID>-<RANDOM>-core.<PID>.<TID>.<SIGNAL>.zst`, where PID
-    /// and TID are the guest's and RANDOM is unique to this invocation. Off by
+    /// and TID are the guest's (TID is the thread that took the signal) and
+    /// RANDOM is unique to this invocation. Like the kernel's, the core holds
+    /// every thread of the process, the one that took the signal first. Off by
     /// default: without this option no core is written. Only ptrace-backed
     /// backends write cores. A run that exits 0 (for `--verify`, whose two
     /// runs also matched) deletes the cores it wrote again. Writing a core
@@ -1514,8 +1516,8 @@ pub struct RunOpts {
     fatal_core_dir: Option<PathBuf>,
 
     /// With `--fatal-core-dir`, the most bytes one compressed core may take. A
-    /// core that does not fit is retried with only its stack, then with only
-    /// its registers and memory layout.
+    /// core that does not fit is retried with only the live part of each
+    /// thread's stack, then with only its registers and memory layout.
     #[clap(long, value_name = "BYTES", default_value_t = 256 << 20, requires = "fatal_core_dir")]
     fatal_core_max_bytes: u64,
 
