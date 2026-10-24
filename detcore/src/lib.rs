@@ -1945,8 +1945,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .end_of_timeslice
                     .filter(|deadline| *deadline > max_timeslice_end)
                     .unwrap_or(fallback_deadline);
-                thread_state.end_of_timeslice = Some(replay_deadline);
-                thread_state.max_timeslice_end = Some(replay_deadline);
+                thread_state.install_schedule_deadline(replay_deadline, true);
                 thread_state.last_rcb_timer = None;
                 thread_state.last_rcb_timer_is_max = false;
                 thread_state.armed_instruction_offset = None;

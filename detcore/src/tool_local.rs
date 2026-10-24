@@ -7105,9 +7105,11 @@ pub struct ThreadState<T> {
     pub chaos_instruction_offset_draws: u64,
     /// Under a schedule replay, the slice end `next_timeslice` installed as
     /// the backstop, `--max-timeslice` after the slice began; see
-    /// `restart_replay_backstop`. It is the backstop only while it is still
-    /// `end_of_timeslice`: whatever installs another slice end (the replayed
-    /// schedule's deadline, an exec's resumed deadline) replaces it.
+    /// `restart_replay_backstop`. Installing a slice end the schedule decides
+    /// (`install_schedule_deadline`) clears it, even when that deadline falls
+    /// on the same nanosecond: a recorded slice end can coincide with the
+    /// backstop, and it is still the schedule's. It is also the backstop only
+    /// while it is still `end_of_timeslice`.
     #[serde(default)]
     pub replay_backstop: Option<LogicalTime>,
 
@@ -10261,6 +10263,20 @@ impl<T> ThreadState<T> {
         self.last_rcb_timer_is_max = false;
     }
 
+    /// Install a slice end the replayed schedule decides: the replayer's
+    /// deadline for this thread's next recorded event (`trace_schedevent`), the
+    /// deadline an exec's continuation resumes, or the no-RCB-time fallback
+    /// past a replayed maximum. It bounds the PMU maximum too when one is
+    /// configured, and it is no backstop, whatever its value
+    /// (`replay_backstop`).
+    pub(crate) fn install_schedule_deadline(&mut self, deadline: LogicalTime, max_timeslice: bool) {
+        self.end_of_timeslice = Some(deadline);
+        if max_timeslice {
+            self.max_timeslice_end = Some(deadline);
+        }
+        self.replay_backstop = None;
+    }
+
     /// Close the current logical-timeslice statistics without selecting a new
     /// preemption point. Used when preemption replay reaches a deterministic
     /// guest sched_yield boundary.
@@ -12504,12 +12520,11 @@ mod timeslice_tests {
         assert_eq!(state.end_of_timeslice, backstop);
         assert_eq!(state.max_timeslice_end, backstop);
 
-        let scheduled = Some(now + Duration::from_nanos(10));
-        state.end_of_timeslice = scheduled;
-        state.max_timeslice_end = scheduled;
+        let scheduled = now + Duration::from_nanos(10);
+        state.install_schedule_deadline(scheduled, true);
         state.restart_replay_backstop(&config);
-        assert_eq!(state.end_of_timeslice, scheduled);
-        assert_eq!(state.max_timeslice_end, scheduled);
+        assert_eq!(state.end_of_timeslice, Some(scheduled));
+        assert_eq!(state.max_timeslice_end, Some(scheduled));
 
         state.next_timeslice(&config);
         state.thread_logical_time.add_rcbs(1000);
@@ -12518,6 +12533,30 @@ mod timeslice_tests {
             state.end_of_timeslice,
             Some(state.thread_logical_time.as_nanos() + Duration::from_nanos(100_000))
         );
+    }
+
+    /// A slice end the replayed schedule installs stays one even on the
+    /// backstop's nanosecond. A recorded slice end can fall there by chance
+    /// (a chaos draw of 9 branches that ended 90 ns after a checkpoint, where
+    /// the kept slice's backstop also ran out); restarting the backstop there
+    /// moved the schedule's slice end 1000 ns later.
+    #[test]
+    fn a_schedule_deadline_on_the_backstop_keeps_its_place() {
+        let config = Config {
+            max_timeslice: nz(1_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        state.next_timeslice(&config);
+        let backstop = state.replay_backstop.expect("a schedule replay's backstop");
+        state.thread_logical_time.add_rcbs(91);
+        state.install_schedule_deadline(backstop, true);
+
+        state.restart_replay_backstop(&config);
+        assert_eq!(state.end_of_timeslice, Some(backstop));
+        assert_eq!(state.max_timeslice_end, Some(backstop));
+        assert_eq!(state.replay_backstop, None);
     }
 
     #[test]

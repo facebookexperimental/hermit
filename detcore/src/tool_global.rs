@@ -12757,10 +12757,10 @@ where
         guest.thread_state().dettid,
         end_of_timeslice
     );
-    guest.thread_state_mut().end_of_timeslice = Some(end_of_timeslice);
-    if guest.config().max_timeslice.is_some() {
-        guest.thread_state_mut().max_timeslice_end = Some(end_of_timeslice);
-    }
+    let max_timeslice = guest.config().max_timeslice.is_some();
+    guest
+        .thread_state_mut()
+        .install_schedule_deadline(end_of_timeslice, max_timeslice);
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
