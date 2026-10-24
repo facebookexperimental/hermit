@@ -191,11 +191,6 @@ impl RunData {
             .to_string()
     }
 
-    pub fn sched_out(&mut self) -> anyhow::Result<&Vec<SchedEvent>> {
-        self.require_complete_output()?;
-        Ok(self.preempts_out().schedevents())
-    }
-
     /// Known omissions cannot become an analysis endpoint or selfcheck proof.
     pub fn require_complete_output(&mut self) -> anyhow::Result<()> {
         let path = self.sched_path_out().to_path_buf();
@@ -1517,6 +1512,20 @@ impl AnalyzeOpts {
         self.write_trial_record(PreemptionRecord::from_sched_events(events), path)
     }
 
+    /// Write `events`, a schedule a search built from the schedules of
+    /// `sources`, for a trial to replay, stamped
+    /// ([`Self::stamp_trial_record`]), with the callback checkpoints of the
+    /// part it shares with one of them ([`trial_record_from`]); with no
+    /// sources, the events alone.
+    pub fn write_trial_schedule_from(
+        &self,
+        events: Vec<SchedEvent>,
+        sources: &[&PreemptionRecord],
+        path: &Path,
+    ) -> anyhow::Result<()> {
+        self.write_trial_record(trial_record_from(events, sources), path)
+    }
+
     /// Write `record` for a trial to replay, stamped
     /// ([`Self::stamp_trial_record`]). The record carries the jumps of global
     /// time of the recorded schedule whose event prefix its events repeat
@@ -1790,6 +1799,50 @@ impl AnalyzeOpts {
             )),
         )
     }
+}
+
+/// The record a trial replays for `events`, a schedule a search built from
+/// the schedules of `sources` (the endpoints it searches between, each the
+/// record of a run): the source whose schedule shares the longest prefix of
+/// events with it, the first on a tie, cut to that prefix
+/// ([`PreemptionRecord::schedule_prefix`]) and given `events` as its schedule.
+/// The trial then keeps the callback checkpoints the unchanged prefix reaches,
+/// with the source's per-thread histories and epoch, so its slices end where
+/// the source's did up to the first edit, as a prefix trial's do, all but the
+/// slice running at the edit: where that one ends decides the edited event,
+/// so the scheduler decides it. An endpoint replayed whole keeps all of its
+/// checkpoints, and so does a source whose schedule ends where the trial's
+/// goes on (no event of its own follows its last slice). The events alone when no
+/// source shares a prefix or its checkpoints do not fit them
+/// ([`PreemptionRecord::with_schedule`]). Past its first edit a trial runs on
+/// its events alone, as before: the prefix keeps no checkpoint beyond the
+/// progress each thread reaches in it.
+pub fn trial_record_from(
+    events: Vec<SchedEvent>,
+    sources: &[&PreemptionRecord],
+) -> PreemptionRecord {
+    // The longest shared prefix wins; on a tie, a source whose whole
+    // schedule is `events` (an endpoint replayed whole, beside another whose
+    // schedule only starts with it), then the first.
+    let mut best: Option<(usize, bool, &PreemptionRecord)> = None;
+    for &source in sources {
+        let shared = source
+            .schedevents()
+            .iter()
+            .zip(&events)
+            .take_while(|(recorded, trial)| recorded == trial)
+            .count();
+        let whole = shared == events.len() && shared == source.schedevents().len();
+        if shared > 0
+            && best.is_none_or(|(longest, was_whole, _)| (shared, whole) > (longest, was_whole))
+        {
+            best = Some((shared, whole, source));
+        }
+    }
+    best.and_then(|(shared, _, source)| {
+        source.schedule_prefix(shared).with_schedule(events.clone())
+    })
+    .unwrap_or_else(|| PreemptionRecord::from_sched_events(events))
 }
 
 #[cfg(test)]

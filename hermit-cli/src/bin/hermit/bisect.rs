@@ -16,7 +16,6 @@ use anyhow::Context;
 use anyhow::bail;
 use clap::Parser;
 use detcore::preemptions::PreemptionRecord;
-use detcore::types::SchedEvent;
 use hermit::Error;
 use regex::Regex;
 use reverie::process::ExitStatus;
@@ -104,7 +103,7 @@ impl BisectOpts {
     fn prepare(
         &self,
         global: &GlobalOpts,
-    ) -> Result<(AnalyzeOpts, Vec<SchedEvent>, Vec<SchedEvent>), Error> {
+    ) -> Result<(AnalyzeOpts, PreemptionRecord, PreemptionRecord), Error> {
         let mut analyzer = AnalyzeOpts {
             target_stdout: self.target_stdout.clone(),
             target_stderr: self.target_stderr.clone(),
@@ -170,8 +169,9 @@ impl BisectOpts {
             ("--good", &self.good),
             ("--bad", &self.bad),
         ])?;
-        // Each trial's schedule is written anew without an epoch, so the
-        // trials replay from the one the two schedules were recorded under.
+        // Trials start through `RunOpts::run`, which does not read the epoch
+        // a replayed record carries, so the trials replay from the one the
+        // two schedules were recorded under.
         analyzer.adopt_recorded_epoch(&[("--good", &self.good), ("--bad", &self.bad)])?;
         // Every replay charges expired timed waits as the failing schedule did.
         analyzer.adopt_expired_wait_charge(Some(&self.bad))?;
@@ -197,16 +197,23 @@ impl BisectOpts {
         // Every replay's schedule is written anew, stamped with the replays'
         // guest IDs, so they are resolved before the first.
         analyzer.prepare_trial_guest_ids(&[("--good", &self.good), ("--bad", &self.bad)])?;
-        let mut good = good.into_global();
-        let mut bad = bad.into_global();
+        let (mut good, mut bad) = (good, bad);
         // Analyze's trial outputs omit optional event timestamps. Put these
         // admitted search inputs in that same representation: bisection edits
         // event order, not the original recordings' virtual-time trajectories.
-        for event in good.iter_mut().chain(&mut bad) {
+        // Stripping event times keeps the records' callback checkpoints valid.
+        for event in good
+            .schedevents_iter_mut()
+            .chain(bad.schedevents_iter_mut())
+        {
             event.end_time = None;
         }
-        let same_events =
-            good.len() == bad.len() && good.iter().zip(&bad).all(|(g, b)| g.same_operations(b));
+        let same_events = good.schedevents().len() == bad.schedevents().len()
+            && good
+                .schedevents()
+                .iter()
+                .zip(bad.schedevents())
+                .all(|(g, b)| g.same_operations(b));
         if same_events {
             bail!("the --good and --bad schedules contain identical event traces");
         }
@@ -245,6 +252,7 @@ mod tests {
     use detcore::types::DetTid;
     use detcore::types::LogicalTime;
     use detcore::types::Op;
+    use detcore::types::SchedEvent;
     use detcore::types::SyscallPhase;
     use reverie::syscalls::Sysno;
 
@@ -265,7 +273,7 @@ mod tests {
     fn prepare_search_records(
         good: &serde_json::Value,
         bad: &serde_json::Value,
-    ) -> Result<(AnalyzeOpts, Vec<SchedEvent>, Vec<SchedEvent>), Error> {
+    ) -> Result<(AnalyzeOpts, PreemptionRecord, PreemptionRecord), Error> {
         let dir = tempfile::tempdir().unwrap();
         let good_path = dir.path().join("good.json");
         let bad_path = dir.path().join("bad.json");
@@ -371,9 +379,13 @@ mod tests {
                 &search_record(timed_bad),
             )
             .unwrap();
-            assert_eq!(prepared_good, good, "{field}: good input");
-            assert_eq!(prepared_bad, bad, "{field}: bad input");
-            assert_ne!(prepared_good, prepared_bad, "{field}");
+            assert_eq!(prepared_good.schedevents(), &good, "{field}: good input");
+            assert_eq!(prepared_bad.schedevents(), &bad, "{field}: bad input");
+            assert_ne!(
+                prepared_good.schedevents(),
+                prepared_bad.schedevents(),
+                "{field}"
+            );
             trials.tmp_dir = Some(trials_dir.path().to_path_buf());
             assert_eq!(trials.trial_epoch_for_test(), RECORDED_RFC3339);
             assert_eq!(trials.trial_pipe_wake_latency(), Some(3_000_000));

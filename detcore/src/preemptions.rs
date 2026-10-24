@@ -722,6 +722,10 @@ impl PreemptionRecord {
     /// For a schedule that replayed this record's events and went on past
     /// them: its own recording keeps no checkpoints, since a replay records
     /// none, but the replayed part ended its slices where this record did.
+    /// Also for a schedule that starts with this record's events and goes on
+    /// with others (a search's edit after a [`Self::schedule_prefix`]): a
+    /// checkpoint the edited part does not reach exactly (callback origin,
+    /// time and branch count) is reported as a desync and otherwise ignored.
     pub fn with_schedule(&self, events: Vec<SchedEvent>) -> Option<PreemptionRecord> {
         let mut record = self.clone();
         record.global = events;

@@ -1633,21 +1633,26 @@ impl AnalyzeOpts {
     }
 
     /// Write analyze's final on-target and baseline schedules, stamped
-    /// ([`Self::stamp_trial_record`]), and say where.
+    /// ([`Self::stamp_trial_record`]) and with the callback checkpoints of
+    /// the part each shares with one of `sources`, the search's endpoint
+    /// records ([`trial_record_from`](crate::analyze::rundata::trial_record_from)), and say where.
     pub fn write_final_schedules(
         &self,
         failing: Vec<SchedEvent>,
         failing_path: &Path,
         passing: Vec<SchedEvent>,
         passing_path: &Path,
+        sources: &[&PreemptionRecord],
     ) {
-        self.write_trial_schedule(failing, failing_path).unwrap();
+        self.write_trial_schedule_from(failing, sources, failing_path)
+            .unwrap();
         eprintln!(
             "Wrote final on-target ({}) schedule to {}",
             self.display_criteria(),
             failing_path.display()
         );
-        self.write_trial_schedule(passing, passing_path).unwrap();
+        self.write_trial_schedule_from(passing, sources, passing_path)
+            .unwrap();
         eprintln!(
             "Wrote final baseline (off-target) schedule to {}",
             passing_path.display()
@@ -1974,18 +1979,29 @@ impl AnalyzeOpts {
     }
 
     /// Perform the binary search through schedule-space, identifying critical events.
+    ///
+    /// Each trial replays its schedule with the callback checkpoints of the
+    /// part it shares with the `target` or `baseline` record
+    /// ([`trial_record_from`](crate::analyze::rundata::trial_record_from)):
+    /// an endpoint replayed whole keeps all of them, and a spliced schedule
+    /// keeps those its unchanged prefix reaches, so its slices end where the
+    /// recording's did up to the first edit.
     pub fn phase5_bisect_traces(
         &self,
-        target: &[SchedEvent],
-        baseline: &[SchedEvent],
+        target: &PreemptionRecord,
+        baseline: &PreemptionRecord,
     ) -> anyhow::Result<CriticalSchedule> {
-        self.phase5_bisect_traces_with(target, baseline, |i, sched| {
+        self.phase5_bisect_traces_with(target.schedevents(), baseline.schedevents(), |i, sched| {
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
             let mut newrun = RunData::new_baseline(self, runname)?
                 .with_schedule_replay() // Default input path
                 .with_schedule_recording(); // Default output path
             // Prepare the next synthetic schedule on disk:
-            self.write_trial_schedule(sched.to_owned(), newrun.sched_path_in())?;
+            self.write_trial_schedule_from(
+                sched.to_owned(),
+                &[target, baseline],
+                newrun.sched_path_in(),
+            )?;
 
             if self.verbose {
                 eprintln!(
@@ -2059,15 +2075,15 @@ impl AnalyzeOpts {
     /// Bisect a known passing/failing schedule pair and report the critical event ordering.
     pub fn bisect_schedule_pair(
         &mut self,
-        good: Vec<SchedEvent>,
-        bad: Vec<SchedEvent>,
+        good: PreemptionRecord,
+        bad: PreemptionRecord,
     ) -> anyhow::Result<ExitStatus> {
         // Bisect keeps its workspace, and says where when it exits.
         let _workspace = self.phase0_initialize(Retention::Keep { because: None })?;
         eprintln!(
             ":: Beginning schedule bisection using good/bad endpoints ({} / {} events)",
-            good.len(),
-            bad.len(),
+            good.schedevents().len(),
+            bad.schedevents().len(),
         );
 
         let critical = self.phase5_bisect_traces(&bad, &good)?;
@@ -2087,7 +2103,7 @@ impl AnalyzeOpts {
             "  critical event  #{index}: {}",
             critical.failing_schedule[index]
         );
-        let report = self.phase6_record_outputs(critical, None)?;
+        let report = self.phase6_record_outputs(critical, &[&bad, &good], None)?;
         println!("Swapping these adjacent events reproduces the good outcome.");
         if let Some(path) = &self.report_file {
             let text = serde_json::to_string_pretty(&report)?;
@@ -2130,9 +2146,10 @@ impl AnalyzeOpts {
     pub fn phase6_record_outputs(
         &self,
         crit: CriticalSchedule,
+        sources: &[&PreemptionRecord],
         target_run: Option<&Path>,
     ) -> Result<Report, Error> {
-        self.phase6_record_outputs_with(crit, target_run, RunData::launch)
+        self.phase6_record_outputs_with(crit, sources, target_run, RunData::launch)
     }
 
     /// [`Self::phase6_record_outputs`], with `launch` running each
@@ -2140,6 +2157,7 @@ impl AnalyzeOpts {
     fn phase6_record_outputs_with(
         &self,
         crit: CriticalSchedule,
+        sources: &[&PreemptionRecord],
         target_run: Option<&Path>,
         launch: impl Fn(&mut RunData) -> anyhow::Result<()>,
     ) -> Result<Report, Error> {
@@ -2171,6 +2189,7 @@ impl AnalyzeOpts {
             &final_failing_path,
             passing_schedule.clone(),
             &final_passing_path,
+            sources,
         );
 
         let mut header = String::new();
@@ -2479,18 +2498,20 @@ impl AnalyzeOpts {
 
         let baseline_sched_name = baseline_endpoint_run.sched_out_file_name();
         let target_sched_name = target_endpoint_run.sched_out_file_name();
-        let target = target_endpoint_run.sched_out()?;
-        let baseline = baseline_endpoint_run.sched_out()?;
+        target_endpoint_run.require_complete_output()?;
+        baseline_endpoint_run.require_complete_output()?;
+        let target = target_endpoint_run.preempts_out().clone();
+        let baseline = baseline_endpoint_run.preempts_out().clone();
 
         eprintln!(
             ":: {} (event lengths {} / {}): {} {}",
             "Beginning bisection using endpoints".yellow().bold(),
-            baseline.len(),
-            target.len(),
+            baseline.schedevents().len(),
+            target.schedevents().len(),
             baseline_sched_name,
             target_sched_name,
         );
-        let crit_sched = match self.phase5_bisect_traces(target, baseline) {
+        let crit_sched = match self.phase5_bisect_traces(&target, &baseline) {
             Ok(crit_sched) => crit_sched,
             // The two endpoints differ in events only one run executed: the
             // decision is still within the failing schedule, and a prefix
@@ -2507,7 +2528,8 @@ impl AnalyzeOpts {
         };
 
         let target_run = target_endpoint_run.root_path();
-        let report = self.phase6_record_outputs(crit_sched, Some(&target_run))?;
+        let report =
+            self.phase6_record_outputs(crit_sched, &[&target, &baseline], Some(&target_run))?;
         self.write_report_and_exit(report)
     }
 
@@ -2864,7 +2886,7 @@ mod tests {
             let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
             options.tmp_dir = Some(dir.path().to_path_buf());
             let error = options
-                .phase6_record_outputs_with(critical(&[1, 2, 1, 2], 2), None, |run| {
+                .phase6_record_outputs_with(critical(&[1, 2, 1, 2], 2), &[], None, |run| {
                     let met = if run.name() == "final_target_for_stacktraces" {
                         target_met
                     } else {
@@ -4477,6 +4499,120 @@ mod tests {
                 },
             );
             assert!(!sentence.contains("removes"), "{sentence}");
+        }
+    }
+
+    /// A bisection trial replays its schedule with the callback checkpoints,
+    /// per-thread histories and epoch of the endpoint record it shares the
+    /// longest prefix with (on a tie, one it replays whole, then the first),
+    /// as far as that prefix reaches: an endpoint replayed whole keeps all of
+    /// its checkpoints, and one that shares nothing is written as events
+    /// alone. A schedule edited right after its first event keeps none of the
+    /// target's checkpoints, though it takes the target's histories and
+    /// epoch: the one at that event's progress ended its slice, which decides
+    /// the edited event, so the scheduler decides it, as in a prefix trial
+    /// (`PreemptionRecord::schedule_prefix`).
+    #[test]
+    fn a_bisection_trial_keeps_the_checkpoints_of_the_part_it_shares_with_an_endpoint() {
+        let parent = tempfile::tempdir().unwrap();
+        let tmp_dir = format!("--tmp-dir={}", parent.path().display());
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
+        options.phase0_initialize().unwrap();
+        let branches = |tid: u64, count: u32| {
+            serde_json::json!({
+                "dettid": tid, "op": "Branch", "count": count,
+                "start_rip": null, "end_rip": null, "end_time": null
+            })
+        };
+        let checkpoint = |row: usize, progress: u64, time: u64| {
+            serde_json::json!({
+                "history_index": row,
+                "origin": {
+                    "callback": "PmuTimer", "site": "Prehook", "progress": progress,
+                    "last_op": "Branch", "time": time, "rcbs": progress
+                }
+            })
+        };
+        let target: PreemptionRecord = serde_json::from_value(serde_json::json!({
+            "per_thread": {"3": {
+                "final_prio": 1000,
+                "prio_changes": [[100, 1000], [200, 1000]],
+                "preemption_rcbs": [10, 15]
+            }},
+            "global": [branches(3, 10), branches(3, 5)],
+            "epoch": "2026-01-01T00:00:00Z",
+            "callback_checkpoints": {"3": [checkpoint(0, 10, 100), checkpoint(1, 15, 200)]}
+        }))
+        .unwrap();
+        target.validate().unwrap();
+        let events = |list: Vec<serde_json::Value>| -> Vec<SchedEvent> {
+            serde_json::from_value(serde_json::Value::Array(list)).unwrap()
+        };
+        // The baseline has the same events and no checkpoints: on the tie the
+        // target, listed first, is the source.
+        let baseline = PreemptionRecord::from_sched_events(target.schedevents().clone());
+        let path = parent.path().join("trial.preempts");
+        // A second endpoint whose schedule only starts with the target's
+        // first event, and keeps no checkpoints.
+        let short = PreemptionRecord::from_sched_events(events(vec![branches(3, 10)]));
+        // (sources, schedule, checkpoints kept, whether the target's histories
+        // and epoch come with them)
+        for (sources, schedule, kept, from_target) in [
+            (
+                [&target, &baseline],
+                events(vec![branches(3, 10), branches(3, 5)]),
+                2,
+                true,
+            ),
+            (
+                [&target, &baseline],
+                events(vec![branches(3, 10), branches(5, 5), branches(3, 5)]),
+                0,
+                true,
+            ),
+            (
+                [&target, &baseline],
+                events(vec![branches(5, 5), branches(3, 10)]),
+                0,
+                false,
+            ),
+            // The longer shared prefix wins, whichever source is listed first.
+            (
+                [&short, &target],
+                events(vec![branches(3, 10), branches(3, 5)]),
+                2,
+                true,
+            ),
+            // A source that ends where the schedule goes on keeps its last
+            // slice end: no event of its own follows it.
+            (
+                [&target, &short],
+                events(vec![branches(3, 10), branches(3, 5), branches(5, 1)]),
+                2,
+                true,
+            ),
+            // On a tie, the source replayed whole wins.
+            ([&target, &short], events(vec![branches(3, 10)]), 0, false),
+        ] {
+            options
+                .write_trial_schedule_from(schedule.clone(), &sources, &path)
+                .unwrap();
+            let written = PreemptionReader::new(&path).load_all();
+            written.validate().unwrap();
+            assert_eq!(written.schedevents(), &schedule);
+            let points = serde_json::to_value(&written).unwrap()["callback_checkpoints"]["3"]
+                .as_array()
+                .map_or(0, |points| points.len());
+            assert_eq!(points, kept, "{schedule:?}");
+            assert_eq!(written.epoch().is_some(), from_target, "{schedule:?}");
+            assert_eq!(
+                serde_json::to_value(&written).unwrap()["per_thread"]
+                    .as_object()
+                    .map_or(0, |rows| rows.len()),
+                usize::from(from_target),
+                "{schedule:?}"
+            );
         }
     }
 
@@ -6135,8 +6271,10 @@ mod tests {
                 dir.path().join("final-passing.json"),
                 dir.path().join("trial.json"),
             );
-            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
-            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing, &[]);
+            options
+                .write_trial_schedule_from(Vec::new(), &[], &trial)
+                .unwrap();
             [failing, passing, trial]
                 .map(|path| detcore::preemptions::read_recorded_pipe_wake_latency(&path).unwrap())
         };
@@ -6214,7 +6352,9 @@ mod tests {
         let off = record("off", Some(false));
         let written = |options: &AnalyzeOpts| {
             let trial = dir.path().join("copy-trial.json");
-            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            options
+                .write_trial_schedule_from(Vec::new(), &[], &trial)
+                .unwrap();
             detcore::preemptions::read_recorded_signal_state_copy(&trial).unwrap()
         };
         let default = prepare(&on, &[]).unwrap();
