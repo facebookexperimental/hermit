@@ -28440,6 +28440,24 @@ fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_i
     }
 }
 
+/// A schedule replay ends each recorded slice once. With the guest's
+/// syscalls, slices also end where a syscall's virtual time crosses the
+/// slice end; the record marks those with callback checkpoints. A replay
+/// ended a timer-preempted slice twice, at the recorded branch count in the
+/// timer's pre-hook and again at its checkpoint in the post-hook, and after a
+/// checkpoint that kept the slice it counted the `--max-timeslice` backstop
+/// from the slice's old start, so it ended the next slice early. Either adds
+/// a scheduler turn, and each turn moves the virtual clock. Before, none of
+/// the first 12 seeds' replays printed their recordings' times.
+#[test]
+fn a_schedule_replay_ends_each_recorded_slice_once() {
+    let divergences = chaos_schedule_replay_divergences(&["syscalls"], false, &[1, 2, 3]);
+    assert!(
+        divergences.is_empty(),
+        "(seed, record, replay): {divergences:?}"
+    );
+}
+
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn
 /// either: 90 ms before, 4 ms now.
 #[test]

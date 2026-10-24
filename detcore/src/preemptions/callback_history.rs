@@ -30,8 +30,20 @@ pub(crate) fn recording_enabled(cfg: &crate::Config) -> bool {
         && cfg.replay_schedule_from.is_none()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-/// The original callback location that ended the logical slice.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Serialize,
+    Deserialize
+)]
+/// The original callback location that ended the logical slice, declared in
+/// the order one callback reaches them, which the derived order compares.
 pub enum Site {
     /// Normal expiration before the handler's operation.
     Prehook,
@@ -328,6 +340,21 @@ impl State {
         }
     }
 
+    /// Whether the next checkpoint ends the running slice at a later site of
+    /// the callback now running, with no event in between: the same callback
+    /// at the same progress, at a later site. A timer preemption the record
+    /// ended at its post-hook, within one RCB of the PMU maximum, reaches its
+    /// replayed branch count already at its pre-hook; ending the slice there
+    /// as well would give the replay a scheduler turn, and a turn's charge of
+    /// virtual time, that the record does not have.
+    pub(crate) fn ends_later_in_callback(&self, actual: &Origin) -> bool {
+        self.checkpoints.front().is_some_and(|expected| {
+            expected.origin.callback == actual.callback
+                && expected.origin.progress == actual.progress
+                && expected.origin.site > actual.site
+        })
+    }
+
     /// Only an independently reached callback endpoint may actuate a checkpoint.
     /// Earlier/nested callbacks wait. Passing the endpoint reports desync; it
     /// never authorizes a late administrative operation.
@@ -493,6 +520,41 @@ mod tests {
             ..Startup::default()
         });
         state
+    }
+
+    /// Only the next checkpoint, in the running callback at the same
+    /// progress and at a later site, ends the slice later.
+    #[test]
+    fn a_later_site_of_the_running_callback_ends_the_slice_later() {
+        let expected = Origin {
+            callback: Callback::PmuTimer,
+            site: Site::PosthookPmuEpsilon,
+            last_op: Some(Op::Branch),
+            ..origin()
+        };
+        let state = replay(expected.clone());
+        for site in [Site::Prehook, Site::Posthook] {
+            assert!(state.ends_later_in_callback(&Origin {
+                site,
+                ..expected.clone()
+            }));
+        }
+        for actual in [
+            expected.clone(),
+            Origin {
+                progress: expected.progress - 1,
+                site: Site::Prehook,
+                ..expected.clone()
+            },
+            Origin {
+                callback: Callback::Syscall(Sysno::close),
+                site: Site::Prehook,
+                ..expected.clone()
+            },
+        ] {
+            assert!(!state.ends_later_in_callback(&actual), "{actual:?}");
+        }
+        assert!(!State::default().ends_later_in_callback(&expected));
     }
 
     #[test]

@@ -166,7 +166,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/chaos_replay_new_thread.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/chaos_replay_new_thread.c is owned by hermit-cli/tests/cli.rs: a_schedule_replay_under_chaos_follows_its_recording records it under --chaos with 100 us slices at several seeds and replays each record with --chaos --replay-schedule-from, comparing exit status and the guest's printed virtual times; a schedule replay must make no chaos decision of its own. It needs two hermit runs per seed and a comparison between them, so it remains a guest fixture rather than a manifest cell."
+      "why": "tests/c/chaos_replay_new_thread.c is owned by hermit-cli/tests/cli.rs: a_schedule_replay_under_chaos_follows_its_recording records it under --chaos with 100 us slices at several seeds and replays each record with --chaos --replay-schedule-from, comparing exit status and the guest's printed virtual times, so a schedule replay must make no chaos decision of its own; a_schedule_replay_ends_each_recorded_slice_once does the same with its syscalls argument and replays without --chaos, so each slice end a callback checkpoint marks must replay as one scheduler turn. It needs two hermit runs per seed and a comparison between them, so it remains a guest fixture rather than a manifest cell."
     },
     {
       "disposition": "guest-fixture",

@@ -17,17 +17,26 @@
 // recorded schedule prints the same line and exits with the same status, and a
 // replay that adds a scheduler turn shifts a time, because every committed
 // turn advances the virtual clock.
+//
+// With the argument "syscalls", both threads also make a getppid call every
+// 256 rounds, so slices also end at syscalls, where the virtual time a
+// syscall adds crosses a slice end, and not only at the preemption timer.
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
 #include <time.h>
+#include <unistd.h>
 
 #define ROUNDS 200000UL
 
 enum { NOBODY, MAIN, WORKER };
 
 static atomic_int first = NOBODY;
+static bool syscalls;
 static long long start_us;
 static long long worker_done_us;
 
@@ -45,6 +54,9 @@ static unsigned long compute(void) {
     x = x * 6364136223846793005UL + 1442695040888963407UL;
     if (x >> 63) {
       high++;
+    }
+    if (syscalls && (i & 255) == 0) {
+      syscall(SYS_getppid);
     }
   }
   return high;
@@ -64,7 +76,8 @@ static void* worker(void* arg) {
   return NULL;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+  syscalls = argc > 1 && strcmp(argv[1], "syscalls") == 0;
   start_us = now_us();
   volatile unsigned long sink = compute();
   pthread_t thread;

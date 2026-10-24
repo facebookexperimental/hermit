@@ -7103,6 +7103,13 @@ pub struct ThreadState<T> {
     /// its next draw in its own stream (`chaos_instruction_offset_draw`).
     #[serde(default)]
     pub chaos_instruction_offset_draws: u64,
+    /// Under a schedule replay, the slice end `next_timeslice` installed as
+    /// the backstop, `--max-timeslice` after the slice began; see
+    /// `restart_replay_backstop`. It is the backstop only while it is still
+    /// `end_of_timeslice`: whatever installs another slice end (the replayed
+    /// schedule's deadline, an exec's resumed deadline) replaces it.
+    #[serde(default)]
+    pub replay_backstop: Option<LogicalTime>,
 
     /// Are we past the global moment when the guest's first execve of its root binary completes
     /// (with a successful exit code).
@@ -8015,6 +8022,7 @@ impl<T> ThreadState<T> {
             slice_instruction_offset: 0,
             replay_instruction_offset: None,
             chaos_instruction_offset_draws: 0,
+            replay_backstop: None,
             record_or_replay,
             preemption_points: None,
             past_global_first_execve: false,
@@ -9780,6 +9788,7 @@ impl<T> ThreadState<T> {
     ///
     /// Returns: an optional new priority.
     pub fn next_timeslice(&mut self, cfg: &Config) -> Option<Priority> {
+        self.replay_backstop = None;
         let logical_timeslice = cfg
             .target_timeslice
             .or(cfg.max_timeslice)
@@ -10112,6 +10121,9 @@ impl<T> ThreadState<T> {
             {
                 self.end_of_timeslice = Some(max_end);
             }
+            if cfg.replay_schedule_from.is_some() && self.preemption_points.is_none() {
+                self.replay_backstop = self.end_of_timeslice;
+            }
 
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
@@ -10218,6 +10230,35 @@ impl<T> ThreadState<T> {
                 .filter(|_| following)
                 .map_or(bound, |backstop| backstop.as_nanos().max(bound)),
         )
+    }
+
+    /// Restart a schedule replay's backstop deadline from now, at a recorded
+    /// slice end that a callback checkpoint replays without closing the slice
+    /// (an administrative turn).
+    ///
+    /// A schedule replay ends a slice where its record does. Beyond that it
+    /// keeps the slice end `next_timeslice` installs, `--max-timeslice` after
+    /// the slice began, as the recorded run did (`replay_backstop`). The
+    /// recorded run began a new slice at this checkpoint, so its next slice
+    /// end comes at most `--max-timeslice` after it. A backstop counted from
+    /// the slice the administrative turn kept would end the replayed slice
+    /// early, at a point the record does not have, and the extra scheduler
+    /// turn would move the virtual clock the guest reads. Any other slice end,
+    /// a deadline the replayed schedule set above all, stays.
+    pub(crate) fn restart_replay_backstop(&mut self, cfg: &Config) {
+        let Some(max_timeslice) = cfg.max_timeslice else {
+            return;
+        };
+        if self.end_of_timeslice.is_none() || self.end_of_timeslice != self.replay_backstop {
+            return;
+        }
+        let end =
+            self.thread_logical_time.as_nanos() + Duration::from_nanos(u64::from(max_timeslice));
+        self.end_of_timeslice = Some(end);
+        self.max_timeslice_end = Some(end);
+        self.replay_backstop = Some(end);
+        self.last_rcb_timer = None;
+        self.last_rcb_timer_is_max = false;
     }
 
     /// Close the current logical-timeslice statistics without selecting a new
@@ -12440,6 +12481,43 @@ mod timeslice_tests {
         assert_eq!(chaos.end_of_timeslice, plain.end_of_timeslice);
         assert_eq!(chaos.max_timeslice_end, plain.max_timeslice_end);
         assert_eq!(chaos.chaos_prng, generator);
+    }
+
+    /// At a checkpoint turn that keeps the slice, a schedule replay counts its
+    /// backstop from now, as the recorded run's new slice did, unless another
+    /// slice end, such as the replayed schedule's deadline, replaced it.
+    #[test]
+    fn a_kept_replay_slice_restarts_only_the_backstop() {
+        let config = Config {
+            max_timeslice: nz(100_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(1000);
+        let now = state.thread_logical_time.as_nanos();
+        assert!(state.end_of_timeslice < Some(now + Duration::from_nanos(100_000)));
+
+        state.restart_replay_backstop(&config);
+        let backstop = Some(now + Duration::from_nanos(100_000));
+        assert_eq!(state.end_of_timeslice, backstop);
+        assert_eq!(state.max_timeslice_end, backstop);
+
+        let scheduled = Some(now + Duration::from_nanos(10));
+        state.end_of_timeslice = scheduled;
+        state.max_timeslice_end = scheduled;
+        state.restart_replay_backstop(&config);
+        assert_eq!(state.end_of_timeslice, scheduled);
+        assert_eq!(state.max_timeslice_end, scheduled);
+
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(1000);
+        state.restart_replay_backstop(&config);
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(state.thread_logical_time.as_nanos() + Duration::from_nanos(100_000))
+        );
     }
 
     #[test]

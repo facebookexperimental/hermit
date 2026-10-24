@@ -882,12 +882,58 @@ async fn drive_callback_hook<F: std::future::Future>(
 }
 
 async fn legacy_callback_expired_deadline_trial(annotated: bool, owner_switch: bool) -> (LogicalTime, LogicalTime) {
-    legacy_callback_expired_deadline_trial_recording(annotated, owner_switch, false).await.0
+async fn legacy_callback_expired_deadline_trial(
+    annotated: bool,
+    owner_switch: bool,
+) -> (LogicalTime, LogicalTime) {
+    legacy_callback_expired_deadline_trial_recording_at(
+        crate::preemptions::callback_history::Site::Prehook,
+        annotated,
+        owner_switch,
+        false,
+        false,
+    )
+    .await
+    .0
 }
 
-async fn legacy_callback_expired_deadline_trial_recording(annotated: bool, owner_switch: bool, record: bool) -> ((LogicalTime, LogicalTime), Option<u64>) {
+async fn legacy_callback_expired_deadline_trial_recording(
+    annotated: bool,
+    owner_switch: bool,
+    record: bool,
+) -> ((LogicalTime, LogicalTime), Option<u64>) {
+    legacy_callback_expired_deadline_trial_recording_at(
+        crate::preemptions::callback_history::Site::Prehook,
+        annotated,
+        owner_switch,
+        false,
+        record,
+    )
+    .await
+}
+
+// As above, with the recorded checkpoint at `site` of the timer callback, and
+// the replay run with `--chaos` when `chaos`.
+async fn legacy_callback_expired_deadline_trial_at(
+    site: crate::preemptions::callback_history::Site,
+    annotated: bool,
+    owner_switch: bool,
+    chaos: bool,
+) -> (LogicalTime, LogicalTime) {
+    legacy_callback_expired_deadline_trial_recording_at(site, annotated, owner_switch, chaos, false)
+        .await
+        .0
+}
+
+async fn legacy_callback_expired_deadline_trial_recording_at(
+    site: crate::preemptions::callback_history::Site,
+    annotated: bool,
+    owner_switch: bool,
+    chaos: bool,
+    record: bool,
+) -> ((LogicalTime, LogicalTime), Option<u64>) {
     use reverie::Tool;
-    use crate::preemptions::callback_history::{Origin, Site, Startup};
+    use crate::preemptions::callback_history::{Origin, Startup};
     use crate::slice_boundary::callbacks::Callback;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("expired-deadline.json");
@@ -895,6 +941,7 @@ async fn legacy_callback_expired_deadline_trial_recording(annotated: bool, owner
     let peer = DetTid::from_raw(18);
     let mut config = Config {
         sequentialize_threads: true,
+        chaos,
         replay_schedule_from: Some(path.clone()),
         max_timeslice: std::num::NonZeroU64::new(5_000_000),
         target_timeslice: std::num::NonZeroU64::new(1_000_000),
@@ -922,7 +969,7 @@ async fn legacy_callback_expired_deadline_trial_recording(annotated: bool, owner
     writer.insert_schedevent(SchedEvent { dettid: tid, op: Op::OtherInstructions, count: 1, start_rip: None, end_rip: None, end_time: None, stopless: false, instruction_offset: None });
     writer.insert_schedevent(SchedEvent::syscall(tid, Sysno::close, detcore_model::schedule::SyscallPhase::Prehook));
     writer.insert_reprioritization(tid, at, 11, DEFAULT_PRIORITY, DEFAULT_PRIORITY, None);
-    if annotated { writer.insert_callback_checkpoint(tid, Origin { callback: Callback::PmuTimer, site: Site::Prehook, progress: 11, last_op: Some(Op::Branch), time: at, rcbs: 11 }); }
+    if annotated { writer.insert_callback_checkpoint(tid, Origin { callback: Callback::PmuTimer, site, progress: 11, last_op: Some(Op::Branch), time: at, rcbs: 11 }); }
     std::fs::write(&path, writer.into_string()).unwrap();
     let (config, state, tid, process) = cancellation_test_state_with_config(config);
     install_test_registration(&state, tid, Ivar::new());
@@ -1405,4 +1452,46 @@ async fn a_schedule_replay_arms_a_recorded_instruction_offset() {
     })
     .await
     .expect("bounded schedule replay of an instruction offset");
+}
+
+// The record ended the timer's slice at its post-hook, within one RCB of the
+// PMU maximum, while the replay reaches the replayed branch deadline already
+// at the pre-hook. The slice ends once, at the checkpoint, as in the record:
+// before, the pre-hook ended it too, one commit more than recorded.
+#[tokio::test]
+async fn legacy_callback_checkpoint_at_the_pmu_epsilon_ends_an_expired_deadline_once() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let baseline = legacy_callback_expired_deadline_trial(false, false).await;
+        let at_epsilon = legacy_callback_expired_deadline_trial_at(
+            crate::preemptions::callback_history::Site::PosthookPmuEpsilon,
+            true,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(at_epsilon, baseline);
+    })
+    .await
+    .expect("bounded expired Continue(None) callback with a PMU-epsilon checkpoint");
+}
+
+// Under `--chaos` the same replay ends the slice as it does without: no random
+// priority change point at the expired deadline (the trial counts it as a
+// skipped turn) and no drawn slice end after it (the trial checks the next
+// slice end is the backstop), so the commits and the clocks agree.
+#[tokio::test]
+async fn legacy_chaos_replay_ends_an_expired_deadline_as_without_chaos() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let baseline = legacy_callback_expired_deadline_trial(false, false).await;
+        let chaos = legacy_callback_expired_deadline_trial_at(
+            crate::preemptions::callback_history::Site::Prehook,
+            false,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(chaos, baseline);
+    })
+    .await
+    .expect("bounded expired Continue(None) callback under --chaos");
 }
