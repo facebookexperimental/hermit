@@ -9954,7 +9954,7 @@ impl<T> ThreadState<T> {
                     self.end_of_timeslice = Some(LogicalTime::MAX);
                     result = Some(thi.final_priority())
                 }
-            } else if !cfg.chaos {
+            } else if !cfg.chaos_draws_schedule() {
                 if self.follows_replayed_schedule(cfg) {
                     if cfg.no_rcb_time {
                         let length = self
@@ -12414,6 +12414,32 @@ mod timeslice_tests {
             longest > 2_000,
             "slices are drawn around the post-crash bound"
         );
+    }
+
+    /// A schedule replay under `--chaos` draws no slice end: the slice runs to
+    /// the backstop, `--max-timeslice` from now, unless the replayed schedule
+    /// ends it first, exactly as without `--chaos`, and the thread's chaos
+    /// generator is left as it was.
+    #[test]
+    fn chaos_schedule_replay_draws_no_slice_end() {
+        let replay = |chaos| Config {
+            chaos,
+            max_timeslice: nz(100_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let mut plain = ThreadState::new(DetPid::from_raw(1), &replay(false), ());
+        let mut chaos = ThreadState::new(DetPid::from_raw(1), &replay(true), ());
+        let generator = chaos.chaos_prng.clone();
+
+        assert_eq!(plain.next_timeslice(&replay(false)), None);
+        assert_eq!(chaos.next_timeslice(&replay(true)), None);
+
+        let backstop = chaos.thread_logical_time.as_nanos() + Duration::from_nanos(100_000);
+        assert_eq!(chaos.end_of_timeslice, Some(backstop));
+        assert_eq!(chaos.end_of_timeslice, plain.end_of_timeslice);
+        assert_eq!(chaos.max_timeslice_end, plain.max_timeslice_end);
+        assert_eq!(chaos.chaos_prng, generator);
     }
 
     #[test]

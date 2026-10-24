@@ -2230,7 +2230,8 @@ enum SchedYieldRoute {
 ///   that did not yield has had a turn. It changes no
 ///   priority, draws nothing from the chaos PRNG and consumes no recorded
 ///   preemption point, so a preemption replay under `--chaos` makes the same
-///   decision. A schedule replay keeps the weak yield it always had, and so
+///   decision. A schedule replay keeps the weak yield it always had, with or
+///   without `--chaos` (`Config::chaos_draws_schedule`), and so
 ///   does a backend that does not deliver the preemption timer
 ///   (`BackendCapabilities::delivers_preemption_timer_events`): there a thread handed the
 ///   turn that never makes a syscall would never give it back.
@@ -2242,7 +2243,7 @@ enum SchedYieldRoute {
 ///   over 32 seeds to fewer than the 7 of 8 classes the cell requires.
 ///   `StickyRandom` keeps its pick across turns, so it keeps the epoch.
 fn sched_yield_route(cfg: &Config) -> SchedYieldRoute {
-    if cfg.chaos && cfg.max_timeslice.is_none() {
+    if cfg.chaos_draws_schedule() && cfg.max_timeslice.is_none() {
         SchedYieldRoute::ChaosReprioritize
     } else if !cfg.chaos && cfg.replay_preemptions_from.is_some() {
         SchedYieldRoute::ReplayStrongYield
@@ -8057,6 +8058,16 @@ mod tests {
             (
                 Config {
                     chaos: true,
+                    replay_schedule_from: path(),
+                    ..Config::default()
+                },
+                SchedYieldRoute::WeakYield,
+            ),
+            // A schedule replay draws no priority, even with the timer off.
+            (
+                Config {
+                    chaos: true,
+                    max_timeslice: None,
                     replay_schedule_from: path(),
                     ..Config::default()
                 },

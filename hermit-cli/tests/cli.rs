@@ -348,6 +348,7 @@ static REPLAY_DESYNC_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static BRANCH_FREE_RACE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
 static BRANCH_FREE_RACE_FIXED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CHAOS_REPLAY_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3737,6 +3738,32 @@ fn replay_desync_spinner_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "replay-desync-spinner guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn chaos_replay_new_thread_guest() -> &'static Path {
+    CHAOS_REPLAY_NEW_THREAD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("chaos-replay-new-thread");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the chaos-replay-new-thread guest directory");
+        let guest = build_root.join("chaos_replay_new_thread");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/chaos_replay_new_thread.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the chaos-replay-new-thread guest");
+        assert!(
+            output.status.success(),
+            "chaos-replay-new-thread guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -28158,6 +28185,85 @@ fn a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay() {
     assert!(
         marked(&schedule_record),
         "a schedule replay of a marked record drops the mark"
+    );
+}
+
+/// Records tests/c/chaos_replay_new_thread.c (with `guest_args`) under
+/// `--chaos` and 100 us slices at each seed, replays each record with
+/// `--replay-schedule-from` and the recorded run's guest seeds
+/// (`--rng-seed`, `--fuzz-seed`, as `hermit analyze` replays), with `--chaos`
+/// when `replay_chaos`, and returns each seed whose replay printed another
+/// line or exited with another status than its recording, with both outcomes.
+/// The scheduler seed stays at its default; with these options a replay
+/// draws nothing from it. The
+/// guest prints virtual times, so a replay that adds a scheduler turn the
+/// record does not have changes the line even where the winner stays.
+fn chaos_schedule_replay_divergences(
+    guest_args: &[&str],
+    replay_chaos: bool,
+    seeds: &[u64],
+) -> Vec<(u64, String, String)> {
+    let _guard = hermit_run_guard();
+    let guest = chaos_replay_new_thread_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let common = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--max-timeslice=100000",
+    ];
+    let outcome = |output: &Output| format!("{:?} {:?}", output.status.code(), stdout(output));
+    let mut divergences = Vec::new();
+    for seed in seeds {
+        let schedule = directory.path().join(format!("seed{seed}.json"));
+        let record_to = format!("--record-preemptions-to={}", schedule.display());
+        let seed_arg = format!("--seed={seed}");
+        let mut record_args: Vec<&str> = common.to_vec();
+        record_args.extend(["--chaos", &seed_arg, &record_to, "--"]);
+        record_args.push(guest);
+        record_args.extend(guest_args);
+        let record = hermit(&record_args);
+        assert!(
+            matches!(record.status.code(), Some(0 | 1)),
+            "{record_args:?}: {}",
+            stderr(&record)
+        );
+
+        let replay_from = format!("--replay-schedule-from={}", schedule.display());
+        let rng_seed = format!("--rng-seed={seed}");
+        let fuzz_seed = format!("--fuzz-seed={seed}");
+        let mut replay_args: Vec<&str> = common.to_vec();
+        if replay_chaos {
+            replay_args.push("--chaos");
+        }
+        replay_args.extend([&rng_seed, &fuzz_seed, &replay_from, "--"]);
+        replay_args.push(guest);
+        replay_args.extend(guest_args);
+        let replay = hermit(&replay_args);
+        if outcome(&replay) != outcome(&record) {
+            divergences.push((*seed, outcome(&record), outcome(&replay)));
+        }
+    }
+    divergences
+}
+
+/// A schedule replay under `--chaos` follows its recording. The schedule
+/// decides where a replayed slice ends and which thread runs next; chaos
+/// used to draw slice ends and priorities as well, so the replay ended
+/// slices the record does not have, and each extra scheduler turn moved the
+/// virtual clock. Before, 9 of the first 10 seeds' replays printed other
+/// times than their recordings, while the same replays without `--chaos`
+/// followed them; `hermit analyze` makes such replays, so it refused its
+/// endpoints.
+#[test]
+fn a_schedule_replay_under_chaos_follows_its_recording() {
+    let divergences = chaos_schedule_replay_divergences(&[], true, &[1, 2, 3]);
+    assert!(
+        divergences.is_empty(),
+        "(seed, record, replay): {divergences:?}"
     );
 }
 

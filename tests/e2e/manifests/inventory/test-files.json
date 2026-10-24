@@ -164,6 +164,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/chaos_replay_new_thread.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/chaos_replay_new_thread.c is owned by hermit-cli/tests/cli.rs: a_schedule_replay_under_chaos_follows_its_recording records it under --chaos with 100 us slices at several seeds and replays each record with --chaos --replay-schedule-from, comparing exit status and the guest's printed virtual times; a schedule replay must make no chaos decision of its own. It needs two hermit runs per seed and a comparison between them, so it remains a guest fixture rather than a manifest cell."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/chaos_spinner_and_new_thread.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/chaos_spinner_and_new_thread.c is owned by hermit-cli/tests/cli.rs: chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting (ptrace) and run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting (KVM) run it under --chaos --sched-seed=7 with 1 ms slices, where a new low-priority thread waits behind a main thread busy-waiting on getpid; the chaos starvation bound must let it run within two slices (https://github.com/rrnewton/hermit/issues/4374). Each run requires run --strict --verify --verify-strict at bitwise parity and parses the guest's own virtual wait, so it remains a guest fixture rather than a manifest cell."

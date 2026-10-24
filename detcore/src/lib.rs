@@ -3844,7 +3844,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         check_in: CheckIn,
         checkin: Option<PriorityCheckin<'_>>,
     ) {
-        let chaos = guest.config().chaos;
+        let chaos = guest.config().chaos_draws_schedule();
         loop {
             let thread_state = guest.thread_state();
             let dettid = thread_state.dettid;

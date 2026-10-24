@@ -2870,9 +2870,10 @@ pub struct Scheduler {
     /// meaningful in chaos mode) the scheduler biases its nondeterminism points
     /// toward known race patterns rather than exploring uniformly.
     chaos_target_races: bool,
-    /// A cached copy of the same (immutable) field in Config. Under chaos a
+    /// A cached copy of `Config::chaos_draws_schedule`: whether chaos, rather
+    /// than a replayed schedule, makes the scheduling decisions. Then a
     /// `sched_yield` opens or joins a yield epoch ([`Self::requeue_after`]).
-    chaos: bool,
+    chaos_draws_schedule: bool,
     /// Whether chaos change points are bounded
     /// ([`Self::bound_chaos_starvation`]): under `--chaos` with timer
     /// preemption and the default heuristic, and not replaying preemptions.
@@ -6368,7 +6369,7 @@ impl Scheduler {
             transferred_exec_syscall_histograms: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
-            chaos: cfg.chaos,
+            chaos_draws_schedule: cfg.chaos_draws_schedule(),
             chaos_bounds_starvation: cfg.chaos
                 && cfg.max_timeslice.is_some()
                 && cfg.sched_heuristic == crate::config::SchedHeuristic::None
@@ -22167,7 +22168,7 @@ impl Scheduler {
     fn requeue_after(&self, rsrcs: &Resources) -> Requeue {
         if !rsrcs.resources.contains_key(&ResourceID::SchedYield) {
             Requeue::Back
-        } else if self.chaos && !self.is_loopback_poll_yield_turn(rsrcs) {
+        } else if self.chaos_draws_schedule && !self.is_loopback_poll_yield_turn(rsrcs) {
             Requeue::YieldEpoch
         } else {
             Requeue::OneTurnYield
@@ -40915,6 +40916,17 @@ mod test {
             assert_eq!(scheduler.requeue_after(&loopback), Requeue::OneTurnYield);
             assert_eq!(scheduler.requeue_after(&other), Requeue::Back);
         }
+        // A schedule replay decides who runs next, with or without `--chaos`
+        // (`Config::chaos_draws_schedule`).
+        let directory = tempfile::tempdir().unwrap();
+        let schedule = directory.path().join("schedule.json");
+        std::fs::write(&schedule, r#"{"per_thread": {}, "global": []}"#).unwrap();
+        let replay = Scheduler::new(&Config {
+            chaos: true,
+            replay_schedule_from: Some(schedule),
+            ..Config::default()
+        });
+        assert_eq!(replay.requeue_after(&sched_yield), Requeue::OneTurnYield);
     }
 
     /// Through `step6_reenquue`, two chaos `sched_yield` callers cannot take

@@ -2264,6 +2264,28 @@ impl Config {
         self.chaos && self.chaos_instruction_offset > 0
     }
 
+    /// Whether chaos mode makes this run's scheduling decisions: `--chaos`,
+    /// unless the run replays a recorded schedule (`--replay-schedule-from`).
+    ///
+    /// Chaos draws a thread's timeslice ends and its new priority at each of
+    /// them, and lets a `sched_yield` loop open a yield epoch. A schedule
+    /// replay takes those decisions from its record instead: it ends a slice
+    /// where the record does and runs the thread the record ran. A chaos draw
+    /// there would end a slice the record does not have, and the extra
+    /// scheduler turn moves the virtual clock the guest reads, so a replay
+    /// with `--chaos` makes exactly the decisions a replay without it makes.
+    /// That holds past the end of the schedule too: the rest of the run is
+    /// scheduled as a run without `--chaos`, as a replay without it is.
+    ///
+    /// What chaos does to virtual time itself (`--chaos-per-thread-slowdown`)
+    /// is not a scheduling decision and stays on. A replay computes those
+    /// factors from its own scheduler seed and slowdown options, so it
+    /// reproduces the recorded run's virtual time only when it is given the
+    /// same ones.
+    pub fn chaos_draws_schedule(&self) -> bool {
+        self.chaos && self.replay_schedule_from.is_none()
+    }
+
     /// Whether a `FUTEX_WAKE` that woke `woken` waiters makes the waker yield
     /// to them (`--futex-wake-yields`).
     ///
