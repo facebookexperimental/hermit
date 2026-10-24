@@ -53,10 +53,12 @@ pub struct AnalyzeOpts {
     #[clap(long, value_name = "REGEX")]
     pub target_stderr: Option<Regex>,
 
-    /// Target: Analyze runs that have the specified exit code.  Accepts "nonzero" for all nonzero
-    /// exit codes.  Accepts "none" or "any" for no filter at all (accepts any exit code).  The
-    /// default is "nonzero" because it's very common to analyze a bug that causes the program to
-    /// crash or error.
+    /// Target: Analyze runs that have the specified exit code, 0 to 255, as a shell reports it:
+    /// the guest's own, or 128 plus the signal number when a signal killed it (134 for SIGABRT,
+    /// which also matches a guest that exits 134).  Accepts "nonzero" for all nonzero exit codes.
+    /// Accepts "none" or "any" for no filter at all (accepts any exit code).  The default is
+    /// "nonzero" because it's very common to analyze a bug that causes the program to crash or
+    /// error.
     #[clap(long, default_value = "nonzero", value_name = "NUM|nonzero|any")]
     pub target_exit_code: ExitStatusConstraint,
 
@@ -451,10 +453,22 @@ pub enum ExitStatusConstraint {
     Any,
 }
 
+/// The exit code a shell reports for a run that ended with `status`: the
+/// guest's own code, or 128 plus the signal number for a signal death. Not
+/// the raw wait status, which shifts an exit code left by eight bits.
+pub fn run_exit_code(status: ExitStatus) -> i32 {
+    match status {
+        ExitStatus::Exited(code) => code,
+        ExitStatus::Signaled(signal, _) => detcore_model::signal_exit_status(signal as i32),
+        ExitStatus::SignaledRaw(signal, _) => detcore_model::signal_exit_status(signal),
+    }
+}
+
 impl ExitStatusConstraint {
-    /// Is the constraint met for a given exit code?
+    /// Is the constraint met for a run that ended with `exit_status`
+    /// ([`run_exit_code`])?
     pub fn is_match(&self, exit_status: ExitStatus) -> bool {
-        let exit_code = exit_status.into_raw();
+        let exit_code = run_exit_code(exit_status);
         match self {
             ExitStatusConstraint::Exact(code) => exit_code == *code,
             ExitStatusConstraint::NonZero => exit_code != 0,
@@ -468,6 +482,12 @@ impl FromStr for ExitStatusConstraint {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Ok(n) = s.parse::<i32>() {
+            if !(0..=255).contains(&n) {
+                return Err(format!(
+                    "Exit code constraint {n} is out of range: an exit code is 0 to 255 (128 plus \
+                     the signal number for a signal death)"
+                ));
+            }
             Ok(ExitStatusConstraint::Exact(n))
         } else {
             match s.to_lowercase().as_str() {

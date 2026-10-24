@@ -2716,7 +2716,7 @@ impl AnalyzeOpts {
         if !self.target_exit_code.is_match(out.status) {
             misses.push(format!(
                 "  Exit code {} is not what we're looking for.",
-                out.status.into_raw()
+                crate::analyze::types::run_exit_code(out.status)
             ));
         }
         misses
@@ -5123,6 +5123,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `--target-exit-code` compares the code `hermit run` exits with: the
+    /// guest's own, or 128 plus the signal number. Before, it compared the
+    /// raw wait status, so `--target-exit-code=121` never matched a run that
+    /// exited 121 (raw 30976), and 134 matched SIGABRT only with a core dump.
+    #[test]
+    fn a_target_exit_code_is_the_one_hermit_run_exits_with() {
+        use nix::sys::signal::Signal;
+        let exact = |code: &str| code.parse::<ExitStatusConstraint>().unwrap();
+        assert!(exact("121").is_match(ExitStatus::Exited(121)));
+        assert!(!exact("121").is_match(ExitStatus::Exited(0)));
+        assert!(exact("0").is_match(ExitStatus::Exited(0)));
+        for coredump in [false, true] {
+            let abort = ExitStatus::Signaled(Signal::SIGABRT, coredump);
+            assert!(exact("134").is_match(abort), "core dump {coredump}");
+            assert!(!exact("6").is_match(abort), "core dump {coredump}");
+            assert!(exact("nonzero").is_match(abort));
+        }
+        assert!(exact("nonzero").is_match(ExitStatus::Exited(121)));
+        assert!(!exact("nonzero").is_match(ExitStatus::Exited(0)));
+        // A realtime signal, which nix's Signal cannot name: 128 + 40.
+        assert!(exact("168").is_match(ExitStatus::SignaledRaw(40, false)));
+        for out_of_range in ["256", "-1", "30976"] {
+            assert!(
+                out_of_range.parse::<ExitStatusConstraint>().is_err(),
+                "{out_of_range} is not an exit code"
+            );
+        }
+        // The line naming a missed exit code prints the code, not the raw
+        // status (30976 for an exit of 121).
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--target-exit-code=3", "--", "/bin/true"])
+                .unwrap();
+        let missed = options.criteria_misses(&Output {
+            status: ExitStatus::Exited(121),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+        assert_eq!(missed, ["  Exit code 121 is not what we're looking for."]);
     }
 
     /// A report written before the deciding event was reported still reads.

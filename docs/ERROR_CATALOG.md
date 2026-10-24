@@ -34,7 +34,7 @@ deterministic I/O, RCB time, and serialized scheduling. Options beginning with
 | `--sched-sticky-random-param must be between 0 and 1 inclusive` | Configuration | The sticky scheduler probability was outside its valid range. | Pass a value from `0` through `1`. |
 | `Cannot set both --replay-preemptions-from and --replay-schedule-from` | Configuration | Two mutually exclusive replay sources were supplied. | Keep exactly one replay option. |
 | `unable to parse <thread_id>:<logical_time> from '...'` | Configuration | A thread/time option did not contain two valid integers separated by `:`. | Use `THREAD_ID:LOGICAL_TIME`, with both fields expressed as unsigned decimal integers. |
-| `Unable to parse string as exit code constraint` | Configuration | Analyze received an invalid `--target-exit-code`. | Use a signed integer, `nonzero`, `none`, or `any`. |
+| `Unable to parse string as exit code constraint` or `Exit code constraint ... is out of range` | Configuration | Analyze or bisect received an invalid `--target-exit-code`. | Use an exit code from 0 to 255 (128 plus the signal number for a signal death), `nonzero`, `none`, or `any`. |
 | `Program ... does not exist or is not accessible` | Configuration | The executable path is absent in the guest view, including the isolated `/tmp`. | Correct the path/mount. For a host `/tmp` binary, use `--bind=SOURCE:TARGET` or, diagnostically, `--tmp=/tmp`. |
 | `Program ... is a directory` | Configuration | `PROGRAM` resolved to a directory. | Select the executable file. |
 | `Program ... is not a regular executable file` | Configuration | `PROGRAM` is a device, socket, FIFO, or other non-regular file. | Use a regular executable or a supported interpreter invocation. |

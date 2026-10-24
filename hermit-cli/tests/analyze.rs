@@ -1209,3 +1209,39 @@ fn analyze_stops_a_run_whose_init_has_not_armed() {
         },
     );
 }
+/// `--target-exit-code` names the exit code as a shell reports it: the
+/// guest's own (121 here; with the guest-deadlock outcome, also the code of
+/// a run Hermit ends as a deadlock), or 128 plus the signal number when a
+/// signal killed the guest (143 for SIGTERM, which dumps no core). Before,
+/// analyze compared the raw wait status, so neither matched and analyze
+/// said the target run missed the target.
+#[test]
+#[ignore = "slow: runs hermit analyze; requires PMU branch counters and working mount namespaces"]
+fn analyze_targets_the_exit_code_hermit_run_reports() {
+    for (code, script) in [
+        ("121", "echo TARGET; exit 121"),
+        ("143", "echo TARGET; kill -TERM $$"),
+    ] {
+        let label = format!("analyze --target-exit-code={code} /bin/sh -c {script:?}");
+        let _guard = analyze_lock();
+        let workspace = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create a workspace");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .args([
+                "analyze",
+                "--prefix-search",
+                "--target-stdout=TARGET",
+                "--run1-seed=1",
+            ])
+            .arg(format!("--target-exit-code={code}"))
+            .arg(format!("--tmp-dir={}", workspace.path().display()))
+            .args(["--", "--", "/bin/sh", "-c", script]);
+        let output = hermit_test::hermit_output(&label, &mut command);
+        let combined = combined_output(&output);
+        assert!(
+            combined.contains("First run matched target criteria"),
+            "{label}: the target run did not match\n{combined}"
+        );
+    }
+}
