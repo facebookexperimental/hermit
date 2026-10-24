@@ -98,7 +98,9 @@ pub struct AnalyzeOpts {
     ///
     /// Unlike the default search, it needs no baseline schedule, so events that only one of
     /// two unrelated runs executed (timeslices that end at other points, iterations of a
-    /// polling loop) cannot stop it. It takes about log2(schedule length) trials.
+    /// polling loop) cannot stop it. It takes about log2(schedule length) trials, two more for
+    /// each continuation (`--continuation-timeslice`) it tries, and two to recheck the
+    /// boundary.
     #[clap(
         long,
         conflicts_with = "minimize",
@@ -108,6 +110,23 @@ pub struct AnalyzeOpts {
         conflicts_with = "run_needleman"
     )]
     pub prefix_search: bool,
+
+    /// The timeslice, in virtual nanoseconds, with which `--prefix-search` trials continue
+    /// without chaos after their replayed prefix: `auto` (the default) or a number.
+    ///
+    /// A race found only at a short timeslice often shows without chaos at that timeslice too:
+    /// the scheduler alone, replaying none of the target schedule, already meets the target,
+    /// and the search has nothing to bisect against. With `auto` the search continues at the
+    /// run's own `--max-timeslice`, and when that cannot serve (the scheduler alone meets the
+    /// target, or replaying the whole schedule misses it) at hermit's default 200 ms. This also
+    /// applies to the prefix search the default search falls back to. The report names the
+    /// timeslice the search used.
+    ///
+    /// The value is the trials' `--max-timeslice`, which also ends the replayed prefix's
+    /// slices that its schedule does not end, so it may not be shorter than the run's own, and
+    /// a run whose arguments disable PMU timeslices takes none.
+    #[clap(long, value_name = "NANOS|auto", default_value = "auto")]
+    pub continuation_timeslice: ContinuationTimeslice,
 
     /// Use `--imprecise-timers` during the (chaos) search phase. Only has an effect if search is
     /// enabled.
@@ -291,6 +310,35 @@ pub struct AnalyzeOpts {
     /// (`crate::app::time_skip_carry`). Shared by every copy of these options.
     #[clap(skip)]
     pub time_skip_sources: crate::app::time_skip_carry::SharedTimeSkipSources,
+}
+
+/// `--continuation-timeslice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationTimeslice {
+    /// Short first, then coarser where the short one cannot serve.
+    Auto,
+    /// This many virtual nanoseconds.
+    Nanos(NonZeroU64),
+}
+
+impl FromStr for ContinuationTimeslice {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "auto" {
+            return Ok(ContinuationTimeslice::Auto);
+        }
+        match s.parse::<NonZeroU64>() {
+            Ok(nanos) if nanos.get() >= detcore_model::time::NANOS_PER_RCB as u64 => {
+                Ok(ContinuationTimeslice::Nanos(nanos))
+            }
+            _ => Err(format!(
+                "expected `auto` or a timeslice of at least one RCB ({} virtual nanoseconds), \
+                 got {s:?}",
+                detcore_model::time::NANOS_PER_RCB
+            )),
+        }
+    }
 }
 
 /// `--trial-timeout`.

@@ -10,6 +10,7 @@
 
 use std::cmp;
 use std::fs::File;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -20,6 +21,7 @@ use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::types::SchedEvent;
 use detcore::util::truncated;
+use detcore_model::config::MaybeTimeslice;
 use hermit::Error;
 use rand::RngExt as _;
 use rand::SeedableRng;
@@ -30,7 +32,9 @@ use reverie::process::Output;
 
 use crate::app::analyze::consts::*;
 use crate::app::analyze::rundata::RunData;
+use crate::app::analyze::rundata::TrialEnd;
 use crate::app::analyze::types::AnalyzeOpts;
+use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
@@ -111,11 +115,13 @@ fn stack_pair_sentences(
 }
 
 /// The result of `--prefix-search`: replaying the first `decision` events of
-/// `schedule` and then scheduling without chaos misses the target, while
-/// replaying event `decision` too meets it.
+/// `schedule` and then scheduling without chaos, with timeslices of
+/// `continuation`, misses the target, while replaying event `decision` too
+/// meets it.
 pub struct PrefixDecision {
     pub schedule: PreemptionRecord,
     pub decision: usize,
+    pub continuation: MaybeTimeslice,
 }
 
 /// The outcome and recorded schedule of a trial that completed.
@@ -148,27 +154,149 @@ fn incomplete_trial(error: Error, root: &Path) -> Error {
     ))
 }
 
-/// The binary search of `--prefix-search` over a schedule of `len` events:
-/// returns `k` such that the prefix of `k` events misses the target and the
-/// prefix of `k + 1` meets it, after checking that the empty prefix misses and
-/// the whole schedule meets it. Uses about log2(len) + 2 trials.
+/// The coarsest timeslice `--continuation-timeslice=auto` tries, in virtual
+/// nanoseconds: `hermit run`'s default `--max-timeslice` (200 ms).
+pub const COARSEST_CONTINUATION_TIMESLICE: NonZeroU64 = NonZeroU64::new(200_000_000).unwrap();
+
+/// The continuation timeslices `--continuation-timeslice=auto` tries, in
+/// order, for a run whose own maximum is `run`: that, then
+/// [`COARSEST_CONTINUATION_TIMESLICE`] if it is coarser. Never a shorter one:
+/// a trial's `--max-timeslice` also ends the replayed prefix's slices that
+/// its schedule does not end, so a shorter one would change the prefix. A run
+/// without PMU timeslices (`None`) continues as it is.
+fn continuation_candidates(run: MaybeTimeslice) -> Vec<MaybeTimeslice> {
+    let Some(run) = run else {
+        return vec![None];
+    };
+    let mut candidates = vec![Some(run), Some(run.max(COARSEST_CONTINUATION_TIMESLICE))];
+    candidates.dedup();
+    candidates
+}
+
+/// What the endpoint trials of a prefix search showed for one continuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Continuation {
+    /// Replaying none of the schedule misses the target, and replaying all
+    /// of it meets it: a search can find the event in between that decides.
+    Usable,
+    /// The scheduler alone, replaying none of the schedule, meets the target.
+    MeetsTargetAlone,
+    /// Replaying the whole schedule finished and missed the target.
+    ReplayMisses,
+    /// Replaying the whole schedule did not finish (a bound or a refusal
+    /// stopped it).
+    ReplayUnfinished,
+}
+
+/// Check the two endpoint trials of a prefix search over `len` events.
+fn check_continuation(
+    len: usize,
+    mut trial: impl FnMut(usize) -> anyhow::Result<TrialEnd>,
+) -> anyhow::Result<Continuation> {
+    if trial(0)? == TrialEnd::Met {
+        return Ok(Continuation::MeetsTargetAlone);
+    }
+    Ok(match trial(len)? {
+        TrialEnd::Met => Continuation::Usable,
+        TrialEnd::Missed => Continuation::ReplayMisses,
+        TrialEnd::Unfinished(_) => Continuation::ReplayUnfinished,
+    })
+}
+
+/// Pick the first of `candidates` (continuation timeslices) whose endpoint
+/// trials allow a prefix search over `len` events, each candidate's trials
+/// run by `trial(prefix, timeslice)`. When none does, the error says what
+/// each one showed and what to do instead.
+fn choose_continuation(
+    candidates: &[MaybeTimeslice],
+    len: usize,
+    mut trial: impl FnMut(usize, MaybeTimeslice) -> anyhow::Result<TrialEnd>,
+) -> anyhow::Result<MaybeTimeslice> {
+    let mut outcomes = Vec::new();
+    for &timeslice in candidates {
+        match check_continuation(len, |prefix| trial(prefix, timeslice))? {
+            Continuation::Usable => return Ok(timeslice),
+            outcome => {
+                eprintln!(
+                    ":: Continuing without chaos {}, {}",
+                    describe_continuation(timeslice),
+                    describe_outcome(outcome)
+                );
+                outcomes.push((timeslice, outcome));
+            }
+        }
+    }
+    let alone: Vec<String> = outcomes
+        .iter()
+        .filter(|(_, outcome)| *outcome == Continuation::MeetsTargetAlone)
+        .map(|(timeslice, _)| describe_continuation(*timeslice))
+        .collect();
+    if alone.len() == outcomes.len() {
+        bail!(
+            "no event of the target schedule decides the outcome: without chaos, the scheduler \
+             alone already meets the target criteria {}. The outcome does not depend on a chaos \
+             decision, so debug that run directly: the reproducer of the first trial \
+             (prefix_round_001.repro in the workspace) runs it. To bisect against a run that \
+             misses the target instead, pass --continuation-timeslice with a timeslice at which \
+             the scheduler alone misses it, or use the default search with a passing \
+             --run2-seed.",
+            alone.join(" and ")
+        );
+    }
+    let remedy = if outcomes
+        .iter()
+        .any(|(_, outcome)| *outcome == Continuation::ReplayUnfinished)
+    {
+        "A replay that did not finish was ended by a bound (raise --trial-timeout) or refused \
+         by Hermit (its reason is in its log)."
+    } else {
+        "Schedule replay does not reproduce this run where replaying the whole target schedule \
+         misses the target; check that the target run replays (--selfcheck)."
+    };
+    bail!(
+        "no continuation allows a prefix search: {}. {remedy} The default search with a \
+         passing --run2-seed needs no continuation.",
+        outcomes
+            .iter()
+            .map(|(timeslice, outcome)| format!(
+                "{} {}",
+                describe_continuation(*timeslice),
+                describe_outcome(*outcome)
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+/// "at a 200000000 ns timeslice", or "without PMU timeslices".
+fn describe_continuation(timeslice: MaybeTimeslice) -> String {
+    match timeslice {
+        Some(nanos) => format!("at a {nanos} ns timeslice"),
+        None => "without PMU timeslices".to_owned(),
+    }
+}
+
+fn describe_outcome(outcome: Continuation) -> &'static str {
+    match outcome {
+        Continuation::Usable => "a prefix search can run",
+        Continuation::MeetsTargetAlone => {
+            "the scheduler alone, replaying none of the target schedule, meets the target"
+        }
+        Continuation::ReplayMisses => "replaying the whole target schedule misses the target",
+        Continuation::ReplayUnfinished => {
+            "replaying the whole target schedule did not finish (a bound or a refusal stopped it)"
+        }
+    }
+}
+
+/// The binary search of `--prefix-search` over a schedule of `len` events
+/// whose endpoints [`check_continuation`] found usable: returns `k` such that
+/// the prefix of `k` events misses the target and the prefix of `k + 1` meets
+/// it. Uses about log2(len) trials.
 fn search_prefix_boundary(
     len: usize,
     mut meets_target: impl FnMut(usize) -> anyhow::Result<bool>,
 ) -> anyhow::Result<usize> {
-    if meets_target(0)? {
-        bail!(
-            "the scheduler alone, replaying none of the target schedule and without chaos, \
-             already meets the target criteria, so no event of the target schedule decides the \
-             outcome"
-        );
-    }
-    if !meets_target(len)? {
-        bail!(
-            "replaying the whole target schedule did not meet the target criteria, so schedule \
-             replay does not reproduce this run and a prefix search cannot work"
-        );
-    }
     let (mut passing, mut failing) = (0, len);
     while failing - passing > 1 {
         let mid = passing + (failing - passing) / 2;
@@ -333,22 +461,24 @@ impl AnalyzeOpts {
     }
 
     /// One `--prefix-search` trial: replay the first `len` events of `target`,
-    /// then let the scheduler go on without chaos. The trial's record keeps
-    /// the callback checkpoints within the prefix
-    /// ([`PreemptionRecord::schedule_prefix`]), so its slices end where the
-    /// recording's did, all but the one running at the prefix's end: where
-    /// that slice ends decides what runs next, which is event `len`'s
-    /// decision. A trial that replayed it would already make that decision,
-    /// and the search would name the event before it, with the thread that
-    /// ran up to it on both sides of the pair.
+    /// then let the scheduler go on without chaos, with timeslices of
+    /// `continuation`. The trial's record keeps the callback checkpoints
+    /// within the prefix ([`PreemptionRecord::schedule_prefix`]), so its
+    /// slices end where the recording's did, all but the one running at the
+    /// prefix's end: where that slice ends decides what runs next, which is
+    /// event `len`'s decision. A trial that replayed it would already make
+    /// that decision, and the search would name the event before it, with
+    /// the thread that ran up to it on both sides of the pair.
     fn prefix_trial(
         &self,
         runname: &str,
         target: &PreemptionRecord,
         len: usize,
+        continuation: MaybeTimeslice,
     ) -> anyhow::Result<RunData> {
         let mut run = RunData::new_baseline(self, runname.to_string())?;
         run.runopts.det_opts.det_config.chaos = false;
+        run.runopts.det_opts.det_config.max_timeslice = continuation;
         let path = run.sched_path_in().to_path_buf();
         self.write_trial_record(target.schedule_prefix(len), &path)?;
         Ok(run.with_schedule_replay_from(path))
@@ -378,9 +508,13 @@ impl AnalyzeOpts {
         &self,
         target_record: &PreemptionRecord,
     ) -> anyhow::Result<PrefixDecision> {
-        self.phase5_prefix_search_with(target_record, |trial, len| {
-            let mut run =
-                self.prefix_trial(&format!("prefix_round_{trial:03}"), target_record, len)?;
+        self.phase5_prefix_search_with(target_record, |trial, len, continuation| {
+            let mut run = self.prefix_trial(
+                &format!("prefix_round_{trial:03}"),
+                target_record,
+                len,
+                continuation,
+            )?;
             self.launch_prefix_trial(&mut run, RunData::launch)
         })
     }
@@ -388,25 +522,40 @@ impl AnalyzeOpts {
     fn phase5_prefix_search_with(
         &self,
         target_record: &PreemptionRecord,
-        mut launch: impl FnMut(usize, usize) -> anyhow::Result<bool>,
+        mut launch: impl FnMut(usize, usize, MaybeTimeslice) -> anyhow::Result<bool>,
     ) -> anyhow::Result<PrefixDecision> {
         let target = target_record.schedevents();
         let mut trial = 0;
-        let mut meets_target = |len: usize| -> anyhow::Result<bool> {
-            trial += 1;
-            let is_match = launch(trial, len)?;
-            eprintln!(
-                ":: Prefix of {len} of {} events => {}",
-                target.len(),
-                if is_match {
-                    format!("target condition ({})", self.display_criteria())
+        let mut meets_target =
+            |len: usize, continuation: MaybeTimeslice| -> anyhow::Result<TrialEnd> {
+                trial += 1;
+                let is_match = launch(trial, len, continuation)?;
+                eprintln!(
+                    ":: Prefix of {len} of {} events => {}",
+                    target.len(),
+                    if is_match {
+                        format!("target condition ({})", self.display_criteria())
+                    } else {
+                        "baseline condition".to_string()
+                    }
+                );
+                Ok(if is_match {
+                    TrialEnd::Met
                 } else {
-                    "baseline condition".to_string()
-                }
-            );
-            Ok(is_match)
-        };
+                    TrialEnd::Missed
+                })
+            };
 
+        let candidates = match self.continuation_timeslice {
+            ContinuationTimeslice::Auto => continuation_candidates(self.trial_max_timeslice()),
+            ContinuationTimeslice::Nanos(nanos) => vec![Some(nanos)],
+        };
+        let continuation = choose_continuation(&candidates, target.len(), &mut meets_target)?;
+        eprintln!(
+            ":: Searching the prefixes continued without chaos {}",
+            describe_continuation(continuation)
+        );
+        let mut meets_target = |len| Ok(meets_target(len, continuation)? == TrialEnd::Met);
         let passing = search_prefix_boundary(target.len(), &mut meets_target)?;
         let failing = passing + 1;
         // On a host whose branch counter is not exact, two replays of one
@@ -426,6 +575,7 @@ impl AnalyzeOpts {
         Ok(PrefixDecision {
             schedule: target_record.clone(),
             decision: passing,
+            continuation,
         })
     }
 
@@ -439,8 +589,9 @@ impl AnalyzeOpts {
         schedule: &PreemptionRecord,
         len: usize,
         position: usize,
+        continuation: MaybeTimeslice,
     ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)> {
-        let mut run = self.prefix_trial(runname, schedule, len)?;
+        let mut run = self.prefix_trial(runname, schedule, len, continuation)?;
         let stack_path = run.root_path().with_extension("stack");
         run.runopts.det_opts.det_config.stacktrace_event =
             vec![(position as u64, Some(stack_path.clone()))];
@@ -465,10 +616,11 @@ impl AnalyzeOpts {
         &self,
         schedule: &PreemptionRecord,
         len: usize,
+        continuation: MaybeTimeslice,
         launch: impl FnOnce(&mut RunData) -> anyhow::Result<bool>,
     ) -> anyhow::Result<CompletedScheduleTrial> {
         let mut run = self
-            .prefix_trial("final_baseline_schedule", schedule, len)?
+            .prefix_trial("final_baseline_schedule", schedule, len, continuation)?
             .with_schedule_recording();
         let target_met = launch(&mut run)?;
         let path = run.sched_path_out().to_path_buf();
@@ -490,11 +642,14 @@ impl AnalyzeOpts {
     /// The report of `--prefix-search`: the stacks of the two threads that
     /// could run at the deciding event.
     pub fn phase6_record_prefix_outputs(&self, found: PrefixDecision) -> anyhow::Result<Report> {
+        let timeslice = found.continuation;
         self.phase6_record_prefix_outputs_with(
             found,
-            |runname, schedule, len, position| self.prefix_stack(runname, schedule, len, position),
+            |runname, schedule, len, position| {
+                self.prefix_stack(runname, schedule, len, position, timeslice)
+            },
             |schedule, len| {
-                self.prefix_continuation(schedule, len, |run| {
+                self.prefix_continuation(schedule, len, timeslice, |run| {
                     self.launch_prefix_trial(run, RunData::launch)
                 })
             },
@@ -512,7 +667,11 @@ impl AnalyzeOpts {
         ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
         continuation: impl FnOnce(&PreemptionRecord, usize) -> anyhow::Result<CompletedScheduleTrial>,
     ) -> anyhow::Result<Report> {
-        let PrefixDecision { schedule, decision } = found;
+        let PrefixDecision {
+            schedule,
+            decision,
+            continuation: timeslice,
+        } = found;
         let (target_met, chosen) = stack(
             "final_target_for_stacktraces",
             &schedule,
@@ -577,6 +736,7 @@ impl AnalyzeOpts {
             decision,
             &continued,
             [chosen, instead],
+            timeslice,
         );
         println!("{}", prefix_report_banner(&report));
         println!("{}", report.header);
@@ -593,11 +753,14 @@ impl AnalyzeOpts {
         decision: usize,
         continued: &[SchedEvent],
         [chosen, instead]: [Option<PrettyBacktrace>; 2],
+        continuation: MaybeTimeslice,
     ) -> Report {
         let mut header = format!(
             "The scheduling decision at event #{decision} of the target schedule decides the \
              outcome.\nReplaying the first {decision} events and then scheduling without chaos \
-             does not meet the target criteria; replaying event #{decision} too ({}) does ({}).\n",
+             {} does not meet the target criteria; replaying event #{decision} too ({}) does \
+             ({}).\n",
+            describe_continuation(continuation),
             schedule[decision],
             self.display_criteria()
         );
@@ -1297,6 +1460,7 @@ impl AnalyzeOpts {
         self.refuse_outputs_trials_overwrite()?;
         self.refuse_unqualified_trial_timeout()?;
         self.refuse_unenforceable_trial_timeout()?;
+        self.refuse_unsound_continuation_timeslice()?;
         self.install_trial_pmu_config()?;
         self.admit_branch_counter(&mut crate::app::tracing::write_stderr_diagnostic)?;
         if let Some(notice) =
@@ -2246,7 +2410,9 @@ mod tests {
         .unwrap();
         target.validate().unwrap();
         for (len, kept) in [(0, 0), (1, 0), (2, 1), (3, 3)] {
-            let mut run = options.prefix_trial("prefix_round", &target, len).unwrap();
+            let mut run = options
+                .prefix_trial("prefix_round", &target, len, None)
+                .unwrap();
             let written: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(run.sched_path_in()).unwrap())
                     .unwrap();
@@ -2394,8 +2560,7 @@ mod tests {
     }
 
     /// The prefix search finds the event at which the outcome flips, wherever
-    /// it lies, in about log2(len) + 2 trials, and refuses a schedule whose
-    /// endpoints do not differ.
+    /// it lies, in about log2(len) trials once its endpoints differ.
     #[test]
     fn the_prefix_search_finds_the_deciding_event() {
         for (len, decision) in [
@@ -2413,17 +2578,88 @@ mod tests {
             .unwrap();
             assert_eq!(found, decision, "len {len}");
             assert!(
-                trials <= 2 + (len as f64).log2().ceil() as usize,
+                trials <= (len as f64).log2().ceil() as usize,
                 "{trials} trials"
             );
         }
+    }
 
-        let always = search_prefix_boundary(10, |_| Ok(true)).unwrap_err();
-        assert!(always.to_string().contains("replaying none"), "{always}");
-        let never = search_prefix_boundary(10, |_| Ok(false)).unwrap_err();
+    /// `auto` continues at the run's own timeslice, then at hermit's default
+    /// 200 ms when that is coarser, never at a shorter one; a run without PMU
+    /// timeslices continues as it is.
+    #[test]
+    fn auto_continuations_only_get_coarser() {
+        let ns = |nanos: u64| NonZeroU64::new(nanos);
+        assert_eq!(continuation_candidates(ns(200_000_000)), [ns(200_000_000)]);
+        assert_eq!(
+            continuation_candidates(ns(1_000)),
+            [ns(1_000), ns(200_000_000)]
+        );
+        assert_eq!(continuation_candidates(ns(500_000_000)), [ns(500_000_000)]);
+        assert_eq!(continuation_candidates(None), [None]);
+    }
+
+    /// The search continues at the first timeslice whose endpoint trials
+    /// differ: one at which the scheduler alone meets the target, or the
+    /// whole schedule's replay misses it or does not finish, is skipped. When
+    /// every timeslice fails, the error names each, says what it showed, and
+    /// what to do.
+    #[test]
+    fn the_prefix_search_continues_at_the_first_usable_timeslice() {
+        let ns = |nanos: u64| NonZeroU64::new(nanos);
+        let candidates = [ns(1_000), ns(200_000_000)];
+        let end = |met: bool| if met { TrialEnd::Met } else { TrialEnd::Missed };
+        // At 1000 ns the scheduler alone already meets the target (a race
+        // found only at a short timeslice); at 200 ms it does not.
+        let mut trials = Vec::new();
+        let chosen = choose_continuation(&candidates, 50, |prefix, timeslice| {
+            trials.push((prefix, timeslice));
+            Ok(end(prefix > 0 || timeslice == ns(1_000)))
+        })
+        .unwrap();
+        assert_eq!(chosen, ns(200_000_000));
+        assert_eq!(
+            trials,
+            [(0, ns(1_000)), (0, ns(200_000_000)), (50, ns(200_000_000))]
+        );
+        assert_eq!(
+            choose_continuation(&candidates, 50, |prefix, _| Ok(end(prefix > 0))).unwrap(),
+            ns(1_000),
+            "the first usable one wins"
+        );
+
+        let alone = choose_continuation(&candidates, 50, |_, _| Ok(TrialEnd::Met)).unwrap_err();
+        let message = alone.to_string();
         assert!(
-            never.to_string().contains("whole target schedule"),
-            "{never}"
+            message.contains("the scheduler alone already meets the target criteria at a 1000 ns timeslice and at a 200000000 ns timeslice"),
+            "{message}"
+        );
+        assert!(
+            message.contains("prefix_round_001.repro") && message.contains("--run2-seed"),
+            "{message}"
+        );
+        let replay = choose_continuation(&candidates, 50, |_, _| Ok(TrialEnd::Missed)).unwrap_err();
+        assert!(
+            replay.to_string().contains(
+                "at a 1000 ns timeslice replaying the whole target schedule misses the target"
+            ),
+            "{replay}"
+        );
+        assert!(replay.to_string().contains("--selfcheck"), "{replay}");
+        let unfinished = choose_continuation(&candidates, 50, |prefix, _| {
+            Ok(if prefix == 0 {
+                TrialEnd::Missed
+            } else {
+                TrialEnd::Unfinished(Stop::Bound)
+            })
+        })
+        .unwrap_err();
+        assert!(
+            unfinished
+                .to_string()
+                .contains("did not finish (a bound or a refusal stopped it)")
+                && unfinished.to_string().contains("raise --trial-timeout"),
+            "{unfinished}"
         );
     }
 

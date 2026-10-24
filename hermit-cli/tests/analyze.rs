@@ -823,3 +823,65 @@ fn analyze_ends_with_a_refused_target_run() {
         "{diagnostics}"
     );
 }
+
+/// A race found only at a short timeslice: at the run's own 100 us, thread a
+/// is preempted before it claims even without chaos, so the scheduler alone
+/// meets the target and gives the prefix search nothing to bisect against.
+/// The search says so and continues at hermit's default 200 ms, where it
+/// does not. Before, the analysis ended there with exit 125.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_continues_prefixes_at_a_coarser_timeslice() {
+    let label = "analyze --prefix-search analyze_race_then late-a --max-timeslice=100000";
+    let (output, report) =
+        analyze_race_then_with("late-a", &["--prefix-search"], &["--max-timeslice=100000"]);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label}: {}\n{combined}",
+        output.status
+    );
+    assert!(
+        combined.contains(
+            "Continuing without chaos at a 100000 ns timeslice, the scheduler alone, replaying \
+             none of the target schedule, meets the target"
+        ),
+        "{label}\n{combined}"
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    assert!(
+        report["header"]
+            .as_str()
+            .unwrap()
+            .contains("scheduling without chaos at a 200000000 ns timeslice does not meet"),
+        "{label}: {report}"
+    );
+}
+
+/// The same race with `--continuation-timeslice=100000`: there is no other
+/// continuation to try, so analyze fails, saying that the outcome does not
+/// depend on a chaos decision and what to run or pass instead.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_explains_a_target_the_scheduler_meets_alone() {
+    let label = "analyze --prefix-search analyze_race_then late-a --continuation-timeslice=100000";
+    let (output, _) = analyze_race_then_with(
+        "late-a",
+        &["--prefix-search", "--continuation-timeslice=100000"],
+        &["--max-timeslice=100000"],
+    );
+    let combined = combined_output(&output);
+    assert!(!output.status.success(), "{label}\n{combined}");
+    for expected in [
+        "no event of the target schedule decides the outcome: without chaos, the scheduler alone \
+         already meets the target criteria at a 100000 ns timeslice",
+        "prefix_round_001.repro",
+        "pass --continuation-timeslice",
+        "--run2-seed",
+    ] {
+        assert!(
+            combined.contains(expected),
+            "{label}: no {expected:?}\n{combined}"
+        );
+    }
+}

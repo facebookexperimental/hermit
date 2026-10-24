@@ -114,6 +114,7 @@ impl BisectOpts {
             run_needleman: self.needleman,
             minimize: false,
             prefix_search: false,
+            continuation_timeslice: crate::analyze::ContinuationTimeslice::Auto,
             imprecise_search: false,
             run1_seed: None,
             run1_preemptions: None,

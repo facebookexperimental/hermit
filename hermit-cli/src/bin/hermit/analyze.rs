@@ -17,5 +17,6 @@ mod types;
 
 pub use memory::MemoryBudget;
 pub use types::AnalyzeOpts;
+pub use types::ContinuationTimeslice;
 pub use types::ExitStatusConstraint;
 pub use types::TrialTimeout;
