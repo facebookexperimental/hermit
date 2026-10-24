@@ -1026,7 +1026,9 @@ found only at a short timeslice often shows without chaos at that timeslice
 too, and then the search continues at 200 ms instead
 (`--continuation-timeslice`). The report shows the stack of the thread the
 failing schedule runs at that event and of the thread that runs there
-otherwise:
+otherwise. When both continuations run the same thread there, the decision is
+how long that thread runs: the report then shows its stack, and the stacks of
+the threads that run after it with and without the event:
 
 ```bash
 hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \

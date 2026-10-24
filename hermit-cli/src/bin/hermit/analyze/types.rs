@@ -469,6 +469,16 @@ pub struct Report {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_counter_warning: Option<String>,
+
+    /// `--prefix-search` only, when the deciding event is a timing decision
+    /// (both continuations run the same thread there, for different lengths):
+    /// that thread's stack at the deciding event. The two critical events are
+    /// then the threads that run next in each continuation, and their
+    /// `event_index` is a position in that continuation's recorded schedule
+    /// (the header names both files); where no other thread runs, it is that
+    /// schedule's length and the stack is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deciding_event: Option<ReportCriticalEvent>,
 }
 
 /// Runtime context for a critical event included in the analyze report.
