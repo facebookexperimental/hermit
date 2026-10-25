@@ -56188,90 +56188,101 @@ fn auto_resolves_v3_for_an_interpreter_declaring_it() {
     assert_auto_resolves_v3(&on_v3, "its program interpreter ");
 }
 
-/// A recording made with `--cpu-profile auto` holds the named profile auto
-/// resolved to, and replay runs that profile without deriving it again,
-/// under any profile its own environment names or none. A recording
-/// claiming auto itself is refused.
-#[test]
-fn auto_records_the_resolved_profile_and_replay_uses_it() {
-    for (name, bits) in [
-        ("auto-record-unmarked", None),
-        ("auto-record-v3", Some(0b111)),
-    ] {
-        let image = isa_fixture(name, bits, 0, IsaLink::Static);
-        let image = image.to_str().unwrap();
-        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-        let data = directory.path().join("recording");
-        let data_dir = format!("--data-dir={}", data.display());
-        let record = || {
-            let (status, stdout, stderr) = isa_run(&[
-                "record",
-                "start",
-                data_dir.as_str(),
-                "--cpu-profile",
-                "auto",
-                "--",
-                image,
-            ]);
-            (status, stdout, stderr, ())
-        };
-        let expected = if bits.is_some() {
-            if v3_run_or_refusal(record).is_none() {
-                continue;
-            }
-            "x86-64-v3"
-        } else {
-            let (status, stdout, stderr, ()) = record();
-            assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
-            "x86-64-v2"
-        };
-        let metadata_path = fs::read_dir(&data)
-            .expect("failed to read the recording directory")
-            .map(|entry| entry.unwrap().path().join("metadata.json"))
-            .find(|path| path.is_file())
-            .expect("no recording metadata.json");
-        let id = metadata_path
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .unwrap()
-            .to_owned();
-        let original = fs::read_to_string(&metadata_path).unwrap();
-        let metadata: serde_json::Value = serde_json::from_str(&original).unwrap();
-        assert_eq!(metadata["cpu_profile"], expected, "{metadata:#}");
-        // Replay runs the recorded profile whatever this invocation's
-        // environment names, and never derives one from the program again.
-        let replay_under = |ambient: Option<&str>| {
-            let mut command =
-                hermit_command(&["replay", data_dir.as_str(), "--autopilot", id.as_str()]);
-            match ambient {
-                Some(profile) => command.env("HERMIT_CPU_PROFILE", profile),
-                None => command.env_remove("HERMIT_CPU_PROFILE"),
-            };
-            let output = hermit_test::hermit_output("hermit replay", &mut command);
-            (
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            )
-        };
-        for ambient in [None, Some("auto"), Some("x86-64-v2"), Some("x86-64-v3")] {
-            let (status, stderr) = replay_under(ambient);
-            assert_eq!(
-                status,
-                Some(0),
-                "{name}: replay under {ambient:?}:\n{stderr}"
-            );
-            assert!(!stderr.contains("--cpu-profile auto"), "{stderr}");
+/// Records `bits`' fixture (`isa_needed.c`, exit 0) as `name` with
+/// `--cpu-profile auto`, and checks that the recording holds the named
+/// profile auto resolved to and that replay runs that profile without
+/// deriving it again, under any profile its own environment names or none.
+/// A recording claiming auto itself is refused. A v3 recording goes through
+/// `v3_run_or_refusal`: where the host does not qualify, the case ends at the
+/// qualification's named refusal.
+fn assert_auto_recording_replays_as(name: &str, bits: Option<u32>) {
+    let image = isa_fixture(name, bits, 0, IsaLink::Static);
+    let image = image.to_str().unwrap();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let data = directory.path().join("recording");
+    let data_dir = format!("--data-dir={}", data.display());
+    let record = || {
+        let (status, stdout, stderr) = isa_run(&[
+            "record",
+            "start",
+            data_dir.as_str(),
+            "--cpu-profile",
+            "auto",
+            "--",
+            image,
+        ]);
+        (status, stdout, stderr, ())
+    };
+    let expected = if bits.is_some() {
+        if v3_run_or_refusal(record).is_none() {
+            return;
         }
-        let replay = || replay_under(None);
-        let mut tampered = metadata.clone();
-        tampered["cpu_profile"] = serde_json::json!("auto");
-        fs::write(&metadata_path, serde_json::to_string(&tampered).unwrap()).unwrap();
-        let (status, stderr) = replay();
-        assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
-        assert!(stderr.contains("never auto itself"), "{stderr}");
-        fs::write(&metadata_path, original).unwrap();
+        "x86-64-v3"
+    } else {
+        let (status, stdout, stderr, ()) = record();
+        assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
+        "x86-64-v2"
+    };
+    let metadata_path = fs::read_dir(&data)
+        .expect("failed to read the recording directory")
+        .map(|entry| entry.unwrap().path().join("metadata.json"))
+        .find(|path| path.is_file())
+        .expect("no recording metadata.json");
+    let id = metadata_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap()
+        .to_owned();
+    let original = fs::read_to_string(&metadata_path).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&original).unwrap();
+    assert_eq!(metadata["cpu_profile"], expected, "{metadata:#}");
+    // Replay runs the recorded profile whatever this invocation's
+    // environment names, and never derives one from the program again.
+    let replay_under = |ambient: Option<&str>| {
+        let mut command =
+            hermit_command(&["replay", data_dir.as_str(), "--autopilot", id.as_str()]);
+        match ambient {
+            Some(profile) => command.env("HERMIT_CPU_PROFILE", profile),
+            None => command.env_remove("HERMIT_CPU_PROFILE"),
+        };
+        let output = hermit_test::hermit_output("hermit replay", &mut command);
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    for ambient in [None, Some("auto"), Some("x86-64-v2"), Some("x86-64-v3")] {
+        let (status, stderr) = replay_under(ambient);
+        assert_eq!(
+            status,
+            Some(0),
+            "{name}: replay under {ambient:?}:\n{stderr}"
+        );
+        assert!(!stderr.contains("--cpu-profile auto"), "{stderr}");
     }
+    let replay = || replay_under(None);
+    let mut tampered = metadata.clone();
+    tampered["cpu_profile"] = serde_json::json!("auto");
+    fs::write(&metadata_path, serde_json::to_string(&tampered).unwrap()).unwrap();
+    let (status, stderr) = replay();
+    assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
+    assert!(stderr.contains("never auto itself"), "{stderr}");
+    fs::write(&metadata_path, original).unwrap();
+}
+
+/// [`assert_auto_recording_replays_as`] for an unmarked image: the recording
+/// holds x86-64-v2.
+#[test]
+fn auto_records_v2_for_an_unmarked_image_and_replay_uses_it() {
+    assert_auto_recording_replays_as("auto-record-unmarked", None);
+}
+
+/// [`assert_auto_recording_replays_as`] for an image declaring x86-64-v3:
+/// the recording holds x86-64-v3.
+#[test]
+fn auto_records_v3_for_an_image_declaring_it_and_replay_uses_it() {
+    assert_auto_recording_replays_as("auto-record-v3", Some(0b111));
 }
 
 /// Launches `image` through the library under `profile` (`None`: the
