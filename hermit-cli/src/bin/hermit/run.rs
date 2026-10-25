@@ -2323,7 +2323,7 @@ pub struct RunOpts {
     e9patch_engagement: Option<BackendEngagement>,
 
     /// What `--cpu-profile auto` resolved to and why, for the diagnostic
-    /// line `--log=info` and finer show.
+    /// line `--log=debug` and finer show.
     #[clap(skip)]
     auto_resolution: Option<String>,
 
@@ -10695,10 +10695,12 @@ impl RunOpts {
     }
 
     /// Log what `--cpu-profile auto` resolved to, once tracing has started,
-    /// where the run's log goes (`--log=info` and finer).
+    /// where the run's log goes (`--log=debug` and finer). Not at info: a
+    /// rerun from the run's manifest names the resolved profile, resolves
+    /// nothing, and must log what the original logged at info.
     fn log_auto_resolution(&self) {
         if let Some(resolution) = &self.auto_resolution {
-            tracing::info!("{resolution}");
+            tracing::debug!("{resolution}");
         }
     }
 
@@ -16588,6 +16590,14 @@ impl RunOpts {
             run_inputs.insert(
                 manifest::MAX_TIMESLICE_KEY.to_owned(),
                 serde_json::Value::from("disabled"),
+            );
+        }
+        // What auto resolved to: a rerun from this manifest runs that
+        // profile, and never derives one again.
+        if self.auto_resolution.is_some() {
+            run_inputs.insert(
+                "cpu-profile".to_owned(),
+                serde_json::Value::from(self.det_opts.det_config.cpu_profile.name()),
             );
         }
         let id = hermit::Id::unique();

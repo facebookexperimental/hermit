@@ -833,6 +833,9 @@ fn boundary_callback_tokens_preserve_actual_accounting_and_nested_entries() {
                 sequentialize_threads: true,
                 record_preemptions: true,
                 strict_schedule_boundaries: true,
+                // No image is launched, so nothing resolves auto: name the
+                // profile whose CPUID table the tool builds.
+                cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V2,
                 ..Config::default()
             }
             .with_backend(|backend| backend.delivers_preemption_timer_events = false);

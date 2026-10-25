@@ -474,11 +474,17 @@ pub fn resolve_launch_auto(
         return Ok(());
     }
     let refuse = |why: String| CpuProfileRefusal::new(CpuProfile::Auto, why);
-    let program = command
-        .find_program()
-        .map_err(|error| refuse(format!("the program cannot be found: {error}")))?;
+    let Ok(program) = command.find_program() else {
+        // No program to read, so none for this launch to exec: its own
+        // error (or its backend's refusal) is the one to report, in its
+        // place. x86-64-v2 is named only so that nothing unresolved reaches
+        // the backend; should an exec succeed after all, Detcore's check of
+        // the executed objects still refuses one that needs more.
+        config.cpu_profile = CpuProfile::X86_64V2;
+        return Ok(());
+    };
     let (profile, why) = resolve_auto(&program, Path::to_path_buf).map_err(refuse)?;
-    tracing::info!("--cpu-profile auto resolved to {profile}: {why}");
+    tracing::debug!("--cpu-profile auto resolved to {profile}: {why}");
     config.cpu_profile = profile;
     Ok(())
 }
@@ -1493,10 +1499,11 @@ mod tests {
             unadmitted.reason.contains("did not qualify"),
             "{unadmitted}"
         );
-        assert_eq!(
-            refuse_unadmitted_launch(&detcore::Config::default(), false),
-            Ok(())
-        );
+        let v2 = detcore::Config {
+            cpu_profile: CpuProfile::X86_64V2,
+            ..Default::default()
+        };
+        assert_eq!(refuse_unadmitted_launch(&v2, false), Ok(()));
 
         let refused = admit_with(&request("kvm"), || {
             panic!("a refused request probed the host")

@@ -91,6 +91,11 @@ impl Replay {
 
         let mut config = record_or_replay_config(dir);
         config.replaying = true;
+        // The profile the recording ran, which `record` resolved before it
+        // started (absent in an old recording: x86-64-v2). Never the profile
+        // this invocation would choose, and never derived again from the
+        // program: a replay runs the CPU its recording saw.
+        config.cpu_profile = metadata.cpu_profile;
         // A v3 recording replays only on a host that qualifies with the same
         // host facts, under the same table
         // (https://github.com/rrnewton/hermit/issues/4243).
@@ -113,7 +118,6 @@ impl Replay {
                 ))
                 .into());
             }
-            config.cpu_profile = metadata.cpu_profile;
             config.cpu_profile_host = Some(recorded);
         }
         // Recorder events contain the raw bytes from the recording namespace.

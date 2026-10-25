@@ -1273,7 +1273,17 @@ mod tests {
     #[test]
     fn a_v3_configuration_without_host_facts_is_refused() {
         use crate::cpu_profile_admission_refusal as refusal;
-        assert_eq!(refusal(&crate::Config::default()), None);
+        let v2 = crate::Config {
+            cpu_profile: CpuProfile::X86_64V2,
+            ..Default::default()
+        };
+        assert_eq!(refusal(&v2), None);
+        // Nor does Detcore run an unresolved auto, the unset default.
+        let auto = crate::Config {
+            cpu_profile: CpuProfile::Auto,
+            ..Default::default()
+        };
+        assert!(refusal(&auto).unwrap().contains("auto was not resolved"));
         let mut v3 = crate::Config {
             cpu_profile: CpuProfile::X86_64V3,
             ..Default::default()

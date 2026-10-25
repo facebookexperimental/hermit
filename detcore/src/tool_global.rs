@@ -21791,6 +21791,9 @@ mod tests {
         let config = Config {
             sequentialize_threads: true,
             max_timeslice: None,
+            // No image is launched, so nothing resolves auto: post-exec runs
+            // under the named profile a launch would have resolved.
+            cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V2,
             ..Config::default()
         }
         .with_backend(|backend| {
@@ -21992,6 +21995,9 @@ mod tests {
         use reverie::Tool;
 
         let config = Config {
+            // No image is launched, so nothing resolves auto: post-exec runs
+            // under the named profile a launch would have resolved.
+            cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V2,
             sequentialize_threads: true,
             // This test enters one callback while the caller owns its turn;
             // no guest instructions or PMU timer are needed to drive it.

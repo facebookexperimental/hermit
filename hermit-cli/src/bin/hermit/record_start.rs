@@ -706,7 +706,7 @@ impl StartOpts {
                 move |(data, identity)| {
                     let _guard = global.init_tracing();
                     if let Some(resolution) = &options.auto_resolution {
-                        tracing::info!("{resolution}");
+                        tracing::debug!("{resolution}");
                     }
                     identity.record_plan()?;
                     let command = options.guest_command()?;

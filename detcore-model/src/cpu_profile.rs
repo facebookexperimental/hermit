@@ -190,8 +190,10 @@ pub const CPU_PROFILE_LONG_HELP: &str = concat!(
      executable and its program interpreter declare they need (GNU_PROPERTY_X86_ISA_1_NEEDED), \
      x86-64-v2 where nothing is declared, and refuses a program it cannot read rather than \
      guess; the chosen profile is what runs, is qualified like an explicit one, is logged at \
-     info level, and is what a recording holds. A later exec of an image needing more is \
-     refused, never upgraded. A named profile always means exactly itself. host-no-rdrand is available for `hermit run` on the ptrace backend with CPUID \
+     debug level, and is what a recording holds. A later exec of an image needing more is \
+     refused, never upgraded. auto reads no shared library: where only a library such as \
+     libc declares its need (as on distributions whose loader is unmarked), name the profile. \
+     A named profile always means exactly itself. host-no-rdrand is available for `hermit run` on the ptrace backend with CPUID \
      faulting and virtual time; it refuses hosts without CPUID faulting instead of \
      allowing native CPUID. RDRAND and RDSEED are hidden. Check availability with \
      `hermit host-capabilities --cpu-profile host-no-rdrand`. Recording and replay \
