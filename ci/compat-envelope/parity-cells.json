@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 2960,
-      "applicable": 1872,
-      "selectable": 1635,
-      "population": 2895,
-      "population_candidate_selected": 1635,
+      "cells": 2970,
+      "applicable": 1874,
+      "selectable": 1637,
+      "population": 2905,
+      "population_candidate_selected": 1637,
       "population_candidate_not_selected": 230,
-      "population_candidate_disabled": 1030
+      "population_candidate_disabled": 1038
     },
     "by_backend": {
       "dbt": {
-        "cells": 592,
-        "applicable": 249,
-        "selectable": 248,
-        "population": 579,
-        "population_candidate_selected": 248,
+        "cells": 594,
+        "applicable": 250,
+        "selectable": 249,
+        "population": 581,
+        "population_candidate_selected": 249,
         "population_candidate_not_selected": 1,
-        "population_candidate_disabled": 330
+        "population_candidate_disabled": 331
       },
       "in-guest-trap": {
-        "cells": 592,
+        "cells": 594,
         "applicable": 302,
         "selectable": 302,
-        "population": 579,
+        "population": 581,
         "population_candidate_selected": 302,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 277
+        "population_candidate_disabled": 279
       },
       "kvm": {
-        "cells": 592,
-        "applicable": 550,
-        "selectable": 547,
-        "population": 579,
-        "population_candidate_selected": 547,
+        "cells": 594,
+        "applicable": 551,
+        "selectable": 548,
+        "population": 581,
+        "population_candidate_selected": 548,
         "population_candidate_not_selected": 1,
-        "population_candidate_disabled": 31
+        "population_candidate_disabled": 32
       },
       "liteinst": {
-        "cells": 592,
+        "cells": 594,
         "applicable": 303,
         "selectable": 303,
-        "population": 579,
+        "population": 581,
         "population_candidate_selected": 303,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 276
+        "population_candidate_disabled": 278
       },
       "sabre": {
-        "cells": 592,
+        "cells": 594,
         "applicable": 468,
         "selectable": 235,
-        "population": 579,
+        "population": 581,
         "population_candidate_selected": 235,
         "population_candidate_not_selected": 228,
-        "population_candidate_disabled": 116
+        "population_candidate_disabled": 118
       }
     }
   },
@@ -885,6 +885,16 @@
     {"test_id":"c-programs/printf-with-threads","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/printf-with-threads","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 9) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"},
     {"test_id":"c-programs/printf-with-threads","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"},
+    {"test_id":"c-programs/proc-cmdline","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/proc-cmdline","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: NAMED GAP: the guest re-executes itself to choose its own arguments and environment, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567); in-guest-trap also reports no initial stack pointer (https://github.com/rrnewton/hermit/issues/4565)."},
+    {"test_id":"c-programs/proc-cmdline","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/proc-cmdline","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: NAMED GAP: the guest re-executes itself to choose its own arguments and environment, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567); LiteInst also reports no initial stack pointer (https://github.com/rrnewton/hermit/issues/4565)."},
+    {"test_id":"c-programs/proc-cmdline","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: NAMED GAP, not fixed, under the owner's ruling that SaBRe is a drop candidate: SaBRe kills this guest with SIGSEGV when its first thread exits, at glibc's madvise(MADV_DONTNEED) of the exiting thread's stack (https://github.com/rrnewton/hermit/issues/4562); SaBRe also reports no initial stack pointer, so its file is the kernel's (https://github.com/rrnewton/hermit/issues/4565)."},
+    {"test_id":"c-programs/proc-cmdline-other-processes","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: NAMED REFUSAL (https://github.com/rrnewton/hermit/issues/4574): the guest's CLONE_VM child, a process that shares its parent's memory without CLONE_THREAD or CLONE_VFORK, is refused by detcore-dbt before the clone runs (copied child cannot own inherited Detcore state), which ends the run as an internal DBT failure; DBT also reports no initial stack pointer, so its own file is the kernel's (https://github.com/rrnewton/hermit/issues/4565)."},
+    {"test_id":"c-programs/proc-cmdline-other-processes","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: NAMED GAP: the guest re-executes itself to choose its own arguments and environment, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567); in-guest-trap also reports no initial stack pointer (https://github.com/rrnewton/hermit/issues/4565)."},
+    {"test_id":"c-programs/proc-cmdline-other-processes","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KNOWN GAP (https://github.com/rrnewton/hermit/issues/4564): Detcore cannot read another process's memory, so another process's /proc/<pid>/cmdline, and a descriptor its owner opened read by another process, are the kernel beneath's; on KVM that is the executor's host /proc lookup, whose answer (EACCES, or ENOENT where the supervisor has no task with that number) depends on the host, so no row can be pinned."},
+    {"test_id":"c-programs/proc-cmdline-other-processes","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: NAMED GAP: the guest re-executes itself to choose its own arguments and environment, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567); LiteInst also reports no initial stack pointer (https://github.com/rrnewton/hermit/issues/4565)."},
+    {"test_id":"c-programs/proc-cmdline-other-processes","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: NAMED GAP, not fixed, under the owner's ruling that SaBRe is a drop candidate: SaBRe kills this guest with SIGSEGV when its first thread exits, at glibc's madvise(MADV_DONTNEED) of the exiting thread's stack (https://github.com/rrnewton/hermit/issues/4562); SaBRe also reports no initial stack pointer, so its file is the kernel's (https://github.com/rrnewton/hermit/issues/4565)."},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"},

@@ -1,7 +1,7 @@
 [package]
 name = "hermit-cdylib"
 description = "libhermit.so, the shared-object form of the hermit library."
-version = "0.5.1"
+version = "0.5.3"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
@@ -18,4 +18,4 @@ test = false
 doctest = false
 
 [dependencies]
-hermit-rlib = { package = "hermit-run", version = "0.5.1", path = "../hermit-cli" }
+hermit-rlib = { package = "hermit-run", version = "0.5.3", path = "../hermit-cli" }

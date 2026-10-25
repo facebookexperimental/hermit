@@ -2513,7 +2513,35 @@ fi
 # algorithm are unchanged, so preserve the calibrated budget, job width and
 # limits. This is a source-identity carry, not a new cold timing/install-key
 # measurement. Related: https://github.com/rrnewton/reverie/pull/1100
-expected_pin=32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14
+# CARRY TO ec92a13ae175e1b945c4f1a1b392410ae9dfd1ec (2026-10-23): from
+# 32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14. One commit (kvm lane,
+# package K slice D4b: reverie-kvm deletes its executor's /proc/self/cmdline
+# copy, which Detcore now renders). It changes reverie-kvm/src and
+# reverie-kvm/tests only; git diff is empty under reverie-dbt/ and
+# third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 32cd7a75 entry.
+# CARRY TO 30f403babbb3471f8bb344b341059f7a13a789e6 (2026-10-23): from
+# ec92a13ae175e1b945c4f1a1b392410ae9dfd1ec. One commit (kvm lane,
+# per-call slice 4: reverie-kvm per-entry mechanics without tree, CPUID or
+# clone churn). It changes reverie-kvm/ and the reverie-kvm target's lints in
+# the root BUCK only; git diff is empty under reverie-dbt/ and third-party/
+# and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so the
+# inventory, SDK and native inputs, calibrated budget, job width and limits
+# carry unchanged from the ec92a13a entry.
+# CARRY TO bc87651747f1daf371da9651e0e0ce0a90a404e9 (2026-10-23): from
+# 30f403babbb3471f8bb344b341059f7a13a789e6. Two commits: f0d4a0de (two
+# signal-handler signatures in reverie-kvm/tests/static_elf.rs) and kvm-lane
+# per-call slice 5 (reverie-kvm shows the Tool the guest's syscall-entry
+# registers and completes plain injections without a box). They change
+# reverie-kvm/ only; git diff is empty under reverie-dbt/ and third-party/
+# and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so the
+# inventory, SDK and native inputs, calibrated budget, job width and limits
+# carry unchanged from the 30f403ba entry.
+# CARRY TO befaebe7482ef3fa8becb242bd020ec882963205: version-only 0.5.3 from bc87651747f1daf371da9651e0e0ce0a90a404e9.
+# Package versions and exact qualifier declarations change; DBT/SDK runtime source,
+# recipes, inventory997 and calibrated resource limits are unchanged. No runtime proof carries.
+expected_pin=befaebe7482ef3fa8becb242bd020ec882963205
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

@@ -43,9 +43,8 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 
-use super::procfs_levels::Lookups;
-use super::procfs_levels::looked_up;
 use super::procfs_levels::map_transient;
+use super::procfs_levels::path_operands;
 use super::procfs_levels::raw_args;
 use super::procfs_levels::unmap_transient;
 use crate::procfs::ids;
@@ -204,6 +203,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         Some(ids::rebuilt_like(names, spelling))
     }
 
+    /// Whether [`Self::procfs_translated_call`] can translate anything in
+    /// `call`: numbers are translated on this thread, and `call` looks up a
+    /// path. Where this is false, that function answers `Ok(None)` at once,
+    /// so a caller that asks first may skip it.
+    pub(crate) fn may_translate_procfs_call<G: Guest<Self>>(guest: &G, call: &Syscall) -> bool {
+        Self::translates_procfs_numbers(guest) && path_operands(call.number()).is_some()
+    }
+
     /// `call` with each path it looks up that names a process or thread by
     /// the guest's number spelled with the kernel's numbers instead (see the
     /// module documentation and [`Self::kernel_spelling`]): `Ok(None)` where
@@ -215,18 +222,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: &Syscall,
     ) -> Result<Option<TranslatedCall>, Errno> {
-        if !Self::translates_procfs_numbers(guest) {
+        if !Self::may_translate_procfs_call(guest, call) {
             return Ok(None);
         }
         let (sysno, args) = call.into_parts();
-        let Some(Lookups::Paths(operands)) = looked_up(sysno) else {
+        let Some(operands) = path_operands(sysno) else {
             return Ok(None);
         };
         let mut values = [
             args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
         ];
         let mut respelled = Vec::new();
-        for (dirfd, argument) in operands {
+        for &(dirfd, argument) in operands {
             let Some(spelling) = PathPtr::from_ptr(values[argument] as *const libc::c_char)
                 .and_then(|address| address.read(&guest.memory()).ok())
             else {

@@ -243,39 +243,63 @@ fn capture_abandonable(
     let name = free_name(&cfg.dir, &stem)?;
     let path = cfg.dir.join(&name);
     let temp = cfg.dir.join(format!(".{name}.tmp"));
+    let written = try_tiers(
+        mem.is_some(),
+        full_timed_out,
+        start,
+        end,
+        |tier, deadline| {
+            let segments = snapshot.segments(tier);
+            let result = write_core(&temp, budget, deadline, &snapshot, &segments, mem);
+            if result.is_err() {
+                let _ = fs::remove_file(&temp);
+            }
+            result
+        },
+    )?;
+    if written.is_some() {
+        if abandoned.load(Ordering::SeqCst) {
+            let _ = fs::remove_file(&temp);
+            anyhow::bail!("the tracer gave up on this capture");
+        }
+        fs::rename(&temp, &path)?;
+        return Ok(Outcome::Written { path });
+    }
+    Ok(Outcome::NoRoom { budget })
+}
+
+/// Try the existing capture tiers and remember only a Full deadline failure.
+/// The attempt owns writing and cleaning up its temporary file; returning the
+/// successful tier lets the unit fixture prove what it actually wrote.
+fn try_tiers(
+    has_memory: bool,
+    full_timed_out: &AtomicBool,
+    start: Instant,
+    end: Instant,
+    mut attempt: impl FnMut(Tier, Instant) -> Result<u64, WriteError>,
+) -> std::io::Result<Option<(Tier, u64)>> {
     let span = end.saturating_duration_since(start);
-    let tiers: &[(Tier, u32)] = match mem {
-        Some(_) if !full_timed_out.load(Ordering::Relaxed) => {
+    let tiers: &[(Tier, u32)] = match has_memory {
+        true if !full_timed_out.load(Ordering::Relaxed) => {
             &[(Tier::Full, 7), (Tier::Stack, 9), (Tier::NotesOnly, 10)]
         }
-        Some(_) => &[(Tier::Stack, 9), (Tier::NotesOnly, 10)],
-        None => &[(Tier::NotesOnly, 10)],
+        true => &[(Tier::Stack, 9), (Tier::NotesOnly, 10)],
+        false => &[(Tier::NotesOnly, 10)],
     };
     for &(tier, tenths) in tiers {
         let deadline = start + span * tenths / 10;
-        let segments = snapshot.segments(tier);
-        match write_core(&temp, budget, deadline, &snapshot, &segments, mem) {
-            Ok(_) => {
-                if abandoned.load(Ordering::SeqCst) {
-                    let _ = fs::remove_file(&temp);
-                    anyhow::bail!("the tracer gave up on this capture");
+        match attempt(tier, deadline) {
+            Ok(bytes) => return Ok(Some((tier, bytes))),
+            Err(error) => match error {
+                WriteError::Deadline if tier == Tier::Full => {
+                    full_timed_out.store(true, Ordering::Relaxed);
                 }
-                fs::rename(&temp, &path)?;
-                return Ok(Outcome::Written { path });
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&temp);
-                match error {
-                    WriteError::Deadline if tier == Tier::Full => {
-                        full_timed_out.store(true, Ordering::Relaxed);
-                    }
-                    WriteError::OverBudget | WriteError::Deadline => {}
-                    WriteError::Io(error) => return Err(error.into()),
-                }
-            }
+                WriteError::OverBudget | WriteError::Deadline => {}
+                WriteError::Io(error) => return Err(error),
+            },
         }
     }
-    Ok(Outcome::NoRoom { budget })
+    Ok(None)
 }
 
 /// When a capture started at `start` must be over: after `time_limit`, or at
@@ -1189,29 +1213,107 @@ mod tests {
     fn after_a_full_core_runs_out_of_time_later_cores_start_smaller() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
-        let mem = File::open("/proc/self/mem").unwrap();
+        // Fixed readable memory, independent of this test process's mappings,
+        // coredump_filter, allocations and the cost of compressing them all.
+        let mem = tempfile::tempfile().unwrap();
+        let mut heap = map(
+            MMapPath::Heap,
+            MMPermissions::READ | MMPermissions::WRITE | MMPermissions::PRIVATE,
+            0,
+        );
+        heap.address = (PAGE, 2 * PAGE);
+        let mut stack = heap.clone();
+        stack.pathname = MMapPath::Stack;
+        stack.address = (2 * PAGE, 3 * PAGE);
+        mem.write_all_at(&vec![0x5a; PAGE as usize], PAGE).unwrap();
+        mem.write_all_at(&vec![0xa5; PAGE as usize], 2 * PAGE)
+            .unwrap();
+        let snapshot = Snapshot {
+            tgid: 1,
+            stack_pointer: 2 * PAGE,
+            notes: Vec::new(),
+            maps: vec![heap, stack],
+            rules: vec![
+                Dump {
+                    whole: true,
+                    elf_header: false,
+                };
+                2
+            ],
+        };
+        let capture = |name: &str, flag: &AtomicBool, mut full_failure: Option<WriteError>| {
+            let path = dir.path().join(name);
+            let start = Instant::now();
+            let mut attempted = Vec::new();
+            let (tier, _) = try_tiers(
+                true,
+                flag,
+                start,
+                start + cfg.time_limit,
+                |tier, deadline| {
+                    attempted.push(tier);
+                    let tenths = match tier {
+                        Tier::Full => 7,
+                        Tier::Stack => 9,
+                        Tier::NotesOnly => 10,
+                    };
+                    assert_eq!(deadline, start + cfg.time_limit * tenths / 10);
+                    if tier == Tier::Full
+                        && let Some(error) = full_failure.take()
+                    {
+                        return Err(error);
+                    }
+                    write_core(
+                        &path,
+                        cfg.max_core_bytes,
+                        deadline,
+                        &snapshot,
+                        &snapshot.segments(tier),
+                        Some(&mem),
+                    )
+                },
+            )
+            .unwrap()
+            .expect("the bounded fixture did not produce a core");
+            assert!(full_failure.is_none(), "the Full attempt was skipped");
+            (path, tier, attempted)
+        };
+
+        let fresh = AtomicBool::new(false);
+        let (big, tier, attempted) = capture("full", &fresh, None);
+        assert_eq!(tier, Tier::Full, "the reference core fell back");
+        assert_eq!(attempted, [Tier::Full]);
+        assert!(!fresh.load(Ordering::Relaxed));
+        assert_eq!(stored_memory(&big), 2 * PAGE);
+
         let flag = AtomicBool::new(false);
-        let late = own_exit(true, Some(Instant::now()));
-        capture_from(&cfg, &late, Some(&mem), &flag).unwrap();
+        let (_, tier, attempted) = capture("timed-out", &flag, Some(WriteError::Deadline));
+        assert_eq!(tier, Tier::Stack);
+        assert_eq!(attempted, [Tier::Full, Tier::Stack]);
         assert!(
             flag.load(Ordering::Relaxed),
             "a timed-out Full core was not remembered"
         );
-        let full = AtomicBool::new(false);
-        let Outcome::Written { path: big } =
-            capture_from(&cfg, &own_exit(true, None), Some(&mem), &full).unwrap()
-        else {
-            panic!("no Full core");
-        };
-        let Outcome::Written { path: small } =
-            capture_from(&cfg, &own_exit(true, None), Some(&mem), &flag).unwrap()
-        else {
-            panic!("no core after the timeout");
-        };
+        let (small, tier, attempted) = capture("after-timeout", &flag, None);
+        assert_eq!(tier, Tier::Stack);
+        assert_eq!(attempted, [Tier::Stack], "a later capture retried Full");
+        assert_eq!(stored_memory(&small), PAGE);
         assert!(
             stored_memory(&small) < stored_memory(&big),
             "the core after a timeout was not smaller"
         );
+
+        // A capacity failure may fall back, but must not disable future Full
+        // attempts as a Full deadline does.
+        let budget_flag = AtomicBool::new(false);
+        let (_, tier, attempted) =
+            capture("over-budget", &budget_flag, Some(WriteError::OverBudget));
+        assert_eq!(tier, Tier::Stack);
+        assert_eq!(attempted, [Tier::Full, Tier::Stack]);
+        assert!(!budget_flag.load(Ordering::Relaxed));
+        let (_, tier, attempted) = capture("after-budget", &budget_flag, None);
+        assert_eq!(tier, Tier::Full);
+        assert_eq!(attempted, [Tier::Full]);
     }
 
     #[test]
@@ -1266,6 +1368,10 @@ mod tests {
         let outcome = capture_from(&config(dir.path()), &late, Some(&mem), &flag).unwrap();
         assert!(matches!(outcome, Outcome::NoRoom { .. }), "{outcome:?}");
         assert_eq!(entries(dir.path()), 0);
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a timed-out Full core was not remembered"
+        );
     }
 
     #[test]

@@ -274,13 +274,16 @@ where
 
 pub(super) async fn capable_resource_request<G, T>(
     guest: &mut G,
-    resources: Resources,
+    mut resources: Resources,
     capability: ControlCapability,
 ) -> ResumeStatus
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    // A parked request publishes the guest's mask as an ordinary one does
+    // (`resource_request`).
+    resources.guest_signal_mask = publish_request_guest_mask(guest, &resources);
     let pid = guest.thread_state().detpid.expect("registered process");
     let response = send_and_update_time(
         guest,

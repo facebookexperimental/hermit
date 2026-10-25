@@ -6355,6 +6355,152 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/proc-cmdline
+    description: "tests/c/proc_cmdline.c reads its own /proc/<pid>/cmdline as Linux's get_mm_cmdline shows it (fs/proc/base.c): it re-executes itself with arguments it chooses (an empty one and one with a space) and a small environment, then reads its own file whole, in three-byte chunks, with pread at offsets and after lseek (including the EINVAL of a read whose end passes LLONG_MAX and of a seek past procfs's s_maxbytes, and the ENXIO of SEEK_DATA and SEEK_HOLE at any offset, of it and of auxv), with readv and preadv2, with splice to valid and refused destinations (EINVAL, EBADF, ESPIPE, EFAULT), through /proc/<pid>, thread-self, task/<tid> and relative to a descriptor of /proc; after rewriting an argument in place; after rewriting the last argument byte (setproctitle: one string from the first argument, at most a page, into the environment area and never past it); with the page of its last argument byte made PROT_NONE (nothing); a thread's task file, and that file once the thread is joined (ESRCH); the top-level file of a thread group whose leader has exited (empty); and, after a second exec, a descriptor opened before it. Detcore renders a process's own file from its memory on ptrace and KVM, at the read's position, at the argument area it reads from each image's initial stack. Standard output is the oracle and the program exits 0; the ptrace and KVM rows are the native output. Another process's file is in c-programs/proc-cmdline-other-processes. The DBT row is a KNOWN-DIFFERENCE BASELINE, NOT COMPLETION: DBT reports no initial stack pointer, so the kernel's file under DynamoRIO is served, which reads a title written over both areas one byte further, to a NUL, fails the own file and its thread-self spelling with ESRCH once the leader has exited, and answers every splice from the file with Detcore's EINVAL for a file it does not render, including a length of 0 and before Linux's EBADF, ESPIPE and EFAULT checks (https://github.com/rrnewton/hermit/issues/4565)"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/proc_cmdline.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+          - kvm
+        backends_disabled:
+          sabre: "NAMED GAP, not fixed, under the owner's ruling that SaBRe is a drop candidate: SaBRe kills this guest with SIGSEGV when its first thread exits, at glibc's madvise(MADV_DONTNEED) of the exiting thread's stack (https://github.com/rrnewton/hermit/issues/4562); SaBRe also reports no initial stack pointer, so its file is the kernel's (https://github.com/rrnewton/hermit/issues/4565)."
+          liteinst: "NAMED GAP: the guest re-executes itself to choose its own arguments and environment, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567); LiteInst also reports no initial stack pointer (https://github.com/rrnewton/hermit/issues/4565)."
+          in-guest-trap: "NAMED GAP: the guest re-executes itself to choose its own arguments and environment, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567); in-guest-trap also reports no initial stack pointer (https://github.com/rrnewton/hermit/issues/4565)."
+        expected_stdout:
+          ptrace: "layout arg-area=34 env-area=66 contiguous=1\nown len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nchunks of 3: len=34 reads=13 same=1\npread 4 at 0 len=4 bytes=cmdl\npread 4 at 5 len=4 bytes=ne-p\npread 4 at 18 len=4 bytes=e1\\0\\0\npread 4 at 33 len=1 bytes=\\0\npread 4 at 34 len=0 bytes=\npread 4 at 44 len=0 bytes=\npread at -1: -1 errno=22\nlseek 7: 7\nread 5 after lseek 7 len=5 bytes=-prob\nlseek 0 SEEK_CUR: 12\nlseek 0 SEEK_END: 0\npread 1 at LLONG_MAX: -1 errno=22\nlseek LLONG_MAX: -1\nreadv 1 after lseek LLONG_MAX: 1 errno=0\npreadv2 1 at -1 after lseek LLONG_MAX, unknown flags: -1 errno=95\nlseek 2^31-1: 2147483647\nreadv 1 at 2^31-1: 0 errno=0\nlseek 2^31: -1 errno=22\npreadv2 1 at -1 after lseek 0, unknown flags: -1 errno=95\nread 0: 0 errno=0\ncmdline SEEK_DATA -1: -1 errno=6 SEEK_HOLE: -1 errno=6\ncmdline SEEK_DATA 0: -1 errno=6 SEEK_HOLE: -1 errno=6\ncmdline SEEK_DATA 3: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA -1: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA 0: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA 3: -1 errno=6 SEEK_HOLE: -1 errno=6\nwrite: -1 errno=9\npwrite: -1 errno=9\npwrite at -1: -1 errno=22\nown pid len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nthread-self len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nown task len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nrelative to /proc: self/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nrelative to /proc: <pid>/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nrelative to /proc: thread-self/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nargv[0] first byte changed len=34 bytes=Cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nfirst separator replaced len=34 bytes=Cmdline-probe_stage1\\0\\0two words\\0x\\0\nsetproctitle short title len=10 bytes=title-one\\0\nsetproctitle into environment len=55 bytes=LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL\\0\nsetproctitle pread 6 at 4 len=6 bytes=LLLLLL\nsetproctitle pread 6 near the end len=3 bytes=LL\\0\nsetproctitle filling both areas len=100 bytes=MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM\nrestored len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nsplice to a pipe: -1 errno=22\nsplice to a pipe, input offset: -1 errno=22\nsplice to a pipe, output offset: -1 errno=29\nsplice to a pipe, unreadable input offset: -1 errno=14\nsplice to a pipe's read end: -1 errno=9\nsplice to a pipe's read end, output offset: -1 errno=29\nsplice to a file: -1 errno=22\nsplice to a file, output offset: -1 errno=22\nsplice to a file, unreadable output offset: -1 errno=14\nsplice to a read-only file: -1 errno=9\nsplice to an O_PATH descriptor: -1 errno=9\nsplice to no descriptor: -1 errno=9\nsplice to no descriptor, length 0: 0 errno=0\nsplice to no descriptor, unknown flags: -1 errno=22\nargument page PROT_NONE len=0 bytes=\nthread's own task file len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nthread's thread-self len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nmain reads the thread's task file len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\njoined thread's open task file errno=3\nleader exited, /proc/self/cmdline len=0 bytes=\nleader exited, thread-self len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nfailures before exec=0\nlayout arg-area=28 env-area=18 contiguous=1\nafter a second exec len=28 bytes=second-image\\0stage2\\03\\0\\0\\0end\\0\ndescriptor opened before exec len=28 bytes=second-image\\0stage2\\03\\0\\0\\0end\\0\nfailures=0\n"
+          dbt: "layout arg-area=34 env-area=66 contiguous=1\nown len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nchunks of 3: len=34 reads=13 same=1\npread 4 at 0 len=4 bytes=cmdl\npread 4 at 5 len=4 bytes=ne-p\npread 4 at 18 len=4 bytes=e1\\0\\0\npread 4 at 33 len=1 bytes=\\0\npread 4 at 34 len=0 bytes=\npread 4 at 44 len=0 bytes=\npread at -1: -1 errno=22\nlseek 7: 7\nread 5 after lseek 7 len=5 bytes=-prob\nlseek 0 SEEK_CUR: 12\nlseek 0 SEEK_END: 0\npread 1 at LLONG_MAX: -1 errno=22\nlseek LLONG_MAX: -1\nreadv 1 after lseek LLONG_MAX: 1 errno=0\npreadv2 1 at -1 after lseek LLONG_MAX, unknown flags: -1 errno=95\nlseek 2^31-1: 2147483647\nreadv 1 at 2^31-1: 0 errno=0\nlseek 2^31: -1 errno=22\npreadv2 1 at -1 after lseek 0, unknown flags: -1 errno=95\nread 0: 0 errno=0\ncmdline SEEK_DATA -1: -1 errno=6 SEEK_HOLE: -1 errno=6\ncmdline SEEK_DATA 0: -1 errno=6 SEEK_HOLE: -1 errno=6\ncmdline SEEK_DATA 3: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA -1: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA 0: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA 3: -1 errno=6 SEEK_HOLE: -1 errno=6\nwrite: -1 errno=9\npwrite: -1 errno=9\npwrite at -1: -1 errno=22\nown pid len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nthread-self len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nown task len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nrelative to /proc: self/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nrelative to /proc: <pid>/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nrelative to /proc: thread-self/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nargv[0] first byte changed len=34 bytes=Cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nfirst separator replaced len=34 bytes=Cmdline-probe_stage1\\0\\0two words\\0x\\0\nsetproctitle short title len=10 bytes=title-one\\0\nsetproctitle into environment len=55 bytes=LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL\\0\nsetproctitle pread 6 at 4 len=6 bytes=LLLLLL\nsetproctitle pread 6 near the end len=3 bytes=LL\\0\nsetproctitle filling both areas len=101 bytes=MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM\\0\nrestored len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nsplice to a pipe: -1 errno=22\nsplice to a pipe, input offset: -1 errno=22\nsplice to a pipe, output offset: -1 errno=22\nsplice to a pipe, unreadable input offset: -1 errno=22\nsplice to a pipe's read end: -1 errno=22\nsplice to a pipe's read end, output offset: -1 errno=22\nsplice to a file: -1 errno=22\nsplice to a file, output offset: -1 errno=22\nsplice to a file, unreadable output offset: -1 errno=22\nsplice to a read-only file: -1 errno=22\nsplice to an O_PATH descriptor: -1 errno=22\nsplice to no descriptor: -1 errno=22\nsplice to no descriptor, length 0: -1 errno=22\nsplice to no descriptor, unknown flags: -1 errno=22\nargument page PROT_NONE len=0 bytes=\nthread's own task file len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nthread's thread-self len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nmain reads the thread's task file len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\njoined thread's open task file errno=3\nleader exited, /proc/self/cmdline errno=3\nleader exited, thread-self errno=3\nfailures before exec=0\nlayout arg-area=28 env-area=18 contiguous=1\nafter a second exec len=28 bytes=second-image\\0stage2\\03\\0\\0\\0end\\0\ndescriptor opened before exec len=28 bytes=second-image\\0stage2\\03\\0\\0\\0end\\0\nfailures=0\n"
+          kvm: "layout arg-area=34 env-area=66 contiguous=1\nown len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nchunks of 3: len=34 reads=13 same=1\npread 4 at 0 len=4 bytes=cmdl\npread 4 at 5 len=4 bytes=ne-p\npread 4 at 18 len=4 bytes=e1\\0\\0\npread 4 at 33 len=1 bytes=\\0\npread 4 at 34 len=0 bytes=\npread 4 at 44 len=0 bytes=\npread at -1: -1 errno=22\nlseek 7: 7\nread 5 after lseek 7 len=5 bytes=-prob\nlseek 0 SEEK_CUR: 12\nlseek 0 SEEK_END: 0\npread 1 at LLONG_MAX: -1 errno=22\nlseek LLONG_MAX: -1\nreadv 1 after lseek LLONG_MAX: 1 errno=0\npreadv2 1 at -1 after lseek LLONG_MAX, unknown flags: -1 errno=95\nlseek 2^31-1: 2147483647\nreadv 1 at 2^31-1: 0 errno=0\nlseek 2^31: -1 errno=22\npreadv2 1 at -1 after lseek 0, unknown flags: -1 errno=95\nread 0: 0 errno=0\ncmdline SEEK_DATA -1: -1 errno=6 SEEK_HOLE: -1 errno=6\ncmdline SEEK_DATA 0: -1 errno=6 SEEK_HOLE: -1 errno=6\ncmdline SEEK_DATA 3: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA -1: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA 0: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA 3: -1 errno=6 SEEK_HOLE: -1 errno=6\nwrite: -1 errno=9\npwrite: -1 errno=9\npwrite at -1: -1 errno=22\nown pid len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nthread-self len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nown task len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nrelative to /proc: self/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nrelative to /proc: <pid>/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nrelative to /proc: thread-self/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nargv[0] first byte changed len=34 bytes=Cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nfirst separator replaced len=34 bytes=Cmdline-probe_stage1\\0\\0two words\\0x\\0\nsetproctitle short title len=10 bytes=title-one\\0\nsetproctitle into environment len=55 bytes=LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL\\0\nsetproctitle pread 6 at 4 len=6 bytes=LLLLLL\nsetproctitle pread 6 near the end len=3 bytes=LL\\0\nsetproctitle filling both areas len=100 bytes=MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM\nrestored len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nsplice to a pipe: -1 errno=22\nsplice to a pipe, input offset: -1 errno=22\nsplice to a pipe, output offset: -1 errno=29\nsplice to a pipe, unreadable input offset: -1 errno=14\nsplice to a pipe's read end: -1 errno=9\nsplice to a pipe's read end, output offset: -1 errno=29\nsplice to a file: -1 errno=22\nsplice to a file, output offset: -1 errno=22\nsplice to a file, unreadable output offset: -1 errno=14\nsplice to a read-only file: -1 errno=9\nsplice to an O_PATH descriptor: -1 errno=9\nsplice to no descriptor: -1 errno=9\nsplice to no descriptor, length 0: 0 errno=0\nsplice to no descriptor, unknown flags: -1 errno=22\nargument page PROT_NONE len=0 bytes=\nthread's own task file len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nthread's thread-self len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nmain reads the thread's task file len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\njoined thread's open task file errno=3\nleader exited, /proc/self/cmdline len=0 bytes=\nleader exited, thread-self len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0x\\0\nfailures before exec=0\nlayout arg-area=28 env-area=18 contiguous=1\nafter a second exec len=28 bytes=second-image\\0stage2\\03\\0\\0\\0end\\0\ndescriptor opened before exec len=28 bytes=second-image\\0stage2\\03\\0\\0\\0end\\0\nfailures=0\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is the same output under Hermit on every backend; the native output equals the ptrace row, checked when the cell was written.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract asserts Hermit's output on each backend, not a native run
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-QUALIFIED: a ptrace recording of this guest is refused, because its thread-group leader exits while a thread runs (https://github.com/rrnewton/hermit/issues/4244), so replay of this cell remains unqualified; under record and replay Detcore leaves /proc/<pid>/cmdline to the kernel.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this cell's strict verification; under record and replay the kernel serves /proc/<pid>/cmdline
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the guest chooses its own arguments by re-executing itself; there are no custom arguments to calibrate.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/proc-cmdline-other-processes
+    description: "tests/c/proc_cmdline_other_processes.c (tests/c/proc_cmdline.c with the guest argument other-processes compiled in): everything c-programs/proc-cmdline reads, plus another process's file, which only the kernel beneath can serve because Detcore reads only the calling process's memory: a running child's /proc/<pid>/cmdline read by its parent, and a descriptor the parent opened read by its fork child after the parent rewrote its arguments, once into an ordinary buffer and once, with an inline read, into the 34 bytes at 192 below the child's stack pointer, where Hermit's stack scratch for the kernel read could lie; and a CLONE_VM child, sharing the parent's memory, reads the parent's file with its stack pointer inside the parent's argument area, whose bytes the kernel reads (the environment is padded so that the area is long enough). Enabled on ptrace, where the kernel beneath serves another process's file. Standard output is the oracle; the ptrace row is the native output. DBT is disabled: detcore-dbt refuses the CLONE_VM child before the clone runs, which ends the run (https://github.com/rrnewton/hermit/issues/4574). A zombie's or reaped child's file is not read, and KVM is disabled: on KVM another process's file is the executor's host /proc lookup, whose answer depends on the host (https://github.com/rrnewton/hermit/issues/4564)"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/proc_cmdline_other_processes.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+        - -pthread
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: "NAMED REFUSAL (https://github.com/rrnewton/hermit/issues/4574): the guest's CLONE_VM child, a process that shares its parent's memory without CLONE_THREAD or CLONE_VFORK, is refused by detcore-dbt before the clone runs (copied child cannot own inherited Detcore state), which ends the run as an internal DBT failure; DBT also reports no initial stack pointer, so its own file is the kernel's (https://github.com/rrnewton/hermit/issues/4565)."
+          kvm: "KNOWN GAP (https://github.com/rrnewton/hermit/issues/4564): Detcore cannot read another process's memory, so another process's /proc/<pid>/cmdline, and a descriptor its owner opened read by another process, are the kernel beneath's; on KVM that is the executor's host /proc lookup, whose answer (EACCES, or ENOENT where the supervisor has no task with that number) depends on the host, so no row can be pinned."
+          sabre: "NAMED GAP, not fixed, under the owner's ruling that SaBRe is a drop candidate: SaBRe kills this guest with SIGSEGV when its first thread exits, at glibc's madvise(MADV_DONTNEED) of the exiting thread's stack (https://github.com/rrnewton/hermit/issues/4562); SaBRe also reports no initial stack pointer, so its file is the kernel's (https://github.com/rrnewton/hermit/issues/4565)."
+          liteinst: "NAMED GAP: the guest re-executes itself to choose its own arguments and environment, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567); LiteInst also reports no initial stack pointer (https://github.com/rrnewton/hermit/issues/4565)."
+          in-guest-trap: "NAMED GAP: the guest re-executes itself to choose its own arguments and environment, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567); in-guest-trap also reports no initial stack pointer (https://github.com/rrnewton/hermit/issues/4565)."
+        expected_stdout:
+          ptrace: "layout arg-area=34 env-area=321 contiguous=1\nown len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nchunks of 3: len=34 reads=13 same=1\npread 4 at 0 len=4 bytes=cmdl\npread 4 at 5 len=4 bytes=ne-p\npread 4 at 18 len=4 bytes=e1\\0\\0\npread 4 at 33 len=1 bytes=\\0\npread 4 at 34 len=0 bytes=\npread 4 at 44 len=0 bytes=\npread at -1: -1 errno=22\nlseek 7: 7\nread 5 after lseek 7 len=5 bytes=-prob\nlseek 0 SEEK_CUR: 12\nlseek 0 SEEK_END: 0\npread 1 at LLONG_MAX: -1 errno=22\nlseek LLONG_MAX: -1\nreadv 1 after lseek LLONG_MAX: 1 errno=0\npreadv2 1 at -1 after lseek LLONG_MAX, unknown flags: -1 errno=95\nlseek 2^31-1: 2147483647\nreadv 1 at 2^31-1: 0 errno=0\nlseek 2^31: -1 errno=22\npreadv2 1 at -1 after lseek 0, unknown flags: -1 errno=95\nread 0: 0 errno=0\ncmdline SEEK_DATA -1: -1 errno=6 SEEK_HOLE: -1 errno=6\ncmdline SEEK_DATA 0: -1 errno=6 SEEK_HOLE: -1 errno=6\ncmdline SEEK_DATA 3: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA -1: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA 0: -1 errno=6 SEEK_HOLE: -1 errno=6\nauxv SEEK_DATA 3: -1 errno=6 SEEK_HOLE: -1 errno=6\nwrite: -1 errno=9\npwrite: -1 errno=9\npwrite at -1: -1 errno=22\nown pid len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nthread-self len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nown task len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nrelative to /proc: self/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nrelative to /proc: <pid>/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nrelative to /proc: thread-self/cmdline len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nargv[0] first byte changed len=34 bytes=Cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nfirst separator replaced len=34 bytes=Cmdline-probe_stage1\\0\\0two words\\0o\\0\nsetproctitle short title len=10 bytes=title-one\\0\nsetproctitle into environment len=55 bytes=LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL\\0\nsetproctitle pread 6 at 4 len=6 bytes=LLLLLL\nsetproctitle pread 6 near the end len=3 bytes=LL\\0\nsetproctitle filling both areas len=355 bytes=MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM\nrestored len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nsplice to a pipe: -1 errno=22\nsplice to a pipe, input offset: -1 errno=22\nsplice to a pipe, output offset: -1 errno=29\nsplice to a pipe, unreadable input offset: -1 errno=14\nsplice to a pipe's read end: -1 errno=9\nsplice to a pipe's read end, output offset: -1 errno=29\nsplice to a file: -1 errno=22\nsplice to a file, output offset: -1 errno=22\nsplice to a file, unreadable output offset: -1 errno=14\nsplice to a read-only file: -1 errno=9\nsplice to an O_PATH descriptor: -1 errno=9\nsplice to no descriptor: -1 errno=9\nsplice to no descriptor, length 0: 0 errno=0\nsplice to no descriptor, unknown flags: -1 errno=22\nrunning child len=34 bytes=Kmdline-probe\\0stage1\\0\\0two words\\0o\\0\ninherited descriptor, parent retitled len=34 bytes=Pmdline-probe\\0stage1\\0\\0two words\\0o\\0\ninherited descriptor, read below the stack pointer len=34 bytes=Pmdline-probe\\0stage1\\0\\0two words\\0o\\0\nclone-vm reader, stack pointer in the arguments len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nargument page PROT_NONE len=0 bytes=\nthread's own task file len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nthread's thread-self len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nmain reads the thread's task file len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\njoined thread's open task file errno=3\nleader exited, /proc/self/cmdline len=0 bytes=\nleader exited, thread-self len=34 bytes=cmdline-probe\\0stage1\\0\\0two words\\0o\\0\nfailures before exec=0\nlayout arg-area=28 env-area=18 contiguous=1\nafter a second exec len=28 bytes=second-image\\0stage2\\03\\0\\0\\0end\\0\ndescriptor opened before exec len=28 bytes=second-image\\0stage2\\03\\0\\0\\0end\\0\nfailures=0\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is the same output under Hermit on every backend; the native output equals the ptrace row, checked when the cell was written.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract asserts Hermit's output on each backend, not a native run
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-QUALIFIED: a ptrace recording of this guest is refused, because its thread-group leader exits while a thread runs (https://github.com/rrnewton/hermit/issues/4244), so replay of this cell remains unqualified; under record and replay Detcore leaves /proc/<pid>/cmdline to the kernel.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this cell's strict verification; under record and replay the kernel serves /proc/<pid>/cmdline
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the guest chooses its own arguments by re-executing itself; there are no custom arguments to calibrate.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/proc-fd-link-aliases
     description: Strict verification for tests/c/proc_fd_link_aliases.c
     lane: portable

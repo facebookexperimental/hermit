@@ -663,18 +663,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
-        let translated = Self::procfs_translated_call(guest, &syscall).await?;
-        let result = self
-            .record_or_replay
-            .handle_syscall_event(
-                &mut guest.into_guest(),
-                translated
-                    .as_ref()
-                    .map_or(syscall, |translated| translated.call),
-            )
-            .await;
+        // Only a call that looks up a path, on a thread whose `/proc` numbers
+        // are translated (DBT), can have anything to translate;
+        // `procfs_translated_call` answers `None` at once for every other
+        // call. Asking first keeps its futures, and their size, out of every
+        // forwarded syscall's future, and the box is allocated only for a
+        // call that then reads its path from the guest anyway.
+        let translated = if Self::may_translate_procfs_call(guest, &syscall) {
+            Box::pin(Self::procfs_translated_call(guest, &syscall)).await?
+        } else {
+            None
+        };
+        let call = translated
+            .as_ref()
+            .map_or(syscall, |translated| translated.call);
+        let result = if crate::record_or_replay::injects_only::<T>() {
+            // What the tool's handler would have done (`NoopTool`), here:
+            // the same single injection of the same call, awaited at the
+            // same point, with its errno converted the same way.
+            guest.inject(call).await.map_err(Error::from)
+        } else {
+            self.record_or_replay
+                .handle_syscall_event(&mut guest.into_guest(), call)
+                .await
+        };
         if let Some(translated) = translated {
-            Self::finish_translated_call(guest, translated).await;
+            Box::pin(Self::finish_translated_call(guest, translated)).await;
         }
         result
     }
@@ -5546,6 +5560,7 @@ impl<T> ThreadState<T> {
             continues_sigreturn: false,
             private_sigchld_decides: false,
             slice_boundary: None,
+            guest_signal_mask: None,
         }
     }
 

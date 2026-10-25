@@ -89,6 +89,8 @@ pub mod slice_boundary;
 mod sock_diag;
 mod stat;
 mod syscall_classification;
+#[cfg(test)]
+mod syscall_hot_path_tests;
 mod syscall_time;
 mod syscalls;
 #[cfg(test)]
@@ -4472,6 +4474,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         } else {
             None
         };
+        // This handler's future is as large as the largest future it awaits,
+        // and every syscall moves the whole of it once, into the box the Tool
+        // trait returns it in, whichever arm runs. `handle_openat`'s future is
+        // the outlier (about 7.5 KiB, against about 6.2 KiB for the next,
+        // `handle_write`), so the open family runs in its own box, allocated
+        // only when one of those calls is made, which already does far more
+        // work than one allocation. The hot read and write arms stay inline:
+        // boxing them too would cost those calls an allocation each.
+        // Box::pin(f).await polls `f` exactly as `f.await` does: no await
+        // moves and no arm changes behaviour. `syscall_hot_path_tests` bounds
+        // the result.
         let res = match classify_syscall(call.number()) {
             _ if sigalrm_refusal.is_some() => Err(sigalrm_refusal.expect("checked").into()),
             _ if rendered_procfs_answer.is_some() => rendered_procfs_answer.expect("checked"),
@@ -4848,9 +4861,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#547)
                 Syscall::Writev(w) => self.handle_writev(guest, w).await,
-                Syscall::Openat(o) => self.handle_openat(guest, o).await,
-                Syscall::Open(o) => self.handle_openat(guest, o.into()).await,
-                Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
+                Syscall::Openat(o) => Box::pin(self.handle_openat(guest, o)).await,
+                Syscall::Open(o) => Box::pin(self.handle_openat(guest, o.into())).await,
+                Syscall::Creat(o) => Box::pin(self.handle_openat(guest, o.into())).await,
                 Syscall::Close(s) => self.handle_close(guest, s).await,
                 Syscall::Read(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
                     self.handle_sock_diag_read(guest, s).await

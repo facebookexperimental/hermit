@@ -197,6 +197,14 @@ fn prstatus_r12(core: &[u8]) -> u64 {
 #[test]
 fn memory_excluded_with_madv_dontdump_stays_out_of_the_core() {
     let (guest, root) = guest("dontdump");
+    let secret = b"HERMIT-DONTDUMP-SECRET";
+    let executable = fs::read(&guest).expect("failed to read the guest executable");
+    assert!(
+        !executable
+            .windows(secret.len())
+            .any(|window| window == secret),
+        "the guest ELF must not hold an independent plaintext copy of the secret"
+    );
     let cores = root.join("cores");
     let output = hermit(
         &["--fatal-core-dir", cores.to_str().unwrap()],
@@ -216,6 +224,33 @@ fn memory_excluded_with_madv_dontdump_stays_out_of_the_core() {
     assert!(
         !holds(b"HERMIT-DONTDUMP-SECRET"),
         "the core holds memory the guest excluded with MADV_DONTDUMP"
+    );
+
+    // The same generated page must be present when only MADV_DONTDUMP is
+    // omitted, so a missing page or failed search cannot satisfy the test.
+    let control_cores = root.join("control-cores");
+    let control = hermit(
+        &["--fatal-core-dir", control_cores.to_str().unwrap()],
+        &guest,
+        &["dumpable-secret"],
+    );
+    assert_eq!(
+        control.status,
+        output.status,
+        "the control guest must die the same way:\n{}",
+        stderr(&control)
+    );
+    let kept = files(&control_cores);
+    assert_eq!(kept.len(), 1, "expected one control core, found {kept:?}");
+    let core = decode_core(&control_cores.join(&kept[0].0));
+    let holds = |needle: &[u8]| core.windows(needle.len()).any(|window| window == needle);
+    assert!(
+        holds(MARKER),
+        "the control core does not hold the guest's heap"
+    );
+    assert!(
+        holds(secret),
+        "the control core does not hold the page without MADV_DONTDUMP"
     );
 }
 

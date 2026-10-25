@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use reverie_dbt_inventory::REVERIE_DBT_FILES;
 
 const CRATE_RELATIVE: &str = "reverie-dbt";
-const VENDORED_CRATE: &str = "shim/third-party/rust/vendor/reverie-dbt-0.5.1";
+const VENDORED_CRATE: &str = "shim/third-party/rust/vendor/reverie-dbt-0.5.3";
 const TARGET_NAME: &str = "reverie-dbt-0.5-materialized-manifest";
 const PRELUDE_LOAD: &str = "load(\"@prelude//rust:cargo_buildscript.bzl\", \"buildscript_run\")\n";
 const MATERIALIZED_LOAD: &str =
@@ -247,7 +247,7 @@ fn render_target(files: &[String]) -> String {
         target.push_str(&starlark_string(relative));
         target.push_str(": ");
         target.push_str(&starlark_string(&format!(
-            "vendor/reverie-dbt-0.5.1/{relative}"
+            "vendor/reverie-dbt-0.5.3/{relative}"
         )));
         target.push_str(",\n");
     }

@@ -1282,6 +1282,17 @@ impl DetFd {
         self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::needs_snapshot))
     }
 
+    /// Whether every read of this open file description reads the process's
+    /// memory again (`ProcfsFile::reads_memory_at_every_read`): a process's
+    /// `cmdline` Detcore opened.
+    pub(crate) fn procfs_reads_memory_at_every_read(&self) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::reads_memory_at_every_read)
+        })
+    }
+
     /// Whether reads of this open file description are served from a procfs
     /// snapshot, already taken or still to be taken.
     pub(crate) fn procfs_serves_snapshot(&self) -> bool {

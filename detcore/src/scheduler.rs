@@ -1422,6 +1422,18 @@ pub struct Scheduler {
     /// thread the kernel would give it (`kernel_sigchld_target`).
     models_signal_targets: bool,
 
+    /// The in-guest delivery gate (`Config::in_guest_signal_delivery`; A5
+    /// step 3c.1b, <https://github.com/rrnewton/hermit/issues/4485>). Under
+    /// it each request may publish the guest's mask
+    /// (`Resources::guest_signal_mask`), which is recorded in
+    /// `saved_guest_sigmasks` (`record_request_guest_mask`) and read in place
+    /// of the kernel's `SigBlk` (`read_thread_blocked_mask_result`) and of a
+    /// `/proc` read at a background grant (`out_of_scheduler_masks`). It
+    /// arms nothing: the paths that arm a thread for a committed signal stay
+    /// under `models_signal_targets`. False on every run today: no host sets
+    /// the gate before step 3c.1f.
+    in_guest_signal_delivery: bool,
+
     /// Signals that a host-timed source armed by a guest can post to a process,
     /// keyed by that process: no gated wait of the process ends for them
     /// (`host_timed_signals`). An entry is added in the turn of the call that
@@ -1768,6 +1780,12 @@ pub struct Scheduler {
     /// signal's thread (`kernel_signal_target`) and the first SIGCHLD taker
     /// (`first_sigchld_taker`) read the kernel's mask instead, through
     /// `thread_signal_mask_for`.
+    ///
+    /// Under the in-guest delivery gate (`in_guest_signal_delivery`) it also
+    /// holds the guest mask each thread published at its latest request
+    /// (`record_request_guest_mask`), because the kernel's
+    /// `SigBlk` may then be the in-guest runtime's mask; and those two readers
+    /// take it too (`read_thread_blocked_mask_result`).
     saved_guest_sigmasks: BTreeMap<DetTid, u64>,
 
     /// Each thread's mask as Detcore's signal-state copy holds it, published
@@ -4087,6 +4105,7 @@ impl Scheduler {
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.models_signal_targets(),
+            in_guest_signal_delivery: cfg.in_guest_signal_delivery,
             host_timed_signals: Default::default(),
             host_timed_signals_everywhere: startup_host_timed_signals(cfg),
             #[cfg(test)]
@@ -6625,6 +6644,27 @@ impl Scheduler {
     /// `SigBlk` its `/proc` status reports.
     pub(crate) fn published_guest_sigmask(&self, dettid: DetTid) -> Option<u64> {
         self.saved_guest_sigmasks.get(&dettid).copied()
+    }
+
+    /// Under the in-guest delivery gate only (A5 step 3c.1b, design 18.16.1
+    /// section 6), make `saved_guest_sigmasks` hold for `dettid` exactly the
+    /// guest mask `rs` publishes (`Resources::guest_signal_mask`), as the
+    /// request is filed and before the scheduler can act on it: the mask, or
+    /// for a request that knows none (`None`) nothing, so that readers take
+    /// `SigBlk` rather than a mask an earlier request published. With the gate
+    /// off nothing changes, whatever the request carries. Returns whether the
+    /// entry was set from `rs`.
+    ///
+    /// A rejoin (`Resources::is_rejoin`) is not recorded here: it is filed at
+    /// a moment host timing chooses, while the thread is still outside the
+    /// schedule, where the mask recorded at its call's request holds (design
+    /// 18.16: the guest mask at the call's request). Its publication is
+    /// recorded when the thread is readmitted, an ordered step-2 point
+    /// (`keep_mask_for_continuation`).
+    pub(crate) fn record_request_guest_mask(&mut self, dettid: DetTid, rs: &Resources) -> bool {
+        self.in_guest_signal_delivery
+            && !rs.is_rejoin()
+            && self.set_saved_guest_sigmask(dettid, rs.guest_signal_mask)
     }
 
     /// Record (`Some`) or clear (`None`) the mask Linux's `blocked` holds for
@@ -10848,7 +10888,11 @@ impl Scheduler {
 
     /// `state`, with its mask replaced by the guest's own that `dettid`
     /// published while Detcore holds it under a private blocking mask
-    /// (`saved_guest_sigmasks`), if any.
+    /// (`saved_guest_sigmasks`), if any. Under the in-guest delivery gate that
+    /// map also holds the mask published at the thread's latest request
+    /// (`record_request_guest_mask`), so the poll's signals are those that
+    /// mask leaves unblocked rather than the in-guest runtime's; with nothing
+    /// published, `state` is kept as read (`SigBlk`).
     fn under_published_mask(&self, dettid: DetTid, state: KernelSignalState) -> KernelSignalState {
         match self.saved_guest_sigmasks.get(&dettid) {
             Some(mask) => KernelSignalState {
@@ -11253,7 +11297,9 @@ impl Scheduler {
     /// committed (`BlockedPool::out_of_scheduler_masks`); for a thread
     /// readmitted from there whose call a signal ended, the call's temporary
     /// mask until its continuation turn (`BlockedPool::continuation_masks`);
-    /// and otherwise the kernel's (`SigBlk`) for a thread stopped at a request.
+    /// and otherwise the kernel's (`SigBlk`) for a thread stopped at a request,
+    /// or under the in-guest delivery gate the mask it published at its latest
+    /// request (`read_thread_blocked_mask_result`).
     fn thread_signal_mask(&self, thread: DetTid) -> Option<u64> {
         self.recorded_signal_mask(thread)
             .unwrap_or_else(|| self.read_thread_blocked_mask(thread))
@@ -11292,22 +11338,40 @@ impl Scheduler {
     /// request posted: the mask its call ran with no longer applies, and a
     /// temporary mask the call's signal left installed holds until its
     /// continuation turn (`continuation_masks`).
+    ///
+    /// Under the in-guest delivery gate this readmission, an ordered step-2
+    /// point, is also where the rejoin's published mask takes effect
+    /// (`record_request_guest_mask` does not record a rejoin at its host-timed
+    /// filing): the own mask a call that returned normally restored, or the
+    /// temporary mask a call a signal ended keeps until `rt_sigreturn`. A
+    /// rejoin that publishes none (a temporary mask the scheduler cannot know,
+    /// `blocked_signal_mask_unknown`: `rt_sigsuspend`) leaves the mask its
+    /// call published, its temporary one, as design 18.16 holds for a thread
+    /// readmitted before its continuation turn; `thread_signal_mask` still
+    /// reads it as unknown (`continuation_masks`).
     fn keep_mask_for_continuation(&mut self, dtid: DetTid) {
         let _ = self.blocked.out_of_scheduler_masks.remove(&dtid);
-        let kept = self
+        let filed = self
             .next_turns
             .get(&dtid)
             .and_then(|turn| turn.req.try_read())
-            .and_then(|req| req.ok())
-            .and_then(|req| {
-                if req.blocked_signal_mask_unknown {
-                    Some(None)
-                } else {
-                    req.blocked_signal_mask.map(Some)
-                }
-            });
+            .and_then(|req| req.ok());
+        let kept = filed.as_ref().and_then(|req| {
+            if req.blocked_signal_mask_unknown {
+                Some(None)
+            } else {
+                req.blocked_signal_mask.map(Some)
+            }
+        });
         if let Some(mask) = kept {
             self.blocked.continuation_masks.insert(dtid, mask);
+        }
+        if self.in_guest_signal_delivery
+            && let Some(published) = filed
+                .filter(Resources::is_rejoin)
+                .and_then(|req| req.guest_signal_mask)
+        {
+            self.saved_guest_sigmasks.insert(dtid, published);
         }
     }
 
@@ -11349,7 +11413,20 @@ impl Scheduler {
 
     /// `read_thread_blocked_mask`, keeping the error, which says nothing about
     /// whether the thread still exists (`thread_is_gone` does).
+    ///
+    /// Under the in-guest delivery gate (`in_guest_signal_delivery`), the mask
+    /// `thread` published at its latest request (`record_request_guest_mask`)
+    /// is returned in place of `SigBlk`, which the in-guest runtime's own mask
+    /// may then hold; with nothing published, `SigBlk` is read as before. The
+    /// one reader that needs the kernel's mask itself, the background entry
+    /// barrier (`step2a_wait_for_background_entry`), is armed only under
+    /// `models_signal_targets`, which the gate's backends never have.
     fn read_thread_blocked_mask_result(&self, thread: DetTid) -> Result<u64, Errno> {
+        if self.in_guest_signal_delivery
+            && let Some(published) = self.saved_guest_sigmasks.get(&thread)
+        {
+            return Ok(*published);
+        }
         #[cfg(test)]
         self.test_kernel_mask_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -13253,13 +13330,33 @@ impl Scheduler {
                 // `/proc` names (ptrace and e9patch). On a backend whose IDs are
                 // guest-virtual, a `/proc` read of `dettid` would name an
                 // unrelated host thread or none at all.
+                //
+                // Under the in-guest delivery gate (`in_guest_signal_delivery`,
+                // A5 step 3c.1b) the mask is recorded too, from what this
+                // request published (`Resources::guest_signal_mask`, held in
+                // `saved_guest_sigmasks` since the request was filed,
+                // `record_request_guest_mask`: the call's temporary mask, or
+                // the guest's own as the backend records it), never from
+                // `/proc`, whose `SigBlk` may be the in-guest runtime's: the
+                // guest mask at the call's request. A request that published
+                // nothing records an unknown mask (`None`), as
+                // `blocked_signal_mask_unknown` does, so no reader takes the
+                // kernel's. Nothing is armed from it below: arming stays under
+                // `models_signal_targets`.
                 let own_mask = self
                     .models_signal_targets
                     .then(|| self.read_thread_blocked_mask(dettid))
                     .flatten();
-                let sleeping_mask = self
-                    .models_signal_targets
-                    .then_some(blocked_signal_mask.or(own_mask));
+                let sleeping_mask = if self.models_signal_targets {
+                    Some(blocked_signal_mask.or(own_mask))
+                } else if self.in_guest_signal_delivery {
+                    Some(
+                        blocked_signal_mask
+                            .or_else(|| self.saved_guest_sigmasks.get(&dettid).copied()),
+                    )
+                } else {
+                    None
+                };
                 // A call that will sleep under a temporary mask other than the
                 // thread's own makes step2 wait until the kernel has installed
                 // it (`background_entry_barriers`).
@@ -13307,7 +13404,9 @@ impl Scheduler {
                 }
                 if let Some(signal) = self.blocked.signaled_sigsuspend_requests.remove(&dettid) {
                     self.arm_signaled_background(dettid, signal);
-                } else if let Some(Some(mask)) = sleeping_mask {
+                } else if self.models_signal_targets
+                    && let Some(Some(mask)) = sleeping_mask
+                {
                     self.arm_for_waiting_scheduler_signal(dettid, mask);
                 }
                 Err(SkipTurn)
@@ -25302,6 +25401,339 @@ mod test {
                 .block_for_one_resource(thread, &rid, &Permission::RW, None, mask, &Ivar::new())
                 .is_err()
         );
+    }
+
+    /// An in-guest scheduler (no signal-target modelling) with the in-guest
+    /// delivery gate `gate` (A5 step 3c.1b): process 100 whose threads are
+    /// 100 and 101, both stopped at a request. 101's kernel `SigBlk` is
+    /// `kernel`, as the in-guest runtime's mask would make it.
+    fn in_guest_publication_family(gate: bool, kernel: u64) -> (Scheduler, DetTid, DetTid) {
+        let mut config = Config {
+            sequentialize_threads: true,
+            max_timeslice: None,
+            in_guest_signal_delivery: gate,
+            ..Config::default()
+        };
+        config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
+        let mut scheduler = Scheduler::new(&config);
+        assert!(!scheduler.models_signal_targets);
+        assert_eq!(scheduler.in_guest_signal_delivery, gate);
+        let parent = DetTid::from_raw(100);
+        let thread = DetTid::from_raw(101);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, thread, false);
+        for known in [parent, thread] {
+            register_known_thread(&mut scheduler, known);
+        }
+        scheduler.test_kernel_signal_states.insert(
+            thread,
+            KernelSignalState {
+                blocked: kernel,
+                ..Default::default()
+            },
+        );
+        (scheduler, parent, thread)
+    }
+
+    /// A request of `thread` that publishes `mask`.
+    fn publishing_request(thread: DetTid, mask: Option<u64>) -> Resources {
+        let mut request = Resources::new(thread);
+        request.guest_signal_mask = mask;
+        request
+    }
+
+    /// Under the in-guest delivery gate, every reader of a thread's mask that
+    /// would otherwise take the kernel's `SigBlk` takes the mask the thread
+    /// published at its latest request (`read_thread_blocked_mask_result`,
+    /// and through it `thread_signal_mask` and `thread_signal_mask_for`), as
+    /// does a restartable poll's filter (`under_published_mask`). With nothing
+    /// published, `SigBlk`, including after a later request that publishes
+    /// nothing. With the gate off, `SigBlk` throughout, as before.
+    /// Mutations: the gate test removed from `read_thread_blocked_mask_result`
+    /// (the kernel's mask is read under the gate), or the record made
+    /// unconditional (a published mask is read with the gate off).
+    #[test]
+    fn under_the_gate_a_threads_mask_is_the_one_its_latest_request_published() {
+        let kernel = kernel_signal_bit(libc::SIGUSR1) | kernel_signal_bit(libc::SIGCHLD);
+        let published = kernel_signal_bit(libc::SIGUSR2);
+        for gate in [true, false] {
+            let (mut scheduler, _parent, thread) = in_guest_publication_family(gate, kernel);
+            assert_eq!(
+                scheduler.thread_signal_mask(thread),
+                Some(kernel),
+                "gate {gate}"
+            );
+            assert_eq!(
+                scheduler.record_request_guest_mask(
+                    thread,
+                    &publishing_request(thread, Some(published))
+                ),
+                gate
+            );
+            let want = if gate { published } else { kernel };
+            assert_eq!(scheduler.read_thread_blocked_mask_result(thread), Ok(want));
+            assert_eq!(scheduler.thread_signal_mask(thread), Some(want));
+            assert_eq!(
+                scheduler.thread_signal_mask_for(thread, libc::SIGUSR1),
+                Some(want)
+            );
+            let state = KernelSignalState {
+                blocked: kernel,
+                ..Default::default()
+            };
+            assert_eq!(scheduler.under_published_mask(thread, state).blocked, want);
+            // A later request that publishes nothing leaves nothing published
+            // under the gate: `SigBlk` again.
+            assert_eq!(
+                scheduler.record_request_guest_mask(thread, &publishing_request(thread, None)),
+                gate
+            );
+            assert_eq!(
+                scheduler.thread_signal_mask(thread),
+                Some(kernel),
+                "gate {gate}"
+            );
+        }
+    }
+
+    /// Under the in-guest delivery gate, a rejoin (`BlockedExternalContinue`)
+    /// is filed at a moment host timing chooses, while its thread is still
+    /// outside the schedule: filing it changes nothing the scheduler holds,
+    /// and the mask published at the call's request stays. When step 2c
+    /// readmits the thread (`step2c_process_io_blockers`, through
+    /// `keep_mask_for_continuation`), an ordered point, the rejoin's
+    /// publication takes effect, so between readmission and the continuation
+    /// turn the readers (`read_thread_blocked_mask_result`,
+    /// `sibling_signal_state`) see:
+    /// - a temporary-mask call that returned normally (`Restored`, a masked
+    ///   `pselect6` with more than 64 descriptors): the own mask Linux
+    ///   restored before it returned;
+    /// - one a signal ended (`Temporary`): the temporary mask, kept until
+    ///   `rt_sigreturn`;
+    /// - `rt_sigsuspend` (`Unknown`, publishing nothing): the temporary mask
+    ///   its call published, as design 18.16 holds for a readmitted thread,
+    ///   while `thread_signal_mask` reads it as unknown (`continuation_masks`).
+    ///
+    /// With the gate off nothing is recorded at either point. Mutations:
+    /// recording only at the continuation turn's grant (the readmitted window
+    /// keeps the temporary mask for `Restored`), and recording at filing (the
+    /// mask changes while the thread is out).
+    #[test]
+    fn under_the_gate_a_rejoin_publishes_at_its_readmission_not_at_its_filing() {
+        let own = kernel_signal_bit(libc::SIGUSR2);
+        let temporary = kernel_signal_bit(libc::SIGTERM);
+        for gate in [true, false] {
+            for (n, kind) in ["restored", "temporary", "unknown"].into_iter().enumerate() {
+                let case = format!("{kind}, gate {gate}");
+                let (mut scheduler, _parent, thread) = in_guest_publication_family(gate, !0);
+                let op = ExternalOpId::new(thread, n as u64 + 1);
+                let mut call = publishing_request(thread, Some(temporary));
+                call.blocked_signal_mask = Some(temporary);
+                call.insert(
+                    if kind == "unknown" {
+                        ResourceID::BlockingRtSigsuspend(op)
+                    } else {
+                        ResourceID::BlockingExternalIO(op)
+                    },
+                    Permission::RW,
+                );
+                scheduler.record_request_guest_mask(thread, &call);
+                scheduler.runqueue_push_back(thread);
+                assert_eq!(scheduler.run_queue.tentative_pop_tid(thread), Some(thread));
+                assert!(
+                    scheduler
+                        .step4_resource_block(thread, &call, &Ivar::new())
+                        .is_err(),
+                    "{case}: the call runs outside the schedule"
+                );
+                let held = gate.then_some(temporary);
+                assert_eq!(scheduler.published_guest_sigmask(thread), held, "{case}");
+                // The call returns and the thread files its rejoin, as
+                // `record_or_replay_blocking` builds it, while it is still out.
+                let mut rejoin = Resources::new(thread);
+                rejoin.insert(ResourceID::BlockedExternalContinue(op), Permission::RW);
+                match kind {
+                    "restored" => rejoin.guest_signal_mask = Some(own),
+                    "temporary" => {
+                        rejoin.blocked_signal_mask = Some(temporary);
+                        rejoin.guest_signal_mask = Some(temporary);
+                    }
+                    _ => rejoin.blocked_signal_mask_unknown = true,
+                }
+                if !gate {
+                    rejoin.guest_signal_mask = None;
+                }
+                assert!(rejoin.is_rejoin());
+                assert!(
+                    !scheduler.record_request_guest_mask(thread, &rejoin),
+                    "{case}"
+                );
+                scheduler.next_turns[&thread].req.put(Ok(rejoin.clone()));
+                assert_eq!(
+                    scheduler.published_guest_sigmask(thread),
+                    held,
+                    "{case}: filing a rejoin changes nothing"
+                );
+                // Step 2c readmits it: an ordered point.
+                assert!(scheduler.step2c_process_io_blockers().is_ok(), "{case}");
+                assert!(
+                    scheduler.run_queue.contains_tid(thread),
+                    "{case}: readmitted"
+                );
+                let readmitted = match (gate, kind) {
+                    (false, _) => None,
+                    (true, "restored") => Some(own),
+                    (true, _) => Some(temporary),
+                };
+                assert_eq!(
+                    scheduler.published_guest_sigmask(thread),
+                    readmitted,
+                    "{case}: what readmission holds"
+                );
+                if gate {
+                    let want = readmitted.unwrap();
+                    assert_eq!(
+                        scheduler.read_thread_blocked_mask_result(thread),
+                        Ok(want),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        scheduler.sibling_signal_state(thread),
+                        SiblingSignalState::InSchedule(Some(want)),
+                        "{case}"
+                    );
+                    if kind == "unknown" {
+                        assert_eq!(scheduler.thread_signal_mask(thread), None, "{case}");
+                    }
+                }
+                // The continuation turn's grant records nothing more.
+                assert!(
+                    scheduler
+                        .step4_resource_block(thread, &rejoin, &Ivar::new())
+                        .is_ok(),
+                    "{case}"
+                );
+                assert_eq!(
+                    scheduler.published_guest_sigmask(thread),
+                    readmitted,
+                    "{case}: after the continuation turn"
+                );
+            }
+            // A failed vfork's rejoin is one too, and is not recorded at its
+            // filing either.
+            let (mut scheduler, _parent, thread) = in_guest_publication_family(gate, !0);
+            let mut failed = publishing_request(thread, Some(own));
+            failed.insert(
+                ResourceID::VforkFailed(ExternalOpId::new(thread, 9)),
+                Permission::RW,
+            );
+            assert!(failed.is_rejoin());
+            assert!(!scheduler.record_request_guest_mask(thread, &failed));
+            assert_eq!(scheduler.published_guest_sigmask(thread), None);
+        }
+    }
+
+    /// Under the in-guest delivery gate, a call granted outside the schedule
+    /// records the mask it sleeps under (`out_of_scheduler_masks`) from what
+    /// its request published: its own mask, or its temporary one, and an
+    /// unknown mask (`None`) when it published none. No `/proc` mask is read
+    /// for it. Nothing is armed from it: with a caught `SIGCHLD` the scheduler
+    /// left in the shared queue that the recorded mask admits, a scheduler
+    /// that models signal targets arms the thread
+    /// (`a_call_that_begins_with_a_scheduler_signal_waiting_is_armed`); under
+    /// the gate it does not, since the arming paths stay under
+    /// `models_signal_targets`. With the gate off nothing is recorded, as
+    /// before. Mutations: the `/proc` read used under the gate (the read count
+    /// moves and the kernel's mask is recorded); the arming moved to the gate
+    /// (the thread is armed).
+    #[test]
+    fn under_the_gate_a_background_grant_records_the_published_mask_and_arms_nothing() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let own = kernel_signal_bit(libc::SIGUSR2);
+        let temporary = kernel_signal_bit(libc::SIGTERM);
+        // What `SigBlk` would show under the in-guest runtime's mask.
+        let kernel = !0_u64;
+        for gate in [true, false] {
+            for (case, rid, blocked, published, want) in [
+                (
+                    "own mask",
+                    ResourceID::BlockingExternalIO(ExternalOpId::new(DetTid::from_raw(101), 1)),
+                    None,
+                    Some(own),
+                    Some(own),
+                ),
+                (
+                    "temporary mask",
+                    ResourceID::BlockingRtSigsuspend(ExternalOpId::new(DetTid::from_raw(101), 2)),
+                    Some(temporary),
+                    Some(temporary),
+                    Some(temporary),
+                ),
+                (
+                    "nothing published",
+                    ResourceID::BlockingExternalIO(ExternalOpId::new(DetTid::from_raw(101), 3)),
+                    None,
+                    None,
+                    None,
+                ),
+            ] {
+                let (mut scheduler, parent, thread) = in_guest_publication_family(gate, kernel);
+                scheduler
+                    .test_signal_masks
+                    .insert((parent, None, "SigCgt"), chld);
+                if let Some(state) = scheduler.test_kernel_signal_states.get_mut(&thread) {
+                    state.shared_pending = chld;
+                }
+                scheduler.note_signal_left_in_shared_queue(parent, libc::SIGCHLD);
+                // The request was filed with its publication
+                // (`record_request_guest_mask`).
+                let mut filed = publishing_request(thread, published);
+                filed.blocked_signal_mask = blocked;
+                scheduler.record_request_guest_mask(thread, &filed);
+                let reads = scheduler
+                    .test_kernel_mask_reads
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                scheduler.runqueue_push_back(thread);
+                assert_eq!(scheduler.run_queue.tentative_pop_tid(thread), Some(thread));
+                assert!(
+                    scheduler
+                        .block_for_one_resource(
+                            thread,
+                            &rid,
+                            &Permission::RW,
+                            None,
+                            blocked,
+                            &Ivar::new()
+                        )
+                        .is_err(),
+                    "{case}"
+                );
+                assert_eq!(
+                    scheduler
+                        .blocked
+                        .out_of_scheduler_masks
+                        .get(&thread)
+                        .copied(),
+                    gate.then_some(want),
+                    "{case}, gate {gate}"
+                );
+                assert_eq!(
+                    scheduler
+                        .test_kernel_mask_reads
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    reads,
+                    "{case}: no /proc mask is read"
+                );
+                assert!(
+                    !scheduler.blocked.signaled_background.contains(&thread),
+                    "{case}, gate {gate}: nothing is armed"
+                );
+                assert!(scheduler.background_entry_barriers.is_empty(), "{case}");
+                if gate {
+                    assert_eq!(scheduler.thread_signal_mask(thread), want, "{case}");
+                }
+            }
+        }
     }
 
     /// Every resource in the published list of kernel-run blocking calls

@@ -90,7 +90,29 @@ pub(super) enum Lookups {
 /// `file_getattr`, `open_tree_attr`) are unknown to Detcore and refused as
 /// such.
 pub(super) fn looked_up(sysno: Sysno) -> Option<Lookups> {
-    let paths = match sysno {
+    if let Some(paths) = path_operands(sysno) {
+        return Some(Lookups::Paths(paths.to_vec()));
+    }
+    match sysno {
+        Sysno::bind | Sysno::connect => Some(Lookups::SocketAddress {
+            address: 1,
+            length: 2,
+            send: false,
+        }),
+        Sysno::sendto => Some(Lookups::SocketAddress {
+            address: 4,
+            length: 5,
+            send: true,
+        }),
+        Sysno::sendmsg => Some(Lookups::MessageAddress),
+        _ => None,
+    }
+}
+
+/// The path operands of a call that looks up paths ([`Lookups::Paths`] of
+/// [`looked_up`]), without allocating; `None` for every other call.
+pub(super) fn path_operands(sysno: Sysno) -> Option<&'static [(Option<usize>, usize)]> {
+    let paths: &'static [(Option<usize>, usize)] = match sysno {
         Sysno::open
         | Sysno::creat
         | Sysno::stat
@@ -118,7 +140,7 @@ pub(super) fn looked_up(sysno: Sysno) -> Option<Lookups> {
         | Sysno::llistxattr
         | Sysno::removexattr
         | Sysno::lremovexattr
-        | Sysno::statfs => vec![(None, 0)],
+        | Sysno::statfs => &[(None, 0)],
         Sysno::openat
         | Sysno::newfstatat
         | Sysno::statx
@@ -133,32 +155,15 @@ pub(super) fn looked_up(sysno: Sysno) -> Option<Lookups> {
         | Sysno::fchmodat2
         | Sysno::fchownat
         | Sysno::utimensat
-        | Sysno::futimesat => vec![(Some(0), 1)],
-        Sysno::symlink => vec![(None, 1)],
-        Sysno::symlinkat => vec![(Some(1), 2)],
-        Sysno::inotify_add_watch => vec![(None, 1)],
-        Sysno::rename | Sysno::link => vec![(None, 0), (None, 1)],
-        Sysno::renameat | Sysno::renameat2 | Sysno::linkat => {
-            vec![(Some(0), 1), (Some(2), 3)]
-        }
-        Sysno::bind | Sysno::connect => {
-            return Some(Lookups::SocketAddress {
-                address: 1,
-                length: 2,
-                send: false,
-            });
-        }
-        Sysno::sendto => {
-            return Some(Lookups::SocketAddress {
-                address: 4,
-                length: 5,
-                send: true,
-            });
-        }
-        Sysno::sendmsg => return Some(Lookups::MessageAddress),
+        | Sysno::futimesat => &[(Some(0), 1)],
+        Sysno::symlink => &[(None, 1)],
+        Sysno::symlinkat => &[(Some(1), 2)],
+        Sysno::inotify_add_watch => &[(None, 1)],
+        Sysno::rename | Sysno::link => &[(None, 0), (None, 1)],
+        Sysno::renameat | Sysno::renameat2 | Sysno::linkat => &[(Some(0), 1), (Some(2), 3)],
         _ => return None,
     };
-    Some(Lookups::Paths(paths))
+    Some(paths)
 }
 
 /// The prefix of the absolute `path` that ends at the first component the
@@ -1203,6 +1208,15 @@ mod tests {
         );
         assert_eq!(looked_up(Sysno::sendmsg), Some(Lookups::MessageAddress));
         assert!(looked_up(Sysno::read).is_none());
+        // The allocation-free form answers the same paths, and only paths.
+        assert_eq!(path_operands(Sysno::openat), Some(&[(Some(0), 1)][..]));
+        assert_eq!(
+            path_operands(Sysno::renameat2),
+            Some(&[(Some(0), 1), (Some(2), 3)][..])
+        );
+        for other in [Sysno::sendto, Sysno::sendmsg, Sysno::bind, Sysno::read] {
+            assert!(path_operands(other).is_none(), "{other}");
+        }
         // Detcore refuses these whatever their path names.
         for refused in [
             Sysno::mount,

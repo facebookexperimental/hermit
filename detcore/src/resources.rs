@@ -716,6 +716,33 @@ pub struct Resources {
     /// publication; it is never a ResourceID, permission or additional turn.
     #[serde(default)]
     pub(crate) slice_boundary: Option<Box<detcore_model::schedule::boundary::Boundary>>,
+    /// The guest's signal mask as this request publishes it, under the
+    /// in-guest delivery gate (`Config::in_guest_signal_delivery`; A5 step
+    /// 3c.1b, design 18.16.1 section 6,
+    /// <https://github.com/rrnewton/hermit/issues/4485>): the mask Linux's
+    /// `blocked` holds for the thread while it is stopped at this request,
+    /// where the kernel's `SigBlk` may be the in-guest runtime's own. For a
+    /// call that sleeps under a temporary mask (`blocked_signal_mask`) it is
+    /// that mask; otherwise it is the backend's record of the guest's mask
+    /// (`Guest::resume_signal_mask`), with signal phase 1's virtual SIGALRM
+    /// bit in a process that handles SIGALRM. Filled by
+    /// `tool_global::publish_request_guest_mask` just before the request is
+    /// sent, and recorded by the scheduler into `saved_guest_sigmasks`
+    /// (`Scheduler::record_request_guest_mask`) as the request is filed, or,
+    /// for a rejoin filed at a moment host timing chooses
+    /// (`Resources::is_rejoin`), when the thread is readmitted
+    /// (`Scheduler::keep_mask_for_continuation`).
+    ///
+    /// `None` with the gate off (every run today), on a request that does not
+    /// pass through that function, when the backend keeps no guest mask apart
+    /// (every backend before step 3c.1e), and when the call's temporary mask
+    /// could not be read (`blocked_signal_mask_unknown`). Under the gate a
+    /// `None` leaves the scheduler holding no published mask for the thread,
+    /// so its readers take `SigBlk`. Appended last and
+    /// `#[serde(default)]`, with no `skip_serializing_if`: `Resources`
+    /// travels in bincode RPCs, which decode by position.
+    #[serde(default)]
+    pub(crate) guest_signal_mask: Option<u64>,
 }
 
 impl fmt::Debug for Resources {
@@ -777,6 +804,9 @@ impl fmt::Debug for Resources {
         if let Some(boundary) = &self.slice_boundary {
             debug.field("slice_boundary", boundary);
         }
+        if let Some(mask) = self.guest_signal_mask {
+            debug.field("guest_signal_mask", &mask);
+        }
         debug.finish()
     }
 }
@@ -822,6 +852,7 @@ impl Resources {
             continues_sigreturn: false,
             private_sigchld_decides: false,
             slice_boundary: None,
+            guest_signal_mask: None,
         }
     }
 
@@ -860,6 +891,12 @@ impl Resources {
             (Some(_), None) => {}
         }
         self.blocked_signal_mask_unknown |= other.blocked_signal_mask_unknown;
+        // Both parts are the same thread's, stopped at the same request.
+        match (self.guest_signal_mask, other.guest_signal_mask) {
+            (None, mask) => self.guest_signal_mask = mask,
+            (Some(left), Some(right)) => assert_eq!(left, right),
+            (Some(_), None) => {}
+        }
         if self.signal_state_task.is_none() {
             self.signal_state_task = other.signal_state_task;
         }
@@ -890,6 +927,19 @@ impl Resources {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
+    }
+
+    /// Whether this is the rejoin a thread files when its call outside the
+    /// schedule returns (`ResourceID::BlockedExternalContinue`, or
+    /// `ResourceID::VforkFailed` for a failed vfork): filed at a moment host
+    /// timing chooses, and taken when the scheduler readmits the thread.
+    pub(crate) fn is_rejoin(&self) -> bool {
+        self.resources.keys().any(|resource| {
+            matches!(
+                resource,
+                ResourceID::BlockedExternalContinue(_) | ResourceID::VforkFailed(_)
+            )
+        })
     }
 
     /// Return the owner snapshot only for an unmodified singleton sleep.
