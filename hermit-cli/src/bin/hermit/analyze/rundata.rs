@@ -45,6 +45,8 @@ use crate::app::analyze::types::TrialTimeout;
 use crate::app::container::RunTimeoutMarker;
 use crate::app::global_opts::GlobalOpts;
 use crate::app::run::RunOpts;
+use crate::app::analyze::types::ContinuationTimeslice;
+use crate::app::analyze::stop;
 
 /// A single run plus the results of the run, either in memory or on disk.
 pub struct RunData {
