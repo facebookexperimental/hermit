@@ -43,6 +43,9 @@ run_strict() {
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Staged sources need not include Git metadata or a Cargo toolchain.
+# Set COMPRESSION_SOURCE_IDENTITY=content with an explicit HERMIT_BIN to identify
+# staged runner/tool bytes without claiming a repository revision. The default
+# revision mode uses COMPRESSION_SOURCE_REVISION when set, otherwise Git.
 repo_root=${COMPRESSION_REPO_ROOT:-$script_dir/../../../..}
 repo_root=$(cd "$repo_root" && pwd) || fail "invalid compression repository root"
 [[ $repo_root/hermit-cli/tests/fixtures/compression/run.sh -ef ${BASH_SOURCE[0]} ]] ||
@@ -51,6 +54,12 @@ hermit_bin=${HERMIT_BIN-$repo_root/target/release/hermit}
 artifact_root=${COMPRESSION_ARTIFACT_ROOT:-$repo_root/target/compression}
 runs=${COMPRESSION_RUNS:-3}
 input_lines=${COMPRESSION_INPUT_LINES:-24000}
+source_identity=${COMPRESSION_SOURCE_IDENTITY-revision}
+
+case "$source_identity" in
+  revision | content) ;;
+  *) fail "COMPRESSION_SOURCE_IDENTITY must be revision or content: $source_identity" ;;
+esac
 
 require_positive_integer COMPRESSION_RUNS "$runs"
 require_positive_integer COMPRESSION_INPUT_LINES "$input_lines"
@@ -60,7 +69,13 @@ for tool in awk basename bzip2 bzip2recover cat cmp cp date gzip mkdir seq sha25
   command -v "$tool" >/dev/null || fail "required command not found: $tool"
 done
 
-if [[ ${COMPRESSION_SOURCE_REVISION+x} ]]; then
+if [[ $source_identity == content ]]; then
+  [[ ! ${COMPRESSION_SOURCE_REVISION+x} ]] ||
+    fail "unset COMPRESSION_SOURCE_REVISION when COMPRESSION_SOURCE_IDENTITY=content"
+  [[ -n ${HERMIT_BIN-} && -f $hermit_bin && -x $hermit_bin ]] ||
+    fail "COMPRESSION_SOURCE_IDENTITY=content requires HERMIT_BIN to name an executable file"
+  repository_commit_source=unavailable-staged
+elif [[ ${COMPRESSION_SOURCE_REVISION+x} ]]; then
   [[ -n $COMPRESSION_SOURCE_REVISION ]] || fail "COMPRESSION_SOURCE_REVISION must not be empty"
   repository_commit=$COMPRESSION_SOURCE_REVISION
   repository_commit_source=explicit
@@ -86,6 +101,17 @@ if [[ ! -x $hermit_bin ]]; then
 fi
 [[ -x $hermit_bin ]] || fail "Hermit binary is not executable: $hermit_bin"
 
+# Assign before printing metadata so a failed hash cannot be hidden by printf.
+hermit_sha256=$(sha256_file "$hermit_bin")
+if [[ $source_identity == content ]]; then
+  # The input generator is inline below; this is the only source file read.
+  # These hashes identify observed files, not an archived runtime environment.
+  runner_sha256=$(sha256_file "${BASH_SOURCE[0]}")
+  bzip2_sha256=$(sha256_file "$bzip2_bin")
+  bzip2recover_sha256=$(sha256_file "$bzip2recover_bin")
+  gzip_sha256=$(sha256_file "$gzip_bin")
+fi
+
 export LC_ALL=C
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 evidence_dir=$artifact_root/evidence-$timestamp
@@ -107,7 +133,16 @@ metadata=$evidence_dir/metadata.txt
 {
   printf 'schema_version=1\n'
   printf 'started_at_utc=%s\n' "$timestamp"
-  printf 'repository_commit=%s\n' "$repository_commit"
+  if [[ $source_identity == content ]]; then
+    printf 'source_identity=content-sha256\n'
+    printf 'runner_sha256=%s\n' "$runner_sha256"
+    printf 'bzip2_sha256=%s\n' "$bzip2_sha256"
+    printf 'bzip2recover=%s\n' "$bzip2recover_bin"
+    printf 'bzip2recover_sha256=%s\n' "$bzip2recover_sha256"
+    printf 'gzip_sha256=%s\n' "$gzip_sha256"
+  else
+    printf 'repository_commit=%s\n' "$repository_commit"
+  fi
   printf 'repository_commit_source=%s\n' "$repository_commit_source"
   printf 'host_kernel=%s\n' "$(uname -srmo)"
   printf 'runs=%s\n' "$runs"
@@ -115,7 +150,7 @@ metadata=$evidence_dir/metadata.txt
   printf 'input_bytes=%s\n' "$input_bytes"
   printf 'input_sha256=%s\n' "$input_sha256"
   printf 'hermit=%s\n' "$hermit_bin"
-  printf 'hermit_sha256=%s\n' "$(sha256_file "$hermit_bin")"
+  printf 'hermit_sha256=%s\n' "$hermit_sha256"
   printf 'bzip2=%s\n' "$bzip2_bin"
   printf 'gzip=%s\n' "$gzip_bin"
   printf 'gzip_flags=-n -9 -c\n'
