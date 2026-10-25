@@ -117,6 +117,10 @@ impl InterceptedCpuid {
                 profile: CpuProfile::HostNoRdrand,
                 xsave: [[0; 4]; XSAVE_SUBLEAVES],
             },
+            CpuProfile::Auto => panic!(
+                "--cpu-profile auto reached Detcore unresolved; the CLI resolves it to a named \
+                 profile before launch"
+            ),
         }
     }
 
@@ -288,6 +292,7 @@ impl InterceptedCpuid {
             // The virtual profiles' fixed vulnerability lists describe their
             // invented CPUs, not this host. Do not invent a host bug list.
             CpuProfile::HostNoRdrand => "",
+            CpuProfile::Auto => unreachable!("`Self::for_config` never builds an auto table"),
         };
         (0..cpus)
             .flat_map(|cpu| {

@@ -748,6 +748,7 @@ pub fn v3_feature_words() -> Vec<(u32, u32, usize, u32)> {
 pub fn cpu_profile_admission_refusal(cfg: &Config) -> Option<&'static str> {
     use detcore_model::cpu_profile::CpuProfile;
     match cfg.cpu_profile {
+        CpuProfile::Auto => Some("auto was not resolved to a named profile before launch"),
         CpuProfile::X86_64V3 if cfg.cpu_profile_host.is_none() => {
             Some("the configuration carries no qualified host facts")
         }

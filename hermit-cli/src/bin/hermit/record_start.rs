@@ -629,6 +629,25 @@ impl StartOpts {
         global: &GlobalOpts,
         preparation: RecordPreparation<'_>,
     ) -> Result<ExitStatus, Error> {
+        // `--cpu-profile auto` records the named profile it resolves to
+        // (`hermit::cpu_profile_admission::resolve_auto`), so replay uses
+        // that profile and never derives it again.
+        if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::Auto {
+            let program = self.guest_command()?.find_program().with_context(|| {
+                format!("Could not resolve program {:?} in PATH", self.program())
+            })?;
+            let (profile, why) =
+                hermit::cpu_profile_admission::resolve_auto(&program, Path::to_path_buf).map_err(
+                    |why| {
+                        Error::new(crate::container::PolicyRefusal)
+                            .context(format!("--cpu-profile auto refused: {why}"))
+                    },
+                )?;
+            eprintln!("hermit: --cpu-profile auto resolved to {profile}: {why}");
+            let mut resolved = self.clone();
+            resolved.cpu_profile = profile;
+            return resolved.main(global);
+        }
         hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
             |refusal| Error::new(crate::app::container::PolicyRefusal).context(refusal.to_string()),
         )?;

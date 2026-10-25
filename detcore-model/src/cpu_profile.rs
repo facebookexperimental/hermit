@@ -41,6 +41,16 @@ pub enum CpuProfile {
     #[value(name = "host-no-rdrand")]
     #[serde(rename = "host-no-rdrand")]
     HostNoRdrand,
+    /// The lowest named profile the guest's image and its program
+    /// interpreter declare they need (`GNU_PROPERTY_X86_ISA_1_NEEDED`):
+    /// x86-64-v2 where neither declares more, x86-64-v3 where one declares
+    /// v3. Opt-in, never the default. The CLI resolves it to that named
+    /// profile before qualification and launch, so a run's configuration
+    /// and a recording only ever hold the named profile, and replay uses it
+    /// without deriving it again.
+    #[value(name = "auto")]
+    #[serde(rename = "auto")]
+    Auto,
 }
 
 impl CpuProfile {
@@ -56,18 +66,31 @@ impl CpuProfile {
             CpuProfile::X86_64V2 => "x86-64-v2",
             CpuProfile::X86_64V3 => "x86-64-v3",
             CpuProfile::HostNoRdrand => "host-no-rdrand",
+            CpuProfile::Auto => "auto",
+        }
+    }
+
+    /// The lowest named profile presenting x86-64 level `level` (as an ISA
+    /// needed property numbers them: 1 baseline, 2 v2, 3 v3, 4 v4), or `None`
+    /// for a level no profile presents.
+    pub fn lowest_presenting(level: u8) -> Option<CpuProfile> {
+        match level {
+            0..=2 => Some(CpuProfile::X86_64V2),
+            3 => Some(CpuProfile::X86_64V3),
+            _ => None,
         }
     }
 
     /// The x86-64 microarchitecture level this profile's fixed table
     /// presents (2 or 3), against which a guest image's declared need is
     /// compared. `None` for host-no-rdrand, whose features are the host's:
-    /// no fixed level describes them.
+    /// no fixed level describes them; and for auto, which names no table
+    /// until the CLI resolves it.
     pub fn x86_64_level(&self) -> Option<u8> {
         match self {
             CpuProfile::X86_64V2 => Some(2),
             CpuProfile::X86_64V3 => Some(3),
-            CpuProfile::HostNoRdrand => None,
+            CpuProfile::HostNoRdrand | CpuProfile::Auto => None,
         }
     }
 }
@@ -161,8 +184,12 @@ pub const HOST_NO_RDRAND_RESIDUAL: &str = host_no_rdrand_residual!();
 
 /// The long help of `--cpu-profile`, for `hermit run` and `hermit record start`.
 pub const CPU_PROFILE_LONG_HELP: &str = concat!(
-    "The CPU the guest sees: x86-64-v2 (the default), x86-64-v3, or host-no-rdrand. \
-     host-no-rdrand is available for `hermit run` on the ptrace backend with CPUID \
+    "The CPU the guest sees: x86-64-v2 (the default), x86-64-v3, host-no-rdrand, or auto. \
+     auto picks the lowest of x86-64-v2 and x86-64-v3 that satisfies what the guest's \
+     executable and its program interpreter declare they need (GNU_PROPERTY_X86_ISA_1_NEEDED), \
+     x86-64-v2 where nothing is declared; the chosen profile is what runs, is qualified like an \
+     explicit one, and is what a recording holds. A later exec of an image needing more is \
+     refused, never upgraded. host-no-rdrand is available for `hermit run` on the ptrace backend with CPUID \
      faulting and virtual time; it refuses hosts without CPUID faulting instead of \
      allowing native CPUID. RDRAND and RDSEED are hidden. Check availability with \
      `hermit host-capabilities --cpu-profile host-no-rdrand`. Recording and replay \
@@ -182,6 +209,25 @@ mod tests {
     use clap::ValueEnum;
 
     use super::*;
+
+    #[test]
+    fn the_lowest_profile_presenting_a_level() {
+        for (level, profile) in [
+            (0, Some(CpuProfile::X86_64V2)),
+            (1, Some(CpuProfile::X86_64V2)),
+            (2, Some(CpuProfile::X86_64V2)),
+            (3, Some(CpuProfile::X86_64V3)),
+            (4, None),
+            (5, None),
+        ] {
+            assert_eq!(CpuProfile::lowest_presenting(level), profile, "{level}");
+            if let Some(profile) = profile {
+                assert!(profile.x86_64_level().unwrap() >= level.max(2));
+            }
+        }
+        assert_eq!(CpuProfile::Auto.x86_64_level(), None);
+        assert!(!CpuProfile::Auto.is_default());
+    }
 
     #[test]
     fn names_round_trip_on_the_command_line_and_in_serde() {

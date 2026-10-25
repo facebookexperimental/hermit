@@ -432,6 +432,11 @@ impl IsaNeeds {
         Self::parse(&header, None, read_exact)
     }
 
+    /// [`Self::read_file`] of the file at `path`.
+    pub fn read_path(path: &Path) -> Option<Self> {
+        Self::read_file(&crate::util::RawFd::open(path, libc::O_RDONLY).ok()?)
+    }
+
     /// What the image a process has mapped at load bias `bias` declares,
     /// read through `read_memory(address, buffer)` from the process's memory:
     /// the bytes the loader itself reads its properties from. Its file header
@@ -632,6 +637,97 @@ pub fn first_needing_above<'a>(
         Some(IsaNeeds::Level(needed)) if needed > level => Some((what, needed)),
         _ => None,
     })
+}
+
+/// The program interpreter (`PT_INTERP`) the x86-64 ELF64 image at `path`
+/// names: `Ok(None)` for an image naming none, an error for a file that is
+/// not one or whose `PT_INTERP` is unreadable. Read as the kernel reads it:
+/// at most a page, up to its terminating NUL.
+pub fn program_interpreter(path: &Path) -> Result<Option<PathBuf>, &'static str> {
+    use std::os::unix::ffi::OsStrExt;
+    let file = crate::util::RawFd::open(path, libc::O_RDONLY).map_err(|_| "unreadable")?;
+    let read_exact = |offset: u64, buffer: &mut [u8]| {
+        (file.read_at(buffer, offset).ok()? == buffer.len()).then_some(())
+    };
+    let mut header = [0_u8; 64];
+    read_exact(0, &mut header).ok_or("shorter than an ELF header")?;
+    let u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
+    let u64_at = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
+    if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 || u16_at(18) != EM_X86_64 {
+        return Err("not an x86-64 ELF64 image");
+    }
+    let (phoff, phentsize, phnum) = (u64_at(32), usize::from(u16_at(54)), u16_at(56));
+    if phentsize < 56 {
+        return Err("program headers too small");
+    }
+    let mut entry = vec![0_u8; phentsize];
+    for index in 0..u64::from(phnum) {
+        let offset = (index * phentsize as u64)
+            .checked_add(phoff)
+            .ok_or("program headers past the address space")?;
+        read_exact(offset, &mut entry).ok_or("program headers past the end of the file")?;
+        if u32::from_le_bytes(entry[..4].try_into().unwrap()) != 3 {
+            continue; // Not PT_INTERP.
+        }
+        let field = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
+        let size = field(32);
+        if size == 0 || size > PAGE_SIZE {
+            return Err("a PT_INTERP that is empty or larger than a page");
+        }
+        let mut name = vec![0_u8; size as usize];
+        read_exact(field(8), &mut name).ok_or("a PT_INTERP past the end of the file")?;
+        let end = name
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(name.len());
+        return Ok(Some(PathBuf::from(std::ffi::OsStr::from_bytes(
+            &name[..end],
+        ))));
+    }
+    Ok(None)
+}
+
+/// The named profile `--cpu-profile auto` resolves to for an exec of
+/// `objects`, each `(what, declaration)`: the lowest presenting the highest
+/// level any declares, x86-64-v2 where none declares one, with why. An
+/// object unread or malformed, or a level no profile presents, refuses with
+/// why: auto never guesses.
+pub fn auto_profile(
+    objects: &[(String, Option<IsaNeeds>)],
+) -> Result<(detcore_model::cpu_profile::CpuProfile, String), String> {
+    use detcore_model::cpu_profile::CpuProfile;
+    let mut highest: Option<(&str, u8)> = None;
+    for (what, needs) in objects {
+        match needs {
+            None => return Err(format!("{what} is unreadable or not an x86-64 ELF64 image")),
+            Some(IsaNeeds::Malformed(why)) => {
+                return Err(format!(
+                    "{what} declares its x86 ISA level unreadably ({why})"
+                ));
+            }
+            Some(IsaNeeds::Unmarked) => {}
+            Some(IsaNeeds::Level(level)) => {
+                if highest.is_none_or(|(_, highest)| *level > highest) {
+                    highest = Some((what, *level));
+                }
+            }
+        }
+    }
+    let level = highest.map_or(0, |(_, level)| level);
+    let Some(profile) = CpuProfile::lowest_presenting(level) else {
+        let (what, _) = highest.expect("a level above 3 was declared");
+        return Err(format!(
+            "{what} declares that it needs {}, which no CPU profile presents",
+            x86_64_level_name(level)
+        ));
+    };
+    let why = match highest {
+        Some((what, level)) if level > 2 => {
+            format!("{what} declares that it needs {}", x86_64_level_name(level))
+        }
+        _ => "nothing it execs first declares more than x86-64-v2".to_owned(),
+    };
+    Ok((profile, why))
 }
 
 /// The name of x86-64 level `level` as an ISA needed property gives it.
@@ -1068,6 +1164,70 @@ mod tests {
         assert_eq!(x86_64_level_name(3), "x86-64-v3");
         assert_eq!(x86_64_level_name(1), "baseline x86-64");
         assert!(x86_64_level_name(5).contains("above v4"));
+    }
+
+    #[test]
+    fn auto_resolves_the_lowest_profile_satisfying_every_declaration() {
+        use detcore_model::cpu_profile::CpuProfile;
+        let objects = |image, loader| {
+            [
+                ("the executable".to_owned(), image),
+                ("its program interpreter".to_owned(), loader),
+            ]
+        };
+        let (v3, v2, unmarked) = (
+            Some(IsaNeeds::Level(3)),
+            Some(IsaNeeds::Level(2)),
+            Some(IsaNeeds::Unmarked),
+        );
+        assert_eq!(
+            auto_profile(&objects(unmarked, unmarked)).unwrap().0,
+            CpuProfile::X86_64V2
+        );
+        assert_eq!(
+            auto_profile(&objects(v2, unmarked)).unwrap().0,
+            CpuProfile::X86_64V2
+        );
+        let (profile, why) = auto_profile(&objects(unmarked, v3)).unwrap();
+        assert_eq!(profile, CpuProfile::X86_64V3);
+        assert!(why.contains("its program interpreter declares that it needs x86-64-v3"));
+        assert_eq!(
+            auto_profile(&objects(v3, v2)).unwrap().0,
+            CpuProfile::X86_64V3
+        );
+        // Refusals: above every profile, unreadable, malformed.
+        assert!(
+            auto_profile(&objects(Some(IsaNeeds::Level(4)), v3))
+                .unwrap_err()
+                .contains("needs x86-64-v4, which no CPU profile presents")
+        );
+        assert!(
+            auto_profile(&objects(unmarked, None))
+                .unwrap_err()
+                .contains("its program interpreter is unreadable")
+        );
+        assert!(
+            auto_profile(&objects(Some(IsaNeeds::Malformed("a truncated note")), v2))
+                .unwrap_err()
+                .contains("unreadably (a truncated note)")
+        );
+    }
+
+    #[test]
+    fn a_program_interpreter_is_read_from_pt_interp() {
+        // This test binary: whether or not it names one, readable.
+        assert!(program_interpreter(&std::env::current_exe().unwrap()).is_ok());
+        assert!(program_interpreter(Path::new("/proc/self/status")).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("image");
+        let interp = b"/lib64/ld-linux-x86-64.so.2\0".to_vec();
+        fs::write(&image, image_with(EM_X86_64, &[(3, interp)])).unwrap();
+        assert_eq!(
+            program_interpreter(&image),
+            Ok(Some(PathBuf::from("/lib64/ld-linux-x86-64.so.2")))
+        );
+        fs::write(&image, image_with(EM_X86_64, &[])).unwrap();
+        assert_eq!(program_interpreter(&image), Ok(None));
     }
 
     #[test]

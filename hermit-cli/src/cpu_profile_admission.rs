@@ -12,6 +12,9 @@
 //! Every class the v3 startup qualification cannot cover is refused by name.
 //! Neither nondefault profile silently falls back to v2 or native CPUID.
 
+use std::path::Path;
+use std::path::PathBuf;
+
 use detcore_model::cpu_profile::CpuProfile;
 use detcore_model::cpu_profile::HostXstate;
 use nix::sched::CpuSet;
@@ -397,6 +400,15 @@ fn admit_host_no_rdrand_with(
 /// CPUID snapshot. Refuse host mode before writing metadata or launching a
 /// guest rather than accidentally treating it as v3.
 pub fn check_record_or_replay(profile: CpuProfile) -> Result<(), CpuProfileRefusal> {
+    if profile == CpuProfile::Auto {
+        // `record start` resolves auto before this check, so a recording
+        // holds the profile that ran; one claiming auto was never written by
+        // Hermit, and replaying it would derive the profile again.
+        return Err(CpuProfileRefusal::new(
+            profile,
+            "a recording holds the named profile auto resolved to, never auto itself",
+        ));
+    }
     if profile == CpuProfile::HostNoRdrand {
         return Err(CpuProfileRefusal::new(
             profile,
@@ -406,6 +418,45 @@ pub fn check_record_or_replay(profile: CpuProfile) -> Result<(), CpuProfileRefus
         ));
     }
     Ok(())
+}
+
+/// The named profile `--cpu-profile auto` resolves to for a guest program
+/// at host path `program`, with why ([`detcore::exec_record::auto_profile`]):
+/// from the declarations of the image it execs first and of that image's
+/// program interpreter, where `to_host` gives the host path of a path as
+/// the guest names it. A script is read as the kernel reads it, through
+/// its `#!` interpreter (one level). This chooses the profile before
+/// launch; Detcore's check of each executed image and interpreter
+/// (`Detcore::isa_refusal`) is still what refuses a run whose actual
+/// objects need more, so a pathname read here can never admit one.
+pub fn resolve_auto(
+    program: &Path,
+    to_host: impl Fn(&Path) -> PathBuf,
+) -> Result<(CpuProfile, String), String> {
+    use detcore::exec_record::IsaNeeds;
+    let mut image = program.to_path_buf();
+    let mut head = [0_u8; 256];
+    let count = std::fs::File::open(program)
+        .and_then(|mut file| std::io::Read::read(&mut file, &mut head))
+        .map_err(|error| format!("{} is unreadable: {error}", program.display()))?;
+    if let Some(interpreter) = crate::Shebang::interpreter_from_buf(&head[..count]) {
+        image = to_host(&interpreter);
+    }
+    let needs = IsaNeeds::read_path(&image);
+    let mut objects = vec![(format!("the executable {}", image.display()), needs)];
+    if matches!(needs, None | Some(IsaNeeds::Malformed(_))) {
+        // Refused as unreadable or malformed, before its interpreter.
+        return detcore::exec_record::auto_profile(&objects);
+    }
+    match detcore::exec_record::program_interpreter(&image) {
+        Ok(None) => {}
+        Ok(Some(interpreter)) => objects.push((
+            format!("its program interpreter {}", interpreter.display()),
+            IsaNeeds::read_path(&to_host(&interpreter)),
+        )),
+        Err(why) => return Err(format!("{} cannot be read: {why}", image.display())),
+    }
+    detcore::exec_record::auto_profile(&objects)
 }
 
 /// Linux's version as (major, minor), from a `uname -r` release string.
@@ -694,6 +745,12 @@ pub fn refuse_unadmitted_launch(
         return Ok(());
     }
     let refuse = |why: &str| Err(CpuProfileRefusal::new(config.cpu_profile, why));
+    if config.cpu_profile == CpuProfile::Auto {
+        return refuse(
+            "auto was not resolved to a named profile before launch; resolve it with \
+             resolve_auto, as `hermit run` and `hermit record start` do",
+        );
+    }
     if config.cpu_profile == CpuProfile::HostNoRdrand {
         // Library callers can configure the network engine directly, without
         // passing through RunOpts or its early artifact-creation guard.

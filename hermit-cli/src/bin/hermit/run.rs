@@ -10534,6 +10534,7 @@ impl RunOpts {
     /// v3 binds qualified XSTATE facts; host-no-rdrand requires CPUID faulting
     /// without running the v3 XSTATE qualification. A v2 run is untouched.
     fn admit_cpu_profile(&mut self) -> Result<(), Error> {
+        self.resolve_auto_cpu_profile()?;
         let config = &self.det_opts.det_config;
         if config.cpu_profile.is_default() {
             return Ok(());
@@ -10633,6 +10634,34 @@ impl RunOpts {
             "{option} needs a gdbserver, which only the ptrace backend runs: {cause}, so no \
              debugger could attach; {remedy}"
         )))
+    }
+
+    /// Resolve `--cpu-profile auto` to the named profile the guest program
+    /// and its program interpreter need
+    /// (`hermit::cpu_profile_admission::resolve_auto`), before that profile
+    /// is admitted like an explicit one. The configuration, and with it any
+    /// recording and the second run of `--verify`, then holds only the named
+    /// profile. A program auto cannot read is refused by name.
+    fn resolve_auto_cpu_profile(&mut self) -> Result<(), Error> {
+        use detcore_model::cpu_profile::CpuProfile;
+        if self.det_opts.det_config.cpu_profile != CpuProfile::Auto {
+            return Ok(());
+        }
+        let (program, _, rootfs) = self.guest_program_on_host()?;
+        let to_host = |path: &Path| match &rootfs {
+            Some(rootfs) => crate::image::resolve_in_rootfs(rootfs, path),
+            None => match self.mapped_host_program(path) {
+                GuestPathMapping::Mapped(host) => host,
+                GuestPathMapping::Unchanged | GuestPathMapping::Hidden => path.to_path_buf(),
+            },
+        };
+        let (profile, why) = hermit::cpu_profile_admission::resolve_auto(&program, to_host)
+            .map_err(|why| {
+                Error::new(PolicyRefusal).context(format!("--cpu-profile auto refused: {why}"))
+            })?;
+        eprintln!("hermit: --cpu-profile auto resolved to {profile}: {why}");
+        self.det_opts.det_config.cpu_profile = profile;
+        Ok(())
     }
 
     fn refuse_unqualified_liteinst_in_guest_options(&self) -> Result<(), Error> {
@@ -13229,6 +13258,14 @@ impl RunOpts {
     }
 
     fn validate_program(&self) -> Result<(), Error> {
+        let (host, requested, rootfs) = self.guest_program_on_host()?;
+        validate_executable(&host, &requested, rootfs.as_deref())
+    }
+
+    /// Where the guest program is on the host, as [`Self::validate_program`]
+    /// checks it: its host path, the path as the command names it, and the
+    /// image rootfs it resolves in, if any.
+    fn guest_program_on_host(&self) -> Result<(PathBuf, PathBuf, Option<PathBuf>), Error> {
         // PROTOTYPE (--image): the guest program is interpreted inside the
         // materialized OCI rootfs, not on the host filesystem. Resolve and
         // validate it against the rootfs so that image-only binaries (e.g.
@@ -13310,11 +13347,20 @@ impl RunOpts {
             return validate_executable(&in_rootfs, &guest_abs, Some(&rootfs));
         }
 
+            let in_rootfs = crate::image::resolve_in_rootfs(&rootfs, &guest_abs);
+            return Ok((in_rootfs, guest_abs, Some(rootfs)));
+        }
+
+        if self.selected_backend() == Backend::E9patch {
+            let (_, host) = self.resolve_guest_and_host_program()?;
+            return Ok((host, self.program.clone(), None));
+        }
+
         let command = self.guest_command()?;
         let requested = Path::new(command.get_program());
         if requested.is_absolute() {
             if let GuestPathMapping::Mapped(host) = self.mapped_host_program(requested) {
-                return validate_executable(&host, requested, None);
+                return Ok((host, requested.to_path_buf(), None));
             }
             if requested.starts_with(TMP_DIR) && self.tmp.is_none() && requested.exists() {
                 anyhow::bail!(
@@ -13326,6 +13372,7 @@ impl RunOpts {
             }
             self.refuse_program_under_dev_shm(requested)?;
             return validate_executable(requested, requested, None);
+            return Ok((requested.to_path_buf(), requested.to_path_buf(), None));
         }
 
         // ⚠️ SAME FAULT AS THE ABSOLUTE-PATH BRANCH ABOVE, SO THE SAME CODE.
@@ -13353,7 +13400,7 @@ impl RunOpts {
                 )
             })
             .map_err(|error| error.context(GuestProgramFault::NotFound))?;
-        validate_executable(&resolved, requested, None)
+        Ok((resolved, requested.to_path_buf(), None))
     }
 
     fn validate_executable_overlay_source_visibility(&self, source: &Path) -> Result<(), Error> {
@@ -16956,6 +17003,7 @@ impl RunOpts {
                     detcore_model::cpu_profile::CpuProfile::HostNoRdrand => {
                         "--cpu-profile host-no-rdrand"
                     }
+                    detcore_model::cpu_profile::CpuProfile::Auto => "--cpu-profile auto",
                     _ => "--cpu-profile x86-64-v3",
                 },
             ),

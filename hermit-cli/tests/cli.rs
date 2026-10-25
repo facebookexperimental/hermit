@@ -55815,6 +55815,309 @@ fn a_v3_profile_runs_an_image_declaring_v3() {
     assert!(!stdout.contains("ran"), "{stdout}");
 }
 
+/// `--cpu-profile auto` (opt-in, never the default) runs the lowest named
+/// profile that satisfies what the guest's executable and its program
+/// interpreter declare: x86-64-v2 where nothing declares more, named on
+/// stderr. A declaration no profile presents, or an executable auto cannot
+/// read, is refused by policy. HERMIT_CPU_PROFILE=auto selects it too.
+#[test]
+fn auto_resolves_the_lowest_profile_the_guest_declares() {
+    let auto = |image: &Path| {
+        let (status, stdout, stderr) = isa_run(&[
+            "run",
+            "--cpu-profile",
+            "auto",
+            "--",
+            image.to_str().unwrap(),
+        ]);
+        (status, stdout, stderr)
+    };
+    let unmarked = isa_fixture("auto-unmarked", None, 42, IsaLink::Static);
+    let (status, stdout, stderr) = auto(&unmarked);
+    assert_eq!((status, stdout.as_str()), (Some(42), "ran\n"), "{stderr}");
+    assert!(
+        stderr.contains("--cpu-profile auto resolved to x86-64-v2: nothing it execs first"),
+        "{stderr}"
+    );
+    let loader_v2 = isa_fixture("auto-loader-v2", Some(0b11), 43, IsaLink::Interpreter);
+    let on_v2 = isa_fixture("auto-on-v2", None, 44, IsaLink::Interpreted(&loader_v2));
+    let (status, stdout, stderr) = auto(&on_v2);
+    assert_eq!((status, stdout.as_str()), (Some(43), "ran\n"), "{stderr}");
+    assert!(stderr.contains("resolved to x86-64-v2"), "{stderr}");
+    // The environment's default, as an explicit flag would be.
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&["run", "--", unmarked.to_str().unwrap()])
+            .env("HERMIT_CPU_PROFILE", "auto"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(42), "{stderr}");
+    assert!(
+        stderr.contains("--cpu-profile auto resolved to x86-64-v2"),
+        "{stderr}"
+    );
+    // Refusals.
+    let v4 = isa_fixture("auto-v4", Some(0b1111), 42, IsaLink::Static);
+    let (status, stdout, stderr) = auto(&v4);
+    assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
+    assert!(
+        stderr.contains("--cpu-profile auto refused: the executable ")
+            && stderr.contains("declares that it needs x86-64-v4, which no CPU profile presents"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("ran"), "{stdout}");
+    let text = process_build_root("isa-needed").join("auto-not-an-image");
+    fs::write(&text, "not an image\n").unwrap();
+    fs::set_permissions(&text, fs::Permissions::from_mode(0o755)).unwrap();
+    let (status, _, stderr) = auto(&text);
+    assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
+    assert!(
+        stderr.contains("--cpu-profile auto refused: the executable ")
+            && stderr.contains("is unreadable or not an x86-64 ELF64 image"),
+        "{stderr}"
+    );
+}
+
+/// auto chooses once, before the run: a later exec of an image needing more
+/// than the profile it chose is refused by policy, naming the profile to
+/// rerun with, and the run is never upgraded midway.
+#[test]
+fn auto_does_not_upgrade_for_a_later_exec() {
+    let v3 = isa_fixture("auto-later-v3", Some(0b111), 42, IsaLink::Static);
+    let v3 = v3.to_str().unwrap();
+    let (status, stdout, stderr) = isa_run(&[
+        "run",
+        "--cpu-profile",
+        "auto",
+        "--",
+        "/bin/sh",
+        "-c",
+        &format!("echo before; {v3}"),
+    ]);
+    let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{context}");
+    assert!(
+        stderr.contains("--cpu-profile auto resolved to x86-64-v2"),
+        "{context}"
+    );
+    assert!(
+        stderr.contains("--cpu-profile x86-64-v2 refused: the executable of ")
+            && stderr.contains("rerun with --cpu-profile x86-64-v3"),
+        "{context}"
+    );
+    assert!(
+        stdout.starts_with("before") && !stdout.contains("ran"),
+        "{context}"
+    );
+}
+
+/// An image, or an unmarked image's program interpreter, declaring
+/// x86-64-v3 resolves auto to x86-64-v3, which is then qualified like an
+/// explicit one: it runs where the host qualifies, and is refused by the
+/// qualification's name where it does not (`v3_run_or_refusal`).
+#[test]
+fn auto_resolves_v3_for_an_image_or_interpreter_declaring_it() {
+    let v3 = isa_fixture("auto-v3", Some(0b111), 0, IsaLink::Static);
+    let loader_v3 = isa_fixture("auto-loader-v3", Some(0b111), 0, IsaLink::Interpreter);
+    let on_v3 = isa_fixture("auto-on-v3", None, 44, IsaLink::Interpreted(&loader_v3));
+    for (image, what) in [
+        (&v3, "the executable "),
+        (&on_v3, "its program interpreter "),
+    ] {
+        let ran = v3_run_or_refusal(|| {
+            let (status, stdout, stderr) = isa_run(&[
+                "run",
+                "--cpu-profile",
+                "auto",
+                "--",
+                image.to_str().unwrap(),
+            ]);
+            (status, stdout, stderr, ())
+        });
+        let Some((stdout, stderr, ())) = ran else {
+            continue;
+        };
+        assert_eq!(stdout, "ran\n", "{stderr}");
+        assert!(
+            stderr.contains("--cpu-profile auto resolved to x86-64-v3: ")
+                && stderr.contains(what)
+                && stderr.contains("declares that it needs x86-64-v3"),
+            "{stderr}"
+        );
+    }
+}
+
+/// A recording made with `--cpu-profile auto` holds the named profile auto
+/// resolved to, and replay runs that profile without deriving it again. A
+/// recording claiming auto itself is refused.
+#[test]
+fn auto_records_the_resolved_profile_and_replay_uses_it() {
+    for (name, bits) in [
+        ("auto-record-unmarked", None),
+        ("auto-record-v3", Some(0b111)),
+    ] {
+        let image = isa_fixture(name, bits, 0, IsaLink::Static);
+        let image = image.to_str().unwrap();
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let data = directory.path().join("recording");
+        let data_dir = format!("--data-dir={}", data.display());
+        let record = || {
+            let (status, stdout, stderr) = isa_run(&[
+                "record",
+                "start",
+                data_dir.as_str(),
+                "--cpu-profile",
+                "auto",
+                "--",
+                image,
+            ]);
+            (status, stdout, stderr, ())
+        };
+        let expected = if bits.is_some() {
+            if v3_run_or_refusal(record).is_none() {
+                continue;
+            }
+            "x86-64-v3"
+        } else {
+            let (status, stdout, stderr, ()) = record();
+            assert_eq!((status, stdout.as_str()), (Some(0), "ran\n"), "{stderr}");
+            "x86-64-v2"
+        };
+        let metadata_path = fs::read_dir(&data)
+            .expect("failed to read the recording directory")
+            .map(|entry| entry.unwrap().path().join("metadata.json"))
+            .find(|path| path.is_file())
+            .expect("no recording metadata.json");
+        let id = metadata_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .to_owned();
+        let original = fs::read_to_string(&metadata_path).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&original).unwrap();
+        assert_eq!(metadata["cpu_profile"], expected, "{metadata:#}");
+        let replay = || isa_run(&["replay", data_dir.as_str(), "--autopilot", id.as_str()]);
+        let (status, _, stderr) = replay();
+        assert_eq!(status, Some(0), "{name}: replay:\n{stderr}");
+        assert!(!stderr.contains("--cpu-profile auto"), "{stderr}");
+        let mut tampered = metadata.clone();
+        tampered["cpu_profile"] = serde_json::json!("auto");
+        fs::write(&metadata_path, serde_json::to_string(&tampered).unwrap()).unwrap();
+        let (status, _, stderr) = replay();
+        assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
+        assert!(stderr.contains("never auto itself"), "{stderr}");
+        fs::write(&metadata_path, original).unwrap();
+    }
+}
+
+/// Launches `image` through the library under `profile`, by `run` or, with
+/// `output`, `run_with_output`, on a thread with room for a real run: the
+/// exit code, or the error.
+fn library_launch(
+    image: PathBuf,
+    profile: detcore_model::cpu_profile::CpuProfile,
+    output: bool,
+) -> Result<Option<i32>, String> {
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            let config = hermit::DetConfig {
+                cpu_profile: profile,
+                max_timeslice: None,
+                ..Default::default()
+            };
+            let command = reverie::process::Command::new(&image);
+            if output {
+                hermit::run_with_output(command, config, false, &None)
+                    .map(|output| output.status.code())
+            } else {
+                hermit::run(command, config, false, &None).map(|status| status.code())
+            }
+            .map_err(|e| format!("{e:#}"))
+        })
+        .unwrap()
+        .join()
+        .expect("the launching thread failed")
+}
+
+/// Both library launch families, `run` (exit status) and `run_with_output`
+/// (captured output), which reach the guest through different dispatchers,
+/// refuse an unresolved auto profile by name before any backend starts.
+#[test]
+fn library_launches_refuse_an_unresolved_auto_profile() {
+    let image = isa_fixture("library-unmarked", None, 42, IsaLink::Static);
+    let expected = "--cpu-profile auto refused: auto was not resolved to a named profile before \
+                    launch; resolve it with resolve_auto, as `hermit run` and `hermit record \
+                    start` do";
+    for output in [false, true] {
+        assert_eq!(
+            library_launch(
+                image.clone(),
+                detcore_model::cpu_profile::CpuProfile::Auto,
+                output
+            ),
+            Err(expected.to_owned()),
+            "run_with_output: {output}"
+        );
+    }
+}
+
+/// The environment variable that makes
+/// [`library_launch_of_a_declaring_image_child`] launch.
+const ISA_LIBRARY_CHILD: &str = "HERMIT_TEST_ISA_LIBRARY_CHILD";
+
+/// Both library launch families end a default-profile run of an image
+/// declaring x86-64-v3 with the policy exit. The whole-run policy shutdown
+/// ends the calling process, as it ends `hermit run`'s, so each family runs
+/// in a child: this test binary, running only the child test below.
+#[test]
+fn library_launches_refuse_a_declaring_image_with_the_policy_exit() {
+    for family in ["run", "run_with_output"] {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "library_launch_of_a_declaring_image_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ISA_LIBRARY_CHILD, family)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert_eq!(
+            child.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{family}:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("--cpu-profile x86-64-v2 refused: the executable of ")
+                && stderr.contains("declares that it needs x86-64-v3"),
+            "{family}:\n{stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&child.stdout).contains("ran\n"),
+            "{family}"
+        );
+    }
+}
+
+/// The child of [`library_launches_refuse_a_declaring_image_with_the_policy_exit`]:
+/// a no-op unless its variable names a launch family.
+#[test]
+fn library_launch_of_a_declaring_image_child() {
+    let Ok(family) = std::env::var(ISA_LIBRARY_CHILD) else {
+        return;
+    };
+    let image = isa_fixture("library-v3", Some(0b111), 42, IsaLink::Static);
+    let result = library_launch(
+        image,
+        detcore_model::cpu_profile::CpuProfile::X86_64V2,
+        family == "run_with_output",
+    );
+    panic!("{family} returned instead of ending the process: {result:?}");
+}
+
 /// Under `--cpu-profile x86-64-v3` the guest sees the v3 CPU: every v3 feature
 /// advertised and executable, the hypervisor bit, HLE and RTM clear, leaf 0xD
 /// matching XGETBV with XSAVEOPT and the rest of 0xD.1 hidden, an XSAVE of
