@@ -56308,20 +56308,51 @@ fn library_launch(
         .expect("the launching thread failed")
 }
 
+/// The environment variable that makes [`library_auto_default_child`] run.
+const ISA_LIBRARY_AUTO_CHILD: &str = "HERMIT_TEST_ISA_LIBRARY_AUTO_CHILD";
+
 /// Both library launch families, `run` (exit status) and `run_with_output`
 /// (captured output), which reach the guest through different dispatchers,
 /// resolve the ordinary default configuration's auto profile from the
 /// program they launch: an unmarked image runs under x86-64-v2, and an image
 /// declaring x86-64-v3 resolves to it and is then refused by name, as an
-/// explicit v3 is, since the library never qualified the host.
+/// explicit v3 is, since the library never qualified the host. Run in a
+/// child given no HERMIT_CPU_PROFILE, so that the default is the unset one,
+/// whatever this process's environment holds.
 #[test]
 fn library_launches_resolve_an_auto_profile() {
-    if std::env::var_os("HERMIT_CPU_PROFILE").is_none() {
-        assert_eq!(
-            hermit::DetConfig::default().cpu_profile,
-            detcore_model::cpu_profile::CpuProfile::Auto
-        );
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "library_auto_default_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ISA_LIBRARY_AUTO_CHILD, "1")
+        .env_remove("HERMIT_CPU_PROFILE")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        child.status.success() && stdout.contains("test result: ok. 1 passed;"),
+        "{}\nstdout:\n{stdout}\nstderr:\n{}",
+        child.status,
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+/// The child of [`library_launches_resolve_an_auto_profile`]: a no-op unless
+/// its variable is set.
+#[test]
+fn library_auto_default_child() {
+    if std::env::var_os(ISA_LIBRARY_AUTO_CHILD).is_none() {
+        return;
     }
+    assert_eq!(std::env::var_os("HERMIT_CPU_PROFILE"), None);
+    assert_eq!(
+        hermit::DetConfig::default().cpu_profile,
+        detcore_model::cpu_profile::CpuProfile::Auto
+    );
     let unmarked = isa_fixture("library-unmarked", None, 42, IsaLink::Static);
     let v3 = isa_fixture("library-auto-v3", Some(0b111), 42, IsaLink::Static);
     let expected =
@@ -56338,6 +56369,15 @@ fn library_launches_resolve_an_auto_profile() {
             "run_with_output: {output}"
         );
     }
+    // A named profile is kept as named: v2 runs the unmarked image.
+    assert_eq!(
+        library_launch(
+            unmarked,
+            detcore_model::cpu_profile::CpuProfile::X86_64V2,
+            false
+        ),
+        Ok(Some(42))
+    );
 }
 
 /// The environment variable that makes

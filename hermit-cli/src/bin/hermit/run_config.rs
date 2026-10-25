@@ -95,6 +95,7 @@ pub(crate) const EPOCH_KEY: &str = "epoch";
 pub(crate) const SEED_KEY: &str = "seed";
 pub(crate) const SEED_FROM_KEY: &str = "seed-from";
 pub(crate) const PID_BASE_KEY: &str = "pid-base";
+pub(crate) const CPU_PROFILE_KEY: &str = "cpu-profile";
 const REPLAY_NETWORKING_KEY: &str = "replay-networking";
 
 /// One run config document. See the module documentation for the format.
@@ -1716,6 +1717,107 @@ mod tests {
             let (reloaded, _) = parse_at(&expanded, LOADING_CLOCK);
             assert_eq!(parsed(&args), parsed(&reloaded), "--{long}: {manifest:#?}");
         }
+    }
+
+    /// A run whose auto profile resolved saves the resolved profile, so that
+    /// `--config` and `--from` a manifest run that named profile rather than
+    /// resolving again; a named profile is saved as given, and a run that
+    /// resolved nothing saves no profile.
+    #[test]
+    fn a_resolved_auto_profile_is_saved_and_reloads_as_named() {
+        use detcore_model::cpu_profile::CpuProfile;
+        // The parsed run's profile, from its field-by-field rendering.
+        let profile_of = |parsed: &Parsed| {
+            parsed
+                .run
+                .lines()
+                .find(|line| line.trim_start().starts_with("cpu_profile:"))
+                .unwrap_or_else(|| panic!("no cpu_profile in {parsed:?}"))
+                .trim()
+                .to_owned()
+        };
+        let save = |run_args: &[&str], resolved: Option<CpuProfile>| {
+            let argv = argv(&[], run_args, GUEST);
+            let (mut args, matches) = parse_at(&argv, SAVING_CLOCK);
+            let config = capture(
+                &crate::Args::command(),
+                &matches,
+                matches.subcommand_matches(RUN).unwrap(),
+            )
+            .unwrap();
+            let crate::Subcommand::Run(run) = &mut args.command else {
+                panic!("{argv:?} is not a `run` command");
+            };
+            run.set_config_capture(config);
+            if let Some(profile) = resolved {
+                run.set_auto_resolution(profile);
+            }
+            run.saved_run_config().unwrap()
+        };
+        let reload = |saved: &RunConfig| {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("run.yaml");
+            write(&path, saved).unwrap();
+            let by_config = parsed(&parse_at(&load(&path, &[]), LOADING_CLOCK).0);
+            let (global, run_inputs) = to_manifest_parts(saved).unwrap();
+            let manifest = crate::manifest::Manifest::new(
+                hermit::Id::unique(),
+                crate::manifest::Kind::InputsOnly,
+                crate::manifest::Command {
+                    program: saved.program.clone(),
+                    args: saved.args.clone(),
+                    cwd: None,
+                },
+                crate::manifest::Inputs {
+                    global,
+                    run: run_inputs,
+                    host_drawn: BTreeMap::new(),
+                },
+            );
+            let path = directory
+                .path()
+                .join("id")
+                .join(crate::manifest::MANIFEST_NAME);
+            crate::manifest::write(&path, &manifest).unwrap();
+            let expanded = expand_argv(
+                &crate::Args::command(),
+                &argv_for_from(path.parent().unwrap()),
+            )
+            .unwrap()
+            .expect("--from expands");
+            let by_from = parsed(&parse_at(&expanded, LOADING_CLOCK).0);
+            assert_eq!(by_config, by_from);
+            profile_of(&by_config)
+        };
+        let named = |profile: &str| {
+            let argv = argv(&[], &["--cpu-profile", profile], GUEST);
+            profile_of(&parsed(&parse_at(&argv, LOADING_CLOCK).0))
+        };
+        for (given, resolved) in [
+            (&[][..], CpuProfile::X86_64V2),
+            (&[][..], CpuProfile::X86_64V3),
+            (&["--cpu-profile", "auto"][..], CpuProfile::X86_64V3),
+        ] {
+            let saved = save(given, Some(resolved));
+            assert_eq!(
+                saved.run.get(CPU_PROFILE_KEY),
+                Some(&Value::from(resolved.name())),
+                "{given:?}"
+            );
+            assert_eq!(reload(&saved), named(resolved.name()), "{given:?}");
+        }
+        // A named profile is saved as given, and reloads as named.
+        let saved = save(&["--cpu-profile", "x86-64-v2"], None);
+        assert_eq!(
+            saved.run.get(CPU_PROFILE_KEY),
+            Some(&Value::from("x86-64-v2"))
+        );
+        assert_eq!(reload(&saved), named("x86-64-v2"));
+        // Nothing resolved, nothing given: no profile is saved, and the
+        // reload is the unset (auto) default again, not a named v2.
+        let saved = save(&[], None);
+        assert_eq!(saved.run.get(CPU_PROFILE_KEY), None);
+        assert_ne!(reload(&saved), named("x86-64-v2"));
     }
 
     fn argv_for_from(path: &Path) -> Vec<OsString> {

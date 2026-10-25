@@ -16069,6 +16069,15 @@ impl RunOpts {
         self.config_capture = Some(config);
     }
 
+    /// Records that `--cpu-profile auto` resolved to `profile`, as
+    /// [`Self::resolve_auto_cpu_profile`] does from the program, for tests
+    /// of what a resolved run saves.
+    #[cfg(test)]
+    pub(crate) fn set_auto_resolution(&mut self, profile: detcore_model::cpu_profile::CpuProfile) {
+        self.auto_resolution = Some(format!("--cpu-profile auto resolved to {profile}"));
+        self.det_opts.det_config.cpu_profile = profile;
+    }
+
     /// Retain source identity independently of YAML capture, which may fail
     /// for a non-UTF-8 argument and does not run for embedded OCI commands.
     pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
@@ -16347,6 +16356,11 @@ impl RunOpts {
         use crate::app::run_config::PID_BASE_KEY;
         use crate::app::run_config::SEED_FROM_KEY;
         use crate::app::run_config::SEED_KEY;
+    pub(crate) fn saved_run_config(&self) -> Result<crate::run_config::RunConfig, Error> {
+        use crate::run_config::CPU_PROFILE_KEY;
+        use crate::run_config::EPOCH_KEY;
+        use crate::run_config::SEED_FROM_KEY;
+        use crate::run_config::SEED_KEY;
 
         let mut config = self.config_capture.clone().ok_or_else(|| {
             Error::msg(
@@ -16381,6 +16395,14 @@ impl RunOpts {
             && let Some(base) = self.det_opts.det_config.guest_ids.base()
         {
             config.run.insert(PID_BASE_KEY.to_owned(), base.into());
+        // The profile auto resolved to, given or not: loading the config
+        // (`--config`, or `--from` a manifest) runs that profile and never
+        // derives one again.
+        if self.auto_resolution.is_some() {
+            config.run.insert(
+                CPU_PROFILE_KEY.to_owned(),
+                self.det_opts.det_config.cpu_profile.name().into(),
+            );
         }
         Ok(config)
     }
@@ -16590,14 +16612,6 @@ impl RunOpts {
             run_inputs.insert(
                 manifest::MAX_TIMESLICE_KEY.to_owned(),
                 serde_json::Value::from("disabled"),
-            );
-        }
-        // What auto resolved to: a rerun from this manifest runs that
-        // profile, and never derives one again.
-        if self.auto_resolution.is_some() {
-            run_inputs.insert(
-                "cpu-profile".to_owned(),
-                serde_json::Value::from(self.det_opts.det_config.cpu_profile.name()),
             );
         }
         let id = hermit::Id::unique();
