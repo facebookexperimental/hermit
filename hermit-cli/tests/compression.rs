@@ -43,6 +43,8 @@ fn compression_tools_are_deterministic_under_strict_hermit() {
             }
             let output = Command::new(&runner)
                 .env("HERMIT_BIN", env!("CARGO_BIN_EXE_hermit"))
+                // Staged test sources may not contain Git metadata.
+                .env("COMPRESSION_SOURCE_IDENTITY", "content")
                 // The script's strict runs take their epoch from this.
                 .env("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)
                 .env("COMPRESSION_ARTIFACT_ROOT", &artifact_root)
