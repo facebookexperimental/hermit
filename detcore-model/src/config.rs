@@ -1141,6 +1141,23 @@ pub struct Config {
     #[clap(long, value_enum, value_name = "each|once")]
     pub expired_wait_charge: Option<ExpiredWaitCharge>,
 
+    /// When a queued plain sleep (a request for `SleepUntil` alone, not yet due) becomes a timed
+    /// waiter: `first-pass`, at the first quiescent scheduler pass that finds it queued, whatever
+    /// the priorities, as a Linux hrtimer is armed when the sleep starts; or `when-chosen`, only
+    /// when its thread is chosen before its deadline, so a sleeper behind threads of better
+    /// priority wakes later. Unset, `when-chosen` under `--chaos` or a `--sched-heuristic` that
+    /// does not select by priority, where those late wakes are what real sleep-ordered races
+    /// depend on, and `first-pass` otherwise. A replay of a schedule or of preemptions that
+    /// leaves this unset takes the value its record stores (a record that stores none, written
+    /// before the option existed or by a `when-chosen` run, registered sleeps when chosen), and an
+    /// explicit value that disagrees with the record is refused. `hermit analyze` and `hermit
+    /// bisect` run every trial under the value of the recording they start from, or
+    /// `when-chosen` when analyze records its own chaos target. Under `hermit record` and
+    /// `hermit replay` a sleep is registered when chosen, as before, whatever the value.
+    #[serde(default)]
+    #[clap(long, value_enum, value_name = "first-pass|when-chosen")]
+    pub sleep_registration: Option<SleepRegistration>,
+
     /// Write a work/span report of the run's schedule to this path as JSON when the run ends
     /// normally: work (the sum of every thread's guest CPU time, in virtual nanoseconds), a
     /// lower span over the scheduler's certain happens-before edges (program order, spawn, a
@@ -1988,6 +2005,19 @@ impl Config {
             }
     }
 
+    /// Whether a queued plain sleep is registered as a timed waiter at the first quiescent pass
+    /// that finds it queued (`--sleep-registration`): the explicit value, or by default outside
+    /// race search (`--chaos`, or a `--sched-heuristic` that does not select by priority). Never
+    /// under `hermit record` and `hermit replay`, whose schedule must not change. A replay that
+    /// leaves the option unset takes its record's value instead (`Scheduler::new`).
+    pub fn queued_sleeps_registered_at_first_pass(&self) -> bool {
+        !self.recordreplay_modes
+            && match self.sleep_registration {
+                Some(registration) => registration == SleepRegistration::FirstPass,
+                None => !self.chaos && self.sched_heuristic.is_priority_ordered(),
+            }
+    }
+
     /// Should we convert sockets to SOCK_NONBLOCK?
     pub fn use_nonblocking_sockets(&self) -> bool {
         self.sequentialize_threads && !self.debug_externalize_sockets
@@ -2227,6 +2257,9 @@ impl fmt::Display for Config {
         }
         if let Some(charge) = self.expired_wait_charge {
             write!(f, " --expired-wait-charge={}", charge.as_str())?;
+        }
+        if let Some(registration) = self.sleep_registration {
+            write!(f, " --sleep-registration={}", registration.as_str())?;
         }
         if let Some(report) = &self.work_span_report {
             write!(f, " --work-span-report={}", report.display())?;
@@ -2483,6 +2516,46 @@ impl ExpiredWaitCharge {
         match self {
             Self::Each => "each",
             Self::Once => "once",
+        }
+    }
+}
+
+/// When a queued plain sleep becomes a timed waiter (`--sleep-registration`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum SleepRegistration {
+    /// At the first quiescent scheduler pass that finds the sleep queued.
+    FirstPass,
+    /// Only when the sleeper's thread is chosen before its deadline.
+    WhenChosen,
+}
+
+impl SleepRegistration {
+    /// The rule a run follows when it registers queued sleeps at the first
+    /// pass (`first-pass`) or not (`when-chosen`).
+    pub fn from_registered_at_first_pass(first_pass: bool) -> Self {
+        if first_pass {
+            Self::FirstPass
+        } else {
+            Self::WhenChosen
+        }
+    }
+
+    /// The option's value as `--sleep-registration` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstPass => "first-pass",
+            Self::WhenChosen => "when-chosen",
         }
     }
 }
@@ -3646,7 +3719,9 @@ mod legacy_backend_json {
     /// it, so it is never written and reads as false.
     /// `standard_stream_aliases` came after it too, and is set only for KVM;
     /// it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 46] = [
+    /// `sleep_registration` too: the scheduler registers sleeps, not the
+    /// runtime, so it is never written and reads as unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 47] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3660,6 +3735,7 @@ mod legacy_backend_json {
         "futex_wake_yields",
         "pipe_wake_latency",
         "expired_wait_charge",
+        "sleep_registration",
         "replaying",
         "scheduler_turn_cost",
         "cap_preemption_charge",
@@ -3858,6 +3934,7 @@ mod legacy_backend_json {
                     | "virtual_timeout"
                     | "pipe_wake_latency"
                     | "expired_wait_charge"
+                    | "sleep_registration"
                     | "container_mount_table"
                     | "mountinfo_mount_namespace"
                     | "directory_placeholder"
@@ -4161,6 +4238,7 @@ mod legacy_backend_json {
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
                 | "expired_wait_charge"
+                | "sleep_registration"
                 | "replaying"
                 | "scheduler_turn_cost"
                 | "cap_preemption_charge"
@@ -5085,6 +5163,7 @@ mod tests {
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
                 | "expired_wait_charge"
+                | "sleep_registration"
                 | "replaying"
                 | "scheduler_turn_cost"
                 | "cap_preemption_charge"
@@ -5132,8 +5211,9 @@ mod tests {
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
-        // `pipe_wake_latency`, `expired_wait_charge`, `replaying`, `scheduler_turn_cost`,
-        // `cap_preemption_charge`, `virtual_timeout`, `inherited_seccomp`, `cpu_profile`,
+        // `pipe_wake_latency`, `expired_wait_charge`, `sleep_registration`, `replaying`,
+        // `scheduler_turn_cost`, `cap_preemption_charge`, `virtual_timeout`,
+        // `inherited_seccomp`, `cpu_profile`,
         // `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
@@ -5153,10 +5233,10 @@ mod tests {
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
         // `access_trace_max_bytes`, `replay_continue_fairly`,
         // `standard_stream_aliases` and `strict_schedule_boundaries` none:
-        // fourteen more keys and forty-five fewer, so thirty-one keys fewer
+        // fourteen more keys and forty-six fewer, so thirty-two keys fewer
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 31);
+        assert_eq!(fields.len(), keys.len() + 32);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -7310,6 +7390,43 @@ mod tests {
                 from_legacy_backend_json(&legacy)
                     .unwrap()
                     .expired_wait_charge,
+                None
+            );
+        }
+    }
+
+    /// `--sleep-registration` is unset by default, parses both values, is
+    /// printed by `Display` (reproducer commands are built from it) only when
+    /// set, round-trips through serde, and never enters the legacy form.
+    #[test]
+    fn the_sleep_registration_is_printed_when_set_and_never_enters_the_legacy_form() {
+        assert_eq!(Config::default().sleep_registration, None);
+        assert!(
+            !Config::default()
+                .to_string()
+                .contains("--sleep-registration")
+        );
+        for (value, registration) in [
+            ("first-pass", SleepRegistration::FirstPass),
+            ("when-chosen", SleepRegistration::WhenChosen),
+        ] {
+            let set = Config::try_parse_from(["detcore", &format!("--sleep-registration={value}")])
+                .unwrap();
+            assert_eq!(set.sleep_registration, Some(registration));
+            assert!(
+                set.to_string()
+                    .contains(&format!(" --sleep-registration={value}")),
+                "{set}"
+            );
+            let reparsed: Config =
+                serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+            assert_eq!(reparsed.sleep_registration, Some(registration));
+            let legacy = to_legacy_backend_json(&set).unwrap();
+            assert!(!legacy.contains("sleep_registration"), "{legacy}");
+            assert_eq!(
+                from_legacy_backend_json(&legacy)
+                    .unwrap()
+                    .sleep_registration,
                 None
             );
         }

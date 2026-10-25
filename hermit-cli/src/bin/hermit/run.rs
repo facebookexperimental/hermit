@@ -5526,6 +5526,51 @@ fn replay_refuses_another_expired_wait_charge() {
     }
 }
 
+/// A replay under an explicit `--sleep-registration` other than the rule its
+/// record states is refused, under both replay flags; a record without the
+/// field registered sleeps when chosen; a replay that leaves the option unset
+/// is never refused (it takes the record's rule).
+#[test]
+fn replay_refuses_another_sleep_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = |name: &str, first_pass: bool| {
+        let path = dir.path().join(name);
+        let record = detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .with_queued_sleeps_registered_at_first_pass(first_pass);
+        std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+        path
+    };
+    let chosen = record("when-chosen.json", false);
+    let first = record("first-pass.json", true);
+    for flag in ["--replay-schedule-from", "--replay-preemptions-from"] {
+        for (path, registration, refused) in [
+            (&chosen, None, false),
+            (&chosen, Some("when-chosen"), false),
+            (&chosen, Some("first-pass"), true),
+            (&first, None, false),
+            (&first, Some("first-pass"), false),
+            (&first, Some("when-chosen"), true),
+        ] {
+            let replay = format!("{flag}={}", path.display());
+            let mut argv = vec!["fakehermit".to_owned(), replay];
+            if let Some(registration) = registration {
+                argv.push(format!("--sleep-registration={registration}"));
+            }
+            argv.push("fakeprog".to_owned());
+            let ro = RunOpts::parse_from(&argv);
+            let result = ro.refuse_replay_under_another_sleep_registration();
+            assert_eq!(result.is_err(), refused, "{argv:?}: {result:?}");
+            if let Err(error) = result {
+                let error = format!("{error:#}");
+                assert!(
+                    error.contains(flag) && error.contains("cannot reproduce the run"),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
 /// A replay of a record made under another `--pipe-wake-latency` is refused,
 /// in both directions and for a different latency, under both replay flags;
 /// `0` is not off; a record without the field is off
@@ -9303,6 +9348,38 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Refuse to replay a preemption or schedule record under an explicit
+    /// `--sleep-registration` other than the rule the record states. A replay
+    /// that leaves the option unset takes the record's rule (a record without
+    /// the field registered sleeps when chosen), so it is never refused. As
+    /// for the epoch, the record is read before anything is launched.
+    fn refuse_replay_under_another_sleep_registration(&self) -> Result<(), Error> {
+        if self.namespace_only || self.det_opts.det_config.sleep_registration.is_none() {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded =
+                detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(path)
+                    .map_err(Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::sleep_registration_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.sleep_registration,
+                false,
+            ) {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
     /// Refuses a replay of a recorded schedule under the other signal-state
     /// copy setting (`--no-signal-state-copy`), as
     /// `refuse_replay_under_another_pipe_wake_latency` refuses another
@@ -10652,6 +10729,7 @@ impl RunOpts {
         self.refuse_replay_under_another_expired_wait_charge()?;
         self.refuse_replay_under_another_cap_preemption_charge()?;
         self.refuse_replay_under_other_guest_ids()?;
+        self.refuse_replay_under_another_sleep_registration()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global

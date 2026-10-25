@@ -1345,6 +1345,7 @@ fn record_or_replay_config_with_timer_support(
         // Record and replay charge every expired timed wait, whatever the value.
         expired_wait_charge: None,
         // Record and replay register queued sleeps when chosen, whatever the value.
+        sleep_registration: None,
         // A `hermit run` option; record and replay do not gather it.
         work_span_report: None,
         scheduler_turn_cost: default_config.scheduler_turn_cost,
@@ -1638,6 +1639,17 @@ mod tests {
         for (name, config) in [("record", record), ("replay", replay), ("gdb", gdb_replay)] {
             assert!(!detcore::observes_sigreturns(&config), "{name}");
         }
+    }
+
+    /// Record and replay register a queued sleep only when its thread is
+    /// chosen, as before `--sleep-registration`, whatever its value, so a
+    /// recording's turn selection is the one its version promises.
+    #[test]
+    fn record_and_replay_register_sleeps_when_chosen() {
+        let mut config = record_or_replay_config(Path::new("replay-data"));
+        assert!(!config.queued_sleeps_registered_at_first_pass());
+        config.sleep_registration = Some(detcore_model::config::SleepRegistration::FirstPass);
+        assert!(!config.queued_sleeps_registered_at_first_pass());
     }
 
     /// Record mode never hands the turn to a readied pipe poller, whatever

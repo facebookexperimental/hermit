@@ -1414,6 +1414,7 @@ mod tests {
         ("futex-wake-yields", &["--futex-wake-yields"]),
         ("pipe-wake-latency", &["--pipe-wake-latency=1000000"]),
         ("expired-wait-charge", &["--expired-wait-charge=once"]),
+        ("sleep-registration", &["--sleep-registration=when-chosen"]),
         (
             "work-span-report",
             &["--work-span-report=/tmp/work-span.json"],

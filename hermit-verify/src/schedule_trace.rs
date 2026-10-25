@@ -249,6 +249,7 @@ impl InterpolateOpts {
         let latency = Self::common_pipe_wake_latency(&self.file_a, &self.file_b)?;
         let copy = Self::common_signal_state_copy(&self.file_a, &self.file_b)?;
         let charged_once = Self::common_expired_wait_charge(&self.file_a, &self.file_b)?;
+        let first_pass = Self::common_sleep_registration(&self.file_a, &self.file_b)?;
         let first_record =
             Recording::read(&self.file_a)?.into_legacy("schedule diff/interpolation")?;
         let second_record =
@@ -279,6 +280,7 @@ impl InterpolateOpts {
                 .with_pipe_wake_latency(latency)
                 .with_signal_state_copy(copy)
                 .with_expired_wait_runs_charged_once(charged_once)
+                .with_queued_sleeps_registered_at_first_pass(first_pass)
         };
         reconciled(first_record)
             .interpolate_events(&reconciled(second_record), requested_schedule)
@@ -350,6 +352,36 @@ impl InterpolateOpts {
                 |once| detcore_model::config::ExpiredWaitCharge::from_charged_once(once).as_str();
             anyhow::bail!(
                 "{} and {} were recorded under different --expired-wait-charge rules ({} and \
+                 {}); no interpolation of them can be replayed",
+                file_a.display(),
+                file_b.display(),
+                show(a),
+                show(b)
+            );
+        }
+        Ok(a)
+    }
+
+    /// How both schedules' runs registered queued sleeps
+    /// (`--sleep-registration`), which the interpolated schedule carries;
+    /// schedules recorded under different rules are refused, since no single
+    /// replay could register as both did.
+    fn common_sleep_registration(
+        file_a: &std::path::Path,
+        file_b: &std::path::Path,
+    ) -> anyhow::Result<bool> {
+        let read = |path: &std::path::Path| {
+            detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(path)
+                .map_err(anyhow::Error::msg)
+        };
+        let (a, b) = (read(file_a)?, read(file_b)?);
+        if a != b {
+            let show = |first_pass| {
+                detcore_model::config::SleepRegistration::from_registered_at_first_pass(first_pass)
+                    .as_str()
+            };
+            anyhow::bail!(
+                "{} and {} were recorded under different --sleep-registration rules ({} and \
                  {}); no interpolation of them can be replayed",
                 file_a.display(),
                 file_b.display(),
@@ -919,6 +951,31 @@ mod tests {
             error
                 .to_string()
                 .contains("different --expired-wait-charge rules (each and once)"),
+            "{error}"
+        );
+    }
+
+    /// Two schedules whose runs registered queued sleeps differently cannot
+    /// be interpolated; agreeing ones give their rule to the result.
+    #[test]
+    fn interpolate_refuses_schedules_recorded_under_different_sleep_registrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, first_pass: bool| {
+            let path = dir.path().join(name);
+            let record = PreemptionRecord::from_sched_events(Vec::new())
+                .with_queued_sleeps_registered_at_first_pass(first_pass);
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            path
+        };
+        let chosen = write("when-chosen.json", false);
+        let first = write("first-pass.json", true);
+        assert!(!InterpolateOpts::common_sleep_registration(&chosen, &chosen).unwrap());
+        assert!(InterpolateOpts::common_sleep_registration(&first, &first).unwrap());
+        let error = InterpolateOpts::common_sleep_registration(&chosen, &first).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("different --sleep-registration rules (when-chosen and first-pass)"),
             "{error}"
         );
     }

@@ -69,6 +69,8 @@ struct RawRecord {
     expired_wait_runs_charged_once: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_inputs: Option<HostInputSet>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    queued_sleeps_registered_at_first_pass: bool,
     #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
     store_exclusive_failures: HostObservedCount,
     #[serde(default, skip_serializing_if = "Option::is_none")]

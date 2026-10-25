@@ -1444,6 +1444,22 @@ pub struct Scheduler {
     /// run on, which is why the length is taken at the grant.
     preemption_cap: Option<(DetTid, u64)>,
 
+    /// Whether a queued plain sleep is registered as a timed waiter at the
+    /// first quiescent pass that finds it queued
+    /// (`step2_register_queued_sleeps`), as `--sleep-registration` says
+    /// (`Config::queued_sleeps_registered_at_first_pass`): by default on
+    /// outside race search, and off under `--chaos` or a heuristic that does
+    /// not select by priority, and under `hermit record`/`hermit replay`,
+    /// where a sleep is registered only when step 3 chooses its thread before
+    /// its deadline, as before. A sleeper left unregistered behind
+    /// better-priority threads runs later, and real sleep-ordered races in
+    /// timing-sensitive tests reproduced under chaos only with that (measured
+    /// in rrnewton/hermit#4682). A replay that leaves the option unset takes
+    /// the value its record states
+    /// (`PreemptionRecord::queued_sleeps_registered_at_first_pass`), and a
+    /// recording stores it.
+    queued_sleeps_registered_at_first_pass: bool,
+
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
 
@@ -4558,10 +4574,11 @@ pub async fn do_a_turn_blocking(
                         {
                             return Err(SkipTurn);
                         }
-                        // Before this refresh's pop, as before any pop: this also
-                        // registers a sleep queued since the first maintenance
-                        // step (a resumed observation), which the ordinary
-                        // loop leaves to step 3 or the next pass.
+                        // Before this refresh's pop, as before any pop: under
+                        // first-pass registration this also registers a sleep
+                        // queued since the first maintenance step (a resumed
+                        // observation), which the ordinary loop leaves to step 3
+                        // or the next pass.
                         state.step2_register_queued_sleeps();
                         if !timed_event_processed {
                             timed_event_processed = state.step2b_process_timed(&global_time);
@@ -5265,6 +5282,27 @@ impl Scheduler {
             }
             _ => cfg.expired_wait_runs_charged_once(),
         };
+        // A replay that leaves `--sleep-registration` unset registers queued
+        // sleeps as its record says (a record that does not say, older or
+        // written by a `when-chosen` run, by default race search, registered
+        // them when chosen); any
+        // other run as `Config::queued_sleeps_registered_at_first_pass` says.
+        // `hermit run` has refused an explicit value that disagrees with the
+        // record.
+        let replayed_record = cfg
+            .replay_schedule_from
+            .as_ref()
+            .or(cfg.replay_preemptions_from.as_ref());
+        let queued_sleeps_registered_at_first_pass = match replayed_record {
+            Some(path) if cfg.sleep_registration.is_none() && !cfg.recordreplay_modes => {
+                crate::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(path)
+                    // A file that cannot be read fails the replay's own
+                    // loader: the schedule's just above, the preemptions'
+                    // in `tool_global` right after this.
+                    .unwrap_or(false)
+            }
+            _ => cfg.queued_sleeps_registered_at_first_pass(),
+        };
         // The strict verifier explicitly selects the complete protocol. Ordinary
         // producers and the recovery/editor path keep the legacy representation.
         let boundaries = cfg.strict_schedule_boundaries;
@@ -5277,7 +5315,10 @@ impl Scheduler {
                 .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once)
                 .with_cap_preemption_charge(cfg.cap_preemption_charge)
                 .with_chaos_timeslice(cfg.chaos_timeslice)
-                .with_guest_ids(cfg.guest_ids);
+                .with_guest_ids(cfg.guest_ids)
+                .with_queued_sleeps_registered_at_first_pass(
+                    queued_sleeps_registered_at_first_pass,
+                );
             // A run that follows no record writes the newest format. A replay
             // writes the format of the record it follows, whose rules it ran
             // by. A replay of a format-1 record (`TimeSkipMode::Legacy`) takes
@@ -5355,6 +5396,7 @@ impl Scheduler {
             released_callback_checkpoints: BTreeMap::new(),
             fair_continuation: cfg.replay_continue_fairly.then(Default::default),
             continuation_clocks: BTreeMap::new(),
+            queued_sleeps_registered_at_first_pass,
             recorded_event_count: 0,
             stacktrace_events,
             stacktrace_events_counted: cfg.record_preemptions || cfg.replay_schedule_from.is_some(),
@@ -11445,7 +11487,14 @@ impl Scheduler {
     /// request. Threads are taken in run-queue order, but a timed waiter's
     /// place depends only on its deadline and thread id
     /// (`TimedEvents::insert`), so the order adds nothing.
+    ///
+    /// Under race search (`queued_sleeps_registered_at_first_pass` off by
+    /// default, `--sleep-registration`) a sleep is registered only when
+    /// chosen, as before; a replay follows its record.
     fn step2_register_queued_sleeps(&mut self) {
+        if !self.queued_sleeps_registered_at_first_pass {
+            return;
+        }
         let committed = self.committed_time;
         let sleeps: Vec<(LogicalTime, DetTid)> = self
             .run_queue
@@ -17109,10 +17158,12 @@ impl Scheduler {
                         "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} which wanted resource {:?} (blocking)",
                         self.turn, dettid, rid
                     );
-                    // Usually registered already: `step2_register_queued_sleeps`
-                    // takes a queued plain sleep out of the run queue at step 2.
-                    // A defensive fallback for a plain sleep queued after that
-                    // within the same pass; no such path is known.
+                    // Under first-pass registration, usually registered already:
+                    // `step2_register_queued_sleeps` takes a queued plain sleep out
+                    // of the run queue at step 2, and this is a defensive fallback
+                    // for one queued after that within the same pass (no such path
+                    // is known). Under `when-chosen` registration (race search,
+                    // record and replay) this is where a sleep is registered.
                     self.blocked.timed_waiters.insert(*target_ns, dettid);
                     self.skip_turn_blocked(dettid)
                 }
@@ -19402,10 +19453,11 @@ impl Scheduler {
     ///   - a timed wait or timer (`timed_waiters`);
     ///   - a backed-off poller's timeout (`poll_deadlines`);
     ///   - the deadline of a sleep or poll another thread has requested but
-    ///     not yet had a turn for. A plain sleep is a timed waiter from the
-    ///     first pass after its request (`step2_register_queued_sleeps`); one
-    ///     queued later in a pass, or a poll, would otherwise wait out the
-    ///     granted thread's whole slice.
+    ///     not yet had a turn for. Under first-pass registration a plain sleep
+    ///     is a timed waiter from the first pass after its request
+    ///     (`step2_register_queued_sleeps`); one queued later in a pass, an
+    ///     unregistered one under `when-chosen` registration, or a poll,
+    ///     would otherwise wait out the granted thread's whole slice.
     ///
     /// Only deadlines still ahead of `now` count, from threads that will take
     /// another turn: a passed one (including a yield's `SleepUntil(0)`) marks
@@ -30761,7 +30813,8 @@ mod test {
     /// no deadline and any other request stay as they are. When the sleep
     /// falls due beside another timed event with a later deadline, the pass
     /// pops the sleeper's wake, not the other event: before, an unregistered
-    /// sleeper behind a runnable thread let the later event pop first.
+    /// sleeper behind a runnable thread let the later event pop first. Under
+    /// `--chaos` the sleep stays queued, as before.
     #[test]
     fn a_queued_sleep_is_a_timed_waiter_from_the_first_pass() {
         let config = Config::default();
@@ -30821,6 +30874,118 @@ mod test {
             Some(at(8_000)),
             "one timed event pops per pass"
         );
+
+        // Under --chaos a queued sleep stays queued, unregistered, until step
+        // 3 chooses its thread (here beside a runnable thread, so the pass
+        // does not jump to the sleep's deadline for want of work).
+        let chaos = Config {
+            chaos: true,
+            ..Default::default()
+        };
+        let mut scheduler = Scheduler::new(&chaos);
+        scheduler.committed_time = at(0);
+        queue_request(&mut scheduler, worker, Resources::new(worker));
+        queue_request(&mut scheduler, sleeper, sleep_request(sleeper, at(7_000)));
+        for tid in [worker, sleeper] {
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+        }
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            None
+        );
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+    }
+
+    /// A replay that leaves `--sleep-registration` unset registers queued
+    /// sleeps as its record says, whatever its own options: a record of a
+    /// plain run (which stores the rule) makes even a `--chaos` replay
+    /// register at the first pass, and a record that does not say (a chaos
+    /// recording, or one older than the rule) makes even a plain replay
+    /// register a sleep only when chosen. An explicit value decides; a run
+    /// that replays nothing takes the default from `--chaos` and the
+    /// heuristic; a recording stores the rule.
+    #[test]
+    fn a_replay_registers_queued_sleeps_as_its_record_says() {
+        let dir = tempfile::tempdir().unwrap();
+        for (recorded, chaos) in [(true, true), (false, false), (true, false), (false, true)] {
+            let path = dir.path().join(format!("record-{recorded}-{chaos}.json"));
+            let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+                .with_queued_sleeps_registered_at_first_pass(recorded);
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            for schedule in [true, false] {
+                let config = Config {
+                    chaos,
+                    replay_schedule_from: schedule.then(|| path.clone()),
+                    replay_preemptions_from: (!schedule).then(|| path.clone()),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    Scheduler::new(&config).queued_sleeps_registered_at_first_pass,
+                    recorded,
+                    "recorded {recorded}, --chaos {chaos}, schedule replay {schedule}"
+                );
+            }
+        }
+        // An explicit `--sleep-registration` decides, record or not (`hermit
+        // run` refuses one that disagrees with the record before this).
+        use crate::config::SleepRegistration;
+        let path = dir.path().join("record-true-true.json");
+        for (registration, first_pass) in [
+            (SleepRegistration::FirstPass, true),
+            (SleepRegistration::WhenChosen, false),
+        ] {
+            for replay in [None, Some(path.clone())] {
+                let config = Config {
+                    chaos: true,
+                    sleep_registration: Some(registration),
+                    replay_schedule_from: replay.clone(),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    Scheduler::new(&config).queued_sleeps_registered_at_first_pass,
+                    first_pass,
+                    "{registration:?}, replaying {replay:?}"
+                );
+            }
+        }
+        // A replay that also records stores the rule it replayed under.
+        let replaying_recorder = Config {
+            chaos: true,
+            replay_schedule_from: Some(path.clone()),
+            record_preemptions: true,
+            ..Default::default()
+        };
+        let scheduler = Scheduler::new(&replaying_recorder);
+        assert!(scheduler.queued_sleeps_registered_at_first_pass);
+        assert!(
+            scheduler
+                .preemption_writer
+                .unwrap()
+                .into_string()
+                .contains("\"queued_sleeps_registered_at_first_pass\":true")
+        );
+        // A heuristic that does not select by priority is race search too.
+        let random = Config {
+            sched_heuristic: crate::config::SchedHeuristic::Random,
+            ..Default::default()
+        };
+        assert!(!Scheduler::new(&random).queued_sleeps_registered_at_first_pass);
+        for chaos in [false, true] {
+            let config = Config {
+                chaos,
+                record_preemptions: true,
+                ..Default::default()
+            };
+            let scheduler = Scheduler::new(&config);
+            assert_eq!(scheduler.queued_sleeps_registered_at_first_pass, !chaos);
+            let written = scheduler.preemption_writer.unwrap().into_string();
+            assert_eq!(
+                written.contains("\"queued_sleeps_registered_at_first_pass\":true"),
+                !chaos,
+                "{written}"
+            );
+        }
     }
 
     /// Registration does not depend on priorities: a sleeper queued behind a

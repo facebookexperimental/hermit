@@ -166,6 +166,8 @@ impl BisectOpts {
         analyzer.adopt_recorded_epoch(&[("--good", &self.good), ("--bad", &self.bad)])?;
         // Every replay charges expired timed waits as the failing schedule did.
         analyzer.adopt_expired_wait_charge(Some(&self.bad))?;
+        // Every replay registers queued sleeps as the failing schedule did.
+        analyzer.adopt_sleep_registration(Some(&self.bad))?;
         // Keep the timeslice drawn by the recordings.
         analyzer.adopt_recorded_timeslice(&[("--good", &self.good), ("--bad", &self.bad)])?;
         analyzer.refuse_recordings_under_another_pipe_wake_latency(&[
@@ -421,6 +423,12 @@ mod tests {
                 "expired_wait_runs_charged_once",
                 serde_json::json!(true),
                 "--expired-wait-charge",
+                true,
+            ),
+            (
+                "queued_sleeps_registered_at_first_pass",
+                serde_json::json!(true),
+                "--sleep-registration",
                 true,
             ),
         ] {
@@ -742,8 +750,15 @@ mod tests {
 
         // The default epoch, for schedules that carry none.
         let trials = prepared_trials(dir, None, None, &[]).unwrap();
-        // No `--epoch` is added; `--expired-wait-charge` always is.
-        assert_eq!(trials.run_arg, ["--expired-wait-charge=each"]);
+        // No `--epoch` is added; `--expired-wait-charge` and
+        // `--sleep-registration` always are.
+        assert_eq!(
+            trials.run_arg,
+            [
+                "--expired-wait-charge=each",
+                "--sleep-registration=when-chosen"
+            ]
+        );
         assert_eq!(trials.trial_epoch_for_test(), "2026-01-01T00:00:00+00:00");
 
         // The recorded epoch, from either schedule or both.
@@ -763,8 +778,15 @@ mod tests {
         // An explicit epoch equal to the recorded one adds no second --epoch.
         let trials =
             prepared_trials(dir, Some(RECORDED), Some(RECORDED), &["--epoch", RECORDED]).unwrap();
-        // No `--epoch` is added; `--expired-wait-charge` always is.
-        assert_eq!(trials.run_arg, ["--expired-wait-charge=each"]);
+        // No `--epoch` is added; `--expired-wait-charge` and
+        // `--sleep-registration` always are.
+        assert_eq!(
+            trials.run_arg,
+            [
+                "--expired-wait-charge=each",
+                "--sleep-registration=when-chosen"
+            ]
+        );
         assert_eq!(trials.trial_epoch_for_test(), RECORDED_RFC3339);
 
         // An explicit epoch that differs is refused, naming the remedy.
@@ -862,6 +884,73 @@ mod tests {
     /// under another `--pipe-wake-latency` than the trials' own
     /// (https://github.com/rrnewton/hermit/issues/4380), and any schedule in
     /// its run arguments.
+    /// Bisect replays every trial under the `--sleep-registration` of the
+    /// `--bad` schedule (unless its run arguments give one), and refuses a
+    /// `--good` schedule recorded under the other rule.
+    #[test]
+    fn bisect_replays_under_the_bad_schedules_sleep_registration() {
+        use detcore_model::config::SleepRegistration;
+        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
+        let dir = tempfile::tempdir().unwrap();
+        let write = |fixture: &str, name: &str, first_pass: bool| {
+            let source = resources.join(format!("flaky_cas_sequence_schedules-{fixture}.json"));
+            let mut record: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(source).unwrap()).unwrap();
+            if first_pass {
+                record["queued_sleeps_registered_at_first_pass"] = serde_json::Value::from(true);
+            }
+            let path = dir.path().join(name);
+            fs::write(&path, record.to_string()).unwrap();
+            path
+        };
+        let prepare = |good: &Path, bad: &Path, run_args: &[&str]| {
+            let good = format!("--good={}", good.display());
+            let bad = format!("--bad={}", bad.display());
+            let mut argv = vec!["hermit", "bisect", good.as_str(), bad.as_str(), "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Bisect(options) = args.command else {
+                panic!("{argv:?} is not bisect")
+            };
+            options
+                .prepare(&args.global)
+                .map(|(analyzer, _, _)| analyzer.trial_sleep_registration())
+        };
+        let good_chosen = write("passing", "good-chosen.json", false);
+        let bad_chosen = write("failing", "bad-chosen.json", false);
+        let good_first = write("passing", "good-first.json", true);
+        let bad_first = write("failing", "bad-first.json", true);
+        assert_eq!(
+            prepare(&good_chosen, &bad_chosen, &[]).unwrap(),
+            SleepRegistration::WhenChosen
+        );
+        assert_eq!(
+            prepare(&good_first, &bad_first, &[]).unwrap(),
+            SleepRegistration::FirstPass
+        );
+        for (good, bad, run_args) in [
+            (&good_chosen, &bad_first, vec![]),
+            (&good_first, &bad_chosen, vec![]),
+            (
+                &good_chosen,
+                &bad_chosen,
+                vec!["--sleep-registration=first-pass"],
+            ),
+        ] {
+            let error = prepare(good, bad, &run_args).unwrap_err();
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            assert!(
+                format!("{error:#}").contains("--sleep-registration"),
+                "{error:#}"
+            );
+        }
+    }
+
+    /// Bisect refuses, before any trial, a `--good` or `--bad` schedule, or a
+    /// record its run arguments replay, made under another
+    /// `--pipe-wake-latency` than the trials' own
+    /// (https://github.com/rrnewton/hermit/issues/4380).
     #[test]
     fn bisect_refuses_schedules_under_another_pipe_wake_latency() {
         let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
