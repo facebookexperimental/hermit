@@ -1719,13 +1719,20 @@ mod tests {
         }
     }
 
+    /// Set in the child of [`a_resolved_auto_profile_is_saved_and_reloads_as_named`]
+    /// that checks the unset case.
+    const UNSET_PROFILE_CHILD: &str = "HERMIT_TEST_RUN_CONFIG_UNSET_PROFILE_CHILD";
+
     /// A run whose auto profile resolved saves the resolved profile, so that
     /// `--config` and `--from` a manifest run that named profile rather than
     /// resolving again; a named profile is saved as given, and a run that
-    /// resolved nothing saves no profile.
+    /// resolved nothing saves no profile. That last case runs in a child
+    /// given no HERMIT_CPU_PROFILE, since the capture keeps a profile the
+    /// environment supplies.
     #[test]
     fn a_resolved_auto_profile_is_saved_and_reloads_as_named() {
         use detcore_model::cpu_profile::CpuProfile;
+        let unset_child = std::env::var_os(UNSET_PROFILE_CHILD).is_some();
         // The parsed run's profile, from its field-by-field rendering.
         let profile_of = |parsed: &Parsed| {
             parsed
@@ -1793,6 +1800,15 @@ mod tests {
             let argv = argv(&[], &["--cpu-profile", profile], GUEST);
             profile_of(&parsed(&parse_at(&argv, LOADING_CLOCK).0))
         };
+        if unset_child {
+            // Nothing resolved, nothing given: no profile is saved, and the
+            // reload is the unset (auto) default again, not a named v2.
+            assert_eq!(std::env::var_os("HERMIT_CPU_PROFILE"), None);
+            let saved = save(&[], None);
+            assert_eq!(saved.run.get(CPU_PROFILE_KEY), None);
+            assert_ne!(reload(&saved), named("x86-64-v2"));
+            return;
+        }
         for (given, resolved) in [
             (&[][..], CpuProfile::X86_64V2),
             (&[][..], CpuProfile::X86_64V3),
@@ -1813,11 +1829,23 @@ mod tests {
             Some(&Value::from("x86-64-v2"))
         );
         assert_eq!(reload(&saved), named("x86-64-v2"));
-        // Nothing resolved, nothing given: no profile is saved, and the
-        // reload is the unset (auto) default again, not a named v2.
-        let saved = save(&[], None);
-        assert_eq!(saved.run.get(CPU_PROFILE_KEY), None);
-        assert_ne!(reload(&saved), named("x86-64-v2"));
+        let test = format!(
+            "{}::a_resolved_auto_profile_is_saved_and_reloads_as_named",
+            module_path!().split_once("::").unwrap().1
+        );
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env(UNSET_PROFILE_CHILD, "1")
+            .env_remove("HERMIT_CPU_PROFILE")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "the unset-profile child did not pass exactly once: {}\nstdout:\n{stdout}\nstderr:\n{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
     }
 
     fn argv_for_from(path: &Path) -> Vec<OsString> {
