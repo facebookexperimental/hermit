@@ -5825,6 +5825,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
                 .await;
         }
+        // Refuse an image that declares it needs more of the CPU than the
+        // profile presents, before its loader can refuse it by exiting
+        // ("Fatal glibc error: CPU does not support x86-64-v3", status 127)
+        // or execute instructions the virtual CPU denies having. Only a
+        // successful exec reaches this callback, so a failed one keeps the
+        // kernel's error.
+        if let Some(message) = self.isa_refusal(guest) {
+            error!("{message}");
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+                .await;
+        }
         // Exec gives the task filesystem information of its own
         // (`unshare_fs_struct`): a root it shared through CLONE_FS is now its
         // own, as it stands.

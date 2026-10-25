@@ -384,6 +384,265 @@ impl ElfLayout {
     }
 }
 
+/// What an x86-64 ELF image declares it needs of the CPU: the
+/// `GNU_PROPERTY_X86_ISA_1_NEEDED` property of its `NT_GNU_PROPERTY_TYPE_0`
+/// note (elf.h; the x86-64 psABI's GNU property section), which glibc's
+/// loader checks against the CPUID it sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsaNeeds {
+    /// No such property. The image declares nothing, which does not prove it
+    /// runs on any CPU: a library built for a higher level need not say so.
+    Unmarked,
+    /// The highest x86-64 microarchitecture level its needed bits name:
+    /// 1 baseline, 2 x86-64-v2, 3 x86-64-v3, 4 x86-64-v4; 0 for an empty set.
+    /// A level above 4 is a bit this Hermit does not know, a level above
+    /// x86-64-v4.
+    Level(u8),
+    /// A declaration that cannot be read as written: a truncated or
+    /// misaligned note, or a repeated property.
+    Malformed(&'static str),
+}
+
+/// `PT_GNU_PROPERTY` (elf.h), which holds the image's
+/// `NT_GNU_PROPERTY_TYPE_0` note.
+const PT_GNU_PROPERTY: u32 = 0x6474_e553;
+/// `PT_NOTE`, read for that note where no `PT_GNU_PROPERTY` segment exists.
+const PT_NOTE: u32 = 4;
+/// `NT_GNU_PROPERTY_TYPE_0`.
+const NT_GNU_PROPERTY_TYPE_0: u32 = 5;
+/// `GNU_PROPERTY_X86_ISA_1_NEEDED`.
+const GNU_PROPERTY_X86_ISA_1_NEEDED: u32 = 0xc000_8002;
+/// `EM_X86_64`.
+const EM_X86_64: u16 = 62;
+/// The most note bytes read from one segment; a larger property or note
+/// segment is reported malformed rather than read without bound.
+const MAX_NOTE_SEGMENT: u64 = 64 * 1024;
+
+impl IsaNeeds {
+    /// What the x86-64 ELF64 image open as `file` declares, read with raw
+    /// syscalls as [`ElfLayout::read_file`] reads. `None` for a file that is
+    /// not a little-endian ELF64 `EM_X86_64` image (nothing for this policy
+    /// to read) and for one the caller cannot read.
+    pub fn read_file(file: &crate::util::RawFd) -> Option<Self> {
+        let read_exact = |offset: u64, buffer: &mut [u8]| {
+            (file.read_at(buffer, offset).ok()? == buffer.len()).then_some(())
+        };
+        let mut header = [0_u8; 64];
+        read_exact(0, &mut header)?;
+        Self::parse(&header, None, read_exact)
+    }
+
+    /// What the image a process has mapped at load bias `bias` declares,
+    /// read through `read_memory(address, buffer)` from the process's memory:
+    /// the bytes the loader itself reads its properties from. Its file header
+    /// must be mapped at the bias, as a position-independent loader's is,
+    /// whose first segment maps file offset 0 at address 0 (`AT_BASE` is then
+    /// that address). `None` for an image mapped otherwise, one that is not
+    /// x86-64 ELF64, and one whose header or program headers are unreadable.
+    pub fn read_mapped(
+        bias: u64,
+        mut read_memory: impl FnMut(u64, &mut [u8]) -> Option<()>,
+    ) -> Option<Self> {
+        let mut header = [0_u8; 64];
+        read_memory(bias, &mut header)?;
+        Self::parse(&header, Some(bias), read_memory)
+    }
+
+    /// [`Self::read_file`] of an image whose file header is `header`, reading
+    /// the rest through `read_at(address, buffer)`: at file offsets, or where
+    /// `bias` is given, at the addresses an image mapped at that load bias
+    /// has them ([`Self::read_mapped`]).
+    fn parse(
+        header: &[u8; 64],
+        bias: Option<u64>,
+        mut read_at: impl FnMut(u64, &mut [u8]) -> Option<()>,
+    ) -> Option<Self> {
+        let u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
+        let u64_at = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
+        if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 || u16_at(18) != EM_X86_64
+        {
+            return None;
+        }
+        let (phoff, phentsize, phnum) = (u64_at(32), usize::from(u16_at(54)), u16_at(56));
+        if phentsize < 56 {
+            return None;
+        }
+        let headers_end = (phentsize as u64)
+            .checked_mul(u64::from(phnum))
+            .and_then(|size| size.checked_add(phoff))?;
+        // Every property and note segment, each `(offset, vaddr, size,
+        // align)`, and whether the file header is mapped at the bias.
+        let (mut segments, mut properties, mut header_mapped) = (Vec::new(), 0, false);
+        let mut entry = vec![0_u8; phentsize];
+        for index in 0..u64::from(phnum) {
+            let offset = phoff.checked_add(index * phentsize as u64)?;
+            read_at(
+                bias.map_or(Some(offset), |bias| bias.checked_add(offset))?,
+                &mut entry,
+            )?;
+            let field = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
+            let (offset, vaddr, filesz) = (field(8), field(16), field(32));
+            match u32::from_le_bytes(entry[..4].try_into().unwrap()) {
+                // PT_LOAD: the program headers are where they were read only
+                // if a segment maps them, from file offset 0, at address 0.
+                1 => header_mapped |= offset == 0 && vaddr == 0 && headers_end <= filesz,
+                // Offset, address, size and alignment (p_align), which pads
+                // every note's name and description in the segment (4, or 8
+                // for the ELF64 property notes).
+                kind @ (PT_GNU_PROPERTY | PT_NOTE) => {
+                    properties += usize::from(kind == PT_GNU_PROPERTY);
+                    segments.push((offset, vaddr, filesz, field(48)));
+                }
+                _ => {}
+            }
+        }
+        if bias.is_some() && !header_mapped {
+            return None;
+        }
+        if properties > 1 {
+            return Some(Self::Malformed("more than one PT_GNU_PROPERTY segment"));
+        }
+        // A linker gives the property note both a PT_GNU_PROPERTY segment
+        // and a PT_NOTE one (or one PT_NOTE with the image's other notes):
+        // every segment is read, so that neither hides a declaration from
+        // the other, and a note is told apart by its place in the file, so
+        // that one declaration seen twice is not two.
+        let mut found: Option<(u64, Self)> = None;
+        for (offset, vaddr, size, align) in segments {
+            let align = match align {
+                // An unaligned note segment is laid out as a 4-aligned one.
+                0..=4 => 4,
+                8 => 8,
+                _ => return Some(Self::Malformed("a note segment aligned to neither 4 nor 8")),
+            };
+            if size > MAX_NOTE_SEGMENT {
+                return Some(Self::Malformed("a note segment larger than 64 KiB"));
+            }
+            let mut bytes = vec![0_u8; usize::try_from(size).ok()?];
+            let address = bias.map_or(Some(offset), |bias| bias.checked_add(vaddr));
+            if address
+                .and_then(|address| read_at(address, &mut bytes))
+                .is_none()
+            {
+                return Some(Self::Malformed(
+                    "a note segment past the end of the file or unmapped",
+                ));
+            }
+            match Self::from_notes(&bytes, align) {
+                Err(why) => return Some(Self::Malformed(why)),
+                Ok(None) => {}
+                Ok(Some((at, level))) => {
+                    let at = offset.checked_add(at as u64)?;
+                    match found {
+                        Some((seen, _)) if seen == at => {}
+                        Some(_) => {
+                            return Some(Self::Malformed("more than one x86 ISA needed property"));
+                        }
+                        None => found = Some((at, level)),
+                    }
+                }
+            }
+        }
+        Some(found.map_or(Self::Unmarked, |(_, level)| level))
+    }
+
+    /// The declaration in one note segment's bytes, its notes' names and
+    /// descriptions each padded to `align`, with where in the segment its
+    /// note starts.
+    fn from_notes(mut notes: &[u8], align: usize) -> Result<Option<(usize, Self)>, &'static str> {
+        let (mut found, mut at) = (None, 0);
+        while !notes.is_empty() {
+            if notes.len() < 12 {
+                return Err("a truncated note header");
+            }
+            let word = |at: usize| u32::from_le_bytes(notes[at..at + 4].try_into().unwrap());
+            let (namesz, descsz, kind) = (word(0) as usize, word(4) as usize, word(8));
+            // As glibc's ELF_NOTE_DESC_OFFSET and ELF_NOTE_NEXT_OFFSET: the
+            // description starts, and the next note follows it, at the next
+            // multiple of `align` from the note's start.
+            let ends = namesz
+                .checked_add(12)
+                .and_then(|name_end| name_end.checked_next_multiple_of(align))
+                .and_then(|desc_start| {
+                    let desc_end = desc_start.checked_add(descsz)?;
+                    Some((desc_start, desc_end.checked_next_multiple_of(align)?))
+                });
+            let Some((desc_start, next)) = ends.filter(|&(_, end)| end <= notes.len()) else {
+                return Err("a truncated note");
+            };
+            let gnu_properties =
+                kind == NT_GNU_PROPERTY_TYPE_0 && notes[12..12 + namesz] == *b"GNU\0";
+            if gnu_properties
+                && let Some(level) = Self::from_properties(&notes[desc_start..desc_start + descsz])?
+            {
+                if found.is_some() {
+                    return Err("more than one x86 ISA needed property");
+                }
+                found = Some((at, level));
+            }
+            notes = &notes[next..];
+            at += next;
+        }
+        Ok(found)
+    }
+
+    /// The declaration in one `NT_GNU_PROPERTY_TYPE_0` description, if it
+    /// has one.
+    fn from_properties(mut properties: &[u8]) -> Result<Option<Self>, &'static str> {
+        let mut found = None;
+        while !properties.is_empty() {
+            if properties.len() < 8 {
+                return Err("a truncated GNU property header");
+            }
+            let word = |at: usize| u32::from_le_bytes(properties[at..at + 4].try_into().unwrap());
+            let (kind, size) = (word(0), word(4) as usize);
+            let end = size
+                .checked_next_multiple_of(8)
+                .and_then(|data| data.checked_add(8));
+            let Some(end) = end.filter(|&end| end <= properties.len()) else {
+                return Err("a truncated GNU property");
+            };
+            if kind == GNU_PROPERTY_X86_ISA_1_NEEDED {
+                if size != 4 {
+                    return Err("an x86 ISA needed property that is not 4 bytes");
+                }
+                if found.is_some() {
+                    return Err("more than one x86 ISA needed property");
+                }
+                // The highest set bit: 1 baseline, 2 v2, 4 v3, 8 v4, and
+                // above that, levels this Hermit does not know.
+                found = Some(Self::Level(32 - word(8).leading_zeros() as u8));
+            }
+            properties = &properties[end..];
+        }
+        Ok(found)
+    }
+}
+
+/// The first of an exec's `objects`, each `(what, declaration)`, that
+/// declares it needs a higher x86-64 level than `level`, with the level it
+/// needs. An unmarked, malformed or unread object declares nothing, so it
+/// is never one: an absent declaration does not prove the image runs, and
+/// the caller reports it as unknown rather than as compatible.
+pub fn first_needing_above<'a>(
+    level: u8,
+    objects: &[(&'a str, Option<IsaNeeds>)],
+) -> Option<(&'a str, u8)> {
+    objects.iter().find_map(|&(what, needs)| match needs {
+        Some(IsaNeeds::Level(needed)) if needed > level => Some((what, needed)),
+        _ => None,
+    })
+}
+
+/// The name of x86-64 level `level` as an ISA needed property gives it.
+pub fn x86_64_level_name(level: u8) -> String {
+    match level {
+        0 | 1 => "baseline x86-64".to_owned(),
+        2..=4 => format!("x86-64-v{level}"),
+        _ => format!("an x86-64 level above v4 (needed bit {})", level - 1),
+    }
+}
+
 /// The load bias of the image file at `path` with inode `ino`, in a
 /// process whose `/proc/<pid>/maps` reads `maps`: the start of the file's
 /// executable mapping at the text segment's offset less the text segment's
@@ -616,6 +875,317 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    /// An ELF64 x86-64 image whose program headers (at file offset 64) name
+    /// `segments`, each `(p_type, contents)` laid out after them at the
+    /// address equal to its file offset. A `PT_LOAD` segment maps the whole
+    /// file at address 0, whatever its contents.
+    fn image_with(machine: u16, segments: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let aligned: Vec<_> = segments
+            .iter()
+            .map(|(kind, contents)| (*kind, contents.clone(), 8))
+            .collect();
+        image_aligned(machine, &aligned)
+    }
+
+    /// [`image_with`] with each segment's p_align given.
+    fn image_aligned(machine: u16, segments: &[(u32, Vec<u8>, u64)]) -> Vec<u8> {
+        let mut header = [0_u8; 64];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        header[16..18].copy_from_slice(&3_u16.to_le_bytes());
+        header[18..20].copy_from_slice(&machine.to_le_bytes());
+        header[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        header[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        header[56..58].copy_from_slice(&(segments.len() as u16).to_le_bytes());
+        let mut file = header.to_vec();
+        let mut offset = 64 + 56 * segments.len() as u64;
+        let mut data = Vec::new();
+        for (kind, contents, align) in segments {
+            let mut entry = [0_u8; 56];
+            entry[..4].copy_from_slice(&kind.to_le_bytes());
+            entry[8..16].copy_from_slice(&offset.to_le_bytes());
+            entry[16..24].copy_from_slice(&offset.to_le_bytes());
+            entry[32..40].copy_from_slice(&(contents.len() as u64).to_le_bytes());
+            entry[48..56].copy_from_slice(&align.to_le_bytes());
+            file.extend_from_slice(&entry);
+            data.extend_from_slice(contents);
+            offset += contents.len() as u64;
+        }
+        file.extend_from_slice(&data);
+        let size = (file.len() as u64).to_le_bytes();
+        for (index, (kind, _, _)) in segments.iter().enumerate() {
+            if *kind == 1 {
+                let entry = 64 + 56 * index;
+                file[entry + 8..entry + 24].fill(0);
+                file[entry + 32..entry + 40].copy_from_slice(&size);
+            }
+        }
+        file
+    }
+
+    fn isa_needs(file: &[u8]) -> Option<IsaNeeds> {
+        let header: [u8; 64] = file[..64].try_into().unwrap();
+        IsaNeeds::parse(&header, None, |offset, buffer| {
+            let start = usize::try_from(offset).ok()?;
+            buffer.copy_from_slice(file.get(start..start.checked_add(buffer.len())?)?);
+            Some(())
+        })
+    }
+
+    /// One `NT_GNU_PROPERTY_TYPE_0` note holding `properties`, each
+    /// `(pr_type, pr_data)`, padded as ELF64 pads them.
+    fn property_note(properties: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut description = Vec::new();
+        for (kind, data) in properties {
+            description.extend_from_slice(&kind.to_le_bytes());
+            description.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            description.extend_from_slice(data);
+            description.resize(description.len().next_multiple_of(8), 0);
+        }
+        let mut note = Vec::new();
+        note.extend_from_slice(&4_u32.to_le_bytes());
+        note.extend_from_slice(&(description.len() as u32).to_le_bytes());
+        note.extend_from_slice(&NT_GNU_PROPERTY_TYPE_0.to_le_bytes());
+        note.extend_from_slice(b"GNU\0");
+        note.extend_from_slice(&description);
+        note
+    }
+
+    fn isa_needed(bits: u32) -> (u32, Vec<u8>) {
+        (GNU_PROPERTY_X86_ISA_1_NEEDED, bits.to_le_bytes().to_vec())
+    }
+
+    #[test]
+    fn an_x86_isa_needed_property_names_its_highest_level() {
+        for (bits, level) in [
+            (0, 0),
+            (1, 1),
+            (0b11, 2),
+            (0b111, 3),
+            (0b100, 3),
+            (0b1111, 4),
+            // A bit above x86-64-v4's, for a level this Hermit does not know:
+            // well formed, and above every level it does.
+            (0b1_0111, 5),
+            (1 << 31, 32),
+        ] {
+            let file = image_with(
+                EM_X86_64,
+                &[(PT_GNU_PROPERTY, property_note(&[isa_needed(bits)]))],
+            );
+            assert_eq!(isa_needs(&file), Some(IsaNeeds::Level(level)), "{bits:#b}");
+        }
+        // Beside another property (X86_FEATURE_1_AND, IBT|SHSTK), as linkers
+        // write them.
+        let file = image_with(
+            EM_X86_64,
+            &[(
+                PT_GNU_PROPERTY,
+                property_note(&[
+                    (0xc000_0002, 3_u32.to_le_bytes().to_vec()),
+                    isa_needed(0b111),
+                ]),
+            )],
+        );
+        assert_eq!(isa_needs(&file), Some(IsaNeeds::Level(3)));
+        // Found in a PT_NOTE segment where no PT_GNU_PROPERTY segment exists.
+        let build_id = {
+            let mut note = Vec::new();
+            note.extend_from_slice(&4_u32.to_le_bytes());
+            note.extend_from_slice(&4_u32.to_le_bytes());
+            note.extend_from_slice(&3_u32.to_le_bytes()); // NT_GNU_BUILD_ID
+            note.extend_from_slice(b"GNU\0\xde\xad\xbe\xef");
+            note
+        };
+        // As linkers lay them out: the 4-aligned build ID and ABI notes in
+        // one PT_NOTE segment, the 8-aligned property note in another.
+        let mut two_build_ids = build_id.clone();
+        two_build_ids.extend_from_slice(&build_id);
+        assert_eq!(
+            isa_needs(&image_aligned(
+                EM_X86_64,
+                &[
+                    (PT_NOTE, two_build_ids.clone(), 4),
+                    (PT_NOTE, property_note(&[isa_needed(0b11)]), 8),
+                ]
+            )),
+            Some(IsaNeeds::Level(2))
+        );
+        // No property at all: unmarked, which proves nothing about the CPU
+        // the image needs.
+        assert_eq!(
+            isa_needs(&image_aligned(EM_X86_64, &[(PT_NOTE, two_build_ids, 4)])),
+            Some(IsaNeeds::Unmarked)
+        );
+        assert_eq!(
+            isa_needs(&image_with(EM_X86_64, &[])),
+            Some(IsaNeeds::Unmarked)
+        );
+        // Not an x86-64 image: nothing for this policy to read.
+        let aarch64 = image_with(
+            183,
+            &[(PT_GNU_PROPERTY, property_note(&[isa_needed(0b111)]))],
+        );
+        assert_eq!(isa_needs(&aarch64), None);
+        // A real image, this test binary: readable, whatever it declares.
+        let file =
+            crate::util::RawFd::open(&std::env::current_exe().unwrap(), libc::O_RDONLY).unwrap();
+        assert!(!matches!(
+            IsaNeeds::read_file(&file),
+            None | Some(IsaNeeds::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn only_a_declared_level_above_the_profiles_refuses() {
+        let objects = |image, loader| [("the image", image), ("its loader", loader)];
+        let v3 = Some(IsaNeeds::Level(3));
+        // The loader's declaration counts as the image's does.
+        assert_eq!(
+            first_needing_above(2, &objects(Some(IsaNeeds::Unmarked), v3)),
+            Some(("its loader", 3))
+        );
+        assert_eq!(
+            first_needing_above(2, &objects(v3, None)),
+            Some(("the image", 3))
+        );
+        assert_eq!(first_needing_above(3, &objects(v3, v3)), None);
+        assert_eq!(
+            first_needing_above(3, &objects(Some(IsaNeeds::Level(5)), None)),
+            Some(("the image", 5))
+        );
+        // Nothing declared, or nothing readable: no refusal.
+        for unknown in [
+            None,
+            Some(IsaNeeds::Unmarked),
+            Some(IsaNeeds::Malformed("a truncated note")),
+            Some(IsaNeeds::Level(2)),
+        ] {
+            assert_eq!(first_needing_above(2, &objects(unknown, unknown)), None);
+        }
+        assert_eq!(x86_64_level_name(3), "x86-64-v3");
+        assert_eq!(x86_64_level_name(1), "baseline x86-64");
+        assert!(x86_64_level_name(5).contains("above v4"));
+    }
+
+    #[test]
+    fn one_isa_declaration_in_two_segments_is_read_once() {
+        // The property note in a PT_GNU_PROPERTY segment and a PT_NOTE one,
+        // as linkers write it: one declaration, not two.
+        let mut file = image_with(
+            EM_X86_64,
+            &[
+                (PT_GNU_PROPERTY, property_note(&[isa_needed(0b111)])),
+                (PT_NOTE, Vec::new()),
+            ],
+        );
+        let first = file[64 + 8..64 + 56].to_vec();
+        file[64 + 56 + 8..64 + 112].copy_from_slice(&first);
+        assert_eq!(isa_needs(&file), Some(IsaNeeds::Level(3)));
+    }
+
+    #[test]
+    fn a_mapped_image_is_read_at_its_load_bias() {
+        const BIAS: u64 = 0x7f00_0000_0000;
+        let mapped = |file: &[u8]| {
+            IsaNeeds::read_mapped(BIAS, |address, buffer| {
+                let start = usize::try_from(address.checked_sub(BIAS)?).ok()?;
+                buffer.copy_from_slice(file.get(start..start.checked_add(buffer.len())?)?);
+                Some(())
+            })
+        };
+        let declared = (PT_GNU_PROPERTY, property_note(&[isa_needed(0b111)]));
+        let file = image_with(EM_X86_64, &[(1, Vec::new()), declared.clone()]);
+        assert_eq!(mapped(&file), Some(IsaNeeds::Level(3)));
+        // Program headers no segment maps from file offset 0 at address 0:
+        // what was read there is not known to be them.
+        assert_eq!(mapped(&image_with(EM_X86_64, &[declared])), None);
+        // A segment past the mapped bytes.
+        let mut file = file;
+        file.truncate(file.len() - 8);
+        assert!(matches!(mapped(&file), Some(IsaNeeds::Malformed(_))));
+        // This test process's own program interpreter, at AT_BASE, read from
+        // memory as Detcore reads a guest's: whatever it declares, readable.
+        let auxv = fs::read("/proc/self/auxv").unwrap();
+        if let Some(base) = auxv_entry(&auxv, libc::AT_BASE).filter(|&base| base != 0) {
+            let loader = IsaNeeds::read_mapped(base, |address, buffer| {
+                // SAFETY: the loader's header, program headers and notes lie
+                // in its mapped, readable first segment.
+                let source =
+                    unsafe { std::slice::from_raw_parts(address as *const u8, buffer.len()) };
+                buffer.copy_from_slice(source);
+                Some(())
+            });
+            assert!(
+                matches!(loader, Some(IsaNeeds::Unmarked | IsaNeeds::Level(_))),
+                "{loader:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_isa_declaration_is_not_read_as_unmarked() {
+        let malformed =
+            |segments: &[(u32, Vec<u8>)]| match isa_needs(&image_with(EM_X86_64, segments)) {
+                Some(IsaNeeds::Malformed(why)) => why,
+                other => panic!("not malformed: {other:?}"),
+            };
+        // The property twice, in one note or across segments.
+        assert!(
+            malformed(&[(
+                PT_GNU_PROPERTY,
+                property_note(&[isa_needed(0b11), isa_needed(0b111)])
+            )])
+            .contains("more than one")
+        );
+        assert!(
+            malformed(&[
+                (PT_NOTE, property_note(&[isa_needed(0b11)])),
+                (PT_NOTE, property_note(&[isa_needed(0b111)])),
+            ])
+            .contains("more than one")
+        );
+        // A second declaration beside the one a PT_GNU_PROPERTY segment
+        // holds, which a reader of that segment alone would never see.
+        assert!(
+            malformed(&[
+                (PT_GNU_PROPERTY, property_note(&[isa_needed(0b11)])),
+                (PT_NOTE, property_note(&[isa_needed(0b111)])),
+            ])
+            .contains("more than one")
+        );
+        assert!(
+            malformed(&[
+                (PT_GNU_PROPERTY, property_note(&[isa_needed(0b11)])),
+                (PT_GNU_PROPERTY, property_note(&[isa_needed(0b11)])),
+            ])
+            .contains("more than one PT_GNU_PROPERTY")
+        );
+        // A property whose data is not 4 bytes.
+        assert!(
+            malformed(&[(
+                PT_GNU_PROPERTY,
+                property_note(&[(GNU_PROPERTY_X86_ISA_1_NEEDED, vec![7; 8])])
+            )])
+            .contains("not 4 bytes")
+        );
+        // Truncated notes and properties.
+        let mut note = property_note(&[isa_needed(0b111)]);
+        note.truncate(note.len() - 4);
+        assert!(malformed(&[(PT_GNU_PROPERTY, note)]).contains("truncated"));
+        assert!(malformed(&[(PT_GNU_PROPERTY, vec![4, 0, 0])]).contains("truncated"));
+        // A segment that runs past the end of the file.
+        let mut file = image_with(
+            EM_X86_64,
+            &[(PT_GNU_PROPERTY, property_note(&[isa_needed(1)]))],
+        );
+        file.truncate(file.len() - 8);
+        assert!(
+            matches!(isa_needs(&file), Some(IsaNeeds::Malformed(why)) if why.contains("past the end"))
+        );
+    }
 
     #[test]
     fn an_elf_layout_gives_linuxs_start_of_the_program_break() {

@@ -58,6 +58,18 @@ impl CpuProfile {
             CpuProfile::HostNoRdrand => "host-no-rdrand",
         }
     }
+
+    /// The x86-64 microarchitecture level this profile's fixed table
+    /// presents (2 or 3), against which a guest image's declared need is
+    /// compared. `None` for host-no-rdrand, whose features are the host's:
+    /// no fixed level describes them.
+    pub fn x86_64_level(&self) -> Option<u8> {
+        match self {
+            CpuProfile::X86_64V2 => Some(2),
+            CpuProfile::X86_64V3 => Some(3),
+            CpuProfile::HostNoRdrand => None,
+        }
+    }
 }
 
 impl std::fmt::Display for CpuProfile {

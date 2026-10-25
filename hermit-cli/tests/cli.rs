@@ -55481,6 +55481,340 @@ fn library_runs_return_on_a_256_kib_thread() {
     assert_eq!(output, Ok(Some(0)));
 }
 
+/// How [`isa_fixture`] links `hermit-cli/tests/fixtures/isa/isa_needed.c`.
+enum IsaLink<'a> {
+    /// A static image.
+    Static,
+    /// A static-pie image, to be another image's program interpreter.
+    Interpreter,
+    /// A position-independent image naming this program interpreter.
+    Interpreted(&'a Path),
+}
+
+/// `isa_needed.c` built as `name` in this process's build root: it declares
+/// the x86 ISA needed `bits` (none for `None`), writes "ran\n" and exits
+/// `status`, executing nothing above baseline x86-64, so that a refusal and
+/// a run tell only the declaration apart.
+fn isa_fixture(name: &str, bits: Option<u32>, status: u8, link: IsaLink) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = process_build_root("isa-needed");
+    fs::create_dir_all(&build_root).expect("failed to create the ISA fixture directory");
+    let image = build_root.join(name);
+    let mut command = Command::new("cc");
+    command.args(["-O1", "-nostdlib", "-Wall", "-Wextra", "-Werror"]);
+    command.arg(format!("-DISA_EXIT={status}"));
+    if let Some(bits) = bits {
+        command.arg(format!("-DISA_NEEDED=\"{bits:#x}\""));
+    }
+    match link {
+        IsaLink::Static => command.args(["-static", "-fno-pie", "-no-pie"]),
+        IsaLink::Interpreter => command.args(["-static-pie", "-fPIE"]),
+        IsaLink::Interpreted(interpreter) => command
+            .args(["-fPIE", "-pie"])
+            .arg(format!("-Wl,--dynamic-linker={}", interpreter.display())),
+    };
+    let output = command
+        .arg(repository.join("hermit-cli/tests/fixtures/isa/isa_needed.c"))
+        .arg("-o")
+        .arg(&image)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to compile {name}: {error}"));
+    assert!(
+        output.status.success(),
+        "{name} compilation failed:\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    image
+}
+
+/// `hermit <args>` with its exit status, stdout and stderr.
+fn isa_run(args: &[&str]) -> (Option<i32>, String, String) {
+    let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut hermit_command(args));
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Asserts that `hermit <args>` was refused, by policy and by name, because
+/// `what` declares it needs `needed`, under the default profile, and that
+/// the declaring image never wrote a byte.
+fn assert_isa_refused(args: &[&str], what: &str, needed: &str) {
+    let (status, stdout, stderr) = isa_run(args);
+    let context = format!("{args:?}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{context}");
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL")
+            && stderr.contains(&format!("--cpu-profile x86-64-v2 refused: {what} of "))
+            && stderr.contains(&format!("declares that it needs {needed} ")),
+        "{context}"
+    );
+    assert!(
+        !stdout.contains("ran"),
+        "the declaring image ran: {context}"
+    );
+}
+
+/// Asserts that `hermit <args>` ran its guest to `status` with stdout
+/// `stdout`, with no policy refusal.
+fn assert_isa_ran(args: &[&str], status: i32, stdout: &str) {
+    let (actual, out, stderr) = isa_run(args);
+    let context = format!("{args:?}:\nstdout:\n{out}\nstderr:\n{stderr}");
+    assert_eq!((actual, out.as_str()), (Some(status), stdout), "{context}");
+    assert!(!stderr.contains("HERMIT_POLICY_REFUSAL"), "{context}");
+}
+
+/// An image that declares it needs a higher x86-64 level than the CPU
+/// profile presents (GNU_PROPERTY_X86_ISA_1_NEEDED) is refused by policy,
+/// exit 122 and named, before its first instruction, under the default
+/// x86-64-v2 profile on any host, whether the run is plain, verified or
+/// recorded. There is no silent upgrade to x86-64-v3. Images declaring v2 or
+/// less, or nothing, run as before.
+#[test]
+fn an_image_declaring_a_level_above_the_profile_is_refused_before_it_runs() {
+    let v3 = isa_fixture("needs-v3", Some(0b111), 42, IsaLink::Static);
+    let v3 = v3.to_str().unwrap();
+    for launch in [
+        &["run"][..],
+        &["run", "--cpu-profile", "x86-64-v2"],
+        &["run", "--verify"],
+        &["record", "start"],
+    ] {
+        let mut args = launch.to_vec();
+        args.extend(["--", v3]);
+        assert_isa_refused(&args, "the executable", "x86-64-v3");
+    }
+    // A needed bit above x86-64-v4's: a level this Hermit does not know.
+    let future = isa_fixture("needs-future", Some(0b1_0111), 42, IsaLink::Static);
+    assert_isa_refused(
+        &["run", "--", future.to_str().unwrap()],
+        "the executable",
+        "an x86-64 level above v4",
+    );
+    // Controls: the same program declaring less, or nothing, runs.
+    for (name, bits) in [
+        ("needs-v2", Some(0b11)),
+        ("needs-baseline", Some(1)),
+        ("needs-nothing-listed", Some(0)),
+        ("unmarked", None),
+    ] {
+        let image = isa_fixture(name, bits, 42, IsaLink::Static);
+        assert_isa_ran(&["run", "--", image.to_str().unwrap()], 42, "ran\n");
+    }
+}
+
+/// The program interpreter the kernel loads for an image is checked as the
+/// image is: glibc's loader declaring x86-64-v3 refuses the run though the
+/// executable naming it declares nothing, and a declaring executable is
+/// refused whatever its interpreter declares. The interpreter fixture runs
+/// in the image's place, so a run writes its "ran" and exits its status.
+#[test]
+fn a_program_interpreter_declaring_a_level_above_the_profile_is_refused() {
+    let loader_v3 = isa_fixture("loader-v3", Some(0b111), 43, IsaLink::Interpreter);
+    let loader_v2 = isa_fixture("loader-v2", Some(0b11), 43, IsaLink::Interpreter);
+    let loader_unmarked = isa_fixture("loader-unmarked", None, 43, IsaLink::Interpreter);
+    let unmarked_on_v3 = isa_fixture("on-loader-v3", None, 44, IsaLink::Interpreted(&loader_v3));
+    assert_isa_refused(
+        &["run", "--", unmarked_on_v3.to_str().unwrap()],
+        "its program interpreter",
+        "x86-64-v3",
+    );
+    let v3_on_unmarked = isa_fixture(
+        "v3-on-loader-unmarked",
+        Some(0b111),
+        44,
+        IsaLink::Interpreted(&loader_unmarked),
+    );
+    assert_isa_refused(
+        &["run", "--", v3_on_unmarked.to_str().unwrap()],
+        "the executable",
+        "x86-64-v3",
+    );
+    // Control: an interpreter declaring v2.
+    let unmarked_on_v2 = isa_fixture("on-loader-v2", None, 44, IsaLink::Interpreted(&loader_v2));
+    assert_isa_ran(
+        &["run", "--", unmarked_on_v2.to_str().unwrap()],
+        43,
+        "ran\n",
+    );
+}
+
+/// `hermit-cli/tests/fixtures/isa/isa_exec.c`, built once in this process's
+/// build root: tests sharing a process must not rebuild it while another
+/// runs it.
+fn isa_exec_helper() -> &'static Path {
+    static HELPER: OnceLock<PathBuf> = OnceLock::new();
+    HELPER.get_or_init(build_isa_exec_helper)
+}
+
+fn build_isa_exec_helper() -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = process_build_root("isa-needed");
+    fs::create_dir_all(&build_root).expect("failed to create the ISA fixture directory");
+    let helper = build_root.join("isa_exec");
+    let output = Command::new("cc")
+        .args(["-O1", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("hermit-cli/tests/fixtures/isa/isa_exec.c"))
+        .arg("-o")
+        .arg(&helper)
+        .output()
+        .expect("failed to compile isa_exec");
+    assert!(
+        output.status.success(),
+        "isa_exec compilation failed:\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    helper
+}
+
+/// A declaring image exec'd later in the run, by a guest that declares
+/// nothing, refuses the whole run by policy (exit 122), whether the exec
+/// names it, runs it as a script's interpreter, runs a memfd copy of it
+/// that has no pathname at all, or names it after a chroot by an absolute
+/// link that resolves only in the new root: the check reads the object the
+/// exec ran, not a pathname.
+#[test]
+fn a_later_exec_of_a_declaring_image_refuses_the_whole_run() {
+    let v3 = isa_fixture("later-v3", Some(0b111), 42, IsaLink::Static);
+    let v3 = v3.to_str().unwrap();
+    let (status, stdout, stderr) = isa_run(&[
+        "run",
+        "--",
+        "/bin/sh",
+        "-c",
+        &format!("echo before; {v3}; echo after"),
+    ]);
+    let context = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{context}");
+    assert!(
+        stderr.contains("--cpu-profile x86-64-v2 refused: the executable of ")
+            && stderr.contains(v3),
+        "{context}"
+    );
+    assert!(
+        stdout.starts_with("before") && !stdout.contains("ran") && !stdout.contains("after"),
+        "{context}"
+    );
+    // A script whose interpreter is the declaring image.
+    let script = process_build_root("isa-needed").join("needs-v3-script");
+    fs::write(&script, format!("#!{v3}\n")).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_isa_refused(
+        &["run", "--", "/bin/sh", "-c", script.to_str().unwrap()],
+        "the executable",
+        "x86-64-v3",
+    );
+    // A memfd copy, exec'd by AT_EMPTY_PATH.
+    let helper = isa_exec_helper();
+    assert_isa_refused(
+        &["run", "--", helper.to_str().unwrap(), "memfd", v3],
+        "the executable",
+        "x86-64-v3",
+    );
+    // After a chroot to a directory holding the image and a link to it.
+    let root = process_build_root("isa-needed").join("chroot");
+    fs::create_dir_all(&root).unwrap();
+    let image = root.join("needs-v3");
+    fs::copy(v3, &image).unwrap();
+    let _ = fs::remove_file(root.join("isa-link"));
+    std::os::unix::fs::symlink("/needs-v3", root.join("isa-link")).unwrap();
+    assert_isa_refused(
+        &[
+            "run",
+            "--",
+            helper.to_str().unwrap(),
+            "chroot",
+            image.to_str().unwrap(),
+        ],
+        "the executable",
+        "x86-64-v3",
+    );
+}
+
+/// An exec of a declaring image that fails keeps the kernel's error: only a
+/// successful exec is checked, so a mismatch never replaces EACCES, ENOENT,
+/// EINVAL or ELOOP with a refusal.
+#[test]
+fn a_failed_exec_of_a_declaring_image_keeps_its_error() {
+    let v3 = isa_fixture("failed-v3", Some(0b111), 42, IsaLink::Static);
+    let v3 = v3.to_str().unwrap();
+    // Not executable: EACCES, which the shell reports as 126.
+    let unexecutable = process_build_root("isa-needed").join("failed-v3-unexecutable");
+    fs::copy(v3, &unexecutable).unwrap();
+    fs::set_permissions(&unexecutable, fs::Permissions::from_mode(0o644)).unwrap();
+    let shell = format!("{} 2>/dev/null; echo status=$?", unexecutable.display());
+    assert_isa_ran(&["run", "--", "/bin/sh", "-c", &shell], 0, "status=126\n");
+    // A missing program interpreter: ENOENT, which the shell reports as 127.
+    let orphan = isa_fixture(
+        "failed-v3-no-loader",
+        Some(0b111),
+        44,
+        IsaLink::Interpreted(Path::new("/nonexistent/isa-loader")),
+    );
+    let shell = format!("{} 2>/dev/null; echo status=$?", orphan.display());
+    assert_isa_ran(&["run", "--", "/bin/sh", "-c", &shell], 0, "status=127\n");
+    // execveat failing on its flags or path: EINVAL, ENOENT, ELOOP.
+    let helper = isa_exec_helper();
+    for (mode, errno) in [
+        ("bad-flag", libc::EINVAL),
+        ("empty-path", libc::ENOENT),
+        ("no-follow", libc::ELOOP),
+    ] {
+        assert_isa_ran(
+            &["run", "--", helper.to_str().unwrap(), mode, v3],
+            0,
+            &format!("errno={errno}\n"),
+        );
+    }
+}
+
+/// Under `--cpu-profile x86-64-v3` an image declaring x86-64-v3 runs, and
+/// one declaring x86-64-v4 is still refused. A host that does not qualify
+/// for v3 refuses the run by name instead (`v3_run_or_refusal`); only this
+/// positive case may end there, never the v2 refusals above.
+#[test]
+fn a_v3_profile_runs_an_image_declaring_v3() {
+    let v3 = isa_fixture("v3-profile-v3", Some(0b111), 0, IsaLink::Static);
+    let ran = v3_run_or_refusal(|| {
+        let (status, stdout, stderr) = isa_run(&[
+            "run",
+            "--cpu-profile",
+            "x86-64-v3",
+            "--",
+            v3.to_str().unwrap(),
+        ]);
+        (status, stdout, stderr, ())
+    });
+    let Some((stdout, _, ())) = ran else {
+        return;
+    };
+    assert_eq!(stdout, "ran\n");
+    let v4 = isa_fixture("v3-profile-v4", Some(0b1111), 0, IsaLink::Static);
+    let (status, stdout, stderr) = isa_run(&[
+        "run",
+        "--cpu-profile",
+        "x86-64-v3",
+        "--",
+        v4.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        status,
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--cpu-profile x86-64-v3 refused: the executable of ")
+            && stderr.contains("declares that it needs x86-64-v4 "),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("ran"), "{stdout}");
+}
+
 /// Under `--cpu-profile x86-64-v3` the guest sees the v3 CPU: every v3 feature
 /// advertised and executable, the hypervisor bit, HLE and RTM clear, leaf 0xD
 /// matching XGETBV with XSAVEOPT and the rest of 0xD.1 hidden, an XSAVE of
