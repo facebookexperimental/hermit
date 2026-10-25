@@ -6321,6 +6321,49 @@ fn backends_without_signal_control_never_enter_the_controlled_loop() {
     }
 }
 
+/// The controlled turn loop registers a queued plain sleep as a timed waiter
+/// before its first pop, as the ordinary loop's step 2 does: a sleep queued
+/// ahead of a runnable thread leaves the run queue and is a timed waiter at
+/// its deadline after one turn, which the runnable thread takes.
+#[test]
+fn the_controlled_loop_registers_a_queued_sleep() {
+    use futures::FutureExt;
+
+    let mut s = scheduler_for(BackendCapabilities::KVM, true);
+    s.install_signal_control(
+        Some(BackendSignalControl {
+            process: Arc::new(Backend::default()),
+        }),
+        true,
+    )
+    .expect("KVM takes the control");
+    assert!(s.signal_control_installed());
+    let (sleeper, _, _) = add(&mut s, 100, 100);
+    let (runner, _, _) = add(&mut s, 100, 101);
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    // Well past the turn's charge, so the sleep is not yet due.
+    let deadline = global.lock().unwrap().as_nanos() + LogicalTime::from_nanos(1_000_000_000);
+    let mut sleep = Resources::new(sleeper);
+    sleep.insert(ResourceID::SleepUntil(deadline), Permission::W);
+    s.next_turns[&sleeper].req.put(Ok(sleep));
+    s.runqueue_push_back(sleeper);
+    s.next_turns[&runner].req.put(Ok(Resources::new(runner)));
+    s.runqueue_push_back(runner);
+    let scheduler = Arc::new(Mutex::new(s));
+    let result = do_a_turn_blocking(scheduler.clone(), global, &Ok(Resources::new(runner)))
+        .now_or_never()
+        .expect("a quiescent request must not block the turn")
+        .expect("the runnable thread must commit");
+    assert_eq!(result.tid, runner);
+    let s = scheduler.lock().unwrap();
+    assert_eq!(s.controlled_turn_entries, 1);
+    assert_eq!(
+        s.blocked.timed_waiters.thread_deadline(sleeper),
+        Some(deadline)
+    );
+    assert!(!s.run_queue.contains_tid(sleeper));
+}
+
 /// Where a real timer goes is decided by the installed control alone. Without
 /// one, Detcore's alarm model serves it, whatever the backend's capabilities.
 /// A backend with process signal control never runs a sequentialized guest

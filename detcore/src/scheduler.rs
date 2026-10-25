@@ -4558,6 +4558,11 @@ pub async fn do_a_turn_blocking(
                         {
                             return Err(SkipTurn);
                         }
+                        // Before this refresh's pop, as before any pop: this also
+                        // registers a sleep queued since the first maintenance
+                        // step (a resumed observation), which the ordinary
+                        // loop leaves to step 3 or the next pass.
+                        state.step2_register_queued_sleeps();
                         if !timed_event_processed {
                             timed_event_processed = state.step2b_process_timed(&global_time);
                         }
@@ -4577,6 +4582,9 @@ pub async fn do_a_turn_blocking(
                     }
                     match maintenance {
                         0 => {
+                            // Before anything can pop a timed event, as the
+                            // ordinary loop's step 2 does.
+                            state.step2_register_queued_sleeps();
                             state.step2_drain_prefix()?;
                             maintenance = 1;
                             continue;
@@ -10447,6 +10455,8 @@ impl Scheduler {
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
+        // Before anything can pop a timed event.
+        self.step2_register_queued_sleeps();
         // Before anything can return or pop a timer (`sigalrm`).
         self.step2_sigalrm_ledger();
         self.step2_release_signaled_background()?;
@@ -11406,6 +11416,65 @@ impl Scheduler {
             readied += 1;
         }
         readied
+    }
+
+    /// Register every queued plain sleep (a request for `SleepUntil` alone,
+    /// not yet due and not indefinite) as a timed waiter, at the first
+    /// quiescent pass that finds it queued, and take its thread out of the run
+    /// queue until the wake pops: what `block_for_one_resource` does to a
+    /// sleeper step 3 chooses early.
+    ///
+    /// A sleep used to become a timed waiter only when step 3 chose its thread
+    /// before its deadline and `block_for_one_resource` skipped it. Whether
+    /// that happened depended on the thread's priority: a sleeper behind a
+    /// runnable thread of better priority stayed unregistered until it fell
+    /// due, then ran without its wake ever popping. A pass pops one due timed
+    /// event (`step2b_process_timed`), so in that pass another due event, such
+    /// as an interval timer's signal, popped in its place, a pass earlier than
+    /// it would beside a registered sleeper. A schedule replay
+    /// (`--replay-schedule-from`) chooses threads by its own priorities, not
+    /// the recording's, so it registered sleepers at other passes than its
+    /// recording and fired signals at other points (a 300 us `ITIMER_REAL`
+    /// beside a sleeping thread left its schedule after a few hundred events).
+    /// Registered when first queued, a sleeper's deadline is in the timed
+    /// events from the pass after its request, whatever the priorities, as a
+    /// Linux hrtimer is armed when the sleep starts.
+    ///
+    /// Determinism: every thread has parked (step 1), so the run queue and
+    /// each queued request are fixed, and the deadline is the guest's own
+    /// request. Threads are taken in run-queue order, but a timed waiter's
+    /// place depends only on its deadline and thread id
+    /// (`TimedEvents::insert`), so the order adds nothing.
+    fn step2_register_queued_sleeps(&mut self) {
+        let committed = self.committed_time;
+        let sleeps: Vec<(LogicalTime, DetTid)> = self
+            .run_queue
+            .tids()
+            .filter(|tid| !self.pending_run_queue_removals.contains_key(*tid))
+            .filter_map(|tid| {
+                let target = self.next_turns.get(tid)?.req.try_read_with(|req| {
+                    let rs = req.as_ref().ok()?;
+                    match rs.resources.iter().next() {
+                        Some((ResourceID::SleepUntil(target), _)) if rs.resources.len() == 1 => {
+                            Some(*target)
+                        }
+                        _ => None,
+                    }
+                })??;
+                (target > committed
+                    && !target.is_indefinite()
+                    && self.blocked.timed_waiters.thread_deadline(*tid).is_none())
+                .then_some((target, *tid))
+            })
+            .collect();
+        for (target, tid) in sleeps {
+            debug!(
+                "[dtid {}] queued sleep registered as a timed waiter at {}",
+                tid, target
+            );
+            self.blocked.timed_waiters.insert(target, tid);
+            assert!(self.run_queue.remove_tid(tid));
+        }
     }
 
     /// Check whether it is time for the *earliest* time-based event to execute INSTEAD of
@@ -17040,6 +17109,10 @@ impl Scheduler {
                         "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} which wanted resource {:?} (blocking)",
                         self.turn, dettid, rid
                     );
+                    // Usually registered already: `step2_register_queued_sleeps`
+                    // takes a queued plain sleep out of the run queue at step 2.
+                    // A defensive fallback for a plain sleep queued after that
+                    // within the same pass; no such path is known.
                     self.blocked.timed_waiters.insert(*target_ns, dettid);
                     self.skip_turn_blocked(dettid)
                 }
@@ -19329,9 +19402,10 @@ impl Scheduler {
     ///   - a timed wait or timer (`timed_waiters`);
     ///   - a backed-off poller's timeout (`poll_deadlines`);
     ///   - the deadline of a sleep or poll another thread has requested but
-    ///     not yet had a turn for. A sleep becomes a timed waiter only at the
-    ///     turn that commits its request, so one queued behind the granted
-    ///     thread would otherwise wait out that thread's whole slice.
+    ///     not yet had a turn for. A plain sleep is a timed waiter from the
+    ///     first pass after its request (`step2_register_queued_sleeps`); one
+    ///     queued later in a pass, or a poll, would otherwise wait out the
+    ///     granted thread's whole slice.
     ///
     /// Only deadlines still ahead of `now` count, from threads that will take
     /// another turn: a passed one (including a yield's `SleepUntil(0)`) marks
@@ -30679,6 +30753,131 @@ mod test {
 
     fn at(offset_ns: u64) -> LogicalTime {
         LogicalTime::from_nanos(NOW_NS + offset_ns)
+    }
+
+    /// A queued plain sleep is a timed waiter from the first quiescent pass
+    /// that finds it queued, whatever the priorities, and its thread leaves
+    /// the run queue until the wake pops. A due sleep (a yield), a sleep with
+    /// no deadline and any other request stay as they are. When the sleep
+    /// falls due beside another timed event with a later deadline, the pass
+    /// pops the sleeper's wake, not the other event: before, an unregistered
+    /// sleeper behind a runnable thread let the later event pop first.
+    #[test]
+    fn a_queued_sleep_is_a_timed_waiter_from_the_first_pass() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        scheduler.committed_time = at(0);
+        let worker = DetTid::from_raw(3);
+        queue_request(&mut scheduler, worker, Resources::new(worker));
+        let sleeper = DetTid::from_raw(5);
+        queue_request(&mut scheduler, sleeper, sleep_request(sleeper, at(7_000)));
+        let yielder = DetTid::from_raw(7);
+        queue_request(
+            &mut scheduler,
+            yielder,
+            sleep_request(yielder, LogicalTime::from_nanos(0)),
+        );
+        let pause = DetTid::from_raw(9);
+        queue_request(
+            &mut scheduler,
+            pause,
+            sleep_request(pause, LogicalTime::INDEFINITE),
+        );
+        // Another timed event, due after the sleep.
+        let later = DetTid::from_raw(11);
+        scheduler.blocked.timed_waiters.insert(at(8_000), later);
+        for tid in [worker, sleeper, yielder, pause, later] {
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+        }
+
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(at(7_000))
+        );
+        assert!(!scheduler.run_queue.contains_tid(sleeper));
+        for tid in [worker, yielder, pause] {
+            assert_eq!(scheduler.blocked.timed_waiters.thread_deadline(tid), None);
+            assert!(scheduler.run_queue.contains_tid(tid));
+        }
+        // A second pass registers nothing again.
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(at(7_000))
+        );
+
+        // Both fall due: the pass pops the earlier, the sleeper's wake.
+        scheduler.committed_time = at(9_000);
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            None
+        );
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(later),
+            Some(at(8_000)),
+            "one timed event pops per pass"
+        );
+    }
+
+    /// Registration does not depend on priorities: a sleeper queued behind a
+    /// runnable thread of better priority and one queued ahead of it are
+    /// registered at the same pass, with the same deadline. A sleeper whose
+    /// thread is pending removal is left alone.
+    #[test]
+    fn a_queued_sleep_registers_whatever_the_priorities() {
+        let config = Config::default();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let worker = DetTid::from_raw(3);
+        let sleeper = DetTid::from_raw(5);
+        let mut orders = Vec::new();
+        for (worker_priority, sleeper_priority) in [(1, 9_999), (9_999, 1)] {
+            let case =
+                format!("worker priority {worker_priority}, sleeper priority {sleeper_priority}");
+            let mut scheduler = Scheduler::new(&config);
+            scheduler.committed_time = at(0);
+            for (tid, request, priority) in [
+                (worker, Resources::new(worker), worker_priority),
+                (sleeper, sleep_request(sleeper, at(7_000)), sleeper_priority),
+            ] {
+                queue_request(&mut scheduler, tid, request);
+                assert!(scheduler.run_queue.remove_tid(tid));
+                scheduler.priorities.insert(tid, priority);
+                scheduler.runqueue_push_back(tid);
+            }
+            orders.push(scheduler.run_queue.tids().copied().collect::<Vec<_>>());
+            let _ = scheduler.step2_process_blocked(&global_time);
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+                Some(at(7_000)),
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+                vec![worker],
+                "{case}"
+            );
+        }
+        assert_eq!(orders, vec![vec![worker, sleeper], vec![sleeper, worker]]);
+
+        // A thread pending removal is left alone: its old queue entry is
+        // still there until the drain takes it.
+        let mut scheduler = Scheduler::new(&config);
+        scheduler.committed_time = at(0);
+        queue_request(&mut scheduler, sleeper, sleep_request(sleeper, at(7_000)));
+        scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+        scheduler
+            .pending_run_queue_removals
+            .insert(sleeper, RemovalDisposition::ReplaceThenAdmit);
+        scheduler.step2_register_queued_sleeps();
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            None
+        );
+        assert!(scheduler.run_queue.contains_tid(sleeper));
     }
 
     /// The deadline hint of hermit#4121 is the time from `committed_time` to
