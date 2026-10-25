@@ -44,10 +44,11 @@ pub enum CpuProfile {
     /// The lowest named profile the guest's image and its program
     /// interpreter declare they need (`GNU_PROPERTY_X86_ISA_1_NEEDED`):
     /// x86-64-v2 where neither declares more, x86-64-v3 where one declares
-    /// v3. Opt-in, never the default. The CLI resolves it to that named
-    /// profile before qualification and launch, so a run's configuration
-    /// and a recording only ever hold the named profile, and replay uses it
-    /// without deriving it again.
+    /// v3. The command line's default where no profile is named. The CLI
+    /// (and the library's launch, for a configuration that names it)
+    /// resolves it to that named profile before qualification and launch,
+    /// so a run's configuration and a recording only ever hold the named
+    /// profile, and replay uses it without deriving it again.
     #[value(name = "auto")]
     #[serde(rename = "auto")]
     Auto,
@@ -184,12 +185,13 @@ pub const HOST_NO_RDRAND_RESIDUAL: &str = host_no_rdrand_residual!();
 
 /// The long help of `--cpu-profile`, for `hermit run` and `hermit record start`.
 pub const CPU_PROFILE_LONG_HELP: &str = concat!(
-    "The CPU the guest sees: x86-64-v2 (the default), x86-64-v3, host-no-rdrand, or auto. \
+    "The CPU the guest sees: auto (the default), x86-64-v2, x86-64-v3, or host-no-rdrand. \
      auto picks the lowest of x86-64-v2 and x86-64-v3 that satisfies what the guest's \
      executable and its program interpreter declare they need (GNU_PROPERTY_X86_ISA_1_NEEDED), \
-     x86-64-v2 where nothing is declared; the chosen profile is what runs, is qualified like an \
-     explicit one, and is what a recording holds. A later exec of an image needing more is \
-     refused, never upgraded. host-no-rdrand is available for `hermit run` on the ptrace backend with CPUID \
+     x86-64-v2 where nothing is declared, and refuses a program it cannot read rather than \
+     guess; the chosen profile is what runs, is qualified like an explicit one, is logged at \
+     info level, and is what a recording holds. A later exec of an image needing more is \
+     refused, never upgraded. A named profile always means exactly itself. host-no-rdrand is available for `hermit run` on the ptrace backend with CPUID \
      faulting and virtual time; it refuses hosts without CPUID faulting instead of \
      allowing native CPUID. RDRAND and RDSEED are hidden. Check availability with \
      `hermit host-capabilities --cpu-profile host-no-rdrand`. Recording and replay \

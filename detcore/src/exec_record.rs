@@ -414,9 +414,50 @@ const NT_GNU_PROPERTY_TYPE_0: u32 = 5;
 const GNU_PROPERTY_X86_ISA_1_NEEDED: u32 = 0xc000_8002;
 /// `EM_X86_64`.
 const EM_X86_64: u16 = 62;
-/// The most note bytes read from one segment; a larger property or note
-/// segment is reported malformed rather than read without bound.
-const MAX_NOTE_SEGMENT: u64 = 64 * 1024;
+/// The largest `NT_GNU_PROPERTY_TYPE_0` description read; a larger one
+/// leaves the image's declaration unknown rather than read without bound.
+/// Other notes' descriptions are skipped, not read, whatever their size.
+const MAX_PROPERTY_DESCRIPTION: usize = 64 * 1024;
+/// The most notes walked in one segment, each at least 12 bytes; past it
+/// the rest of the segment is unknown.
+const MAX_NOTES: usize = 4096;
+
+/// What one image's note segments showed: the declaration found, with the
+/// file offset of its note; whether two different notes declared one; and
+/// the first reason some other part could not be read.
+#[derive(Default)]
+struct NoteWalk {
+    found: Option<(u64, IsaNeeds)>,
+    conflict: bool,
+    unknown: Option<&'static str>,
+}
+
+impl NoteWalk {
+    fn declare(&mut self, at: u64, level: IsaNeeds) {
+        match self.found {
+            // One note seen through two segments is one declaration.
+            Some((seen, _)) if seen == at => {}
+            Some(_) => self.conflict = true,
+            None => self.found = Some((at, level)),
+        }
+    }
+
+    fn unknown(&mut self, why: &'static str) {
+        self.unknown.get_or_insert(why);
+    }
+
+    /// A declaration read is kept whatever else could not be read: an
+    /// unrelated note's failure says nothing about it. Only where none was
+    /// read does a failure make the whole image's declaration unknown.
+    fn result(self) -> IsaNeeds {
+        match (self.found, self.unknown) {
+            _ if self.conflict => IsaNeeds::Malformed("more than one x86 ISA needed property"),
+            (Some((_, level)), _) => level,
+            (None, Some(why)) => IsaNeeds::Malformed(why),
+            (None, None) => IsaNeeds::Unmarked,
+        }
+    }
+}
 
 impl IsaNeeds {
     /// What the x86-64 ELF64 image open as `file` declares, read with raw
@@ -437,29 +478,34 @@ impl IsaNeeds {
         Self::read_file(&crate::util::RawFd::open(path, libc::O_RDONLY).ok()?)
     }
 
-    /// What the image a process has mapped at load bias `bias` declares,
-    /// read through `read_memory(address, buffer)` from the process's memory:
-    /// the bytes the loader itself reads its properties from. Its file header
-    /// must be mapped at the bias, as a position-independent loader's is,
-    /// whose first segment maps file offset 0 at address 0 (`AT_BASE` is then
-    /// that address). `None` for an image mapped otherwise, one that is not
-    /// x86-64 ELF64, and one whose header or program headers are unreadable.
+    /// What the image a process has mapped at load bias `bias`, with its
+    /// file header at `header` (where its segment holding file offset 0 is
+    /// mapped: `bias` plus that segment's address), declares, read through
+    /// `read_memory(address, buffer)` from the process's memory: the bytes
+    /// the loader itself reads its properties from. The program headers must
+    /// show a `PT_LOAD` mapping file offset 0 at `header - bias` and holding
+    /// them, so that what was read is known to be this image's. `None` for
+    /// an image mapped otherwise, one that is not x86-64 ELF64, and one whose
+    /// header or program headers are unreadable.
     pub fn read_mapped(
         bias: u64,
+        header: u64,
         mut read_memory: impl FnMut(u64, &mut [u8]) -> Option<()>,
     ) -> Option<Self> {
-        let mut header = [0_u8; 64];
-        read_memory(bias, &mut header)?;
-        Self::parse(&header, Some(bias), read_memory)
+        let header_vaddr = header.checked_sub(bias)?;
+        let mut bytes = [0_u8; 64];
+        read_memory(header, &mut bytes)?;
+        Self::parse(&bytes, Some((bias, header_vaddr)), read_memory)
     }
 
     /// [`Self::read_file`] of an image whose file header is `header`, reading
     /// the rest through `read_at(address, buffer)`: at file offsets, or where
-    /// `bias` is given, at the addresses an image mapped at that load bias
-    /// has them ([`Self::read_mapped`]).
+    /// `mapped` gives the load bias and the address its file header is
+    /// mapped at before the bias, at the addresses the mapped image has them
+    /// ([`Self::read_mapped`]).
     fn parse(
         header: &[u8; 64],
-        bias: Option<u64>,
+        mapped: Option<(u64, u64)>,
         mut read_at: impl FnMut(u64, &mut [u8]) -> Option<()>,
     ) -> Option<Self> {
         let u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
@@ -475,22 +521,34 @@ impl IsaNeeds {
         let headers_end = (phentsize as u64)
             .checked_mul(u64::from(phnum))
             .and_then(|size| size.checked_add(phoff))?;
+        // Where file offset `offset` of the image (in its first segment) and
+        // address `vaddr` are read.
+        let at_offset = |offset: u64| match mapped {
+            None => Some(offset),
+            Some((bias, header_vaddr)) => bias.checked_add(header_vaddr)?.checked_add(offset),
+        };
+        let at_vaddr = |offset: u64, vaddr: u64| match mapped {
+            None => Some(offset),
+            Some((bias, _)) => bias.checked_add(vaddr),
+        };
         // Every property and note segment, each `(offset, vaddr, size,
-        // align)`, and whether the file header is mapped at the bias.
+        // align)`, and whether the file header is mapped where it was read.
         let (mut segments, mut properties, mut header_mapped) = (Vec::new(), 0, false);
         let mut entry = vec![0_u8; phentsize];
         for index in 0..u64::from(phnum) {
             let offset = phoff.checked_add(index * phentsize as u64)?;
-            read_at(
-                bias.map_or(Some(offset), |bias| bias.checked_add(offset))?,
-                &mut entry,
-            )?;
+            read_at(at_offset(offset)?, &mut entry)?;
             let field = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
             let (offset, vaddr, filesz) = (field(8), field(16), field(32));
             match u32::from_le_bytes(entry[..4].try_into().unwrap()) {
                 // PT_LOAD: the program headers are where they were read only
-                // if a segment maps them, from file offset 0, at address 0.
-                1 => header_mapped |= offset == 0 && vaddr == 0 && headers_end <= filesz,
+                // if a segment maps them, from file offset 0, at the address
+                // the header was read at.
+                1 => {
+                    header_mapped |= offset == 0
+                        && mapped.is_some_and(|(_, header_vaddr)| vaddr == header_vaddr)
+                        && headers_end <= filesz
+                }
                 // Offset, address, size and alignment (p_align), which pads
                 // every note's name and description in the segment (4, or 8
                 // for the ELF64 property notes).
@@ -501,7 +559,7 @@ impl IsaNeeds {
                 _ => {}
             }
         }
-        if bias.is_some() && !header_mapped {
+        if mapped.is_some() && !header_mapped {
             return None;
         }
         if properties > 1 {
@@ -512,59 +570,61 @@ impl IsaNeeds {
         // every segment is read, so that neither hides a declaration from
         // the other, and a note is told apart by its place in the file, so
         // that one declaration seen twice is not two.
-        let mut found: Option<(u64, Self)> = None;
+        let mut walk = NoteWalk::default();
         for (offset, vaddr, size, align) in segments {
             let align = match align {
                 // An unaligned note segment is laid out as a 4-aligned one.
                 0..=4 => 4,
                 8 => 8,
-                _ => return Some(Self::Malformed("a note segment aligned to neither 4 nor 8")),
-            };
-            if size > MAX_NOTE_SEGMENT {
-                return Some(Self::Malformed("a note segment larger than 64 KiB"));
-            }
-            let mut bytes = vec![0_u8; usize::try_from(size).ok()?];
-            let address = bias.map_or(Some(offset), |bias| bias.checked_add(vaddr));
-            if address
-                .and_then(|address| read_at(address, &mut bytes))
-                .is_none()
-            {
-                return Some(Self::Malformed(
-                    "a note segment past the end of the file or unmapped",
-                ));
-            }
-            match Self::from_notes(&bytes, align) {
-                Err(why) => return Some(Self::Malformed(why)),
-                Ok(None) => {}
-                Ok(Some((at, level))) => {
-                    let at = offset.checked_add(at as u64)?;
-                    match found {
-                        Some((seen, _)) if seen == at => {}
-                        Some(_) => {
-                            return Some(Self::Malformed("more than one x86 ISA needed property"));
-                        }
-                        None => found = Some((at, level)),
-                    }
+                _ => {
+                    walk.unknown("a note segment aligned to neither 4 nor 8");
+                    continue;
                 }
+            };
+            match at_vaddr(offset, vaddr) {
+                Some(address) => {
+                    Self::walk_notes(&mut walk, address, offset, size, align, &mut read_at)
+                }
+                None => walk.unknown("a note segment past the address space"),
             }
         }
-        Some(found.map_or(Self::Unmarked, |(_, level)| level))
+        Some(walk.result())
     }
 
-    /// The declaration in one note segment's bytes, its notes' names and
-    /// descriptions each padded to `align`, with where in the segment its
-    /// note starts.
-    fn from_notes(mut notes: &[u8], align: usize) -> Result<Option<(usize, Self)>, &'static str> {
-        let (mut found, mut at) = (None, 0);
-        while !notes.is_empty() {
-            if notes.len() < 12 {
-                return Err("a truncated note header");
+    /// Walk the notes of one segment of `size` bytes, read at `address` and
+    /// at file offset `offset`, their names and descriptions each padded to
+    /// `align` (as glibc's ELF_NOTE_DESC_OFFSET and ELF_NOTE_NEXT_OFFSET pad
+    /// them: the description starts, and the next note follows it, at the
+    /// next multiple of `align` from the note's start). Only a GNU property
+    /// note's description is read; every other note is skipped by its sizes,
+    /// whatever they are, so an unrelated note cannot hide a declaration.
+    fn walk_notes(
+        walk: &mut NoteWalk,
+        address: u64,
+        offset: u64,
+        size: u64,
+        align: u64,
+        read_at: &mut impl FnMut(u64, &mut [u8]) -> Option<()>,
+    ) {
+        let mut cursor = 0_u64;
+        for _ in 0..MAX_NOTES {
+            if cursor == size {
+                return;
             }
-            let word = |at: usize| u32::from_le_bytes(notes[at..at + 4].try_into().unwrap());
-            let (namesz, descsz, kind) = (word(0) as usize, word(4) as usize, word(8));
-            // As glibc's ELF_NOTE_DESC_OFFSET and ELF_NOTE_NEXT_OFFSET: the
-            // description starts, and the next note follows it, at the next
-            // multiple of `align` from the note's start.
+            if size - cursor < 12 {
+                return walk.unknown("a truncated note header");
+            }
+            let mut head = [0_u8; 12];
+            if address
+                .checked_add(cursor)
+                .and_then(|at| read_at(at, &mut head))
+                .is_none()
+            {
+                return walk.unknown("a note past the end of the file or unmapped");
+            }
+            let word =
+                |at: usize| u64::from(u32::from_le_bytes(head[at..at + 4].try_into().unwrap()));
+            let (namesz, descsz, kind) = (word(0), word(4), word(8) as u32);
             let ends = namesz
                 .checked_add(12)
                 .and_then(|name_end| name_end.checked_next_multiple_of(align))
@@ -572,32 +632,54 @@ impl IsaNeeds {
                     let desc_end = desc_start.checked_add(descsz)?;
                     Some((desc_start, desc_end.checked_next_multiple_of(align)?))
                 });
-            let Some((desc_start, next)) = ends.filter(|&(_, end)| end <= notes.len()) else {
-                return Err("a truncated note");
+            let Some((desc_start, next)) = ends.filter(|&(_, next)| next <= size - cursor) else {
+                return walk.unknown("a truncated note");
             };
-            let gnu_properties =
-                kind == NT_GNU_PROPERTY_TYPE_0 && notes[12..12 + namesz] == *b"GNU\0";
-            if gnu_properties
-                && let Some(level) = Self::from_properties(&notes[desc_start..desc_start + descsz])?
-            {
-                if found.is_some() {
-                    return Err("more than one x86 ISA needed property");
+            if kind == NT_GNU_PROPERTY_TYPE_0 && namesz == 4 {
+                let mut name = [0_u8; 4];
+                let read = address
+                    .checked_add(cursor + 12)
+                    .and_then(|at| read_at(at, &mut name));
+                if read.is_none() {
+                    return walk.unknown("a note past the end of the file or unmapped");
                 }
-                found = Some((at, level));
+                if name == *b"GNU\0" {
+                    match usize::try_from(descsz) {
+                        Ok(length) if length <= MAX_PROPERTY_DESCRIPTION => {
+                            let mut description = vec![0_u8; length];
+                            let read = address
+                                .checked_add(cursor + desc_start)
+                                .and_then(|at| read_at(at, &mut description));
+                            if read.is_none() {
+                                return walk.unknown("a note past the end of the file or unmapped");
+                            }
+                            let (level, unknown) = Self::from_properties(&description);
+                            if let Some(level) = level {
+                                walk.declare(offset + cursor, level);
+                            }
+                            if let Some(why) = unknown {
+                                walk.unknown(why);
+                            }
+                        }
+                        _ => walk.unknown("a GNU property note larger than 64 KiB"),
+                    }
+                }
             }
-            notes = &notes[next..];
-            at += next;
+            cursor += next;
         }
-        Ok(found)
+        if cursor < size {
+            walk.unknown("a note segment of more than 4096 notes");
+        }
     }
 
     /// The declaration in one `NT_GNU_PROPERTY_TYPE_0` description, if it
-    /// has one.
-    fn from_properties(mut properties: &[u8]) -> Result<Option<Self>, &'static str> {
+    /// has one, and why some of it could not be read, if so. A declaration
+    /// read before an unreadable property is kept.
+    fn from_properties(mut properties: &[u8]) -> (Option<Self>, Option<&'static str>) {
         let mut found = None;
         while !properties.is_empty() {
             if properties.len() < 8 {
-                return Err("a truncated GNU property header");
+                return (found, Some("a truncated GNU property header"));
             }
             let word = |at: usize| u32::from_le_bytes(properties[at..at + 4].try_into().unwrap());
             let (kind, size) = (word(0), word(4) as usize);
@@ -605,14 +687,17 @@ impl IsaNeeds {
                 .checked_next_multiple_of(8)
                 .and_then(|data| data.checked_add(8));
             let Some(end) = end.filter(|&end| end <= properties.len()) else {
-                return Err("a truncated GNU property");
+                return (found, Some("a truncated GNU property"));
             };
             if kind == GNU_PROPERTY_X86_ISA_1_NEEDED {
-                if size != 4 {
-                    return Err("an x86 ISA needed property that is not 4 bytes");
-                }
                 if found.is_some() {
-                    return Err("more than one x86 ISA needed property");
+                    return (
+                        Some(Self::Malformed("more than one x86 ISA needed property")),
+                        None,
+                    );
+                }
+                if size != 4 {
+                    return (None, Some("an x86 ISA needed property that is not 4 bytes"));
                 }
                 // The highest set bit: 1 baseline, 2 v2, 4 v3, 8 v4, and
                 // above that, levels this Hermit does not know.
@@ -620,8 +705,51 @@ impl IsaNeeds {
             }
             properties = &properties[end..];
         }
-        Ok(found)
+        (found, None)
     }
+}
+
+/// The start and pathname of the lowest file mapping at or above `bias` in
+/// `maps` (a process's `/proc/<pid>/maps`) that maps its file from offset 0:
+/// where the kernel put the first segment of an image it loaded at load
+/// bias `bias`, and with it the image's file header. The kernel maps that
+/// segment at the bias plus its address, which need not be 0.
+pub fn first_image_mapping(maps: &[u8], bias: u64) -> Option<(u64, Vec<u8>)> {
+    maps.split(|&byte| byte == b'\n')
+        .filter_map(|line| {
+            let mut fields = line.splitn(6, |&byte| byte == b' ');
+            let range = std::str::from_utf8(fields.next()?).ok()?;
+            let (start, _) = range.split_once('-')?;
+            let start = u64::from_str_radix(start, 16).ok()?;
+            let _permissions = fields.next()?;
+            let offset = u64::from_str_radix(std::str::from_utf8(fields.next()?).ok()?, 16).ok()?;
+            let _device = fields.next()?;
+            let inode: u64 = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
+            let path = fields
+                .next()
+                .unwrap_or_default()
+                .trim_ascii_start()
+                .to_vec();
+            (start >= bias && offset == 0 && inode != 0).then_some((start, path))
+        })
+        .min_by_key(|&(start, _)| start)
+}
+
+/// The objects an exec ran, each `(what, declaration)` for
+/// [`first_needing_above`]: the executable, and its program interpreter
+/// wherever the kernel loaded one (`loader` is `Some` where `AT_BASE` is
+/// set), whether or not the executable itself could be read. A declaration
+/// read from the mapped interpreter is evidence of its own; it does not
+/// wait on the executable's.
+pub fn exec_objects(
+    image: Option<IsaNeeds>,
+    loader: Option<Option<IsaNeeds>>,
+) -> Vec<(&'static str, Option<IsaNeeds>)> {
+    let mut objects = vec![("the executable", image)];
+    if let Some(loader) = loader {
+        objects.push(("its program interpreter", loader));
+    }
+    objects
 }
 
 /// The first of an exec's `objects`, each `(what, declaration)`, that
@@ -1246,31 +1374,55 @@ mod tests {
         assert_eq!(isa_needs(&file), Some(IsaNeeds::Level(3)));
     }
 
+    /// `file` with every program header's address moved up by `shift`, as
+    /// a linker lays out an image whose first segment is not at address 0.
+    fn shifted(mut file: Vec<u8>, shift: u64) -> Vec<u8> {
+        let count = usize::from(u16::from_le_bytes([file[56], file[57]]));
+        for index in 0..count {
+            let at = 64 + 56 * index + 16;
+            let vaddr = u64::from_le_bytes(file[at..at + 8].try_into().unwrap());
+            file[at..at + 8].copy_from_slice(&(vaddr + shift).to_le_bytes());
+        }
+        file
+    }
+
     #[test]
     fn a_mapped_image_is_read_at_its_load_bias() {
         const BIAS: u64 = 0x7f00_0000_0000;
-        let mapped = |file: &[u8]| {
-            IsaNeeds::read_mapped(BIAS, |address, buffer| {
-                let start = usize::try_from(address.checked_sub(BIAS)?).ok()?;
+        // `file` mapped with its first segment (file offset 0) at address
+        // `first`, so its header is at BIAS + first.
+        let mapped = |file: &[u8], first: u64| {
+            IsaNeeds::read_mapped(BIAS, BIAS + first, |address, buffer| {
+                let start = usize::try_from(address.checked_sub(BIAS + first)?).ok()?;
                 buffer.copy_from_slice(file.get(start..start.checked_add(buffer.len())?)?);
                 Some(())
             })
         };
         let declared = (PT_GNU_PROPERTY, property_note(&[isa_needed(0b111)]));
         let file = image_with(EM_X86_64, &[(1, Vec::new()), declared.clone()]);
-        assert_eq!(mapped(&file), Some(IsaNeeds::Level(3)));
-        // Program headers no segment maps from file offset 0 at address 0:
-        // what was read there is not known to be them.
-        assert_eq!(mapped(&image_with(EM_X86_64, &[declared])), None);
+        assert_eq!(mapped(&file, 0), Some(IsaNeeds::Level(3)));
+        // A first segment at 0x10000, its header at AT_BASE + 0x10000 and
+        // AT_BASE itself unmapped: read where the header is.
+        let high = shifted(file.clone(), 0x10000);
+        assert_eq!(mapped(&high, 0x10000), Some(IsaNeeds::Level(3)));
+        // Read at the bias, it is not there.
+        assert_eq!(mapped(&high, 0), None);
+        // Program headers no segment maps from file offset 0 at the header's
+        // address: what was read there is not known to be them.
+        assert_eq!(mapped(&image_with(EM_X86_64, &[declared]), 0), None);
         // A segment past the mapped bytes.
         let mut file = file;
         file.truncate(file.len() - 8);
-        assert!(matches!(mapped(&file), Some(IsaNeeds::Malformed(_))));
-        // This test process's own program interpreter, at AT_BASE, read from
-        // memory as Detcore reads a guest's: whatever it declares, readable.
+        assert!(matches!(mapped(&file, 0), Some(IsaNeeds::Malformed(_))));
+        // This test process's own program interpreter, found by its first
+        // file mapping at or above AT_BASE and read from memory as Detcore
+        // reads a guest's: whatever it declares, readable.
         let auxv = fs::read("/proc/self/auxv").unwrap();
         if let Some(base) = auxv_entry(&auxv, libc::AT_BASE).filter(|&base| base != 0) {
-            let loader = IsaNeeds::read_mapped(base, |address, buffer| {
+            let maps = fs::read("/proc/self/maps").unwrap();
+            let (header, path) = first_image_mapping(&maps, base).unwrap();
+            assert!(path.starts_with(b"/"), "{}", String::from_utf8_lossy(&path));
+            let loader = IsaNeeds::read_mapped(base, header, |address, buffer| {
                 // SAFETY: the loader's header, program headers and notes lie
                 // in its mapped, readable first segment.
                 let source =
@@ -1283,6 +1435,82 @@ mod tests {
                 "{loader:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_first_image_mapping_is_found_at_or_above_the_bias() {
+        let maps = b"7f0000000000-7f0000001000 r--p 00001000 fd:01 99 /lib/ld.so\n\
+                     7f0000010000-7f0000011000 r--p 00000000 fd:01 99 /lib/ld so\n\
+                     7f0000020000-7f0000021000 rw-p 00000000 00:00 0 \n\
+                     7e0000000000-7e0000001000 r--p 00000000 fd:01 7 /bin/sh\n";
+        assert_eq!(
+            first_image_mapping(maps, 0x7f00_0000_0000),
+            Some((0x7f00_0001_0000, b"/lib/ld so".to_vec()))
+        );
+        assert_eq!(first_image_mapping(maps, 0x7f00_0002_0000), None);
+    }
+
+    #[test]
+    fn a_mapped_interpreters_declaration_does_not_wait_on_the_executable() {
+        // The executable unreadable (say, its permissions changed after the
+        // exec) while the mapped interpreter declares v3: refused.
+        let objects = exec_objects(None, Some(Some(IsaNeeds::Level(3))));
+        assert_eq!(
+            first_needing_above(2, &objects),
+            Some(("its program interpreter", 3))
+        );
+        // No interpreter loaded: only the executable.
+        assert_eq!(exec_objects(Some(IsaNeeds::Unmarked), None).len(), 1);
+        // Neither known: nothing to refuse on.
+        assert_eq!(
+            first_needing_above(2, &exec_objects(None, Some(None))),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unrelated_note_cannot_erase_a_declaration() {
+        // A well-formed 65552-byte note of another kind (namesz 4, descsz
+        // 65536, name "REV"), in its own 4-aligned PT_NOTE.
+        let mut large = Vec::new();
+        large.extend_from_slice(&4_u32.to_le_bytes());
+        large.extend_from_slice(&65536_u32.to_le_bytes());
+        large.extend_from_slice(&0x1234_u32.to_le_bytes());
+        large.extend_from_slice(b"REV\0");
+        large.resize(large.len() + 65536, 0xa5);
+        let declared = (PT_GNU_PROPERTY, property_note(&[isa_needed(0b111)]), 8);
+        let unrelated = (PT_NOTE, large, 4);
+        for segments in [
+            [declared.clone(), unrelated.clone()],
+            [unrelated.clone(), declared.clone()],
+        ] {
+            assert_eq!(
+                isa_needs(&image_aligned(EM_X86_64, &segments)),
+                Some(IsaNeeds::Level(3))
+            );
+        }
+        // Nor can an unrelated note whose header cannot be read (the file
+        // ends 6 bytes into it): the declaration stands, and only without
+        // one is the image unknown. (An unrelated description is skipped,
+        // never read, so its own truncation is not even seen.)
+        let cut = 65552 - 6;
+        let mut truncated = image_aligned(EM_X86_64, &[declared.clone(), unrelated.clone()]);
+        truncated.truncate(truncated.len() - cut);
+        assert_eq!(isa_needs(&truncated), Some(IsaNeeds::Level(3)));
+        let mut alone = image_aligned(EM_X86_64, &[unrelated]);
+        alone.truncate(alone.len() - cut);
+        assert!(
+            matches!(isa_needs(&alone), Some(IsaNeeds::Malformed(why)) if why.contains("past the end"))
+        );
+        // A property before an unreadable one in the same note stands too.
+        let mut note = property_note(&[isa_needed(0b111), (0xc000_0002, vec![3, 0, 0, 0])]);
+        // The second property (at description offset 16) claims 16 data
+        // bytes, past the description's end.
+        note[16 + 16 + 4..16 + 16 + 8].copy_from_slice(&16_u32.to_le_bytes());
+        assert_eq!(
+            isa_needs(&image_aligned(EM_X86_64, &[(PT_GNU_PROPERTY, note, 8)])),
+            Some(IsaNeeds::Level(3))
+        );
     }
 
     #[test]

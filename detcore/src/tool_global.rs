@@ -17596,15 +17596,10 @@ mod tests {
         }
 
         fn memory(&self) -> Self::Memory {
-            // Post-exec reads the new image's program interpreter
-            // (`Detcore::isa_refusal`). Where the tool shares the guest's
-            // process, the procfs directory it reads is this process's, so
-            // its memory is too.
-            assert!(
-                self.post_exec,
-                "external registration must not access guest memory"
-            );
-            reverie::syscalls::LocalMemory::new()
+            // No guest image is read: this guest reports no CPUID
+            // interception (the trait default), so post-exec's image check
+            // (`Detcore::isa_refusal`) never reaches procfs or memory.
+            panic!("external registration must not access guest memory")
         }
 
         fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {

@@ -235,9 +235,12 @@ pub struct Config {
     /// features without hardware randomness. The long help states each
     /// profile's host requirements and determinism limits. Like
     /// HERMIT_EPOCH, HERMIT_CPU_PROFILE supplies the value when the flag is
-    /// absent; an explicit flag wins, unset means x86-64-v2, and a value that
-    /// names no profile is refused. Admission is the same either way.
-    #[clap(long, value_enum, default_value_t, env = "HERMIT_CPU_PROFILE", long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
+    /// absent; an explicit flag wins, and a value that names no profile is
+    /// refused. Unset on the command line means auto, which `hermit run` and
+    /// `hermit record start` resolve to a named profile before launch;
+    /// [`Config::default`] keeps x86-64-v2 for library callers that set
+    /// neither. Admission is the same either way.
+    #[clap(long, value_enum, default_value = "auto", env = "HERMIT_CPU_PROFILE", long_help = crate::cpu_profile::CPU_PROFILE_LONG_HELP)]
     #[serde(default)]
     pub cpu_profile: crate::cpu_profile::CpuProfile,
 
@@ -2294,7 +2297,10 @@ impl fmt::Display for Config {
         if !self.virtualize_cpuid {
             write!(f, " --no-virtualize-cpuid")?;
         }
-        if !self.cpu_profile.is_default() {
+        // The command line's default is auto, so every named profile, v2
+        // included, is written out: a rerun of this line runs that profile,
+        // and never derives one again.
+        if self.cpu_profile != crate::cpu_profile::CpuProfile::Auto {
             write!(f, " --cpu-profile={}", self.cpu_profile)?;
         }
         if !self.virtualize_metadata {
@@ -3319,7 +3325,16 @@ fn signal_state_copy_default() -> bool {
 impl Default for Config {
     fn default() -> Self {
         let v: Vec<String> = vec![];
-        Config::parse_from(v.iter())
+        let mut config = Config::parse_from(v.iter());
+        // The command line's unset profile is auto, which the CLI resolves
+        // before launch. A library caller's configuration, and Detcore's own
+        // tests, never pass through that step: their unset profile stays
+        // x86-64-v2, its meaning before auto. HERMIT_CPU_PROFILE still names
+        // any profile, auto included, which the library's launch resolves.
+        if std::env::var_os("HERMIT_CPU_PROFILE").is_none() {
+            config.cpu_profile = crate::cpu_profile::CpuProfile::X86_64V2;
+        }
+        config
     }
 }
 
@@ -7557,7 +7572,13 @@ mod tests {
                 .to_owned()
         };
 
-        assert_eq!(parse(None, &[]), "cpu-profile=x86-64-v2 wire=x86-64-v2");
+        // Unset on the command line is auto; the wire default stays v2.
+        assert_eq!(parse(None, &[]), "cpu-profile=auto wire=x86-64-v2");
+        assert_eq!(parse(Some("auto"), &[]), "cpu-profile=auto wire=x86-64-v2");
+        assert_eq!(
+            parse(Some("auto"), &["--cpu-profile=x86-64-v2"]),
+            "cpu-profile=x86-64-v2 wire=x86-64-v2"
+        );
         assert_eq!(
             parse(Some("x86-64-v3"), &[]),
             "cpu-profile=x86-64-v3 wire=x86-64-v2"

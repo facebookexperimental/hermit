@@ -201,12 +201,19 @@ pub struct StartOpts {
     #[clap(value_name = "PROGRAM", required = true)]
     program: Option<PathBuf>,
 
-    /// The CPU the recorded guest sees: x86-64-v2 (the default) or x86-64-v3,
-    /// offered only on qualified ptrace hosts. The long help states what the
-    /// qualification leaves uncovered. HERMIT_CPU_PROFILE supplies it when the
-    /// flag is absent, as for `hermit run`; the flag wins.
-    #[clap(long, value_enum, default_value_t, env = "HERMIT_CPU_PROFILE", long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
+    /// The CPU the recorded guest sees: auto (the default), x86-64-v2 or
+    /// x86-64-v3, offered only on qualified ptrace hosts. auto is resolved
+    /// before recording, and the recording holds what it resolved to. The
+    /// long help states what the qualification leaves uncovered.
+    /// HERMIT_CPU_PROFILE supplies it when the flag is absent, as for `hermit
+    /// run`; the flag wins.
+    #[clap(long, value_enum, default_value = "auto", env = "HERMIT_CPU_PROFILE", long_help = detcore_model::cpu_profile::CPU_PROFILE_LONG_HELP)]
     cpu_profile: detcore_model::cpu_profile::CpuProfile,
+
+    /// What `--cpu-profile auto` resolved to and why, logged once the
+    /// recording's tracing starts.
+    #[clap(skip)]
+    auto_resolution: Option<String>,
 
     /// Refuse to record (exit 122) on a host whose retired-conditional-branch counter
     /// fails Reverie's performance-counter validation, as `hermit run --strict` does: the
@@ -643,9 +650,10 @@ impl StartOpts {
                             .context(format!("--cpu-profile auto refused: {why}"))
                     },
                 )?;
-            eprintln!("hermit: --cpu-profile auto resolved to {profile}: {why}");
             let mut resolved = self.clone();
             resolved.cpu_profile = profile;
+            resolved.auto_resolution =
+                Some(format!("--cpu-profile auto resolved to {profile}: {why}"));
             return resolved.main(global);
         }
         hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
@@ -697,6 +705,9 @@ impl StartOpts {
                 None,
                 move |(data, identity)| {
                     let _guard = global.init_tracing();
+                    if let Some(resolution) = &options.auto_resolution {
+                        tracing::info!("{resolution}");
+                    }
                     identity.record_plan()?;
                     let command = options.guest_command()?;
                     let mountinfo = identity.mount_provenance()?;
@@ -1439,6 +1450,7 @@ mod tests {
         StartOpts {
             program: Some(PathBuf::from("/bin/true")),
             cpu_profile: Default::default(),
+            auto_resolution: None,
             strict: false,
             args: Vec::new(),
             env,
@@ -1513,7 +1525,7 @@ mod tests {
     const RECORD_CPU_PROFILE_ARGS_IN_CHILD: &str = "HERMIT_TEST_RECORD_CPU_PROFILE_ARGS";
 
     /// `record start --cpu-profile` reads HERMIT_CPU_PROFILE exactly as `hermit
-    /// run` does: unset is x86-64-v2, the flag wins, and a value that names no
+    /// run` does: unset is auto, the flag wins, and a value that names no
     /// profile is refused. Each parse runs in a child process given exactly
     /// the variable under test.
     #[test]
@@ -1565,7 +1577,8 @@ mod tests {
                 .to_owned()
         };
 
-        assert_eq!(parse(None, &[]), "cpu-profile=x86-64-v2");
+        assert_eq!(parse(None, &[]), "cpu-profile=auto");
+        assert_eq!(parse(Some("auto"), &[]), "cpu-profile=auto");
         assert_eq!(parse(Some("x86-64-v3"), &[]), "cpu-profile=x86-64-v3");
         assert_eq!(
             parse(Some("x86-64-v3"), &["--cpu-profile=x86-64-v2"]),
@@ -1943,6 +1956,7 @@ mod tests {
         let options = StartOpts {
             program: Some(PathBuf::from("/proc/self/exe")),
             cpu_profile: Default::default(),
+            auto_resolution: None,
             strict: false,
             args: Vec::new(),
             env: Vec::new(),

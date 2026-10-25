@@ -4002,6 +4002,7 @@ async fn dispatch_backend(
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
 ) -> Result<ExitStatus, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
+    crate::cpu_profile_admission::resolve_launch_auto(&command, &mut config)?;
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
     detcore_model::virtual_timeout::refuse_debugger(config.virtual_timeout, config.gdbserver)?;
     crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
@@ -4399,6 +4400,7 @@ async fn dispatch_output_backend(
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
 ) -> Result<Output, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
+    crate::cpu_profile_admission::resolve_launch_auto(&command, &mut config)?;
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
     detcore_model::virtual_timeout::refuse_debugger(config.virtual_timeout, config.gdbserver)?;
     crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;

@@ -7,7 +7,8 @@
  * Writes "ran\n" and exits ISA_EXIT, executing no instruction above
  * baseline x86-64, while declaring in a GNU property note the x86 ISA levels
  * it needs: ISA_NEEDED, the GNU_PROPERTY_X86_ISA_1_NEEDED bits (1 baseline,
- * 2 v2, 4 v3, 8 v4). Without ISA_NEEDED it declares nothing. Linked static it
+ * 2 v2, 4 v3, 8 v4). Without ISA_NEEDED it declares nothing. ISA_LARGE_NOTE
+ * adds an unrelated 65552-byte note in a PT_NOTE of its own. Linked static it
  * is an image; linked static-pie, a program interpreter, which the kernel
  * runs in place of the image naming it.
  */
@@ -20,6 +21,18 @@ __asm__(".pushsection .note.gnu.property, \"a\"\n"
         ".asciz \"GNU\"\n"
         /* pr_type, pr_datasz, pr_data, padding to 8 */
         ".long 0xc0008002, 4, " ISA_NEEDED ", 0\n"
+        ".popsection\n");
+#endif
+
+#ifdef ISA_LARGE_NOTE
+/* A well-formed note of another kind with a 65536-byte description, in its
+   own 4-aligned note section and so its own PT_NOTE segment: it must not
+   hide the declaration above. */
+__asm__(".pushsection .note.isa-large, \"a\", @note\n"
+        ".p2align 2\n"
+        ".long 4, 65536, 0x1234\n"
+        ".asciz \"REV\"\n"
+        ".skip 65536, 0xa5\n"
         ".popsection\n");
 #endif
 

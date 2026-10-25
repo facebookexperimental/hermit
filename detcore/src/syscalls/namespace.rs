@@ -1708,8 +1708,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// loader checks against the CPUID Detcore answers. `None` where nothing
     /// declares more, and where nothing can be compared:
     ///
-    /// - host-no-rdrand, whose features are the host's, and
-    ///   `--no-virtualize-cpuid`, where the guest sees the host's CPUID;
+    /// - host-no-rdrand, which masks the host's CPUID (hiding RDRAND, RDSEED
+    ///   and other nondeterministic features) but presents its ISA, so no
+    ///   fixed level describes it: excluding it proves nothing about a v3
+    ///   image on a v2 host, which then gets no typed refusal;
+    /// - `--no-virtualize-cpuid`, and an image whose CPUID is not intercepted
+    ///   (`Guest::has_cpuid_interception`): the guest sees the host's CPUID;
     /// - a run that declares a launcher (DBT, SaBRe): the kernel exec'd the
     ///   launcher, and the guest's loader runs under it before this callback;
     /// - an object unread or declaring nothing, logged as unknown: that is
@@ -1727,7 +1731,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         use crate::exec_record::IsaNeeds;
         let profile = self.cfg.cpu_profile;
         let level = profile.x86_64_level()?;
-        if !self.cfg.virtualize_cpuid || self.declares_launcher() {
+        // The profile is what the guest sees only where Detcore answers its
+        // CPUID: virtualized, and intercepted for this image (ptrace arms
+        // CPUID faulting before this callback, or refuses the run).
+        if !self.cfg.virtualize_cpuid || !guest.has_cpuid_interception() || self.declares_launcher()
+        {
             return None;
         }
         let dettid = guest.thread_state().dettid;
@@ -1741,30 +1749,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             return None;
         };
-        let exe = crate::util::RawFd::open(&directory.join("exe"), libc::O_RDONLY).ok();
-        let image = exe.as_ref().and_then(IsaNeeds::read_file);
-        let interpreter = exe
+        let image = crate::util::RawFd::open(&directory.join("exe"), libc::O_RDONLY)
+            .ok()
             .as_ref()
-            .and_then(crate::exec_record::ElfLayout::read_file)
-            .is_some_and(|layout| layout.interpreter);
+            .and_then(IsaNeeds::read_file);
+        // The interpreter the kernel loaded, wherever AT_BASE says it did,
+        // read on its own evidence: its first file mapping at or above
+        // AT_BASE (its segment holding file offset 0, which need not be at
+        // AT_BASE itself), in the process's memory.
         let base = crate::util::raw_read_file(&directory.join("auxv"))
             .ok()
             .and_then(|auxv| crate::exec_record::auxv_entry(&auxv, libc::AT_BASE))
             .filter(|&base| base != 0);
-        let loader = base.and_then(|base| {
-            IsaNeeds::read_mapped(base, |address, buffer| {
+        let maps = base.and_then(|_| crate::util::raw_read_file(&directory.join("maps")).ok());
+        let mapping = base
+            .zip(maps.as_deref())
+            .and_then(|(base, maps)| crate::exec_record::first_image_mapping(maps, base));
+        let loader = base.map(|base| {
+            let (header, _) = mapping.as_ref()?;
+            IsaNeeds::read_mapped(base, *header, |address, buffer| {
                 let address = reverie::syscalls::Addr::from_raw(usize::try_from(address).ok()?)?;
                 guest.memory().read_exact(address, buffer).ok()
             })
         });
-        let objects = [
-            ("the executable", image),
-            (
-                "its program interpreter",
-                interpreter.then_some(loader).flatten(),
-            ),
-        ];
-        for (what, needs) in objects {
+        let objects = crate::exec_record::exec_objects(image, loader);
+        for &(what, needs) in &objects {
             match needs {
                 Some(IsaNeeds::Level(_)) => {}
                 Some(IsaNeeds::Unmarked) => tracing::debug!(
@@ -1778,7 +1787,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     what,
                     why
                 ),
-                None if what == "its program interpreter" && !interpreter => {}
                 None => tracing::warn!(
                     "[detcore, dtid {}] {} is unreadable or not x86-64 ELF64: its x86 ISA level is unknown",
                     dettid,
@@ -1789,6 +1797,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (what, needed) = crate::exec_record::first_needing_above(level, &objects)?;
         let path = crate::util::raw_read_link(&directory.join("exe"))
             .map_or_else(|_| "?".into(), |path| path.display().to_string());
+        let what = match (what, &mapping) {
+            ("its program interpreter", Some((_, loader))) if !loader.is_empty() => {
+                format!(
+                    "its program interpreter {}",
+                    String::from_utf8_lossy(loader)
+                )
+            }
+            _ => what.to_owned(),
+        };
         let remedy = if needed == 3 {
             "rerun with --cpu-profile x86-64-v3, on a host that qualifies for it"
         } else {

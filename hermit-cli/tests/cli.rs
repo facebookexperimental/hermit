@@ -55485,8 +55485,15 @@ fn library_runs_return_on_a_256_kib_thread() {
 enum IsaLink<'a> {
     /// A static image.
     Static,
+    /// A static image with an unrelated 65552-byte note in a PT_NOTE of its
+    /// own (`ISA_LARGE_NOTE`).
+    StaticWithLargeNote,
     /// A static-pie image, to be another image's program interpreter.
     Interpreter,
+    /// A position-independent interpreter whose first segment is at
+    /// address 0x10000, so the kernel maps its file header at AT_BASE +
+    /// 0x10000, not at AT_BASE.
+    HighInterpreter,
     /// A position-independent image naming this program interpreter.
     Interpreted(&'a Path),
 }
@@ -55510,7 +55517,16 @@ fn isa_fixture(name: &str, bits: Option<u32>, status: u8, link: IsaLink) -> Path
     }
     match link {
         IsaLink::Static => command.args(["-static", "-fno-pie", "-no-pie"]),
+        IsaLink::StaticWithLargeNote => {
+            command.args(["-static", "-fno-pie", "-no-pie", "-DISA_LARGE_NOTE"])
+        }
         IsaLink::Interpreter => command.args(["-static-pie", "-fPIE"]),
+        IsaLink::HighInterpreter => command.args([
+            "-shared",
+            "-fPIC",
+            "-Wl,-e,_start",
+            "-Wl,-Ttext-segment=0x10000",
+        ]),
         IsaLink::Interpreted(interpreter) => command
             .args(["-fPIE", "-pie"])
             .arg(format!("-Wl,--dynamic-linker={}", interpreter.display())),
@@ -55540,7 +55556,7 @@ fn isa_run(args: &[&str]) -> (Option<i32>, String, String) {
 }
 
 /// Asserts that `hermit <args>` was refused, by policy and by name, because
-/// `what` declares it needs `needed`, under the default profile, and that
+/// `what` declares it needs `needed`, under the named x86-64-v2 profile, and that
 /// the declaring image never wrote a byte.
 fn assert_isa_refused(args: &[&str], what: &str, needed: &str) {
     let (status, stdout, stderr) = isa_run(args);
@@ -55569,28 +55585,69 @@ fn assert_isa_ran(args: &[&str], status: i32, stdout: &str) {
 
 /// An image that declares it needs a higher x86-64 level than the CPU
 /// profile presents (GNU_PROPERTY_X86_ISA_1_NEEDED) is refused by policy,
-/// exit 122 and named, before its first instruction, under the default
+/// exit 122 and named, before its first instruction, under the named
 /// x86-64-v2 profile on any host, whether the run is plain, verified or
-/// recorded. There is no silent upgrade to x86-64-v3. Images declaring v2 or
+/// recorded: a named profile means exactly itself, with no upgrade to
+/// x86-64-v3. Images declaring v2 or
 /// less, or nothing, run as before.
 #[test]
 fn an_image_declaring_a_level_above_the_profile_is_refused_before_it_runs() {
     let v3 = isa_fixture("needs-v3", Some(0b111), 42, IsaLink::Static);
     let v3 = v3.to_str().unwrap();
     for launch in [
-        &["run"][..],
-        &["run", "--cpu-profile", "x86-64-v2"],
-        &["run", "--verify"],
-        &["record", "start"],
+        &["run", "--cpu-profile", "x86-64-v2"][..],
+        &["run", "--verify", "--cpu-profile", "x86-64-v2"],
+        &["record", "start", "--cpu-profile", "x86-64-v2"],
     ] {
         let mut args = launch.to_vec();
         args.extend(["--", v3]);
         assert_isa_refused(&args, "the executable", "x86-64-v3");
     }
+    // Beside an unrelated, well-formed 65552-byte note: still refused.
+    let beside = isa_fixture(
+        "needs-v3-large-note",
+        Some(0b111),
+        42,
+        IsaLink::StaticWithLargeNote,
+    );
+    assert_isa_refused(
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            beside.to_str().unwrap(),
+        ],
+        "the executable",
+        "x86-64-v3",
+    );
+    let unmarked_beside = isa_fixture(
+        "unmarked-large-note",
+        None,
+        42,
+        IsaLink::StaticWithLargeNote,
+    );
+    assert_isa_ran(
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            unmarked_beside.to_str().unwrap(),
+        ],
+        42,
+        "ran\n",
+    );
     // A needed bit above x86-64-v4's: a level this Hermit does not know.
     let future = isa_fixture("needs-future", Some(0b1_0111), 42, IsaLink::Static);
     assert_isa_refused(
-        &["run", "--", future.to_str().unwrap()],
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            future.to_str().unwrap(),
+        ],
         "the executable",
         "an x86-64 level above v4",
     );
@@ -55602,7 +55659,17 @@ fn an_image_declaring_a_level_above_the_profile_is_refused_before_it_runs() {
         ("unmarked", None),
     ] {
         let image = isa_fixture(name, bits, 42, IsaLink::Static);
-        assert_isa_ran(&["run", "--", image.to_str().unwrap()], 42, "ran\n");
+        assert_isa_ran(
+            &[
+                "run",
+                "--cpu-profile",
+                "x86-64-v2",
+                "--",
+                image.to_str().unwrap(),
+            ],
+            42,
+            "ran\n",
+        );
     }
 }
 
@@ -55618,8 +55685,14 @@ fn a_program_interpreter_declaring_a_level_above_the_profile_is_refused() {
     let loader_unmarked = isa_fixture("loader-unmarked", None, 43, IsaLink::Interpreter);
     let unmarked_on_v3 = isa_fixture("on-loader-v3", None, 44, IsaLink::Interpreted(&loader_v3));
     assert_isa_refused(
-        &["run", "--", unmarked_on_v3.to_str().unwrap()],
-        "its program interpreter",
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            unmarked_on_v3.to_str().unwrap(),
+        ],
+        &format!("its program interpreter {}", loader_v3.display()),
         "x86-64-v3",
     );
     let v3_on_unmarked = isa_fixture(
@@ -55629,14 +55702,63 @@ fn a_program_interpreter_declaring_a_level_above_the_profile_is_refused() {
         IsaLink::Interpreted(&loader_unmarked),
     );
     assert_isa_refused(
-        &["run", "--", v3_on_unmarked.to_str().unwrap()],
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            v3_on_unmarked.to_str().unwrap(),
+        ],
         "the executable",
         "x86-64-v3",
     );
     // Control: an interpreter declaring v2.
     let unmarked_on_v2 = isa_fixture("on-loader-v2", None, 44, IsaLink::Interpreted(&loader_v2));
     assert_isa_ran(
-        &["run", "--", unmarked_on_v2.to_str().unwrap()],
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            unmarked_on_v2.to_str().unwrap(),
+        ],
+        43,
+        "ran\n",
+    );
+    // An interpreter whose file header is mapped above AT_BASE.
+    let high_v3 = isa_fixture("loader-high-v3", Some(0b111), 43, IsaLink::HighInterpreter);
+    let on_high_v3 = isa_fixture(
+        "on-loader-high-v3",
+        None,
+        44,
+        IsaLink::Interpreted(&high_v3),
+    );
+    assert_isa_refused(
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            on_high_v3.to_str().unwrap(),
+        ],
+        &format!("its program interpreter {}", high_v3.display()),
+        "x86-64-v3",
+    );
+    let high_v2 = isa_fixture("loader-high-v2", Some(0b11), 43, IsaLink::HighInterpreter);
+    let on_high_v2 = isa_fixture(
+        "on-loader-high-v2",
+        None,
+        44,
+        IsaLink::Interpreted(&high_v2),
+    );
+    assert_isa_ran(
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            on_high_v2.to_str().unwrap(),
+        ],
         43,
         "ran\n",
     );
@@ -55705,14 +55827,30 @@ fn a_later_exec_of_a_declaring_image_refuses_the_whole_run() {
     fs::write(&script, format!("#!{v3}\n")).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     assert_isa_refused(
-        &["run", "--", "/bin/sh", "-c", script.to_str().unwrap()],
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            "/bin/sh",
+            "-c",
+            script.to_str().unwrap(),
+        ],
         "the executable",
         "x86-64-v3",
     );
     // A memfd copy, exec'd by AT_EMPTY_PATH.
     let helper = isa_exec_helper();
     assert_isa_refused(
-        &["run", "--", helper.to_str().unwrap(), "memfd", v3],
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            helper.to_str().unwrap(),
+            "memfd",
+            v3,
+        ],
         "the executable",
         "x86-64-v3",
     );
@@ -55748,7 +55886,19 @@ fn a_failed_exec_of_a_declaring_image_keeps_its_error() {
     fs::copy(v3, &unexecutable).unwrap();
     fs::set_permissions(&unexecutable, fs::Permissions::from_mode(0o644)).unwrap();
     let shell = format!("{} 2>/dev/null; echo status=$?", unexecutable.display());
-    assert_isa_ran(&["run", "--", "/bin/sh", "-c", &shell], 0, "status=126\n");
+    assert_isa_ran(
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            "/bin/sh",
+            "-c",
+            &shell,
+        ],
+        0,
+        "status=126\n",
+    );
     // A missing program interpreter: ENOENT, which the shell reports as 127.
     let orphan = isa_fixture(
         "failed-v3-no-loader",
@@ -55757,7 +55907,19 @@ fn a_failed_exec_of_a_declaring_image_keeps_its_error() {
         IsaLink::Interpreted(Path::new("/nonexistent/isa-loader")),
     );
     let shell = format!("{} 2>/dev/null; echo status=$?", orphan.display());
-    assert_isa_ran(&["run", "--", "/bin/sh", "-c", &shell], 0, "status=127\n");
+    assert_isa_ran(
+        &[
+            "run",
+            "--cpu-profile",
+            "x86-64-v2",
+            "--",
+            "/bin/sh",
+            "-c",
+            &shell,
+        ],
+        0,
+        "status=127\n",
+    );
     // execveat failing on its flags or path: EINVAL, ENOENT, ELOOP.
     let helper = isa_exec_helper();
     for (mode, errno) in [
@@ -55766,7 +55928,15 @@ fn a_failed_exec_of_a_declaring_image_keeps_its_error() {
         ("no-follow", libc::ELOOP),
     ] {
         assert_isa_ran(
-            &["run", "--", helper.to_str().unwrap(), mode, v3],
+            &[
+                "run",
+                "--cpu-profile",
+                "x86-64-v2",
+                "--",
+                helper.to_str().unwrap(),
+                mode,
+                v3,
+            ],
             0,
             &format!("errno={errno}\n"),
         );
@@ -55824,6 +55994,7 @@ fn a_v3_profile_runs_an_image_declaring_v3() {
 fn auto_resolves_the_lowest_profile_the_guest_declares() {
     let auto = |image: &Path| {
         let (status, stdout, stderr) = isa_run(&[
+            "--log=info",
             "run",
             "--cpu-profile",
             "auto",
@@ -55847,7 +56018,7 @@ fn auto_resolves_the_lowest_profile_the_guest_declares() {
     // The environment's default, as an explicit flag would be.
     let output = hermit_test::hermit_output(
         "hermit run",
-        hermit_command(&["run", "--", unmarked.to_str().unwrap()])
+        hermit_command(&["--log=info", "run", "--", unmarked.to_str().unwrap()])
             .env("HERMIT_CPU_PROFILE", "auto"),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -55878,6 +56049,62 @@ fn auto_resolves_the_lowest_profile_the_guest_declares() {
     );
 }
 
+/// With no profile named (neither flag nor HERMIT_CPU_PROFILE), a run is
+/// auto: an unmarked guest runs under x86-64-v2 as before, an image
+/// declaring x86-64-v4 is refused by auto's name, and a named profile keeps
+/// its exact meaning (explicit v2 refuses a v3 image by the post-exec check,
+/// never resolving anything).
+#[test]
+fn an_unset_profile_is_auto() {
+    let run = |args: &[&str]| {
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(args).env_remove("HERMIT_CPU_PROFILE"),
+        );
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let unmarked = isa_fixture("unset-unmarked", None, 42, IsaLink::Static);
+    let (status, stdout, stderr) = run(&["--log=info", "run", "--", unmarked.to_str().unwrap()]);
+    assert_eq!((status, stdout.as_str()), (Some(42), "ran\n"), "{stderr}");
+    assert!(
+        stderr.contains("--cpu-profile auto resolved to x86-64-v2"),
+        "{stderr}"
+    );
+    let v4 = isa_fixture("unset-v4", Some(0b1111), 42, IsaLink::Static);
+    let (status, _, stderr) = run(&["run", "--", v4.to_str().unwrap()]);
+    assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
+    assert!(
+        stderr.contains("--cpu-profile auto refused: the executable "),
+        "{stderr}"
+    );
+    let v3 = isa_fixture("unset-v3", Some(0b111), 42, IsaLink::Static);
+    let (status, _, stderr) = run(&[
+        "--log=info",
+        "run",
+        "--cpu-profile",
+        "x86-64-v2",
+        "--",
+        v3.to_str().unwrap(),
+    ]);
+    assert_eq!(status, Some(HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
+    assert!(
+        stderr.contains("--cpu-profile x86-64-v2 refused: the executable of ")
+            && !stderr.contains("--cpu-profile auto"),
+        "{stderr}"
+    );
+    // A program that is not there keeps its own fault, before auto reads it.
+    let (status, _, stderr) = run(&["run", "--", "/nonexistent/isa-guest"]);
+    assert_eq!(
+        status,
+        Some(hermit::GUEST_PROGRAM_NOT_FOUND_EXIT),
+        "{stderr}"
+    );
+}
+
 /// auto chooses once, before the run: a later exec of an image needing more
 /// than the profile it chose is refused by policy, naming the profile to
 /// rerun with, and the run is never upgraded midway.
@@ -55886,6 +56113,7 @@ fn auto_does_not_upgrade_for_a_later_exec() {
     let v3 = isa_fixture("auto-later-v3", Some(0b111), 42, IsaLink::Static);
     let v3 = v3.to_str().unwrap();
     let (status, stdout, stderr) = isa_run(&[
+        "--log=info",
         "run",
         "--cpu-profile",
         "auto",
@@ -55911,40 +56139,49 @@ fn auto_does_not_upgrade_for_a_later_exec() {
     );
 }
 
-/// An image, or an unmarked image's program interpreter, declaring
-/// x86-64-v3 resolves auto to x86-64-v3, which is then qualified like an
-/// explicit one: it runs where the host qualifies, and is refused by the
-/// qualification's name where it does not (`v3_run_or_refusal`).
+/// Runs `image` with `--cpu-profile auto`, which `what` makes resolve to
+/// x86-64-v3, then qualified like an explicit one: it runs where the host
+/// qualifies, and is refused by the qualification's name where it does not
+/// (`v3_run_or_refusal`).
+fn assert_auto_resolves_v3(image: &Path, what: &str) {
+    let ran = v3_run_or_refusal(|| {
+        let (status, stdout, stderr) = isa_run(&[
+            "--log=info",
+            "run",
+            "--cpu-profile",
+            "auto",
+            "--",
+            image.to_str().unwrap(),
+        ]);
+        (status, stdout, stderr, ())
+    });
+    let Some((stdout, stderr, ())) = ran else {
+        return;
+    };
+    assert_eq!(stdout, "ran\n", "{stderr}");
+    assert!(
+        stderr.contains("--cpu-profile auto resolved to x86-64-v3: ")
+            && stderr.contains(what)
+            && stderr.contains("declares that it needs x86-64-v3"),
+        "{stderr}"
+    );
+}
+
+/// An image declaring x86-64-v3 resolves auto to x86-64-v3
+/// ([`assert_auto_resolves_v3`]).
 #[test]
-fn auto_resolves_v3_for_an_image_or_interpreter_declaring_it() {
+fn auto_resolves_v3_for_an_image_declaring_it() {
     let v3 = isa_fixture("auto-v3", Some(0b111), 0, IsaLink::Static);
+    assert_auto_resolves_v3(&v3, "the executable ");
+}
+
+/// An unmarked image whose program interpreter declares x86-64-v3 resolves
+/// auto to x86-64-v3 ([`assert_auto_resolves_v3`]).
+#[test]
+fn auto_resolves_v3_for_an_interpreter_declaring_it() {
     let loader_v3 = isa_fixture("auto-loader-v3", Some(0b111), 0, IsaLink::Interpreter);
     let on_v3 = isa_fixture("auto-on-v3", None, 44, IsaLink::Interpreted(&loader_v3));
-    for (image, what) in [
-        (&v3, "the executable "),
-        (&on_v3, "its program interpreter "),
-    ] {
-        let ran = v3_run_or_refusal(|| {
-            let (status, stdout, stderr) = isa_run(&[
-                "run",
-                "--cpu-profile",
-                "auto",
-                "--",
-                image.to_str().unwrap(),
-            ]);
-            (status, stdout, stderr, ())
-        });
-        let Some((stdout, stderr, ())) = ran else {
-            continue;
-        };
-        assert_eq!(stdout, "ran\n", "{stderr}");
-        assert!(
-            stderr.contains("--cpu-profile auto resolved to x86-64-v3: ")
-                && stderr.contains(what)
-                && stderr.contains("declares that it needs x86-64-v3"),
-            "{stderr}"
-        );
-    }
+    assert_auto_resolves_v3(&on_v3, "its program interpreter ");
 }
 
 /// A recording made with `--cpu-profile auto` holds the named profile auto
@@ -56043,17 +56280,29 @@ fn library_launch(
 
 /// Both library launch families, `run` (exit status) and `run_with_output`
 /// (captured output), which reach the guest through different dispatchers,
-/// refuse an unresolved auto profile by name before any backend starts.
+/// resolve a configuration's auto profile from the program they launch: an
+/// unmarked image runs under x86-64-v2, and an image declaring x86-64-v3
+/// resolves to it and is then refused by name, as an explicit v3 is, since
+/// the library never qualified the host.
 #[test]
-fn library_launches_refuse_an_unresolved_auto_profile() {
-    let image = isa_fixture("library-unmarked", None, 42, IsaLink::Static);
-    let expected = "--cpu-profile auto refused: auto was not resolved to a named profile before \
-                    launch; resolve it with resolve_auto, as `hermit run` and `hermit record \
-                    start` do";
+fn library_launches_resolve_an_auto_profile() {
+    let unmarked = isa_fixture("library-unmarked", None, 42, IsaLink::Static);
+    let v3 = isa_fixture("library-auto-v3", Some(0b111), 42, IsaLink::Static);
+    let expected =
+        "--cpu-profile x86-64-v3 refused: the configuration carries no qualified host facts";
     for output in [false, true] {
         assert_eq!(
             library_launch(
-                image.clone(),
+                unmarked.clone(),
+                detcore_model::cpu_profile::CpuProfile::Auto,
+                output
+            ),
+            Ok(Some(42)),
+            "run_with_output: {output}"
+        );
+        assert_eq!(
+            library_launch(
+                v3.clone(),
                 detcore_model::cpu_profile::CpuProfile::Auto,
                 output
             ),
@@ -56067,7 +56316,7 @@ fn library_launches_refuse_an_unresolved_auto_profile() {
 /// [`library_launch_of_a_declaring_image_child`] launch.
 const ISA_LIBRARY_CHILD: &str = "HERMIT_TEST_ISA_LIBRARY_CHILD";
 
-/// Both library launch families end a default-profile run of an image
+/// Both library launch families end an x86-64-v2 run of an image
 /// declaring x86-64-v3 with the policy exit. The whole-run policy shutdown
 /// ends the calling process, as it ends `hermit run`'s, so each family runs
 /// in a child: this test binary, running only the child test below.

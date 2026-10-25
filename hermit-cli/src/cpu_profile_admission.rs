@@ -459,6 +459,30 @@ pub fn resolve_auto(
     detcore::exec_record::auto_profile(&objects)
 }
 
+/// Resolve a configuration's auto profile for a library launch of `command`
+/// ([`resolve_auto`] of the program it names, found as the launch finds it),
+/// before [`refuse_unadmitted_launch`]. `hermit run` and `hermit record
+/// start` resolve it earlier, before qualification; a configuration naming a
+/// profile is left as it is. A resolved x86-64-v3 is then admitted only as
+/// an explicit one is, so a library launch that never qualified the host
+/// refuses it by name.
+pub fn resolve_launch_auto(
+    command: &crate::Command,
+    config: &mut detcore::Config,
+) -> Result<(), CpuProfileRefusal> {
+    if config.cpu_profile != CpuProfile::Auto {
+        return Ok(());
+    }
+    let refuse = |why: String| CpuProfileRefusal::new(CpuProfile::Auto, why);
+    let program = command
+        .find_program()
+        .map_err(|error| refuse(format!("the program cannot be found: {error}")))?;
+    let (profile, why) = resolve_auto(&program, Path::to_path_buf).map_err(refuse)?;
+    tracing::info!("--cpu-profile auto resolved to {profile}: {why}");
+    config.cpu_profile = profile;
+    Ok(())
+}
+
 /// Linux's version as (major, minor), from a `uname -r` release string.
 pub fn kernel_version(release: &str) -> Option<(u32, u32)> {
     let mut parts = release.split(['.', '-']);
@@ -747,8 +771,7 @@ pub fn refuse_unadmitted_launch(
     let refuse = |why: &str| Err(CpuProfileRefusal::new(config.cpu_profile, why));
     if config.cpu_profile == CpuProfile::Auto {
         return refuse(
-            "auto was not resolved to a named profile before launch; resolve it with \
-             resolve_auto, as `hermit run` and `hermit record start` do",
+            "auto was not resolved to a named profile before launch (resolve_launch_auto)",
         );
     }
     if config.cpu_profile == CpuProfile::HostNoRdrand {
