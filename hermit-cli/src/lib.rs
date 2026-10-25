@@ -4134,10 +4134,19 @@ async fn dispatch_backend(
     )
     .await?;
     let stats_source = tracer.backend_stats();
-    let (exit_status, global_state) = ptrace_completion::wait(tracer, control).await?;
-    let terminal_outcome = global_state.terminal_outcome();
+    let waited = ptrace_completion::wait_outcome(tracer, control).await?;
     let dispatch_stats =
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
+    let (exit_status, global_state) = match waited {
+        ptrace_completion::Waited::Finished(status, global_state) => (status, global_state),
+        ptrace_completion::Waited::TimedOut(run) => {
+            let summary_json = print_summary_to_json_file.as_deref();
+            return Err(run
+                .finish(print_summary, summary_json, dispatch_stats)
+                .await);
+        }
+    };
+    let terminal_outcome = global_state.terminal_outcome();
     let cleanup = global_state
         .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
         .await;
@@ -4517,10 +4526,19 @@ async fn dispatch_output_backend(
     )
     .await?;
     let stats_source = tracer.backend_stats();
-    let (output, global_state) = ptrace_completion::wait_with_output(tracer, control).await?;
-    let terminal_outcome = global_state.terminal_outcome();
+    let waited = ptrace_completion::wait_with_output_outcome(tracer, control).await?;
     let dispatch_stats =
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
+    let (output, global_state) = match waited {
+        ptrace_completion::Waited::Finished(output, global_state) => (output, global_state),
+        ptrace_completion::Waited::TimedOut(run) => {
+            let summary_json = print_summary_to_json_file.as_deref();
+            return Err(run
+                .finish(print_summary, summary_json, dispatch_stats)
+                .await);
+        }
+    };
+    let terminal_outcome = global_state.terminal_outcome();
     let cleanup = global_state
         .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
         .await;

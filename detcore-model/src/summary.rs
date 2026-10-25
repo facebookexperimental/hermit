@@ -309,6 +309,13 @@ pub struct RunSummary {
     /// the background is itself decided by host timing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binder_external_calls: Option<u64>,
+    /// The guest had not exited when `--timeout`, the run's wall-clock
+    /// deadline, whose bound in seconds this is, stopped the run: the summary
+    /// is partial and describes the run up to then, including the exit
+    /// reports of the threads the deadline killed. Absent for every other run
+    /// and in older summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_timeout_secs: Option<u64>,
 }
 
 fn is_zero(count: &u64) -> bool {
@@ -516,7 +523,14 @@ impl RunSummary {
             replay_departure: _,
             desync_notes: _,
             binder_external_calls,
+            run_timeout_secs,
         } = self;
+        if let Some(bound) = run_timeout_secs {
+            writeln!(
+                f,
+                "PARTIAL: --timeout={bound} (seconds of wall-clock time) stopped the run before the guest exited; these statistics describe the run up to then."
+            )?;
+        }
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
             f,
@@ -817,6 +831,32 @@ mod tests {
         assert_eq!(value["syscalls"], 0);
         let parsed: RunSummary = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.syscalls, Some(0));
+    }
+
+    /// A run `--timeout` stopped says so first, in the report and in the INFO
+    /// view, and its JSON names the bound; any other run, and an older
+    /// summary, carries no bound.
+    #[test]
+    fn a_summary_of_a_run_the_timeout_stopped_is_marked_partial() {
+        let finished = RunSummary::default();
+        assert!(!finished.to_string().contains("PARTIAL"));
+        let value = serde_json::to_value(&finished).unwrap();
+        assert!(value.get("run_timeout_secs").is_none());
+        let parsed: RunSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.run_timeout_secs, None);
+
+        let stopped = RunSummary {
+            run_timeout_secs: Some(2),
+            ..Default::default()
+        };
+        let partial = "PARTIAL: --timeout=2 (seconds of wall-clock time) stopped the run";
+        for text in [stopped.to_string(), stopped.info(None).to_string()] {
+            assert!(text.starts_with(partial), "{text}");
+        }
+        let value = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(value["run_timeout_secs"], 2);
+        let parsed: RunSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.run_timeout_secs, Some(2));
     }
 
     #[test]

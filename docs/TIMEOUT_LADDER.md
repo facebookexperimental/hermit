@@ -30,7 +30,7 @@ agreeing with each other.
 
 | Rung | Bounds | Value comes from | How it stops the run | Reports |
 | --- | --- | --- | --- | --- |
-| `hermit run --timeout N` | **one hermit invocation** = one guest execution, **ptrace and liteinst only** | the caller's argument | ptrace publishes termination and polls the retained original operation; unresolved cleanup retains its owner and guards. LiteInst keeps its existing timeout/unwind path. | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout` |
+| `hermit run --timeout N` | **one hermit invocation** = one guest execution, **ptrace only** (in-guest LiteInst refuses it) | the caller's argument | ptrace publishes termination and polls the retained original operation; unresolved cleanup retains its owner and guards. | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout`; a requested summary is kept, marked partial (see below) |
 | `hermit run --virtual-timeout N` | **one hermit invocation's virtual time**: Detcore's global virtual time since the run began, the `virttime_elapsed` of its summary, in virtual nanoseconds, checked as each scheduler turn commits it | the caller's argument | the scheduler grants no further turn; ptrace unwinds the guest as for `--timeout` and finishes the run; other backends exit 124 from the scheduler (see below) | exit 124, `HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=N` |
 | hermit's unwind fallback | the same invocation, `N + 10s` | `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/bin/hermit/run_timeout.rs` | `_exit(124)` from a `SIGALRM` handler; no destructors | exit 124, `HERMIT_RUN_TIMEOUT_FALLBACK` |
 | `hermit record --record-timeout N` | one recording | the caller's argument | `_exit(124)` from a `SIGALRM` handler | exit 124 |
@@ -414,6 +414,29 @@ scheduler in Hermit's own process, so the exit that ends a stopped run would
 end Hermit itself without its class line. `hermit record` takes no virtual
 bound.
 
+## A run `--timeout` stopped keeps its summary
+
+A timed-out run is when its statistics are most needed, so `--summary` and
+`--summary-json` still report it. The summary prints before the class line, and
+its first line says it is partial:
+
+```text
+PARTIAL: --timeout=2 (seconds of wall-clock time) stopped the run before the guest exited; these statistics describe the run up to then.
+```
+
+The JSON carries the bound as `"run_timeout_secs": 2`. A run whose guest
+exited first keeps its complete summary without the bound, even when the
+deadline fires during Hermit's own cleanup after that.
+The scheduler's turns, recorded events and virtual time are the run's as it
+stood at the deadline, and the syscall and timeslice counts include the threads
+the deadline killed, from their exit reports. A `--record-preemptions-to`
+recording is flushed after the summary, as for any failed run: the summary
+names the file even if that write then fails, and the write error is the
+run's, as before. Without `--summary`, the summary goes to the INFO log, as a
+finished run's does. The partial summary is withheld, with a warning naming
+why, when the scheduler task did not finish, a handler panicked while holding
+the scheduler or clock lock, or the summary could not be written.
+
 ## `--timeout` is qualified per backend, and refuses elsewhere
 
 ⚠️ **A TIMEOUT FLAG READS AS BACKEND-AGNOSTIC AND THIS ONE IS NOT.** Measured
@@ -451,11 +474,13 @@ and fixing that — and until it is fixed, the refusal below is the honest
 behaviour rather than a placeholder.
 
 So `--timeout` **refuses** (exit 122, `HERMIT_POLICY_REFUSAL`) on any backend
-other than `ptrace` and `liteinst`, rather than accepting a bound it cannot
-enforce. `kvm` is refused for a softer reason than the other two: it does bound
-the run, but every KVM timeout would take the hard `_exit` path and emit the
-marker that is supposed to mean *the unwind failed*, destroying the signal that
-marker carries. Qualify a backend by finding out why the runtime never reaches
+other than `ptrace`, rather than accepting a bound it cannot enforce. (The
+`liteinst` row above measured a ptrace-hosted hybrid that no longer exists;
+in-guest LiteInst refuses the flag in
+`refuse_unqualified_liteinst_in_guest_options`.) `kvm` is refused for a softer
+reason than the other two: it does bound the run, but every KVM timeout would
+take the hard `_exit` path and emit the marker that is supposed to mean *the
+unwind failed*, destroying the signal that marker carries. Qualify a backend by finding out why the runtime never reaches
 the timer — not by widening the list.
 
 Fail-closed, so a new backend must be qualified deliberately instead of

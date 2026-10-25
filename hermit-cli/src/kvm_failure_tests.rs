@@ -409,6 +409,7 @@ async fn kvm_failure_error_retains_scheduler_recording_and_primary_causes() {
         Some(detcore::BackendFailureCleanup {
             scheduler: Err(scheduler),
             preemption_recording: Err("recording control".to_owned()),
+            summary: Ok(()),
         }),
     );
     assert_eq!(

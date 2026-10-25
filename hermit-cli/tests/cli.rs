@@ -39499,6 +39499,71 @@ fn run_timeout_leaves_a_guest_that_finishes_in_time_alone() {
     );
 }
 
+/// `--summary` of a run `--timeout` stopped: the summary still prints, before
+/// the deadline's class line, marked partial and naming the bound, and
+/// `--summary-json` records the bound beside the scheduler's turns and the
+/// virtual time the run had reached. A guest that finishes inside its bound
+/// gets a summary with no bound. Before, a timed-out run printed and wrote no
+/// summary at all.
+#[test]
+fn run_timeout_prints_a_partial_summary_naming_the_deadline() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let summary_run = |name: &str, secs: u64, argv: &[&str]| {
+        let path = directory.path().join(name);
+        let json = format!("--summary-json={}", path.display());
+        let secs = secs.to_string();
+        let mut args = vec!["run", "--summary", &json, "--timeout", &secs, "--"];
+        args.extend_from_slice(argv);
+        let output = hermit_command(&args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit run --summary --timeout");
+        let summary = fs::read(&path).ok().map(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or_else(|error| panic!("{name}: unreadable summary JSON: {error}"))
+        });
+        (output, summary)
+    };
+
+    let (output, summary) = summary_run("stopped.json", RUN_TIMEOUT_SECS, RUN_TIMEOUT_SPINNER);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(124), "stderr:\n{stderr}");
+    let report = stderr
+        .find("hermit run report")
+        .unwrap_or_else(|| panic!("a timed-out run printed no summary. stderr:\n{stderr}"));
+    let partial = format!(
+        "PARTIAL: --timeout={RUN_TIMEOUT_SECS} (seconds of wall-clock time) stopped the run \
+         before the guest exited"
+    );
+    let marked = stderr[report..]
+        .find(&partial)
+        .unwrap_or_else(|| panic!("the summary is not marked partial. stderr:\n{stderr}"));
+    let class = stderr
+        .find("HERMIT_RUN_TIMEOUT class=run-timeout")
+        .unwrap_or_else(|| panic!("the deadline lost its class line. stderr:\n{stderr}"));
+    assert!(report + marked < class, "stderr:\n{stderr}");
+    let summary = summary.expect("a timed-out run wrote no --summary-json");
+    assert_eq!(summary["run_timeout_secs"], RUN_TIMEOUT_SECS, "{summary}");
+    // `syscalls` comes from the exit reports of the threads the deadline
+    // killed: the shell is the run's only thread.
+    for field in ["sched_turns", "virttime_elapsed", "syscalls"] {
+        assert!(
+            summary[field].as_u64().is_some_and(|value| value > 0),
+            "{field}: {summary}"
+        );
+    }
+
+    let (output, summary) = summary_run("finished.json", 30, &["/bin/echo", "finished"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains("hermit run report"), "stderr:\n{stderr}");
+    assert!(!stderr.contains("PARTIAL"), "stderr:\n{stderr}");
+    let summary = summary.expect("a finished run wrote no --summary-json");
+    assert!(summary.get("run_timeout_secs").is_none(), "{summary}");
+}
+
 /// The SIGALRM fallback fires, is named, and reports the deadline code.
 ///
 /// ⚠️ THIS CELL EXISTS BECAUSE THE FALLBACK COULD NOT BE MADE TO FIRE ANY OTHER

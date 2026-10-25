@@ -363,7 +363,7 @@ mod real_random {
                         facts.primary_address = copy as *const _ as usize;
                     }
                 }
-                let (output, global) = consume(outcome, control).await?;
+                let (output, global) = consume(outcome, control).await?.into_finished().await?;
                 global.clean_up(false, &Some(future_summary)).await?;
                 Ok(output)
             })

@@ -373,6 +373,10 @@ pub struct BackendFailureCleanup {
     pub scheduler: Result<(), tokio::task::JoinError>,
     /// The requested partial recording's write result; no destination is success.
     pub preemption_recording: Result<(), String>,
+    /// The partial summary's result for a run `--timeout` stopped
+    /// (`GlobalState::clean_up_after_run_timeout`); success for any other
+    /// failed run, which has no summary.
+    pub summary: Result<(), String>,
 }
 
 #[derive(Clone, Copy)]
@@ -2320,7 +2324,41 @@ impl GlobalState {
     /// A failed run has no successful run summary. Preserve the scheduler's
     /// join error and any requested partial preemption recording's write error
     /// for the caller, without allowing either to replace the backend failure.
-    pub async fn clean_up_after_backend_failure(mut self) -> BackendFailureCleanup {
+    pub async fn clean_up_after_backend_failure(self) -> BackendFailureCleanup {
+        self.clean_up_failed_run(None).await
+    }
+
+    /// [`Self::clean_up_after_backend_failure`] for a run that `--timeout`,
+    /// its wall-clock deadline of `limit_secs` seconds, stopped before the
+    /// guest exited. Once the scheduler has finished, the run is summarized
+    /// as it stood, marked partial with the bound
+    /// (`RunSummary::run_timeout_secs`), and the summary is printed or logged,
+    /// and written to `print_summary_to_json_file` with the backend's
+    /// `dispatch_stats`, as [`Self::clean_up_with_dispatch_stats`] does for a
+    /// finished run. A panicked scheduler, or a poisoned scheduler or clock
+    /// lock, leaves no summary. The partial recording is flushed after the
+    /// summary describes it, so a write error stays the run's recording
+    /// error.
+    pub async fn clean_up_after_run_timeout(
+        self,
+        limit_secs: u64,
+        to_stderr: bool,
+        print_summary_to_json_file: Option<&std::path::Path>,
+        dispatch_stats: Option<reverie::DispatchStats>,
+    ) -> BackendFailureCleanup {
+        self.clean_up_failed_run(Some(PartialSummary {
+            limit_secs,
+            to_stderr,
+            json: print_summary_to_json_file,
+            dispatch_stats,
+        }))
+        .await
+    }
+
+    async fn clean_up_failed_run(
+        mut self,
+        partial_summary: Option<PartialSummary<'_>>,
+    ) -> BackendFailureCleanup {
         // From here a scheduler panic is reported beside the backend's
         // failure, as its JoinError below, not by ending the process.
         crate::scheduler::note_backend_failure_cleanup();
@@ -2329,6 +2367,14 @@ impl GlobalState {
         } else {
             Ok(())
         };
+        let summary = match partial_summary {
+            Some(request) if scheduler.is_ok() => self.report_partial_summary(request),
+            Some(_) => Err("the scheduler task did not finish".to_owned()),
+            None => Ok(()),
+        };
+        if let Err(error) = &summary {
+            warn!("No summary of the run --timeout stopped: {error}");
+        }
         // A scheduler panic can poison this mutex. Its JoinError is returned
         // below; recovering only to finish output must not replace that error.
         let mut writer = self
@@ -2353,7 +2399,36 @@ impl GlobalState {
         BackendFailureCleanup {
             scheduler,
             preemption_recording,
+            summary,
         }
+    }
+
+    /// The summary of a run its deadline stopped, reported as `clean_up`
+    /// reports a finished run's.
+    fn report_partial_summary(&self, request: PartialSummary<'_>) -> Result<(), String> {
+        // A handler that panicked while holding either lock leaves state no
+        // summary should be built from, and must not panic the cleanup that
+        // flushes the recording.
+        if self.sched.is_poisoned() || self.global_time.is_poisoned() {
+            return Err("a scheduler or clock lock was poisoned".to_owned());
+        }
+        let (mut summary, info_reprio_descrip) = self
+            .run_summary_for_log(Scheduler::generate_stopped_run_summary_for_log)
+            .map_err(|error| format!("{error:#}"))?;
+        summary.run_timeout_secs = Some(request.limit_secs);
+        summary.dispatch_stats = request.dispatch_stats;
+        if let Some(path) = request.json {
+            let json = serde_json::to_string_pretty(&summary).map_err(|error| error.to_string())?;
+            fs::write(path, json + "\n")
+                .map_err(|error| format!("writing {}: {error}", path.display()))?;
+        }
+        report_run_summary(
+            summary,
+            info_reprio_descrip.as_deref(),
+            self.cfg.record_preemptions_to.as_deref(),
+            request.to_stderr,
+        );
+        Ok(())
     }
 
     /// Shut down anything running, in particular wait on the scheduler.
@@ -2405,8 +2480,6 @@ impl GlobalState {
         };
         let network_refusal = self.finish_network_trace();
         self.finish_access_trace();
-        let banner =
-            "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
         // The run is over: write what it opened for --verify.
         if let Some(log) = &self.cfg.host_input_log {
@@ -2437,7 +2510,7 @@ impl GlobalState {
             });
         // A saved network refusal is an additional observed cause on this new
         // error path. The existing network-only report/exit path stays below.
-        let (mut summary, info_reprio_descrip) = match summary_result {
+        let (summary, info_reprio_descrip) = match summary_result {
             Ok(summary) => summary,
             Err(error) => {
                 return crate::combine_finalization(
@@ -2449,32 +2522,12 @@ impl GlobalState {
                 );
             }
         };
-        // Print human-readable summary:
-        if to_stderr {
-            // In this case, print summary irrespective of logging level.
-            // TODO: output summary in machine-readable, JSON form.
-            //
-            // NOT `eprint!`: a guest that set O_NONBLOCK on the inherited fd 2
-            // makes `write_all` fail with EAGAIN here, which panics the print
-            // macro and loses both the summary and the panic message. See
-            // `crate::util::RetryingStderr`.
-            {
-                use std::io::Write;
-                let _ = write!(crate::util::RetryingStderr, "{}\n{}", banner, summary);
-            }
-        } else {
-            // Separate out the nondeterministic bits and print them at debug level:
-            let rt = summary.realtime_elapsed.take();
-            log_run_summary(
-                banner,
-                &summary,
-                info_reprio_descrip.as_deref(),
-                recording_destination.as_deref(),
-            );
-            if let Some(x) = rt {
-                debug!("Nondeterministic realtime elapsed: {:?}", x);
-            }
-        }
+        report_run_summary(
+            summary,
+            info_reprio_descrip.as_deref(),
+            recording_destination.as_deref(),
+            to_stderr,
+        );
         // After the report, so a refused replay still describes the run.
         if let Some(refusal) = network_refusal {
             {
@@ -2495,7 +2548,7 @@ impl GlobalState {
     // In particular, strict finish can fail before the summary takes it. A
     // consumed failed write is absent and must never be retried by Drop.
     fn finalize_run_summary(&self) -> anyhow::Result<(RunSummary, Option<String>)> {
-        let summary = self.run_summary_for_log();
+        let summary = self.run_summary_for_log(Scheduler::generate_partial_run_summary_for_log);
         let writer = self.sched.lock().unwrap().preemption_writer.take();
         // Do not hold the scheduler mutex while doing output I/O.
         let flushed = if self.cfg.record_preemptions_to.is_some() {
@@ -2624,7 +2677,15 @@ impl GlobalState {
         }
     }
 
-    fn run_summary_for_log(&self) -> anyhow::Result<(RunSummary, Option<String>)> {
+    /// The run's summary, whose scheduler half `scheduler_half` builds
+    /// (`Scheduler::generate_partial_run_summary_for_log` for a finished run).
+    fn run_summary_for_log(
+        &self,
+        scheduler_half: impl FnOnce(
+            &mut Scheduler,
+            Option<&PathBuf>,
+        ) -> anyhow::Result<(RunSummary, Option<String>)>,
+    ) -> anyhow::Result<(RunSummary, Option<String>)> {
         // The host files the guest opened go into the recorded schedule,
         // which the scheduler flushes below, and into the summary.
         let host_inputs = self.host_input_set();
@@ -2651,7 +2712,7 @@ impl GlobalState {
                         .failures_for_recording(),
                 );
             }
-            sched.generate_partial_run_summary_for_log(self.cfg.record_preemptions_to.as_ref())?
+            scheduler_half(&mut sched, self.cfg.record_preemptions_to.as_ref())?
         };
         #[cfg(target_arch = "aarch64")]
         self.store_exclusive
@@ -2708,6 +2769,55 @@ impl GlobalState {
         }
 
         Ok((summary, info_reprio_descrip))
+    }
+}
+
+/// What [`GlobalState::clean_up_after_run_timeout`] reports of a run its
+/// deadline stopped.
+struct PartialSummary<'a> {
+    limit_secs: u64,
+    to_stderr: bool,
+    json: Option<&'a std::path::Path>,
+    dispatch_stats: Option<reverie::DispatchStats>,
+}
+
+const RUN_REPORT_BANNER: &str =
+    "  ------------------------------ hermit run report ------------------------------";
+
+/// Print the human-readable summary to stderr, or log its INFO view, with the
+/// nondeterministic realtime at debug level.
+fn report_run_summary(
+    mut summary: RunSummary,
+    info_reprio_descrip: Option<&str>,
+    recording_destination: Option<&std::path::Path>,
+    to_stderr: bool,
+) {
+    if to_stderr {
+        // In this case, print summary irrespective of logging level.
+        //
+        // NOT `eprint!`: a guest that set O_NONBLOCK on the inherited fd 2
+        // makes `write_all` fail with EAGAIN here, which panics the print
+        // macro and loses both the summary and the panic message. See
+        // `crate::util::RetryingStderr`.
+        use std::io::Write;
+        let _ = write!(
+            crate::util::RetryingStderr,
+            "{}\n{}",
+            RUN_REPORT_BANNER,
+            summary
+        );
+    } else {
+        // Separate out the nondeterministic bits and print them at debug level:
+        let rt = summary.realtime_elapsed.take();
+        log_run_summary(
+            RUN_REPORT_BANNER,
+            &summary,
+            info_reprio_descrip,
+            recording_destination,
+        );
+        if let Some(x) = rt {
+            debug!("Nondeterministic realtime elapsed: {:?}", x);
+        }
     }
 }
 
@@ -14572,6 +14682,70 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), recorded);
         assert_eq!(summary.to_string(), full);
         assert_eq!(serde_json::to_vec(&summary).unwrap(), json);
+    }
+
+    /// A run `--timeout` stopped is summarized as it stood, marked partial
+    /// with the bound, before its partial recording is flushed: the summary
+    /// describes the recording and the file it goes to, and the recording is
+    /// then written once. The summary does not flush it: a recording that
+    /// cannot be written stays the failed run's recording error, as before,
+    /// and the summary is still reported.
+    #[tokio::test]
+    async fn a_run_the_timeout_stopped_is_summarized_before_its_recording_is_flushed() {
+        let directory = tempfile::tempdir().unwrap();
+        let recording = directory.path().join("recording");
+        let summary_json = directory.path().join("summary.json");
+        let (_config, state, tid, _) = cancellation_test_state_with_config(Config {
+            sequentialize_threads: true,
+            record_preemptions_to: Some(recording.clone()),
+            ..Config::default()
+        });
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recording.clone()));
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        state.sched.lock().unwrap().preemption_writer = Some(writer);
+
+        let cleanup = state
+            .clean_up_after_run_timeout(2, false, Some(&summary_json), None)
+            .await;
+        assert!(cleanup.scheduler.is_ok());
+        assert_eq!(cleanup.preemption_recording, Ok(()));
+        assert_eq!(cleanup.summary, Ok(()));
+        let summary: detcore_model::summary::RunSummary =
+            serde_json::from_slice(&std::fs::read(&summary_json).unwrap()).unwrap();
+        assert_eq!(summary.run_timeout_secs, Some(2));
+        assert_eq!(
+            summary.reprio_descrip.as_deref(),
+            Some(
+                format!(
+                    "Record of 1 preemption and reprioritization events:\n  (Writing to file {recording:?})\n"
+                )
+                .as_str()
+            )
+        );
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&recording).unwrap()).unwrap();
+        assert_eq!(
+            recorded["per_thread"][tid.to_string()]["prio_changes"],
+            serde_json::json!([[100, DEFAULT_PRIORITY]])
+        );
+
+        let unwritable = summary_json.join("recording");
+        let (_config, state, tid, _) = cancellation_test_state_with_config(Config {
+            sequentialize_threads: true,
+            record_preemptions_to: Some(unwritable.clone()),
+            ..Config::default()
+        });
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(unwritable));
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        state.sched.lock().unwrap().preemption_writer = Some(writer);
+        let second_summary = directory.path().join("second.json");
+        let cleanup = state
+            .clean_up_after_run_timeout(2, false, Some(&second_summary), None)
+            .await;
+        assert!(cleanup.preemption_recording.is_err());
+        assert_eq!(cleanup.summary, Ok(()));
+        assert!(second_summary.exists());
     }
 
     #[test]

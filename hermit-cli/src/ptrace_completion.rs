@@ -25,6 +25,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -130,6 +131,7 @@ impl fmt::Debug for HermitPtraceFailure {
             .field("failure", &self.failure)
             .field("scheduler", &self.cleanup.scheduler)
             .field("preemption_recording", &self.cleanup.preemption_recording)
+            .field("summary", &self.cleanup.summary)
             .field("callbacks", &self.callbacks)
             .field("timeout_during_cleanup", &self.timeout_during_cleanup)
             .finish()
@@ -869,6 +871,69 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
     }
 }
 
+/// How a waited run ended: finished, with the status and global state the
+/// caller cleans up, or stopped by `--timeout`, whose partial summary the
+/// caller reports ([`TimedOutRun::finish`]). Any other failed run is cleaned
+/// up while waiting, and is the wait's error.
+pub(crate) enum Waited<R> {
+    Finished(R, detcore::GlobalState),
+    TimedOut(TimedOutRun),
+}
+impl<R> Waited<R> {
+    /// The finished run, or a stopped run's failure, its summary logged as a
+    /// finished run's is by `clean_up(false, &None)`.
+    pub(crate) async fn into_finished(self) -> Result<(R, detcore::GlobalState), Error> {
+        match self {
+            Waited::Finished(result, global_state) => Ok((result, global_state)),
+            Waited::TimedOut(run) => Err(run.finish(false, None, None).await),
+        }
+    }
+}
+
+/// A run `--timeout` stopped before the guest exited, with its global state
+/// kept for the partial summary.
+pub(crate) struct TimedOutRun {
+    limit: Duration,
+    failure: PtraceRunFailure,
+    callbacks: Vec<PtraceCallbackDiagnostic>,
+    global_state: detcore::GlobalState,
+    control: Rc<Control>,
+}
+impl TimedOutRun {
+    /// Clean the run up with its partial summary
+    /// (`GlobalState::clean_up_after_run_timeout`), reported where the
+    /// caller's summary of a finished run goes, and return its failure.
+    pub(crate) async fn finish(
+        self,
+        print_summary: bool,
+        summary_json: Option<&Path>,
+        dispatch_stats: Option<reverie::DispatchStats>,
+    ) -> Error {
+        let Self {
+            limit,
+            failure,
+            callbacks,
+            global_state,
+            control,
+        } = self;
+        let cleanup = global_state
+            .clean_up_after_run_timeout(
+                limit.as_secs(),
+                print_summary,
+                summary_json,
+                dispatch_stats,
+            )
+            .await;
+        HermitPtraceFailure {
+            failure,
+            cleanup,
+            callbacks,
+            timeout_during_cleanup: control.expired.get(),
+        }
+        .into()
+    }
+}
+
 /// Wait for the run. A terminal outcome the scheduler hands this run
 /// (`detcore::TerminalOutcomeUnwindGuard`: a guest deadlock, a virtual
 /// timeout) is torn down like a `--timeout` and completes with the outcome's
@@ -879,9 +944,7 @@ pub(crate) async fn wait(
     control: Rc<Control>,
 ) -> Result<(reverie::ExitStatus, detcore::GlobalState), Error> {
     control.root.set(Some(tracer.guest_pid().as_raw()));
-    control.register(tracer.termination_handle());
-    let _unwind = control.unwind_terminal_outcomes();
-    consume(tracer.wait_completion().await, control).await
+    wait_outcome(tracer, control).await?.into_finished().await
 }
 /// [`wait`], with the guest's output; a terminal outcome keeps the output the
 /// guest wrote before it.
@@ -890,9 +953,37 @@ pub(crate) async fn wait_with_output(
     control: Rc<Control>,
 ) -> Result<(reverie::process::Output, detcore::GlobalState), Error> {
     control.root.set(Some(tracer.guest_pid().as_raw()));
+    wait_with_output_outcome(tracer, control)
+        .await?
+        .into_finished()
+        .await
+}
+/// [`wait`], handing a run `--timeout` stopped back to the caller.
+pub(crate) async fn wait_outcome(
+    tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
+    control: Rc<Control>,
+) -> Result<Waited<reverie::ExitStatus>, Error> {
+    control.register(tracer.termination_handle());
+    let _unwind = control.unwind_terminal_outcomes();
+    consume(tracer.wait_completion().await, control).await
+}
+/// [`wait_with_output`], handing a run `--timeout` stopped back to the caller.
+pub(crate) async fn wait_with_output_outcome(
+    tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
+    control: Rc<Control>,
+) -> Result<Waited<reverie::process::Output>, Error> {
     control.register(tracer.termination_handle());
     let _unwind = control.unwind_terminal_outcomes();
     consume(tracer.wait_with_output_completion().await, control).await
+}
+/// The `--timeout` bound, when the deadline's own termination
+/// (`Control::publish_timeout`) is the run's primary failure, not one that
+/// followed an earlier failure.
+fn stopped_by_run_timeout(failure: &PtraceRunFailure) -> Option<Duration> {
+    match failure.primary() {
+        reverie::Error::Tool(inner) => inner.downcast_ref::<GuestTimedOut>().map(|t| t.limit),
+        _ => None,
+    }
 }
 /// The outcome of a failed run that is a clean terminal-outcome teardown: the
 /// unwind's cause is the `primary`, so no earlier failure of the run is
@@ -928,14 +1019,14 @@ pub(crate) fn completed_terminal_outcome<R: TerminalOutcomeResult>(
 async fn consume<R: TerminalOutcomeResult>(
     mut outcome: ToolRunOutcome<detcore::GlobalState, R>,
     control: Rc<Control>,
-) -> Result<(R, detcore::GlobalState), Error> {
+) -> Result<Waited<R>, Error> {
     loop {
         match outcome {
             ToolRunOutcome::Complete(completion) => {
                 let callbacks = completion.callback_diagnostics().to_vec();
                 control.termination.borrow_mut().take();
                 return match completion.result {
-                    Ok(result) => Ok((result, completion.global_state)),
+                    Ok(result) => Ok(Waited::Finished(result, completion.global_state)),
                     Err(failure)
                         if let Some(result) = completed_terminal_outcome::<R>(
                             failure.primary(),
@@ -945,10 +1036,19 @@ async fn consume<R: TerminalOutcomeResult>(
                     {
                         // The terminal outcome, not a failed run: the caller
                         // finishes the run (summary, recording) as for an exit.
-                        Ok((result, completion.global_state))
+                        Ok(Waited::Finished(result, completion.global_state))
                     }
                     Err(failure) => {
                         control.global_failure(&failure, callbacks.clone());
+                        if let Some(limit) = stopped_by_run_timeout(&failure) {
+                            return Ok(Waited::TimedOut(TimedOutRun {
+                                limit,
+                                failure,
+                                callbacks,
+                                global_state: completion.global_state,
+                                control,
+                            }));
+                        }
                         let cleanup = completion
                             .global_state
                             .clean_up_after_backend_failure()

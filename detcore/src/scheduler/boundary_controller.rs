@@ -290,6 +290,55 @@ mod tests {
         scheduler
     }
 
+    /// A finished run's summary refuses a replay that did not reach its
+    /// schedule's end, and names unconsumed callback checkpoints. The summary
+    /// of a run `--timeout` stopped does neither: a stopped replay is
+    /// unfinished by definition.
+    #[test]
+    fn only_a_finished_runs_summary_requires_its_replay_to_have_ended() {
+        use crate::preemptions::callback_history::Checkpoint;
+        use crate::preemptions::callback_history::Origin;
+        use crate::preemptions::callback_history::Site;
+        use crate::slice_boundary::callbacks::Callback;
+
+        let mut finished = scheduler(vec![marker(3, 1)]);
+        let refusal = finished
+            .generate_partial_run_summary_for_log(None)
+            .unwrap_err();
+        assert!(
+            refusal
+                .downcast_ref::<crate::TerminalReplayRefusal>()
+                .is_some(),
+            "{refusal:#}"
+        );
+
+        let mut stopped = scheduler(vec![marker(3, 1)]);
+        stopped.callback_checkpoints.insert(
+            DetTid::from_raw(3),
+            [Checkpoint {
+                history_index: 0,
+                origin: Origin {
+                    callback: Callback::Syscall(Sysno::close),
+                    site: Site::Posthook,
+                    progress: 10,
+                    last_op: None,
+                    time: LogicalTime::from_nanos(100),
+                    rcbs: 10,
+                },
+            }]
+            .into(),
+        );
+        let (summary, _) = stopped.generate_stopped_run_summary_for_log(None).unwrap();
+        assert_eq!(summary.desync_descrip, None);
+        stopped.boundary_replayer = None;
+        let (summary, _) = stopped.generate_partial_run_summary_for_log(None).unwrap();
+        assert!(
+            summary
+                .desync_descrip
+                .is_some_and(|text| text.contains("incomplete callback history")),
+        );
+    }
+
     #[test]
     fn boundary_constructor_preserves_formats_and_authenticates_lookahead() {
         use crate::preemptions::PreemptionRecord;
