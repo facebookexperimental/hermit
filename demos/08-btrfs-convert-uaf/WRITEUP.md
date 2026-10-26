@@ -11,9 +11,9 @@ counting retired branches: Hermit arms the counter's interrupt a safety margin
 of branches early and single-steps the rest of the way to the exact switch
 point. If the interrupt arrives later than that margin, which is more likely
 under heavy host load, Reverie, the library Hermit uses to trace the program,
-prints a line starting with `HERMIT_SKID_OVERSHOOT` and Hermit refuses the run:
-it prints a line starting with `HERMIT_POLICY_REFUSAL class=policy-refusal
-cause=skid-overshoot` and exits with status 122 instead of reporting the crash.
+prints a line starting with `HERMIT_SKID_OVERSHOOT`; Hermit goes on from the
+late point and warns that the run is not reproducible from its seed, and the
+demo stops instead of counting that run.
 
 ## The bug
 
@@ -245,14 +245,16 @@ Three limits are worth knowing:
   astray at the reviewer's rate of 7 in 96, the chance that none of 110 would
   is (89/96)^110, about 1 in 4,100. The evidence is consistent with the mount
   table being the whole cause, and does not exclude a rarer one.
-- **Heavy host load can make Hermit refuse a run.** Hermit arms the counter
-  interrupt for each chaos-mode thread switch a safety margin of branches
-  early and single-steps the rest of the way. An interrupt that arrives later
-  than that margin, which is more likely when the host is busy, makes Reverie
-  print a line starting with `HERMIT_SKID_OVERSHOOT`. Hermit then refuses the
-  run instead of treating it as deterministic: it prints a line starting with
-  `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot` and exits
-  with status 122, and `run.sh` reports rc=122 instead of the expected crash.
+- **Heavy host load can make a run not reproducible from its seed.** Hermit
+  arms the counter interrupt for each chaos-mode thread switch a safety margin
+  of branches early and single-steps the rest of the way. An interrupt that
+  arrives later than that margin, which is more likely when the host is busy,
+  makes Reverie print a line starting with `HERMIT_SKID_OVERSHOOT`. The thread
+  switch then happens where the interrupt found the thread, so the seed no
+  longer reproduces the run. The demo runs Hermit without `--strict`, so Hermit
+  finishes the run and prints one warning that counts the
+  `skid-overshoot report(s)`; `run.sh` stops instead of counting the run.
+  (Under `--strict` Hermit refuses such a run with exit status 122.)
   All 44 seed-7 runs counted in the
   [demo's README](README.md#what-to-notice) crashed. The host's load was not
   recorded during them; the README gives the 1-minute load average during

@@ -2,10 +2,11 @@
 """Tests for demo 8's result checks and for its seed calibration.
 
 Both scripts decide PASS or FAIL from what `hermit run --chaos` returns: the
-exit status (134 is the ASAN abort, 124 the timeout, 125 a wrapper failure,
-122 Hermit's refusal after a late performance-counter interrupt), whether the
-output holds a complete AddressSanitizer report, and whether two runs of one
-seed print the same complete report. Each test puts a stub `hermit` first on
+exit status (134 is the ASAN abort, 124 the timeout, 125 a wrapper failure, 122
+a Hermit refusal), Hermit's warning that a late performance-counter interrupt
+made the run not reproducible from its seed, whether the output holds a
+complete AddressSanitizer report, and whether two runs of one seed print the
+same complete report. Each test puts a stub `hermit` first on
 PATH that returns one scripted outcome, runs the real script, and checks that
 the script accepts or refuses it for the stated reason. No real Hermit and no
 btrfs-convert build are involved.
@@ -203,11 +204,11 @@ if [ "${1:-}" = --version ]; then
 fi
 printf '%s\n' "$*" >>"$DEMO08_TEST_ARGS_FILE"
 # What Reverie and Hermit print when a precise-timer interrupt arrives past its
-# target: Hermit refuses the run with HERMIT_POLICY_REFUSAL_EXIT (122).
-skid_refusal() {
+# target in a run without --strict: the run goes on from the late point, and
+# Hermit warns that its seed does not reproduce it.
+skid_warning() {
   echo 'HERMIT_SKID_OVERSHOOT rcb_actual=1008 rcb_target=1000 skid_margin=32 overshoot=8' >&2
-  echo 'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=1' >&2
-  exit 122
+  echo 'hermit: WARNING: 1 skid-overshoot report(s): a precise timer took effect past its programmed branch count, so this run is not reproducible from its seed; it ran on from the observed point, and --strict would refuse it. First: tid=3 kind=delivered_late rcb_actual=1008 rcb_target=1000 past_target=8' >&2
 }
 conv=""
 seen=0
@@ -226,15 +227,16 @@ case "$conv" in
       partial-rc0) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 0 ;;
       partial-rc124) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 124 ;;
       truncated-abort) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 134 ;;
-      skid-refusal) skid_refusal ;;
-      replay-partial-rc0|replay-partial-rc124|replay-truncated-abort|replay-different|replay-skid-refusal|replay-custom)
+      # The crash still happened, after a thread switch the seed did not place.
+      skid-warning) skid_warning; cat "$DEMO08_TEST_UAF_FILE"; exit 134 ;;
+      replay-partial-rc0|replay-partial-rc124|replay-truncated-abort|replay-different|replay-skid-warning|replay-custom)
         if [ "$count" -eq 1 ]; then cat "$DEMO08_TEST_UAF_FILE"; exit 134; fi
         case "$DEMO08_TEST_BUGGY_MODE" in
           replay-partial-rc0) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 0 ;;
           replay-partial-rc124) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 124 ;;
           replay-truncated-abort) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 134 ;;
           replay-different) cat "$DEMO08_TEST_OTHER_FILE"; exit 134 ;;
-          replay-skid-refusal) skid_refusal ;;
+          replay-skid-warning) skid_warning; cat "$DEMO08_TEST_OTHER_FILE"; exit 134 ;;
           # The ASAN abort with whatever output the test wrote to the file.
           replay-custom) cat "$DEMO08_TEST_REPLAY_FILE"; exit 134 ;;
         esac ;;
@@ -247,7 +249,7 @@ case "$conv" in
       timeout) echo "conversion still running"; exit 124 ;;
       wrapper-failure) echo "wrapper: limit exceeded" >&2; exit 125 ;;
       regression-uaf) cat "$DEMO08_TEST_UAF_FILE"; exit 134 ;;
-      skid-refusal) skid_refusal ;;
+      skid-warning) skid_warning; exit 0 ;;
       *) echo "stub: unknown DEMO08_TEST_FIXED_MODE" >&2; exit 9 ;;
     esac ;;
   *) echo "stub: unexpected btrfs-convert path: $conv" >&2; exit 9 ;;
@@ -308,19 +310,27 @@ partial_report() {
   echo '==123==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210'
   echo 'READ of size 8 at 0x606000000210 thread T1'
 }
-# Hermit's refusal after a late performance-counter interrupt (exit 122).
+# A Hermit refusal (exit 122).
 refusal() {
-  echo 'HERMIT_SKID_OVERSHOOT rcb_actual=1008 rcb_target=1000 skid_margin=32 overshoot=8' >&2
-  echo 'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=1' >&2
+  echo 'HERMIT_POLICY_REFUSAL class=policy-refusal' >&2
   exit 122
+}
+# Hermit's warning after a late performance-counter interrupt: the run went on
+# from the late point, here to a clean conversion, so it did not test the seed.
+warned_clean() {
+  echo 'HERMIT_SKID_OVERSHOOT rcb_actual=1008 rcb_target=1000 skid_margin=32 overshoot=8' >&2
+  echo 'hermit: WARNING: 1 skid-overshoot report(s): a precise timer took effect past its programmed branch count, so this run is not reproducible from its seed; it ran on from the observed point, and --strict would refuse it. First: tid=3 kind=delivered_late rcb_actual=1008 rcb_target=1000 past_target=8' >&2
+  engage
+  echo 'Conversion complete'
+  exit 0
 }
 
 case "${DEMO08_TEST_MODE:?}" in
-  refused-once)
-    # Each (variant, seed) pair is refused on its first run only; after that
-    # the buggy variant crashes on DEMO08_TEST_UAF_SEED and the fixed one is
-    # clean.
-    if [ "$count" -eq 1 ]; then refusal; fi
+  warned-once)
+    # Each (variant, seed) pair is warned about on its first run only; after
+    # that the buggy variant crashes on DEMO08_TEST_UAF_SEED and the fixed one
+    # is clean.
+    if [ "$count" -eq 1 ]; then warned_clean; fi
     engage
     if [ "$variant" = buggy ] && [ "$seed" = "${DEMO08_TEST_UAF_SEED:?}" ]; then
       abort_with_uaf
@@ -693,16 +703,22 @@ class DemoRunControlsTest(unittest.TestCase):
             "rc=125 is a wrapper failure, not a guest result",
         )
 
-    def test_a_fixed_run_refused_after_a_skid_overshoot_is_refused(self):
+    def test_a_fixed_run_warned_about_a_skid_overshoot_is_not_counted(self):
+        result = self._run(fixed_mode="skid-warning")
         self._assert_refused(
-            self._run(fixed_mode="skid-refusal"),
-            "rc=122 means Hermit refused the run",
+            result, "Hermit warned that this run is not reproducible from its seed"
         )
+        self.assertIn("chaos-fixed.out", result.stdout)
+        self.assertNotIn("chaos fixed: completed", result.stdout)
 
-    def test_a_buggy_run_refused_after_a_skid_overshoot_is_explained(self):
-        result = self._run(buggy_mode="skid-refusal")
-        self._assert_refused(result, "rc=122 means Hermit refused the run")
+    def test_a_buggy_crash_warned_about_a_skid_overshoot_is_not_counted(self):
+        """A crash after a thread switch the seed did not place proves nothing."""
+        result = self._run(buggy_mode="skid-warning")
+        self._assert_refused(
+            result, "Hermit warned that this run is not reproducible from its seed"
+        )
         self.assertIn("chaos-buggy.out", result.stdout)
+        self.assertNotIn("reproduced the use-after-free", result.stdout)
 
     def test_a_partial_report_with_exit_0_is_not_a_crash(self):
         self._assert_refused(self._run(buggy_mode="partial-rc0"), "expected 134")
@@ -732,12 +748,14 @@ class DemoRunControlsTest(unittest.TestCase):
             "replay did not complete with the ASAN abort",
         )
 
-    def test_a_second_run_refused_after_a_skid_overshoot_is_explained(self):
-        """Step 4 explains a refusal as steps 2 and 3 do, and still exits 1."""
-        result = self._run(buggy_mode="replay-skid-refusal")
-        self._assert_refused(result, "replay did not complete with the ASAN abort: rc=122")
-        self.assertIn("rc=122 means Hermit refused the run", result.stdout)
+    def test_a_second_run_warned_about_a_skid_overshoot_is_explained(self):
+        """Step 4 stops as steps 2 and 3 do, before comparing the reports."""
+        result = self._run(buggy_mode="replay-skid-warning")
+        self._assert_refused(
+            result, "Hermit warned that this run is not reproducible from its seed"
+        )
         self.assertIn("chaos-buggy-replay.out", result.stdout)
+        self.assertNotIn("ASAN reports differ", result.stdout)
 
     def test_a_second_run_with_a_truncated_report_is_refused(self):
         self._assert_refused(
@@ -1196,19 +1214,21 @@ class CalibrationControlsTest(unittest.TestCase):
         result = self._prepare("runner-failure-with-signatures", 1)
         self._assert_refused(result, "never executed the guest: 0 of 1 seeds")
 
-    def test_a_refused_run_is_retried_and_the_seed_still_found(self):
-        """A refusal (exit 122) is not "this seed did not crash": run it again."""
+    def test_a_warned_run_is_retried_and_the_seed_still_found(self):
+        """A skid-overshoot warning is not "this seed did not crash": run it again."""
         result = self._calibrated(
-            self._prepare("refused-once", 1, DEMO08_TEST_UAF_SEED="0")
+            self._prepare("warned-once", 1, DEMO08_TEST_UAF_SEED="0")
         )
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("Demo 8 crash seed calibrated: 0", result.stdout)
         self.assertIn(
-            "Hermit refused the buggy run on seed 0 (rc=122, attempt 1 of 3)",
+            "Hermit refused the buggy run on seed 0 (a skid-overshoot warning, rc=0, "
+            "attempt 1 of 3)",
             result.stdout,
         )
         self.assertIn(
-            "Hermit refused the fixed run on seed 0 (rc=122, attempt 1 of 3)",
+            "Hermit refused the fixed run on seed 0 (a skid-overshoot warning, rc=0, "
+            "attempt 1 of 3)",
             result.stdout,
         )
         self.assertIn("executed=1/1 unconfirmed=0 refused=0/1 refused_runs=2", result.stdout)
@@ -1217,7 +1237,7 @@ class CalibrationControlsTest(unittest.TestCase):
         )
         # The two refused attempts are rows of their own, with their output kept.
         self.assertEqual(len(self._rows()), 6)
-        self.assertEqual(self._count_rows(r"\t122\t\d+\trefused\t"), 2)
+        self.assertEqual(self._count_rows(r"\t0\t\d+\trefused\t"), 2)
         self.assertEqual(
             self._count_rows(r"^0\tcold\tbuggy\treached\tcomplete\t134\t\d+\tyes\t"), 1
         )
@@ -1226,7 +1246,7 @@ class CalibrationControlsTest(unittest.TestCase):
             "calibration-confirm-fixed-seed-0-refused-1.out",
         ):
             self.assertIn(
-                "HERMIT_POLICY_REFUSAL", (self.artifacts / name).read_text()
+                "skid-overshoot report(s)", (self.artifacts / name).read_text()
             )
 
     def test_seeds_refused_on_every_attempt_are_reported_as_refused(self):
@@ -1234,7 +1254,7 @@ class CalibrationControlsTest(unittest.TestCase):
         self._assert_refused(
             result,
             "refused by Hermit on every seed: each of the 2 attempted seeds "
-            "exited 122 on all 3 attempt(s)",
+            "was refused on all 3 attempt(s)",
             "refused=2/2 refused_runs=6",
             "seed 0 was not tested: Hermit refused every attempt",
         )
@@ -1244,7 +1264,9 @@ class CalibrationControlsTest(unittest.TestCase):
 
     def test_refusal_retries_can_be_turned_off(self):
         result = self._prepare("always-refused", 1, DEMO08_REFUSAL_RETRIES="0")
-        self._assert_refused(result, "exited 122 on all 1 attempt(s)", "refused_runs=1")
+        self._assert_refused(
+            result, "was refused on all 1 attempt(s)", "refused_runs=1"
+        )
         self.assertEqual(len(self._rows()), 2)
 
     def test_a_replay_refused_on_every_attempt_is_not_a_disagreement(self):

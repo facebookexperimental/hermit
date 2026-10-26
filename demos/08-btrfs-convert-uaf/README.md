@@ -20,10 +20,10 @@ CPU's retired branches: Hermit arms the counter's interrupt a safety margin of
 branches early and single-steps the rest of the way to the exact switch point.
 If the interrupt arrives later than that margin, which is more likely under
 heavy host load, Reverie, the library Hermit uses to trace the program, prints
-a line starting with `HERMIT_SKID_OVERSHOOT` and Hermit refuses the run: it
-prints a line starting with `HERMIT_POLICY_REFUSAL class=policy-refusal
-cause=skid-overshoot` and exits with status 122, so `run.sh` reports rc=122
-instead of the expected crash. The story of the bug is in
+a line starting with `HERMIT_SKID_OVERSHOOT`, and Hermit, which the demo runs
+without `--strict`, goes on from the late point and prints one warning that
+counts the `skid-overshoot report(s)` and says the run is not reproducible
+from its seed. `run.sh` then stops instead of counting that run. The story of the bug is in
 [WRITEUP.md](WRITEUP.md).
 
 ## Prerequisites
@@ -328,16 +328,18 @@ replay: ASAN report byte-identical: all 63 lines from the ERROR line through ABO
   interrupt a safety margin of branches early and single-steps the rest of the
   way to the exact switch point. If the interrupt arrives later than that
   margin, which is more likely under heavy host load, Reverie prints a line
-  starting with `HERMIT_SKID_OVERSHOOT` and Hermit refuses the run instead of
-  treating it as deterministic: it prints a line starting with
-  `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=` and
-  exits with status 122, whether or not the program crashed. Steps 2, 3, and 4
-  then report rc=122 instead of the result they expected, add a line that
-  begins `rc=122 means Hermit refused the run` and names the file to look in,
-  and exit 1. `run.sh` saves each Hermit run's standard error with its output
-  in its artifacts directory, `target/demos/08-btrfs-convert-uaf/` by default.
-  Both lines are in `chaos-buggy.out` when step 2 reports rc=122, in
-  `chaos-fixed.out` for step 3, and in `chaos-buggy-replay.out` for step 4.
+  starting with `HERMIT_SKID_OVERSHOOT`. The demo runs Hermit without
+  `--strict`, so Hermit goes on from the late point, whether or not the
+  program then crashes, and prints one warning, starting `hermit: WARNING:`,
+  that counts the `skid-overshoot report(s)` and says the run is not
+  reproducible from its seed. (Under `--strict` Hermit refuses such a run
+  with exit status 122.) Steps 2, 3, and 4 then print a line that begins
+  `Hermit warned that this run is not reproducible from its seed` and names
+  the file to look in, and exit 1 instead of counting the run. `run.sh` saves
+  each Hermit run's standard error with its output in its artifacts directory,
+  `target/demos/08-btrfs-convert-uaf/` by default. Both lines are in
+  `chaos-buggy.out` when step 2 stops, in `chaos-fixed.out` for step 3, and in
+  `chaos-buggy-replay.out` for step 4.
 - The program no longer reads the mount table. Under Hermit,
   `/proc/self/mounts` lists mounts that come from the host at the time of the
   run, and Hermit passes it through unchanged

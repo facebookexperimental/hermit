@@ -50,9 +50,9 @@ file system or network deterministic.
   not reproduce reliably: Hermit arms the retired-branch counter interrupt for
   each chaos-mode thread switch a safety margin early and single-steps to the
   exact point, and if the interrupt arrives later than that margin, which is
-  more likely under heavy host load, Hermit prints `HERMIT_SKID_OVERSHOOT` and
-  refuses the run (`HERMIT_POLICY_REFUSAL ... cause=skid-overshoot`, exit
-  status 122) instead of reporting the crash.
+  more likely under heavy host load, Hermit prints `HERMIT_SKID_OVERSHOOT`,
+  runs on from the late point and warns that the run is not reproducible from
+  its seed, and the demo stops instead of counting the run.
 - **Build Debian packages bit for bit reproducibly**: in a 58-package sample
   measured with Hermit commit `1fadc03779f2`, 52 built byte-identically from two
   different root directories and none differed; an earlier, larger run found

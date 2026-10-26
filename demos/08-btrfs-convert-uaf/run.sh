@@ -23,9 +23,10 @@
 # README.md, which gives the host's load where it was recorded. If a
 # performance-counter interrupt arrives later than Hermit's safety margin, which
 # heavy host load makes more likely, Reverie prints a HERMIT_SKID_OVERSHOOT line
-# and Hermit refuses the run: it prints "HERMIT_POLICY_REFUSAL
-# class=policy-refusal cause=skid-overshoot count=N" and exits 122, so this
-# script reports rc=122 instead of the expected crash. README.md explains this.
+# and Hermit, which this demo runs without --strict, runs on from the late point
+# and prints one warning that counts "skid-overshoot report(s)": the seed no
+# longer reproduces that run, so this script stops and says so instead of
+# counting it. README.md explains this.
 # prepare-assets.sh builds the binaries and the input image; WRITEUP.md tells
 # the story of the bug.
 
@@ -51,8 +52,9 @@ Show a schedule-dependent btrfs-convert use-after-free that native execution
 cannot reproduce on demand and `hermit run --chaos` finds and reproduces; the
 README counts the runs in which it did and gives the host's load where it was
 recorded. Under heavy host load a late performance-counter interrupt makes
-Hermit refuse a run (HERMIT_POLICY_REFUSAL ... cause=skid-overshoot, exit 122),
-and this script then reports rc=122; see demos/08-btrfs-convert-uaf/README.md.
+Hermit warn that a run is not reproducible from its seed ("skid-overshoot
+report(s)"), and this script then stops instead of counting that run; see
+demos/08-btrfs-convert-uaf/README.md.
 
 Needs AddressSanitizer btrfs-convert binaries and a populated ext4 image, which
 demos/08-btrfs-convert-uaf/prepare-assets.sh builds:
@@ -224,16 +226,20 @@ chaos_convert() {
     -- "$conv" "$img" >"$out" 2>&1
 }
 
-# Explain exit status 122 for the chaos run whose output is in $1. Every chaos
-# step uses it, so a refusal reads the same whichever step it happens in.
-explain_refusal() {
+# Stop if Hermit warned that the chaos run whose output is in $1 is not
+# reproducible from its seed: a performance-counter interrupt arrived later than
+# its safety margin, and the run went on from the late point. Its outcome then
+# says nothing about the seed, so no step counts it. Every chaos step checks, so
+# the explanation reads the same whichever step it happens in.
+stop_if_skid_overshoot() {
   local out="$1"
-  echo "rc=122 means Hermit refused the run: a performance-counter" \
-    "interrupt arrived later than its safety margin, so it printed" \
-    "HERMIT_SKID_OVERSHOOT and HERMIT_POLICY_REFUSAL ..." \
-    "cause=skid-overshoot instead of treating the run as deterministic" \
-    "evidence. Heavy host load makes this more likely; see both lines" \
-    "in $out and re-run on a quieter host" >&2
+  grep -qaF 'skid-overshoot report(s)' "$out" || return 0
+  echo "Hermit warned that this run is not reproducible from its seed: a" \
+    "performance-counter interrupt arrived later than its safety margin, so" \
+    "Reverie printed HERMIT_SKID_OVERSHOOT and the run went on from the late" \
+    "point. The demo does not count it. Heavy host load makes this more" \
+    "likely; see the warning in $out and re-run on a quieter host" >&2
+  exit 1
 }
 
 echo "=== Demo 8: schedule-dependent btrfs-convert use-after-free ==="
@@ -276,6 +282,7 @@ fresh_image "$CHAOS_IMG"
 buggy_rc=0
 chaos_convert "$BUGGY" "$CRASH_SEED" "$CHAOS_IMG" "$ARTIFACTS/chaos-buggy.out" \
   || buggy_rc=$?
+stop_if_skid_overshoot "$ARTIFACTS/chaos-buggy.out"
 if [ "$buggy_rc" -ne 134 ]; then
   echo "chaos buggy seed $CRASH_SEED did not complete with the ASAN abort:" \
     "rc=$buggy_rc, expected 134" >&2
@@ -283,7 +290,6 @@ if [ "$buggy_rc" -ne 134 ]; then
     0)   echo "rc=0 means the crash did not occur. If the seed came from an earlier" \
            "prepare-assets.sh, re-run it: it re-checks the recorded seed and" \
            "searches again when that seed no longer crashes" >&2 ;;
-    122) explain_refusal "$ARTIFACTS/chaos-buggy.out" ;;
     124) echo "rc=124 means the ${TIMEOUT}s timeout cut the run off" >&2 ;;
     125) echo "rc=125 is a wrapper failure, not a guest crash" >&2 ;;
   esac
@@ -322,10 +328,10 @@ if grep -qaE 'AddressSanitizer: heap-use-after-free' "$ARTIFACTS/chaos-fixed.out
   echo "the fix does not close the window on seed $CRASH_SEED" >&2
   exit 1
 fi
+stop_if_skid_overshoot "$ARTIFACTS/chaos-fixed.out"
 if [ "$fixed_rc" -ne 0 ]; then
   echo "the fixed control did not complete: rc=$fixed_rc, no use-after-free reported" >&2
   case "$fixed_rc" in
-    122) explain_refusal "$ARTIFACTS/chaos-fixed.out" ;;
     124) echo "rc=124 is the ${TIMEOUT}s timeout: the control was cut off" >&2 ;;
     125) echo "rc=125 is a wrapper failure, not a guest result" >&2 ;;
     *)   echo "rc=$fixed_rc is an execution or environment failure" >&2 ;;
@@ -353,10 +359,10 @@ fresh_image "$CHAOS_IMG"
 replay_rc=0
 chaos_convert "$BUGGY" "$CRASH_SEED" "$CHAOS_IMG" "$ARTIFACTS/chaos-buggy-replay.out" \
   || replay_rc=$?
+stop_if_skid_overshoot "$ARTIFACTS/chaos-buggy-replay.out"
 if [ "$replay_rc" -ne 134 ]; then
   echo "replay did not complete with the ASAN abort: rc=$replay_rc, expected 134" >&2
   case "$replay_rc" in
-    122) explain_refusal "$ARTIFACTS/chaos-buggy-replay.out" ;;
     124) echo "rc=124 means the ${TIMEOUT}s timeout cut the run off" >&2 ;;
     125) echo "rc=125 is a wrapper failure, not a guest crash" >&2 ;;
   esac

@@ -2647,7 +2647,8 @@ impl SkidOvershoots {
         }
     }
 
-    /// The one line [`SkidOvershootPolicy::Warn`] prints.
+    /// The one line [`SkidOvershootPolicy::Warn`] prints. Demo 8's `run.sh`
+    /// finds it by `skid-overshoot report(s)`.
     fn warning(&self) -> String {
         let first = match &self.first {
             Some(detail) => detail.to_string(),
