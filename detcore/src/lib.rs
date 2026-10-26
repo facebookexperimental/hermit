@@ -99,6 +99,7 @@ mod sigalrm_phase1;
 mod signal_announcement_tests;
 pub mod signal_restart;
 mod signal_state;
+pub mod skid_overshoots;
 pub mod slice_boundary;
 mod sock_diag;
 mod stat;
@@ -449,23 +450,37 @@ use crate::types::SigWrapper;
 #[macro_use]
 extern crate bitflags;
 
+/// Report that thread `tid` ran `delta_rcbs` branches since its last handler,
+/// to clock value `clock_value`, past the `last_timer` its timer was armed
+/// for, which made the timer due at Reverie clock value `rcb_target`. The
+/// report is keyed by thread and target, the pair a Reverie report of the same
+/// event names (`skid_overshoots`), and counted in Reverie's count of reports,
+/// where it also stands for an overshoot no Reverie site saw.
 #[cold]
 fn report_rcb_overshoot(
     panic_on_rcb_overshoot: bool,
+    tid: reverie::Tid,
+    rcb_target: u64,
     clock_value: u64,
     delta_rcbs: u64,
     last_timer: u64,
 ) {
     let message = format!(
-        "{} prehook: PMU RCB overshoot! Clock_value: {}. Stepped forward {} RCBs, but should have trapped at {}",
+        "{} prehook: PMU RCB overshoot! Clock_value: {}. Stepped forward {} RCBs, but should have trapped at {} (tid={} rcb_target={})",
         reverie::SKID_OVERSHOOT_MARKER,
         clock_value,
         delta_rcbs,
-        last_timer
+        last_timer,
+        tid,
+        rcb_target
     );
     if panic_on_rcb_overshoot {
         panic!("{}", message);
     }
+    skid_overshoots::record_rcb_overshoot_report(skid_overshoots::RcbOvershootReport {
+        tid,
+        rcb_target,
+    });
     reverie::record_skid_overshoot();
     error!("{}", message);
 }
@@ -1830,13 +1845,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(end) => end,
                 None => guest.read_clock().expect("Couldn't read clock"),
             };
+            let tid = guest.tid();
             // N.B. clock_value does not yet include any updates for the inbound
             // syscall/instruction because this function is the very first thing that
             // happens in each type of handler.
             let thread_state = guest.thread_state_mut();
             let dettid = thread_state.dettid;
-            assert!(thread_state.committed_clock_value <= clock_value);
-            let delta_rcbs: u64 = clock_value - thread_state.committed_clock_value;
+            let committed = thread_state.committed_clock_value;
+            assert!(committed <= clock_value);
+            let delta_rcbs: u64 = clock_value - committed;
             if self.cfg.use_rcb_time() {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-1151)
@@ -1859,6 +1876,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 {
                     report_rcb_overshoot(
                         self.cfg.panic_on_rcb_overshoot,
+                        tid,
+                        // The last handler armed the timer `last_timer`
+                        // branches past its clock value, `committed`
+                        // (`post_handler_hook`), which is where Reverie's
+                        // target for that programming lies.
+                        committed.saturating_add(last_timer),
                         clock_value,
                         delta_rcbs,
                         last_timer,
@@ -8677,10 +8700,11 @@ mod rcb_overshoot_tests {
 
     #[test]
     fn default_overshoot_policy_emits_error_and_returns() {
-        let _ = reverie::take_skid_overshoot_count();
+        let _lock = crate::skid_overshoots::tests::lock_global_skid_overshoots();
+        let _ = crate::skid_overshoots::take_skid_overshoots();
         let error = Arc::new(Mutex::new(None));
         with_default(ErrorSubscriber(error.clone()), || {
-            report_rcb_overshoot(false, 16_249, 139, 100);
+            report_rcb_overshoot(false, reverie::Tid::from_raw(5), 16_210, 16_249, 139, 100);
         });
 
         let error = error.lock().unwrap().take().expect("missing ERROR event");
@@ -8689,10 +8713,111 @@ mod rcb_overshoot_tests {
         assert!(error.contains("16249"), "{error}");
         assert!(error.contains("139"), "{error}");
         assert!(error.contains("100"), "{error}");
+        assert!(error.contains("tid=5 rcb_target=16210"), "{error}");
         assert_eq!(
             reverie::take_skid_overshoot_count(),
             1,
             "the log-and-continue path must feed the supervisor's structural count"
+        );
+        let reports = crate::skid_overshoots::take_rcb_overshoot_reports();
+        assert_eq!(
+            reports.kept,
+            [crate::skid_overshoots::RcbOvershootReport {
+                tid: reverie::Tid::from_raw(5),
+                rcb_target: 16_210,
+            }]
+        );
+    }
+
+    /// Reverie's late-delivery guard records an event with its detail before
+    /// the Tool's timer callback, whose prehook reports it again.
+    fn reverie_reports_late_delivery(tid: i32, rcb_target: u64, rcb_actual: u64) {
+        reverie::record_skid_overshoot();
+        reverie::record_skid_overshoot_detail(reverie::SkidOvershootDetail {
+            tid: reverie::Tid::from_raw(tid),
+            kind: reverie::SkidOvershootKind::DeliveredLate,
+            rcb_actual,
+            rcb_target,
+            overflow_point: Some(rcb_target),
+            overflow_recorded: Some(true),
+            sample_age_ns: None,
+        });
+    }
+
+    /// The prehook's report of an event its thread `tid` ran past: due at
+    /// `rcb_target`, found at `clock_value`. That the two sites name the same
+    /// target for one event is what the CLI test
+    /// `a_skid_overshoot_without_strict_warns_and_keeps_the_guest_status`
+    /// checks against a real run.
+    fn detcore_reports(tid: i32, rcb_target: u64, clock_value: u64) {
+        report_rcb_overshoot(
+            false,
+            reverie::Tid::from_raw(tid),
+            rcb_target,
+            clock_value,
+            clock_value - (rcb_target - 500),
+            500,
+        );
+    }
+
+    #[test]
+    fn both_sites_reporting_one_event_count_one_event() {
+        let _lock = crate::skid_overshoots::tests::lock_global_skid_overshoots();
+        let _ = crate::skid_overshoots::take_skid_overshoots();
+        // Late delivery: Reverie first, then Detcore's timer-callback prehook.
+        reverie_reports_late_delivery(5, 19_786_922, 19_786_961);
+        detcore_reports(5, 19_786_922, 19_786_961);
+        let (counts, details) = crate::skid_overshoots::take_skid_overshoots();
+        assert_eq!((counts.events, counts.reports), (1, 2));
+        assert_eq!(details.len(), 1);
+        // An event another stop overtook: Detcore's prehook first, then
+        // Reverie when the stop is settled after the callback.
+        detcore_reports(7, 1_500, 1_600);
+        reverie::record_skid_overshoot();
+        reverie::record_skid_overshoot_detail(reverie::SkidOvershootDetail {
+            tid: reverie::Tid::from_raw(7),
+            kind: reverie::SkidOvershootKind::Missed {
+                by: "Seccomp stop".to_owned(),
+                notification_queued: false,
+            },
+            rcb_actual: 1_600,
+            rcb_target: 1_500,
+            overflow_point: Some(1_500),
+            overflow_recorded: Some(false),
+            sample_age_ns: None,
+        });
+        let (counts, _) = crate::skid_overshoots::take_skid_overshoots();
+        assert_eq!((counts.events, counts.reports), (1, 2));
+    }
+
+    #[test]
+    fn a_detection_only_detcore_made_counts_one_event() {
+        let _lock = crate::skid_overshoots::tests::lock_global_skid_overshoots();
+        let _ = crate::skid_overshoots::take_skid_overshoots();
+        detcore_reports(5, 1_500, 1_600);
+        let counts = crate::skid_overshoots::skid_overshoot_counts();
+        assert_eq!((counts.events, counts.reports), (1, 1));
+        let (taken, _) = crate::skid_overshoots::take_skid_overshoots();
+        assert_eq!(taken, counts, "a read leaves the counts to the take");
+    }
+
+    #[test]
+    fn two_events_reported_by_both_sites_count_two_events() {
+        let _lock = crate::skid_overshoots::tests::lock_global_skid_overshoots();
+        let _ = crate::skid_overshoots::take_skid_overshoots();
+        reverie_reports_late_delivery(5, 1_500, 1_510);
+        detcore_reports(5, 1_500, 1_510);
+        reverie_reports_late_delivery(6, 1_500, 1_520);
+        detcore_reports(6, 1_500, 1_520);
+        let read = crate::skid_overshoots::skid_overshoot_counts();
+        assert_eq!((read.events, read.reports), (2, 4));
+        let (counts, details) = crate::skid_overshoots::take_skid_overshoots();
+        assert_eq!(counts, read);
+        assert_eq!(details.len(), 2, "the read put the details back in order");
+        assert_eq!(details[0].tid, reverie::Tid::from_raw(5));
+        assert_eq!(
+            crate::skid_overshoots::take_skid_overshoots().0,
+            crate::skid_overshoots::SkidOvershootCounts::default()
         );
     }
 
@@ -8706,7 +8831,7 @@ mod rcb_overshoot_tests {
     #[test]
     #[should_panic(expected = "PMU RCB overshoot")]
     fn opt_in_overshoot_policy_panics() {
-        report_rcb_overshoot(true, 16_249, 139, 100);
+        report_rcb_overshoot(true, reverie::Tid::from_raw(5), 16_210, 16_249, 139, 100);
     }
 }
 

@@ -2599,8 +2599,8 @@ pub enum SkidOvershootPolicy {
     /// recorded schedule, and [`run`], [`run_with_backend`], [`run_with_output`],
     /// [`run_with_output_backend`], record and replay.
     Refuse,
-    /// Keep the result, and print one warning that counts the reports,
-    /// classifies the first one, and says that the seed does not reproduce
+    /// Keep the result, and print one warning that counts the events and
+    /// reports, classifies the first one, and says that the seed does not reproduce
     /// the run: a run without `--strict`, which does not promise that its
     /// seed reproduces it.
     Warn,
@@ -2609,8 +2609,9 @@ pub enum SkidOvershootPolicy {
 /// The skid overshoots one run reported.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SkidOvershoots {
-    /// Reports counted by [`reverie::take_skid_overshoot_count`].
-    count: u64,
+    /// The events, and the reports of them by every detection site
+    /// ([`detcore::skid_overshoots::take_skid_overshoots`]).
+    counts: detcore::skid_overshoots::SkidOvershootCounts,
     /// The first overshoot a backend classified, if one did. Detcore counts
     /// an overshoot it finds without classifying it.
     first: Option<reverie::SkidOvershootDetail>,
@@ -2619,20 +2620,24 @@ struct SkidOvershoots {
 impl SkidOvershoots {
     /// Take the reports recorded in this process since the last take.
     fn take() -> Self {
+        let (counts, details) = detcore::skid_overshoots::take_skid_overshoots();
         Self {
-            count: reverie::take_skid_overshoot_count(),
-            first: reverie::take_skid_overshoot_details().into_iter().next(),
+            counts,
+            first: details.into_iter().next(),
         }
     }
 
     /// Applies `policy` to the `result` of the run that reported these.
+    /// Any report applies it (there are events exactly when there are
+    /// reports); a refusal counts the reports, as its
+    /// `HERMIT_SKID_OVERSHOOT report(s)` says.
     fn apply<T>(self, result: Result<T, Error>, policy: SkidOvershootPolicy) -> Result<T, Error> {
-        if self.count == 0 {
+        if self.counts.reports == 0 {
             return result;
         }
         match policy {
             SkidOvershootPolicy::Refuse => {
-                let refusal = SkidOvershootError::new(self.count);
+                let refusal = SkidOvershootError::new(self.counts.reports);
                 match result {
                     Ok(_) => Err(Error::new(refusal)),
                     Err(error) => Err(error.context(refusal)),
@@ -2647,18 +2652,20 @@ impl SkidOvershoots {
         }
     }
 
-    /// The one line [`SkidOvershootPolicy::Warn`] prints. Demo 8's `run.sh`
-    /// finds it by `skid-overshoot report(s)`.
+    /// The one line [`SkidOvershootPolicy::Warn`] prints. It leads with the
+    /// events and keeps `skid-overshoot report(s)`, by which demo 8's `run.sh`
+    /// finds it.
     fn warning(&self) -> String {
         let first = match &self.first {
             Some(detail) => detail.to_string(),
             None => "not classified".to_owned(),
         };
         format!(
-            "hermit: WARNING: {} skid-overshoot report(s): a precise timer took effect past its \
-             programmed branch count, so this run is not reproducible from its seed; it ran on \
-             from the observed point, and --strict would refuse it. First: {first}",
-            self.count
+            "hermit: WARNING: {} skid-overshoot event(s) ({} skid-overshoot report(s)): a \
+             precise timer took effect past its programmed branch count, so this run is not \
+             reproducible from its seed; it ran on from the observed point, and --strict would \
+             refuse it. First: {first}",
+            self.counts.events, self.counts.reports
         )
     }
 }
@@ -2696,8 +2703,9 @@ impl SkidOvershootReport {
         self.take().apply(result, policy)
     }
 
+    /// Returns the reports, as a refusal counts them.
     fn finish_with_count<T>(self, result: Result<T, Error>) -> Result<(T, u64), Error> {
-        let count = self.take().count;
+        let count = self.take().counts.reports;
         match result {
             Ok(value) => Ok((value, count)),
             Err(error) if count > 0 => Err(error.context(SkidOvershootError::new(count))),
@@ -4234,7 +4242,7 @@ async fn dispatch_backend(
             print_summary,
             print_summary_to_json_file,
             dispatch_stats,
-            Some(reverie::skid_overshoot_count()),
+            Some(detcore::skid_overshoots::skid_overshoot_counts()),
         )
         .await;
     let completed = match terminal_outcome {
@@ -4634,7 +4642,7 @@ async fn dispatch_output_backend(
             print_summary,
             print_summary_to_json_file,
             dispatch_stats,
-            Some(reverie::skid_overshoot_count()),
+            Some(detcore::skid_overshoots::skid_overshoot_counts()),
         )
         .await;
     let status = output.status;
@@ -7587,8 +7595,8 @@ mod tests {
     /// A run without `--strict` keeps its result, whether the guest
     /// succeeded or failed, when its precise timers report overshoots: no
     /// refusal joins the error chain, so the exit status stays the run's own.
-    /// Its one warning counts the reports, classifies the first, and says the
-    /// seed does not reproduce the run. The reports and details are taken,
+    /// Its one warning counts the events and reports, classifies the first,
+    /// and says the seed does not reproduce the run. The reports and details are taken,
     /// so a later run in the process starts clean.
     #[test]
     fn a_warned_skid_overshoot_keeps_the_result_and_names_the_first_report() {
@@ -7602,13 +7610,17 @@ mod tests {
             reverie::record_skid_overshoot();
             reverie::record_skid_overshoot_detail(late_delivery(rcb_actual));
         }
-        // Detcore counts one it finds without classifying it.
+        // A site that counts one without classifying it, as Reverie's
+        // block-step guard does.
         reverie::record_skid_overshoot();
         let overshoots = report.take();
         assert_eq!(
             overshoots,
             SkidOvershoots {
-                count: 3,
+                counts: detcore::skid_overshoots::SkidOvershootCounts {
+                    events: 3,
+                    reports: 3,
+                },
                 first: Some(late_delivery(41_000)),
             }
         );
@@ -7616,11 +7628,12 @@ mod tests {
         let warning = overshoots.warning();
         assert_eq!(
             warning,
-            "hermit: WARNING: 3 skid-overshoot report(s): a precise timer took effect past its \
-             programmed branch count, so this run is not reproducible from its seed; it ran on \
-             from the observed point, and --strict would refuse it. First: tid=42 \
-             kind=delivered_late rcb_actual=41000 rcb_target=33000 past_target=8000 \
-             overflow_point=31000 past_overflow=10000 overflow_recorded=true sample_age_ns=3500"
+            "hermit: WARNING: 3 skid-overshoot event(s) (3 skid-overshoot report(s)): a precise \
+             timer took effect past its programmed branch count, so this run is not reproducible \
+             from its seed; it ran on from the observed point, and --strict would refuse it. \
+             First: tid=42 kind=delivered_late rcb_actual=41000 rcb_target=33000 \
+             past_target=8000 overflow_point=31000 past_overflow=10000 overflow_recorded=true \
+             sample_age_ns=3500"
         );
         assert!(!warning.contains('\n'), "one line: {warning}");
         // Neither the marker the retry predicates count nor a class line.
@@ -7641,14 +7654,30 @@ mod tests {
         assert!(error.downcast_ref::<SkidOvershootError>().is_none());
         assert_eq!(format!("{error:#}"), "guest failed");
 
+        // One event that Reverie and Detcore's prehook both reported.
         let unclassified = SkidOvershoots {
-            count: 1,
+            counts: detcore::skid_overshoots::SkidOvershootCounts {
+                events: 1,
+                reports: 2,
+            },
             first: None,
         };
+        let warning = unclassified.warning();
         assert!(
-            unclassified.warning().ends_with("First: not classified"),
-            "{}",
-            unclassified.warning()
+            warning.starts_with(
+                "hermit: WARNING: 1 skid-overshoot event(s) (2 skid-overshoot report(s)): "
+            ) && warning.ends_with("First: not classified"),
+            "{warning}"
+        );
+        let refusal = unclassified
+            .apply(Ok::<_, Error>(()), SkidOvershootPolicy::Refuse)
+            .unwrap_err();
+        assert_eq!(
+            refusal
+                .downcast_ref::<SkidOvershootError>()
+                .map(SkidOvershootError::count),
+            Some(2),
+            "a refusal counts the reports"
         );
     }
 

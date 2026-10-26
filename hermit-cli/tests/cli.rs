@@ -36652,9 +36652,10 @@ fn skid_overshoot_and_guest_failure_have_different_exit_codes() {
 
 /// Without `--strict`, a recorded PMU skid overshoot no longer refuses the
 /// run: the guest's own exit status passes through, Hermit prints exactly one
-/// warning that counts the reports and classifies the first one, and the
-/// summary records the reports with `seed_reproducible: false`. The overshoot
-/// is induced with Reverie's own fault injector, as in
+/// warning that counts the events and reports and classifies the first one,
+/// and the summary records the events, one per thread and timer target named
+/// in the timer warnings and prehook errors, with `seed_reproducible: false`.
+/// The overshoot is induced with Reverie's own fault injector, as in
 /// `skid_overshoot_and_guest_failure_have_different_exit_codes`, whose
 /// `--strict --verify` run is still refused. The guest's status, 3, is one no
 /// refusal or Hermit failure uses.
@@ -36705,10 +36706,39 @@ fn a_skid_overshoot_without_strict_warns_and_keeps_the_guest_status() {
     assert!(
         report["skid_overshoots"]
             .as_u64()
-            .is_some_and(|reports| reports > 0),
+            .is_some_and(|events| events > 0),
         "{report}"
     );
     assert_eq!(report["seed_reproducible"], serde_json::json!(false));
+    // The summary counts events: the distinct thread and target pairs that
+    // Reverie's timer warnings and Detcore's prehook errors name, however
+    // many of those lines name each.
+    let field = |line: &str, name: &str| -> Option<u64> {
+        let start = line.find(&format!("{name}="))? + name.len() + 1;
+        let digits: String = line[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    };
+    let reported: Vec<(u64, u64)> = stderr
+        .lines()
+        .filter(|line| {
+            line.contains("reverie_ptrace::timer") || line.contains("HERMIT_SKID_OVERSHOOT prehook")
+        })
+        .filter_map(|line| Some((field(line, "tid")?, field(line, "rcb_target")?)))
+        .collect();
+    let events: std::collections::BTreeSet<_> = reported.iter().copied().collect();
+    assert_eq!(
+        report["skid_overshoots"].as_u64(),
+        Some(events.len() as u64),
+        "{report}\n{stderr}"
+    );
+    let reports = report["skid_overshoot_reports"].as_u64();
+    assert!(
+        reports.is_some_and(|reports| reports >= reported.len() as u64),
+        "{report}\n{stderr}"
+    );
 }
 
 /// Retained entries of a verify-log directory whose names start with `prefix`.

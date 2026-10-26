@@ -176,11 +176,12 @@ counter's interrupt arrived past its target, exit status 122), and so does a
 replay of a recorded schedule (`--replay-preemptions-from`,
 `--replay-schedule-from`), which such a run no longer follows. Any other run
 finishes instead and prints one warning, starting `hermit: WARNING:`, that
-counts the skid-overshoot reports, classifies the first, and says that the
-seed does not reproduce the run; `--summary` and `--summary-json` record the
-number of reports (`skid_overshoots`, with `seed_reproducible: false`). Reverie
-and Detcore can each report one overshoot, so the reports can outnumber the
-late preemptions.
+counts the skid-overshoot events and reports, classifies the first, and says
+that the seed does not reproduce the run; `--summary` and `--summary-json`
+record the number of events (`skid_overshoots`, with `seed_reproducible:
+false`). Reverie and Detcore can each report one overshoot, so an event is one
+thread's late timer and its target, however many reports name it; the JSON
+also records the reports (`skid_overshoot_reports`).
 
 ## Choosing A Mode
 

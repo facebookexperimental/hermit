@@ -2489,15 +2489,16 @@ impl GlobalState {
     }
 
     /// [`Self::clean_up_with_dispatch_stats`], also recording in the summary
-    /// the skid-overshoot reports of the backend's precise PMU timers
-    /// ([`RunSummary::record_skid_overshoots`]). Only a backend with such
-    /// timers passes `Some`.
+    /// the skid overshoots of the backend's precise PMU timers, events and
+    /// reports ([`RunSummary::record_skid_overshoots`],
+    /// [`crate::skid_overshoots::skid_overshoot_counts`]). Only a backend with
+    /// such timers passes `Some`.
     pub async fn clean_up_with_backend_counts(
         mut self,
         to_stderr: bool,
         print_summary_to_json_file: &Option<PathBuf>,
         dispatch_stats: Option<reverie::DispatchStats>,
-        skid_overshoots: Option<u64>,
+        skid_overshoots: Option<crate::skid_overshoots::SkidOvershootCounts>,
     ) -> anyhow::Result<()> {
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
@@ -2537,8 +2538,8 @@ impl GlobalState {
             .finalize_run_summary()
             .and_then(|(mut summary, description)| {
                 summary.dispatch_stats = dispatch_stats;
-                if let Some(reports) = skid_overshoots {
-                    summary.record_skid_overshoots(reports);
+                if let Some(counts) = skid_overshoots {
+                    summary.record_skid_overshoots(counts.events, counts.reports);
                 }
                 // No summary is published unless terminal validation and recording
                 // output both succeeded. Output errors retain their ordinary class.
