@@ -163,13 +163,24 @@ hermit run -- /bin/sh -c 'od -An -N8 -tx1 /dev/urandom'
 ```
 
 Both invocations should print the same bytes when the command, inputs, and
-Hermit configuration are unchanged.
+Hermit configuration are unchanged, unless Hermit warns of a skid overshoot
+(below), which `--strict` refuses.
 
 Hermit uses strict deterministic execution by default. The explicit
 `--strict` option also requires every input of the run on the command line: a
 run without `--epoch` (or `HERMIT_EPOCH`, or a replayed recording that supplies
 the epoch), or with `--seed-from=SystemRandom`, is refused before the guest
-starts instead of drawing that input from the host.
+starts instead of drawing that input from the host. It also refuses, at the
+end, a run whose precise timers preempted a thread late (a skid overshoot: the
+counter's interrupt arrived past its target, exit status 122), and so does a
+replay of a recorded schedule (`--replay-preemptions-from`,
+`--replay-schedule-from`), which such a run no longer follows. Any other run
+finishes instead and prints one warning, starting `hermit: WARNING:`, that
+counts the skid-overshoot reports, classifies the first, and says that the
+seed does not reproduce the run; `--summary` and `--summary-json` record the
+number of reports (`skid_overshoots`, with `seed_reproducible: false`). Reverie
+and Detcore can each report one overshoot, so the reports can outnumber the
+late preemptions.
 
 ## Choosing A Mode
 
@@ -1081,7 +1092,7 @@ hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
 
 | Option | Effect |
 | --- | --- |
-| `--strict` | Uses the current deterministic defaults and refuses a run that would draw an input from the host: pass `--epoch` (or set `HERMIT_EPOCH`), and do not use `--seed-from=SystemRandom`. |
+| `--strict` | Uses the current deterministic defaults and refuses a run that would draw an input from the host: pass `--epoch` (or set `HERMIT_EPOCH`), and do not use `--seed-from=SystemRandom`. Refuses a run with a skid overshoot (exit 122), which a run without it, other than a replay, only warns about. |
 | `--allow-unsupported-syscalls` | Run-only compatibility escape hatch that permits Unsupported syscalls to reach Linux and prints a warning. A successful exit does not establish complete deterministic execution. |
 | `--passthru-opt` | Use the reduced syscall subscription set for performance. Requires `--allow-unsupported-syscalls`; unlisted PassThrough syscalls bypass Detcore, weakening deterministic accounting. Unsupported syscalls remain subscribed so the explicit policy is observable. |
 | `--no-sequentialize-threads` | Lets Linux schedule guest threads concurrently. This weakens schedule reproducibility. |

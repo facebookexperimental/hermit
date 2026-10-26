@@ -21995,6 +21995,9 @@ impl Scheduler {
                 binder_external_calls: None,
                 // GlobalState marks a run its deadline stopped.
                 run_timeout_secs: None,
+                // The backend's precise timers count these.
+                skid_overshoots: None,
+                seed_reproducible: None,
             },
             info_reprio_descrip,
         ))

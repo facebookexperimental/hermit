@@ -2547,8 +2547,9 @@ impl std::fmt::Display for BackendRunFailure {
 impl std::error::Error for BackendRunFailure {}
 
 /// A run on a backend that delivers precise timer events (ptrace, e9patch
-/// preprocessing on it, or KVM) observed late precise-timer delivery, so Hermit
-/// refuses to treat the completed execution as deterministic evidence.
+/// preprocessing on it, or KVM) observed late precise-timer delivery, so
+/// Hermit, under [`SkidOvershootPolicy::Refuse`], refuses to treat the
+/// completed execution as deterministic evidence.
 ///
 /// This is a type rather than a message match because it crosses the container
 /// error boundary as [`error::FailureKind::PolicyRefusal`].
@@ -2585,40 +2586,117 @@ impl std::fmt::Display for SkidOvershootError {
 
 impl std::error::Error for SkidOvershootError {}
 
-fn take_skid_overshoot_error() -> Option<SkidOvershootError> {
-    let count = reverie::take_skid_overshoot_count();
-    (count > 0).then(|| SkidOvershootError::new(count))
+/// What a run does with its result when its precise PMU timers reported a
+/// skid overshoot: a preemption point that took effect past the branch count
+/// it was programmed for, because the overflow interrupt was handled late.
+/// The guest runs on from the observed point either way, and a preemption
+/// recording records that point, so the outcome stands; only the claim that
+/// the run's seed reproduces it is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkidOvershootPolicy {
+    /// Refuse the result with [`SkidOvershootError`] (exit 122), as a run
+    /// that promises reproduction must: `run --strict` and a replay of a
+    /// recorded schedule, and [`run`], [`run_with_backend`], [`run_with_output`],
+    /// [`run_with_output_backend`], record and replay.
+    Refuse,
+    /// Keep the result, and print one warning that counts the reports,
+    /// classifies the first one, and says that the seed does not reproduce
+    /// the run: a run without `--strict`, which does not promise that its
+    /// seed reproduces it.
+    Warn,
+}
+
+/// The skid overshoots one run reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SkidOvershoots {
+    /// Reports counted by [`reverie::take_skid_overshoot_count`].
+    count: u64,
+    /// The first overshoot a backend classified, if one did. Detcore counts
+    /// an overshoot it finds without classifying it.
+    first: Option<reverie::SkidOvershootDetail>,
+}
+
+impl SkidOvershoots {
+    /// Take the reports recorded in this process since the last take.
+    fn take() -> Self {
+        Self {
+            count: reverie::take_skid_overshoot_count(),
+            first: reverie::take_skid_overshoot_details().into_iter().next(),
+        }
+    }
+
+    /// Applies `policy` to the `result` of the run that reported these.
+    fn apply<T>(self, result: Result<T, Error>, policy: SkidOvershootPolicy) -> Result<T, Error> {
+        if self.count == 0 {
+            return result;
+        }
+        match policy {
+            SkidOvershootPolicy::Refuse => {
+                let refusal = SkidOvershootError::new(self.count);
+                match result {
+                    Ok(_) => Err(Error::new(refusal)),
+                    Err(error) => Err(error.context(refusal)),
+                }
+            }
+            SkidOvershootPolicy::Warn => {
+                let mut warning = self.warning();
+                warning.push('\n');
+                write_stderr_after_run(&warning);
+                result
+            }
+        }
+    }
+
+    /// The one line [`SkidOvershootPolicy::Warn`] prints.
+    fn warning(&self) -> String {
+        let first = match &self.first {
+            Some(detail) => detail.to_string(),
+            None => "not classified".to_owned(),
+        };
+        format!(
+            "hermit: WARNING: {} skid-overshoot report(s): a precise timer took effect past its \
+             programmed branch count, so this run is not reproducible from its seed; it ran on \
+             from the observed point, and --strict would refuse it. First: {first}",
+            self.count
+        )
+    }
+}
+
+/// Write `message` to stderr once the guest has run: once and without
+/// waiting while `--max-log-bytes` is in force, and otherwise through
+/// `RetryingStderr`, since the guest may have left fd 2 nonblocking.
+fn write_stderr_after_run(message: &str) {
+    if nonwaiting_write::diagnostics_must_not_wait() {
+        nonwaiting_write::write_without_waiting(libc::STDERR_FILENO, message.as_bytes());
+    } else {
+        use std::io::Write as _;
+        let _ = detcore::util::RetryingStderr.write_all(message.as_bytes());
+    }
 }
 
 impl SkidOvershootReport {
     fn begin(enabled: bool) -> Self {
         if enabled {
             // A previous invocation in this process must not qualify this one.
-            let _ = reverie::take_skid_overshoot_count();
+            let _ = SkidOvershoots::take();
         }
         Self { enabled }
     }
 
-    fn finish<T>(self, result: Result<T, Error>) -> Result<T, Error> {
-        if !self.enabled {
-            return result;
-        }
-
-        let Some(overshoot) = take_skid_overshoot_error() else {
-            return result;
-        };
-        match result {
-            Ok(_) => Err(Error::new(overshoot)),
-            Err(error) => Err(error.context(overshoot)),
+    fn take(self) -> SkidOvershoots {
+        if self.enabled {
+            SkidOvershoots::take()
+        } else {
+            SkidOvershoots::default()
         }
     }
 
-    fn finish_with_count<T>(self, result: Result<T, Error>) -> Result<(T, u64), Error> {
-        if !self.enabled {
-            return result.map(|value| (value, 0));
-        }
+    fn finish<T>(self, result: Result<T, Error>, policy: SkidOvershootPolicy) -> Result<T, Error> {
+        self.take().apply(result, policy)
+    }
 
-        let count = reverie::take_skid_overshoot_count();
+    fn finish_with_count<T>(self, result: Result<T, Error>) -> Result<(T, u64), Error> {
+        let count = self.take().count;
         match result {
             Ok(value) => Ok((value, count)),
             Err(error) if count > 0 => Err(error.context(SkidOvershootError::new(count))),
@@ -3448,6 +3526,7 @@ pub fn run_with_backend(
         print_summary_to_json_file,
         backend,
         None,
+        SkidOvershootPolicy::Refuse,
     )
 }
 
@@ -3468,7 +3547,8 @@ pub fn run_with_backend(
 /// and `DetConfig` is the determinism configuration that is serialized to disk
 /// and reasoned about as guest-visible. Threading a real-time deadline through
 /// it would put a nondeterministic quantity inside the structure whose entire
-/// job is to exclude them.
+/// job is to exclude them. `skid_overshoots` is not part of it either: it
+/// decides only whether the finished run's result is accepted.
 pub fn run_with_backend_timeout(
     command: Command,
     config: DetConfig,
@@ -3476,6 +3556,7 @@ pub fn run_with_backend_timeout(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     timeout: Option<Duration>,
+    skid_overshoots: SkidOvershootPolicy,
 ) -> Result<ExitStatus, Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
@@ -3493,7 +3574,7 @@ pub fn run_with_backend_timeout(
                 Some(control),
             )
             .await;
-            report.finish(result)
+            report.finish(result, skid_overshoots)
         });
     }
     let skid_overshoot_report =
@@ -3510,7 +3591,7 @@ pub fn run_with_backend_timeout(
         backend,
         timeout,
     );
-    skid_overshoot_report.finish(result)
+    skid_overshoot_report.finish(result, skid_overshoots)
 }
 
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
@@ -4148,7 +4229,12 @@ async fn dispatch_backend(
     };
     let terminal_outcome = global_state.terminal_outcome();
     let cleanup = global_state
-        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
+        .clean_up_with_backend_counts(
+            print_summary,
+            print_summary_to_json_file,
+            dispatch_stats,
+            Some(reverie::skid_overshoot_count()),
+        )
         .await;
     let completed = match terminal_outcome {
         Some(outcome) => Err(SchedulerEndedRun::new(outcome, None)),
@@ -4227,6 +4313,7 @@ pub fn run_with_output_backend(
         print_summary_to_json_file,
         backend,
         None,
+        SkidOvershootPolicy::Refuse,
     )
 }
 
@@ -4241,7 +4328,54 @@ pub fn run_with_output_backend_timeout(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     timeout: Option<Duration>,
+    skid_overshoots: SkidOvershootPolicy,
 ) -> Result<Output, Error> {
+    run_with_output_and_skid_overshoot_report(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+        move |report, result| report.finish(result, skid_overshoots),
+    )
+}
+
+/// Run with captured output and return the number of precise PMU timer
+/// overshoots alongside it instead of refusing before a caller can inspect the
+/// completed output. The `--verify` path uses this to finish and publish its
+/// comparison before it refuses the overshoot-tainted result.
+#[doc(hidden)]
+pub fn run_with_output_backend_timeout_and_skid_overshoots(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+) -> Result<(Output, u64), Error> {
+    run_with_output_and_skid_overshoot_report(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+        SkidOvershootReport::finish_with_count,
+    )
+}
+
+/// Run with captured output, then hand the run's skid-overshoot report and
+/// result to `finish`, on the tracer thread for ptrace.
+fn run_with_output_and_skid_overshoot_report<T: Send + 'static>(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+    finish: impl FnOnce(SkidOvershootReport, Result<Output, Error>) -> Result<T, Error> + Send + 'static,
+) -> Result<T, Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
         let command = tracer_thread::SendCommand::new(command);
@@ -4259,52 +4393,7 @@ pub fn run_with_output_backend_timeout(
                 Some(control),
             ))
             .await;
-            report.finish(result)
-        });
-    }
-    let (output, skid_overshoots) = run_with_output_backend_timeout_and_skid_overshoots(
-        command,
-        config,
-        print_summary,
-        print_summary_to_json_file,
-        backend,
-        timeout,
-    )?;
-    if skid_overshoots > 0 {
-        return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
-    }
-    Ok(output)
-}
-
-/// Run with captured output and return the number of precise PMU timer
-/// overshoots alongside it instead of refusing before a caller can inspect the
-/// completed output. The `--verify` path uses this to finish and publish its
-/// comparison before it refuses the overshoot-tainted result.
-#[doc(hidden)]
-pub fn run_with_output_backend_timeout_and_skid_overshoots(
-    command: Command,
-    config: DetConfig,
-    print_summary: bool,
-    print_summary_to_json_file: &Option<PathBuf>,
-    backend: Backend,
-    timeout: Option<Duration>,
-) -> Result<(Output, u64), Error> {
-    if backend == Backend::Ptrace {
-        let summary_path = print_summary_to_json_file.clone();
-        let command = tracer_thread::SendCommand::new(command);
-        return ptrace_completion::run_on_tracer_thread(timeout, move |control| async move {
-            let command = command.into_inner();
-            let report = SkidOvershootReport::begin(true);
-            let result = Box::pin(dispatch_output_backend(
-                command,
-                prepare_backend_config(config, backend),
-                print_summary,
-                &summary_path,
-                backend,
-                Some(control),
-            ))
-            .await;
-            report.finish_with_count(result)
+            finish(report, result)
         });
     }
     let skid_overshoot_report =
@@ -4324,7 +4413,7 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
         backend,
         timeout,
     );
-    skid_overshoot_report.finish_with_count(result)
+    finish(skid_overshoot_report, result)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -4540,7 +4629,12 @@ async fn dispatch_output_backend(
     };
     let terminal_outcome = global_state.terminal_outcome();
     let cleanup = global_state
-        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
+        .clean_up_with_backend_counts(
+            print_summary,
+            print_summary_to_json_file,
+            dispatch_stats,
+            Some(reverie::skid_overshoot_count()),
+        )
         .await;
     let status = output.status;
     let completed = match terminal_outcome {
@@ -5216,7 +5310,7 @@ async fn record_to_async(
             .await
     }
     .await;
-    report.finish(result)
+    report.finish(result, SkidOvershootPolicy::Refuse)
 }
 
 /// Records and captures output. Keep the directory's backing resources alive
@@ -5300,7 +5394,7 @@ async fn record_with_output_async(
             .await
     }
     .await;
-    report.finish(result)
+    report.finish(result, SkidOvershootPolicy::Refuse)
 }
 
 /// Replays an existing recording. Materialization and chroot guards remain with
@@ -5344,7 +5438,7 @@ fn replay_plain(dir: &Path, port: Option<u16>, mounts: &[Mount]) -> Result<ExitS
                 .await
         }
         .await;
-        report.finish(result)
+        report.finish(result, SkidOvershootPolicy::Refuse)
     })
 }
 
@@ -5372,7 +5466,7 @@ pub fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Out
                 .await
         }
         .await;
-        report.finish(result)
+        report.finish(result, SkidOvershootPolicy::Refuse)
     })
 }
 
@@ -6147,12 +6241,16 @@ mod tests {
             0,
             "begin must clear evidence from a previous invocation"
         );
-        empty_run.finish(Ok::<_, Error>(())).unwrap();
+        empty_run
+            .finish(Ok::<_, Error>(()), SkidOvershootPolicy::Refuse)
+            .unwrap();
 
         let success = SkidOvershootReport::begin(true);
         reverie::record_skid_overshoot();
         reverie::record_skid_overshoot();
-        let error = success.finish(Ok::<_, Error>(7)).unwrap_err();
+        let error = success
+            .finish(Ok::<_, Error>(7), SkidOvershootPolicy::Refuse)
+            .unwrap_err();
         assert_eq!(
             error
                 .downcast_ref::<SkidOvershootError>()
@@ -6177,7 +6275,10 @@ mod tests {
         let error = SkidOvershootReport::begin(true);
         reverie::record_skid_overshoot();
         let error = error
-            .finish(Err::<(), _>(anyhow!("guest failed")))
+            .finish(
+                Err::<(), _>(anyhow!("guest failed")),
+                SkidOvershootPolicy::Refuse,
+            )
             .unwrap_err();
         assert!(error.downcast_ref::<SkidOvershootError>().is_some());
         let error = format!("{error:#}");
@@ -6190,7 +6291,9 @@ mod tests {
 
         reverie::record_skid_overshoot();
         let disabled = SkidOvershootReport::begin(false);
-        disabled.finish(Ok::<_, Error>(())).unwrap();
+        disabled
+            .finish(Ok::<_, Error>(()), SkidOvershootPolicy::Refuse)
+            .unwrap();
         assert_eq!(
             reverie::take_skid_overshoot_count(),
             1,
@@ -7429,11 +7532,19 @@ mod tests {
     #[test]
     fn skid_overshoot_error_refuses_a_successful_result() {
         let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
-        let _ = reverie::take_skid_overshoot_count();
-        assert!(take_skid_overshoot_error().is_none());
+        let _ = SkidOvershoots::take();
+        assert_eq!(
+            SkidOvershoots::take()
+                .apply(Ok::<_, Error>(7), SkidOvershootPolicy::Refuse)
+                .unwrap(),
+            7
+        );
 
         reverie::record_skid_overshoot();
-        let error = take_skid_overshoot_error().expect("recorded overshoot must be reported");
+        reverie::record_skid_overshoot_detail(late_delivery(41_000));
+        let error = SkidOvershoots::take()
+            .apply(Ok::<_, Error>(7), SkidOvershootPolicy::Refuse)
+            .expect_err("recorded overshoot must be reported");
         assert!(
             error
                 .to_string()
@@ -7444,7 +7555,8 @@ mod tests {
                 .to_string()
                 .contains("deterministic execution was not established")
         );
-        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+        // The refusal took the details with the count.
+        assert_eq!(SkidOvershoots::take(), SkidOvershoots::default());
     }
 
     #[test]
@@ -7452,9 +7564,91 @@ mod tests {
         let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
         let _ = reverie::take_skid_overshoot_count();
 
+        for policy in [SkidOvershootPolicy::Refuse, SkidOvershootPolicy::Warn] {
+            let report = SkidOvershootReport::begin(true);
+            assert_eq!(report.finish(Ok::<_, Error>(7), policy).unwrap(), 7);
+            assert_eq!(reverie::take_skid_overshoot_count(), 0);
+        }
+    }
+
+    fn late_delivery(rcb_actual: u64) -> reverie::SkidOvershootDetail {
+        reverie::SkidOvershootDetail {
+            tid: reverie::Tid::from_raw(42),
+            kind: reverie::SkidOvershootKind::DeliveredLate,
+            rcb_target: 33_000,
+            rcb_actual,
+            overflow_point: Some(31_000),
+            overflow_recorded: Some(true),
+            sample_age_ns: Some(3_500),
+        }
+    }
+
+    /// A run without `--strict` keeps its result, whether the guest
+    /// succeeded or failed, when its precise timers report overshoots: no
+    /// refusal joins the error chain, so the exit status stays the run's own.
+    /// Its one warning counts the reports, classifies the first, and says the
+    /// seed does not reproduce the run. The reports and details are taken,
+    /// so a later run in the process starts clean.
+    #[test]
+    fn a_warned_skid_overshoot_keeps_the_result_and_names_the_first_report() {
+        let _lock = SKID_OVERSHOOT_TEST_LOCK.lock().unwrap();
+        // An earlier invocation's report does not reach this run's warning.
+        reverie::record_skid_overshoot();
+        reverie::record_skid_overshoot_detail(late_delivery(99_000));
+
         let report = SkidOvershootReport::begin(true);
-        assert_eq!(report.finish(Ok::<_, Error>(7)).unwrap(), 7);
-        assert_eq!(reverie::take_skid_overshoot_count(), 0);
+        for rcb_actual in [41_000, 50_000] {
+            reverie::record_skid_overshoot();
+            reverie::record_skid_overshoot_detail(late_delivery(rcb_actual));
+        }
+        // Detcore counts one it finds without classifying it.
+        reverie::record_skid_overshoot();
+        let overshoots = report.take();
+        assert_eq!(
+            overshoots,
+            SkidOvershoots {
+                count: 3,
+                first: Some(late_delivery(41_000)),
+            }
+        );
+        assert_eq!(SkidOvershoots::take(), SkidOvershoots::default());
+        let warning = overshoots.warning();
+        assert_eq!(
+            warning,
+            "hermit: WARNING: 3 skid-overshoot report(s): a precise timer took effect past its \
+             programmed branch count, so this run is not reproducible from its seed; it ran on \
+             from the observed point, and --strict would refuse it. First: tid=42 \
+             kind=delivered_late rcb_actual=41000 rcb_target=33000 past_target=8000 \
+             overflow_point=31000 past_overflow=10000 overflow_recorded=true sample_age_ns=3500"
+        );
+        assert!(!warning.contains('\n'), "one line: {warning}");
+        // Neither the marker the retry predicates count nor a class line.
+        assert!(!warning.starts_with("HERMIT_"), "{warning}");
+        assert_eq!(
+            overshoots
+                .clone()
+                .apply(Ok::<_, Error>(7), SkidOvershootPolicy::Warn)
+                .unwrap(),
+            7
+        );
+        let error = overshoots
+            .apply(
+                Err::<(), _>(anyhow!("guest failed")),
+                SkidOvershootPolicy::Warn,
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<SkidOvershootError>().is_none());
+        assert_eq!(format!("{error:#}"), "guest failed");
+
+        let unclassified = SkidOvershoots {
+            count: 1,
+            first: None,
+        };
+        assert!(
+            unclassified.warning().ends_with("First: not classified"),
+            "{}",
+            unclassified.warning()
+        );
     }
 
     #[test]

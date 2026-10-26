@@ -36650,6 +36650,67 @@ fn skid_overshoot_and_guest_failure_have_different_exit_codes() {
     );
 }
 
+/// Without `--strict`, a recorded PMU skid overshoot no longer refuses the
+/// run: the guest's own exit status passes through, Hermit prints exactly one
+/// warning that counts the reports and classifies the first one, and the
+/// summary records the reports with `seed_reproducible: false`. The overshoot
+/// is induced with Reverie's own fault injector, as in
+/// `skid_overshoot_and_guest_failure_have_different_exit_codes`, whose
+/// `--strict --verify` run is still refused. The guest's status, 3, is one no
+/// refusal or Hermit failure uses.
+#[test]
+fn a_skid_overshoot_without_strict_warns_and_keeps_the_guest_status() {
+    let _guard = hermit_run_guard();
+
+    let busy = "awk 'BEGIN{s=0;for(i=0;i<300000;i++)s+=i;print s}'; exit 3";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create skid-overshoot summary directory");
+    let summary = directory.path().join("summary.json");
+    let summary_arg = format!("--summary-json={}", summary.display());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args(["run", summary_arg.as_str()]);
+    append_hermit_args(&mut command, &["--", "/bin/sh", "-c", busy]);
+    let output = command
+        .env("REVERIE_SKID_MARGIN_OVERRIDE", "0")
+        .output()
+        .expect("failed to run hermit under the skid injector");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HERMIT_SKID_OVERSHOOT"),
+        "the skid injector did not induce an overshoot; this test is measuring nothing:\n{stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "the guest's own exit status must pass through:\n{stderr}"
+    );
+    assert!(!stderr.contains("HERMIT_POLICY_REFUSAL"), "{stderr}");
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("hermit: WARNING: "))
+        .filter(|line| line.contains("skid-overshoot report(s)"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "exactly one warning:\n{stderr}");
+    assert!(
+        warnings[0].contains("not reproducible from its seed")
+            && warnings[0].contains("First: tid="),
+        "{}",
+        warnings[0]
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&summary).expect("the summary was not written"))
+            .expect("the summary is not JSON");
+    assert!(
+        report["skid_overshoots"]
+            .as_u64()
+            .is_some_and(|reports| reports > 0),
+        "{report}"
+    );
+    assert_eq!(report["seed_reproducible"], serde_json::json!(false));
+}
+
 /// Retained entries of a verify-log directory whose names start with `prefix`.
 fn retained_captures(log_dir: &Path, prefix: &str) -> Vec<PathBuf> {
     let mut captures = fs::read_dir(log_dir)

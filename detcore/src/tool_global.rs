@@ -2463,7 +2463,10 @@ impl GlobalState {
         to_stderr: bool,
         print_summary_to_json_file: &Option<PathBuf>,
     ) -> anyhow::Result<()> {
-        self.clean_up_with_dispatch_stats(to_stderr, print_summary_to_json_file, None)
+        // Each entry point calls the shared body directly: a guest's ptrace
+        // run awaits this on the tracer thread's stack, and every wrapper
+        // future would hold its own copy of `self`.
+        self.clean_up_with_backend_counts(to_stderr, print_summary_to_json_file, None, None)
             .await
     }
 
@@ -2471,10 +2474,30 @@ impl GlobalState {
     /// machine-readable summary. The human-readable report, including the INFO
     /// view `--verify` compares, never shows it.
     pub async fn clean_up_with_dispatch_stats(
+        self,
+        to_stderr: bool,
+        print_summary_to_json_file: &Option<PathBuf>,
+        dispatch_stats: Option<reverie::DispatchStats>,
+    ) -> anyhow::Result<()> {
+        self.clean_up_with_backend_counts(
+            to_stderr,
+            print_summary_to_json_file,
+            dispatch_stats,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::clean_up_with_dispatch_stats`], also recording in the summary
+    /// the skid-overshoot reports of the backend's precise PMU timers
+    /// ([`RunSummary::record_skid_overshoots`]). Only a backend with such
+    /// timers passes `Some`.
+    pub async fn clean_up_with_backend_counts(
         mut self,
         to_stderr: bool,
         print_summary_to_json_file: &Option<PathBuf>,
         dispatch_stats: Option<reverie::DispatchStats>,
+        skid_overshoots: Option<u64>,
     ) -> anyhow::Result<()> {
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
@@ -2514,6 +2537,9 @@ impl GlobalState {
             .finalize_run_summary()
             .and_then(|(mut summary, description)| {
                 summary.dispatch_stats = dispatch_stats;
+                if let Some(reports) = skid_overshoots {
+                    summary.record_skid_overshoots(reports);
+                }
                 // No summary is published unless terminal validation and recording
                 // output both succeeded. Output errors retain their ordinary class.
                 if let Some(path) = print_summary_to_json_file {

@@ -90,8 +90,9 @@ the run:
 - If a late notification has already let the thread reach or pass the
   target, the event fires one branch after the return. Without the reports
   it would fire after the return too, at a point host timing decides.
-  Either way the late notification is witnessed, and the run is refused as
-  a skid overshoot.
+  Either way the late notification is witnessed as a skid overshoot, which
+  `--strict`, `--verify` and a replay refuse and any other run reports in
+  one warning.
 - In these cases the stop still cancels the event without requesting it
   again:
   - the mask the handler's frame restores blocks the timer's signal, or
