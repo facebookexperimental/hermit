@@ -8240,6 +8240,149 @@ fn detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm() {
     );
 }
 
+/// The omitted-names guest's two removals (`--removals`: `unlink` of
+/// /proc/kallsyms and `rmdir` of /proc/sysvipc) in `runs`, each `(backend,
+/// level, mode)` as `detcore_omits_the_procfs_names_outside_the_level_on_every_backend`
+/// runs it: both fail as Linux fails them for a name procfs does not have
+/// (ENOENT), with that test's verification and record checks.
+fn check_omitted_procfs_removals(
+    test: &str,
+    runs: Vec<(&'static str, &'static str, &'static str)>,
+) {
+    let guest = omitted_procfs_names_guest();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut compared = Vec::new();
+    for (backend, level, mode) in runs {
+        let report = directory
+            .path()
+            .join(format!("{backend}-{level}-{mode}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let level_arg = format!("--proc={level}");
+        let mut args = match mode {
+            "verified" => vec![
+                "--backend",
+                backend,
+                "run",
+                "--strict",
+                &level_arg,
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                &report_arg,
+                "--base-env=minimal",
+            ],
+            "no-metadata" => vec![
+                "--backend",
+                backend,
+                "run",
+                "--strict",
+                &level_arg,
+                "--no-virtualize-metadata",
+                "--base-env=minimal",
+            ],
+            "recorded" => vec!["record", "--verify", &level_arg],
+            _ => panic!("{test}: unknown mode {mode}"),
+        };
+        args.extend(["--", guest.to_str().expect("guest path is UTF-8")]);
+        if level == "minimal" {
+            args.push("--minimal");
+        }
+        if backend == "kvm" {
+            args.push("--kvm-local-procfs");
+        }
+        match mode {
+            "no-metadata" => args.push("--kernel-listings"),
+            "recorded" => args.push("--recorded"),
+            _ => {}
+        }
+        args.push("--removals");
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        match mode {
+            "verified" => {
+                let verdict: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&report).expect("read the verification report"),
+                )
+                .expect("parse the verification report");
+                assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+                let messages = &verdict["compared_log_messages"];
+                assert!(
+                    messages["left"].as_u64().is_some_and(|count| count > 0)
+                        && messages["left"] == messages["right"],
+                    "{backend} compared no INFO messages: {verdict}"
+                );
+            }
+            "recorded" => assert!(
+                stderr(&output).contains("Success: replay matched recording."),
+                "replay must match the recording: {output:?}"
+            ),
+            _ => {}
+        }
+        assert_eq!(
+            stdout(&output),
+            "removing a name procfs does not have: as Linux\n",
+            "{backend} at {level}"
+        );
+        compared.push(format!("{backend}/{level}/{mode}"));
+    }
+    eprintln!("{test} compared {compared:?}");
+}
+
+/// Removing a `/proc` name in no `--proc` level fails as Linux fails it for a
+/// name procfs does not have (ENOENT), in every run of
+/// `detcore_omits_the_procfs_names_outside_the_level_on_every_backend` that
+/// makes changes on Hermit's procfs mount: its backends but KVM (whose own
+/// /proc is checked by
+/// `detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm`) at
+/// both levels, ptrace without virtualized metadata, and ptrace's record and
+/// replay. Linux refuses a removal on a read-only mount before it looks the
+/// name up, so these need that mount to be writable.
+#[test]
+fn detcore_refuses_removing_the_procfs_names_outside_the_level_on_every_backend() {
+    // The original test's selection, so exactly its backends run and the same
+    // ones are named as not yet or not compared.
+    let backends =
+        procfs_backends("detcore_omits_the_procfs_names_outside_the_level_on_every_backend");
+    let mut runs = Vec::new();
+    for level in ["standard", "minimal"] {
+        runs.extend(
+            backends
+                .iter()
+                .filter(|backend| **backend != "kvm")
+                .map(|backend| (*backend, level, "verified")),
+        );
+    }
+    runs.extend([
+        ("ptrace", "standard", "no-metadata"),
+        ("ptrace", "standard", "recorded"),
+        ("ptrace", "minimal", "recorded"),
+    ]);
+    check_omitted_procfs_removals(
+        "detcore_refuses_removing_the_procfs_names_outside_the_level_on_every_backend",
+        runs,
+    );
+}
+
+/// The same two removals on KVM's own /proc, at both levels and verified, as
+/// `detcore_omits_the_procfs_names_outside_the_level_on_every_backend` runs
+/// KVM: they fail with ENOENT there too. KVM is selected, or named as not
+/// compared, by that test's selection.
+#[test]
+fn detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm() {
+    let backends =
+        procfs_backends("detcore_omits_the_procfs_names_outside_the_level_on_every_backend");
+    if !backends.contains(&"kvm") {
+        return;
+    }
+    check_omitted_procfs_removals(
+        "detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm",
+        vec![
+            ("kvm", "standard", "verified"),
+            ("kvm", "minimal", "verified"),
+        ],
+    );
+}
+
 /// The `/proc` links whose targets Detcore decides itself read the same by
 /// every spelling and on every backend
 /// (https://github.com/rrnewton/hermit/issues/4266, slice B3a-2): `self`
