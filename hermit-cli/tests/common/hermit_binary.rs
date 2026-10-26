@@ -286,3 +286,31 @@ pub fn configure_guest_execution_for(
     *command = rebuilt;
     Ok(())
 }
+
+/// The preemption record in the recording at `path`, as the JSON it
+/// serializes to alone (`per_thread`, `global`, `epoch`, `pipe_wake_latency`,
+/// ...).
+///
+/// A recording wraps its record in the `rcb_history` envelope that states the
+/// writer's RCB clock identity, so the record is not the file's top level.
+/// This reads the file through Detcore's own decoder and requires the stated
+/// identity, so a file that is not such a recording fails here rather than as
+/// a missing field.
+///
+/// For inspection only: the returned JSON omits the identity (the record's
+/// identity field is not serialized), so it must never be written back as a
+/// history.
+#[allow(dead_code)]
+pub fn recorded_preemption_json(path: &Path) -> serde_json::Value {
+    let recording = detcore::preemptions::boundary_recording::Recording::read(path)
+        .unwrap_or_else(|error| panic!("{} is not a recording: {error:#}", path.display()));
+    assert!(
+        recording.identity().is_some(),
+        "{} states no RCB coordinate identity",
+        path.display()
+    );
+    let record = recording
+        .into_legacy("a test reading a preemption record")
+        .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+    serde_json::to_value(&record).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}

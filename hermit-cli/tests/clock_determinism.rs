@@ -499,8 +499,7 @@ fn replay_without_virtual_time_adopts_the_recorded_epoch() {
         format!("--replay-preemptions-from={}", schedule.display()),
         format!("--record-preemptions-to={}", rerecorded.display()),
     ]);
-    let rerecord: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&rerecorded).unwrap()).unwrap();
+    let rerecord = hermit_binary::recorded_preemption_json(&rerecorded);
     assert_eq!(
         rerecord["epoch"], "2000-12-31T23:59:59.123456789Z",
         "a --no-virtualize-time replay did not start from the recorded epoch: {rerecord}"

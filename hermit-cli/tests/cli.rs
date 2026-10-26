@@ -27617,8 +27617,7 @@ fn a_bounded_chaos_schedule_replays_as_recorded() {
 
     // Each thread's priorities, in order, and its preemption RCB counts.
     let schedule = |path: &Path| -> Vec<(String, Vec<u64>, serde_json::Value)> {
-        let json: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap();
+        let json = hermit_test::recorded_preemption_json(path);
         let threads = json["per_thread"].as_object().expect("per_thread");
         threads
             .iter()
@@ -29035,8 +29034,7 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
 
     // The premise: real preemption points, at absolute instants after the epoch.
     let epoch_nanos: u64 = 978_307_199_123_456_789;
-    let json: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let json = hermit_test::recorded_preemption_json(&record);
     assert_eq!(json["epoch"], "2000-12-31T23:59:59.123456789Z", "{json}");
     let ends: Vec<u64> = json["per_thread"]
         .as_object()
@@ -64783,8 +64781,7 @@ fn a_schedule_recorded_with_the_pipe_wake_latency_replays_only_with_it() {
             recorded.starts_with(&format!("readied at 100, ran at {ran_at}\nreader clock ")),
             "{recorded}"
         );
-        let json: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let json = hermit_test::recorded_preemption_json(&path);
         assert_eq!(json["pipe_wake_latency"], stored, "{json}");
         for kind in ["--replay-preemptions-from", "--replay-schedule-from"] {
             let replay = format!("{kind}={}", path.display());

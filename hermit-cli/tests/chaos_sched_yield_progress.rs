@@ -392,10 +392,7 @@ fn schedule_summary(path: &Path) -> (u64, u64, u64) {
 
 /// How many priority changes a preemption record holds, over all threads.
 fn recorded_preemption_points(path: &Path) -> usize {
-    let text = fs::read_to_string(path)
-        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
-    let record: serde_json::Value = serde_json::from_str(&text)
-        .unwrap_or_else(|error| panic!("{} is not JSON: {error}", path.display()));
+    let record = hermit_test::recorded_preemption_json(path);
     record["per_thread"]
         .as_object()
         .unwrap_or_else(|| panic!("{} has no per_thread map", path.display()))

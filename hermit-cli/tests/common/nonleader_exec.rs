@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use detcore::Digest;
 use detcore::preemptions::PreemptionRecord;
+use detcore::preemptions::boundary_recording::Recording;
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use hermit::canonical_verdict::ComparedLogScope;
 use hermit::canonical_verdict::RecordEnvelopeReport;
@@ -60,6 +61,20 @@ const LOG_DIRECTIVES: &str = "reverie_ptrace::timer=debug";
 
 /// The text that starts every per-step record [`LOG_DIRECTIVES`] turns off.
 const SINGLE_STEP_DUMP: &str = "[instruction]";
+
+/// The preemption record in a recording's bytes, read through Detcore's own
+/// decoder: the record sits inside the `rcb_history` envelope that states the
+/// writer's RCB clock identity, which a recording must state.
+fn recorded_history(bytes: &[u8]) -> PreemptionRecord {
+    let recording = Recording::decode(bytes).unwrap();
+    assert!(
+        recording.identity().is_some(),
+        "the recording states no RCB coordinate identity"
+    );
+    recording
+        .into_legacy("the non-leader exec history reader")
+        .unwrap()
+}
 
 /// Fails if a retained log contains a per-step instruction and register dump.
 fn assert_no_single_step_dumps(log: &str, path: &Path) {
@@ -683,8 +698,7 @@ fn assert_artifact_log(
         "the recorded and replayed prefix contains actual PMU preemption"
     );
     if let Some(path) = artifact_option.strip_prefix("--replay-preemptions-from=") {
-        let history: PreemptionRecord =
-            serde_json::from_slice(&bounded_read(Path::new(path), 4 * MIB)).unwrap();
+        let history = recorded_history(&bounded_read(Path::new(path), 4 * MIB));
         history.validate().unwrap();
         let (_, history) = history
             .extract_all()
@@ -901,7 +915,7 @@ pub(super) fn run_preemption_artifacts() {
         remaining(),
     );
     let recorded_bytes = bounded_read(&recording, 4 * MIB);
-    let history: PreemptionRecord = serde_json::from_slice(&recorded_bytes).unwrap();
+    let history = recorded_history(&recorded_bytes);
     history
         .validate()
         .expect("real completed recording is well formed");
