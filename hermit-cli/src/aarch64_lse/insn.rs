@@ -163,7 +163,15 @@ pub fn decode(word: u32) -> Insn {
         let rn = ((word >> 5) & 0x1f) as Reg;
         let rt = (word & 0x1f) as Reg;
         if pair {
-            return Insn::ExclPair;
+            // CASP shares this encoding space with LDXP and STXP and is told
+            // apart by its size field: the exclusive pair instructions use
+            // 0b10 and 0b11 (32- and 64-bit), the compare-and-swap pair 0b00
+            // and 0b01. CASP is an LSE atomic and no exclusive at all.
+            return if matches!(size, Size::B | Size::H) {
+                Insn::Other
+            } else {
+                Insn::ExclPair
+            };
         }
         if rt2 != ZR {
             return Insn::Other;

@@ -111,7 +111,15 @@ fn refusal_detail(reason: &Refusal) -> String {
 /// error: a caller that was handed the wrong file should say so and run the
 /// original.
 pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::error::Error> {
-    let mut relocated: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // A guest that is not an ELF image at all -- a `#!` script, say -- is not
+    // an error: it simply has nothing to rewrite. A file that starts like an
+    // ELF and then does not parse IS an error, because something is wrong
+    // with a file we are about to run.
+    if bytes.len() < 4 || bytes[..4] != *goblin::elf::header::ELFMAG {
+        return Ok(None);
+    }
+    let mut relocated: Vec<(u64, u64)> = Vec::new();
+    let mut relr_unreadable = false;
     let sections = {
         let elf = Elf::parse(bytes)?;
         if elf.header.e_machine != header::EM_AARCH64 {
@@ -125,6 +133,40 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
             })
             .map(|ph| (ph.p_vaddr, ph.p_vaddr.saturating_add(ph.p_memsz)))
             .collect();
+        // SHT_RELR = 19: packed relative relocations, which the ELF reader
+        // does not report. The format is its own: an even entry is an
+        // address, and each odd entry that follows is a bitmap of the next
+        // 63 words after it. Decode them rather than refuse the image, since
+        // every aarch64 system binary now uses them.
+        for sh in &elf.section_headers {
+            if sh.sh_type != 19 || sh.sh_size == 0 {
+                continue;
+            }
+            let (start, end) = (sh.sh_offset as usize, (sh.sh_offset + sh.sh_size) as usize);
+            if end > bytes.len() {
+                relr_unreadable = true;
+                continue;
+            }
+            let mut where_ = 0u64;
+            for entry in bytes[start..end].as_chunks::<8>().0 {
+                let entry = u64::from_le_bytes(*entry);
+                if entry & 1 == 0 {
+                    relocated.push((entry, entry + 8));
+                    where_ = entry + 8;
+                    continue;
+                }
+                let mut bits = entry >> 1;
+                let mut at = where_;
+                while bits != 0 {
+                    if bits & 1 == 1 {
+                        relocated.push((at, at + 8));
+                    }
+                    bits >>= 1;
+                    at += 8;
+                }
+                where_ += 63 * 8;
+            }
+        }
         if elf.section_headers.is_empty() {
             let mut report = FileReport::default();
             report
@@ -132,6 +174,10 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                 .push("the file has no section headers, so code cannot be told from data".into());
             return Ok(Some(report));
         }
+        // A relocation's own width is not in the entry, so take the widest
+        // aarch64 relocation (8 bytes): any sequence those bytes touch is
+        // refused. DT_RELR entries are not in goblin's lists, so an image
+        // that has a .relr.dyn section is refused wholesale further down.
         relocated = elf
             .shdr_relocs
             .iter()
@@ -139,6 +185,7 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
             .chain(elf.dynrelas.iter().map(|reloc| reloc.r_offset))
             .chain(elf.dynrels.iter().map(|reloc| reloc.r_offset))
             .chain(elf.pltrelocs.iter().map(|reloc| reloc.r_offset))
+            .map(|offset| (offset, offset + 8))
             .collect();
         elf.section_headers
             .iter()
@@ -155,8 +202,40 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
             })
             .collect::<Vec<_>>()
     };
+    // A direct branch in one executable section can target a sequence in
+    // another, so collect each section's targets before planning any. A
+    // section's OWN branches are not external to it: the planner already
+    // knows them, and its loops' own backward branches are among them.
+    let section_targets: Vec<std::collections::HashSet<u64>> = sections
+        .iter()
+        .map(|(offset, filesz, vaddr, _)| {
+            let (start, end) = (*offset as usize, (*offset + *filesz) as usize);
+            if end > bytes.len() || !start.is_multiple_of(4) {
+                return std::collections::HashSet::new();
+            }
+            let words: Vec<u32> = (0..(end - start) / 4)
+                .map(|i| {
+                    let at = start + 4 * i;
+                    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+                })
+                .collect();
+            rewrite::direct_branch_targets(&words, *vaddr)
+        })
+        .collect();
     let mut report = FileReport::default();
-    for (offset, filesz, vaddr, writable) in sections {
+    if relr_unreadable {
+        report
+            .skipped_segments
+            .push("a packed relative relocation section is truncated".into());
+        return Ok(Some(report));
+    }
+    for (section, (offset, filesz, vaddr, writable)) in sections.iter().copied().enumerate() {
+        let external_targets: std::collections::HashSet<u64> = section_targets
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != section)
+            .flat_map(|(_, targets)| targets.iter().copied())
+            .collect();
         let start = offset as usize;
         let end = start.saturating_add(filesz as usize);
         if end > bytes.len() || !start.is_multiple_of(4) || !vaddr.is_multiple_of(4) {
@@ -178,12 +257,15 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                 u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
             })
             .collect();
-        let mut plan = rewrite::plan(&words, vaddr);
+        let mut plan = rewrite::plan_with_external_targets(&words, vaddr, &external_targets);
         // A relocation inside a sequence means the loader will write those
         // bytes itself, for the instruction that used to be there.
         if !relocated.is_empty() {
             let (keep, relocated_sites) = plan.patched.into_iter().partition::<Vec<_>, _>(|site| {
-                !(0..site.words.len() as u64).any(|i| relocated.contains(&(site.addr + 4 * i)))
+                let end = site.addr + 4 * site.words.len() as u64;
+                !relocated
+                    .iter()
+                    .any(|(start, stop)| *start < end && site.addr < *stop)
             });
             plan.patched = keep;
             plan.refused.extend(
@@ -218,10 +300,27 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
     Ok(Some(report))
 }
 
+/// Write already-rewritten bytes to `output`, with `source`'s permissions.
+///
+/// The file is written whole under a temporary name the filesystem
+/// guarantees is unused and renamed into place, so a failed or concurrent
+/// write is never observed under the final name.
+pub fn write_rewritten(output: &Path, bytes: &[u8], source: &Path) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let directory = output.parent().unwrap_or(Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".rewrite-")
+        .tempfile_in(directory)?;
+    temporary.write_all(bytes)?;
+    temporary.flush()?;
+    std::fs::set_permissions(temporary.path(), std::fs::metadata(source)?.permissions())?;
+    temporary.persist(output).map_err(|error| error.error)?;
+    Ok(())
+}
+
 /// Read `input`, rewrite it, and write the result to `output` with `input`'s
-/// permissions. The output is written whole and renamed into place, so a
-/// failed rewrite leaves no partial file behind under that name and a
-/// concurrent writer of the same output cannot be seen half-written.
+/// permissions.
 pub fn rewrite_file(
     input: impl AsRef<Path>,
     output: impl AsRef<Path>,
@@ -232,22 +331,6 @@ pub fn rewrite_file(
         Some(report) => report,
         None => return Ok(None),
     };
-    // A unique temporary in the output's own directory: several runs may
-    // rewrite the same input into the same cached output at the same time.
-    // A name derived from the process id was not enough -- four concurrent
-    // runs collided on it and three failed -- so take a name the filesystem
-    // guarantees is unused.
-    let directory = output.as_ref().parent().unwrap_or(Path::new("."));
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".rewrite-")
-        .tempfile_in(directory)?;
-    use std::io::Write;
-    temporary.write_all(&bytes)?;
-    temporary.flush()?;
-    let mode = std::fs::metadata(input)?.permissions();
-    std::fs::set_permissions(temporary.path(), mode)?;
-    temporary
-        .persist(output.as_ref())
-        .map_err(|error| error.error)?;
+    write_rewritten(output.as_ref(), &bytes, input)?;
     Ok(Some(report))
 }

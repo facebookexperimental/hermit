@@ -32,7 +32,7 @@ pub mod rewrite;
 /// Bumped whenever the rewrite's output for the same input can change. It is
 /// part of the cache key, so a cached artifact from an older rewriter is
 /// never reused.
-pub const REWRITE_FORMAT_VERSION: u32 = 1;
+pub const REWRITE_FORMAT_VERSION: u32 = 2;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///
@@ -68,27 +68,37 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
         || PathBuf::from("/var/tmp").join(format!("hermit-{}", nix::unistd::geteuid().as_raw())),
         |dir| dir.join("hermit"),
     );
-    let dir = if base.starts_with("/tmp") {
-        PathBuf::from("/var/tmp")
-            .join(format!("hermit-{}", nix::unistd::geteuid().as_raw()))
-            .join("exclusive-rewrites")
+    // An XDG cache under /tmp is no use: Hermit replaces the guest's /tmp
+    // with an isolated directory, so an artifact there is not visible to the
+    // guest that has to map it.
+    let base = if base.starts_with("/tmp") {
+        PathBuf::from("/var/tmp").join(format!("hermit-{}", nix::unistd::geteuid().as_raw()))
     } else {
-        base.join("exclusive-rewrites")
+        base
     };
+    let dir = base.join("exclusive-rewrites");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create the rewrite cache {}", dir.display()))?;
-    let metadata = std::fs::symlink_metadata(&dir)
-        .with_context(|| format!("failed to inspect the rewrite cache {}", dir.display()))?;
+    // The cache holds images the guest will execute, so every directory this
+    // code creates must be ours and private: the `/var/tmp/hermit-<uid>`
+    // fallback lives in a sticky directory anyone can write, so another user
+    // could pre-create it and choose what the cache offers. Only the
+    // directories this function creates are checked; the standard locations
+    // above them (a home directory, `/var/tmp`) are the system's business.
     let uid = nix::unistd::geteuid().as_raw();
-    anyhow::ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.uid() == uid,
-        "the rewrite cache {} must be a real directory owned by uid {uid}",
-        dir.display()
-    );
-    if metadata.permissions().mode() & 0o077 != 0 {
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&dir, permissions)?;
+    for path in [base.as_path(), dir.as_path()] {
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect the rewrite cache {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.uid() == uid,
+            "the rewrite cache path {} must be a real directory owned by uid {uid}",
+            path.display()
+        );
+        if metadata.permissions().mode() & 0o077 != 0 {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(path, permissions)?;
+        }
     }
     Ok(dir)
 }

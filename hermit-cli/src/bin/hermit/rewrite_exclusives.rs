@@ -39,6 +39,18 @@ pub struct RewriteExclusivesOpts {
 impl RewriteExclusivesOpts {
     pub fn main(&self) -> Result<ExitStatus, Error> {
         if let Some(dir) = &self.output_dir {
+            let mut names = std::collections::HashSet::new();
+            for file in &self.files {
+                let name = file
+                    .file_name()
+                    .ok_or_else(|| Error::msg(format!("{} has no file name", file.display())))?;
+                anyhow::ensure!(
+                    names.insert(name.to_owned()),
+                    "two inputs are named {}, so one would overwrite the other in {}",
+                    name.to_string_lossy(),
+                    dir.display()
+                );
+            }
             std::fs::create_dir_all(dir)?;
         }
         let mut incomplete = false;
@@ -80,8 +92,9 @@ impl RewriteExclusivesOpts {
             }
             incomplete |= !report.complete();
         }
-        // A nonzero status says the files are not free of exclusive loops, so
-        // a caller that needs that property can test for it.
+        // A nonzero status says a file still holds a loop the rewriter
+        // refused, or a section it did not read, so a build check can ask for
+        // the property directly instead of parsing the report.
         Ok(ExitStatus::Exited(if incomplete { 1 } else { 0 }))
     }
 }

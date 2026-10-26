@@ -2557,6 +2557,14 @@ impl fmt::Display for RunOpts {
         if self.in_guest_exec_stop {
             write!(f, " --in-guest-exec-stop")?;
         }
+        // The rewrite changes which instructions the guest executes, so a
+        // reproducer without it reproduces a different program.
+        if self.rewrite_exclusives {
+            write!(f, " --rewrite-exclusives")?;
+            for also in &self.rewrite_exclusives_also {
+                write!(f, " --rewrite-exclusives-also={}", also.display())?;
+            }
+        }
         let mut dop = self.det_opts.det_config.clone();
         // Fail-closed is the `run` default, so serialize only the compatibility
         // opt-out. `DetConfig` is also used outside `run` and retains a neutral
@@ -12953,6 +12961,7 @@ impl RunOpts {
              raise SIGILL"
         );
         let (guest, host) = self.resolve_guest_and_host_program()?;
+        let guest = self.resolve_e9patch_overlay_target(&guest, &host)?;
         let mut files = vec![(guest, host)];
         for also in &self.rewrite_exclusives_also {
             let path = fs::canonicalize(also).with_context(|| {
@@ -12961,8 +12970,21 @@ impl RunOpts {
                     also.display()
                 )
             })?;
+            // The overlay binds the rewritten copy over this path, so it is
+            // both the host path read and the guest path mounted: a file the
+            // guest reaches under a different path would be rewritten here
+            // and loaded unrewritten there.
+            anyhow::ensure!(
+                self.mapped_or_visible_host_program(&path).as_deref() == Some(path.as_path()),
+                "--rewrite-exclusives-also {} must name a path the guest loads unchanged; \
+                 this run's mounts map it elsewhere",
+                path.display()
+            );
             files.push((path.clone(), path));
         }
+        // The overlay mechanism is e9patch's, so its checks apply here too:
+        // a custom mount must not hide the target or the cached artifact.
+        self.validate_e9patch_mount_targets()?;
         let cache = hermit::aarch64_lse::cache_dir()?;
         for (guest_path, host_path) in files {
             let input = fs::read(&host_path)
@@ -12976,11 +12998,16 @@ impl RunOpts {
                 "v{}-{digest}-{name}",
                 hermit::aarch64_lse::REWRITE_FORMAT_VERSION
             ));
-            let report = if output.exists() {
-                hermit::aarch64_lse::elf::rewrite_bytes(&mut input.clone())?
-            } else {
-                hermit::aarch64_lse::elf::rewrite_file(&host_path, &output)?
-            };
+            // Rewrite into memory first, always: it is the same pure function
+            // of the same bytes, so it is also the check that a cached file
+            // is the one this version of the rewriter would have written. A
+            // cache entry that differs -- an older rewriter's, or anyone
+            // else's -- is replaced rather than mounted.
+            let mut rewritten = input.clone();
+            let report = hermit::aarch64_lse::elf::rewrite_bytes(&mut rewritten)?;
+            if report.is_some() && fs::read(&output).ok().as_deref() != Some(&rewritten) {
+                hermit::aarch64_lse::elf::write_rewritten(&output, &rewritten, &host_path)?;
+            }
             let Some(report) = report else {
                 crate::tracing::diagnostic_eprintln!(
                     ":: Exclusive-loop rewrite: {} is not an aarch64 ELF image; left unchanged",
@@ -13003,6 +13030,7 @@ impl RunOpts {
                 tracing::info!("exclusive loop left alone at {addr:#x}: {why}");
             }
             if report.patched_total() != 0 {
+                self.validate_executable_overlay_source_visibility(&output)?;
                 self.exclusive_rewrite_overlays.push(ExecutableOverlayMount {
                     source: output,
                     target: guest_path,

@@ -131,8 +131,22 @@ impl Report {
 
 /// A code range to scan: `words` are the instructions at `base`.
 pub fn plan(words: &[u32], base: u64) -> Report {
+    plan_with_external_targets(words, base, &HashSet::new())
+}
+
+/// The same, told the direct branch targets of the code OUTSIDE this range:
+/// an image's other executable sections can branch into this one, and a
+/// sequence those branches reach is refused exactly as one this range reaches
+/// would be.
+pub fn plan_with_external_targets(
+    words: &[u32],
+    base: u64,
+    external_targets: &HashSet<u64>,
+) -> Report {
     let decoded: Vec<Insn> = words.iter().copied().map(decode).collect();
-    let targets = direct_branch_targets(&decoded, base);
+    let branches = direct_branches(&decoded, base);
+    let mut targets: HashSet<u64> = branches.iter().map(|(_, target)| *target).collect();
+    targets.extend(external_targets.iter().copied());
     let addr = |index: usize| base + 4 * index as u64;
     let mut report = Report::default();
     for (index, insn) in decoded.iter().enumerate() {
@@ -151,7 +165,7 @@ pub fn plan(words: &[u32], base: u64) -> Report {
             Insn::LoadExcl { .. } => report.exclusive_instructions += 1,
             Insn::StoreExcl { .. } => {
                 report.exclusive_instructions += 1;
-                match match_sequence(words, &decoded, index, base) {
+                match match_sequence(words, &decoded, index, base, &branches, external_targets) {
                     Ok(site) => {
                         let start = ((site.addr - base) / 4) as usize;
                         let interior_entered = (start + 1..start + site.words.len())
@@ -185,8 +199,18 @@ pub fn apply(words: &mut [u32], base: u64, report: &Report) {
     }
 }
 
-fn direct_branch_targets(decoded: &[Insn], base: u64) -> HashSet<u64> {
-    let mut targets = HashSet::new();
+/// The addresses every direct branch in the range targets.
+pub fn direct_branch_targets(words: &[u32], base: u64) -> HashSet<u64> {
+    let decoded: Vec<Insn> = words.iter().copied().map(decode).collect();
+    direct_branches(&decoded, base)
+        .into_iter()
+        .map(|(_, target)| target)
+        .collect()
+}
+
+/// Every direct branch in the range, as (index of the branch, target address).
+fn direct_branches(decoded: &[Insn], base: u64) -> Vec<(usize, u64)> {
+    let mut branches = Vec::new();
     for (index, insn) in decoded.iter().enumerate() {
         let here = base + 4 * index as u64;
         let offset = match *insn {
@@ -196,18 +220,21 @@ fn direct_branch_targets(decoded: &[Insn], base: u64) -> HashSet<u64> {
             | Insn::TestBranch { offset } => offset,
             _ => continue,
         };
-        targets.insert(here.wrapping_add(offset as u64));
+        branches.push((index, here.wrapping_add(offset as u64)));
     }
-    targets
+    branches
 }
 
 /// Match the sequence ending at the store-exclusive `store`, returning the
 /// index of its first instruction, the replacement words and the idiom.
+#[allow(clippy::too_many_arguments)]
 fn match_sequence(
     words: &[u32],
     decoded: &[Insn],
     store: usize,
     base: u64,
+    branches: &[(usize, u64)],
+    external_targets: &HashSet<u64>,
 ) -> Result<Site, Refusal> {
     let (size, store_ord, rs, rv, rn) = match decoded[store] {
         Insn::StoreExcl {
@@ -265,12 +292,26 @@ fn match_sequence(
     if rt == rn || rv == rn {
         return Err(Refusal::Registers("a value register is the base register"));
     }
+    // Register 31 is SP in the base position of both the exclusives and the
+    // atomics. An atomic on the stack pointer is not something a compiler
+    // emits, and it is not worth reasoning about.
+    if rn == ZR {
+        return Err(Refusal::Registers("the stack pointer is the base register"));
+    }
     let ord = Ordering {
         acquire: load_ord.acquire,
         release: store_ord.release,
     };
     let sf = size.is_64();
     let zero_status = insn::mov_reg(false, rs, ZR);
+    // Whether anything outside the sequence can jump straight to its first
+    // instruction. The loop's own backward branch does, and that is the only
+    // entry an argument about what ran BEFORE the loop may ignore.
+    let head = base + 4 * start as u64;
+    let entered_from_outside = external_targets.contains(&head)
+        || branches
+            .iter()
+            .any(|(index, target)| *target == head && (*index < start || *index > close));
     let (idiom, words) = match (store - start, decoded[start + 1]) {
         (1, _) => (Idiom::Swap, swap(size, ord, rs, rt, rv, rn, zero_status)?),
         (2, alu @ Insn::Alu { .. }) => (
@@ -313,7 +354,9 @@ fn match_sequence(
                 rn,
                 sf,
                 zero_status,
-                start.checked_sub(1).map(|i| decoded[i]),
+                (!entered_from_outside)
+                    .then(|| start.checked_sub(1).map(|i| decoded[i]))
+                    .flatten(),
             )?,
         ),
         _ => return Err(Refusal::NotCanonical),
@@ -420,8 +463,10 @@ fn rmw(
     if rt == ZR {
         return Err(Refusal::Registers("the loaded value is discarded"));
     }
-    // The atomic carries the operand in Rs and the loaded value in Rt, and
-    // the architecture leaves one register in both roles unpredictable.
+    // The atomic carries the operand in Rs and the loaded value in Rt. Arm
+    // ARM DDI 0487 L.a, C6.2 (the LD<op> instructions, "Constrained
+    // unpredictable behavior"): when Rs and Rt are the same register the
+    // behaviour is CONSTRAINED UNPREDICTABLE.
     if rs == rt {
         return Err(Refusal::Registers(
             "the status register is the load destination",
@@ -448,10 +493,10 @@ fn rmw(
             AtomicOp::Add,
         ),
         (AluOp::Sub, Operand::Reg(rm)) => (insn::neg(sf, rs, rm), AtomicOp::Add),
-        // MOVN materialises -k as !(k - 1); k is a 12-bit immediate. A
-        // subtraction of a shifted immediate has no one-instruction negation:
-        // MOVN's result is one less than a multiple of 4096, never equal to
-        // one.
+        // MOVN materialises -k as !(k - 1), exactly, for every k up to
+        // 0x10000, the shifted immediates in that range included. A larger
+        // one has no single-instruction negation, because MOVN at a
+        // multiple-of-16 shift leaves the bits below the shift set.
         (AluOp::Sub, Operand::Imm(k)) if (1..=0x10000).contains(&k) => {
             (insn::movn(sf, rs, k - 1), AtomicOp::Add)
         }
@@ -511,7 +556,9 @@ fn cas_compare(
         // the low bits, so the two disagree whenever the register's high bits
         // are set -- unless the instruction just before the loop zero-extended
         // that very register to the access width, which is what the compiler's
-        // own outline-atomics helpers do.
+        // own outline-atomics helpers do. That argument needs the extension to
+        // have RUN, so the caller passes it only when nothing outside the
+        // sequence can branch straight to the loop head.
         Operand::Reg(rm)
             if !matches!(size, Size::W | Size::X)
                 && !matches!(
@@ -815,6 +862,36 @@ mod tests {
             report.refused.first().map(|r| r.reason.clone()),
             Some(Refusal::Registers("a sub-word compare against a register"))
         );
+
+        // The reviewer's repro: a direct branch to the loop head skips the
+        // zero extension, so the proof it carries does not hold and the loop
+        // must stay refused. With w16 = 0x141 and the byte in memory 0x41,
+        // the original branches out and leaves memory alone, while a CASALB
+        // comparing only the low byte would store.
+        let mut words = vec![0x1400_0002u32, 0x5300_1c10];
+        words.extend_from_slice(&loop_words);
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![], "{report:?}");
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::Registers("a sub-word compare against a register"))
+        );
+
+        // A branch to the zero extension itself is what the real helpers do,
+        // and it keeps the proof: the extension still runs.
+        let mut words = vec![0x1400_0001u32, 0x5300_1c10];
+        words.extend_from_slice(&loop_words);
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched.len(), 1, "{report:?}");
+
+        // An outside branch to the head also refuses it when it comes from
+        // another executable section.
+        let mut head_targets = HashSet::new();
+        head_targets.insert(BASE + 4);
+        let mut words = vec![0x5300_1c10u32];
+        words.extend_from_slice(&loop_words);
+        let report = plan_with_external_targets(&words, BASE, &head_targets);
+        assert_eq!(report.patched, vec![], "{report:?}");
 
         // A zero extension of the wrong width, or of another register, does not.
         for before in [0x5300_3c10u32, 0x5300_1c13] {
