@@ -2145,7 +2145,7 @@ mod tests {
                 format!("HERMIT_INTERNAL_FAILURE class={class}")
             );
         }
-        let verdict = Error::new(AnalyzeVerdict::NoDecidingEvent("no event decides".into()));
+        let verdict = Error::new(AnalyzeVerdict::no_deciding_event("no event decides", None));
         assert_eq!(failure_exit_code(&verdict), 0);
         assert_eq!(
             classify_failure(&verdict),

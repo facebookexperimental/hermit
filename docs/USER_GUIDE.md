@@ -1159,8 +1159,22 @@ A report file (`--report-file`) has one schema for every verdict: read its
 `verdict` first. `critical_events` fills `critical_event1` and
 `critical_event2` (and `deciding_event` for a timing decision);
 `no_deciding_event` leaves them out, and the racing accesses
-(`racing_accesses`) too, and `header` says why. A report from
-before the field names the critical events.
+(`racing_accesses`) too, and `header` says why. Its
+`verdict_reason` says what the scheduler alone shows. When the trials keep
+timing settings from the run arguments (`--pipe-wake-latency`,
+`--scheduler-turn-cost` other than the default charge), analyze runs one more
+trial, the empty prefix without them at the first continuation it tried: if it
+misses the target, the
+reason is `{"cause": "timing_semantics", "options": [...], "alternatives":
+[...], "trial": "..."}`, the settings cause the outcome, a two-seed search
+can end the same way, and a new failing run under the alternatives may have
+an event that decides it. Otherwise (it meets the target too, or it is not
+run because a `--run1-preemptions` recording fixes the settings) the reason
+is `{"cause": "scheduler_alone", "timing_in_force": [...]}`, and without
+such settings `{"cause": "scheduler_alone"}`. A cause a later build adds
+reads as `unknown`. A report from before the field names the critical
+events.
+
 #### Racing accesses
 
 The report ends with a "Racing accesses" section (`racing_accesses` in a

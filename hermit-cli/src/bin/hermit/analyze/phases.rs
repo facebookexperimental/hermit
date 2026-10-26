@@ -67,6 +67,10 @@ use crate::app::analyze::verdict::AnalyzePrecondition;
 use crate::app::analyze::verdict::AnalyzeVerdict;
 use crate::app::analyze::verdict::PreconditionClass;
 use crate::app::analyze::verdict::Verdict;
+use crate::app::analyze::rundata::Stop;
+use crate::app::analyze::rundata::TrialEnd;
+use crate::app::analyze::verdict::AlternativeTiming;
+use crate::app::analyze::verdict::TimingSetting;
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
@@ -328,22 +332,21 @@ fn choose_continuation(
         .filter(|(_, outcome)| *outcome == Continuation::MeetsTargetAlone)
         .map(|(timeslice, _)| describe_continuation(*timeslice))
         .collect();
-    // Only the empty prefix ran at each of these continuations, and prefix
-    // outcomes need not be monotone: a longer prefix can still miss the
-    // target. So the error states what those trials observed, not that no
-    // event or chaos decision matters.
-    if alone.len() == outcomes.len() {
+    if let (true, Some(&(first, _))) = (alone.len() == outcomes.len(), outcomes.first()) {
         // A completed analysis, not a failure (`AnalyzeVerdict`).
-        return Err(AnalyzeVerdict::NoDecidingEvent(format!(
-            "no event of the target schedule decides the outcome: without chaos, the scheduler \
+        return Err(AnalyzeVerdict::no_deciding_event(
+            format!(
+                "no event of the target schedule decides the outcome: without chaos, the scheduler \
              alone already meets the target criteria {}. The outcome does not depend on a chaos \
              decision, so debug that run directly: the reproducer of the first trial \
              (prefix_round_001.repro in the workspace) runs it. To bisect against a run that \
              misses the target instead, pass --continuation-timeslice with a timeslice at which \
              the scheduler alone misses it, or use the default search with a passing \
              --run2-seed.",
-            alone.join(" and ")
-        ))
+                alone.join(" and ")
+            ),
+            first,
+        )
         .into());
     }
     let remedy = "Schedule replay does not reproduce this run where replaying the whole target \
@@ -474,19 +477,46 @@ fn empty_prefix_verdict(
             untried.join(" or ")
         )
     };
-    AnalyzeVerdict::NoDecidingEvent(format!(
-        "no event of the target schedule decides the outcome: {error}, so without chaos {}, the \
+    AnalyzeVerdict::no_deciding_event(
+        format!(
+            "no event of the target schedule decides the outcome: {error}, so without chaos {}, the \
          scheduler alone, replaying none of the target schedule, meets the target. The outcome \
          does not depend on a chaos decision, so debug that run directly: the reproducer of the \
          last trial in the workspace runs it. To bisect against a run that misses the target \
          instead, pass --continuation-timeslice with a timeslice at which the scheduler alone \
          misses it, or use the default search with a passing --run2-seed.{untried}",
-        describe_continuation(continuation)
-    ))
+            describe_continuation(continuation)
+        ),
+        continuation,
+    )
+}
+
+/// `args` without the option `name`, as `name=VALUE` or as `name` and its
+/// value, before any `--` that starts the guest command, whose arguments are
+/// kept as they are.
+fn without_option(args: &[String], name: &str) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            kept.push(arg.clone());
+            kept.extend(iter.cloned());
+            break;
+        }
+        if arg == name {
+            iter.next();
+        } else if !arg
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('='))
+        {
+            kept.push(arg.clone());
+        }
+    }
+    kept
 }
 
 /// "at a 200000000 ns timeslice", or "without PMU timeslices".
-fn describe_continuation(timeslice: MaybeTimeslice) -> String {
+pub(super) fn describe_continuation(timeslice: MaybeTimeslice) -> String {
     match timeslice {
         Some(nanos) => format!("at a {nanos} ns timeslice"),
         None => "without PMU timeslices".to_owned(),
@@ -1685,6 +1715,7 @@ impl AnalyzeOpts {
 
         Report {
             verdict: Verdict::CriticalEvents,
+            verdict_reason: None,
             header,
             additional_context: context,
             baseline_run: false,
@@ -1955,6 +1986,7 @@ impl AnalyzeOpts {
 
         Ok(Some(Report {
             verdict: Verdict::CriticalEvents,
+            verdict_reason: None,
             header,
             additional_context: context,
             baseline_run: false,
@@ -2704,6 +2736,7 @@ impl AnalyzeOpts {
 
         Ok(Report {
             verdict: Verdict::CriticalEvents,
+            verdict_reason: None,
             header,
             additional_context: passing_context,
             baseline_run: true,
@@ -2961,10 +2994,113 @@ impl AnalyzeOpts {
     ) -> anyhow::Result<ExitStatus> {
         let decision = match searched {
             Ok(decision) => decision,
-            Err(error) => return self.write_verdict_and_exit(&error.downcast::<AnalyzeVerdict>()?),
+            Err(error) => {
+                let verdict = error.downcast::<AnalyzeVerdict>()?;
+                let verdict = self.with_timing_tried(verdict, |timing, continuation| {
+                    self.try_alternative_timing(timing, continuation)
+                });
+                return self.write_verdict_and_exit(&verdict);
+            }
         };
         let report = self.phase6_record_prefix_outputs(decision)?;
         self.write_report_and_exit(report)
+    }
+
+    /// `verdict`, reached by trials that all kept the recording's timing
+    /// settings ([`Self::continuation_timing`]), with what one more trial
+    /// shows about them: `try_alternative` runs the empty prefix under their
+    /// alternatives. A recording given with `--run1-preemptions` fixes the
+    /// trials' settings, so that trial is not run and the verdict says a new
+    /// failing run can tell.
+    pub(super) fn with_timing_tried(
+        &self,
+        verdict: AnalyzeVerdict,
+        try_alternative: impl FnOnce(&[TimingSetting], MaybeTimeslice) -> AlternativeTiming,
+    ) -> AnalyzeVerdict {
+        let timing = self.continuation_timing();
+        if timing.is_empty() {
+            return verdict;
+        }
+        let tried = if self.run1_preemptions.is_some() {
+            AlternativeTiming::Untried {
+                why: "the failing run is a recording (--run1-preemptions), which every trial \
+                      replays under the run arguments it was made with, so analyze runs no trial \
+                      under others (a record stamped with one --pipe-wake-latency is refused \
+                      under another)"
+                    .to_owned(),
+            }
+        } else {
+            try_alternative(&timing, verdict.continuation())
+        };
+        verdict.with_timing(&timing, tried)
+    }
+
+    /// Run the empty prefix, continued without chaos at `continuation` as
+    /// the search's trials were, with the alternatives of `timing` in place
+    /// of the settings: one deterministic trial, outside the search, that
+    /// shows whether those settings make the scheduler alone meet the
+    /// target.
+    fn try_alternative_timing(
+        &self,
+        timing: &[TimingSetting],
+        continuation: MaybeTimeslice,
+    ) -> AlternativeTiming {
+        self.try_alternative_timing_with(timing, |alternative, runname| {
+            let empty = PreemptionRecord::from_sched_events(Vec::new());
+            alternative
+                .prefix_trial(runname, &empty, 0, continuation)
+                .and_then(|mut run| run.launch_trial())
+        })
+    }
+
+    /// [`Self::try_alternative_timing`], with `launch` running the trial
+    /// (`runname`) on the options it is given, these options under the
+    /// alternatives: how it ended decides the cause. A trial that missed
+    /// shows the settings cause the outcome; one that met the target shows
+    /// they do not; one that did not finish (a bound or a refusal) or could
+    /// not run shows nothing, and the verdict says it was not tried.
+    fn try_alternative_timing_with(
+        &self,
+        timing: &[TimingSetting],
+        launch: impl FnOnce(&AnalyzeOpts, &str) -> anyhow::Result<TrialEnd>,
+    ) -> AlternativeTiming {
+        let runname = "prefix_alternative_timing";
+        let trial = format!("{runname}.repro");
+        let mut alternative = self.clone();
+        for setting in timing {
+            alternative.run_arg = without_option(&alternative.run_arg, setting.drops);
+            alternative.run_args = without_option(&alternative.run_args, setting.drops);
+            alternative.run_arg.extend(setting.adds.clone());
+        }
+        eprintln!(
+            ":: Trying the empty prefix with {} instead of {}",
+            timing
+                .iter()
+                .map(|t| t.alternative.as_str())
+                .collect::<Vec<_>>()
+                .join(" and "),
+            timing
+                .iter()
+                .map(|t| t.option.as_str())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        );
+        match launch(&alternative, runname) {
+            Ok(TrialEnd::Missed) => AlternativeTiming::Missed { trial },
+            Ok(TrialEnd::Met) => AlternativeTiming::Met { trial },
+            Ok(TrialEnd::Unfinished(stop)) => AlternativeTiming::Untried {
+                why: format!(
+                    "the trial with them ({trial} in the workspace) {}",
+                    match stop {
+                        Stop::Bound => "did not finish",
+                        Stop::Refusal => "was refused by Hermit",
+                    }
+                ),
+            },
+            Err(error) => AlternativeTiming::Untried {
+                why: format!("the trial with them could not run ({error:#})"),
+            },
+        }
     }
 
     /// What follows a first run that missed the target: `--search` (`search`),
@@ -3003,6 +3139,7 @@ impl AnalyzeOpts {
         println!("{verdict}");
         self.write_report_file(&Report {
             verdict: verdict.verdict(),
+            verdict_reason: Some(verdict.reason().clone()),
             header: verdict.to_string(),
             additional_context: String::new(),
             baseline_run: false,
@@ -5592,7 +5729,7 @@ mod tests {
         assert!(
             matches!(
                 alone.downcast_ref::<AnalyzeVerdict>(),
-                Some(AnalyzeVerdict::NoDecidingEvent(_))
+                Some(AnalyzeVerdict::NoDecidingEvent { .. })
             ),
             "{alone:#}"
         );
@@ -5635,7 +5772,7 @@ mod tests {
         let ns = |nanos: u64| NonZeroU64::new(nanos);
         let candidates = [ns(1_000), ns(200_000_000)];
         let error = Error::new(EmptyPrefixMeetsTarget);
-        let AnalyzeVerdict::NoDecidingEvent(explanation) =
+        let AnalyzeVerdict::NoDecidingEvent { explanation, .. } =
             empty_prefix_verdict(&error, &candidates, ns(1_000));
         assert!(
             explanation.starts_with("no event of the target schedule decides the outcome: ")
@@ -5643,51 +5780,152 @@ mod tests {
                     .contains("The search did not try continuing at a 200000000 ns timeslice"),
             "{explanation}"
         );
-        let AnalyzeVerdict::NoDecidingEvent(explanation) =
+        let AnalyzeVerdict::NoDecidingEvent { explanation, .. } =
             empty_prefix_verdict(&error, &candidates, ns(200_000_000));
         assert!(!explanation.contains("did not try"), "{explanation}");
     }
 
     /// A verdict that names no event is reported as a completed analysis:
-    /// its report carries `"verdict": "no_deciding_event"` and the
+    /// its report carries `"verdict": "no_deciding_event"`, its reason and the
     /// explanation, and analyze exits as it does after naming an event (0, or
-    /// `--success-exit-code`). `main.rs` never sees it as an error.
+    /// `--success-exit-code`). `main.rs` never sees it as an error. Without
+    /// timing settings in force no other trial runs. With them, a recording
+    /// given with `--run1-preemptions` leaves them untried; otherwise the
+    /// trial under their alternatives decides the cause, shown here with
+    /// stand-ins for that trial.
+    /// A trial under another timing setting drops the option, as
+    /// `name=VALUE` or as `name VALUE`, from analyze's arguments and the run
+    /// arguments before the guest command, and keeps the guest's own.
+    #[test]
+    fn a_trial_under_another_setting_drops_the_option() {
+        let args = |list: &[&str]| -> Vec<String> { list.iter().map(|a| a.to_string()).collect() };
+        assert_eq!(
+            without_option(
+                &args(&[
+                    "--pipe-wake-latency=50000",
+                    "--strict",
+                    "--pipe-wake-latency",
+                    "7",
+                    "--pipe-wake-latency-extra=1",
+                    "--",
+                    "/bin/guest",
+                    "--pipe-wake-latency=3",
+                ]),
+                "--pipe-wake-latency"
+            ),
+            args(&[
+                "--strict",
+                "--pipe-wake-latency-extra=1",
+                "--",
+                "/bin/guest",
+                "--pipe-wake-latency=3",
+            ])
+        );
+    }
+
     #[test]
     fn a_verdict_is_reported_and_ends_analyze_successfully() {
         let dir = tempfile::tempdir().unwrap();
         let report = dir.path().join("report.json");
-        let verdict = AnalyzeVerdict::NoDecidingEvent("no event decides the outcome".into());
-        for (extra, status) in [
-            (&[][..], ExitStatus::SUCCESS),
-            (&["--success-exit-code=3"][..], ExitStatus::Exited(3)),
-        ] {
+        let verdict = AnalyzeVerdict::no_deciding_event("no event decides the outcome.", None);
+        let written = |status: anyhow::Result<ExitStatus>, expected: ExitStatus| {
+            assert_eq!(status.unwrap(), expected);
+            let text = std::fs::read_to_string(&report).unwrap();
+            std::fs::remove_file(&report).unwrap();
+            // One schema reads both kinds of report.
+            let parsed: Report = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed.verdict, Verdict::NoDecidingEvent);
+            assert_eq!(parsed.critical_event1, None);
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+        let parse = |extra: &[&str], run_args: &[&str]| {
             let mut argv = vec![
                 "analyze".to_string(),
                 format!("--report-file={}", report.display()),
             ];
             argv.extend(extra.iter().map(|flag| flag.to_string()));
-            argv.extend(["--".to_string(), "/bin/true".to_string()]);
-            let options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            argv.push("--".to_string());
+            argv.extend(run_args.iter().map(|flag| flag.to_string()));
+            argv.push("/bin/true".to_string());
+            AnalyzeOpts::try_parse_from(argv).unwrap()
+        };
+        for (extra, status) in [
+            (&[][..], ExitStatus::SUCCESS),
+            (&["--success-exit-code=3"][..], ExitStatus::Exited(3)),
+        ] {
             // Through the prefix search's end, as analyze reaches it.
+            let options = parse(extra, &[]);
             let searched = Err(Error::new(verdict.clone()));
-            assert_eq!(options.finish_prefix_search(searched).unwrap(), status);
-            let text = std::fs::read_to_string(&report).unwrap();
-            let written: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!(
-                written,
+                written(options.finish_prefix_search(searched), status),
                 serde_json::json!({
                     "verdict": "no_deciding_event",
-                    "header": "no event decides the outcome",
+                    "verdict_reason": {"cause": "scheduler_alone"},
+                    "header": "no event decides the outcome.",
                     "additional_context": "",
                     "baseline_run": false,
                 })
             );
-            // One schema reads both kinds of report.
-            let parsed: Report = serde_json::from_str(&text).unwrap();
-            assert_eq!(parsed.verdict, Verdict::NoDecidingEvent);
-            assert_eq!(parsed.critical_event1, None);
-            std::fs::remove_file(&report).unwrap();
         }
+
+        // A recording fixes the settings, so no trial tries others.
+        let recorded = parse(
+            &["--run1-preemptions=/nonexistent.preempts"],
+            &["--pipe-wake-latency=50000"],
+        );
+        let searched = Err(Error::new(verdict.clone()));
+        let json = written(recorded.finish_prefix_search(searched), ExitStatus::SUCCESS);
+        assert_eq!(
+            json["verdict_reason"],
+            serde_json::json!({
+                "cause": "scheduler_alone",
+                "timing_in_force": ["--pipe-wake-latency=50000"],
+            })
+        );
+        let header = json["header"].as_str().unwrap();
+        assert!(
+            header.contains("was not tried: the failing run is a recording (--run1-preemptions)")
+                && header.contains("A new failing run with no --pipe-wake-latency"),
+            "{header}"
+        );
+
+        // Otherwise the trial without the setting decides the cause.
+        let options = parse(&[], &["--pipe-wake-latency=50000"]);
+        let trial = || "prefix_alternative_timing.repro".to_owned();
+        let shown = options.with_timing_tried(verdict.clone(), |timing, continuation| {
+            assert_eq!(timing.len(), 1);
+            assert_eq!(timing[0].drops, "--pipe-wake-latency");
+            assert_eq!(continuation, None);
+            AlternativeTiming::Missed { trial: trial() }
+        });
+        let json = written(options.write_verdict_and_exit(&shown), ExitStatus::SUCCESS);
+        assert_eq!(
+            json["verdict_reason"],
+            serde_json::json!({
+                "cause": "timing_semantics",
+                "options": ["--pipe-wake-latency=50000"],
+                "alternatives": ["no --pipe-wake-latency"],
+                "trial": "prefix_alternative_timing.repro",
+            })
+        );
+        assert!(
+            json["header"]
+                .as_str()
+                .unwrap()
+                .contains("meets the target because of --pipe-wake-latency=50000"),
+            "{json}"
+        );
+        let met = options.with_timing_tried(verdict.clone(), |_, _| AlternativeTiming::Met {
+            trial: trial(),
+        });
+        assert_eq!(
+            serde_json::to_value(met.reason()).unwrap(),
+            serde_json::json!({
+                "cause": "scheduler_alone",
+                "timing_in_force": ["--pipe-wake-latency=50000"],
+            })
+        );
+
         // Any other end of the search ends the analysis, writing no report.
         let options = AnalyzeOpts::try_parse_from([
             "analyze".to_string(),
@@ -5710,6 +5948,78 @@ mod tests {
             verdict.class_line(),
             "HERMIT_ANALYZE_VERDICT class=no-deciding-event"
         );
+    }
+
+    /// The trial under the alternative timing runs without the settings it
+    /// drops, and its end decides the cause: missed shows the settings cause
+    /// the outcome, met shows they do not, and an unfinished (bound or
+    /// refused) or failed trial shows nothing.
+    #[test]
+    fn the_alternative_timing_trial_decides_the_cause_by_how_it_ends() {
+        use crate::analyze::rundata::Stop;
+        let options = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--run-arg=--scheduler-turn-cost=10000",
+            "--",
+            "--pipe-wake-latency=50000",
+            "/bin/true",
+        ])
+        .unwrap();
+        let timing = options.continuation_timing();
+        assert_eq!(
+            timing.iter().map(|t| t.option.as_str()).collect::<Vec<_>>(),
+            ["--pipe-wake-latency=50000", "--scheduler-turn-cost=10000"]
+        );
+        // How the trial ends, and what the cause must then be.
+        type Case = (anyhow::Result<TrialEnd>, fn(&AlternativeTiming) -> bool);
+        let cases: [Case; 5] = [
+            (
+                Ok(TrialEnd::Missed),
+                |t| matches!(t, AlternativeTiming::Missed { trial } if trial == "prefix_alternative_timing.repro"),
+            ),
+            (Ok(TrialEnd::Met), |t| {
+                matches!(t, AlternativeTiming::Met { .. })
+            }),
+            (
+                Ok(TrialEnd::Unfinished(Stop::Bound)),
+                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("prefix_alternative_timing.repro")),
+            ),
+            (Ok(TrialEnd::Unfinished(Stop::Refusal)), |t| {
+                matches!(t, AlternativeTiming::Untried { .. })
+            }),
+            (
+                Err(anyhow::anyhow!("no such binary")),
+                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("could not run (no such binary)")),
+            ),
+        ];
+        // An explicit turn cost equal to the default charge is no setting.
+        let default_cost = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--run-arg=--scheduler-turn-cost=500000",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        assert_eq!(default_cost.continuation_timing(), Vec::new());
+        for (end, expected) in cases {
+            let tried = options.try_alternative_timing_with(&timing, |alternative, runname| {
+                assert_eq!(runname, "prefix_alternative_timing");
+                let args: Vec<&String> = alternative
+                    .run_arg
+                    .iter()
+                    .chain(&alternative.run_args)
+                    .collect();
+                assert!(
+                    args.iter()
+                        .all(|arg| !arg.starts_with("--pipe-wake-latency")
+                            && !arg.starts_with("--scheduler-turn-cost")),
+                    "{args:?}"
+                );
+                assert_eq!(alternative.continuation_timing(), Vec::new());
+                end
+            });
+            assert!(expected(&tried), "{tried:?}");
+        }
     }
 
     /// A first run that misses the target ends the analysis without --search,
