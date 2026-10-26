@@ -10384,9 +10384,15 @@ fn replay_starting_priority(config: &Config, dettid: DetTid) -> Priority {
     }
 }
 
-/// Whether `dettid` is the guest's first thread (`replay_starting_priority`).
+/// Whether `dettid` is the guest's first thread (`replay_starting_priority`):
+/// the chosen base under `GuestIds::Chosen`, whose later tasks take the IDs
+/// after it (a base of 2 makes 3 a child), and otherwise thread 3 or below,
+/// as Hermit's PID namespace numbers it.
 fn is_replay_root(config: &Config, dettid: DetTid) -> bool {
-    dettid <= DetTid::from_raw(3) || config.guest_ids.base() == Some(dettid.as_raw())
+    match config.guest_ids.base() {
+        Some(base) => dettid.as_raw() == base,
+        None => dettid <= DetTid::from_raw(3),
+    }
 }
 
 /// Global method RPC for the parent to add a child-thread to the round-robin pool.
@@ -13495,18 +13501,19 @@ mod tests {
     }
 
     /// Under `--replay-schedule-from` the guest's first thread starts in the
-    /// foreground and every other deferred, however the guest is numbered:
-    /// thread 3 in Hermit's PID namespace, the chosen base under
-    /// `--no-namespace` (`GuestIds::Chosen`), whose first thread a spliced
-    /// schedule otherwise left deferred beside its children.
+    /// foreground and every other deferred, under either replayable
+    /// numbering: thread 3 in Hermit's PID namespace (`GuestIds::Namespace`),
+    /// the chosen base under `--no-namespace` (`GuestIds::Chosen`), whose
+    /// first thread a replay otherwise left deferred beside its children. A
+    /// low base's children are not taken for the first thread.
     #[test]
-    fn the_first_guest_thread_starts_a_schedule_replay_in_the_foreground_however_numbered() {
+    fn the_first_guest_thread_starts_a_schedule_replay_in_the_foreground_under_either_numbering() {
         use detcore_model::pid::GuestIds;
         let namespace = super::Config::default();
         assert_eq!(namespace.guest_ids, GuestIds::Namespace);
-        let chosen = super::Config {
+        let chosen = |base| super::Config {
             guest_ids: GuestIds::Chosen {
-                base: 31744,
+                base,
                 refuse_host_ids: true,
             },
             ..Default::default()
@@ -13514,11 +13521,20 @@ mod tests {
         let starts = |config: &super::Config, tid: i32| {
             super::replay_starting_priority(config, super::DetTid::from_raw(tid))
         };
-        assert_eq!(starts(&namespace, 3), super::REPLAY_FOREGROUND_PRIORITY);
-        assert_eq!(starts(&namespace, 4), super::REPLAY_DEFERRED_PRIORITY);
-        assert_eq!(starts(&chosen, 31744), super::REPLAY_FOREGROUND_PRIORITY);
-        assert_eq!(starts(&chosen, 31745), super::REPLAY_DEFERRED_PRIORITY);
-        assert_eq!(starts(&chosen, 40000), super::REPLAY_DEFERRED_PRIORITY);
+        let (foreground, deferred) = (
+            super::REPLAY_FOREGROUND_PRIORITY,
+            super::REPLAY_DEFERRED_PRIORITY,
+        );
+        assert_eq!(starts(&namespace, 3), foreground);
+        assert_eq!(starts(&namespace, 4), deferred);
+        assert_eq!(starts(&chosen(31744), 31744), foreground);
+        assert_eq!(starts(&chosen(31744), 31745), deferred);
+        assert_eq!(starts(&chosen(31744), 3), deferred);
+        assert_eq!(starts(&chosen(2), 2), foreground);
+        assert_eq!(starts(&chosen(2), 3), deferred);
+        assert_eq!(starts(&chosen(1), 1), foreground);
+        assert_eq!(starts(&chosen(1), 2), deferred);
+        assert_eq!(starts(&chosen(1), 3), deferred);
     }
 
     /// A process reads its current image's vector; a forked child its
