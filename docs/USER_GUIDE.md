@@ -1207,7 +1207,13 @@ phase was running:
   runs, still reports the decision, in the fields a complete report uses:
   `deciding_event` for `--prefix-search` and `critical_event1` and
   `critical_event2` for the default search, without stacks (`partial.stacks`
-  says why); `--resume` takes them.
+  says why); `--resume` takes them. On the prefix path both critical events
+  name the deciding event too, until the stack-trace runs place them: which
+  shape the complete report takes (critical events at the deciding event, or
+  a timing decision with `deciding_event` and the critical events at
+  continuation positions) is known only after those runs. So in a partial
+  report `deciding_event`'s presence does not mean a timing decision; a
+  script reads `partial` first.
 
 In a report file such a report's `verdict` is `partial`, and `partial` holds
 what it found. Its event fields name the events the search decided on when it

@@ -772,6 +772,12 @@ pub struct Report {
     /// `event_index` is a position in that continuation's recorded schedule
     /// (the header names both files); where no other thread runs, it is that
     /// schedule's length and the stack is empty.
+    ///
+    /// In a partial report (`partial` set) its presence does NOT mean a timing
+    /// decision: when a budget ends the stack-trace runs of a prefix search,
+    /// the deciding event and both critical events all name the decision,
+    /// because which shape the complete report takes is known only after
+    /// those runs. Read `partial` first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deciding_event: Option<ReportCriticalEvent>,
 
@@ -781,7 +787,9 @@ pub struct Report {
     pub racing_accesses: Option<RacingAccesses>,
 
     /// Set when a budget (--time-budget, --trial-budget) ended the analysis
-    /// before it found the critical events: what it found so far.
+    /// before it found the critical events: what it found so far. Read it
+    /// before the event fields, whose shape differs in a partial report (see
+    /// `deciding_event` and [`PartialReport::decided`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial: Option<PartialReport>,
 }
@@ -808,7 +816,12 @@ pub struct PartialReport {
     pub interval: Option<BisectInterval>,
     /// `--prefix-search`'s bracket, if it got that far.
     pub bracket: Option<PrefixBracket>,
-    /// The search's result, if it had one before the stack traces.
+    /// The search's result, if it had one before the stack traces. The
+    /// report's event fields then carry it too, without stacks: for
+    /// `--prefix-search` the deciding event and both critical events name
+    /// the decision until the stack-trace runs place them, so
+    /// `deciding_event`'s presence does not mean a timing decision; for the
+    /// default search the critical events are the critical pair.
     pub decided: Option<String>,
     /// Whether the stack traces were taken, or why not.
     pub stacks: String,

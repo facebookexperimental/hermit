@@ -3519,7 +3519,13 @@ impl AnalyzeOpts {
     /// The analysis, in the workspace phase 0 created; a partial report
     /// (exit 120) when a budget ends it first.
     fn analyze(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
-        match self.analyze_steps(global) {
+        let result = self.analyze_steps(global);
+        self.end_on_budget(result)
+    }
+
+    /// `result`, or the partial report when a budget ended the analysis.
+    fn end_on_budget(&mut self, result: anyhow::Result<ExitStatus>) -> anyhow::Result<ExitStatus> {
+        match result {
             Err(error) => match error.downcast::<BudgetExpired>() {
                 Ok(expired) => self.report_partial(expired),
                 Err(error) => Err(error),
@@ -9315,6 +9321,153 @@ mod tests {
                 written.header
             );
         }
+    }
+
+    /// The same, through the real cut path: a prefix search with a trial
+    /// runner in place of the guest and `--trial-budget` set to the trials the
+    /// search takes, so the budget runs out at the first stack-trace run
+    /// (`final_target_for_stacktraces`), and `end_on_budget` reports it as
+    /// `analyze` does. The report carries the decision as above. Resumed
+    /// through the journal, the analysis answers the search's trials from it
+    /// and finishes with the same deciding event.
+    #[test]
+    fn a_trial_budget_that_ends_at_the_stack_trace_runs_reports_the_decision() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use crate::app::analyze::rundata::TrialRunner;
+        let (len, deciding) = (200, 137);
+        let target = PreemptionRecord::from_sched_events(
+            (0..len)
+                .map(|i| SchedEvent::branches(DetTid::from_raw(3 + (i % 2)), 1))
+                .collect(),
+        );
+        // A trial meets the target when its prefix holds the deciding event.
+        let runner = |names: Arc<Mutex<Vec<String>>>| {
+            TrialRunner(Some(Arc::new(move |run: &mut RunData| {
+                names.lock().unwrap().push(run.name().to_owned());
+                let replayed = run
+                    .runopts
+                    .det_opts
+                    .det_config
+                    .replay_schedule_from
+                    .clone()
+                    .unwrap();
+                let prefix = PreemptionReader::new(&replayed)
+                    .load_all()
+                    .schedevents()
+                    .len();
+                run.finish_for_test(prefix > deciding, std::time::Duration::from_secs(1));
+                Ok(())
+            })))
+        };
+        let search = ["--target-stdout=FAILED", "--prefix-search"];
+
+        // How many trials the search takes, uninterrupted.
+        let parent = tempfile::tempdir().unwrap();
+        let counted = Arc::new(Mutex::new(Vec::new()));
+        let (mut uninterrupted, _uninterrupted_workspace) =
+            analysis_in(&parent.path().join("uninterrupted"), &search);
+        uninterrupted.start_checkpoint().unwrap();
+        uninterrupted.trial_runner = runner(counted.clone());
+        assert_eq!(
+            uninterrupted
+                .phase5_prefix_search(&target)
+                .unwrap()
+                .decision,
+            deciding
+        );
+        let search_trials = counted.lock().unwrap().len();
+
+        let report_file = parent.path().join("report.json");
+        let report = format!("--report-file={}", report_file.display());
+        let budget = format!("--trial-budget={search_trials}");
+        let mut args = search.to_vec();
+        args.extend([report.as_str(), budget.as_str()]);
+        let (mut options, mut workspace) = analysis_in(&parent.path().join("first"), &args);
+        workspace.keep("the resumed analysis owns it");
+        options.start_checkpoint().unwrap();
+        options.budget = Budget::new(options.time_budget, options.trial_budget);
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        options.trial_runner = runner(ran.clone());
+        let result = options
+            .phase5_prefix_search(&target)
+            .and_then(|decision| options.phase6_record_prefix_outputs(decision))
+            .map(|_| ExitStatus::SUCCESS);
+        let status = options.end_on_budget(result).unwrap();
+        assert_eq!(
+            status,
+            ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
+        );
+        // The search ran to its end; the stack-trace run never started.
+        assert_eq!(ran.lock().unwrap().len(), search_trials);
+        assert!(
+            !ran.lock()
+                .unwrap()
+                .iter()
+                .any(|name| name == "final_target_for_stacktraces")
+        );
+        let written: Report =
+            serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
+        assert_eq!(
+            written
+                .deciding_event
+                .as_ref()
+                .map(|event| event.event_index),
+            Some(deciding)
+        );
+        assert_eq!(
+            [
+                written.critical_event1.event_index,
+                written.critical_event2.event_index
+            ],
+            [deciding, deciding]
+        );
+        assert!(written.critical_event1.stack.is_none());
+        assert!(written.critical_event2.stack.is_none());
+        assert!(
+            written
+                .deciding_event
+                .as_ref()
+                .is_some_and(|event| event.stack.is_none())
+        );
+        let partial = written.partial.unwrap();
+        assert_eq!(partial.reason, BudgetKind::TrialBudget);
+        assert_eq!(partial.phase, Phase::StackTraces);
+        assert!(
+            partial.decided.as_deref().is_some_and(|decided| decided
+                .starts_with(&format!("event #{deciding} of the target schedule decides"))),
+            "{:?}",
+            partial.decided
+        );
+        assert_eq!(
+            partial.stacks,
+            "not taken: the budget ran out during the stack-trace runs; --resume takes them"
+        );
+
+        // Resumed, the search's trials come from the journal and only the
+        // stack-trace runs run.
+        let path = workspace.path().to_path_buf();
+        let resume = format!("--resume={}", path.display());
+        let mut argv = vec!["analyze", resume.as_str()];
+        argv.extend(search);
+        argv.extend(["--", "--chaos", "/bin/true"]);
+        let mut resumed = AnalyzeOpts::try_parse_from(argv).unwrap();
+        let resumed_workspace = resumed.phase0_resume(&path).unwrap();
+        let resumed_ran = Arc::new(Mutex::new(Vec::new()));
+        resumed.trial_runner = runner(resumed_ran.clone());
+        let decision = resumed.phase5_prefix_search(&target).unwrap();
+        assert_eq!(resumed.journal.answered() as usize, search_trials);
+        assert!(resumed_ran.lock().unwrap().is_empty());
+        let complete = resumed.phase6_record_prefix_outputs(decision).unwrap();
+        assert!(complete.partial.is_none());
+        assert_eq!(complete.critical_event1.event_index, deciding);
+        assert_eq!(
+            resumed_ran.lock().unwrap().first().map(String::as_str),
+            Some("final_target_for_stacktraces")
+        );
+        drop(resumed_workspace);
+        drop(workspace);
     }
 
     /// The default search's partial report names its pair of schedules, the
