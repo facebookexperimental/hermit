@@ -306,6 +306,11 @@ def hermit_rust_test(
         ],
         rustc_flags = [
             "-Aunused-crate-dependencies",
+            # The guests keep the unoptimised code generation upstream gives
+            # them in every profile ([profile.validate.package.
+            # hermetic_infra_hermit_tests] opt-level = 0), whatever the build
+            # mode does to Hermit and to the guests' dependencies.
+            "-Copt-level=0",
         ],
         unittests = False,
         **allocator_args
