@@ -1195,6 +1195,10 @@ struct PreparedMounts {
     identity_sources: IdentityGuard,
 }
 
+/// A rewritten copy of one guest file, bind-mounted over the path the guest
+/// knows it by, so preprocessing never changes what the program sees of
+/// itself. Used by the e9patch preprocessor and by the aarch64 exclusive-loop
+/// rewrite.
 #[derive(Debug, Clone)]
 struct ExecutableOverlayMount {
     source: PathBuf,
@@ -1706,6 +1710,24 @@ pub struct RunOpts {
     #[clap(long, value_name = "path")]
     pub(crate) bind: Vec<Bind>,
 
+    /// Rewrite canonical aarch64 load/store-exclusive retry loops in the guest
+    /// executable to single LSE atomic instructions before running it.
+    ///
+    /// An `LDXR`/`STXR` pair retries whenever an exception clears the local
+    /// exclusive monitor between the two, and each retry retires the loop's
+    /// branches again, so the same guest work does not retire the same number
+    /// of branches. A single atomic instruction cannot retry. This is
+    /// preprocessing for the ptrace backend, not a backend: the rewritten copy
+    /// is bind-mounted over the original path, and anything that is not a
+    /// fully decoded canonical loop is left alone and reported.
+    #[clap(long)]
+    pub(crate) rewrite_exclusives: bool,
+
+    /// Also rewrite this file (a shared library the guest loads), with
+    /// `--rewrite-exclusives`. Repeatable.
+    #[clap(long, value_name = "FILE", requires = "rewrite_exclusives")]
+    pub(crate) rewrite_exclusives_also: Vec<PathBuf>,
+
     /// Select guest networking. `local` creates an isolated loopback interface; `host` exposes the
     /// host network and compromises isolation and deterministic reproducibility.
     ///
@@ -2205,6 +2227,11 @@ pub struct RunOpts {
     /// Read-only overlay that exposes the rewritten ELF at its original guest path.
     #[clap(skip)]
     executable_overlay: Option<ExecutableOverlayMount>,
+
+    /// Runtime-only: the rewritten files `--rewrite-exclusives` produced,
+    /// each bind-mounted over the path the guest loads it from.
+    #[clap(skip)]
+    exclusive_rewrite_overlays: Vec<ExecutableOverlayMount>,
 
     /// Runtime-only: how many of the last `--mount`s and `--bind`s a backend
     /// adapter added to the caller's (`with_dbt_mounts`). They are installed
@@ -10976,7 +11003,9 @@ impl RunOpts {
             let program = self.load_and_resolve_happens_before()?;
             self.resolved_happens_before = Some(program);
         }
-
+        if self.rewrite_exclusives {
+            self.prepare_exclusive_rewrite(backend)?;
+        }
         let private_engagement_summary = if self.backend_engagement_json.is_some()
             && backend == Backend::Ptrace
             && self.application_backend.is_none()
@@ -12904,6 +12933,133 @@ impl RunOpts {
         anyhow::ensure!(
             self.adapter_executable_overlay_plan()? == *plan,
             "executable overlay no longer matches the admitted guest/mount resolution"
+    /// Rewrite the guest executable's canonical exclusive loops (and those of
+    /// any file named by `--rewrite-exclusives-also`) into content-addressed
+    /// copies, and overlay each copy on the path the guest loads it from.
+    ///
+    /// The rewrite is a pure function of the input bytes, so the cache key is
+    /// the input digest: two runs of one `--verify` pair, and a replay of a
+    /// recording, map identical bytes.
+    fn prepare_exclusive_rewrite(&mut self, backend: Backend) -> Result<(), Error> {
+        anyhow::ensure!(
+            backend == Backend::Ptrace,
+            "--rewrite-exclusives is preprocessing for the ptrace backend; \
+             backend `{backend:?}` would run the rewritten image under a different runtime"
+        );
+        let (guest, host) = self.resolve_guest_and_host_program()?;
+        let mut files = vec![(guest, host)];
+        for also in &self.rewrite_exclusives_also {
+            let path = fs::canonicalize(also).with_context(|| {
+                format!("--rewrite-exclusives-also {} cannot be resolved", also.display())
+            })?;
+            files.push((path.clone(), path));
+        }
+        let cache = hermit::aarch64_lse::cache_dir()?;
+        for (guest_path, host_path) in files {
+            let input = fs::read(&host_path)
+                .with_context(|| format!("reading {} to rewrite", host_path.display()))?;
+            let digest = detcore::Digest::new(&input);
+            let name = host_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "image".to_owned());
+            let output = cache.join(format!("{digest}-{name}"));
+            let report = if output.exists() {
+                hermit::aarch64_lse::elf::rewrite_bytes(&mut input.clone())?
+            } else {
+                hermit::aarch64_lse::elf::rewrite_file(&host_path, &output)?
+            };
+            let Some(report) = report else {
+                crate::tracing::diagnostic_eprintln!(
+                    ":: Exclusive-loop rewrite: {} is not an aarch64 ELF image; left unchanged",
+                    guest_path.display()
+                );
+                continue;
+            };
+            crate::tracing::diagnostic_eprintln!(
+                ":: Exclusive-loop rewrite: {}: exclusive_instructions={}; rewritten={} {:?}; \
+                 left_alone={} {:?}; skipped_segments={:?}",
+                guest_path.display(),
+                report.exclusive_instructions,
+                report.patched_total(),
+                report.patched,
+                report.refused_total(),
+                report.refused,
+                report.skipped_segments,
+            );
+            for (addr, why) in &report.refused_examples {
+                tracing::info!("exclusive loop left alone at {addr:#x}: {why}");
+            }
+            if report.patched_total() != 0 {
+                self.exclusive_rewrite_overlays.push(ExecutableOverlayMount {
+                    source: output,
+                    target: guest_path,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_e9patch_program(&mut self) -> Result<(), Error> {
+        let (guest, host) = self.resolve_guest_and_host_program()?;
+        self.e9patch_program = Some(guest.clone());
+        let overlay_target = self.resolve_e9patch_overlay_target(&guest, &host)?;
+        if !is_elf_file(&host)? {
+            self.e9patch_engagement = Some(BackendEngagement::E9patch {
+                candidate_sites: 0,
+                mapped_sites: 0,
+                b0_sites: 0,
+            });
+            self.e9patch_sites = Some(reverie::SiteCounters::default());
+            crate::tracing::diagnostic_eprintln!(
+                ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
+                 main_executable=non-ELF; preprocessing=not-applicable"
+            );
+            return Ok(());
+        }
+        if let Some(reason) = hermit::e9patch::unavailable_reason() {
+            anyhow::bail!("backend `e9patch` is unavailable: {reason}");
+        }
+        let prepared = hermit::e9patch::prepare(&host)?;
+        self.e9patch_engagement = Some(BackendEngagement::E9patch {
+            candidate_sites: u64::try_from(prepared.candidate_sites)
+                .map_err(|_| Error::msg("e9patch candidate-site count does not fit u64"))?,
+            mapped_sites: u64::try_from(prepared.patched_sites)
+                .map_err(|_| Error::msg("e9patch mapped-site count does not fit u64"))?,
+            b0_sites: u64::try_from(prepared.b0_sites)
+                .map_err(|_| Error::msg("e9patch B0-site count does not fit u64"))?,
+        });
+        self.e9patch_sites = Some(reverie::SiteCounters::from_rewrite(
+            prepared.candidate_sites as u64,
+            prepared.patched_sites as u64,
+        ));
+        if prepared.patched_sites != 0 {
+            self.validate_e9patch_mount_targets()?;
+            self.validate_e9patch_source_visibility(&prepared.binary)?;
+            self.e9patch_overlay = Some(ExecutableOverlayMount {
+                source: prepared.binary,
+                target: overlay_target,
+            });
+        }
+        let rewrite_cache = if prepared.patched_sites == 0 {
+            "not-applicable"
+        } else if prepared.rewrite_cache_hit {
+            "hit"
+        } else {
+            "miss"
+        };
+        crate::tracing::diagnostic_eprintln!(
+            ":: Backend: e9patch preprocessing + ptrace runtime; candidate_sites={}; \
+             mapped_sites={}; b0_sites={}; \
+             instruction_map_cache={:?}; rewrite_cache={}; artifact_sha256={}; \
+             preprocess_us={}",
+            prepared.candidate_sites,
+            prepared.patched_sites,
+            prepared.b0_sites,
+            prepared.instruction_map_cache_status,
+            rewrite_cache,
+            prepared.artifact_sha256.as_deref().unwrap_or("none"),
+            prepared.preprocess_micros,
         );
         let overlay = if let Some(source) = source {
             self.validate_executable_overlay_mount_targets()?;
@@ -14800,6 +14956,11 @@ impl RunOpts {
         mounts.extend(user_mounts);
 
         if let Some(overlay) = &self.executable_overlay {
+        for overlay in self
+            .exclusive_rewrite_overlays
+            .iter()
+            .chain(self.e9patch_overlay.iter())
+        {
             let target = if let Ok(relative_path) = overlay.target.strip_prefix(TMP_DIR) {
                 tmpfs.join(relative_path)
             } else {
