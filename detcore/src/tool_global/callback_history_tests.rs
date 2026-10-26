@@ -602,7 +602,7 @@ async fn legacy_callback_history_restores_actual_progress_after_same_leader_relo
                     };
                     startup.progress == observed
                         && startup.checkpoints == loaded_points
-                        && matches!(response.as_ref(), GlobalResponse::StartNewThread(None))
+                        && matches!(response.as_ref(), GlobalResponse::StartNewThread(None, None))
                 });
             assert_eq!(carries_history, active, "actual startup carries and consumes active history with its deadline: {responses:?}");
         }

@@ -700,7 +700,9 @@ mod tests {
                 checkpoints: vec![point.clone()],
                 ..Startup::default()
             },
-            Box::new(crate::tool_global::GlobalResponse::StartNewThread(None)),
+            Box::new(crate::tool_global::GlobalResponse::StartNewThread(
+                None, None,
+            )),
         );
         let bytes = bincode::serde::encode_to_vec(&response, bincode::config::standard()).unwrap();
         let (decoded, used): (crate::tool_global::GlobalResponse, usize) =
