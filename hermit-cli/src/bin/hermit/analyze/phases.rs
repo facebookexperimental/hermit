@@ -59,6 +59,14 @@ use crate::app::schedule_search::INEXACT_COUNTER_BRANCH_JITTER;
 use crate::app::schedule_search::NoSingleSwap;
 use crate::app::schedule_search::TrialOutcome;
 use crate::app::schedule_search::search_for_critical_schedule;
+use crate::app::analyze::race_report::TracedReplay;
+use crate::app::analyze::races::RacingAccesses;
+use crate::app::analyze::races::render_racing_accesses;
+use crate::app::analyze::verdict::AnalyzeFailure;
+use crate::app::analyze::verdict::AnalyzePrecondition;
+use crate::app::analyze::verdict::AnalyzeVerdict;
+use crate::app::analyze::verdict::PreconditionClass;
+use crate::app::analyze::verdict::Verdict;
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
@@ -325,21 +333,22 @@ fn choose_continuation(
     // target. So the error states what those trials observed, not that no
     // event or chaos decision matters.
     if alone.len() == outcomes.len() {
-        bail!(
-            "no continuation gives the prefix search a miss to bisect against: replaying none of \
-             the target schedule and then scheduling without chaos, the scheduler alone already \
-             meets the target criteria {}. Only that empty prefix was tried; a longer prefix may \
-             still miss the target. Each such trial reproduces the target outcome while \
-             replaying nothing: the reproducer of the first one (prefix_round_001.repro in the \
-             workspace) reruns it. To bisect against a run that misses the target instead, pass \
-             --continuation-timeslice with a timeslice at which the scheduler alone misses it, \
-             or use the default search with a passing --run2-seed.",
+        // A completed analysis, not a failure (`AnalyzeVerdict`).
+        return Err(AnalyzeVerdict::NoDecidingEvent(format!(
+            "no event of the target schedule decides the outcome: without chaos, the scheduler \
+             alone already meets the target criteria {}. The outcome does not depend on a chaos \
+             decision, so debug that run directly: the reproducer of the first trial \
+             (prefix_round_001.repro in the workspace) runs it. To bisect against a run that \
+             misses the target instead, pass --continuation-timeslice with a timeslice at which \
+             the scheduler alone misses it, or use the default search with a passing \
+             --run2-seed.",
             alone.join(" and ")
-        );
+        ))
+        .into());
     }
     let remedy = "Schedule replay does not reproduce this run where replaying the whole target \
                   schedule misses the target; check that the target run replays (--selfcheck).";
-    bail!(
+    Err(AnalyzePrecondition::no_prefix_continuation(format!(
         "no continuation allows a prefix search: {}. {remedy} The default search with a \
          passing --run2-seed needs no continuation.",
         outcomes
@@ -351,7 +360,129 @@ fn choose_continuation(
             ))
             .collect::<Vec<_>>()
             .join("; ")
-    )
+    ))
+    .into())
+}
+
+/// Whether the bisection's `error` says that it has not established an exact
+/// one-swap pair of schedules with opposite outcomes ([`NoSingleSwap`]): a
+/// prefix search, which needs no baseline, then searches for a decision
+/// within the failing schedule.
+fn no_swap_separates(error: &Error) -> bool {
+    error.downcast_ref::<NoSingleSwap>().is_some()
+}
+
+/// `error` from bisecting analyze's own endpoints, pointing an endpoint that
+/// did not reproduce its outcome at replay: analyze recorded both endpoints
+/// itself, so Hermit's replay, or the host's branch counter, did not
+/// reproduce the run.
+fn point_endpoint_misses_at_replay(error: Error) -> Error {
+    match error.downcast::<AnalyzePrecondition>() {
+        Ok(precondition)
+            if matches!(
+                precondition.class,
+                PreconditionClass::TargetNotReproduced | PreconditionClass::BaselineNotReproduced
+            ) =>
+        {
+            precondition
+                .with_hint(
+                    "Analyze recorded this endpoint itself, so its replay did not reproduce \
+                     the run: --selfcheck checks that the target run replays, and `hermit \
+                     host-capabilities` whether this host's branch counter is exact.",
+                )
+                .into()
+        }
+        Ok(precondition) => precondition.into(),
+        Err(error) => error,
+    }
+}
+
+/// How analyze goes on after bisecting its own endpoints
+/// ([`own_bisection_end`]).
+enum OwnBisectionEnd {
+    /// The critical pair, to report.
+    Critical(CriticalSchedule),
+    /// The bisection has not established an exact one-swap pair of schedules
+    /// with opposite outcomes (the error says why): a prefix search, which
+    /// needs no baseline, searches for a decision within the failing schedule.
+    SearchPrefixes(Error),
+}
+
+/// What the bisection of analyze's own endpoints, `bisected`, leads to. An
+/// endpoint that did not reproduce is pointed at replay
+/// ([`point_endpoint_misses_at_replay`]); any other error ends the analysis.
+fn own_bisection_end(
+    bisected: anyhow::Result<CriticalSchedule>,
+) -> anyhow::Result<OwnBisectionEnd> {
+    match bisected {
+        Ok(critical) => Ok(OwnBisectionEnd::Critical(critical)),
+        Err(error) if no_swap_separates(&error) => Ok(OwnBisectionEnd::SearchPrefixes(error)),
+        Err(error) => Err(point_endpoint_misses_at_replay(error)),
+    }
+}
+
+/// --selfcheck's conclusion from its rerun of the target: whether it met the
+/// target, whether its log matched, and (checked last) whether it recorded
+/// the preemptions it replayed. Any difference is replay not reproducing,
+/// Hermit's or the host's, and a failure (`AnalyzeFailure`), not an input
+/// analyze cannot use.
+fn selfcheck_conclusion(
+    rerun_matched: bool,
+    logs_agree: bool,
+    fixed_point: impl FnOnce() -> Result<(), String>,
+) -> anyhow::Result<()> {
+    const HOST: &str = "`hermit host-capabilities` reports whether this host's branch counter \
+                        is exact.";
+    let difference = if !rerun_matched {
+        "First run matched criteria but second run did not.".to_string()
+    } else if !logs_agree {
+        "Log differences found, aborting because --selfcheck requires perfect reproducibility \
+         of the target run!"
+            .to_string()
+    } else if let Err(difference) = fixed_point() {
+        difference
+    } else {
+        return Ok(());
+    };
+    Err(AnalyzeFailure::ReplayNotReproducible(format!("{difference} {HOST}")).into())
+}
+
+/// The verdict of a prefix search whose empty prefix meets the target when
+/// continued without chaos at `continuation` (`error`, an
+/// [`EmptyPrefixMeetsTarget`]), naming any coarser one of `candidates` it did
+/// not try.
+fn empty_prefix_verdict(
+    error: &Error,
+    candidates: &[Option<NonZeroU64>],
+    continuation: Option<NonZeroU64>,
+) -> AnalyzeVerdict {
+    // The empty prefix's first trial was stopped, so the continuation looked
+    // usable and any coarser candidate went untried; name it rather than let
+    // the host's speed decide.
+    let untried: Vec<String> = candidates
+        .iter()
+        .skip_while(|&&candidate| candidate != continuation)
+        .skip(1)
+        .map(|&candidate| describe_continuation(candidate))
+        .collect();
+    let untried = if untried.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " The search did not try continuing {}, because the empty prefix's first trial did \
+             not finish; --continuation-timeslice selects one.",
+            untried.join(" or ")
+        )
+    };
+    AnalyzeVerdict::NoDecidingEvent(format!(
+        "no event of the target schedule decides the outcome: {error}, so without chaos {}, the \
+         scheduler alone, replaying none of the target schedule, meets the target. The outcome \
+         does not depend on a chaos decision, so debug that run directly: the reproducer of the \
+         last trial in the workspace runs it. To bisect against a run that misses the target \
+         instead, pass --continuation-timeslice with a timeslice at which the scheduler alone \
+         misses it, or use the default search with a passing --run2-seed.{untried}",
+        describe_continuation(continuation)
+    ))
 }
 
 /// "at a 200000000 ns timeslice", or "without PMU timeslices".
@@ -1506,8 +1637,20 @@ impl AnalyzeOpts {
         );
         println!("{}", prefix_report_banner(&report));
         println!("{}", report.header);
-        Self::print_stack("stack1", &report.critical_event1.stack);
-        Self::print_stack("stack2", &report.critical_event2.stack);
+        Self::print_stack(
+            "stack1",
+            report
+                .critical_event1
+                .as_ref()
+                .map_or(&None, |event| &event.stack),
+        );
+        Self::print_stack(
+            "stack2",
+            report
+                .critical_event2
+                .as_ref()
+                .map_or(&None, |event| &event.stack),
+        );
         Self::print_racing_accesses(&report.racing_accesses);
         println!("\n{}", report.additional_context);
         Ok(report)
@@ -1541,17 +1684,18 @@ impl AnalyzeOpts {
         let context = Self::generate_context(schedule, decision.max(1), self.execution_context);
 
         Report {
+            verdict: Verdict::CriticalEvents,
             header,
             additional_context: context,
             baseline_run: false,
-            critical_event1: ReportCriticalEvent {
+            critical_event1: Some(ReportCriticalEvent {
                 event_index: decision,
                 stack: chosen,
-            },
-            critical_event2: ReportCriticalEvent {
+            }),
+            critical_event2: Some(ReportCriticalEvent {
                 event_index: decision,
                 stack: instead,
-            },
+            }),
             branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: None,
             racing_accesses,
@@ -1810,17 +1954,18 @@ impl AnalyzeOpts {
         println!("\n{}", context);
 
         Ok(Some(Report {
+            verdict: Verdict::CriticalEvents,
             header,
             additional_context: context,
             baseline_run: false,
-            critical_event1: ReportCriticalEvent {
+            critical_event1: Some(ReportCriticalEvent {
                 event_index: event1,
                 stack: stack1,
-            },
-            critical_event2: ReportCriticalEvent {
+            }),
+            critical_event2: Some(ReportCriticalEvent {
                 event_index: event2,
                 stack: stack2,
-            },
+            }),
             branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: Some(ReportCriticalEvent {
                 event_index: decision,
@@ -1970,19 +2115,9 @@ impl AnalyzeOpts {
                     self.display_criteria()
                 );
             }
-            if self.search {
-                eprintln!(
-                    ":: {}",
-                    "First run did not match target criteria; now searching for a matching run..."
-                        .red()
-                        .bold()
-                );
-                let target = self.do_search()?;
-                self.record_endpoint(&target);
-                Ok(target)
-            } else {
-                bail!("FAILED. The run did not match the target criteria. Try --search.");
-            }
+            let target = self.after_a_first_run_that_missed(|| self.do_search())?;
+            self.record_endpoint(&target);
+            Ok(target)
         } else if self.has_filters() {
             eprintln!(
                 ":: {}",
@@ -2090,22 +2225,20 @@ impl AnalyzeOpts {
             let run1b_log_path = run1b.log_path().unwrap();
             let status = self.log_diff_preemption_replay(global, min_log_path, run1b_log_path);
 
-            if !run1b.is_a_match() {
-                bail!("First run matched criteria but second run did not.");
-            }
-            if !status.success() {
-                bail!(
-                    "Log differences found, aborting because --selfcheck requires perfect reproducibility of the target run!"
-                )
-            }
+            let matched = run1b.is_a_match();
             let run1b_preempts_path = run1b.preempts_path_out();
-            if !preempt_files_equal(&min_preempts_path, run1b_preempts_path) {
-                bail!(
-                    "The preemptions recorded by the additional run did not match the preemptions replayed (no fixed point): {} vs {}",
-                    min_preempts_path.display(),
-                    run1b_preempts_path.display(),
-                );
-            }
+            selfcheck_conclusion(matched, status.success(), || {
+                preempt_files_equal(&min_preempts_path, run1b_preempts_path)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        format!(
+                            "The preemptions recorded by the additional run did not match the \
+                             preemptions replayed (no fixed point): {} vs {}",
+                            min_preempts_path.display(),
+                            run1b_preempts_path.display(),
+                        )
+                    })
+            })?;
 
             eprintln!(
                 ":: {}",
@@ -2185,9 +2318,11 @@ impl AnalyzeOpts {
                     .to_string_lossy(),
             );
             if newrun.is_a_match() {
-                bail!(
-                    "Expectations not met... baseline run matched target criteria when it should not."
+                Err(AnalyzePrecondition::baseline_not_reproduced(
+                    "Expectations not met... baseline run matched target criteria when it should \
+                     not.",
                 )
+                .into())
             } else {
                 eprintln!("Good: baseline run does not match criteria (e.g. pass not fail).");
                 Ok(newrun)
@@ -2568,17 +2703,18 @@ impl AnalyzeOpts {
         }
 
         Ok(Report {
+            verdict: Verdict::CriticalEvents,
             header,
             additional_context: passing_context,
             baseline_run: true,
-            critical_event1: ReportCriticalEvent {
+            critical_event1: Some(ReportCriticalEvent {
                 event_index: critical_event_index - 1,
                 stack: stack1,
-            },
-            critical_event2: ReportCriticalEvent {
+            }),
+            critical_event2: Some(ReportCriticalEvent {
                 event_index: critical_event_index,
                 stack: stack2,
-            },
+            }),
             branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: None,
             racing_accesses,
@@ -2780,12 +2916,9 @@ impl AnalyzeOpts {
             baseline_sched_name,
             target_sched_name,
         );
-        let crit_sched = match self.phase5_bisect_traces(&target, &baseline) {
-            Ok(crit_sched) => crit_sched,
-            // The two endpoints differ in events only one run executed: the
-            // decision is still within the failing schedule, and a prefix
-            // search needs no baseline to find it.
-            Err(error) if error.downcast_ref::<NoSingleSwap>().is_some() => {
+        let crit_sched = match own_bisection_end(self.phase5_bisect_traces(&target, &baseline))? {
+            OwnBisectionEnd::Critical(crit_sched) => crit_sched,
+            OwnBisectionEnd::SearchPrefixes(error) => {
                 eprintln!(
                     ":: {} {error:#}\n:: Searching within the failing schedule instead \
                      (--prefix-search).",
@@ -2793,7 +2926,6 @@ impl AnalyzeOpts {
                 );
                 return self.prefix_search_and_report(&mut target_endpoint_run);
             }
-            Err(error) => return Err(error),
         };
 
         let target_run = target_endpoint_run.root_path();
@@ -2816,16 +2948,84 @@ impl AnalyzeOpts {
             target.schedevents().len(),
             target_endpoint_run.sched_out_file_name(),
         );
-        let decision = self.phase5_prefix_search(&target)?;
+        let searched = self.phase5_prefix_search(&target);
+        self.finish_prefix_search(searched)
+    }
+
+    /// Report what the prefix search `searched` found: the deciding event, or
+    /// a verdict that names none, which completes the analysis too. Any other
+    /// error ends it.
+    pub(super) fn finish_prefix_search(
+        &self,
+        searched: anyhow::Result<PrefixDecision>,
+    ) -> anyhow::Result<ExitStatus> {
+        let decision = match searched {
+            Ok(decision) => decision,
+            Err(error) => return self.write_verdict_and_exit(&error.downcast::<AnalyzeVerdict>()?),
+        };
         let report = self.phase6_record_prefix_outputs(decision)?;
         self.write_report_and_exit(report)
+    }
+
+    /// What follows a first run that missed the target: `--search` (`search`),
+    /// or the end of the analysis, its input not giving it a target run.
+    pub(super) fn after_a_first_run_that_missed(
+        &self,
+        search: impl FnOnce() -> anyhow::Result<RunData>,
+    ) -> anyhow::Result<RunData> {
+        if self.search {
+            eprintln!(
+                ":: {}",
+                "First run did not match target criteria; now searching for a matching run..."
+                    .red()
+                    .bold()
+            );
+            search()
+        } else {
+            Err(AnalyzePrecondition::target_not_reproduced(
+                "FAILED. The run did not match the target criteria. Try --search.",
+            )
+            .into())
+        }
+    }
+
+    /// Report `verdict`, a completed analysis that names no event: print it
+    /// as analyze prints any report, write it to `--report-file`, if given,
+    /// and return the exit status of a successful analysis, with the class
+    /// line on stderr.
+    pub(super) fn write_verdict_and_exit(
+        &self,
+        verdict: &AnalyzeVerdict,
+    ) -> anyhow::Result<ExitStatus> {
+        println!(
+            "\n------------------------------ hermit analyze report ------------------------------"
+        );
+        println!("{verdict}");
+        self.write_report_file(&Report {
+            verdict: verdict.verdict(),
+            header: verdict.to_string(),
+            additional_context: String::new(),
+            baseline_run: false,
+            critical_event1: None,
+            critical_event2: None,
+            deciding_event: None,
+            racing_accesses: None,
+        });
+        eprintln!("{}", verdict.class_line());
+        self.success_status()
     }
 
     /// Write `report` to `--report-file`, if given, and return the exit status
     /// of a successful analysis.
     fn write_report_and_exit(&self, report: Report) -> anyhow::Result<ExitStatus> {
+        self.write_report_file(&report);
+        self.success_status()
+    }
+
+    /// Write `report` to `--report-file`, if given.
+    fn write_report_file(&self, report: &Report) {
         if let Some(path) = &self.report_file {
-            let txt = serde_json::to_string(&report).unwrap();
+            let txt = serde_json::to_string(report).unwrap();
             std::fs::write(path, txt).expect("Unable to write report file");
             eprintln!(
                 ":: {}\n {}",
@@ -2833,6 +3033,10 @@ impl AnalyzeOpts {
                 path.display()
             );
         }
+    }
+
+    /// The exit status of a successful analysis: 0, or `--success-exit-code`.
+    fn success_status(&self) -> anyhow::Result<ExitStatus> {
         self.success_exit_code
             .map_or(Ok(ExitStatus::SUCCESS), |exit_code| {
                 Ok(ExitStatus::Exited(exit_code))
@@ -2870,7 +3074,10 @@ impl AnalyzeOpts {
             self.record_endpoint(&newrun);
             eprintln!("    {}", newrun.to_repro());
             if !newrun.is_a_match() {
-                bail!("Final preemption record still does not match target criteria");
+                return Err(AnalyzePrecondition::target_not_reproduced(
+                    "Final preemption record still does not match target criteria",
+                )
+                .into());
             }
             Ok(newrun)
         }
@@ -5381,6 +5588,14 @@ mod tests {
         );
 
         let alone = choose_continuation(&candidates, 50, |_, _| Ok(true)).unwrap_err();
+        // A completed analysis that names no event, not a failure.
+        assert!(
+            matches!(
+                alone.downcast_ref::<AnalyzeVerdict>(),
+                Some(AnalyzeVerdict::NoDecidingEvent(_))
+            ),
+            "{alone:#}"
+        );
         let message = alone.to_string();
         assert!(
             message.contains("the scheduler alone already meets the target criteria at a 1000 ns timeslice and at a 200000000 ns timeslice"),
@@ -5398,6 +5613,278 @@ mod tests {
             "{replay}"
         );
         assert!(replay.to_string().contains("--selfcheck"), "{replay}");
+        assert_eq!(
+            replay
+                .downcast_ref::<AnalyzePrecondition>()
+                .map(|precondition| precondition.class.name()),
+            Some("no-prefix-continuation"),
+            "{replay:#}"
+        );
+        assert_eq!(crate::failure_exit_code(&replay), 2);
+        assert_eq!(
+            crate::classify_failure(&replay),
+            "HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation"
+        );
+    }
+
+    /// A prefix search whose empty prefix already meets the target concludes
+    /// that no event decides the outcome, naming a coarser continuation it did
+    /// not try.
+    #[test]
+    fn an_empty_prefix_that_meets_the_target_is_a_verdict() {
+        let ns = |nanos: u64| NonZeroU64::new(nanos);
+        let candidates = [ns(1_000), ns(200_000_000)];
+        let error = Error::new(EmptyPrefixMeetsTarget);
+        let AnalyzeVerdict::NoDecidingEvent(explanation) =
+            empty_prefix_verdict(&error, &candidates, ns(1_000));
+        assert!(
+            explanation.starts_with("no event of the target schedule decides the outcome: ")
+                && explanation
+                    .contains("The search did not try continuing at a 200000000 ns timeslice"),
+            "{explanation}"
+        );
+        let AnalyzeVerdict::NoDecidingEvent(explanation) =
+            empty_prefix_verdict(&error, &candidates, ns(200_000_000));
+        assert!(!explanation.contains("did not try"), "{explanation}");
+    }
+
+    /// A verdict that names no event is reported as a completed analysis:
+    /// its report carries `"verdict": "no_deciding_event"` and the
+    /// explanation, and analyze exits as it does after naming an event (0, or
+    /// `--success-exit-code`). `main.rs` never sees it as an error.
+    #[test]
+    fn a_verdict_is_reported_and_ends_analyze_successfully() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.json");
+        let verdict = AnalyzeVerdict::NoDecidingEvent("no event decides the outcome".into());
+        for (extra, status) in [
+            (&[][..], ExitStatus::SUCCESS),
+            (&["--success-exit-code=3"][..], ExitStatus::Exited(3)),
+        ] {
+            let mut argv = vec![
+                "analyze".to_string(),
+                format!("--report-file={}", report.display()),
+            ];
+            argv.extend(extra.iter().map(|flag| flag.to_string()));
+            argv.extend(["--".to_string(), "/bin/true".to_string()]);
+            let options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            // Through the prefix search's end, as analyze reaches it.
+            let searched = Err(Error::new(verdict.clone()));
+            assert_eq!(options.finish_prefix_search(searched).unwrap(), status);
+            let text = std::fs::read_to_string(&report).unwrap();
+            let written: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                written,
+                serde_json::json!({
+                    "verdict": "no_deciding_event",
+                    "header": "no event decides the outcome",
+                    "additional_context": "",
+                    "baseline_run": false,
+                })
+            );
+            // One schema reads both kinds of report.
+            let parsed: Report = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed.verdict, Verdict::NoDecidingEvent);
+            assert_eq!(parsed.critical_event1, None);
+            std::fs::remove_file(&report).unwrap();
+        }
+        // Any other end of the search ends the analysis, writing no report.
+        let options = AnalyzeOpts::try_parse_from([
+            "analyze".to_string(),
+            format!("--report-file={}", report.display()),
+            "--".to_string(),
+            "/bin/true".to_string(),
+        ])
+        .unwrap();
+        let other = options
+            .finish_prefix_search(Err(
+                AnalyzePrecondition::no_prefix_continuation("none").into()
+            ))
+            .unwrap_err();
+        assert!(
+            other.downcast_ref::<AnalyzePrecondition>().is_some(),
+            "{other:#}"
+        );
+        assert!(!report.exists());
+        assert_eq!(
+            verdict.class_line(),
+            "HERMIT_ANALYZE_VERDICT class=no-deciding-event"
+        );
+    }
+
+    /// A first run that misses the target ends the analysis without --search,
+    /// an input that gives it no target run (exit 2, `target-not-reproduced`),
+    /// and searches with it.
+    #[test]
+    fn a_first_run_that_misses_ends_the_analysis_or_searches() {
+        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let mut searched = false;
+        let error = options
+            .after_a_first_run_that_missed(|| {
+                searched = true;
+                bail!("searched")
+            })
+            .err()
+            .unwrap();
+        assert!(!searched);
+        assert_eq!(crate::failure_exit_code(&error), 2, "{error:#}");
+        assert_eq!(
+            crate::classify_failure(&error),
+            "HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced"
+        );
+        assert!(error.to_string().contains("Try --search"), "{error}");
+
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--search", "--", "/bin/true"]).unwrap();
+        let error = options
+            .after_a_first_run_that_missed(|| bail!("searched"))
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "searched");
+    }
+
+    /// Both of the bisection's ends that no single reordering separates the
+    /// endpoints send analyze to a prefix search; other ends do not. An
+    /// endpoint of analyze's own that did not reproduce is pointed at replay.
+    #[test]
+    fn bisection_ends_are_answered_by_their_kind() {
+        for swaps_left in [0, 1] {
+            assert!(no_swap_separates(&Error::new(NoSingleSwap {
+                unshared_events: 2,
+                swaps_left,
+                trimmed_failing_passed: false,
+            })));
+        }
+        assert!(!no_swap_separates(&Error::new(
+            AnalyzePrecondition::target_not_reproduced("no")
+        )));
+
+        for precondition in [
+            AnalyzePrecondition::target_not_reproduced("the failing endpoint did not."),
+            AnalyzePrecondition::baseline_not_reproduced("the passing endpoint did not."),
+        ] {
+            let class = precondition.class;
+            let pointed = point_endpoint_misses_at_replay(precondition.into());
+            let pointed_precondition = pointed.downcast_ref::<AnalyzePrecondition>().unwrap();
+            assert_eq!(pointed_precondition.class, class);
+            let message = pointed.to_string();
+            assert!(
+                message.contains("--selfcheck") && message.contains("hermit host-capabilities"),
+                "{message}"
+            );
+        }
+        let other = point_endpoint_misses_at_replay(anyhow::anyhow!("other"));
+        assert_eq!(other.to_string(), "other");
+    }
+
+    /// Analyze's own bisection goes on to a prefix search when no swap
+    /// separates its endpoints, and an endpoint that did not reproduce ends it
+    /// pointed at replay: --selfcheck and `hermit host-capabilities`, with the
+    /// class kept (exit 2). Other errors pass through unchanged.
+    #[test]
+    fn analyze_own_bisection_points_endpoint_misses_at_replay() {
+        let separable = own_bisection_end(Err(Error::new(NoSingleSwap {
+            unshared_events: 1,
+            swaps_left: 0,
+            trimmed_failing_passed: false,
+        })));
+        assert!(matches!(separable, Ok(OwnBisectionEnd::SearchPrefixes(_))));
+        for (precondition, class) in [
+            (
+                AnalyzePrecondition::target_not_reproduced(
+                    "the failing schedule endpoint did not reproduce the target failure",
+                ),
+                "target-not-reproduced",
+            ),
+            (
+                AnalyzePrecondition::baseline_not_reproduced(
+                    "the passing schedule endpoint did not reproduce a passing outcome",
+                ),
+                "baseline-not-reproduced",
+            ),
+        ] {
+            let Err(error) = own_bisection_end(Err(precondition.into())) else {
+                panic!("an endpoint miss ended no analysis")
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("--selfcheck") && message.contains("`hermit host-capabilities`"),
+                "{message}"
+            );
+            assert_eq!(crate::failure_exit_code(&error), 2);
+            assert_eq!(
+                crate::classify_failure(&error),
+                format!("HERMIT_ANALYZE_PRECONDITION class={class}")
+            );
+        }
+        let Err(other) = own_bisection_end(Err(anyhow::anyhow!("other"))) else {
+            panic!("an error ended no analysis")
+        };
+        assert_eq!(other.to_string(), "other");
+    }
+
+    /// --selfcheck's differences are replay not reproducing, Hermit's or the
+    /// host's: exit 125 with `class=replay-not-reproducible`, never an input
+    /// analyze cannot use. The first difference found is reported.
+    #[test]
+    fn a_selfcheck_difference_is_replay_not_reproducing() {
+        assert!(selfcheck_conclusion(true, true, || Ok(())).is_ok());
+        for (matched, logs, fixed_point, expected) in [
+            (false, true, true, "second run did not"),
+            (true, false, true, "Log differences found"),
+            (true, true, false, "no fixed point"),
+        ] {
+            let error = selfcheck_conclusion(matched, logs, || {
+                if fixed_point {
+                    Ok(())
+                } else {
+                    Err("no fixed point".to_string())
+                }
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(expected)
+                    && error.to_string().contains("hermit host-capabilities"),
+                "{error}"
+            );
+            assert_eq!(crate::failure_exit_code(&error), 125);
+            assert_eq!(
+                crate::classify_failure(&error),
+                "HERMIT_INTERNAL_FAILURE class=replay-not-reproducible"
+            );
+        }
+    }
+
+    /// `--success-exit-code` refuses the statuses that already mean something
+    /// for analyze, naming why.
+    #[test]
+    fn a_success_exit_code_that_means_something_else_is_refused() {
+        for code in ["2", "120", "122", "125", "127"] {
+            let error = AnalyzeOpts::try_parse_from([
+                "analyze",
+                "--success-exit-code",
+                code,
+                "--",
+                "/bin/true",
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&format!("{code} is")) && error.contains("could not be told apart"),
+                "{code}: {error}"
+            );
+        }
+        for code in ["0", "1", "3", "119", "128"] {
+            let options = AnalyzeOpts::try_parse_from([
+                "analyze",
+                "--success-exit-code",
+                code,
+                "--",
+                "/bin/true",
+            ])
+            .unwrap();
+            assert_eq!(options.success_exit_code, Some(code.parse().unwrap()));
+        }
     }
 
     /// Prefix outcomes need not be monotone. A guest whose thread B stores 2
@@ -6096,6 +6583,13 @@ mod tests {
             !serde_json::to_string(&report)
                 .unwrap()
                 .contains("deciding_event")
+        );
+        // Nor had it a verdict: it named the critical events, and says so now.
+        assert_eq!(report.verdict, Verdict::CriticalEvents);
+        assert!(
+            serde_json::to_string(&report)
+                .unwrap()
+                .starts_with(r#"{"verdict":"critical_events","#)
         );
     }
 

@@ -22,6 +22,7 @@ use serde::Serialize;
 use tracing::metadata::LevelFilter;
 
 use crate::app::analyze::races::RacingAccesses;
+use crate::app::analyze::verdict::Verdict;
 
 /// Repeat a run multiple times in a controlled search to find concurrency bugs.
 ///
@@ -353,8 +354,10 @@ pub struct AnalyzeOpts {
     pub keep_tmp: bool,
 
     /// Specify that analyze itself should return a non-zero exit code on success.
-    /// This is needed under esoteric invocation scenarios.
-    #[clap(long, value_name = "INT32")]
+    /// This is needed under esoteric invocation scenarios. 2 and 120 to 127 are refused:
+    /// analyze exits 2 when its inputs do not give it what it needs, and Hermit reserves
+    /// 120 to 127 for its own statuses.
+    #[clap(long, value_name = "INT32", value_parser = parse_success_exit_code)]
     pub success_exit_code: Option<i32>,
 
     /// Additional arguments to pass through unmodified to the hermit run subcommand.  While
@@ -587,23 +590,54 @@ impl FromStr for ExitStatusConstraint {
     }
 }
 
+/// `--success-exit-code`: any status but those that already mean something
+/// else for analyze (see the exit-code allocation table in `hermit::lib`).
+fn parse_success_exit_code(text: &str) -> Result<i32, String> {
+    let code: i32 = text
+        .parse()
+        .map_err(|error| format!("{text:?} is not a 32-bit integer: {error}"))?;
+    match code {
+        hermit::HERMIT_ANALYZE_PRECONDITION_EXIT => Err(format!(
+            "{code} is the status analyze exits with when its inputs do not give it what it \
+             needs (HERMIT_ANALYZE_PRECONDITION), so a success could not be told apart from it"
+        )),
+        120..=127 => Err(format!(
+            "{code} is in 120 to 127, which Hermit reserves for its own statuses (122 a refusal, \
+             123 the log cap, 124 a deadline, 125 an internal failure, 126 and 127 a program \
+             that cannot run), so a success could not be told apart from them"
+        )),
+        _ => Ok(code),
+    }
+}
+
 /// The final report that comes out of the analyze process.
 #[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
 pub struct Report {
+    /// What the analysis concluded; read it first. `critical_events` names
+    /// the critical events below. `no_deciding_event` names none: the header
+    /// says why, and the event fields are absent. A report without the field,
+    /// from before it, names the critical events.
+    #[serde(default)]
+    pub verdict: Verdict,
+
     /// A header containing some contextual information, to go at the beginning of the report.
     pub header: String,
 
     /// Some additional context about where in the execution the issue occured. (Basically used as a footer.)
+    #[serde(default)]
     pub additional_context: String,
 
     /// Is it a baseline run (e.g. passing run) vs a target run (e.g. failing/crashing).
+    #[serde(default)]
     pub baseline_run: bool,
 
     /// The runtime context for one critical event, which is racing with, and does not commute with
-    /// the other.
-    pub critical_event1: ReportCriticalEvent,
+    /// the other. Absent when the verdict names no event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_event1: Option<ReportCriticalEvent>,
     /// The runtime context for the other identified critical event.
-    pub critical_event2: ReportCriticalEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_event2: Option<ReportCriticalEvent>,
 
     /// The warning line, without its newline, that `hermit analyze` or `hermit bisect` printed
     /// before its first trial because those trials read a retired-branch counter that failed

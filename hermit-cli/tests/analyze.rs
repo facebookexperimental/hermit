@@ -417,6 +417,9 @@ fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts
         combined.contains("baseline run matched target criteria when it should not"),
         "{label}: analyze did not reject indistinguishable endpoints\n{combined}"
     );
+    // A baseline that meets the target is an input analyze cannot use, not a
+    // failure of Hermit.
+    assert_precondition(label, &output, "baseline-not-reproduced");
     // The error is about the baseline run: its reproducer and the output that
     // met the target stay to be read.
     assert_workspace_kept_after_error(
@@ -1137,6 +1140,88 @@ fn analyze_ends_with_a_refused_target_run() {
     );
 }
 
+/// Stdout and stderr of `output`, together.
+/// Analyze (or bisect) ended because its inputs do not give it what it
+/// needs: exit 2, the precondition's class line on stderr, and no internal
+/// failure (125 and `HERMIT_INTERNAL_FAILURE class=cli-error` before).
+fn assert_precondition(label: &str, output: &Output, class: &str) {
+    let combined = combined_output(output);
+    assert_eq!(
+        output.status.code(),
+        Some(hermit::HERMIT_ANALYZE_PRECONDITION_EXIT),
+        "{label}\n{combined}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = format!("HERMIT_ANALYZE_PRECONDITION class={class}");
+    assert!(
+        stderr.lines().any(|candidate| candidate == line)
+            && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+        "{label}: no {line:?}\n{combined}"
+    );
+}
+
+/// `hermit bisect` verifies its endpoints as analyze does: a --good schedule
+/// that meets the target is an input it cannot use, so it ends with exit 2
+/// and `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced`, as
+/// analyze would. Before, it exited 125 with `HERMIT_INTERNAL_FAILURE
+/// class=cli-error`.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn bisect_exits_2_when_its_good_schedule_meets_the_target() {
+    let label = "bisect analyze_race_then, --good meets the target";
+    let guest = &workloads().race_then;
+    let then = "exit";
+    let target_seed = race_then_target_seed();
+    // Not in /tmp: the schedule is written where the guest's /tmp is not.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create bisect directory");
+    let record = |seed: u64| -> (PathBuf, Vec<u8>) {
+        let schedule = dir.path().join(format!("seed-{seed}.json"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            // One epoch for both schedules, which bisect requires.
+            .args([
+                "run",
+                "--chaos",
+                "--timeout=5",
+                "--epoch=2026-01-01T00:00:00Z",
+            ])
+            .arg(format!("--seed={seed}"))
+            .arg(format!("--record-preemptions-to={}", schedule.display()))
+            .arg("--")
+            .arg(guest)
+            .arg(then);
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        (schedule, output.stdout)
+    };
+    let (target, stdout) = record(target_seed);
+    assert_eq!(stdout, b"b-first\n", "{label}: target seed {target_seed}");
+    let (passing, _) = (0..40)
+        .filter(|&seed| seed != target_seed)
+        .map(record)
+        .find(|(_, stdout)| stdout == b"a-first\n")
+        .expect("no chaos seed in 0..40 lets thread a win the race");
+    let _guard = analyze_lock();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .arg("bisect")
+        // Swapped: the schedule called good is the one that meets the target.
+        .arg(format!("--good={}", target.display()))
+        .arg(format!("--bad={}", passing.display()))
+        .args(["--target-stdout=b-first", "--target-exit-code=0"])
+        .args(["--", "--timeout=30", "--"])
+        .arg(guest)
+        .arg(then);
+    let output = hermit_test::hermit_output(label, &mut command);
+    assert!(
+        combined_output(&output)
+            .contains("the passing schedule endpoint did not reproduce a passing outcome"),
+        "{label}\n{}",
+        combined_output(&output)
+    );
+    assert_precondition(label, &output, "baseline-not-reproduced");
+}
+
 /// `hermit analyze` of the analyze_race_then fixture in mode `then` (one
 /// that terminates whichever thread wins), with `analyze_opts` and the run
 /// arguments `run_args`, from a chaos seed under which thread b wins: the
@@ -1228,19 +1313,38 @@ fn analyze_continues_prefixes_at_a_coarser_timeslice() {
 }
 
 /// The same race with `--continuation-timeslice=100000`: there is no other
-/// continuation to try, so analyze fails, saying what its empty-prefix trial
-/// observed (no miss to bisect against) and what to run or pass instead.
+/// continuation to try, so analyze concludes that the outcome does not
+/// depend on a chaos decision, and says what to run or pass instead. That is
+/// a completed analysis: exit 0, `HERMIT_ANALYZE_VERDICT
+/// class=no-deciding-event`, and a report whose verdict says so. Before, it
+/// exited 125 with `HERMIT_INTERNAL_FAILURE class=cli-error`.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_explains_a_target_the_scheduler_meets_alone() {
     let label = "analyze --prefix-search analyze_race_then late-a --continuation-timeslice=100000";
-    let (output, _) = analyze_race_then_with(
+    let (output, report) = analyze_race_then_with(
         "late-a",
         &["--prefix-search", "--continuation-timeslice=100000"],
         &["--max-timeslice=100000"],
     );
     let combined = combined_output(&output);
-    assert!(!output.status.success(), "{label}\n{combined}");
+    assert_eq!(output.status.code(), Some(0), "{label}\n{combined}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "HERMIT_ANALYZE_VERDICT class=no-deciding-event")
+            && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+        "{label}\n{combined}"
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    assert_eq!(report["verdict"], "no_deciding_event", "{label}: {report}");
+    assert!(
+        report["header"].as_str().is_some_and(
+            |header| header.starts_with("no event of the target schedule decides the outcome")
+        ),
+        "{label}: {report}"
+    );
     for expected in [
         "no continuation gives the prefix search a miss to bisect against: replaying none of the \
          target schedule and then scheduling without chaos, the scheduler alone already meets \
@@ -1255,6 +1359,61 @@ fn analyze_explains_a_target_the_scheduler_meets_alone() {
             "{label}: no {expected:?}\n{combined}"
         );
     }
+}
+
+/// A target the scheduler meets without chaos at every timeslice (thread a
+/// winning the race, which it does unless chaos or a tiny timeslice lets b
+/// in): the prefix search concludes that no event decides the outcome, a
+/// completed analysis that exits 0 with `HERMIT_ANALYZE_VERDICT
+/// class=no-deciding-event` and a report whose verdict says so. Unlike
+/// `analyze_explains_a_target_the_scheduler_meets_alone`, it needs no short
+/// timeslice, so it does not depend on preemption repeating on the host.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_concludes_no_event_decides_a_target_met_without_chaos() {
+    let label = "analyze --prefix-search analyze_race_then exit, target a-first";
+    let guest = &workloads().race_then;
+    let _guard = analyze_lock();
+    let dir = tempfile::tempdir().expect("failed to create analyze report directory");
+    let report_file = dir.path().join("report.json");
+    let tmp_dir = tmp_dir_in(dir.path());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["analyze", "--prefix-search", "--target-stdout=a-first"])
+        .args(["--target-exit-code=nonzero", "--run1-seed=0"])
+        .arg(format!("--report-file={}", report_file.display()))
+        .arg(format!("--tmp-dir={}", tmp_dir.display()))
+        .args(["--", "--chaos", "--timeout=30", "--"])
+        .arg(guest)
+        .arg("exit");
+    let output = hermit_test::hermit_output(label, &mut command);
+    let combined = combined_output(&output);
+    assert_eq!(output.status.code(), Some(0), "{label}\n{combined}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "HERMIT_ANALYZE_VERDICT class=no-deciding-event")
+            && !stderr.contains("HERMIT_INTERNAL_FAILURE"),
+        "{label}\n{combined}"
+    );
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&report_file)
+            .unwrap_or_else(|error| panic!("{label}: no report: {error}\n{combined}")),
+    )
+    .unwrap();
+    assert_eq!(report["verdict"], "no_deciding_event", "{label}: {report}");
+    assert!(
+        report["header"]
+            .as_str()
+            .is_some_and(|header| header.starts_with(
+                "no event of the target schedule decides the outcome: without chaos, the scheduler \
+             alone already meets the target criteria"
+            )),
+        "{label}: {report}"
+    );
+    assert!(report.get("critical_event1").is_none(), "{label}: {report}");
+    assert_no_workspace_left(label, &tmp_dir, &combined);
 }
 
 /// An analysis that ends with an error keeps its workspace, with or without
@@ -1288,6 +1447,7 @@ fn analyze_keeps_its_workspace_after_an_error() {
             "{label}: {}\n{combined}",
             output.status
         );
+        assert_precondition(&label, &output, "target-not-reproduced");
         let left = left_in(&tmp_dir);
         assert!(
             left.len() == 1 && left[0].join("run1_target.repro").is_file(),

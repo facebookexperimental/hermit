@@ -25,6 +25,9 @@ use detcore::types::SchedEvent;
 /// on a host whose branch counter is not exact ([`Config::max_branch_count_jitter`]).
 pub const INEXACT_COUNTER_BRANCH_JITTER: u32 = 64;
 
+use crate::analyze::AnalyzeFailure;
+use crate::analyze::AnalyzePrecondition;
+
 /// User configurable settings.
 pub struct Config {
     pub max_jitter_editdist: usize,
@@ -171,13 +174,22 @@ where
     F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
     eprintln!("Verifying pass/fail endpoints of the search, using schedule-trace replay:");
+    // The endpoints are the search's inputs (`hermit bisect`'s --good and
+    // --bad too): one that does not reproduce its outcome ends the search as
+    // an `AnalyzePrecondition`, not as a failure of Hermit.
     let (passing_endpoint_passes, _) = tester(&initial_passing_schedule)?;
     if !passing_endpoint_passes {
-        bail!("the passing schedule endpoint did not reproduce a passing outcome");
+        return Err(AnalyzePrecondition::baseline_not_reproduced(
+            "the passing schedule endpoint did not reproduce a passing outcome",
+        )
+        .into());
     }
     let (failing_endpoint_passes, _) = tester(&initial_failing_schedule)?;
     if failing_endpoint_passes {
-        bail!("the failing schedule endpoint did not reproduce the target failure");
+        return Err(AnalyzePrecondition::target_not_reproduced(
+            "the failing schedule endpoint did not reproduce the target failure",
+        )
+        .into());
     }
 
     // Do the first level search at the event level
@@ -504,7 +516,8 @@ where
         replays.push((replayed_passes, replayed_actual));
     }
 
-    anyhow::bail!(
+    // Replay itself, Hermit's or the host's, did not reproduce.
+    Err(AnalyzeFailure::ReplayNotReproducible(format!(
         "jittered schedule replay was not stable after {} attempts; refusing to attach an outcome \
          to the requested control schedule. Replays of one schedule realized different traces \
          ({}), so this program's schedule cannot be replayed reproducibly here; on a host whose \
@@ -515,7 +528,8 @@ where
             Some(jitter) => format!("more than {jitter} branches apart or in another order"),
             None => "not identical, on a host whose branch counter is exact".to_owned(),
         },
-    );
+    ))
+    .into())
 }
 
 /// Search of the schedule space to find the critical schedule
@@ -596,10 +610,11 @@ where
         }
     }
 
-    anyhow::bail!(
+    Err(AnalyzeFailure::SearchDidNotConverge(format!(
         "event-level search failed: no convergence after {} passes",
         cfg.max_event_level_search_passes
-    );
+    ))
+    .into())
 }
 
 /// Generate a permutation between source and target and print unmatched events (up to a limit).
@@ -773,10 +788,11 @@ where
         }
     }
 
-    anyhow::bail!(
+    Err(AnalyzeFailure::SearchDidNotConverge(format!(
         "event-level search failed: no convergence after {} passes",
         cfg.max_event_level_search_passes
-    );
+    ))
+    .into())
 }
 
 /// Returns `(prefix, postfix)` respectively, of events that are `same`.
@@ -1298,6 +1314,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("passing schedule endpoint"));
+        assert_endpoint_precondition(&error, "baseline-not-reproduced");
 
         let error = search_for_critical_schedule(
             |schedule| Ok((true, schedule.to_vec())),
@@ -1307,6 +1324,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("failing schedule endpoint"));
+        assert_endpoint_precondition(&error, "target-not-reproduced");
+    }
+
+    /// An endpoint that does not reproduce its outcome is an input analyze
+    /// cannot use, and so is `hermit bisect`'s --good or --bad, which this
+    /// search verifies the same way (`phase5_bisect_traces`): both commands
+    /// end with exit 2 and the precondition's class line, not as a failure of
+    /// Hermit (125 and `HERMIT_INTERNAL_FAILURE class=cli-error` before).
+    fn assert_endpoint_precondition(error: &anyhow::Error, class: &str) {
+        assert_eq!(
+            error
+                .downcast_ref::<AnalyzePrecondition>()
+                .map(|precondition| precondition.class.name()),
+            Some(class),
+            "{error:#}"
+        );
+        assert_eq!(crate::failure_exit_code(error), 2, "{error:#}");
+        assert_eq!(
+            crate::classify_failure(error),
+            format!("HERMIT_ANALYZE_PRECONDITION class={class}")
+        );
     }
 
     #[test]
@@ -1609,6 +1647,83 @@ mod tests {
         let error = test_and_select_stable_point(&mut tester, &requested, &cfg).unwrap_err();
         assert!(error.to_string().contains("was not stable"), "{error}");
         assert_eq!(trial, cfg.max_replay_attempts);
+        // Replay did not reproduce: a failure of Hermit or the host, named.
+        assert!(
+            matches!(
+                error.downcast_ref::<AnalyzeFailure>(),
+                Some(AnalyzeFailure::ReplayNotReproducible(_))
+            ),
+            "{error:#}"
+        );
+        assert_eq!(crate::failure_exit_code(&error), 125);
+        assert_eq!(
+            crate::classify_failure(&error),
+            "HERMIT_INTERNAL_FAILURE class=replay-not-reproducible"
+        );
+    }
+
+    /// Schedules that differ only in events one of them executed end the
+    /// search with [`NoSingleSwap`], which analyze answers with an attempt at a
+    /// prefix search and bisect reports as `endpoints-not-separable` (exit
+    /// 2). A search that runs out of passes, at the event level or through
+    /// Needleman-Wunsch, did not conclude: 125 with
+    /// `class=search-did-not-converge`.
+    #[test]
+    fn the_searches_ends_are_typed() {
+        let a = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let b = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let extra = SchedEvent::syscall(DetTid::from_raw(7), Sysno::close, SyscallPhase::Prehook);
+        let passes_without_extra = |schedule: &[SchedEvent]| -> TrialOutcome {
+            Ok((!schedule.contains(&extra), schedule.to_vec()))
+        };
+        let error = search_for_critical_schedule(
+            passes_without_extra,
+            vec![a.clone(), b.clone()],
+            vec![a.clone(), b.clone(), extra.clone()],
+            &Config::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<NoSingleSwap>()
+                .is_some_and(|ended| ended.swaps_left == 0),
+            "{error:#}"
+        );
+        assert_eq!(crate::failure_exit_code(&error), 2);
+        assert_eq!(
+            crate::classify_failure(&error),
+            "HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable"
+        );
+
+        for needleman_search in [false, true] {
+            let fails_when_b_first = |schedule: &[SchedEvent]| -> TrialOutcome {
+                Ok((schedule.first() != Some(&b), schedule.to_vec()))
+            };
+            let cfg = Config {
+                max_event_level_search_passes: 0,
+                needleman_search,
+                ..Default::default()
+            };
+            let error = search_for_critical_schedule(
+                fails_when_b_first,
+                vec![a.clone(), b.clone()],
+                vec![b.clone(), a.clone()],
+                &cfg,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<AnalyzeFailure>(),
+                    Some(AnalyzeFailure::SearchDidNotConverge(_))
+                ),
+                "needleman {needleman_search}: {error:#}"
+            );
+            assert_eq!(crate::failure_exit_code(&error), 125);
+            assert_eq!(
+                crate::classify_failure(&error),
+                "HERMIT_INTERNAL_FAILURE class=search-did-not-converge"
+            );
+        }
     }
 
     /// Two agreeing replays classify a control schedule even when the first

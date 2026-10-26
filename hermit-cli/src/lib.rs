@@ -151,6 +151,23 @@ pub const RECORD_REPLAY_VIRTUALIZES_TIME: bool = false;
 /// one of its own accord.
 pub const HERMIT_VERIFICATION_DIVERGENCE_EXIT: i32 = 1;
 
+/// Exit status of `hermit analyze` and `hermit bisect` when their inputs do
+/// not give them what they need: **2**.
+///
+/// The target run does not meet the target criteria, the baseline does not
+/// miss it or does not finish, no continuation allows a prefix search, or
+/// bisect's endpoints are identical or no reordering separates them.
+/// Analyze concluded that, and says what to change; Hermit did not fail, so
+/// it is not 125, and no fail-closed policy refused a run, so it is not 122
+/// (which analyze exits with when Hermit refuses one of its runs). It
+/// completes the convention [`HERMIT_VERIFICATION_DIVERGENCE_EXIT`] follows,
+/// that of `diff`, `cmp` and `grep`: 0 an answer, 1 a difference, 2 trouble
+/// doing what was asked. clap's usage error is 2 as well, and the class line
+/// `HERMIT_ANALYZE_PRECONDITION class=...` on stderr tells the two apart.
+///
+/// Neither command passes a guest's status through, so for them 2 is not a
+/// guest's; for `hermit run` it still is (see the allocation table below).
+pub const HERMIT_ANALYZE_PRECONDITION_EXIT: i32 = 2;
 /// Exit status for a failure of HERMIT ITSELF, as distinct from the guest's.
 ///
 /// ⚠️ EVERY CLI ERROR USED TO BE `Exited(1)`, WHICH IS THE SINGLE MOST COMMON
@@ -297,9 +314,12 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //   0          success.
 //   1          HERMIT_VERIFICATION_DIVERGENCE_EXIT, matching `diff`; also a
 //              legal guest status. Read the verification JSON to distinguish.
-//   2 ..= 120  THE GUEST'S OWN STATUS, passed through untouched. (The range
-//              stops at 120 because 121 is reserved below; a guest may still
-//              CHOOSE any value, see the caveat at the end.)
+//   2 ..= 120  `hermit run`: THE GUEST'S OWN STATUS, passed through untouched.
+//              (The range stops at 120 because 121 is reserved below; a guest
+//              may still CHOOSE any value, see the caveat at the end.)
+//              `hermit analyze` and `hermit bisect` pass no guest status
+//              through; for them 2 is HERMIT_ANALYZE_PRECONDITION_EXIT (see
+//              their table below).
 //   121        HERMIT_GUEST_DEADLOCK_EXIT -- DEADLOCK UNDER HERMIT'S MODEL:
 //              Detcore's scheduler found every remaining thread blocked with
 //              no wake it models and printed its "Deadlock detected" report.
@@ -346,6 +366,32 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //   128 + N    killed by signal N (shell convention). Hermit does not emit these
 //              deliberately; a wrapper reporting a signal death must use them
 //              rather than borrow a code that already means something.
+//
+// `hermit analyze` AND `hermit bisect`, the whole of their exit statuses. The
+// class line is the first line on stderr; it, not the number, says which.
+//
+//   0          a completed analysis (or `--success-exit-code`, which refuses 2
+//              and 120 ..= 127): the report names the critical events
+//              (verdict `critical_events`; no class line), or no event decides
+//              the outcome (verdict `no_deciding_event`,
+//              `HERMIT_ANALYZE_VERDICT class=no-deciding-event`).
+//   2          HERMIT_ANALYZE_PRECONDITION_EXIT -- the inputs do not give
+//              analyze what it needs, `diff`'s "trouble":
+//              `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced`,
+//              `class=baseline-not-reproduced`, `class=no-prefix-continuation`,
+//              `class=endpoints-not-separable` (bisect; analyze searches
+//              within the target schedule instead) or `class=endpoints-identical`
+//              (bisect). clap's usage error is 2 too, with no class line.
+//   122        HERMIT_POLICY_REFUSAL_EXIT: Hermit refused the target run, or
+//              analyze or bisect refused its options or schedules
+//              (`HERMIT_POLICY_REFUSAL class=policy-refusal`).
+//   123        HERMIT_LOG_CAP_EXIT (`HERMIT_LOG_CAP class=log-cap`).
+//   125        HERMIT_INTERNAL_FAILURE_EXIT -- analyze could not conclude:
+//              `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible`
+//              (--selfcheck found a difference, or a jittered schedule never
+//              replayed the same way twice), `class=search-did-not-converge`,
+//              or another `HERMIT_INTERNAL_FAILURE class=` for Hermit failing.
+//   128 + N    analyze stopped by signal N (SIGTERM, SIGINT or SIGHUP).
 //
 // ⚠️ NO CODE IS EXCLUSIVELY HERMIT'S. Every value in 0..=255 is a legal guest
 // status, so a guest may return 125 or 127 of its own accord and this table
@@ -419,6 +465,10 @@ const _: () = assert!(
     "1 is the established diff-style result for a completed comparison that diverged"
 );
 const _: () = assert!(
+    HERMIT_ANALYZE_PRECONDITION_EXIT == 2,
+    "2 is diff's trouble code, which analyze's unusable inputs follow; see the allocation table"
+);
+const _: () = assert!(
     HERMIT_INTERNAL_FAILURE_EXIT == 125,
     "125 is the GNU wrapper-failed convention; 1 is the commonest guest status and 0 is success"
 );
@@ -438,6 +488,7 @@ const _: () = assert!(
     HERMIT_LOG_CAP_EXIT != 0
         && HERMIT_VERIFICATION_DIVERGENCE_EXIT != 0
         && HERMIT_INTERNAL_FAILURE_EXIT != 0
+        && HERMIT_ANALYZE_PRECONDITION_EXIT != 0
         && GUEST_PROGRAM_NOT_FOUND_EXIT != 0
         && GUEST_PROGRAM_NOT_EXECUTABLE_EXIT != 0,
     "a failure code of 0 would invert every assert_eq!(code, Some(CONST)) into demanding success"
