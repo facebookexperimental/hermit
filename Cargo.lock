@@ -879,6 +879,7 @@ dependencies = [
  "clap",
  "detcore-model",
  "futures 0.3.33",
+ "goblin",
  "hex",
  "libc",
  "nix 0.30.1",

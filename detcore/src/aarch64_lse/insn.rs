@@ -23,14 +23,19 @@
 /// only in the base-register position, which the rewriter refuses.
 pub type Reg = u8;
 
+/// The zero register, XZR or WZR, in the positions these encodings use it.
 pub const ZR: Reg = 31;
 
 /// Access size of an exclusive or atomic access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Size {
+    /// A byte.
     B = 0,
+    /// A halfword.
     H = 1,
+    /// A word, with 32-bit value registers.
     W = 2,
+    /// A doubleword, with 64-bit value registers.
     X = 3,
 }
 
@@ -53,43 +58,64 @@ impl Size {
 /// Memory ordering carried by one half of an exclusive pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Ordering {
+    /// Load-acquire semantics (`LDAXR`, or the `A` of an atomic).
     pub acquire: bool,
+    /// Store-release semantics (`STLXR`, or the `L` of an atomic).
     pub release: bool,
 }
 
 /// The data-processing operations an RMW idiom may use between its pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AluOp {
+    /// `ADD`.
     Add,
+    /// `SUB`.
     Sub,
+    /// `AND`.
     And,
+    /// `ORR`.
     Orr,
+    /// `EOR`.
     Eor,
+    /// `BIC`: and with the complement.
     Bic,
 }
 
 /// The second operand of a decoded data-processing instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
+    /// A register, unshifted.
     Reg(Reg),
+    /// An immediate, already shifted into place.
     Imm(u32),
 }
 
+/// One decoded instruction: the subset the rewriter reasons about, and
+/// [`Insn::Other`] for everything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Insn {
     /// LDXR/LDAXR and their byte and halfword forms.
     LoadExcl {
+        /// The access size.
         size: Size,
+        /// Acquire or not.
         ord: Ordering,
+        /// The loaded register.
         rt: Reg,
+        /// The base address register.
         rn: Reg,
     },
     /// STXR/STLXR and their byte and halfword forms.
     StoreExcl {
+        /// The access size.
         size: Size,
+        /// Release or not.
         ord: Ordering,
+        /// The status register: 0 when the store succeeded, 1 when it failed.
         rs: Reg,
+        /// The stored register.
         rt: Reg,
+        /// The base address register.
         rn: Reg,
     },
     /// LDXP/LDAXP/STXP/STLXP: recognised so they are reported, never rewritten.
@@ -98,48 +124,69 @@ pub enum Insn {
     /// with no shift. `rd` is never the zero register here: a flag-setting or
     /// discarding form decodes as [`Insn::Cmp`] or [`Insn::Other`].
     Alu {
+        /// The operation.
         op: AluOp,
+        /// 64-bit (`X` registers) rather than 32-bit.
         sf: bool,
+        /// The destination.
         rd: Reg,
+        /// The first operand.
         rn: Reg,
+        /// The second operand.
         operand: Operand,
     },
     /// UXTB/UXTH: a zero extension, which proves the bits above its width
     /// are clear in the destination.
     ZeroExtend {
+        /// The width kept: 8 for UXTB, 16 for UXTH.
         bits: u32,
+        /// The destination.
         rd: Reg,
+        /// The source.
         rn: Reg,
     },
     /// SUBS with a discarded result: CMP, register or immediate.
     Cmp {
+        /// 64-bit rather than 32-bit.
         sf: bool,
+        /// The first operand.
         rn: Reg,
+        /// The second operand.
         operand: Operand,
     },
     /// CBZ/CBNZ.
     CompareBranch {
+        /// CBNZ rather than CBZ.
         nonzero: bool,
+        /// 64-bit rather than 32-bit.
         sf: bool,
+        /// The tested register.
         rt: Reg,
         /// Byte offset from this instruction.
         offset: i64,
     },
     /// B.cond.
     CondBranch {
+        /// The condition code.
         cond: u32,
+        /// Byte offset from this instruction.
         offset: i64,
     },
     /// B and BL.
     Branch {
+        /// BL rather than B.
         link: bool,
+        /// Byte offset from this instruction.
         offset: i64,
     },
     /// TBZ/TBNZ.
     TestBranch {
+        /// Byte offset from this instruction.
         offset: i64,
     },
+    /// CLREX: clears the local exclusive monitor.
     Clrex,
+    /// NOP.
     Nop,
     /// Anything outside the decoded subset, including every indirect branch.
     Other,
@@ -150,6 +197,8 @@ fn sign_extend(value: u32, bits: u32) -> i64 {
     ((value as i64) << shift) >> shift
 }
 
+/// Decode one instruction word. Total: every word decodes, to
+/// [`Insn::Other`] when it is outside the subset.
 pub fn decode(word: u32) -> Insn {
     // C3.2.6: exclusives share bits 29:24 = 001000 with the FEAT_LSE compare-
     // and-swap instructions, which set bit 23; those are left as Other.
@@ -349,7 +398,9 @@ pub fn decode(word: u32) -> Insn {
     Insn::Other
 }
 
+/// The `NOP` encoding.
 pub const NOP: u32 = 0xd503_201f;
+/// The `CLREX` encoding (with the default, ignored, `CRm`).
 pub const CLREX: u32 = 0xd503_3f5f;
 
 fn sf_bit(sf: bool) -> u32 {
@@ -402,10 +453,15 @@ pub fn mvn(sf: bool, rd: Reg, rm: Reg) -> u32 {
 /// The FEAT_LSE atomic memory operations this rewriter emits (C3.2.12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtomicOp {
+    /// `LDADD`.
     Add = 0,
+    /// `LDCLR`: clear the bits set in the operand.
     Clr = 1,
+    /// `LDEOR`.
     Eor = 2,
+    /// `LDSET`: set the bits set in the operand.
     Set = 3,
+    /// `SWP`.
     Swp = 8,
 }
 

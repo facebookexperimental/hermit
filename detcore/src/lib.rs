@@ -36,6 +36,7 @@
 #![deny(missing_docs)]
 #![allow(clippy::uninlined_format_args)]
 
+pub mod aarch64_lse;
 pub mod access_trace;
 mod arch;
 mod commit_creds;

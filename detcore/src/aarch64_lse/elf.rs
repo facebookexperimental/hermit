@@ -27,13 +27,13 @@
 //! too: writable text is either a loader quirk or a runtime that rewrites
 //! itself, and rewriting it would race whatever writes it.
 //!
-//! A sequence any relocation points into is refused as well. A relocation is
+//! A sequence any relocation points into is refused as well. Relocations are
+//! read as 64-bit little-endian, the only aarch64 ELF this rewriter handles. A relocation is
 //! the loader's licence to change those bytes at load time, which would
 //! overwrite part of a rewritten sequence with something computed for the
 //! original one.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use goblin::elf::Elf;
 use goblin::elf::header;
@@ -60,10 +60,12 @@ pub struct FileReport {
 }
 
 impl FileReport {
+    /// The rewritten sequences.
     pub fn patched_total(&self) -> usize {
         self.patched.values().sum()
     }
 
+    /// The sequences left alone.
     pub fn refused_total(&self) -> usize {
         self.refused.values().sum()
     }
@@ -199,10 +201,14 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
     let section_targets: Vec<std::collections::HashSet<u64>> = sections
         .iter()
         .map(|(offset, filesz, vaddr, _)| {
-            let (start, end) = (*offset as usize, (*offset + *filesz) as usize);
-            if end > bytes.len() || !start.is_multiple_of(4) {
+            let start = *offset as usize;
+            let Some(end) = offset
+                .checked_add(*filesz)
+                .and_then(|end| usize::try_from(end).ok())
+                .filter(|end| *end <= bytes.len() && start.is_multiple_of(4))
+            else {
                 return std::collections::HashSet::new();
-            }
+            };
             let words: Vec<u32> = (0..(end - start) / 4)
                 .map(|i| {
                     let at = start + 4 * i;
@@ -290,37 +296,60 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
     Ok(Some(report))
 }
 
-/// Write already-rewritten bytes to `output`, with `source`'s permissions.
+/// The byte ranges a packed relative relocation section covers.
 ///
-/// The file is written whole under a temporary name the filesystem
-/// guarantees is unused and renamed into place, so a failed or concurrent
-/// write is never observed under the final name.
-pub fn write_rewritten(output: &Path, bytes: &[u8], source: &Path) -> anyhow::Result<()> {
-    use std::io::Write;
-
-    let directory = output.parent().unwrap_or(Path::new("."));
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".rewrite-")
-        .tempfile_in(directory)?;
-    temporary.write_all(bytes)?;
-    temporary.flush()?;
-    std::fs::set_permissions(temporary.path(), std::fs::metadata(source)?.permissions())?;
-    temporary.persist(output).map_err(|error| error.error)?;
-    Ok(())
+/// An even entry is an address and covers its own eight bytes; each odd
+/// entry after it is a bitmap whose set bits name the words following that
+/// address, 63 at a time.
+fn decode_relr(section: &[u8]) -> Vec<(u64, u64)> {
+    let mut covered = Vec::new();
+    let mut next = 0u64;
+    for entry in section.as_chunks::<8>().0 {
+        let entry = u64::from_le_bytes(*entry);
+        if entry & 1 == 0 {
+            covered.push((entry, entry.saturating_add(8)));
+            next = entry.saturating_add(8);
+            continue;
+        }
+        let mut bits = entry >> 1;
+        let mut at = next;
+        while bits != 0 {
+            if bits & 1 == 1 {
+                covered.push((at, at.saturating_add(8)));
+            }
+            bits >>= 1;
+            at = at.saturating_add(8);
+        }
+        next = next.saturating_add(63 * 8);
+    }
+    covered
 }
 
-/// Read `input`, rewrite it, and write the result to `output` with `input`'s
-/// permissions.
-pub fn rewrite_file(
-    input: impl AsRef<Path>,
-    output: impl AsRef<Path>,
-) -> anyhow::Result<Option<FileReport>> {
-    let input = input.as_ref();
-    let mut bytes = std::fs::read(input)?;
-    let report = match rewrite_bytes(&mut bytes)? {
-        Some(report) => report,
-        None => return Ok(None),
-    };
-    write_rewritten(output.as_ref(), &bytes, input)?;
-    Ok(Some(report))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A relocation section's entries must be seen, including the packed
+    /// relative ones the ELF reader does not report. The check here is on
+    /// the decoder itself rather than a whole synthetic ELF: an address
+    /// entry names its own eight bytes, and the odd entry after it is a
+    /// bitmap of the 63 words that follow.
+    #[test]
+    fn packed_relative_relocations_decode_to_the_bytes_they_cover() {
+        let section: Vec<u8> = [0x1000u64, (0b1011 << 1) | 1]
+            .iter()
+            .flat_map(|entry| entry.to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_relr(&section),
+            vec![
+                (0x1000, 0x1008),
+                // The bitmap starts at the word after the address, and its
+                // set bits are words 0, 1 and 3 from there.
+                (0x1008, 0x1010),
+                (0x1010, 0x1018),
+                (0x1020, 0x1028),
+            ]
+        );
+    }
 }

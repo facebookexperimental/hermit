@@ -95,31 +95,39 @@ pub enum Refusal {
     Relocated,
 }
 
+/// A sequence the rewriter replaces, and its replacement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Site {
     /// Virtual address of the first instruction of the sequence.
     pub addr: u64,
+    /// Which canonical loop it is.
     pub idiom: Idiom,
     /// The replacement words, one per original instruction.
     pub words: Vec<u32>,
 }
 
+/// An exclusive the rewriter leaves alone, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusedSite {
     /// Virtual address of the store-exclusive (or pair instruction).
     pub addr: u64,
+    /// Why it is left alone.
     pub reason: Refusal,
 }
 
+/// What planning one run of instruction words found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
+    /// The sequences to replace.
     pub patched: Vec<Site>,
+    /// The exclusives left alone.
     pub refused: Vec<RefusedSite>,
     /// Exclusive instructions seen, whether or not they were rewritten.
     pub exclusive_instructions: usize,
 }
 
 impl Report {
+    /// The replaced sequences, counted by idiom.
     pub fn by_idiom(&self) -> HashMap<Idiom, usize> {
         let mut counts = HashMap::new();
         for site in &self.patched {
