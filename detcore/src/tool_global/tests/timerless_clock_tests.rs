@@ -90,6 +90,7 @@ impl GlobalRPC<GlobalState> for ClockGuest {
                         schedule_released: false,
                         schedule_over: false,
                         watch: None,
+                        backstop: None,
                     }),
                 )
             }

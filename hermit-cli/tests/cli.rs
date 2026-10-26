@@ -158,6 +158,7 @@ static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PREEMPTION_CHARGE_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDERR_FSYNC_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static UNCAPPED_SLICE_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -25962,6 +25963,96 @@ fn a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets() {
     let replay = hermit(&args);
     assert_success(&replay, &args);
     assert_eq!(parse_branch_free_race(&stdout(&replay)), lost);
+/// A record made while replaying preemptions says its slices ran without the
+/// `--max-timeslice` bound, and a schedule replay of it ends slices where the
+/// record does. A preemption replay ends its slices where its record says, so
+/// with most preemption points removed (as `hermit analyze --minimize`
+/// removes them) its recorded slices run far past the bound. The schedule
+/// replay ended every such slice at the bound instead, left the record and
+/// printed other clock readings: about 240 desynced events here, and
+/// minimize's check of its own failing endpoint missed the target. In the
+/// guest (`tests/c/uncapped_slice_replay.c`) two threads compute and read
+/// the clock. A chaos recording keeps each thread's last preemption point
+/// only; its preemption replay is recorded with the mark, and that record's
+/// schedule replay, at the same 100 us bound, follows it with no desync and
+/// prints the same lines, and records the mark again. An ordinary recording
+/// carries no mark.
+#[test]
+fn a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay() {
+    let _guard = hermit_run_guard();
+    let guest = compiled_c_guest(&UNCAPPED_SLICE_REPLAY_GUEST, "uncapped_slice_replay")
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = |name: &str| directory.path().join(name).to_str().unwrap().to_owned();
+    let (chaos_record, edited, replay_record, schedule_record, summary) = (
+        path("chaos.json"),
+        path("edited.json"),
+        path("replayed.json"),
+        path("scheduled.json"),
+        path("summary.json"),
+    );
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            "--max-timeslice=100000",
+            "--seed=1",
+        ];
+        args.extend_from_slice(extra);
+        args.extend(["--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        stdout(&output)
+    };
+    let marked = |path: &str| -> bool {
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap();
+        json.get("uncapped_slices").is_some_and(|mark| mark == true)
+    };
+
+    run(&[
+        "--chaos",
+        &format!("--record-preemptions-to={chaos_record}"),
+    ]);
+    assert!(!marked(&chaos_record), "an ordinary recording is marked");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&chaos_record).unwrap()).unwrap();
+    for thread in json["per_thread"].as_object_mut().unwrap().values_mut() {
+        let changes = thread["prio_changes"].as_array_mut().unwrap();
+        let last = changes.split_off(changes.len().saturating_sub(1));
+        *changes = last;
+        thread["preemption_rcbs"] = serde_json::json!([]);
+        thread["chaos_epochs"] = serde_json::json!([]);
+    }
+    json["global"] = serde_json::json!([]);
+    json.as_object_mut().unwrap().remove("callback_checkpoints");
+    fs::write(&edited, serde_json::to_vec(&json).unwrap()).unwrap();
+
+    let replayed = run(&[
+        "--chaos",
+        &format!("--replay-preemptions-from={edited}"),
+        &format!("--record-preemptions-to={replay_record}"),
+    ]);
+    assert!(
+        marked(&replay_record),
+        "a preemption replay's record is unmarked"
+    );
+
+    let scheduled = run(&[
+        &format!("--replay-schedule-from={replay_record}"),
+        &format!("--record-preemptions-to={schedule_record}"),
+        &format!("--summary-json={summary}"),
+    ]);
+    let summary: serde_json::Value = serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
+    assert_eq!(summary["schedevent_desynced"], 0, "{summary}");
+    assert_eq!(scheduled, replayed);
+    assert!(
+        marked(&schedule_record),
+        "a schedule replay of a marked record drops the mark"
+    );
 }
 
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn

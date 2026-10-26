@@ -7005,6 +7005,12 @@ pub struct ThreadState<T> {
     /// (`crate::post_crash::note_stop`).
     #[serde(default)]
     pub crash_armed: Option<i32>,
+    /// The slice length that replaces `--max-timeslice` while this thread
+    /// replays a record whose slices ran without that bound
+    /// (`Scheduler::uncapped_backstop`), as the replayer last said; `None` for
+    /// every other run and once the record has run out.
+    #[serde(default)]
+    pub uncapped_backstop: Option<LogicalTime>,
 
     /// The deadline hint carried by the last scheduler reply this thread
     /// received (`ThreadState::cap_timeslice_at_deadline`). Applied when the
@@ -7159,6 +7165,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("max_timeslice_end", &self.max_timeslice_end)
             .field("post_crash_bound", &self.post_crash_bound)
             .field("crash_armed", &self.crash_armed)
+            .field("uncapped_backstop", &self.uncapped_backstop)
             .field("last_rcb_timer", &self.last_rcb_timer)
             .field("last_rcb_timer_is_max", &self.last_rcb_timer_is_max)
             .finish()
@@ -7979,6 +7986,7 @@ impl<T> ThreadState<T> {
             max_timeslice_end: None,
             post_crash_bound: None,
             crash_armed: None,
+            uncapped_backstop: None,
             last_grant_deadline: None,
             published_runtime_private_memory: None,
             published_cpu: None,
@@ -9937,12 +9945,10 @@ impl<T> ThreadState<T> {
             } else if !cfg.chaos {
                 if self.follows_replayed_schedule(cfg) {
                     if cfg.no_rcb_time {
-                        let max_timeslice = self.after_post_crash(
-                            cfg.max_timeslice
-                                .expect("schedule replay with PMU requires a maximum"),
-                        );
-                        self.end_of_timeslice =
-                            Some(current_ns + Duration::from_nanos(u64::from(max_timeslice)));
+                        let length = self
+                            .max_slice_length(cfg)
+                            .expect("schedule replay with PMU requires a maximum");
+                        self.end_of_timeslice = Some(current_ns + Duration::from_nanos(length));
                     } else {
                         // Branch-event replay will overwrite this deadline when needed.
                         debug!(
@@ -10056,8 +10062,8 @@ impl<T> ThreadState<T> {
             let past_an_edited_record = cfg.replay_edited_preemptions
                 && self.preemption_points.is_some()
                 && self.end_of_timeslice == Some(LogicalTime::MAX);
-            let configured_max_end = cfg.max_timeslice.map(|max_timeslice| {
-                let length = Duration::from_nanos(self.after_post_crash(max_timeslice).get());
+            let configured_max_end = self.max_slice_length(cfg).map(|length| {
+                let length = Duration::from_nanos(length);
                 current_ns
                     + if past_an_edited_record {
                         length.max(margin)
@@ -10111,6 +10117,70 @@ impl<T> ThreadState<T> {
             self.replay_instruction_offset = None;
             None
         }
+    }
+
+    /// Take the replay backstop the replayer sent with a traced event
+    /// (`Scheduler::uncapped_backstop`). A thread's first slice begins before
+    /// it traces anything, so it began under the plain bound; when the
+    /// backstop first arrives, a slice end that came from that bound moves
+    /// out to the backstop, counted from the slice's start, as if the slice
+    /// had begun with it.
+    pub(crate) fn learn_uncapped_backstop(
+        &mut self,
+        backstop: Option<LogicalTime>,
+        bound: Option<std::num::NonZeroU64>,
+        schedule_replay: bool,
+    ) {
+        let first = self.uncapped_backstop.is_none() && backstop.is_some();
+        self.uncapped_backstop = backstop;
+        if !first || !schedule_replay {
+            return;
+        }
+        if let (Some(start), Some(end), Some(max_end), Some(length)) = (
+            self.stats.timeslice_start_ns,
+            self.end_of_timeslice,
+            self.max_timeslice_end,
+            self.slice_length_within(bound, schedule_replay),
+        ) && end == max_end
+        {
+            let backstop_end = start + Duration::from_nanos(length);
+            if backstop_end > end {
+                self.end_of_timeslice = Some(backstop_end);
+                self.max_timeslice_end = Some(backstop_end);
+                self.last_rcb_timer = None;
+                self.last_rcb_timer_is_max = false;
+            }
+        }
+    }
+
+    /// The longest a slice runs before the `--max-timeslice` bound ends it, in
+    /// nanoseconds of the thread's logical time: the bound itself, except
+    /// while a schedule replay follows a record whose slices ran without it
+    /// (`uncapped_backstop`), where only the record ends a slice. A recorded
+    /// slice can be far longer than the bound there (one that replayed a
+    /// preemption record ends its slices where that record says), and ending
+    /// it at the bound would leave the record.
+    pub(crate) fn max_slice_length(&self, cfg: &Config) -> Option<u64> {
+        // The post-crash bound (main's `after_post_crash`) and the uncapped
+        // backstop each replace the configured bound with the larger of the
+        // two, so the effective maximum is the largest of the three.
+        self.slice_length_within(
+            cfg.max_timeslice.map(|bound| self.after_post_crash(bound)),
+            cfg.replay_schedule_from.is_some(),
+        )
+    }
+
+    fn slice_length_within(
+        &self,
+        bound: Option<std::num::NonZeroU64>,
+        schedule_replay: bool,
+    ) -> Option<u64> {
+        let bound = bound?.get();
+        Some(
+            self.uncapped_backstop
+                .filter(|_| schedule_replay)
+                .map_or(bound, |backstop| backstop.as_nanos().max(bound)),
+        )
     }
 
     /// Close the current logical-timeslice statistics without selecting a new
@@ -11065,6 +11135,62 @@ mod timeslice_tests {
         state.cap_timeslice_at_deadline(Duration::ZERO, 1.0, Duration::ZERO, false);
         assert_eq!(state.end_of_timeslice, Some(now + Duration::from_nanos(11)));
         assert_eq!(state.max_timeslice_end, Some(end));
+    }
+
+    /// A schedule replay of a record whose slices ran without the bound
+    /// ends a slice at the replay backstop instead of `--max-timeslice` while
+    /// the replayer sends one. A thread's first slice, begun under the plain
+    /// bound before its first traced event, moves out to the backstop when it
+    /// first arrives; a later one moves nothing, and once the record runs out
+    /// (no backstop) the next slice is bounded as before. Outside a schedule
+    /// replay the backstop is ignored.
+    #[test]
+    fn an_uncapped_replay_ends_slices_at_its_backstop_while_the_record_lasts() {
+        let bound = std::num::NonZeroU64::new(100_000);
+        let config = Config {
+            max_timeslice: bound,
+            replay_schedule_from: Some(std::path::PathBuf::from("record.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        state.next_timeslice(&config);
+        let start = state.thread_logical_time.as_nanos();
+        assert_eq!(
+            state.max_timeslice_end,
+            Some(start + Duration::from_nanos(100_000))
+        );
+        let backstop = LogicalTime::from_nanos(3_000_000);
+        state.learn_uncapped_backstop(Some(backstop), bound, true);
+        let moved = start + Duration::from_nanos(3_000_000);
+        assert_eq!(state.end_of_timeslice, Some(moved));
+        assert_eq!(state.max_timeslice_end, Some(moved));
+        assert_eq!(state.max_slice_length(&config), Some(3_000_000));
+        // A backstop that arrives again moves nothing.
+        state.end_of_timeslice = Some(start + Duration::from_nanos(7));
+        state.learn_uncapped_backstop(Some(backstop), bound, true);
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(start + Duration::from_nanos(7))
+        );
+        // A backstop shorter than the bound never shortens a slice.
+        state.learn_uncapped_backstop(Some(LogicalTime::from_nanos(10)), bound, true);
+        assert_eq!(state.max_slice_length(&config), Some(100_000));
+        // The record ran out.
+        state.learn_uncapped_backstop(None, bound, true);
+        assert_eq!(state.uncapped_backstop, None);
+        state.next_timeslice(&config);
+        let now = state.thread_logical_time.as_nanos();
+        assert_eq!(
+            state.max_timeslice_end,
+            Some(now + Duration::from_nanos(100_000))
+        );
+        // Not a schedule replay.
+        let plain = Config {
+            max_timeslice: bound,
+            ..Default::default()
+        };
+        state.uncapped_backstop = Some(backstop);
+        assert_eq!(state.max_slice_length(&plain), Some(100_000));
     }
 
     /// The cap never ends a slice sooner than one scheduler turn charge

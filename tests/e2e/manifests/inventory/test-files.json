@@ -3517,6 +3517,12 @@
       "why": "tests/c/uname_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/uncapped_slice_replay.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/uncapped_slice_replay.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test records this guest under --chaos, removes all but each thread's last preemption point, replays that record while recording a schedule, and replays the schedule at the same --max-timeslice, asserting the uncapped-slices mark on the records, no desync and the same output; it remains a guest fixture because a generic manifest cannot edit a preemption record or chain a recording into its replays."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/unix_autobind.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",

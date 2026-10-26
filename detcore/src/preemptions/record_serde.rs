@@ -66,6 +66,8 @@ struct RawRecord {
     post_crash_timeslice: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    uncapped_slices: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

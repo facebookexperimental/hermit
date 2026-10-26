@@ -21829,6 +21829,15 @@ impl Scheduler {
         }
     }
 
+    /// The slice length a thread uses instead of `--max-timeslice` while it
+    /// replays a record whose slices ran without that bound
+    /// (`uncapped_replay_backstop`): `None` once the record has run out, so
+    /// the run goes on under the bound, and for every other run.
+    pub(crate) fn uncapped_backstop(&self) -> Option<LogicalTime> {
+        self.uncapped_replay_backstop
+            .filter(|_| self.replay_has_records_left())
+    }
+
     /// Mark the record as departed at the point the replayed schedule ran
     /// out, because the run has now continued past that point without
     /// recording the continuation's priority change points
