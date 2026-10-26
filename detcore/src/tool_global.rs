@@ -6429,7 +6429,7 @@ impl GlobalState {
             // parent is already kernel-blocked (vfork), the child takes the tail
             // and no PRNG is consumed.
             let intent = if self.cfg.sequentialize_threads && !parent_is_kernel_blocked {
-                AdmitIntent::PostFork(self.cfg.runs_post_fork)
+                AdmitIntent::PostFork(self.cfg.runs_post_fork, parent_dettid)
             } else {
                 AdmitIntent::Fixed(AdmitSide::Back)
             };

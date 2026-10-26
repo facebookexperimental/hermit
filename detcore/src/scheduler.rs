@@ -1182,6 +1182,39 @@ pub(crate) enum AdmitSide {
     Back,
 }
 
+/// Whether a schedule replay runs `child`, created by `parent`'s fork, before
+/// its parent, when the replayed schedule names `next` as the thread that runs
+/// next. A record lists events in the order the run made them, and a clone's
+/// admission is anchored to the parent's `ParentContinue`
+/// (`Scheduler::admit_to_run_queue`), so it is drained before either side runs
+/// again: when `next` names either side, it identifies the side that ran first.
+/// No post-fork child is placed ahead of the thread `next` names: another child
+/// of the same drain that it names is admitted last, ahead of this one, which
+/// then follows the post-fork `policy`; a thread outside the drain keeps this
+/// child behind it. That costs a later parent/child order where the record ran
+/// the named thread first by its priority alone.
+///
+/// Without this, a record whose parent ran on after a clone, as a chaos record
+/// does whenever its priorities say so, replayed the child's first slice
+/// instead under `--no-namespace` with chosen IDs, where the child registers at
+/// the root's starting priority and the side alone decides, and the replay left
+/// its schedule there.
+fn replayed_child_first(
+    next: DetTid,
+    parent: DetTid,
+    child: DetTid,
+    next_pending: bool,
+    policy: bool,
+) -> bool {
+    if next == child {
+        true
+    } else if next == parent {
+        false
+    } else {
+        next_pending && policy
+    }
+}
+
 /// How a run-queue admission's side is determined.
 ///
 /// The side is *resolved* — not merely applied — at the deterministic drain
@@ -1196,8 +1229,10 @@ pub(crate) enum AdmitIntent {
     /// The side is fixed regardless of scheduler state; consumes no PRNG.
     Fixed(AdmitSide),
     /// The side follows the post-fork policy; `RunsPostFork::Random` draws from
-    /// the scheduler PRNG at resolution time.
-    PostFork(RunsPostFork),
+    /// the scheduler PRNG at resolution time. The thread is the parent whose
+    /// fork created the admitted one: a schedule replay runs first whichever
+    /// of the two its record ran first (`replayed_child_first`).
+    PostFork(RunsPostFork, DetTid),
 }
 
 /// Why a raw TID must be removed from the physical run queue at the next
@@ -19971,17 +20006,48 @@ impl Scheduler {
     /// drain membership to deterministic scheduler state. See
     /// [`Scheduler::admit_to_run_queue`] for the causal and explicit barriers
     /// that provide that binding for all current production sites.
-    fn resolve_admit_intent(&mut self, intent: AdmitIntent) -> AdmitSide {
+    fn resolve_admit_intent(
+        &mut self,
+        dtid: DetTid,
+        intent: AdmitIntent,
+        named: Option<DetTid>,
+        named_pending: bool,
+    ) -> AdmitSide {
         match intent {
             AdmitIntent::Fixed(side) => side,
-            AdmitIntent::PostFork(mode) => {
-                if self.child_runs_first_post_fork(mode) {
+            AdmitIntent::PostFork(mode, parent) => {
+                // The policy's draw is taken even where the schedule decides:
+                // under `RunsPostFork::Random` this run then consumes one draw
+                // per post-fork admission whoever decides, and keeps its
+                // stream position wherever the policy decides later.
+                let policy = self.child_runs_first_post_fork(mode);
+                let child_first = match named {
+                    None => policy,
+                    Some(next) => replayed_child_first(next, parent, dtid, named_pending, policy),
+                };
+                if child_first {
                     AdmitSide::Front
                 } else {
                     AdmitSide::Back
                 }
             }
         }
+    }
+
+    /// The thread a schedule replay runs next: the next record's under
+    /// `--strict-schedule-boundaries`, otherwise the next event's of
+    /// `--replay-schedule-from`. `None` without a replayed schedule, past its
+    /// end, or once a `--replay-schedule-from` replay has left its schedule
+    /// (a hard desync), where its next event no longer says who runs.
+    fn replayed_next_thread(&self) -> Option<DetTid> {
+        if self
+            .replayer
+            .as_ref()
+            .is_some_and(|replayer| replayer.desync_counts.values().any(|stats| stats.hard > 0))
+        {
+            return None;
+        }
+        self.replay_next_resume().map(|(next, _)| next)
     }
 
     /// Record an intent to remove `dtid` from the run queue, applied by the
@@ -20312,6 +20378,15 @@ impl Scheduler {
         // means any `RunsPostFork::Random` PRNG draw is consumed in this
         // canonical order, so both the admission order *and* the chosen side are
         // pure functions of deterministic state.
+        //
+        // A schedule replay names the thread that runs next
+        // (`replayed_next_thread`): no post-fork admission of this drain may
+        // be placed ahead of it (`replayed_child_first`), and when it is
+        // itself a pending post-fork child, its front admission is resolved
+        // with the others but applied last.
+        let named = self.replayed_next_thread();
+        let named_pending = named.is_some_and(|tid| pending.contains_key(&tid));
+        let mut resolved = Vec::with_capacity(pending.len());
         for (dtid, intent) in pending {
             // A thread retired (exec/kill) between record and drain is skipped.
             // `remove_blocking_entries` also clears the buffer on teardown, so
@@ -20323,7 +20398,12 @@ impl Scheduler {
                 );
                 continue;
             }
-            let side = self.resolve_admit_intent(intent);
+            let side = self.resolve_admit_intent(dtid, intent, named, named_pending);
+            resolved.push((dtid, side));
+        }
+        // A stable sort: the others keep their canonical order.
+        resolved.sort_by_key(|&(dtid, side)| Some(dtid) == named && side == AdmitSide::Front);
+        for (dtid, side) in resolved {
             self.admit_now(dtid, side);
         }
     }
@@ -26252,6 +26332,132 @@ mod test {
         }
     }
 
+    /// A schedule replay admits a new thread on the side its record ran
+    /// first: the child at the front when the replay's next event is the
+    /// child's, at the back when it is the parent's, whatever the post-fork
+    /// policy. Nothing admitted in one drain is placed ahead of the thread the
+    /// replay names next. With no schedule left, or once the replay has left
+    /// it, the policy decides.
+    #[test]
+    fn a_schedule_replay_admits_a_post_fork_child_on_the_side_its_record_ran_first() {
+        let parent = DetTid::from_raw(31744);
+        let child = DetTid::from_raw(31745);
+        let second = DetTid::from_raw(31746);
+        let other = DetTid::from_raw(40000);
+        let next_event =
+            |tid: DetTid| SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Prehook);
+        // Admit `children` (each a child of `parent`) under `policy` with the
+        // replay's next event `next` (none: no schedule left), drain, and
+        // return the run queue.
+        let drained = |policy: RunsPostFork,
+                       next: Option<DetTid>,
+                       hard_desync: bool,
+                       children: &[DetTid]|
+         -> Vec<DetTid> {
+            let mut sched = Scheduler::new(&Config {
+                runs_post_fork: policy,
+                ..Default::default()
+            });
+            let mut replayer = Replayer::new(next.map(next_event));
+            if hard_desync {
+                replayer.desync_counts.entry(other).or_default().hard = 1;
+            }
+            sched.replayer = Some(replayer);
+            register_known_thread(&mut sched, parent);
+            sched.runqueue_push_back(parent);
+            if next == Some(other) {
+                register_known_thread(&mut sched, other);
+                sched.runqueue_push_back(other);
+            }
+            for &tid in children {
+                register_known_thread(&mut sched, tid);
+                sched.admit_to_run_queue(tid, AdmitIntent::PostFork(policy, parent));
+            }
+            sched.drain_pending_run_queue_admissions();
+            sched.run_queue.tids().copied().collect()
+        };
+
+        for policy in [RunsPostFork::Child, RunsPostFork::Parent] {
+            // The schedule decides against either policy.
+            assert_eq!(
+                drained(policy, Some(child), false, &[child]),
+                [child, parent],
+                "{policy:?}"
+            );
+            assert_eq!(
+                drained(policy, Some(parent), false, &[child]),
+                [parent, child],
+                "{policy:?}"
+            );
+            // A queued thread outside the drain is named next: it remains
+            // ahead of the child.
+            assert_eq!(
+                drained(policy, Some(other), false, &[child]),
+                [parent, other, child],
+                "{policy:?}"
+            );
+            // No schedule left, or a replay that left it: the policy decides.
+            let policy_queue = match policy {
+                RunsPostFork::Child => [child, parent],
+                _ => [parent, child],
+            };
+            assert_eq!(drained(policy, None, false, &[child]), policy_queue);
+            assert_eq!(drained(policy, Some(parent), true, &[child]), policy_queue);
+        }
+        // Two children in one drain: whichever the replay names runs first,
+        // whatever their IDs' order; the other follows the policy.
+        assert_eq!(
+            drained(RunsPostFork::Child, Some(second), false, &[child, second]),
+            [second, child, parent]
+        );
+        assert_eq!(
+            drained(RunsPostFork::Child, Some(child), false, &[child, second]),
+            [child, second, parent]
+        );
+        assert_eq!(
+            drained(RunsPostFork::Parent, Some(child), false, &[child, second]),
+            [child, parent, second]
+        );
+    }
+
+    /// Where a schedule replay decides a post-fork side, the policy's draw is
+    /// still taken, so under `RunsPostFork::Random` the post-fork PRNG goes on
+    /// from the same position as in a run whose policy decided that admission.
+    #[test]
+    fn a_schedule_replay_takes_the_post_fork_draw_it_overrides() {
+        let config = Config {
+            sched_seed: Some(0xABCD),
+            runs_post_fork: RunsPostFork::Random,
+            ..Default::default()
+        };
+        let parent = DetTid::from_raw(31744);
+        let child = DetTid::from_raw(31745);
+        let mut replayed = Scheduler::new(&config);
+        replayed.replayer = Some(Replayer::new([SchedEvent::syscall(
+            child,
+            Sysno::getpid,
+            SyscallPhase::Prehook,
+        )]));
+        register_known_thread(&mut replayed, parent);
+        replayed.runqueue_push_back(parent);
+        register_known_thread(&mut replayed, child);
+        replayed.admit_to_run_queue(child, AdmitIntent::PostFork(RunsPostFork::Random, parent));
+        replayed.drain_pending_run_queue_admissions();
+        assert_eq!(
+            replayed.run_queue.tids().copied().collect::<Vec<_>>(),
+            [child, parent]
+        );
+
+        let mut control = Scheduler::new(&config);
+        let _ = control.child_runs_first_post_fork(RunsPostFork::Random);
+        let draws = |sched: &mut Scheduler| -> Vec<bool> {
+            (0..64)
+                .map(|_| sched.child_runs_first_post_fork(RunsPostFork::Random))
+                .collect()
+        };
+        assert_eq!(draws(&mut replayed), draws(&mut control));
+    }
+
     /// F1/F2: an admission deferred while a tentative_pop window is live must
     /// resolve its side -- including the `RunsPostFork::Random` PRNG draw -- at
     /// the `DetTid`-ordered drain, so the drained run queue is a pure function of
@@ -26285,7 +26491,10 @@ mod test {
                 assert!(sched.run_queue.tentative_pop_in_progress());
             }
             for tid in order {
-                sched.admit_to_run_queue(tid, AdmitIntent::PostFork(RunsPostFork::Random));
+                sched.admit_to_run_queue(
+                    tid,
+                    AdmitIntent::PostFork(RunsPostFork::Random, DetTid::from_raw(3)),
+                );
             }
             // Admission ALWAYS defers -- window or not -- so nothing is pushed or
             // resolved (no side chosen, no PRNG drawn) until the drain.
@@ -26786,8 +26995,14 @@ mod test {
 
             register_known_thread(&mut s, lower);
             register_known_thread(&mut s, higher);
-            s.admit_to_run_queue(lower, AdmitIntent::PostFork(RunsPostFork::Random));
-            s.admit_to_run_queue(higher, AdmitIntent::PostFork(RunsPostFork::Random));
+            s.admit_to_run_queue(
+                lower,
+                AdmitIntent::PostFork(RunsPostFork::Random, DetTid::from_raw(3)),
+            );
+            s.admit_to_run_queue(
+                higher,
+                AdmitIntent::PostFork(RunsPostFork::Random, DetTid::from_raw(3)),
+            );
             // `step2` drains first, then this unresolved barrier returns
             // `SkipTurn`, exposing the exact first-drain queue before step3 can
             // tentatively select or rotate it.
@@ -28357,9 +28572,15 @@ mod test {
             register_known_thread(&mut sched, b);
             sched.runqueue_push_back(anchor);
 
-            sched.admit_to_run_queue(first, AdmitIntent::PostFork(RunsPostFork::Random));
+            sched.admit_to_run_queue(
+                first,
+                AdmitIntent::PostFork(RunsPostFork::Random, DetTid::from_raw(3)),
+            );
             sched.drain_pending_run_queue_admissions(); // drain 1
-            sched.admit_to_run_queue(second, AdmitIntent::PostFork(RunsPostFork::Random));
+            sched.admit_to_run_queue(
+                second,
+                AdmitIntent::PostFork(RunsPostFork::Random, DetTid::from_raw(3)),
+            );
             sched.drain_pending_run_queue_admissions(); // drain 2 (adjacent)
 
             sched.run_queue.tids().copied().collect()

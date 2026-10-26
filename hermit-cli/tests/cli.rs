@@ -13173,6 +13173,76 @@ fn no_namespace_validates_parent_signal_before_choosing_an_id() {
     }
 }
 
+/// A schedule replay runs first, after a clone, the side its record ran
+/// first, whatever `--runs-post-fork` the replay has. Under `--no-namespace`
+/// with chosen IDs (each run the init of a PID namespace of its own, as above),
+/// the record here runs the parent on after its `pthread_create`
+/// (`--runs-post-fork=parent`) and the replay explicitly chooses the child
+/// (`--runs-post-fork=child`), in both schedule formats.
+/// The child registers before the replayed schedule switches to it, at the
+/// same starting priority as the root, so the post-fork side alone chose who
+/// ran: the replay ran the child's first slice where the record had the
+/// parent's clone posthook, and left its schedule there. A chaos record whose
+/// priorities ran the parent on did the same, so on a host without PID
+/// namespaces every `hermit analyze` trial left its schedule at the guest's
+/// first thread.
+#[test]
+fn a_no_namespace_schedule_replay_runs_first_after_a_clone_the_side_its_record_did() {
+    let guest = hb_two_threads_guest();
+    let run = |args: &[String]| {
+        let mut command = Command::new("unshare");
+        command
+            .args(OWN_PID_NAMESPACE)
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=info", "run", "--no-namespace", "--base-env=minimal"])
+            .args(args)
+            .arg("--")
+            .arg(guest);
+        let label = format!("{command:?}");
+        hermit_test::hermit_output(&label, &mut command)
+    };
+    // Both schedule formats: `--replay-schedule-from`'s events and
+    // `--strict-schedule-boundaries`' records.
+    for format in [None, Some("--strict-schedule-boundaries")] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let schedule = directory.path().join("schedule.json");
+        let with_format = |mut args: Vec<String>| {
+            args.extend(format.map(str::to_owned));
+            args
+        };
+        let recorded = run(&with_format(vec![
+            "--max-timeslice=disabled".to_owned(),
+            "--runs-post-fork=parent".to_owned(),
+            format!("--record-preemptions-to={}", schedule.display()),
+        ]));
+        let record_log = stderr(&recorded);
+        assert!(recorded.status.success(), "{format:?}: {record_log}");
+        assert!(
+            record_log.contains("guest process IDs: chosen by Hermit"),
+            "{format:?}: the record's guest IDs were not chosen:\n{record_log}"
+        );
+        // The parent ran on: its line comes before the new thread's.
+        assert_eq!(stdout(&recorded), "main!\nworker\n", "{format:?}");
+
+        let replayed = run(&with_format(vec![
+            "--max-timeslice=disabled".to_owned(),
+            "--runs-post-fork=child".to_owned(),
+            format!("--replay-schedule-from={}", schedule.display()),
+        ]));
+        let log = stderr(&replayed);
+        assert!(
+            replayed.status.success(),
+            "{format:?}: exit {:?}:\n{log}",
+            replayed.status.code()
+        );
+        assert!(
+            !log.contains("desynced state") && !log.contains("expected to be running thread"),
+            "{format:?}: the replay left its recorded schedule:\n{log}"
+        );
+        assert_eq!(stdout(&replayed), stdout(&recorded), "{format:?}");
+    }
+}
+
 /// Two `--no-namespace` runs started together in one PID namespace reserve
 /// different windows of IDs, so neither collides with the other: both
 /// succeed, each with its own base and its guest's IDs following it.
