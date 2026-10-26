@@ -166,6 +166,10 @@ impl BisectOpts {
 
         let good = read_schedule(&self.good, "good")?;
         let bad = read_schedule(&self.bad, "bad")?;
+        AnalyzeOpts::refuse_recordings_numbered_apart(&[
+            ("--good", &self.good),
+            ("--bad", &self.bad),
+        ])?;
         // Each trial's schedule is written anew without an epoch, so the
         // trials replay from the one the two schedules were recorded under.
         analyzer.adopt_recorded_epoch(&[("--good", &self.good), ("--bad", &self.bad)])?;
@@ -374,6 +378,62 @@ mod tests {
         }
     }
 
+    /// Two `--no-namespace` records whose guest IDs start from different
+    /// bases are refused before any trial: every trial numbers its guest
+    /// alike, so none could follow both. Records numbered alike are admitted.
+    #[test]
+    fn bisect_refuses_records_whose_guests_were_numbered_apart() {
+        use detcore_model::pid::GuestIds;
+        let chosen = |base| {
+            serde_json::to_value(GuestIds::Chosen {
+                base,
+                refuse_host_ids: true,
+            })
+            .unwrap()
+        };
+        // A record with chosen IDs carries the reserved-input layout of the
+        // Hermit that made it, which main's Chosen-input admission requires of
+        // every source (`ReservedInputMetadata::require_same_for_chosen`): the
+        // native layout, as a recording made here would.
+        let provenance = serde_json::json!({
+            "contract": "sealed-private-input-v1",
+            "base": "0x71010000",
+            "abi": std::env::consts::ARCH,
+            "page_bytes": unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
+        });
+        let numbered = |count, ids: Option<serde_json::Value>| {
+            let mut record = search_record(vec![SchedEvent::branches(DetTid::from_raw(3), count)]);
+            if let Some(ids) = ids {
+                record["guest_ids"] = ids;
+                record["reserved_input"] = provenance.clone();
+            }
+            record
+        };
+        let error = prepare_search_records(
+            &numbered(4, Some(chosen(31744))),
+            &numbered(5, Some(chosen(40000))),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Record both runs under --no-namespace with the same --pid-base"),
+            "{error:#}"
+        );
+        let error = prepare_search_records(&numbered(4, Some(chosen(31744))), &numbered(5, None))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no trial could follow both"),
+            "{error:#}"
+        );
+        prepare_search_records(
+            &numbered(4, Some(chosen(31744))),
+            &numbered(5, Some(chosen(31744))),
+        )
+        .unwrap();
+        prepare_search_records(&numbered(4, None), &numbered(5, None)).unwrap();
+    }
+
     #[test]
     fn bisect_refuses_endpoints_differing_only_in_event_times() {
         let event = SchedEvent::branches(DetTid::from_raw(3), 4);
@@ -572,6 +632,11 @@ mod tests {
                 "refuse --preemption-stacktrace-log-file in the run arguments",
             ),
         ] {
+            // Where this host may choose IDs, --no-namespace is admitted and
+            // its replays take chosen IDs (`RunOpts::prepare_trial_guest_ids`).
+            if run_args == ["--no-namespace"] && crate::app::guest_ids::may_choose_ids().is_ok() {
+                continue;
+            }
             let error = bisect(run_args);
             assert!(
                 error
@@ -581,8 +646,9 @@ mod tests {
             );
             assert!(error.to_string().contains(named), "{run_args:?}: {error:#}");
         }
-        // `--no-namespace` is refused above: schedule replay, which every
-        // bisect trial is, needs stable namespace PIDs.
+        // `--no-namespace` is refused above where Hermit cannot choose the
+        // guest's IDs: schedule replay, which every bisect trial is, needs IDs
+        // that do not change from run to run.
         for admitted in [&["--stacktrace-event=5"][..], &["--timeout=3"][..]] {
             let error = bisect(admitted);
             assert!(

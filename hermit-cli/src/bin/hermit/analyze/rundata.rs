@@ -329,6 +329,9 @@ impl RunData {
         // preprocessing `RunOpts::main` does, so the trial runs the image its
         // reproducer names only if it is prepared here.
         self.runopts.prepare_trial_preprocessing()?;
+        // A trial starts through `RunOpts::run`, which skips `RunOpts::main`'s
+        // numbering of the guest's process IDs.
+        self.runopts.prepare_trial_guest_ids()?;
 
         let repro_file = self.root_path().with_extension("repro");
         std::fs::write(repro_file, self.to_repro() + "\n")?;
@@ -1048,6 +1051,31 @@ impl AnalyzeOpts {
     /// reproducer that applied it.
     pub fn install_trial_pmu_config(&self) -> anyhow::Result<()> {
         RunData::get_raw_runopts(self).install_pmu_config()
+    }
+
+    /// Refuse, before any trial, input recordings that number their guests
+    /// apart (`GuestIds::numbers_like`). Every trial of one analysis or
+    /// bisection takes the same guest IDs (`RunOpts::prepare_trial_guest_ids`),
+    /// so a trial replaying one of them could not follow it. Two
+    /// `--no-namespace` runs choose their bases independently unless both
+    /// were given the same `--pid-base`.
+    pub fn refuse_recordings_numbered_apart(recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
+        let mut first: Option<(String, detcore_model::pid::GuestIds)> = None;
+        for (option, path) in recordings {
+            let ids =
+                detcore::preemptions::read_recorded_guest_ids(path).map_err(anyhow::Error::msg)?;
+            let source = format!("{option} {}", path.display());
+            match &first {
+                None => first = Some((source, ids)),
+                Some((first_source, first_ids)) if !first_ids.numbers_like(&ids) => bail!(
+                    "{first_source} was recorded with guest process IDs {first_ids}, and {source} \
+                     with {ids}. Every trial numbers its guest alike, so no trial could follow \
+                     both records. Record both runs under --no-namespace with the same --pid-base"
+                ),
+                Some(_) => {}
+            }
+        }
+        Ok(())
     }
 
     /// Replay the given records from the virtual-time epoch they were
@@ -2724,6 +2752,11 @@ mod tests {
                 "refuse --preemption-stacktrace-log-file in the run arguments",
             ),
         ] {
+            // Where this host may choose IDs, --no-namespace is admitted and
+            // its trials take chosen IDs (`RunOpts::prepare_trial_guest_ids`).
+            if extra == "--no-namespace" && crate::app::guest_ids::may_choose_ids().is_ok() {
+                continue;
+            }
             let mut argv = vec!["hermit"];
             argv.extend(backend);
             argv.extend([

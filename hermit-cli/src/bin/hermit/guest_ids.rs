@@ -71,6 +71,18 @@ pub(super) fn resolve(
     resolve_with(no_namespace, required, strict, &Host)
 }
 
+/// Whether this process may choose its guests' process IDs at all, as the
+/// default base search first checks: `Err` names why not. `hermit analyze`
+/// and `hermit bisect` ask before they accept `--no-namespace`, whose trials
+/// replay one another's records and so need IDs that do not depend on the
+/// host.
+pub(super) fn may_choose_ids() -> Result<(), String> {
+    let host = Host;
+    let pid_max = host.pid_max()?;
+    let cursor = host.cursor().unwrap_or(pid_max / 2).clamp(1, pid_max - 1);
+    host.may_choose(cursor)
+}
+
 /// A base the run must have, and why.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Required<'a> {
