@@ -1465,47 +1465,78 @@ mod tests {
     // `census_by_class(classify_syscall)` and paste each sorted bucket. Do not
     // edit a list to make a red test green without saying which policy changed
     // and why -- that is the failure mode these lists exist to expose.
+    //
+    // A name only one architecture's table has carries that `target_arch`
+    // cfg. x86_64 keeps legacy entry points (open, stat, poll, ...) that the
+    // generic table aarch64 uses (include/uapi/asm-generic/unistd.h) omits.
+    // Two names are renames, not omissions: aarch64 has newfstatat and
+    // sync_file_range too, which the syscalls crate calls fstatat and
+    // sync_file_range2 there. The crate's aarch64 table also has the generic
+    // table's 32-bit `*_time64` numbers, which a 64-bit kernel leaves unwired.
 
     /// Syscalls Detcore models, replaces deterministically, or explicitly refuses.
     const DETERMINIZED_SYSCALLS: &[&str] = &[
+        #[cfg(target_arch = "x86_64")]
         "_sysctl",
         "accept",
         "accept4",
         "acct",
         "add_key",
         "adjtimex",
+        #[cfg(target_arch = "x86_64")]
         "afs_syscall",
+        #[cfg(target_arch = "x86_64")]
         "alarm",
+        #[cfg(target_arch = "x86_64")]
         "arch_prctl",
         "bind",
         "bpf",
         "cachestat",
+        #[cfg(target_arch = "x86_64")]
         "chown",
         "clock_adjtime",
+        #[cfg(target_arch = "aarch64")]
+        "clock_adjtime64",
         "clock_getres",
+        #[cfg(target_arch = "aarch64")]
+        "clock_getres_time64",
         "clock_gettime",
+        #[cfg(target_arch = "aarch64")]
+        "clock_gettime64",
         "clock_nanosleep",
+        #[cfg(target_arch = "aarch64")]
+        "clock_nanosleep_time64",
         "clock_settime",
+        #[cfg(target_arch = "aarch64")]
+        "clock_settime64",
         "clone",
         "clone3",
         "close",
         "close_range",
         "connect",
         "copy_file_range",
+        #[cfg(target_arch = "x86_64")]
         "creat",
+        #[cfg(target_arch = "x86_64")]
         "create_module",
         "delete_module",
         "dup",
+        #[cfg(target_arch = "x86_64")]
         "dup2",
         "dup3",
+        #[cfg(target_arch = "x86_64")]
         "epoll_create",
         "epoll_create1",
         "epoll_ctl",
+        #[cfg(target_arch = "x86_64")]
         "epoll_ctl_old",
         "epoll_pwait",
         "epoll_pwait2",
+        #[cfg(target_arch = "x86_64")]
         "epoll_wait",
+        #[cfg(target_arch = "x86_64")]
         "epoll_wait_old",
+        #[cfg(target_arch = "x86_64")]
         "eventfd",
         "eventfd2",
         "execve",
@@ -1520,22 +1551,30 @@ mod tests {
         "fcntl",
         "finit_module",
         "flock",
+        #[cfg(target_arch = "x86_64")]
         "fork",
         "fsconfig",
         "fsmount",
         "fsopen",
         "fspick",
         "fstat",
+        #[cfg(target_arch = "aarch64")]
+        "fstatat",
         "fstatfs",
         "futex",
         "futex_requeue",
+        #[cfg(target_arch = "aarch64")]
+        "futex_time64",
         "futex_wait",
         "futex_waitv",
         "futex_wake",
+        #[cfg(target_arch = "x86_64")]
         "futimesat",
+        #[cfg(target_arch = "x86_64")]
         "get_kernel_syms",
         "get_mempolicy",
         "getcpu",
+        #[cfg(target_arch = "x86_64")]
         "getdents",
         "getdents64",
         "getegid",
@@ -1544,8 +1583,10 @@ mod tests {
         "getitimer",
         "getpeername",
         "getpgid",
+        #[cfg(target_arch = "x86_64")]
         "getpgrp",
         "getpid",
+        #[cfg(target_arch = "x86_64")]
         "getpmsg",
         "getpriority",
         "getrandom",
@@ -1561,6 +1602,7 @@ mod tests {
         "getuid",
         "init_module",
         "inotify_add_watch",
+        #[cfg(target_arch = "x86_64")]
         "inotify_init",
         "inotify_init1",
         "inotify_rm_watch",
@@ -1568,13 +1610,17 @@ mod tests {
         "io_destroy",
         "io_getevents",
         "io_pgetevents",
+        #[cfg(target_arch = "aarch64")]
+        "io_pgetevents_time64",
         "io_setup",
         "io_submit",
         "io_uring_enter",
         "io_uring_register",
         "io_uring_setup",
         "ioctl",
+        #[cfg(target_arch = "x86_64")]
         "ioperm",
+        #[cfg(target_arch = "x86_64")]
         "iopl",
         "ioprio_get",
         "ioprio_set",
@@ -1586,6 +1632,7 @@ mod tests {
         "landlock_add_rule",
         "landlock_create_ruleset",
         "landlock_restrict_self",
+        #[cfg(target_arch = "x86_64")]
         "lchown",
         "listen",
         "listmount",
@@ -1594,6 +1641,7 @@ mod tests {
         "lsm_get_self_attr",
         "lsm_list_modules",
         "lsm_set_self_attr",
+        #[cfg(target_arch = "x86_64")]
         "lstat",
         "madvise",
         "map_shadow_stack",
@@ -1612,7 +1660,11 @@ mod tests {
         "mq_notify",
         "mq_open",
         "mq_timedreceive",
+        #[cfg(target_arch = "aarch64")]
+        "mq_timedreceive_time64",
         "mq_timedsend",
+        #[cfg(target_arch = "aarch64")]
+        "mq_timedsend_time64",
         "mq_unlink",
         "mremap",
         "msgctl",
@@ -1622,23 +1674,30 @@ mod tests {
         "munmap",
         "name_to_handle_at",
         "nanosleep",
+        #[cfg(target_arch = "x86_64")]
         "newfstatat",
         "nfsservctl",
+        #[cfg(target_arch = "x86_64")]
         "open",
         "open_by_handle_at",
         "open_tree",
         "openat",
         "openat2",
+        #[cfg(target_arch = "x86_64")]
         "pause",
         "perf_event_open",
         "pidfd_getfd",
         "pidfd_open",
         "pidfd_send_signal",
+        #[cfg(target_arch = "x86_64")]
         "pipe",
         "pipe2",
         "pivot_root",
+        #[cfg(target_arch = "x86_64")]
         "poll",
         "ppoll",
+        #[cfg(target_arch = "aarch64")]
+        "ppoll_time64",
         "prctl",
         "pread64",
         "preadv",
@@ -1649,21 +1708,28 @@ mod tests {
         "process_vm_readv",
         "process_vm_writev",
         "pselect6",
+        #[cfg(target_arch = "aarch64")]
+        "pselect6_time64",
         "ptrace",
+        #[cfg(target_arch = "x86_64")]
         "putpmsg",
         "pwrite64",
         "pwritev",
         "pwritev2",
+        #[cfg(target_arch = "x86_64")]
         "query_module",
         "quotactl",
         "quotactl_fd",
         "read",
+        #[cfg(target_arch = "x86_64")]
         "readlink",
         "readlinkat",
         "readv",
         "reboot",
         "recvfrom",
         "recvmmsg",
+        #[cfg(target_arch = "aarch64")]
+        "recvmmsg_time64",
         "recvmsg",
         "remap_file_pages",
         "request_key",
@@ -1674,24 +1740,32 @@ mod tests {
         "rt_sigqueueinfo",
         "rt_sigsuspend",
         "rt_sigtimedwait",
+        #[cfg(target_arch = "aarch64")]
+        "rt_sigtimedwait_time64",
         "rt_tgsigqueueinfo",
         "sched_getaffinity",
         "sched_getattr",
         "sched_getparam",
         "sched_getscheduler",
         "sched_rr_get_interval",
+        #[cfg(target_arch = "aarch64")]
+        "sched_rr_get_interval_time64",
         "sched_setaffinity",
         "sched_setattr",
         "sched_setparam",
         "sched_setscheduler",
         "sched_yield",
         "seccomp",
+        #[cfg(target_arch = "x86_64")]
         "security",
+        #[cfg(target_arch = "x86_64")]
         "select",
         "semctl",
         "semget",
         "semop",
         "semtimedop",
+        #[cfg(target_arch = "aarch64")]
+        "semtimedop_time64",
         "sendfile",
         "sendmmsg",
         "sendmsg",
@@ -1722,46 +1796,67 @@ mod tests {
         "shmdt",
         "shmget",
         "shutdown",
+        #[cfg(target_arch = "x86_64")]
         "signalfd",
         "signalfd4",
         "socket",
         "socketpair",
         "splice",
+        #[cfg(target_arch = "x86_64")]
         "stat",
         "statfs",
         "statmount",
         "statx",
         "swapoff",
         "swapon",
+        #[cfg(target_arch = "x86_64")]
         "sysfs",
         "sysinfo",
         "syslog",
         "tee",
         "tgkill",
+        #[cfg(target_arch = "x86_64")]
         "time",
         "timer_create",
         "timer_delete",
         "timer_getoverrun",
         "timer_gettime",
+        #[cfg(target_arch = "aarch64")]
+        "timer_gettime64",
         "timer_settime",
+        #[cfg(target_arch = "aarch64")]
+        "timer_settime64",
         "timerfd_create",
         "timerfd_gettime",
+        #[cfg(target_arch = "aarch64")]
+        "timerfd_gettime64",
         "timerfd_settime",
+        #[cfg(target_arch = "aarch64")]
+        "timerfd_settime64",
         "times",
         "tkill",
+        #[cfg(target_arch = "x86_64")]
         "tuxcall",
         "umount2",
         "uname",
         "unshare",
+        #[cfg(target_arch = "x86_64")]
         "uselib",
         "userfaultfd",
+        #[cfg(target_arch = "x86_64")]
         "ustat",
+        #[cfg(target_arch = "x86_64")]
         "utime",
         "utimensat",
+        #[cfg(target_arch = "aarch64")]
+        "utimensat_time64",
+        #[cfg(target_arch = "x86_64")]
         "utimes",
+        #[cfg(target_arch = "x86_64")]
         "vfork",
         "vhangup",
         "vmsplice",
+        #[cfg(target_arch = "x86_64")]
         "vserver",
         "wait4",
         "waitid",
@@ -1771,11 +1866,13 @@ mod tests {
 
     /// Syscalls intentionally forwarded under documented container assumptions.
     const PASSTHROUGH_SYSCALLS: &[&str] = &[
+        #[cfg(target_arch = "x86_64")]
         "access",
         "brk",
         "capget",
         "capset",
         "chdir",
+        #[cfg(target_arch = "x86_64")]
         "chmod",
         "chroot",
         "faccessat",
@@ -1793,25 +1890,30 @@ mod tests {
         "fsync",
         "ftruncate",
         "get_robust_list",
+        #[cfg(target_arch = "x86_64")]
         "get_thread_area",
         "getcwd",
         "getgroups",
         "getppid",
         "getxattr",
         "lgetxattr",
+        #[cfg(target_arch = "x86_64")]
         "link",
         "linkat",
         "listxattr",
         "llistxattr",
         "lremovexattr",
         "lsetxattr",
+        #[cfg(target_arch = "x86_64")]
         "mkdir",
         "mkdirat",
+        #[cfg(target_arch = "x86_64")]
         "mknod",
         "mknodat",
         "mlock",
         "mlock2",
         "mlockall",
+        #[cfg(target_arch = "x86_64")]
         "modify_ldt",
         "mprotect",
         "msync",
@@ -1823,25 +1925,33 @@ mod tests {
         "pkey_mprotect",
         "readahead",
         "removexattr",
+        #[cfg(target_arch = "x86_64")]
         "rename",
         "renameat",
         "renameat2",
+        #[cfg(target_arch = "x86_64")]
         "rmdir",
         "rt_sigreturn",
         "sched_get_priority_max",
         "sched_get_priority_min",
         "set_robust_list",
+        #[cfg(target_arch = "x86_64")]
         "set_thread_area",
         "set_tid_address",
         "setxattr",
         "sigaltstack",
+        #[cfg(target_arch = "x86_64")]
         "symlink",
         "symlinkat",
         "sync",
+        #[cfg(target_arch = "x86_64")]
         "sync_file_range",
+        #[cfg(target_arch = "aarch64")]
+        "sync_file_range2",
         "syncfs",
         "truncate",
         "umask",
+        #[cfg(target_arch = "x86_64")]
         "unlink",
         "unlinkat",
     ];
@@ -2003,7 +2113,9 @@ mod tests {
             SyscallClassification::Determinized
         );
         // select is the timeval sibling of pselect6 and must stay Determinized
-        // (routed through handle_select); regression for #800.
+        // (routed through handle_select); regression for #800. x86_64 only:
+        // aarch64 has pselect6 alone.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             classify_syscall(Sysno::select),
             SyscallClassification::Determinized
@@ -2012,8 +2124,17 @@ mod tests {
             classify_syscall(Sysno::pselect6),
             SyscallClassification::Determinized
         );
+        // x86_64 only: arch_prctl is an x86 syscall.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             classify_syscall(Sysno::arch_prctl),
+            SyscallClassification::Determinized
+        );
+        // aarch64 only: fstatat is the generic table's name for x86_64's
+        // newfstatat.
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            classify_syscall(Sysno::fstatat),
             SyscallClassification::Determinized
         );
         assert_eq!(
@@ -2065,9 +2186,16 @@ mod tests {
         );
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#877)
-        for sysno in [Sysno::readlink, Sysno::readlinkat] {
-            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
-        }
+        // x86_64 only: aarch64 has readlinkat alone.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            classify_syscall(Sysno::readlink),
+            SyscallClassification::Determinized
+        );
+        assert_eq!(
+            classify_syscall(Sysno::readlinkat),
+            SyscallClassification::Determinized
+        );
         // recvmmsg is the multi-message sibling of recvmsg and must stay
         // Determinized (routed through handle_sendrecv); regression for #788.
         assert_eq!(
@@ -2128,9 +2256,13 @@ mod tests {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
         }
         for sysno in [
+            // Names under the x86_64 cfg are absent from the aarch64 table,
+            // which has only their *at successors; sync_file_range2 is
+            // aarch64's sync_file_range.
             Sysno::capget,
             Sysno::capset,
             Sysno::chdir,
+            #[cfg(target_arch = "x86_64")]
             Sysno::chmod,
             Sysno::faccessat,
             Sysno::faccessat2,
@@ -2148,32 +2280,41 @@ mod tests {
             Sysno::fsync,
             Sysno::munlock,
             Sysno::munlockall,
+            #[cfg(target_arch = "x86_64")]
             Sysno::rename,
             Sysno::renameat,
             Sysno::getgroups,
             Sysno::getppid,
             Sysno::getxattr,
             Sysno::lgetxattr,
+            #[cfg(target_arch = "x86_64")]
             Sysno::link,
             Sysno::linkat,
             Sysno::listxattr,
             Sysno::llistxattr,
             Sysno::lremovexattr,
             Sysno::lsetxattr,
+            #[cfg(target_arch = "x86_64")]
             Sysno::mkdir,
             Sysno::mkdirat,
             Sysno::msync,
             Sysno::removexattr,
             Sysno::readahead,
             Sysno::renameat2,
+            #[cfg(target_arch = "x86_64")]
             Sysno::rmdir,
             Sysno::rt_sigreturn,
             Sysno::setxattr,
+            #[cfg(target_arch = "x86_64")]
             Sysno::symlink,
             Sysno::symlinkat,
+            #[cfg(target_arch = "x86_64")]
             Sysno::sync_file_range,
+            #[cfg(target_arch = "aarch64")]
+            Sysno::sync_file_range2,
             Sysno::truncate,
             Sysno::umask,
+            #[cfg(target_arch = "x86_64")]
             Sysno::unlink,
             Sysno::unlinkat,
         ] {
@@ -2184,13 +2325,18 @@ mod tests {
             assert!(is_kernel_keyring_syscall(sysno));
         }
         for sysno in [
+            // Names under the x86_64 cfg are x86-only: the thread-area and LDT
+            // calls are x86 syscalls, and aarch64 has mknodat alone.
             Sysno::chroot,
+            #[cfg(target_arch = "x86_64")]
             Sysno::get_thread_area,
+            #[cfg(target_arch = "x86_64")]
             Sysno::mknod,
             Sysno::mknodat,
             Sysno::mlock,
             Sysno::mlock2,
             Sysno::mlockall,
+            #[cfg(target_arch = "x86_64")]
             Sysno::modify_ldt,
             Sysno::personality,
             Sysno::pkey_alloc,
@@ -2198,6 +2344,7 @@ mod tests {
             Sysno::pkey_mprotect,
             Sysno::sched_get_priority_max,
             Sysno::sched_get_priority_min,
+            #[cfg(target_arch = "x86_64")]
             Sysno::set_thread_area,
             Sysno::sync,
             Sysno::syncfs,
@@ -2296,22 +2443,48 @@ mod tests {
         // Every syscall in the deterministic ENOSYS-refusal set must classify as
         // Determinized, and the helper used by the dispatcher must agree exactly
         // with that classification across the whole pinned table.
-        let refused = [
+        let mut refused = vec![Sysno::lookup_dcookie, Sysno::nfsservctl];
+        // x86_64 only: these are absent from the aarch64 table.
+        #[cfg(target_arch = "x86_64")]
+        refused.extend([
             Sysno::_sysctl,
             Sysno::afs_syscall,
             Sysno::create_module,
             Sysno::get_kernel_syms,
             Sysno::getpmsg,
-            Sysno::lookup_dcookie,
-            Sysno::nfsservctl,
             Sysno::putpmsg,
             Sysno::query_module,
             Sysno::security,
             Sysno::tuxcall,
             Sysno::uselib,
             Sysno::vserver,
-        ];
-        for sysno in refused {
+        ]);
+        // aarch64 only: the generic table's 32-bit `*_time64` numbers, which a
+        // 64-bit arm64 kernel leaves unwired.
+        #[cfg(target_arch = "aarch64")]
+        refused.extend([
+            Sysno::clock_adjtime64,
+            Sysno::clock_getres_time64,
+            Sysno::clock_gettime64,
+            Sysno::clock_nanosleep_time64,
+            Sysno::clock_settime64,
+            Sysno::futex_time64,
+            Sysno::io_pgetevents_time64,
+            Sysno::mq_timedreceive_time64,
+            Sysno::mq_timedsend_time64,
+            Sysno::ppoll_time64,
+            Sysno::pselect6_time64,
+            Sysno::recvmmsg_time64,
+            Sysno::rt_sigtimedwait_time64,
+            Sysno::sched_rr_get_interval_time64,
+            Sysno::semtimedop_time64,
+            Sysno::timer_gettime64,
+            Sysno::timer_settime64,
+            Sysno::timerfd_gettime64,
+            Sysno::timerfd_settime64,
+            Sysno::utimensat_time64,
+        ]);
+        for &sysno in &refused {
             assert_eq!(
                 classify_syscall(sysno),
                 SyscallClassification::Determinized,
@@ -2462,9 +2635,12 @@ mod tests {
     #[test]
     fn mount_introspection_syscalls_are_determinized_and_consistent() {
         let refused = [
+            // x86_64 only: sysfs and ustat are absent from the aarch64 table.
+            #[cfg(target_arch = "x86_64")]
             Sysno::sysfs,
             Sysno::statmount,
             Sysno::listmount,
+            #[cfg(target_arch = "x86_64")]
             Sysno::ustat,
         ];
         for sysno in refused {
@@ -2631,7 +2807,10 @@ mod tests {
             Sysno::reboot,
             Sysno::swapon,
             Sysno::swapoff,
+            // x86_64 only: raw I/O port access exists only on x86.
+            #[cfg(target_arch = "x86_64")]
             Sysno::ioperm,
+            #[cfg(target_arch = "x86_64")]
             Sysno::iopl,
             Sysno::pivot_root,
             Sysno::sethostname,
@@ -2819,10 +2998,14 @@ mod tests {
             Sysno::openat2,
             Sysno::copy_file_range,
             Sysno::clock_settime,
+            // x86_64 only: futimesat and epoll_ctl_old are absent from the
+            // aarch64 table.
+            #[cfg(target_arch = "x86_64")]
             Sysno::futimesat,
             Sysno::io_uring_setup,
             Sysno::io_uring_enter,
             Sysno::io_uring_register,
+            #[cfg(target_arch = "x86_64")]
             Sysno::epoll_ctl_old,
         ];
         for sysno in refused_members {
@@ -2882,7 +3065,15 @@ mod tests {
         // behavioural contract lives in
         // hermit-cli/tests/chown_virtual_root_identity.rs, which fails under
         // both of those mutations. Do not let this test stand in for it.
-        for sysno in [Sysno::chown, Sysno::fchown, Sysno::fchownat, Sysno::lchown] {
+        for sysno in [
+            // x86_64 only: aarch64 has fchown and fchownat alone.
+            #[cfg(target_arch = "x86_64")]
+            Sysno::chown,
+            Sysno::fchown,
+            Sysno::fchownat,
+            #[cfg(target_arch = "x86_64")]
+            Sysno::lchown,
+        ] {
             assert!(
                 is_ownership_change_noop_syscall(sysno),
                 "{sysno:?} must be in the ownership-change no-op set"
@@ -2900,6 +3091,8 @@ mod tests {
         // families are a DIFFERENT no-op set with its own dispatch arm, and
         // collapsing the two would make either arm's removal untestable.
         for sysno in [
+            // x86_64 only: aarch64 has fchmod and fchmodat alone.
+            #[cfg(target_arch = "x86_64")]
             Sysno::chmod,
             Sysno::fchmod,
             Sysno::fchmodat,
@@ -2912,7 +3105,11 @@ mod tests {
                 "{sysno:?} must NOT be in the ownership-change no-op set"
             );
         }
+        // x86_64 only: chown is absent from the aarch64 table; fchownat
+        // checks the same on both.
+        #[cfg(target_arch = "x86_64")]
         assert!(!is_credential_identity_noop_syscall(Sysno::chown));
+        assert!(!is_credential_identity_noop_syscall(Sysno::fchownat));
         assert!(!is_ownership_change_noop_syscall(Sysno::setuid));
     }
 }

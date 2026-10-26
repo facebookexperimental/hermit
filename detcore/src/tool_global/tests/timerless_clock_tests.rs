@@ -123,7 +123,7 @@ impl Guest<Detcore> for ClockGuest {
     async fn regs(&mut self) -> libc::user_regs_struct {
         // SAFETY: user_regs_struct contains only integer register fields.
         let mut registers: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        registers.rip = RIP;
+        crate::arch::set_instruction_pointer(&mut registers, RIP);
         registers
     }
     async fn stack(&mut self) -> Self::Stack {
@@ -501,10 +501,14 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
                     Some(initial + LogicalTime::from_nanos(20_000)),
                 );
                 assert_eq!(boundary.timeslice_expired(), target_expired);
+                // x86_64 only: instruction traps (CPUID, RDTSC) exist only there.
+                #[cfg(target_arch = "x86_64")]
                 assert_eq!(
                     boundary.instruction_trap_ends_timeslice(&boundary_config),
                     trap_ends,
                 );
+                #[cfg(not(target_arch = "x86_64"))]
+                let _ = trap_ends;
                 assert_eq!(boundary.last_rcb_timer, None);
                 assert!(!boundary.last_rcb_timer_is_max);
             }
@@ -738,7 +742,10 @@ fn boundary_callback_tokens_preserve_actual_accounting_and_nested_entries() {
                 assert_eq!(observation["current"][2], 2);
             }
             // Use the real Tool implementation, not only the token helper.
+            // x86_64 only: CPUID traps exist only there.
+            #[cfg(target_arch = "x86_64")]
             tool.handle_cpuid_event(&mut guest, 0, 0).await.unwrap();
+            #[cfg(target_arch = "x86_64")]
             if observed {
                 let observation =
                     serde_json::to_value(guest.thread.slice_boundary.as_ref().unwrap()).unwrap();

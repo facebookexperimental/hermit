@@ -2582,6 +2582,9 @@ mod tests {
         }
     }
 
+    // x86_64 only: the rewrite serves readlink, which aarch64 does not have
+    // and the build compiles only for x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn rewrites_only_numeric_virtual_self_proc_fd_aliases() {
         assert_eq!(

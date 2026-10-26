@@ -1403,6 +1403,8 @@ mod tests {
 
     #[test]
     fn every_path_operand_is_found() {
+        // x86_64 only: aarch64 has openat alone.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             looked_up(Sysno::open),
             Some(Lookups::Paths(vec![(None, 0)]))

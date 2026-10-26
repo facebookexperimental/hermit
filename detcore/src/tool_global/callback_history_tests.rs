@@ -66,7 +66,7 @@ impl Guest<Detcore> for LegacyDeadlineGuest<'_> {
     async fn regs(&mut self) -> libc::user_regs_struct {
         // Synthetic registers are inspected, never executed by this fixture.
         let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.rip = 1;
+        crate::arch::set_instruction_pointer(&mut regs, 1);
         regs
     }
     async fn stack(&mut self) -> Self::Stack {

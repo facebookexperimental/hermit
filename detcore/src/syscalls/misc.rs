@@ -1397,12 +1397,12 @@ mod tests {
         // Two pages, the second made unreadable: "x\0" in the last two bytes
         // of the first page is a whole name; "xy" there runs into the
         // unreadable page.
-        const PAGE: usize = 4096;
+        let page = crate::test_pages::page_size();
         // SAFETY: a private anonymous mapping this test owns and unmaps.
         let base = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                2 * PAGE,
+                2 * page,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -1414,19 +1414,19 @@ mod tests {
         // SAFETY: inside the first, writable page; then the second page is
         // made unreadable.
         unsafe {
-            *((base + PAGE - 2) as *mut u8) = b'x';
-            *((base + PAGE - 1) as *mut u8) = 0;
+            *((base + page - 2) as *mut u8) = b'x';
+            *((base + page - 1) as *mut u8) = 0;
             assert_eq!(
-                libc::mprotect((base + PAGE) as *mut _, PAGE, libc::PROT_NONE),
+                libc::mprotect((base + page) as *mut _, page, libc::PROT_NONE),
                 0
             );
         }
-        assert_eq!(name(base + PAGE - 2), Some(b"x".to_vec()));
+        assert_eq!(name(base + page - 2), Some(b"x".to_vec()));
         // SAFETY: the first page is still writable.
-        unsafe { *((base + PAGE - 1) as *mut u8) = b'y' };
-        assert_eq!(name(base + PAGE - 2), None);
+        unsafe { *((base + page - 1) as *mut u8) = b'y' };
+        assert_eq!(name(base + page - 2), None);
         // SAFETY: the mapping this test made.
-        assert_eq!(unsafe { libc::munmap(base as *mut _, 2 * PAGE) }, 0);
+        assert_eq!(unsafe { libc::munmap(base as *mut _, 2 * page) }, 0);
     }
 
     use super::*;
@@ -1708,6 +1708,18 @@ mod tests {
         #[tokio::test]
         #[should_panic(expected = "HERMIT_INTERNAL_FAILURE class=tool-decided-injection")]
         async fn an_injected_tool_decided_call_ends_the_run() {
+            // Any group or session getter will do; aarch64 has getpgid, not
+            // getpgrp.
+            #[cfg(target_arch = "x86_64")]
+            let (sysno, call) = (
+                Sysno::getpgrp,
+                reverie::syscalls::Syscall::Getpgrp(reverie::syscalls::Getpgrp::new()),
+            );
+            #[cfg(not(target_arch = "x86_64"))]
+            let (sysno, call) = (
+                Sysno::getpgid,
+                reverie::syscalls::Syscall::Getpgid(reverie::syscalls::Getpgid::new()),
+            );
             let process = DetPid::from_raw(23);
             let config = Config::default();
             let global = GlobalState::init_global_state(&config).await;
@@ -1724,14 +1736,9 @@ mod tests {
                 refusal: Some(reverie::UnsupportedOperation::ToolDecided),
                 recorded: None,
                 injections: Mutex::new(0),
-                expected: Sysno::getpgrp,
+                expected: sysno,
             };
-            let result = tool
-                .handle_group_or_session_getter(
-                    &mut guest,
-                    reverie::syscalls::Syscall::Getpgrp(reverie::syscalls::Getpgrp::new()),
-                )
-                .await;
+            let result = tool.handle_group_or_session_getter(&mut guest, call).await;
             assert_eq!(*guest.injections.lock().unwrap(), 1);
             assert!(
                 matches!(result, Err(Error::Errno(Errno::ENOSYS))),
@@ -1740,7 +1747,7 @@ mod tests {
             crate::syscalls::helpers::fail_on_tool_decided_injection::<
                 crate::record_or_replay::NoopTool,
                 _,
-            >(&mut guest, Sysno::getpgrp);
+            >(&mut guest, sysno);
         }
     }
 

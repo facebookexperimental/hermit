@@ -889,6 +889,8 @@ mod tests {
         [result.eax, result.ebx, result.ecx, result.edx]
     }
 
+    // x86_64 only: the host CPUID profile, which the build compiles only there.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn host_profile_masks_nondeterministic_instructions_and_cpu_identity() {
         // Feed every bit set, including features absent on the test host.
@@ -941,6 +943,8 @@ mod tests {
         );
     }
 
+    // x86_64 only: it executes the host's CPUID instruction.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn host_profile_preserves_xsave_subleaves_and_ordinary_host_features() {
         let profile = InterceptedCpuid::for_config(&crate::Config {

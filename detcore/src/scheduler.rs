@@ -23767,7 +23767,23 @@ mod test {
     extern "C" fn pause_forever(_: *mut libc::c_void) -> libc::c_int {
         loop {
             // SAFETY: pause has no arguments and only waits for a signal.
-            unsafe { libc::syscall(libc::SYS_pause) };
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                libc::syscall(libc::SYS_pause)
+            };
+            // aarch64 has no pause; a ppoll of no descriptors with no timeout
+            // waits for a signal the same way.
+            // SAFETY: ppoll reads nothing through its null pointers.
+            #[cfg(not(target_arch = "x86_64"))]
+            unsafe {
+                libc::syscall(
+                    libc::SYS_ppoll,
+                    std::ptr::null::<libc::pollfd>(),
+                    0 as libc::nfds_t,
+                    std::ptr::null::<libc::timespec>(),
+                    std::ptr::null::<libc::sigset_t>(),
+                )
+            };
         }
     }
 

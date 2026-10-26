@@ -18572,8 +18572,8 @@ mod test {
     use super::opened_controlling_terminal;
     use super::pipe_capacity_request_exceeds_ceiling;
     use super::terminal_can_become_controlling;
-    use crate::test_pages::PAGE;
     use crate::test_pages::Pages;
+    use crate::test_pages::page_size;
 
     /// Run the test named `case` in an isolated child process, returning
     /// true when this invocation is the parent and the caller must return
@@ -19844,7 +19844,7 @@ mod test {
         assert_eq!(address.sun_path[0], 0);
         let name = address.sun_path[1..UNIX_AUTOBIND_NAME_LEN]
             .iter()
-            .map(|byte| *byte as u8)
+            .map(|byte| u8::from_ne_bytes(byte.to_ne_bytes()))
             .collect::<Vec<_>>();
         assert_eq!(name, b"002af");
         assert_eq!(
@@ -19922,7 +19922,7 @@ mod test {
                 let (records, names) = directory_records(format, &TEN);
                 let copied = super::copy_records(
                     &mut LocalMemory::new(),
-                    pages.address(PAGE - 16),
+                    pages.address(page_size() - 16),
                     format,
                     &records,
                     &names,
@@ -19966,7 +19966,8 @@ mod test {
     /// does), and reading the prefix the `getdents64` observer hashes.
     #[test]
     fn a_copy_error_other_than_a_fault_is_returned() {
-        let buf = |offset| reverie::syscalls::AddrMut::<u8>::from_raw(16 * PAGE + offset).unwrap();
+        let buf =
+            |offset| reverie::syscalls::AddrMut::<u8>::from_raw(16 * page_size() + offset).unwrap();
         for errno in [Errno::ESRCH, Errno::EIO] {
             let mut bytes = [0; 32];
             assert_eq!(
@@ -19975,7 +19976,7 @@ mod test {
             );
             for format in FORMATS {
                 let (records, names) = directory_records(format, &TEN);
-                for offset in [0, PAGE - 4] {
+                for offset in [0, page_size() - 4] {
                     let copied = super::copy_records(
                         &mut FailingMemory(errno),
                         buf(offset),
@@ -19999,7 +20000,7 @@ mod test {
     /// empty copy means, as it does for a short one.
     #[test]
     fn a_fault_of_the_whole_copy_copies_nothing() {
-        let buf = reverie::syscalls::AddrMut::<u8>::from_raw(16 * PAGE).unwrap();
+        let buf = reverie::syscalls::AddrMut::<u8>::from_raw(16 * page_size()).unwrap();
         let mut bytes = [0; 32];
         assert_eq!(
             super::read_guest_prefix(&FailingMemory(Errno::EFAULT), buf, &mut bytes),
@@ -20022,7 +20023,7 @@ mod test {
             let (records, names) = directory_records(format, &TEN);
             let copied = super::copy_records(
                 &mut LocalMemory::new(),
-                pages.address(PAGE - 8),
+                pages.address(page_size() - 8),
                 format,
                 &records,
                 &names,
@@ -20030,11 +20031,15 @@ mod test {
             );
             assert_eq!(copied, (0, Err(Errno::EFAULT)), "{format:?}");
             let contents = pages.contents();
-            assert_eq!(&contents[PAGE..PAGE + 8], &7i64.to_ne_bytes(), "{format:?}");
+            assert_eq!(
+                &contents[page_size()..page_size() + 8],
+                &7i64.to_ne_bytes(),
+                "{format:?}"
+            );
             assert!(
-                contents[..PAGE]
+                contents[..page_size()]
                     .iter()
-                    .chain(&contents[PAGE + 8..])
+                    .chain(&contents[page_size() + 8..])
                     .all(|&byte| byte == Pages::FILL),
                 "{format:?}: bytes other than the first d_off changed"
             );
@@ -20052,7 +20057,7 @@ mod test {
             let (records, names) = directory_records(format, &TEN);
             let copied = super::copy_records(
                 &mut LocalMemory::new(),
-                pages.address(PAGE - 12),
+                pages.address(page_size() - 12),
                 format,
                 &records,
                 &names,
@@ -20087,7 +20092,7 @@ mod test {
                 let (records, names) = directory_records(format, &TEN);
                 let copied = super::copy_records(
                     &mut LocalMemory::new(),
-                    pages.address(PAGE - 12),
+                    pages.address(page_size() - 12),
                     format,
                     &records,
                     &names,
@@ -20118,7 +20123,7 @@ mod test {
             let (records, names) = directory_records(format, &TEN);
             let copied = super::copy_records(
                 &mut LocalMemory::new(),
-                pages.address(PAGE - 100),
+                pages.address(page_size() - 100),
                 format,
                 &records,
                 &names,
@@ -20127,14 +20132,14 @@ mod test {
             assert_eq!(copied, (4, Ok(96)), "{format:?}");
             let contents = pages.contents();
             assert_eq!(
-                &contents[PAGE - 100..PAGE - 4],
+                &contents[page_size() - 100..page_size() - 4],
                 &as_linux_writes(format, &records[..96], &names[..4])[..],
                 "{format:?}"
             );
             assert!(
-                contents[..PAGE - 100]
+                contents[..page_size() - 100]
                     .iter()
-                    .chain(&contents[PAGE - 4..])
+                    .chain(&contents[page_size() - 4..])
                     .all(|&byte| byte == Pages::FILL),
                 "{format:?}: bytes outside the records copied changed"
             );
@@ -20147,7 +20152,7 @@ mod test {
     #[test]
     fn a_torn_procfs_read_is_partial_for_a_seq_file_and_a_fault_for_a_sysctl() {
         let pages = Pages::new(&[libc::PROT_READ | libc::PROT_WRITE, libc::PROT_NONE]);
-        let edge = || Some(pages.address(PAGE - 2));
+        let edge = || Some(pages.address(page_size() - 2));
         let read = |bytes: &[u8], sysctl| {
             super::copy_procfs_read(&mut LocalMemory::new(), edge(), bytes, sysctl)
                 .map_err(|error| error.into_errno().unwrap())
@@ -20246,7 +20251,7 @@ mod test {
             let (records, names) = directory_records(format, &TEN);
             let copied = super::copy_records(
                 &mut LocalMemory::new(),
-                pages.address(PAGE - 4),
+                pages.address(page_size() - 4),
                 format,
                 &records,
                 &names,
@@ -20262,18 +20267,26 @@ mod test {
 
     /// Records across two writable pages and into a third the guest cannot
     /// write, starting 40 bytes before the second page, so the third starts
-    /// 4136 bytes in. Record 172 starts at 4128: Linux stores its position
-    /// into record 171's `d_off` and its `d_ino`, which ends at the third
-    /// page, and then fails at its `d_reclen`. The call returns 172 records
-    /// and leaves that `d_ino` written.
+    /// a page and 40 bytes in (4136 bytes with 4 KiB pages). Every record is
+    /// 24 bytes, so record n = (page + 40) / 24 (172) starts 8 bytes before
+    /// the third page (at 4128): Linux stores its position into record
+    /// n - 1's `d_off` and its `d_ino`, which ends at the third page, and
+    /// then fails at its `d_reclen`. The call returns n records and leaves
+    /// that `d_ino` written.
     #[test]
     fn a_record_not_copied_is_left_as_linux_leaves_it() {
-        let names: Vec<[u8; 1]> = (0..200u8).map(|i| [b'a' + i % 26]).collect();
+        let writable = page_size() + 40;
+        let whole = writable / 24;
+        assert_eq!(writable % 24, 8, "the third page starts after a d_ino");
+        if page_size() == 4096 {
+            assert_eq!((whole, whole * 24, writable), (172, 4128, 4136));
+        }
+        let names: Vec<[u8; 1]> = (0..whole + 28).map(|i| [b'a' + (i % 26) as u8]).collect();
         let names: Vec<&[u8]> = names.iter().map(|name| &name[..]).collect();
         for format in FORMATS {
             let rw = libc::PROT_READ | libc::PROT_WRITE;
             let pages = Pages::new(&[rw, rw, libc::PROT_NONE]);
-            let start = PAGE - 40;
+            let start = page_size() - 40;
             let (records, lens) = directory_records(format, &names);
             let copied = super::copy_records(
                 &mut LocalMemory::new(),
@@ -20283,15 +20296,19 @@ mod test {
                 &lens,
                 0,
             );
-            assert_eq!(copied, (172, Ok(172 * 24)), "{format:?}");
+            assert_eq!(copied, (whole, Ok(whole * 24)), "{format:?}");
             let contents = pages.contents();
-            let mut expected = as_linux_writes(format, &records[..4128], &lens[..172]);
-            expected.extend_from_slice(&records[4128..4136]);
-            assert_eq!(&contents[start..start + 4136], &expected[..], "{format:?}");
+            let mut expected = as_linux_writes(format, &records[..whole * 24], &lens[..whole]);
+            expected.extend_from_slice(&records[whole * 24..writable]);
+            assert_eq!(
+                &contents[start..start + writable],
+                &expected[..],
+                "{format:?}"
+            );
             assert!(
                 contents[..start]
                     .iter()
-                    .chain(&contents[start + 4136..])
+                    .chain(&contents[start + writable..])
                     .all(|&byte| byte == Pages::FILL),
                 "{format:?}: bytes outside what Linux writes changed"
             );
@@ -20311,14 +20328,14 @@ mod test {
             let (records, names) = directory_records(format, &[b"a", b"abcdefghijklmnopqrst"]);
             let copied = super::copy_records(
                 &mut LocalMemory::new(),
-                pages.address(PAGE - 50),
+                pages.address(page_size() - 50),
                 format,
                 &records,
                 &names,
                 0,
             );
             assert_eq!(copied, (1, Ok(24)), "{format:?}");
-            let contents = &pages.contents()[PAGE - 50..PAGE];
+            let contents = &pages.contents()[page_size() - 50..page_size()];
             let mut expected = as_linux_writes(format, &records[..24], &names[..1]);
             expected.extend_from_slice(&records[24..32]);
             expected.extend_from_slice(&[Pages::FILL; 8]);
@@ -20343,7 +20360,7 @@ mod test {
             let (records, names) = directory_records(format, &TEN);
             let copied = super::copy_records(
                 &mut LocalMemory::new(),
-                pages.address(PAGE - 50),
+                pages.address(page_size() - 50),
                 format,
                 &records,
                 &names,
@@ -20352,14 +20369,14 @@ mod test {
             assert_eq!(copied, (10, Ok(240)), "{format:?}");
             let contents = pages.contents();
             assert_eq!(
-                &contents[PAGE - 50..PAGE - 50 + records.len()],
+                &contents[page_size() - 50..page_size() - 50 + records.len()],
                 &as_linux_writes(format, &records, &names)[..],
                 "{format:?}"
             );
             assert!(
-                contents[..PAGE - 50]
+                contents[..page_size() - 50]
                     .iter()
-                    .chain(&contents[PAGE - 50 + records.len()..])
+                    .chain(&contents[page_size() - 50 + records.len()..])
                     .all(|&byte| byte == Pages::FILL),
                 "{format:?}: bytes outside the records changed"
             );
@@ -20745,7 +20762,12 @@ mod inject_fstat_scratch {
                     0
                 );
             }
-            if matches!(number, Sysno::getdents | Sysno::getdents64) {
+            // x86_64 only: aarch64 has getdents64 alone.
+            #[cfg(target_arch = "x86_64")]
+            let reads_directory = matches!(number, Sysno::getdents | Sysno::getdents64);
+            #[cfg(not(target_arch = "x86_64"))]
+            let reads_directory = number == Sysno::getdents64;
+            if reads_directory {
                 let bytes = self
                     .directory_batches
                     .pop_front()
@@ -21437,7 +21459,12 @@ mod inject_fstat_scratch {
     pub(super) async fn raw_directory_projection() {
         use std::os::fd::AsRawFd;
         let directory = std::fs::File::open("/proc/self/fd").unwrap();
-        for format in [DirentFormat::Legacy, DirentFormat::Dirent64] {
+        for format in [
+            // x86_64 only: aarch64 has getdents64 alone.
+            #[cfg(target_arch = "x86_64")]
+            DirentFormat::Legacy,
+            DirentFormat::Dirent64,
+        ] {
             let entries = [
                 DirEntry {
                     ino: 91,
@@ -21509,6 +21536,7 @@ mod inject_fstat_scratch {
                 let mut bytes = vec![0xa5; 512];
                 let buffer: AddrMut<u8> = AddrMut::from_raw(bytes.as_mut_ptr() as usize).unwrap();
                 let result = match format {
+                    #[cfg(target_arch = "x86_64")]
                     DirentFormat::Legacy => {
                         tool.handle_getdents(
                             &mut guest,
@@ -21519,6 +21547,8 @@ mod inject_fstat_scratch {
                         )
                         .await
                     }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    DirentFormat::Legacy => unreachable!("aarch64 has no getdents"),
                     DirentFormat::Dirent64 => {
                         tool.handle_getdents64(
                             &mut guest,

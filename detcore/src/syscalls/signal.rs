@@ -6705,6 +6705,8 @@ mod tests {
         }
     }
 
+    // x86_64 only: it tests alarm, which aarch64 does not have.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn alarm_seconds_round_as_linux_does() {
         assert_eq!(linux_alarm_seconds(LogicalTime::ZERO), 0);
@@ -6728,6 +6730,8 @@ mod tests {
         );
     }
 
+    // x86_64 only: it tests alarm, which aarch64 does not have.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn alarm_remaining_seconds_round_up() {
         assert_eq!(logical_time_to_alarm_seconds(LogicalTime::ZERO), 0);
@@ -6998,10 +7002,12 @@ mod rt_sigsuspend_tests {
         async fn regs(&mut self) -> libc::user_regs_struct {
             // SAFETY: user_regs_struct is plain integers; all zeroes is valid.
             let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-            regs.rsp = self
-                .stack_pointer
-                .unwrap_or(self.arena.as_ptr() as usize + STACK_WORD * 8)
-                as u64;
+            crate::arch::set_stack_pointer(
+                &mut regs,
+                self.stack_pointer
+                    .unwrap_or(self.arena.as_ptr() as usize + STACK_WORD * 8)
+                    as u64,
+            );
             regs
         }
         async fn stack(&mut self) -> Self::Stack {

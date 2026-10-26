@@ -216,8 +216,16 @@ fn a_representative_call_of_each_check_still_reaches_it() {
     futures::executor::block_on(async {
         let mut tool = detcore::<NoopTool>();
         tool.cfg.recordreplay_modes = false;
-        let unlink = Syscall::from_raw(Sysno::unlink, SyscallArgs::new(path, 0, 0, 0, 0, 0));
-        assert!(may_name_file_or_descriptor(Sysno::unlink));
+        // aarch64 has unlinkat, not unlink.
+        #[cfg(target_arch = "x86_64")]
+        let (removal, args) = (Sysno::unlink, SyscallArgs::new(path, 0, 0, 0, 0, 0));
+        #[cfg(not(target_arch = "x86_64"))]
+        let (removal, args) = (
+            Sysno::unlinkat,
+            SyscallArgs::new(libc::AT_FDCWD as usize, path, 0, 0, 0, 0),
+        );
+        let unlink = Syscall::from_raw(removal, args);
+        assert!(may_name_file_or_descriptor(removal));
 
         let mut guest =
             InjectGuest::<NoopTool>::new(Err(reverie::Errno::ENOMEM)).with_registers(no_scratch());
@@ -282,9 +290,16 @@ fn a_representative_call_of_each_check_still_reaches_it() {
             Sysno::mmap,
             rendered_procfs::may_answer_mapping(Sysno::mmap),
         ),
+        // aarch64 has faccessat, not access.
+        #[cfg(target_arch = "x86_64")]
         (
             Sysno::access,
             rendered_procfs::may_answer_path_call(Sysno::access),
+        ),
+        #[cfg(not(target_arch = "x86_64"))]
+        (
+            Sysno::faccessat,
+            rendered_procfs::may_answer_path_call(Sysno::faccessat),
         ),
     ] {
         assert!(own, "{sysno}");

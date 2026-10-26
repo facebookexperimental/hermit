@@ -385,7 +385,7 @@ mod tests {
                             }
                             Ok(bytes.len())
                         }
-                        Sysno::newfstatat => {
+                        crate::arch::FSTATAT => {
                             assert_eq!(calls, 2);
                             assert_eq!(args[3], 0, "follow the descriptor's target");
                             // Also fill on failure: a failed stat must not

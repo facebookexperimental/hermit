@@ -123,7 +123,7 @@ pub unsafe fn serialize_dirents64(dents: &[Dirent64], bytes: &mut [u8]) -> usize
                 // NOTE: name is null-terminated with the man page
                 // explicitly warning against other methods to read
                 // d_name besides strlen(): https://man7.org/linux/man-pages/man3/readdir.3.html
-                strlen(ent.name.as_ptr() as *const i8),
+                strlen(ent.name.as_ptr() as *const libc::c_char),
             );
             k += reclen as isize;
             i += 1;
@@ -188,7 +188,7 @@ pub unsafe fn serialize_dirents(dents: &[Dirent64], bytes: &mut [u8]) -> usize {
             ptr::copy_nonoverlapping(
                 ent.name.as_ptr(),
                 dirp.offset(j),
-                strlen(ent.name.as_ptr() as *const i8),
+                strlen(ent.name.as_ptr() as *const libc::c_char),
             );
             j = reclen as isize - 1;
             ptr::write(dirp.offset(j).cast::<u8>(), ent.ty);

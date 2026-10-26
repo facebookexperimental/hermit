@@ -2173,9 +2173,11 @@ mod tests {
             self.delivery.registers_read += 1;
             // SAFETY: an all-zero `user_regs_struct` is a valid value.
             let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-            regs.orig_rax = orig_rax as u64;
-            regs.rip = self.delivery.rip;
-            [regs.rdi, regs.rsi, regs.rdx, regs.rsp] = self.delivery.frame_regs;
+            crate::arch::set_syscall_number(&mut regs, orig_rax as u64);
+            crate::arch::set_instruction_pointer(&mut regs, self.delivery.rip);
+            let [arg0, arg1, arg2, sp] = self.delivery.frame_regs;
+            crate::arch::set_syscall_arguments(&mut regs, &[arg0, arg1, arg2]);
+            crate::arch::set_stack_pointer(&mut regs, sp);
             regs
         }
         fn signal_report_path(&self) -> Option<reverie::SignalReportPath> {
@@ -2582,6 +2584,9 @@ mod tests {
     /// mask from a forced clear of the own one, so the copy follows the
     /// kernel only when the record agrees, and otherwise gives itself up
     /// quietly, as for a forced delivery, never reporting a divergence.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_wait_mask_differing_only_in_forced_signals_is_taken_only_with_evidence() {
         let kernel = Kernel::default();
@@ -3677,6 +3682,9 @@ mod tests {
         assert_eq!(due(&parent), Some(None));
     }
 
+    // x86_64 only: the ptrace backend reports sigreturns only there (the
+    // report reads an x86-64 signal frame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn sigreturns_are_observed_only_where_the_backend_reports_them() {
         let config = |backend| Config {
@@ -3815,6 +3823,9 @@ mod tests {
         }
     }
 
+    // x86_64 only: the ptrace backend reports sigreturns only there (the
+    // report reads an x86-64 signal frame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_report_the_kernel_did_not_follow_fails_closed_at_the_next_entry() {
         let kernel = Kernel::default();
@@ -3866,7 +3877,12 @@ mod tests {
         let kernel = Kernel::default();
         let _seam = kernel.install();
         for (backend, inferred) in [
+            // The ptrace backend reports sigreturns only on x86_64 (the report
+            // reads an x86-64 signal frame); elsewhere its returns are inferred.
+            #[cfg(target_arch = "x86_64")]
             (reverie::BackendCapabilities::PTRACE, false),
+            #[cfg(not(target_arch = "x86_64"))]
+            (reverie::BackendCapabilities::PTRACE, true),
             (reverie::BackendCapabilities::E9PATCH, true),
         ] {
             let mut guest = in_handler(&kernel, backend);
@@ -4043,6 +4059,9 @@ mod tests {
     /// delivery: the caught action, the frame and current masks, Linux's
     /// handler mask, every reserved and forced signal unchecked except the
     /// delivered one, and the interruption Detcore recorded.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_checked_delivery_is_built_from_the_copy_and_recorded_as_unchecked() {
         let kernel = Kernel::default();
@@ -4242,7 +4261,8 @@ mod tests {
     /// The registers Linux leaves for a SIGUSR1 frame at 0x7fff_0008, stated
     /// on their own rather than from `KERNEL_UCONTEXT_SIZE`: `rdi` the signal,
     /// `rsi` the siginfo 8 + 304 bytes above the frame, `rdx` the ucontext 8
-    /// bytes above it, and `rsp` the frame.
+    /// bytes above it, and `rsp` the frame. x86_64 only, as are its tests.
+    #[cfg(target_arch = "x86_64")]
     const FRAME_REGS: [u64; 4] = [libc::SIGUSR1 as u64, 0x7fff_0140, 0x7fff_0010, 0x7fff_0008];
 
     /// A frame's chained delivery at the same exit stops at the handler's
@@ -4251,6 +4271,9 @@ mod tests {
     /// guest ran on, and with `orig_ax` -1 that is no syscall. Anywhere else
     /// it is no syscall too; and still at the syscall's exit away from the
     /// handler, where a frame fault's SIGSEGV stops, the registers decide.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn after_frame_holds_only_at_the_handlers_first_instruction() {
         let kernel = Kernel::default();
@@ -4333,6 +4356,9 @@ mod tests {
     /// until the thread enters the kernel again. At the handler's first
     /// instruction with every frame register intact but `orig_ax` -1, the
     /// thread went back to user code and came in again: not `AfterFrame`.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn after_frame_needs_the_frames_own_orig_ax() {
         let kernel = Kernel::default();
@@ -4373,6 +4399,9 @@ mod tests {
     /// at the same exit is. One the thread queued to itself with a positive
     /// code is chained too, but cannot be told from a fault, and takes the
     /// registers' answer as well.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn after_frame_is_never_a_synchronous_signal_with_a_kernel_code() {
         let kernel = Kernel::default();
@@ -4691,6 +4720,9 @@ mod tests {
     /// Detcore cannot see; and the record as it stands where it disagrees with
     /// a known syscall, so the backend reports it. Only `orig_ax` -1 is no
     /// syscall.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_interruption_is_the_record_where_the_registers_agree_on_the_syscall() {
         let kernel = Kernel::default();
@@ -4787,6 +4819,45 @@ mod tests {
                 u64::from(from_registers),
                 "record {record:?}, orig_rax {orig}, passthru {passthru}"
             );
+        }
+    }
+
+    /// The aarch64 side of `delivery_interruption`: it reads no registers
+    /// there, so every delivery is sent as `AfterFrame`, which checks nothing,
+    /// whatever the record, the syscall the thread is in and `--passthru-opt`,
+    /// and counts as taken from the registers.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn without_register_reads_every_interruption_is_after_frame() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let read = reverie::Interruption::Return {
+            syscall: libc::SYS_read,
+            result: -512,
+        };
+        let cases = [
+            (Some(read), libc::SYS_read, false),
+            (Some(read), -1, false),
+            (None, libc::SYS_read, false),
+            (Some(reverie::Interruption::NotInSyscall), -1, false),
+            (Some(read), libc::SYS_write, true),
+        ];
+        for (record, orig, passthru) in cases {
+            let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+            guest.config.passthru_opt = passthru;
+            guest.thread.delivery_interruption = record;
+            guest.delivery.orig_rax = Some(orig);
+            check(&mut guest, libc::SIGUSR1);
+            assert_eq!(
+                guest.delivery.asked[0].interruption,
+                reverie::Interruption::AfterFrame,
+                "record {record:?}, orig {orig}, passthru {passthru}"
+            );
+            assert_eq!(
+                guest.thread.delivery_counters.interruption_from_registers, 1,
+                "record {record:?}, orig {orig}, passthru {passthru}"
+            );
+            assert_eq!(guest.delivery.registers_read, 0, "no register is read");
         }
     }
 }

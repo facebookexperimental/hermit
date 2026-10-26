@@ -7513,6 +7513,9 @@ mod tests {
 
     #[test]
     fn signal_interruption_errno_matches_linux_restart_policy() {
+        // x86_64 only: aarch64 has no poll or epoll_wait, only ppoll and
+        // epoll_pwait.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             reverie::syscalls::Poll::new().signal_interrupt_errno(),
             Errno::EINTR
@@ -7521,8 +7524,13 @@ mod tests {
             reverie::syscalls::Ppoll::new().signal_interrupt_errno(),
             Errno::EINTR
         );
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             reverie::syscalls::EpollWait::new().signal_interrupt_errno(),
+            Errno::EINTR
+        );
+        assert_eq!(
+            reverie::syscalls::EpollPwait::new().signal_interrupt_errno(),
             Errno::EINTR
         );
         let sigtimedwait = reverie::syscalls::RtSigtimedwait::new();
@@ -7554,6 +7562,9 @@ mod tests {
         // code: a handler turns it into EINTR, and with no handler the kernel runs
         // restart_syscall, which Detcore resumes with the deadline it kept
         // (`RestartBlock`, https://github.com/rrnewton/hermit/issues/3358).
+        // x86_64 only: aarch64 has no poll or epoll_wait, only ppoll and
+        // epoll_pwait.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             reverie::syscalls::Poll::new()
                 .with_timeout(300)
@@ -7562,10 +7573,12 @@ mod tests {
         );
         // A zero timeout never blocks and a negative one never expires, so there is
         // no deadline to keep, and running the call again is Linux's restart.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             reverie::syscalls::Poll::new().kernel_restart_errno(),
             Errno::ERESTARTNOHAND
         );
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             reverie::syscalls::Poll::new()
                 .with_timeout(-1)
@@ -7577,8 +7590,13 @@ mod tests {
             Errno::ERESTARTNOHAND
         );
         // epoll_wait and sigtimedwait never restart after a handler.
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             reverie::syscalls::EpollWait::new().kernel_restart_errno(),
+            Errno::EINTR
+        );
+        assert_eq!(
+            reverie::syscalls::EpollPwait::new().kernel_restart_errno(),
             Errno::EINTR
         );
         assert_eq!(
@@ -10730,6 +10748,11 @@ pub(crate) mod kernel_signal_wait_failures {
     /// signals and the pull request.
     #[tokio::test]
     async fn a_held_signal_refusal_follows_the_unsupported_operation_policy() {
+        // Any wait will do; aarch64 has ppoll, not poll.
+        #[cfg(target_arch = "x86_64")]
+        const WAIT: Sysno = Sysno::poll;
+        #[cfg(not(target_arch = "x86_64"))]
+        const WAIT: Sysno = Sysno::ppoll;
         let refused = || {
             Err::<i64, Error>(Error::Tool(anyhow::Error::new(HeldSignalRefusal {
                 wait: None,
@@ -10740,15 +10763,15 @@ pub(crate) mod kernel_signal_wait_failures {
         };
         let (mut guest, _kernel) = WaitGuest::live(guest_mask());
         guest.config.panic_on_unsupported_syscalls = false;
-        let result = refuse_held_signal_loss(&mut guest, Sysno::poll, refused()).await;
+        let result = refuse_held_signal_loss(&mut guest, WAIT, refused()).await;
         assert!(
             matches!(result, Err(Error::Errno(Errno::ERESTARTNOINTR))),
             "{result:?}"
         );
-        let result = refuse_held_signal_loss(&mut guest, Sysno::poll, Ok(3)).await;
+        let result = refuse_held_signal_loss(&mut guest, WAIT, Ok(3)).await;
         assert!(matches!(result, Ok(3)), "{result:?}");
         let result =
-            refuse_held_signal_loss(&mut guest, Sysno::poll, Err(Errno::ERESTARTSYS.into())).await;
+            refuse_held_signal_loss(&mut guest, WAIT, Err(Errno::ERESTARTSYS.into())).await;
         assert!(
             matches!(result, Err(Error::Errno(Errno::ERESTARTSYS))),
             "{result:?}"
@@ -10757,12 +10780,12 @@ pub(crate) mod kernel_signal_wait_failures {
         guest.config.panic_on_unsupported_syscalls = true;
         guest.config.exit_on_unsupported_syscall = true;
         guest.config.shutdown_on_unsupported_syscall = false;
-        let result = refuse_held_signal_loss(&mut guest, Sysno::poll, refused()).await;
+        let result = refuse_held_signal_loss(&mut guest, WAIT, refused()).await;
         match result {
             Err(Error::Tool(error)) => assert!(
                 matches!(
                     error.downcast_ref::<crate::UnsupportedSyscallError>(),
-                    Some(crate::UnsupportedSyscallError(Sysno::poll))
+                    Some(crate::UnsupportedSyscallError(WAIT))
                 ),
                 "{error:#}"
             ),
@@ -10770,7 +10793,7 @@ pub(crate) mod kernel_signal_wait_failures {
         }
 
         let message = HeldSignalRefusal {
-            wait: Some(Sysno::poll),
+            wait: Some(WAIT),
             held: Some(libc::SIGCHLD),
             replacing: Some(libc::SIGWINCH),
             loss: HeldSignalLoss::Replaced,
@@ -11573,27 +11596,29 @@ mod tool_decided_injection_tests {
     /// groups, a signal), is not judged here.
     #[test]
     fn only_a_tool_decided_refusal_is_an_internal_failure() {
+        // Any injected call will do; aarch64 has getpgid, not getpgrp.
+        #[cfg(target_arch = "x86_64")]
+        let (sysno, name) = (Sysno::getpgrp, "getpgrp");
+        #[cfg(not(target_arch = "x86_64"))]
+        let (sysno, name) = (Sysno::getpgid, "getpgid");
         let dettid = DetTid::from_raw(7);
         let failure = tool_decided_injection_failure(
             refusal(reverie::UnsupportedOperation::ToolDecided),
             dettid,
-            Sysno::getpgrp,
+            sysno,
         )
         .expect("a ToolDecided refusal is an internal failure");
         assert!(
-            failure.starts_with(
-                "HERMIT_INTERNAL_FAILURE class=tool-decided-injection dtid=7 syscall=getpgrp"
-            ),
+            failure.starts_with(&format!(
+                "HERMIT_INTERNAL_FAILURE class=tool-decided-injection dtid=7 syscall={name}"
+            )),
             "{failure}"
         );
         assert!(
             failure.contains("KVM leaves this call to the Tool"),
             "{failure}"
         );
-        assert_eq!(
-            tool_decided_injection_failure(None, dettid, Sysno::getpgrp),
-            None
-        );
+        assert_eq!(tool_decided_injection_failure(None, dettid, sysno), None);
         for operation in [
             reverie::UnsupportedOperation::Flock,
             reverie::UnsupportedOperation::ProcessGroups,
@@ -11601,7 +11626,7 @@ mod tool_decided_injection_tests {
             reverie::UnsupportedOperation::NonLeaderExec,
         ] {
             assert_eq!(
-                tool_decided_injection_failure(refusal(operation), dettid, Sysno::getpgrp),
+                tool_decided_injection_failure(refusal(operation), dettid, sysno),
                 None,
                 "{operation:?}"
             );

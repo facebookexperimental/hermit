@@ -259,6 +259,9 @@ async fn with_the_gate_off_rt_sigsuspend_keeps_its_kernel_run_path() {
     }
     let _seam = signal_state_read_seam::install(|_, _| panic!("a /proc read with the gate off"));
     let mut guest = turn_guest(false, Some(0));
+    // A real stack for the path's scratch cells below the red zone.
+    let stack: &'static mut [u8; 4096] = Box::leak(Box::new([0; 4096]));
+    guest.rsp = stack.as_ptr() as u64 + 2048;
     let tool = super::tool(&guest);
     let result = tool
         .handle_rt_sigsuspend(&mut guest, suspend(bit(libc::SIGTERM)))
@@ -598,8 +601,16 @@ impl FormMemory {
     const WRAPPER: usize = 64;
     const MASK: usize = 128;
     const SET: usize = 256;
-    const READ_ONLY: usize = crate::test_pages::PAGE;
-    const UNREADABLE: usize = 2 * crate::test_pages::PAGE;
+
+    /// The start of the read-only page.
+    fn read_only() -> usize {
+        crate::test_pages::page_size()
+    }
+
+    /// The start of the unreadable page.
+    fn unreadable() -> usize {
+        2 * crate::test_pages::page_size()
+    }
 
     /// `timeout` in nanoseconds (`None`: no timeout argument), the
     /// temporary `mask`, and the writable set or pollfd zeroed.
@@ -710,7 +721,7 @@ async fn under_the_gate_a_zero_timeout_masked_pselect6_follows_linux_order() {
         ),
         (
             "(b) read-only, ready",
-            FormMemory::READ_ONLY,
+            FormMemory::read_only(),
             0,
             Some(Ok(1)),
             Err(Errno::EFAULT),
@@ -718,7 +729,7 @@ async fn under_the_gate_a_zero_timeout_masked_pselect6_follows_linux_order() {
         ),
         (
             "(c) read-only, nothing ready",
-            FormMemory::READ_ONLY,
+            FormMemory::read_only(),
             0,
             Some(Ok(0)),
             Err(Errno::ERESTARTNOHAND),
@@ -726,7 +737,7 @@ async fn under_the_gate_a_zero_timeout_masked_pselect6_follows_linux_order() {
         ),
         (
             "(d) unreadable",
-            FormMemory::UNREADABLE,
+            FormMemory::unreadable(),
             0,
             None,
             Err(Errno::EFAULT),
@@ -765,7 +776,7 @@ async fn under_the_gate_a_zero_timeout_masked_pselect6_follows_linux_order() {
         );
         if dies {
             assert_eq!(
-                memory.word(FormMemory::READ_ONLY),
+                memory.word(FormMemory::read_only()),
                 u64::from_ne_bytes([crate::test_pages::Pages::FILL; 8]),
                 "{name}: no copy-out"
             );
@@ -899,6 +910,8 @@ async fn under_the_gate_each_select_form_ends_only_for_a_signal_its_mask_lets_in
     enum Form {
         MaskedPselect6,
         Pselect6,
+        // x86_64 only: aarch64 has no select syscall.
+        #[cfg(target_arch = "x86_64")]
         Select,
     }
     // (form, own mask, temporary mask, pending, ends, removed)
@@ -908,8 +921,11 @@ async fn under_the_gate_each_select_form_ends_only_for_a_signal_its_mask_lets_in
         (Form::MaskedPselect6, urg, 0, urg, false, urg),
         (Form::Pselect6, 0, 0, term, true, 0),
         (Form::Pselect6, term, 0, term, false, 0),
+        #[cfg(target_arch = "x86_64")]
         (Form::Select, 0, 0, term, true, 0),
+        #[cfg(target_arch = "x86_64")]
         (Form::Select, term, 0, term, false, 0),
+        #[cfg(target_arch = "x86_64")]
         (Form::Select, 0, 0, urg, false, 0),
     ];
     for (form, own, temporary, pending, ends, removed) in rows {
@@ -943,6 +959,7 @@ async fn under_the_gate_each_select_form_ends_only_for_a_signal_its_mask_lets_in
                 );
                 tool.handle_pselect6(&mut guest, call).await
             }
+            #[cfg(target_arch = "x86_64")]
             Form::Select => {
                 // A one-second `timeval` at the timeout's place.
                 LocalMemory::new()
@@ -1185,7 +1202,7 @@ async fn under_the_gate_a_masked_ppoll_follows_linux_order_and_waits_under_its_t
         (
             "zero, read-only",
             0,
-            FormMemory::READ_ONLY,
+            FormMemory::read_only(),
             term,
             None,
             Err(Errno::EFAULT),
@@ -1524,7 +1541,7 @@ async fn the_base_rows_where_in_guest_matched_linux_keep_their_answers_under_the
             "zt-ps-ro-ready",
             false,
             1,
-            FormMemory::READ_ONLY,
+            FormMemory::read_only(),
             0,
             Some(Ok(1)),
             Err(Errno::EFAULT),
@@ -1533,7 +1550,7 @@ async fn the_base_rows_where_in_guest_matched_linux_keep_their_answers_under_the
             "zt-ps-ro-none",
             false,
             1,
-            FormMemory::READ_ONLY,
+            FormMemory::read_only(),
             0,
             Some(Ok(0)),
             death,
@@ -1542,7 +1559,7 @@ async fn the_base_rows_where_in_guest_matched_linux_keep_their_answers_under_the
             "zt-ps-unreadable",
             false,
             1,
-            FormMemory::UNREADABLE,
+            FormMemory::unreadable(),
             0,
             None,
             Err(Errno::EFAULT),
@@ -1587,7 +1604,7 @@ async fn the_base_rows_where_in_guest_matched_linux_keep_their_answers_under_the
             "zt-pp-ro-none",
             true,
             1,
-            FormMemory::READ_ONLY,
+            FormMemory::read_only(),
             0,
             Some(Ok(0)),
             Err(Errno::EFAULT),
@@ -1596,7 +1613,7 @@ async fn the_base_rows_where_in_guest_matched_linux_keep_their_answers_under_the
             "zt-pp-ro-ready",
             true,
             1,
-            FormMemory::READ_ONLY,
+            FormMemory::read_only(),
             0,
             Some(Ok(1)),
             Err(Errno::EFAULT),
@@ -1623,7 +1640,7 @@ async fn the_base_rows_where_in_guest_matched_linux_keep_their_answers_under_the
             "zt-pp-unreadable",
             true,
             1,
-            FormMemory::UNREADABLE,
+            FormMemory::unreadable(),
             0,
             Some(Ok(0)),
             Err(Errno::EFAULT),
@@ -1832,7 +1849,7 @@ async fn under_the_gate_an_invalid_masked_call_meets_d41_only_for_a_signal_its_o
                     (tool.handle_pselect6(&mut guest, call).await, Errno::EINVAL)
                 }
                 "ppoll" => (
-                    tool.handle_ppoll(&mut guest, ppoll(&memory, FormMemory::UNREADABLE))
+                    tool.handle_ppoll(&mut guest, ppoll(&memory, FormMemory::unreadable()))
                         .await,
                     Errno::EFAULT,
                 ),
@@ -2148,6 +2165,9 @@ async fn under_the_gate_a_masked_wait_ready_at_its_first_probe_still_yields_once
 /// Mutations "the scratch refusal before any probe" (every row is ENOSYS with
 /// no probe) and "a count returned without the publication" (the timerfd
 /// ready row returns 1).
+// x86_64 only: it tests the stage-free poll probe, and aarch64 has no poll
+// syscall (its probe is a ppoll, whose timeout needs scratch).
+#[cfg(target_arch = "x86_64")]
 #[tokio::test]
 async fn under_the_gate_a_masked_ppoll_on_a_tight_stack_gets_the_kernel_s_answer_first() {
     for (name, pollfd, probe, expected) in [
@@ -2172,7 +2192,7 @@ async fn under_the_gate_a_masked_ppoll_on_a_tight_stack_gets_the_kernel_s_answer
         ),
         (
             "unreadable",
-            FormMemory::UNREADABLE,
+            FormMemory::unreadable(),
             None,
             Err(Errno::EFAULT),
         ),
@@ -2204,6 +2224,57 @@ async fn under_the_gate_a_masked_ppoll_on_a_tight_stack_gets_the_kernel_s_answer
             "{name}: one stage-free probe, no ppoll"
         );
         assert_eq!(guest.probe_masks, [None], "{name}: no mask (IR-9)");
+    }
+}
+
+/// The aarch64 side of round-2 ruling 2: it has no `poll`, and its `ppoll`
+/// needs memory for the zero timeout, so a masked `ppoll` on a stack with no
+/// room has no stage-free probe. It is refused by name, without a probe,
+/// whatever the kernel would answer: `ENOSYS` where unsupported syscalls are
+/// allowed, and the typed refusal of `ppoll` in a fail-closed run.
+#[cfg(target_arch = "aarch64")]
+#[tokio::test]
+async fn under_the_gate_a_masked_ppoll_on_a_tight_stack_is_refused_without_a_probe() {
+    for (name, pollfd, probe) in [
+        ("ready", FormMemory::SET, Some(Ok(1))),
+        ("nfds", FormMemory::SET, Some(Err(Errno::EINVAL))),
+        ("unreadable", FormMemory::unreadable(), None),
+        ("nothing ready", FormMemory::SET, None),
+    ] {
+        for fail_closed in [false, true] {
+            let memory = FormMemory::new(Some(1_000_000_000), 0);
+            let mut guest = turn_guest(true, Some(0));
+            guest.tight_stack = true;
+            guest.config.panic_on_unsupported_syscalls = fail_closed;
+            guest.config.exit_on_unsupported_syscall = true;
+            guest.config.shutdown_on_unsupported_syscall = false;
+            if let Some(probe) = probe {
+                guest.probe_results.push_back(probe);
+            }
+            let _seam = script_by_probe(&guest, vec![proc_state(0, 0, 0)]);
+            let tool = super::tool(&guest);
+            let result = tool.handle_ppoll(&mut guest, ppoll(&memory, pollfd)).await;
+            if fail_closed {
+                match result {
+                    Err(Error::Tool(error)) => assert!(
+                        matches!(
+                            error.downcast_ref::<crate::UnsupportedSyscallError>(),
+                            Some(crate::UnsupportedSyscallError(Sysno::ppoll))
+                        ),
+                        "{name}: {error:#}"
+                    ),
+                    other => panic!("{name}: expected the typed refusal, got {other:?}"),
+                }
+            } else {
+                assert_eq!(errno_result(&result), Err(Errno::ENOSYS), "{name}");
+            }
+            assert!(
+                !guest.injected.contains(&Sysno::ppoll),
+                "{name}: no probe, {:?}",
+                guest.injected
+            );
+            assert!(guest.probe_masks.is_empty(), "{name}: no probe");
+        }
     }
 }
 
@@ -2416,7 +2487,7 @@ async fn under_the_gate_a_zero_timeout_masked_pselect6_on_a_tight_stack_gets_the
         ("nothing ready", FormMemory::SET, None, Ok(0), Some(0)),
         (
             "read-only",
-            FormMemory::READ_ONLY,
+            FormMemory::read_only(),
             Some(Ok(1)),
             Err(Errno::ENOSYS),
             None,
@@ -2466,6 +2537,9 @@ async fn under_the_gate_a_zero_timeout_masked_pselect6_on_a_tight_stack_gets_the
 /// never overlaps a set, the sets get the kernel's writes in place, and the
 /// red zone's other bytes are restored afterwards. Mutation "the window chosen
 /// with no live ranges" (the cell lands on the set).
+// x86_64 only: it tests the x86-64 red zone, which the AArch64 ABI does not
+// have.
+#[cfg(target_arch = "x86_64")]
 #[tokio::test]
 async fn under_the_gate_a_staged_pselect6_s_private_timeout_avoids_sets_in_the_red_zone() {
     const LEN: usize = 16; // FDS_BYTES(65)

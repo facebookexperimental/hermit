@@ -177,9 +177,90 @@ pub(crate) fn completed_syscall_projection(
     completed
 }
 
+/// Test fixtures' register writes, the inverses of the reads above: set the
+/// guest's program counter.
+#[cfg(test)]
+pub(crate) fn set_instruction_pointer(regs: &mut libc::user_regs_struct, value: u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        regs.rip = value;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        regs.pc = value;
+    }
+}
+
+/// Test fixtures' register writes: set the guest's stack pointer.
+#[cfg(test)]
+pub(crate) fn set_stack_pointer(regs: &mut libc::user_regs_struct, value: u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        regs.rsp = value;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        regs.sp = value;
+    }
+}
+
+/// Test fixtures' register writes: set the number
+/// [`syscall_number`] reads.
+#[cfg(test)]
+pub(crate) fn set_syscall_number(regs: &mut libc::user_regs_struct, value: u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        regs.orig_rax = value;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        regs.regs[8] = value;
+    }
+}
+
+/// Test fixtures' register writes: set the leading syscall argument
+/// registers [`syscall_arguments`] reads, in argument order.
+#[cfg(test)]
+pub(crate) fn set_syscall_arguments(regs: &mut libc::user_regs_struct, arguments: &[u64]) {
+    assert!(
+        arguments.len() <= 6,
+        "a syscall takes at most six arguments"
+    );
+    for (index, &value) in arguments.iter().enumerate() {
+        #[cfg(target_arch = "x86_64")]
+        match index {
+            0 => regs.rdi = value,
+            1 => regs.rsi = value,
+            2 => regs.rdx = value,
+            3 => regs.r10 = value,
+            4 => regs.r8 = value,
+            _ => regs.r9 = value,
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            regs.regs[index] = value;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fixtures' register writes land where Detcore's reads look.
+    #[test]
+    fn register_writes_are_read_back_by_name() {
+        // SAFETY: user_regs_struct is plain integers; all zeroes is valid.
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        set_instruction_pointer(&mut regs, 0x40_1000);
+        set_stack_pointer(&mut regs, 0x7ffd_0000);
+        set_syscall_number(&mut regs, 56);
+        set_syscall_arguments(&mut regs, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(instruction_pointer(&regs), 0x40_1000);
+        assert_eq!(stack_pointer(&regs), 0x7ffd_0000);
+        assert_eq!(syscall_number(&regs), 56);
+        assert_eq!(syscall_arguments(&regs), [1, 2, 3, 4, 5, 6]);
+    }
 
     /// Signal phase 1: the signal pipeline at a syscall's completion reads
     /// the result in rax, rip after the two-byte syscall instruction, and the

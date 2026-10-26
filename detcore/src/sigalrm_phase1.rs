@@ -496,13 +496,16 @@ mod tests {
     /// The table's exact membership is pinned, and every syscall outside it is
     /// refused: an entry added, removed or swapped fails here and needs the
     /// check that places it.
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_sigalrm_phase1_table_admits_exactly_its_pinned_members() {
         assert_eq!(
             names(ALWAYS_ALLOWED),
             [
+                // Names under a target_arch cfg are in that architecture's
+                // table alone; fstatat is x86_64's newfstatat.
+                #[cfg(target_arch = "x86_64")]
                 "access",
+                #[cfg(target_arch = "x86_64")]
                 "alarm",
                 "brk",
                 "clock_getres",
@@ -511,6 +514,8 @@ mod tests {
                 "exit_group",
                 "faccessat",
                 "fstat",
+                #[cfg(target_arch = "aarch64")]
+                "fstatat",
                 "getdents64",
                 "getegid",
                 "geteuid",
@@ -523,17 +528,30 @@ mod tests {
                 "mmap",
                 "mprotect",
                 "munmap",
+                #[cfg(target_arch = "x86_64")]
                 "newfstatat",
+                #[cfg(target_arch = "x86_64")]
                 "pause",
                 "rt_sigaction",
                 "rt_sigprocmask",
                 "rt_sigreturn",
                 "setitimer",
+                #[cfg(target_arch = "x86_64")]
                 "time",
             ]
         );
         assert_eq!(names(DESCRIPTOR_IO), ["read", "write"]);
-        assert_eq!(names(OPENS), ["creat", "open", "openat"]);
+        assert_eq!(
+            names(OPENS),
+            [
+                // x86_64 only: aarch64 has openat alone.
+                #[cfg(target_arch = "x86_64")]
+                "creat",
+                #[cfg(target_arch = "x86_64")]
+                "open",
+                "openat",
+            ]
+        );
         assert_eq!(names(CONDITIONAL), ["close", "lseek"]);
 
         let placed: Vec<Sysno> = [ALWAYS_ALLOWED, DESCRIPTOR_IO, OPENS, CONDITIONAL].concat();
@@ -555,7 +573,6 @@ mod tests {
     /// Only the four fixed scalar credential returns are admitted. Buffered
     /// credentials, native process relations and new path operations keep their
     /// existing refusal; none of these decisions may consult a descriptor.
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn sigalrm_phase1_scalar_identity_keeps_neighboring_refusals() {
         for sysno in [Sysno::getuid, Sysno::geteuid, Sysno::getgid, Sysno::getegid] {
@@ -572,14 +589,19 @@ mod tests {
             Sysno::getresgid,
             Sysno::getgroups,
             Sysno::getppid,
+            // Names under the x86_64 cfg are absent from the aarch64 table.
+            #[cfg(target_arch = "x86_64")]
             Sysno::getpgrp,
             Sysno::getpgid,
             Sysno::getsid,
             Sysno::uname,
             Sysno::getrandom,
+            #[cfg(target_arch = "x86_64")]
             Sysno::stat,
+            #[cfg(target_arch = "x86_64")]
             Sysno::lstat,
             Sysno::statx,
+            #[cfg(target_arch = "x86_64")]
             Sysno::readlink,
             Sysno::readlinkat,
         ] {

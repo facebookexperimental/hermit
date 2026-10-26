@@ -462,6 +462,8 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
     reverie::syscalls::Sysno::getrandom,
     reverie::syscalls::Sysno::getcwd,
     reverie::syscalls::Sysno::getdents64,
+    // x86_64 only: aarch64 has readlinkat alone.
+    #[cfg(target_arch = "x86_64")]
     reverie::syscalls::Sysno::readlink,
     reverie::syscalls::Sysno::readlinkat,
     reverie::syscalls::Sysno::recvmsg,
@@ -479,13 +481,18 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
     reverie::syscalls::Sysno::pwritev,
     reverie::syscalls::Sysno::pwritev2,
     // Rewritten in place across the whole array.
+    // x86_64 only: aarch64 has ppoll alone.
+    #[cfg(target_arch = "x86_64")]
     reverie::syscalls::Sysno::poll,
     reverie::syscalls::Sysno::ppoll,
     // A structure the kernel (and Detcore) fills whole (`stat_buffer`).
+    // x86_64 only: aarch64 has fstat, fstatat and statx alone.
+    #[cfg(target_arch = "x86_64")]
     reverie::syscalls::Sysno::stat,
+    #[cfg(target_arch = "x86_64")]
     reverie::syscalls::Sysno::lstat,
     reverie::syscalls::Sysno::fstat,
-    reverie::syscalls::Sysno::newfstatat,
+    crate::arch::FSTATAT,
     reverie::syscalls::Sysno::statx,
 ];
 
@@ -1534,11 +1541,15 @@ mod event_tests {
 
         async fn regs(&mut self) -> libc::user_regs_struct {
             if self.audit_call("regs") {
-                return libc::user_regs_struct {
-                    rip: 0x4000,
-                    eflags: 2,
-                    ..unsafe { std::mem::zeroed() }
-                };
+                // SAFETY: user_regs_struct is plain integers; all zeroes is valid.
+                let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+                crate::arch::set_instruction_pointer(&mut regs, 0x4000);
+                // x86_64's reserved flags bit 1, which always reads as one.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    regs.eflags = 2;
+                }
+                return regs;
             }
             panic!("buffer observation must not request register evidence")
         }
@@ -2714,8 +2725,10 @@ mod event_tests {
         }
 
         // Every syscall whose main result is a clock or timer value.
-        const TIME_READS: [Sysno; 11] = [
+        const TIME_READS: &[Sysno] = &[
             Sysno::gettimeofday,
+            // x86_64 only: aarch64 has no time syscall.
+            #[cfg(target_arch = "x86_64")]
             Sysno::time,
             Sysno::clock_gettime,
             Sysno::sysinfo,
@@ -2727,7 +2740,7 @@ mod event_tests {
             Sysno::adjtimex,
             Sysno::clock_adjtime,
         ];
-        for sysno in TIME_READS {
+        for &sysno in TIME_READS {
             assert!(observes_virtual_time(sysno), "{sysno} reads virtual time");
         }
         assert!(!observes_virtual_time(Sysno::readv));
@@ -2760,7 +2773,7 @@ mod event_tests {
         assert_eq!(second_read - first_read, time_read_cost);
         // The other time reads are charged inside the window as well, and
         // none of them counts toward the cap.
-        for sysno in TIME_READS {
+        for &sysno in TIME_READS {
             assert!(
                 booting.thread.charge_syscall_time(true, sysno),
                 "{sysno} inside the window must be charged"
@@ -3708,12 +3721,18 @@ mod event_tests {
     /// different `[iobuf]` records, and the record must name the device.
     #[test]
     fn a_stat_result_is_hashed_and_its_fields_are_named() {
-        let call: Syscall = reverie::syscalls::Newfstatat::new()
-            .with_dirfd(libc::AT_FDCWD)
-            .with_stat(Some(reverie::syscalls::StatPtr(
-                AddrMut::from_raw(FIRST_DEST).unwrap(),
-            )))
-            .into();
+        let call = crate::arch::fstatat_syscall(
+            reverie::syscalls::Fstatat::new()
+                .with_dirfd(libc::AT_FDCWD)
+                .with_stat(Some(reverie::syscalls::StatPtr(
+                    AddrMut::from_raw(FIRST_DEST).unwrap(),
+                ))),
+        );
+        // x86_64 numbers fstatat as newfstatat.
+        #[cfg(target_arch = "x86_64")]
+        let name = "newfstatat";
+        #[cfg(target_arch = "aarch64")]
+        let name = "fstatat";
         let mut records = Vec::new();
         for dev in [0x6, 0x7] {
             let logs = BufferLog::default();
@@ -3729,7 +3748,7 @@ mod event_tests {
             let messages = logs.0.lock().unwrap();
             assert_eq!(messages.len(), 1, "{messages:?}");
             let expected = format!(
-                "[iobuf][dtid 1] newfstatat in fd=-100 {FIRST_DEST:#x}+{}->{}",
+                "[iobuf][dtid 1] {name} in fd=-100 {FIRST_DEST:#x}+{}->{}",
                 bytes.len(),
                 Digest::new(&bytes)
             );
@@ -3762,11 +3781,14 @@ mod event_tests {
             ))
         };
         let stat_len = std::mem::size_of::<libc::stat>() as u64;
-        let calls: [(Syscall, u64); 5] = [
+        let calls: [(Syscall, u64); _] = [
+            // x86_64 only: aarch64 has fstat, fstatat and statx alone.
+            #[cfg(target_arch = "x86_64")]
             (
                 reverie::syscalls::Stat::new().with_stat(stat_ptr()).into(),
                 stat_len,
             ),
+            #[cfg(target_arch = "x86_64")]
             (
                 reverie::syscalls::Lstat::new().with_stat(stat_ptr()).into(),
                 stat_len,
@@ -3779,9 +3801,9 @@ mod event_tests {
                 stat_len,
             ),
             (
-                reverie::syscalls::Newfstatat::new()
-                    .with_stat(stat_ptr())
-                    .into(),
+                crate::arch::fstatat_syscall(
+                    reverie::syscalls::Fstatat::new().with_stat(stat_ptr()),
+                ),
                 stat_len,
             ),
             (
@@ -4248,7 +4270,9 @@ mod tests {
     fn poll_family_extents_use_the_low_32_bits_of_nfds() {
         let memory = LocalMemory::new();
         let nfds = (1_u64 << 32) | 1;
-        for call in [
+        let calls = [
+            // x86_64 only: aarch64 has ppoll alone.
+            #[cfg(target_arch = "x86_64")]
             Syscall::Poll(
                 syscalls::Poll::new()
                     .with_fds(AddrMut::from_raw(0x2000))
@@ -4259,7 +4283,8 @@ mod tests {
                     .with_fds(AddrMut::from_raw(0x2000))
                     .with_nfds(nfds as _),
             ),
-        ] {
+        ];
+        for call in calls {
             assert_eq!(
                 extents(&memory, &call, 1).unwrap(),
                 vec![BufferExtent {
@@ -4283,7 +4308,9 @@ mod tests {
     #[test]
     fn the_poll_family_is_exempt_from_the_return_value_guard() {
         let nfds = 3;
-        for call in [
+        let calls = [
+            // x86_64 only: aarch64 has ppoll alone.
+            #[cfg(target_arch = "x86_64")]
             Syscall::Poll(
                 syscalls::Poll::new()
                     .with_fds(AddrMut::from_raw(0x2000))
@@ -4294,7 +4321,8 @@ mod tests {
                     .with_fds(AddrMut::from_raw(0x2000))
                     .with_nfds(nfds),
             ),
-        ] {
+        ];
+        for call in calls {
             assert!(
                 !ret_gates_output(&call),
                 "{} returns a count of READY DESCRIPTORS, not a byte count, so a \
@@ -4400,7 +4428,7 @@ mod tests {
     /// 64-bit count would read past it and fail.
     #[test]
     fn vectored_calls_decode_only_the_low_32_bits_of_their_iovec_count() {
-        let page = 4096;
+        let page = crate::test_pages::page_size();
         // SAFETY: a fresh private anonymous mapping, unmapped below.
         let base = unsafe {
             libc::mmap(
@@ -4723,14 +4751,14 @@ mod tests {
     fn read_extent_in(prot: &[i32], offset: usize, bytes: &[u8], records: bool) -> ReadAndContents {
         use reverie::syscalls::MemoryAccess;
 
-        use crate::test_pages::PAGE;
         use crate::test_pages::Pages;
+        use crate::test_pages::page_size;
 
         let pages = Pages::new(prot);
         let mut memory = LocalMemory::new();
         let mut at = 0;
         while at < bytes.len() {
-            let len = (PAGE - (offset + at) % PAGE).min(bytes.len() - at);
+            let len = (page_size() - (offset + at) % page_size()).min(bytes.len() - at);
             // A page the guest cannot write keeps its fill.
             let _ = memory.write_exact(pages.address(offset + at), &bytes[at..at + len]);
             at += len;
@@ -4766,19 +4794,19 @@ mod tests {
     /// is an error, whatever the guest's buffer holds.
     #[test]
     fn only_unwritten_directory_padding_may_be_unread() {
-        use crate::test_pages::PAGE;
+        use crate::test_pages::page_size;
 
         const RW: i32 = libc::PROT_READ | libc::PROT_WRITE;
         let records = two_records();
         assert_eq!(records.len(), 48);
 
         for flag in [false, true] {
-            let (read, held) = read_extent_in(&[RW, RW], PAGE - 45, &records, flag);
+            let (read, held) = read_extent_in(&[RW, RW], page_size() - 45, &records, flag);
             assert_eq!(read.unwrap(), (held, 0), "records {flag}");
         }
 
         // The last three bytes, padding, in a page the guest cannot access.
-        let (read, held) = read_extent_in(&[RW, libc::PROT_NONE], PAGE - 45, &records, true);
+        let (read, held) = read_extent_in(&[RW, libc::PROT_NONE], page_size() - 45, &records, true);
         let (bytes, unread) = read.unwrap();
         assert_eq!(unread, 3);
         assert_eq!(bytes[..45], held[..45]);
@@ -4791,10 +4819,10 @@ mod tests {
         // write-only page here; on ptrace the word read can (see
         // `read_written_reads_every_extent_of_a_write_only_mapping`).
         for (prot, offset, flag) in [
-            ([RW, libc::PROT_NONE], PAGE - 45, false),
-            ([RW, libc::PROT_NONE], PAGE - 44, true),
+            ([RW, libc::PROT_NONE], page_size() - 45, false),
+            ([RW, libc::PROT_NONE], page_size() - 44, true),
             ([libc::PROT_WRITE, libc::PROT_WRITE], 0, true),
-            ([libc::PROT_WRITE, RW], PAGE - 24, true),
+            ([libc::PROT_WRITE, RW], page_size() - 24, true),
         ] {
             let (read, _) = read_extent_in(&prot, offset, &records, flag);
             assert!(read.is_err(), "{prot:?} at {offset}, records {flag}");

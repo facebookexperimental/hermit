@@ -494,7 +494,7 @@ impl Guest<Detcore> for TurnGuest {
     async fn regs(&mut self) -> libc::user_regs_struct {
         // SAFETY: a plain register record.
         let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        regs.rsp = self.rsp;
+        crate::arch::set_stack_pointer(&mut regs, self.rsp);
         regs
     }
     async fn stack(&mut self) -> ScratchStack {
@@ -569,6 +569,9 @@ impl Guest<Detcore> for TurnGuest {
                     .map_or(Err(Errno::EFAULT), |_| Err(Errno::EINVAL)),
                 None => Err(Errno::EINVAL),
             },
+            // The pending query of rt_sigsuspend's kernel-run path, which
+            // this harness fails.
+            Syscall::RtSigpending(_) => Err(Errno::ENOSYS),
             Syscall::RtSigtimedwait(wait) => {
                 let set = wait
                     .set()
@@ -644,6 +647,9 @@ impl Guest<Detcore> for TurnGuest {
                 }
                 result
             }
+            // x86_64 only: select and poll exist only there; aarch64's
+            // probes are pselect6 and ppoll.
+            #[cfg(target_arch = "x86_64")]
             Syscall::Select(_) => {
                 self.probe_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -677,6 +683,7 @@ impl Guest<Detcore> for TurnGuest {
             // A stage-free `poll` probe (round-2 ruling 2), answered as a
             // ppoll probe is: the scripted result, and `revents` written for a
             // count, which an unreadable array fails with EFAULT.
+            #[cfg(target_arch = "x86_64")]
             Syscall::Poll(probe) => {
                 if let Some(fds) = probe.fds() {
                     let fd = LocalMemory::new().read_value::<_, i32>(fds.cast()).ok();
@@ -993,7 +1000,12 @@ async fn under_the_gate_the_restart_checkpoint_resolves_an_end_behind_a_caught_s
         shared_pending: xcpu,
         ..proc_state(xcpu, 0, 0)
     };
+    // The checkpoint uses the call only for its name in a refusal, so any
+    // wait will do: pause on x86_64, and ppoll on aarch64, which has no pause.
+    #[cfg(target_arch = "x86_64")]
     let pause = Syscall::from(reverie::syscalls::Pause::new());
+    #[cfg(not(target_arch = "x86_64"))]
+    let pause = Syscall::from(reverie::syscalls::Ppoll::new());
     for (name, mask, fails, interrupted, refused) in [
         ("(a) SIGALRM's mask holds SIGXCPU", xcpu, false, None, false),
         (
@@ -1226,8 +1238,12 @@ async fn under_the_gate_a_restartable_poll_ends_where_it_would_block_only_for_a_
 /// caught ERESTARTNOINTR row returns the raw code and files nothing).
 #[tokio::test]
 async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
-    use reverie::syscalls::Pause;
-    let pause = Syscall::from(Pause::new());
+    // The checkpoint uses the call only for its name in a refusal, so any
+    // wait will do: pause on x86_64, and ppoll on aarch64, which has no pause.
+    #[cfg(target_arch = "x86_64")]
+    let pause = Syscall::from(reverie::syscalls::Pause::new());
+    #[cfg(not(target_arch = "x86_64"))]
+    let pause = Syscall::from(reverie::syscalls::Ppoll::new());
     let code = |errno: Errno| Err::<i64, Error>(errno.into());
     let errno_of = |result: &Result<i64, Error>| match result {
         Err(Error::Errno(errno)) => Some(*errno),
@@ -1380,7 +1396,12 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
 /// whatever the result.
 #[tokio::test]
 async fn with_the_gate_off_the_restart_checkpoint_is_the_identity() {
+    // The checkpoint uses the call only for its name in a refusal, so any
+    // wait will do: pause on x86_64, and ppoll on aarch64, which has no pause.
+    #[cfg(target_arch = "x86_64")]
     let pause = Syscall::from(reverie::syscalls::Pause::new());
+    #[cfg(not(target_arch = "x86_64"))]
+    let pause = Syscall::from(reverie::syscalls::Ppoll::new());
     for result in [
         Errno::ERESTARTSYS,
         Errno::ERESTARTNOINTR,
@@ -1407,6 +1428,8 @@ async fn with_the_gate_off_the_restart_checkpoint_is_the_identity() {
 /// checkpoint moved to `complete_syscall` (the backend, `delivery_interruption`
 /// and DETLOG would see a raw 514), and `interrupted` dropped (the anchor
 /// would file a plain checkpoint).
+// x86_64 only: it tests pause, which aarch64 does not have.
+#[cfg(target_arch = "x86_64")]
 #[tokio::test]
 async fn under_the_gate_a_pause_ended_by_a_fatal_signal_shows_eintr_to_every_observer() {
     use detcore_model::happens_before::HappensBeforeSpec;
@@ -1877,7 +1900,25 @@ async fn under_the_gate_a_kernel_run_call_with_a_fatal_signal_at_its_entry_is_no
     let sigsuspend = reverie::syscalls::RtSigsuspend::new()
         .with_mask(None)
         .with_sigsetsize(3);
+    #[cfg(target_arch = "x86_64")]
     let vfork = reverie::syscalls::family::CloneFamily::Vfork(reverie::syscalls::Vfork::new());
+    // aarch64 has no vfork syscall: its vfork is clone with CLONE_VM,
+    // CLONE_VFORK and SIGCHLD, as Linux implements vfork.
+    #[cfg(not(target_arch = "x86_64"))]
+    let vfork = match Syscall::from_raw(
+        Sysno::clone,
+        reverie::syscalls::SyscallArgs::new(
+            (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as usize,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ),
+    ) {
+        Syscall::Clone(clone) => reverie::syscalls::family::CloneFamily::Clone(clone),
+        other => panic!("not a clone: {other:?}"),
+    };
     for family in ["background read", "rt_sigsuspend", "vfork"] {
         let _seam = script(fatal);
         let mut guest = turn_guest(true, Some(0));

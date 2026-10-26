@@ -7946,6 +7946,8 @@ mod subscription_tests {
             "syslog must reach its deterministic Detcore handler"
         );
         for sysno in [
+            // x86_64 only: aarch64 has faccessat and faccessat2 alone.
+            #[cfg(target_arch = "x86_64")]
             Sysno::access,
             Sysno::faccessat,
             Sysno::faccessat2,
@@ -8222,6 +8224,8 @@ mod subscription_tests {
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::madvise)
         );
+        // x86_64 only: arch_prctl is an x86 syscall.
+        #[cfg(target_arch = "x86_64")]
         assert!(
             subscriptions
                 .iter_syscalls()
@@ -8827,9 +8831,9 @@ mod finished_syscall_display_tests {
     use reverie::syscalls::AtFlags;
     use reverie::syscalls::ClockGettime;
     use reverie::syscalls::ClockId;
+    use reverie::syscalls::Fstatat;
     use reverie::syscalls::Gettimeofday;
     use reverie::syscalls::LocalMemory;
-    use reverie::syscalls::Newfstatat;
     use reverie::syscalls::PathPtr;
     use reverie::syscalls::StatPtr;
     use reverie::syscalls::Statx;
@@ -8871,9 +8875,10 @@ mod finished_syscall_display_tests {
         statx
     }
 
+    /// `fstatat`, which x86_64 numbers as `newfstatat`.
     fn newfstatat(path: &CString, stat: &libc::stat) -> Syscall {
-        Syscall::Newfstatat(
-            Newfstatat::new()
+        crate::arch::fstatat_syscall(
+            Fstatat::new()
                 .with_dirfd(libc::AT_FDCWD)
                 .with_path(PathPtr::from_ptr(path.as_ptr()))
                 .with_stat(StatPtr::from_ptr(stat as *const libc::stat))

@@ -567,13 +567,16 @@ mod tests {
     #[test]
     fn boundary_software_expiry_requires_actual_entry_phase_rcbs_and_occurrence() {
         let (config, mut thread, mut observed) = fixture();
-        observed
-            .syscall(&thread, Sysno::poll, Phase::Prehook)
-            .unwrap();
+        // Any syscall will do; aarch64 has ppoll, not poll.
+        #[cfg(target_arch = "x86_64")]
+        let sysno = Sysno::poll;
+        #[cfg(not(target_arch = "x86_64"))]
+        let sysno = Sysno::ppoll;
+        observed.syscall(&thread, sysno, Phase::Prehook).unwrap();
         let mut recorded_thread = ThreadState::new(thread.dettid, &config, ());
         let mut recorded = observed.clone();
         recorded
-            .syscall(&recorded_thread, Sysno::poll, Phase::Posthook)
+            .syscall(&recorded_thread, sysno, Phase::Posthook)
             .unwrap();
         let marker = recorded
             .close_slice(&mut recorded_thread, &config, false, None)
@@ -591,9 +594,7 @@ mod tests {
         );
         assert_eq!(replay_expiration(&thread).unwrap(), Some(false));
         let mut observed = thread.slice_boundary.take().unwrap();
-        observed
-            .syscall(&thread, Sysno::poll, Phase::Posthook)
-            .unwrap();
+        observed.syscall(&thread, sysno, Phase::Posthook).unwrap();
         thread.slice_boundary = Some(observed);
         assert_eq!(replay_expiration(&thread).unwrap(), Some(true));
         assert_eq!(

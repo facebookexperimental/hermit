@@ -1727,6 +1727,47 @@ mod tests {
             }
         }
 
+        /// The aarch64 side of the repair: with no time(2) to probe each word
+        /// with, the repair of a `gettimeofday` that failed with EFAULT
+        /// refuses with the typed `NoStoreProbe` failure, injects nothing and
+        /// leaves `tv` as the call left it.
+        #[cfg(target_arch = "aarch64")]
+        #[test]
+        fn without_a_store_probe_the_repair_refuses() {
+            use crate::record_or_replay::NoopTool;
+            use crate::syscall_hot_path_tests::InjectGuest;
+            let tv: &'static mut Timeval = Box::leak(Box::new(Timeval {
+                tv_sec: 7,
+                tv_usec: 8,
+            }));
+            let tv_addr = tv as *mut Timeval as usize;
+            let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+            let virtual_tv = Timeval {
+                tv_sec: 1,
+                tv_usec: 2,
+            };
+            let result = futures::executor::block_on(overwrite_failed_gettimeofday_tv(
+                &mut guest,
+                AddrMut::from_raw(tv_addr).unwrap(),
+                &virtual_tv,
+                &[Ok(7), Ok(8)],
+            ));
+            assert_eq!(
+                failure(result.expect_err("the repair refuses")),
+                TvRepairFailure {
+                    field: "tv",
+                    kind: TvRepairFailureKind::NoStoreProbe,
+                }
+            );
+            assert!(guest.injected().is_empty(), "no probe is injected");
+            // SAFETY: the leaked timeval this test owns.
+            let tv = unsafe { *(tv_addr as *const Timeval) };
+            assert_eq!((tv.tv_sec, tv.tv_usec), (7, 8), "tv is left alone");
+        }
+
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn successful_time_store_probe_requires_an_overwrite() {
             assert_eq!(
@@ -1735,6 +1776,9 @@ mod tests {
             );
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn efault_time_store_probe_stops_without_an_overwrite() {
             assert_eq!(
@@ -1743,6 +1787,9 @@ mod tests {
             );
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn any_control_probe_error_means_the_efault_was_not_a_store_fault() {
             require_native_time_control_probe("tv_sec", Ok(1_767_225_600)).unwrap();
@@ -1759,6 +1806,9 @@ mod tests {
             }
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn a_stopped_word_must_keep_its_contents_and_readability() {
             assert_eq!(
@@ -1788,6 +1838,9 @@ mod tests {
             }
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn an_unreadable_word_is_unstored_only_if_part_of_it_is_unmapped() {
             const PAGE: u64 = 0x1000;
@@ -1810,6 +1863,9 @@ mod tests {
             }
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn an_unreadable_word_needs_a_readable_nonempty_map() {
             let unreadable = Err(Error::Errno(Errno::EPERM));
@@ -1826,6 +1882,9 @@ mod tests {
             }
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn other_time_store_probe_errors_fail_closed() {
             for errno in [Errno::ENOSYS, Errno::EPERM, Errno::EIO] {
@@ -1841,6 +1900,9 @@ mod tests {
             }
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn overwrite_errors_and_nonexact_counts_fail_closed() {
             assert_eq!(
@@ -1908,23 +1970,28 @@ mod tests {
                 }
             );
 
-            // Checking a stopped word needs no probe, so a word past the end of
-            // the address space is simply one no store reached.
-            for (_, offset) in TIMEVAL_WORDS {
+            // x86_64 only: stopped words are checked only by the time(2) store
+            // probe, which aarch64 does not have.
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Checking a stopped word needs no probe, so a word past the end of
+                // the address space is simply one no store reached.
+                for (_, offset) in TIMEVAL_WORDS {
+                    assert_eq!(
+                        stopped_timeval_word_addr(tv_addr, offset).map(|addr| addr.as_raw()),
+                        Some(tv_addr.as_raw() + offset)
+                    );
+                }
+                // `gettimeofday((void *)-1, NULL)`: `tv_sec` is the last byte of
+                // the address space and `tv_usec` has no address at all.
+                let last = AddrMut::<Timeval>::from_raw(usize::MAX).unwrap();
                 assert_eq!(
-                    stopped_timeval_word_addr(tv_addr, offset).map(|addr| addr.as_raw()),
-                    Some(tv_addr.as_raw() + offset)
+                    stopped_timeval_word_addr(last, 0).map(|addr| addr.as_raw()),
+                    Some(usize::MAX)
                 );
+                assert!(stopped_timeval_word_addr(last, 8).is_none());
+                assert!(stopped_timeval_word_addr(overflowing, 8).is_none());
             }
-            // `gettimeofday((void *)-1, NULL)`: `tv_sec` is the last byte of
-            // the address space and `tv_usec` has no address at all.
-            let last = AddrMut::<Timeval>::from_raw(usize::MAX).unwrap();
-            assert_eq!(
-                stopped_timeval_word_addr(last, 0).map(|addr| addr.as_raw()),
-                Some(usize::MAX)
-            );
-            assert!(stopped_timeval_word_addr(last, 8).is_none());
-            assert!(stopped_timeval_word_addr(overflowing, 8).is_none());
         }
     }
 }

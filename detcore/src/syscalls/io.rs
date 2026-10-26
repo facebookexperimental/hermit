@@ -6181,6 +6181,9 @@ mod tests {
         assert_eq!(pselect6_probe_result(Err(Errno::EINTR)), Err(Errno::EINTR));
     }
 
+    // x86_64 only: it tests select's timeval timeout, and aarch64 has no
+    // select.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn select_timeout_folds_whole_seconds_out_of_microseconds() {
         let timeval = |tv_sec, tv_usec| libc::timeval { tv_sec, tv_usec };
