@@ -11480,10 +11480,11 @@ impl RunOpts {
 
     /// The run options `hermit analyze` and `hermit bisect` cannot pass to
     /// their trials, each with the reason, as given. Every trial would either
-    /// leave the deterministic, isolated setup the trials are compared in, or
-    /// write the same output path as every other trial. Options a trial sets
-    /// for itself afterwards (analyze's own preemption record and stack-trace
-    /// events) are not seen here.
+    /// leave the deterministic, isolated setup the trials are compared in,
+    /// write the same output path as every other trial, or replay one fixed
+    /// recording where each run needs its own. Options a trial sets for
+    /// itself afterwards (analyze's own preemption record, schedules and
+    /// stack-trace events) are not seen here.
     pub(crate) fn options_trials_refuse(&self) -> Vec<(&'static str, &'static str)> {
         let config = &self.det_opts.det_config;
         const SHARED: &str = "every trial writes that same path, so only the last trial's output \
@@ -11532,6 +11533,21 @@ impl RunOpts {
                 config.record_preemptions_to.is_some(),
                 "--record-preemptions-to",
                 SHARED,
+            ),
+            (
+                config.replay_schedule_from.is_some(),
+                "--replay-schedule-from",
+                "analyze's target and baseline runs would replay that one schedule, and every \
+                 trial replays its own; pass a recording to analyze as --run1-preemptions or \
+                 --run2-preemptions, and to bisect as --good or --bad",
+            ),
+            (
+                config.replay_preemptions_from.is_some(),
+                "--replay-preemptions-from",
+                "analyze's target and baseline runs would replay that one record, and a trial, \
+                 which replays a schedule of its own, cannot replay both; pass a recording to \
+                 analyze as --run1-preemptions or --run2-preemptions, and to bisect as --good or \
+                 --bad",
             ),
             (
                 config

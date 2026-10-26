@@ -1301,11 +1301,10 @@ impl AnalyzeOpts {
     /// `--pipe-wake-latency` than the trials' own, including a different
     /// latency (https://github.com/rrnewton/hermit/issues/4380). Trials start
     /// through `RunOpts::run`, which skips `hermit run`'s own check, so the
-    /// check is made here, as `adopt_recorded_epoch` makes the epoch's. Besides
-    /// the named `recordings`, a record the run arguments replay
-    /// (`--replay-schedule-from`, `--replay-preemptions-from`) is checked.
-    /// A record without the field was made with the option off. The same
-    /// recordings are checked for the signal-state copy setting
+    /// check is made here, as `adopt_recorded_epoch` makes the epoch's. The
+    /// run arguments name no record to replay: `refuse_outputs_trials_overwrite`
+    /// refuses one first. A record without the field was made with the option
+    /// off. The same recordings are checked for the signal-state copy setting
     /// (`--no-signal-state-copy`), which a record without that field does not
     /// state, so it is accepted under either, and for the trials'
     /// `--expired-wait-charge` ([`Self::adopt_expired_wait_charge`]), which a
@@ -1316,21 +1315,7 @@ impl AnalyzeOpts {
     ) -> anyhow::Result<()> {
         let trial = RunData::get_raw_runopts(self);
         let config = &trial.det_opts.det_config;
-        let in_run_arguments = [
-            (
-                "--replay-schedule-from",
-                config.replay_schedule_from.as_deref(),
-            ),
-            (
-                "--replay-preemptions-from",
-                config.replay_preemptions_from.as_deref(),
-            ),
-        ];
-        for (option, path) in recordings.iter().copied().chain(
-            in_run_arguments
-                .into_iter()
-                .filter_map(|(option, path)| Some((option, path?))),
-        ) {
+        for &(option, path) in recordings {
             detcore::preemptions::boundary_recording::Recording::read(path)?
                 .require_faithful_replay()
                 .map_err(|error| {
@@ -1400,8 +1385,8 @@ impl AnalyzeOpts {
     /// files would never be written. `--record-networking` is refused too:
     /// it would put every trial on the host network and have every trial
     /// write the same trace. So are the options `RunOpts::options_trials_refuse`
-    /// lists: host-network and namespace-less routes, and output paths every
-    /// trial would share.
+    /// lists: host-network and namespace-less routes, output paths every
+    /// trial would share, and a recording every run would replay.
     pub fn refuse_outputs_trials_overwrite(&self) -> anyhow::Result<()> {
         let trial = RunData::get_raw_runopts(self);
         // A recording runs on the host network (`RunOpts::validate_args`), so
@@ -2195,8 +2180,9 @@ mod tests {
                 && message.contains("--replay-networking"),
             "{message}"
         );
-        // Host-network and namespace-less routes, and output paths every
-        // trial would share (`RunOpts::options_trials_refuse`).
+        // Host-network and namespace-less routes, output paths every trial
+        // would share, and a recording every run would replay
+        // (`RunOpts::options_trials_refuse`).
         for (run_arg, named) in [
             ("--strace-only", "--strace-only"),
             ("--no-sequentialize-threads", "--no-sequentialize-threads"),
@@ -2219,6 +2205,14 @@ mod tests {
             (
                 "--record-access-trace-to=requested.access",
                 "--record-access-trace-to",
+            ),
+            (
+                "--replay-schedule-from=requested.preempts",
+                "--replay-schedule-from",
+            ),
+            (
+                "--replay-preemptions-from=requested.preempts",
+                "--replay-preemptions-from",
             ),
         ] {
             let error = options(&[run_arg])

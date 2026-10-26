@@ -2747,9 +2747,9 @@ mod tests {
     }
 
     /// Analyze refuses, before any trial, a `--run1-preemptions` record made
-    /// under another `--pipe-wake-latency` than the trials' own, or one its
-    /// run arguments replay; its final schedules carry the trials' value
-    /// (https://github.com/rrnewton/hermit/issues/4380).
+    /// under another `--pipe-wake-latency` than the trials' own, and any
+    /// record in its run arguments; its final schedules carry the trials'
+    /// value (https://github.com/rrnewton/hermit/issues/4380).
     #[test]
     fn analyze_refuses_records_under_another_pipe_wake_latency() {
         let dir = tempfile::tempdir().unwrap();
@@ -2804,11 +2804,6 @@ mod tests {
         for (run1, run_args, named) in [
             (&zero, vec![], "--run1-preemptions"),
             (&off, vec!["--pipe-wake-latency=0"], "--run1-preemptions"),
-            (
-                &off,
-                vec![replay_flag.as_str()],
-                "--replay-preemptions-from",
-            ),
         ] {
             let error = prepare(run1, &run_args).unwrap_err();
             assert!(
@@ -2823,6 +2818,19 @@ mod tests {
                 "{run_args:?}: {message}"
             );
         }
+        // A record in the run arguments is refused before any recording is
+        // read, whatever its latency (`RunOpts::options_trials_refuse`).
+        let error = prepare(&off, &[replay_flag.as_str()]).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("refuse --replay-preemptions-from in the run arguments"),
+            "{error:#}"
+        );
     }
 
     /// Every record analyze writes states the trials' signal-state copy

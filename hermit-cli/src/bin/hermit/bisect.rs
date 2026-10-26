@@ -858,10 +858,10 @@ mod tests {
         }
     }
 
-    /// Bisect refuses, before any trial, a `--good` or `--bad` schedule, or a
-    /// record its run arguments replay, made under another
-    /// `--pipe-wake-latency` than the trials' own
-    /// (https://github.com/rrnewton/hermit/issues/4380).
+    /// Bisect refuses, before any trial, a `--good` or `--bad` schedule made
+    /// under another `--pipe-wake-latency` than the trials' own
+    /// (https://github.com/rrnewton/hermit/issues/4380), and any schedule in
+    /// its run arguments.
     #[test]
     fn bisect_refuses_schedules_under_another_pipe_wake_latency() {
         let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
@@ -908,12 +908,6 @@ mod tests {
                 vec!["--pipe-wake-latency=0"],
                 "--good",
             ),
-            (
-                &good_off,
-                &bad_off,
-                vec![replay_flag.as_str()],
-                "--replay-schedule-from",
-            ),
         ] {
             let error = prepare(good, bad, &run_args).unwrap_err();
             assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
@@ -921,6 +915,18 @@ mod tests {
             assert!(
                 message.contains(named) && message.contains("cannot reproduce the run"),
                 "{run_args:?}: {message}"
+            );
+        }
+        // A schedule in the run arguments is refused before any recording is
+        // read, whatever its latency: no run bisect launches would replay it
+        // (`RunOpts::options_trials_refuse`).
+        // A missing `--good` shows that no schedule was read before it.
+        for good in [good_off.clone(), dir.path().join("missing.json")] {
+            let error = prepare(&good, &bad_off, &[replay_flag.as_str()]).unwrap_err();
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            assert!(
+                format!("{error:#}").contains("refuse --replay-schedule-from in the run arguments"),
+                "{error:#}"
             );
         }
     }
