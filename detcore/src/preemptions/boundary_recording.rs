@@ -10,21 +10,30 @@
 //! The scheduler consumes the complete stream; legacy editors must refuse it.
 //! History-only replay and read-only inspection never rewrite that stream.
 
+use std::fs::File;
+use std::io::Cursor;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::Path;
 
 use anyhow::Context;
 use anyhow::bail;
+use detcore_model::schedule::boundary::BorrowedSchedule;
 use detcore_model::schedule::boundary::Schedule;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de::MapAccess;
+use serde::de::SeqAccess;
+use serde::de::Visitor;
 
 use super::PreemptionRecord;
 
 /// Keep the preemption history and every existing run setting alongside the
 /// complete boundary stream. No public access returns its legacy component:
 /// doing so would let an editor silently discard the protocol and markers.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "BoundaryWire", into = "BoundaryWire")]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(try_from = "BoundaryWire")]
 pub struct BoundaryRecording {
     preemptions: PreemptionRecord,
     schedule: Schedule,
@@ -45,12 +54,130 @@ struct Envelope {
     slice_boundary_recording: BoundaryRecording,
 }
 
-/// Whether a record is in the slice-boundary format. The probe builds none of
-/// the record: it skips every value, so reading the format of a schedule of
+#[derive(Serialize)]
+#[serde(rename = "BoundaryWire")]
+struct BorrowedBoundary<'a> {
+    preemptions: &'a PreemptionRecord,
+    schedule: BorrowedSchedule<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename = "Envelope")]
+pub(super) struct BorrowedEnvelope<'a> {
+    slice_boundary_recording: BorrowedBoundary<'a>,
+}
+
+impl<'a> BorrowedEnvelope<'a> {
+    pub(super) fn new(
+        preemptions: &'a PreemptionRecord,
+        records: &'a [detcore_model::schedule::boundary::Record],
+    ) -> anyhow::Result<Self> {
+        preemptions.validate().map_err(anyhow::Error::msg)?;
+        if !preemptions.global.is_empty() {
+            bail!("slice-boundary recording has a second, legacy global event stream");
+        }
+        Ok(Self {
+            slice_boundary_recording: BorrowedBoundary {
+                preemptions,
+                schedule: Schedule::borrow_records(records)?,
+            },
+        })
+    }
+}
+
+impl Serialize for BoundaryRecording {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(rename = "BoundaryWire")]
+        struct Wire<'a> {
+            preemptions: &'a PreemptionRecord,
+            schedule: &'a Schedule,
+        }
+        Wire {
+            preemptions: &self.preemptions,
+            schedule: &self.schedule,
+        }
+        .serialize(serializer)
+    }
+}
+
+// Unlike a struct-only probe, this accepts every JSON shape that the old Value
+// dispatch accepted. The typed second pass decides whether a legacy sequence
+// is valid. Visit nested numbers/strings too: IgnoredAny alone would accept an
+// out-of-range float or invalid string hidden in a legacy unknown field, which
+// the old Value pass rejected. No tree or complete payload buffer is built.
+struct FormatProbe(bool);
+
+impl<'de> Deserialize<'de> for FormatProbe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Probe;
+        impl<'de> Visitor<'de> for Probe {
+            type Value = FormatProbe;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<FormatProbe, E> {
+                Ok(FormatProbe(false))
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<FormatProbe, E> {
+                Ok(FormatProbe(false))
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<FormatProbe, E> {
+                Ok(FormatProbe(false))
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<FormatProbe, E> {
+                Ok(FormatProbe(false))
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<FormatProbe, E> {
+                Ok(FormatProbe(false))
+            }
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<FormatProbe, E> {
+                Ok(FormatProbe(false))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<FormatProbe, A::Error> {
+                while seq.next_element::<FormatProbe>()?.is_some() {}
+                Ok(FormatProbe(false))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<FormatProbe, A::Error> {
+                let Some(first) = map.next_key::<String>()? else {
+                    return Ok(FormatProbe(false));
+                };
+                // serde_json's enabled raw_value feature gives Value's first
+                // map key this special interpretation, even in literal input.
+                // Preserve it without constructing its embedded Value tree.
+                if first == "$serde_json::private::RawValue" {
+                    let raw = map.next_value::<String>()?;
+                    return serde_json::from_str(&raw).map_err(serde::de::Error::custom);
+                }
+                let mut present = first == "slice_boundary_recording";
+                map.next_value::<FormatProbe>()?;
+                while let Some(key) = map.next_key::<String>()? {
+                    present |= key == "slice_boundary_recording";
+                    map.next_value::<FormatProbe>()?;
+                }
+                Ok(FormatProbe(present))
+            }
+        }
+        deserializer.deserialize_any(Probe)
+    }
+}
+
+#[cfg(test)]
+impl FormatProbe {
+    /// The byte-slice form of the streaming dispatch probe, through the
+    /// struct marker probe: duplicate top-level markers are rejected, as
+    /// serde rejects duplicate struct fields.
+    fn is_boundary_recording(bytes: &[u8]) -> serde_json::Result<bool> {
+        serde_json::from_slice::<MarkerProbe>(bytes).map(|probe| probe.slice_boundary_recording)
+    }
+}
+
+/// Which protocol markers a record carries. The probe builds none of the
+/// record: it skips every value, so reading the format of a schedule of
 /// millions of events does not cost a JSON tree of it, several times the
 /// size of its text.
 #[derive(Deserialize)]
-struct FormatProbe {
+struct MarkerProbe {
     // A present null must not look like an absent protocol marker.
     #[serde(default, deserialize_with = "marker_present")]
     slice_boundary_recording: bool,
@@ -62,31 +189,54 @@ fn marker_present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<b
     serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
-impl FormatProbe {
-    fn is_boundary_recording(bytes: &[u8]) -> serde_json::Result<bool> {
-        serde_json::from_slice::<Self>(bytes).map(|probe| probe.slice_boundary_recording)
+pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+    fn seekable<T: serde::de::DeserializeOwned, R: Read + Seek>(
+        input: &mut R,
+    ) -> anyhow::Result<T> {
+        let start = input.stream_position()?;
+        let (probe, digest) = super::streaming::parse_pass::<MarkerProbe, _>(&mut *input)?;
+        input.seek(SeekFrom::Start(start))?;
+        if !probe.slice_boundary_recording && !probe.incomplete_preemption_record {
+            // Each old metadata reader still deserializes only its own field,
+            // preserving its legacy acceptance contract.
+            let (settings, typed_digest) = super::streaming::parse_pass(&mut *input)?;
+            require_same_input(digest, typed_digest)?;
+            return Ok(settings);
+        }
+        // Settings do not depend on the record's format, which the replay
+        // itself checks and refuses (`Recording::decode`), with the
+        // refusal's exit status.
+        let (recording, typed_digest) = Recording::read_fingerprinted(input)?;
+        require_same_input(digest, typed_digest)?;
+        Ok(serde_json::from_value(
+            super::record_serde::settings_value(recording.metadata())
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        )?)
     }
+    let mut file = File::open(path)
+        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
+    let rewindable = file
+        .stream_position()
+        .and_then(|start| file.seek(SeekFrom::Start(start)))
+        .is_ok();
+    let parsed = if rewindable {
+        seekable(&mut file)
+    } else {
+        // Preserve FIFO/pipe compatibility. Only this unseekable path retains
+        // the historical whole-byte buffer; regular histories do not use it.
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| seekable(&mut Cursor::new(bytes)))
+    };
+    parsed.map_err(|e| format!("cannot parse preemption record {}: {e}", path.display()))
 }
 
-pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
-    let format: FormatProbe = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
-    if !format.slice_boundary_recording && !format.incomplete_preemption_record {
-        // Each old metadata reader still deserializes only its own field,
-        // from the original bytes, preserving its legacy acceptance contract.
-        return serde_json::from_slice(&bytes)
-            .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e));
+fn require_same_input(probe: [u8; 32], typed: [u8; 32]) -> anyhow::Result<()> {
+    if probe != typed {
+        bail!("schedule input changed between complete parsing passes");
     }
-    // Settings do not depend on the record's format, which the replay itself
-    // checks and refuses (`Recording::decode`), with the refusal's exit status.
-    let recording = Recording::decode_unchecked_format(&bytes)
-        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
-    serde_json::from_value(
-        super::record_serde::settings_value(recording.metadata()).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))
+    Ok(())
 }
 
 impl BoundaryRecording {
@@ -137,15 +287,6 @@ impl TryFrom<BoundaryWire> for BoundaryRecording {
     }
 }
 
-impl From<BoundaryRecording> for BoundaryWire {
-    fn from(recording: BoundaryRecording) -> Self {
-        Self {
-            preemptions: recording.preemptions,
-            schedule: recording.schedule,
-        }
-    }
-}
-
 /// A recording whose format remains explicit through file transformations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Recording {
@@ -153,6 +294,63 @@ pub enum Recording {
     Legacy(PreemptionRecord),
     /// A versioned boundary stream and its associated preemption history.
     Boundaries(BoundaryRecording),
+}
+
+impl Serialize for Recording {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Legacy(record) => record.serialize(serializer),
+            Self::Boundaries(record) => {
+                #[derive(Serialize)]
+                struct Envelope<'a> {
+                    slice_boundary_recording: &'a BoundaryRecording,
+                }
+                Envelope {
+                    slice_boundary_recording: record,
+                }
+                .serialize(serializer)
+            }
+        }
+    }
+}
+
+/// A passive summary of stored rows, not a replay/terminal certificate. Its
+/// memory is proportional to thread count, rather than event/history rows.
+#[derive(Debug, Serialize)]
+pub struct Inspection {
+    /// The stored format: `legacy` or `slice_boundaries`.
+    pub format: &'static str,
+    /// The structural validation performed, without certifying replay completion.
+    pub structural_validation: &'static str,
+    /// All rows in the stored global stream, including any boundary markers.
+    pub stored_global_rows: usize,
+    /// Scheduling-event rows in the stored global stream.
+    pub event_rows: usize,
+    /// None means the legacy format has no boundary protocol, not zero proof.
+    pub boundary_rows: Option<usize>,
+    /// The recorded virtual-time epoch, if the history stores one.
+    pub epoch: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recorded `--pipe-wake-latency` in nanoseconds, or absent/off as `None`.
+    pub pipe_wake_latency: Option<u64>,
+    /// The recorded signal-state-copy setting, or `None` when unspecified.
+    pub signal_state_copy: Option<bool>,
+    /// Stored per-thread history counts, keyed by deterministic thread identity.
+    pub threads: std::collections::BTreeMap<crate::types::DetTid, ThreadInspection>,
+}
+
+/// Counts and the final priority stored in one thread's history.
+#[derive(Debug, Serialize)]
+pub struct ThreadInspection {
+    /// Stored priority-change rows.
+    pub priority_rows: usize,
+    /// Stored retired-conditional-branch preemption counts.
+    pub rcb_rows: usize,
+    /// Stored chaos-epoch transitions.
+    pub chaos_epoch_rows: usize,
+    /// Stored callback checkpoints for this deterministic thread.
+    pub callback_rows: usize,
+    /// The history's recorded final priority.
+    pub final_priority: crate::scheduler::runqueue::Priority,
 }
 
 impl Recording {
@@ -186,7 +384,16 @@ impl Recording {
     /// A record whose format this Hermit refuses fails with a
     /// `RecordFormatRefusal` in its chain, whichever format it is in.
     pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
-        let recording = Self::decode_unchecked_format(bytes)?;
+        Self::read_from(&mut Cursor::new(bytes))
+    }
+
+    /// Stream a seekable input with no raw-byte or Value-tree copy. Every pass
+    /// reaches EOF, and hashes must match before the typed result is exposed.
+    /// This rejects inconsistent passes; it is not a filesystem snapshot.
+    /// A record whose format this Hermit refuses fails with a
+    /// `RecordFormatRefusal` in its chain, whichever format it is in.
+    pub fn read_from<R: Read + Seek>(input: &mut R) -> anyhow::Result<Self> {
+        let (recording, _) = Self::read_fingerprinted(input)?;
         recording
             .metadata()
             .validate_format()
@@ -194,44 +401,112 @@ impl Recording {
         Ok(recording)
     }
 
-    /// [`Self::decode`], except for the record's format.
-    fn decode_unchecked_format(bytes: &[u8]) -> anyhow::Result<Self> {
-        // Inspect only to dispatch. Deserialize the ORIGINAL bytes again so
-        // duplicate fields in the envelope are rejected. A malformed new
-        // recording never falls back to legacy.
-        if FormatProbe::is_boundary_recording(bytes)? {
-            let envelope: Envelope = serde_json::from_slice(bytes)?;
-            Ok(Self::Boundaries(envelope.slice_boundary_recording))
+    /// [`Self::read_from`] without the format check, for readers that take a
+    /// recording whose format the replay itself refuses (settings).
+    /// Inspect only to dispatch. Deserialize the complete input again so
+    /// duplicate fields in the envelope are rejected. A malformed new
+    /// recording never falls back to legacy.
+    fn read_fingerprinted<R: Read + Seek>(input: &mut R) -> anyhow::Result<(Self, [u8; 32])> {
+        let start = input.stream_position()?;
+        let (probe, digest) = super::streaming::parse_pass::<FormatProbe, _>(&mut *input)?;
+        input.seek(SeekFrom::Start(start))?;
+        let (recording, typed_digest) = if probe.0 {
+            let (envelope, digest) = super::streaming::parse_pass::<Envelope, _>(&mut *input)?;
+            (Self::Boundaries(envelope.slice_boundary_recording), digest)
         } else {
-            let legacy: PreemptionRecord = serde_json::from_slice(bytes)?;
+            let (legacy, digest) =
+                super::streaming::parse_pass::<PreemptionRecord, _>(&mut *input)?;
             legacy.validate_contents().map_err(anyhow::Error::msg)?;
-            Ok(Self::Legacy(legacy))
-        }
+            (Self::Legacy(legacy), digest)
+        };
+        require_same_input(digest, typed_digest)?;
+        Ok((recording, typed_digest))
     }
 
     /// Read a complete recording, preserving errors as failures.
     pub fn read(path: &Path) -> anyhow::Result<Self> {
-        Self::decode(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)
-            .with_context(|| format!("reading schedule {}", path.display()))
+        let mut file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
+        let rewindable = file
+            .stream_position()
+            .and_then(|start| file.seek(SeekFrom::Start(start)))
+            .is_ok();
+        let recording = if rewindable {
+            Self::read_from(&mut file)
+        } else {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Self::decode(&bytes)
+        };
+        recording.with_context(|| format!("reading schedule {}", path.display()))
     }
 
     /// Serialize the same format with the conventional terminal newline.
     pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
-        let mut bytes = match self {
-            Self::Legacy(record) => serde_json::to_vec(record)?,
-            Self::Boundaries(record) => serde_json::to_vec(&Envelope {
-                slice_boundary_recording: record.clone(),
-            })?,
-        };
+        let mut bytes = serde_json::to_vec(self)?;
         bytes.push(b'\n');
         Ok(bytes)
     }
 
     /// Write the complete serialized recording, without changing its format.
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
-        // Complete validation/serialization precedes opening the destination.
-        let bytes = self.encode()?;
-        std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+        super::streaming::write_file(path, self)
+    }
+
+    /// Count every stored row by borrowing the fully parsed history. This
+    /// repeats the existing metadata validator, never loads/clones its tape.
+    pub fn inspect(&self) -> anyhow::Result<Inspection> {
+        let metadata = self.metadata();
+        metadata.validate().map_err(anyhow::Error::msg)?;
+        let (format, stored_global_rows, event_rows, boundary_rows) = match self {
+            Self::Legacy(record) => ("legacy", record.global.len(), record.global.len(), None),
+            Self::Boundaries(record) => {
+                if !metadata.global.is_empty() {
+                    bail!("slice-boundary recording has a second, legacy global event stream");
+                }
+                let records = record.schedule.records();
+                let events = records
+                    .iter()
+                    .filter(|row| {
+                        matches!(row, detcore_model::schedule::boundary::Record::Event(_))
+                    })
+                    .count();
+                (
+                    "slice_boundaries",
+                    records.len(),
+                    events,
+                    Some(records.len() - events),
+                )
+            }
+        };
+        Ok(Inspection {
+            format,
+            structural_validation: "existing format and history validators passed; not replay certification",
+            stored_global_rows,
+            event_rows,
+            boundary_rows,
+            epoch: metadata.epoch(),
+            pipe_wake_latency: metadata.pipe_wake_latency(),
+            signal_state_copy: metadata.signal_state_copy(),
+            threads: metadata
+                .per_thread
+                .iter()
+                .map(|(tid, history)| {
+                    (
+                        *tid,
+                        ThreadInspection {
+                            priority_rows: history.prio_changes.len(),
+                            rcb_rows: history.preemption_rcbs.len(),
+                            chaos_epoch_rows: history.chaos_epochs.len(),
+                            callback_rows: metadata
+                                .callback_checkpoints
+                                .get(tid)
+                                .map_or(0, Vec::len),
+                            final_priority: history.final_prio,
+                        },
+                    )
+                })
+                .collect(),
+        })
     }
 
     /// Give a legacy-only operation its input, or refuse a boundary format
@@ -413,8 +688,7 @@ impl HistoryReader {
 
 impl std::fmt::Display for HistoryReader {
     fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let bytes = self.0.encode().map_err(|_| std::fmt::Error)?;
-        output.write_str(std::str::from_utf8(&bytes).map_err(|_| std::fmt::Error)?)
+        super::streaming::fmt_json(&self.0, output, true)
     }
 }
 
@@ -480,6 +754,194 @@ mod tests {
         Recording::Boundaries(
             BoundaryRecording::new(metadata, Schedule::new(records).unwrap()).unwrap(),
         )
+    }
+
+    #[test]
+    fn streaming_dispatch_preserves_the_original_value_and_typed_contracts() {
+        fn original(bytes: &[u8]) -> anyhow::Result<Recording> {
+            let value: serde_json::Value = serde_json::from_slice(bytes)?;
+            if value.get("slice_boundary_recording").is_some() {
+                let envelope: Envelope = serde_json::from_slice(bytes)?;
+                Ok(Recording::Boundaries(envelope.slice_boundary_recording))
+            } else {
+                let record: PreemptionRecord = serde_json::from_slice(bytes)?;
+                record.validate().map_err(anyhow::Error::msg)?;
+                Ok(Recording::Legacy(record))
+            }
+        }
+        let mut inputs: Vec<Vec<u8>> = [
+            r#"{"per_thread":{},"global":[]}"#,
+            r#"[{},[],null,null,null,false]"#,
+            r#"{"per_thread":{},"global":[],"extra":{"slice_boundary_recording":null}}"#,
+            r#"{"per_thread":{},"global":[],"extra":1,"extra":2}"#,
+            r#"{"per_thread":{},"global":[],"epoch":null,"epoch":null}"#,
+            r#"{"per_thread":{},"global":[],"slice_boundary_recording":null}"#,
+            r#"{"per_thread":{},"global":[],"slice_boundary_recording":null,"slice_boundary_recording":{}}"#,
+            r#"{"per_thread":{},"global":[],"extra":1e999}"#,
+            r#"{"per_thread":{},"global":[],"extra":"\ud800"}"#,
+            r#"{"per_thread":{},"global":[],"extra":{"$serde_json::private::RawValue":"null"}}"#,
+            r#"{"per_thread":{},"global":[],"extra":{"$serde_json::private::RawValue":"bad"}}"#,
+            r#"{"per_thread":{},"global":[],"extra":{"$serde_json::private::RawValue":7}}"#,
+            r#"{"$serde_json::private::RawValue":"null","per_thread":{},"global":[]}"#,
+            r#"{"per_thread":{},"global":[]} true"#,
+            r#"{"per_thread":{},"global":[]} trailing"#,
+            "null", "[]", "false", "3", "\"text\"", "",
+        ].into_iter().map(|text| text.as_bytes().to_vec()).collect();
+        inputs.push(sample(false).encode().unwrap());
+        inputs.push(sample(true).encode().unwrap());
+        for bytes in &inputs {
+            let expected = original(bytes);
+            let actual = Recording::decode(bytes);
+            match (expected, actual) {
+                (Ok(expected), Ok(actual)) => assert_eq!(actual, expected),
+                (Err(_), Err(_)) => {}
+                (expected, actual) => {
+                    panic!("changed acceptance for {bytes:?}: {expected:?} / {actual:?}")
+                }
+            }
+        }
+        assert!(Recording::decode(br#"[{},[],null,null,null,false]"#).is_ok());
+        assert!(Recording::decode(br#"{"per_thread":{},"global":[],"extra":1e999}"#).is_err());
+    }
+
+    #[test]
+    fn short_reads_full_eof_and_changed_passes_use_the_actual_reader() {
+        struct Short {
+            input: Cursor<Vec<u8>>,
+            maximum: usize,
+            largest_request: usize,
+        }
+        impl Read for Short {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.largest_request = self.largest_request.max(bytes.len());
+                let count = self.maximum.min(bytes.len());
+                self.input.read(&mut bytes[..count])
+            }
+        }
+        impl Seek for Short {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.input.seek(position)
+            }
+        }
+        for recording in [Recording::Legacy(PreemptionRecord::default()), sample(true)] {
+            let mut bytes = recording.encode().unwrap();
+            bytes.extend_from_slice(b" \r\n\t");
+            for maximum in 1..=7 {
+                let mut input = Short {
+                    input: Cursor::new(bytes.clone()),
+                    maximum,
+                    largest_request: 0,
+                };
+                assert_eq!(Recording::read_from(&mut input).unwrap(), recording);
+                assert!(input.largest_request <= 8192);
+            }
+            assert!(Recording::decode(&bytes[..bytes.len() - 8]).is_err());
+        }
+        struct Changed {
+            input: Cursor<Vec<u8>>,
+            second: Vec<u8>,
+        }
+        impl Read for Changed {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.input.read(bytes)
+            }
+        }
+        impl Seek for Changed {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                if matches!(position, SeekFrom::Start(0)) {
+                    self.input = Cursor::new(self.second.clone());
+                }
+                self.input.seek(position)
+            }
+        }
+        let first = b"{\"per_thread\":{},\"global\":[]} ".to_vec();
+        let mut input = Changed {
+            input: Cursor::new(first),
+            second: b"{\"per_thread\":{},\"global\":[]}\n".to_vec(),
+        };
+        assert!(
+            Recording::read_from(&mut input)
+                .unwrap_err()
+                .to_string()
+                .contains("changed between")
+        );
+    }
+
+    #[test]
+    fn nonseekable_path_and_independent_metadata_reads_remain_supported() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("history.fifo");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let bytes = Recording::Legacy(PreemptionRecord::default())
+            .encode()
+            .unwrap();
+        let writer_path = fifo.clone();
+        let writer = std::thread::spawn(move || std::fs::write(writer_path, bytes).unwrap());
+        assert_eq!(
+            Recording::read(&fifo).unwrap(),
+            Recording::Legacy(PreemptionRecord::default())
+        );
+        writer.join().unwrap();
+        // Metadata has always ignored unrelated legacy fields, even where the
+        // full Recording Value probe rejects their numeric representation.
+        let path = directory.path().join("settings.json");
+        std::fs::write(
+            &path,
+            br#"{"epoch":null,"extra":1e999,"pipe_wake_latency":"bad"}"#,
+        )
+        .unwrap();
+        assert_eq!(super::super::read_recorded_epoch(&path), Ok(None));
+        assert!(super::super::read_recorded_pipe_wake_latency(&path).is_err());
+        assert_eq!(
+            super::super::read_recorded_signal_state_copy(&path),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn inspection_counts_rows_and_keeps_legacy_boundary_capabilities_distinct() {
+        let legacy = Recording::Legacy(PreemptionRecord::default());
+        let summary = legacy.inspect().unwrap();
+        assert_eq!(summary.format, "legacy");
+        assert_eq!(summary.boundary_rows, None);
+        let summary = sample(true).inspect().unwrap();
+        assert_eq!(summary.format, "slice_boundaries");
+        assert_eq!(summary.stored_global_rows, 1);
+        assert_eq!(summary.event_rows, 0);
+        assert_eq!(summary.boundary_rows, Some(1));
+        assert_eq!(summary.pipe_wake_latency, Some(0));
+        assert_eq!(summary.signal_state_copy, Some(false));
+    }
+
+    #[test]
+    fn streamed_boundary_files_match_the_original_owned_envelope_bytes() {
+        #[derive(Serialize)]
+        struct OriginalEnvelope {
+            slice_boundary_recording: BoundaryWire,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for markers in [false, true] {
+            let recording = sample(markers);
+            let Recording::Boundaries(boundary) = &recording else {
+                unreachable!()
+            };
+            let mut expected = serde_json::to_vec(&OriginalEnvelope {
+                slice_boundary_recording: BoundaryWire {
+                    preemptions: boundary.preemptions.clone(),
+                    schedule: boundary.schedule.clone(),
+                },
+            })
+            .unwrap();
+            expected.push(b'\n');
+            let path = directory.path().join(format!("{markers}.json"));
+            recording.write(&path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            assert_eq!(recording.encode().unwrap(), expected);
+        }
     }
 
     #[test]

@@ -15171,6 +15171,36 @@ mod tests {
     }
 
     #[test]
+    fn requested_history_output_refusal_is_propagated_and_the_writer_is_consumed() {
+        for boundaries in [false, true] {
+            let (_config, state, _, _) = cancellation_test_state();
+            let directory = tempfile::tempdir().unwrap();
+            // Opening a directory as the output file fails without relying on
+            // ambient permissions or a privileged test runner.
+            let path = directory.path().to_owned();
+            let mut writer = crate::preemptions::PreemptionWriter::new(Some(path.clone()));
+            if boundaries {
+                writer = writer.with_slice_boundaries().unwrap();
+            }
+            let mut scheduler = state.sched.lock().unwrap();
+            scheduler.preemption_writer = Some(writer);
+            let error = scheduler
+                .generate_partial_run_summary_for_log(Some(&path))
+                .unwrap_err();
+            assert!(!error.is::<crate::finalization::TerminalReplayRefusal>());
+            let message = format!("{error:#}");
+            assert!(message.contains("writing") || message.contains("creating"));
+            assert!(scheduler.preemption_writer.is_none());
+            // A second summary cannot retry a consumed failed output attempt.
+            assert!(
+                scheduler
+                    .generate_partial_run_summary_for_log(Some(&path))
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
     fn run_summary_records_the_effective_shared_preemption_configuration() {
         // Config::default() is unprepared: launch installs the timer capability.
         // Specify that mechanism fact here independently of the maximum.

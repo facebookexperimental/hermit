@@ -12,6 +12,7 @@ pub mod boundary_recording;
 pub mod callback_history;
 mod record_serde;
 mod reserved_input;
+mod streaming;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -433,8 +434,7 @@ pub(crate) fn read_recorded_rejoins(
 
 impl std::fmt::Display for PreemptionRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let str = serde_json::to_string(&self).unwrap();
-        write!(f, "{}", str)
+        streaming::fmt_json(self, f, false)
     }
 }
 
@@ -1312,21 +1312,12 @@ impl PreemptionRecord {
 
     /// Save to disk.
     pub fn write_to_disk(&self, path: &Path) -> Result<(), String> {
-        let mut str: String = self.to_string();
-        str.push('\n');
-        match File::create(path) {
-            Ok(mut file) => match std::io::Write::write_all(&mut file, str.as_bytes()) {
-                Ok(_) => Ok(()),
-                Err(err) => Err(format!(
-                    "Failed to write preemption record to file {:?}, error: {}",
-                    path, err
-                )),
-            },
-            Err(err) => Err(format!(
-                "Failed to create file for preemption record {:?}, error: {}",
-                path, err
-            )),
-        }
+        streaming::write_file(path, self).map_err(|error| {
+            format!(
+                "Failed to write preemption record to file {:?}, error: {error:#}",
+                path
+            )
+        })
     }
 
     /// Perform internal invariant checks on the PreemptionRecord and return an error if
@@ -2483,6 +2474,194 @@ mod tests {
                 .unwrap_err();
             assert_eq!(mixed, refusal, "interpolation");
         }
+    }
+
+    #[test]
+    fn streamed_files_keep_every_metadata_history_and_callback_field() {
+        use callback_history::Origin;
+        use callback_history::Site;
+        use reverie::syscalls::Sysno;
+
+        use crate::slice_boundary::callbacks::Callback;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("complete.json");
+        let tid = DetTid::from_raw(3);
+        let empty_tid = DetTid::from_raw(5);
+        let epoch = "2001-02-03T04:05:06Z".parse().unwrap();
+        let mut writer = PreemptionWriter::new(Some(path.clone()))
+            .with_epoch(epoch)
+            .with_pipe_wake_latency(Some(0))
+            .with_signal_state_copy(false);
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.register_thread(empty_tid, DEFAULT_PRIORITY);
+        writer.insert_chaos_epoch(
+            tid,
+            ChaosEpochTransition {
+                logical_time: LogicalTime::from_nanos(50),
+                epoch: 0,
+                factor: RcbTimeMultiplier::from_f64(1.5),
+            },
+        );
+        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        writer.insert_schedevent(SchedEvent::branches(tid, 10));
+        writer.insert_callback_checkpoint(
+            tid,
+            Origin {
+                callback: Callback::Syscall(Sysno::close),
+                site: Site::Posthook,
+                progress: 10,
+                last_op: Some(Op::Branch),
+                time: LogicalTime::from_nanos(100),
+                rcbs: 10,
+            },
+        );
+        let expected = writer.inner.clone();
+        let mut expected_bytes = serde_json::to_vec(&expected).unwrap();
+        expected_bytes.push(b'\n');
+        writer.flush().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected_bytes);
+        let recording = boundary_recording::Recording::read(&path).unwrap();
+        let summary = recording.inspect().unwrap();
+        assert_eq!(summary.epoch, Some(epoch));
+        assert_eq!(summary.pipe_wake_latency, Some(0));
+        assert_eq!(summary.signal_state_copy, Some(false));
+        assert_eq!(summary.event_rows, 1);
+        assert_eq!(summary.threads.len(), 2);
+        assert_eq!(summary.threads[&tid].priority_rows, 1);
+        assert_eq!(summary.threads[&tid].rcb_rows, 1);
+        assert_eq!(summary.threads[&tid].chaos_epoch_rows, 1);
+        assert_eq!(summary.threads[&tid].callback_rows, 1);
+        assert_eq!(summary.threads[&empty_tid].priority_rows, 0);
+        assert_eq!(summary.threads[&empty_tid].final_priority, DEFAULT_PRIORITY);
+        assert_eq!(recording.into_legacy("test").unwrap(), expected);
+    }
+
+    #[test]
+    fn deprecated_trace_reader_keeps_its_independent_typed_legacy_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.json");
+        std::fs::write(&path, br#"{"per_thread":{},"global":[],"extra":1e999}"#).unwrap();
+        assert!(read_trace(&path).is_empty());
+        assert!(boundary_recording::Recording::read(&path).is_err());
+        std::fs::write(&path, br#"{"per_thread":{},"global":[]} false"#).unwrap();
+        assert!(std::panic::catch_unwind(|| read_trace(&path)).is_err());
+        std::fs::write(
+            &path,
+            b"{\"per_thread\":{},\"global\":[],\"extra\":\"\xff\"}",
+        )
+        .unwrap();
+        assert!(std::panic::catch_unwind(|| read_trace(&path)).is_err());
+    }
+
+    #[test]
+    fn bounded_summary_validates_boundaries_without_writing_or_retrying_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retained.json");
+        std::fs::write(&path, b"retained original").unwrap();
+        let writer = PreemptionWriter::new(Some(path.clone()))
+            .with_slice_boundaries()
+            .unwrap();
+        assert!(
+            writer
+                .summary()
+                .unwrap()
+                .contains("0 boundary-protocol rows")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained original");
+
+        let mut invalid = PreemptionWriter::new(Some(path.clone()))
+            .with_slice_boundaries()
+            .unwrap();
+        invalid
+            .inner
+            .global
+            .push(SchedEvent::branches(DetTid::from_raw(3), 1));
+        assert!(invalid.summary().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained original");
+    }
+
+    /// Every streaming write/summary path runs the writer's stopless
+    /// lowering refusal (`finalize`) before serializing, as the legacy
+    /// write path does: a below-format record whose stopless end would
+    /// become invisible without its mark is refused before any file is
+    /// created or truncated, never streamed out silently losing the end.
+    /// An end that stays visible without its mark is lowered and written.
+    #[test]
+    fn a_below_format_stopless_record_is_refused_before_the_streaming_writer_creates_a_file() {
+        let tid = DetTid::from_raw(3);
+        let check_in = SchedEvent {
+            dettid: tid,
+            op: Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: None,
+            end_time: None,
+            stopless: false,
+        };
+        let invisible = [
+            SchedEvent::branches(tid, 123).taken_without_stop(),
+            check_in,
+        ];
+        for boundaries in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("record.json");
+            std::fs::write(&path, b"retained original").unwrap();
+            let mut writer = PreemptionWriter::new(Some(path.clone()));
+            if boundaries {
+                writer = writer.with_slice_boundaries().unwrap();
+                // A boundary writer's tape carries slice ends in its own
+                // protocol (insert lowers the mark), so put the marked
+                // legacy stream where a boundary envelope would carry it:
+                // in the metadata history the envelope serializes.
+                writer.inner.global.extend(invisible.iter().cloned());
+            } else {
+                for event in invisible.iter().cloned() {
+                    writer.insert_schedevent(event);
+                }
+            }
+            let refusal = writer
+                .flush()
+                .expect_err("a writer that would hide the end must refuse");
+            assert!(
+                refusal.contains("`stopless`"),
+                "boundaries={boundaries}: {refusal}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"retained original");
+
+            // The summary path refuses the same record without writing.
+            let mut writer = PreemptionWriter::new(Some(path.clone()));
+            if boundaries {
+                writer = writer.with_slice_boundaries().unwrap();
+                writer.inner.global.extend(invisible.iter().cloned());
+            } else {
+                for event in invisible.iter().cloned() {
+                    writer.insert_schedevent(event);
+                }
+            }
+            let refusal = writer
+                .summary()
+                .expect_err("a summary that would hide the end must refuse");
+            assert!(
+                refusal.contains("`stopless`"),
+                "boundaries={boundaries}: {refusal}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"retained original");
+        }
+
+        // Control: the same end followed by a Branch stays visible without
+        // its mark, so the streaming writer lowers it and writes the file.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("visible.json");
+        let mut writer = PreemptionWriter::new(Some(path.clone()));
+        writer.insert_schedevent(SchedEvent::branches(tid, 123).taken_without_stop());
+        writer.insert_schedevent(SchedEvent::branches(tid, 7));
+        writer.flush().unwrap();
+        let written = boundary_recording::Recording::read(&path).unwrap();
+        let boundary_recording::Recording::Legacy(written) = written else {
+            panic!("a legacy writer writes a legacy recording")
+        };
+        assert!(!written.global[0].stopless);
     }
 
     /// `--pipe-wake-latency` rides in a preemption record as the epoch does:
@@ -4498,6 +4677,30 @@ impl PreemptionWriter {
         self.inner.stopless_lowering_refusal()
     }
 
+    /// A bounded description for logs that do not request a complete JSON
+    /// artifact. Counting rows does not serialize or clone the tape.
+    pub(crate) fn summary(mut self) -> Result<String, String> {
+        // Like into_string, this consumes the output owner without a later
+        // Drop write. Run the same stopless lowering/refusal and boundary
+        // validation as the write paths, even when no file is wanted:
+        // a summary must not describe a record this writer would refuse
+        // to write. Lowering drops only marks, never rows, so the counts
+        // below are the record's either way.
+        self.flushed = true;
+        self.finalize()?;
+        if let Some(records) = &self.boundary_records {
+            boundary_recording::BorrowedEnvelope::new(&self.inner, records)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(format!(
+            "{} threads, {} priority/epoch rows, {} legacy event rows, {} boundary-protocol rows",
+            self.inner.per_thread.len(),
+            self.len(),
+            self.inner.global.len(),
+            self.boundary_records.as_ref().map_or(0, Vec::len)
+        ))
+    }
+
     fn write_to_disk(&mut self) -> Result<(), String> {
         if self.dest.is_some() {
             if self.boundary_records.is_none() {
@@ -4506,11 +4709,24 @@ impl PreemptionWriter {
                 return self.inner.write_to_disk(&path);
             }
             let path = self.dest.clone().unwrap();
-            // Validate the complete stream before opening an existing file.
-            let mut bytes = self.serialized_string()?.into_bytes();
-            bytes.push(b'\n');
-            std::fs::write(&path, bytes)
-                .map_err(|e| format!("Failed to write boundary recording {}: {e}", path.display()))
+            // Lower and refuse stopless marks as the legacy path does,
+            // before validating/serializing the complete stream:
+            // BorrowedEnvelope validation alone neither drops the marks
+            // lowering may drop nor is it the writer's ordering, and
+            // write_file preflights serialization before it opens the
+            // destination, so no refusal here creates or truncates it.
+            self.finalize()?;
+            let output = boundary_recording::BorrowedEnvelope::new(
+                &self.inner,
+                self.boundary_records.as_ref().unwrap(),
+            )
+            .map_err(|error| error.to_string())?;
+            streaming::write_file(&path, &output).map_err(|e| {
+                format!(
+                    "Failed to write boundary recording {}: {e:#}",
+                    path.display()
+                )
+            })
         } else {
             Err(
                 "Cannot write_to_disk because this PreemptionWriter was created without a backing file.".to_string()
@@ -4525,15 +4741,15 @@ impl PreemptionWriter {
             record.stopless_lowering_refusal()?;
             return Ok(record.to_string());
         };
-        let schedule = detcore_model::schedule::boundary::Schedule::new(records.clone())
+        // As the legacy branch above: serialize the lowered record, and
+        // refuse one whose stopless end lowering would hide, rather than
+        // stream it out under a format that may not hold the mark.
+        let mut record = self.inner.clone();
+        record.forget_stopless_marks_below_their_format();
+        record.stopless_lowering_refusal()?;
+        let output = boundary_recording::BorrowedEnvelope::new(&record, records)
             .map_err(|e| e.to_string())?;
-        let recording = boundary_recording::Recording::Boundaries(
-            boundary_recording::BoundaryRecording::new(self.inner.clone(), schedule)
-                .map_err(|e| e.to_string())?,
-        );
-        let mut bytes = recording.encode().map_err(|e| e.to_string())?;
-        assert_eq!(bytes.pop(), Some(b'\n'));
-        String::from_utf8(bytes).map_err(|e| e.to_string())
+        serde_json::to_string(&output).map_err(|e| e.to_string())
     }
 }
 
@@ -4572,24 +4788,20 @@ pub fn read_trace(path: &Path) -> Vec<SchedEvent> {
     pr.global
 }
 
-// TODO: we should implement streaming and not read this all at once.
 fn read_preemption_record(path: &Path) -> PreemptionRecord {
-    let string = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("Error reading file {:?}:\n {}", path, e));
-    let pr: PreemptionRecord = serde_json::from_str(&string).unwrap_or_else(|e| {
+    let parsed = File::open(path)
+        .map_err(anyhow::Error::from)
+        .and_then(|file| {
+            let (record, _) = streaming::parse_utf8_pass::<PreemptionRecord, _>(file)?;
+            record.validate().map_err(anyhow::Error::msg)?;
+            Ok(record)
+        });
+    parsed.unwrap_or_else(|error| {
         panic!(
-            "Error parsing PreemptionRecord from JSON: {}\nJSON contents:\n{}",
-            e, string
+            "Error reading preemption record {}: {error:#}",
+            path.display()
         )
-    });
-    if let Err(e) = pr.validate() {
-        panic!(
-            "Invalid PreemptionRecord when loading from path {}. Error:\n {}",
-            path.display(),
-            e
-        );
-    }
-    pr
+    })
 }
 
 /// Read only the virtual-time epoch stored in a preemption record file.

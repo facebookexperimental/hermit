@@ -526,7 +526,7 @@ enum Subcommand {
     #[clap(name = "list")]
     List(inventory::ListOpts),
 
-    /// Print a recording's manifest.
+    /// Print a recording's manifest, or inspect a preemption/schedule file.
     #[clap(name = "show")]
     Show(inventory::ShowOpts),
 

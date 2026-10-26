@@ -153,7 +153,6 @@ use crate::types::PosixTimerThread;
 use crate::types::SchedEvent;
 use crate::types::SigWrapper;
 use crate::types::SyscallPhase;
-use crate::util::truncated;
 
 fn scheduler_commit_record_suffix(
     scheduler_turn: u64,
@@ -22920,16 +22919,10 @@ impl Scheduler {
                 // description before adding the host artifact destination.
                 info_description = buf.clone();
                 writeln!(buf, "  (Writing to file {:?})", path)?;
-                let strict = pw.records_slice_boundaries();
-                if let Err(str) = pw.flush() {
-                    if strict {
-                        return Err(anyhow::anyhow!(str));
-                    }
-                    tracing::warn!("{}", str);
-                }
+                pw.flush().map_err(anyhow::Error::msg)?;
             } else {
                 // Recording, but not outputting to file, so this is the only (partial) record of it:
-                writeln!(buf, "{}", truncated(200, pw.into_string()))?;
+                writeln!(buf, "{}", pw.summary().map_err(anyhow::Error::msg)?)?;
                 info_description = buf.clone();
             }
             (Some(buf), Some(info_description))

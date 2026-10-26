@@ -11,6 +11,7 @@
 //! (<https://github.com/rrnewton/hermit/issues/4271>).
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -50,8 +51,13 @@ pub struct ShowOpts {
     /// `last-run` (the newest of any kind), a recording ID or a unique
     /// prefix of at least 6 hex digits, or the path of a manifest.json or of
     /// its directory; `hermit list` lists them.
-    #[clap(value_name = "RECORDING")]
+    #[clap(value_name = "RECORDING", conflicts_with = "preemptions")]
     recording: Option<OsString>,
+
+    /// Validate an entire preemption/schedule JSON file and print stored-row
+    /// counts and settings. This does not run a guest or certify replay.
+    #[clap(long, value_name = "FILE", conflicts_with = "recording")]
+    preemptions: Option<PathBuf>,
 
     /// Directory where recordings are stored.
     #[clap(long, value_name = "DIR", env = "HERMIT_DATA_DIR")]
@@ -181,6 +187,10 @@ impl ListOpts {
 
 impl ShowOpts {
     pub fn main(&self) -> Result<ExitStatus, Error> {
+        if let Some(path) = &self.preemptions {
+            show_preemptions(path, &mut std::io::stdout().lock())?;
+            return Ok(ExitStatus::SUCCESS);
+        }
         let store = HermitData::from(self.data_dir.as_ref());
         let spec = self
             .recording
@@ -212,6 +222,17 @@ impl ShowOpts {
         }
         Ok(ExitStatus::SUCCESS)
     }
+}
+
+fn show_preemptions(path: &Path, output: &mut impl Write) -> Result<(), Error> {
+    let recording = detcore::preemptions::boundary_recording::Recording::read(path)?;
+    let summary = recording.inspect()?;
+    // No output is exposed until the complete file, EOF and existing typed
+    // validators passed. The summary borrows/counts rows, never loads a clone.
+    serde_json::to_writer(&mut *output, &summary)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -253,5 +274,43 @@ mod tests {
         assert_eq!(listed[0].kind, "network");
         assert_eq!(listed[0].command_text(), "/bin/echo 'two words'");
         assert_eq!(listed[0].exit_text(), "-");
+    }
+
+    #[test]
+    fn show_preemptions_validates_the_whole_input_before_printing_counts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.json");
+        let bytes = br#"{"per_thread":{"3":{"final_prio":1000,"prio_changes":[[10,1000]],"preemption_rcbs":[7],"chaos_epochs":[]}},"global":[],"pipe_wake_latency":0,"signal_state_copy":false}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let mut output = Vec::new();
+        show_preemptions(&path, &mut output).unwrap();
+        let summary: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(summary["format"], "legacy");
+        assert_eq!(summary["stored_global_rows"], 0);
+        assert_eq!(summary["boundary_rows"], serde_json::Value::Null);
+        assert_eq!(summary["threads"]["3"]["priority_rows"], 1);
+        assert_eq!(summary["threads"]["3"]["rcb_rows"], 1);
+        assert_eq!(summary["threads"]["3"]["final_priority"], 1000);
+        assert_eq!(summary["pipe_wake_latency"], 0);
+        assert_eq!(summary["signal_state_copy"], false);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        let mut malformed = bytes.to_vec();
+        malformed.extend_from_slice(b" true");
+        std::fs::write(&path, &malformed).unwrap();
+        output.clear();
+        assert!(show_preemptions(&path, &mut output).is_err());
+        assert!(output.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn show_history_and_manifest_selection_are_explicit_and_exclusive() {
+        assert!(ShowOpts::try_parse_from(["show", "--preemptions", "history.json"]).is_ok());
+        assert!(ShowOpts::try_parse_from(["show", "last"]).is_ok());
+        assert!(ShowOpts::try_parse_from(["show"]).is_ok());
+        assert!(
+            ShowOpts::try_parse_from(["show", "last", "--preemptions", "history.json"]).is_err()
+        );
     }
 }
