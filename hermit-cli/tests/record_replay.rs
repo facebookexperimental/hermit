@@ -1468,7 +1468,15 @@ fn replay_captured_output_ftruncate_failure_aborts_without_panicking() {
     let _guard = hermit_record_lock();
     let data_dir = tempfile::tempdir().expect("failed to create recording directory");
     let guest = workload("c_ftruncate_ignore_output_error");
-    let mut recorded_stdout = tempfile::tempfile().expect("failed to create regular stdout");
+    // Named regular files in TMPDIR, held until the test ends: an unnamed
+    // temporary file escapes a TMPDIR-scoped space guard. The clones share each
+    // file's open description, so offsets and ftruncate behave as before.
+    let recorded_stdout_file =
+        tempfile::NamedTempFile::new().expect("failed to create regular stdout");
+    let mut recorded_stdout = recorded_stdout_file
+        .as_file()
+        .try_clone()
+        .expect("failed to clone regular stdout");
     recorded_stdout
         .write_all(b"must be truncated")
         .expect("failed to seed regular stdout");
@@ -1491,7 +1499,12 @@ fn replay_captured_output_ftruncate_failure_aborts_without_panicking() {
         "recording did not exercise a successful ftruncate on captured stdout"
     );
 
-    let mut control_stdout = tempfile::tempfile().expect("failed to create replay stdout");
+    let control_stdout_file =
+        tempfile::NamedTempFile::new().expect("failed to create replay stdout");
+    let mut control_stdout = control_stdout_file
+        .as_file()
+        .try_clone()
+        .expect("failed to clone replay stdout");
     control_stdout
         .write_all(b"must also be truncated")
         .expect("failed to seed replay stdout");
@@ -3747,7 +3760,14 @@ fn record_and_replay_into_a_shared_stdout_file(mode: &str) -> (Vec<u8>, Vec<u8>)
     let guest = workload("c_record_replay_forked_stdout_pipe");
     let data_dir = tempfile::tempdir().expect("failed to create recording directory");
     let run = |subcommand: &[&str], what: &str| {
-        let mut stdout = tempfile::tempfile().expect("failed to create regular stdout");
+        // A named regular file in TMPDIR, held until the contents are read: an
+        // unnamed temporary file escapes a TMPDIR-scoped space guard. The clone
+        // shares the file's open description, so the offsets are unchanged.
+        let stdout_file = tempfile::NamedTempFile::new().expect("failed to create regular stdout");
+        let mut stdout = stdout_file
+            .as_file()
+            .try_clone()
+            .expect("failed to clone regular stdout");
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         command
             .arg("--log=off")
