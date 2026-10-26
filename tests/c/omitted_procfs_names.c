@@ -43,6 +43,10 @@
  *   the CPUs a single virtual CPU leaves out), so listings are not checked.
  *   --host: natively, print which of the omitted names this host has, so
  *   the test shows that Hermit hides names that exist.
+ *   --removals: instead, only the removals of an omitted name (unlink of
+ *   /proc/kallsyms, rmdir of /proc/sysvipc), which fail as Linux fails them
+ *   (ENOENT) where procfs is writable; the other changes are checked without
+ *   this flag.
  *
  * Output: a line per name and per group of checks, and a line for each
  * group that was not checked; nothing that depends on the host.
@@ -260,8 +264,6 @@ static void check_changes(int kvm_local_procfs) {
   ABSENT(open("/proc/kallsyms", O_CREAT | O_WRONLY, 0600), "open O_CREAT /proc/kallsyms");
   ABSENT(mkdir("/proc/kallsyms", 0700), "mkdir /proc/kallsyms");
   ABSENT(mkdir("/proc/sysvipc/x", 0700), "mkdir /proc/sysvipc/x");
-  ABSENT(unlink("/proc/kallsyms"), "unlink /proc/kallsyms");
-  ABSENT(rmdir("/proc/sysvipc"), "rmdir /proc/sysvipc");
   ABSENT(symlink(file, "/proc/kallsyms"), "symlink to /proc/kallsyms");
   if (!kvm_local_procfs) {
     ABSENT(link(file, "/proc/kallsyms"), "link to /proc/kallsyms");
@@ -272,6 +274,14 @@ static void check_changes(int kvm_local_procfs) {
     FAILS_WITH(EXDEV, rename("/proc/kallsyms", file), "rename from /proc/kallsyms");
   }
   unlink(file);
+}
+
+/* Removing a name procfs does not have fails as Linux fails it: ENOENT.
+ * Linux refuses a removal on a read-only mount before the lookup, so these
+ * two run on their own, with --removals. */
+static void check_removals(void) {
+  ABSENT(unlink("/proc/kallsyms"), "unlink /proc/kallsyms");
+  ABSENT(rmdir("/proc/sysvipc"), "rmdir /proc/sysvipc");
 }
 
 /* The arguments Linux checks before the lookup, and the order of its
@@ -486,6 +496,7 @@ static void check_listed(const char* path, int shown) {
 
 int main(int argc, char** argv) {
   int host = 0, minimal_level = 0, kvm_local_procfs = 0, kernel_listings = 0;
+  int removals = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--host") == 0) {
       host = 1;
@@ -499,11 +510,13 @@ int main(int argc, char** argv) {
       recorded = 1;
     } else if (strcmp(argv[i], "--chroot-into-proc") == 0) {
       return chroot_into_proc();
+    } else if (strcmp(argv[i], "--removals") == 0) {
+      removals = 1;
     } else {
       fprintf(
           stderr,
           "usage: %s [--host] [--minimal] [--kvm-local-procfs] "
-          "[--kernel-listings] [--recorded] [--chroot-into-proc]\n",
+          "[--kernel-listings] [--recorded] [--chroot-into-proc] [--removals]\n",
           argv[0]);
       return 2;
     }
@@ -517,6 +530,11 @@ int main(int argc, char** argv) {
       }
     }
     return 0;
+  }
+  if (removals) {
+    check_removals();
+    printf("removing a name procfs does not have: as Linux\n");
+    return failures ? 1 : 0;
   }
   for (size_t i = 0; i < count; i++) {
     check_absent(omitted[i], kvm_local_procfs);
@@ -556,7 +574,7 @@ int main(int argc, char** argv) {
   check_process_spellings(kvm_local_procfs);
   printf("a process's names by its pid, its threads and a descriptor: as the level\n");
   check_changes(kvm_local_procfs);
-  printf("creating, removing, renaming and linking: as Linux\n");
+  printf("creating, renaming and linking: as Linux\n");
   check_linux_order(kvm_local_procfs);
   printf("arguments and lookups in Linux's order: as Linux\n");
   check_sockets(!recorded);

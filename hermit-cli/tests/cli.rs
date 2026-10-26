@@ -5651,7 +5651,8 @@ const VIRTUAL_KERNEL_FILES: [&str; 36] = [
 /// (https://github.com/rrnewton/hermit/issues/4266). Before, the host-process
 /// backends passed the kernel's files through and kept each table's host
 /// shape, and KVM made up its own files or refused them. Linux's own
-/// invariants are checked natively first.
+/// invariants are checked natively in
+/// `virtual_kernel_files_hold_linuxs_invariants_natively`.
 ///
 /// Every backend that runs Detcore is checked, one test each, and each
 /// one's output is compared with ptrace's whole, inode numbers included
@@ -5676,11 +5677,6 @@ fn detcore_fixes_the_virtual_kernel_files_on(test: &str, backend: &'static str) 
         return;
     }
     let guest = virtual_kernel_files_guest();
-    let native = Command::new(guest)
-        .arg("--host")
-        .output()
-        .expect("run virtual-kernel-files natively");
-    assert!(native.status.success(), "native: {native:?}");
     // The files that describe the kernel and its limits, written out; then
     // the tables, as Detcore renders them on the run's machine (their bytes
     // are pinned by Detcore's unit tests). A file of one line prints as its
@@ -5821,6 +5817,19 @@ fn detcore_fixes_the_virtual_kernel_files_on(test: &str, backend: &'static str) 
             outputs[0].0
         );
     }
+}
+
+/// Linux's own invariants of the files `detcore_fixes_the_virtual_kernel_files_on`
+/// compares, checked natively (the guest's `--host` mode). The host kernel
+/// decides this obligation, not Detcore, so it is its own test and the
+/// backends' checks do not wait on it.
+#[test]
+fn virtual_kernel_files_hold_linuxs_invariants_natively() {
+    let native = Command::new(virtual_kernel_files_guest())
+        .arg("--host")
+        .output()
+        .expect("run virtual-kernel-files natively");
+    assert!(native.status.success(), "native: {native:?}");
 }
 
 #[test]
@@ -6002,7 +6011,7 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
             .collect::<String>();
         lines
             .push_str("a process's names by its pid, its threads and a descriptor: as the level\n");
-        lines.push_str("creating, removing, renaming and linking: as Linux\n");
+        lines.push_str("creating, renaming and linking: as Linux\n");
         lines.push_str("arguments and lookups in Linux's order: as Linux\n");
         lines.push_str("socket addresses: absent\n");
         if mode == Mode::NoMetadata {
@@ -6136,6 +6145,149 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
     );
     eprintln!(
         "detcore_omits_the_procfs_names_outside_the_level_on_every_backend compared {compared:?}"
+    );
+}
+
+/// The omitted-names guest's two removals (`--removals`: `unlink` of
+/// /proc/kallsyms and `rmdir` of /proc/sysvipc) in `runs`, each `(backend,
+/// level, mode)` as `detcore_omits_the_procfs_names_outside_the_level_on_every_backend`
+/// runs it: both fail as Linux fails them for a name procfs does not have
+/// (ENOENT), with that test's verification and record checks.
+fn check_omitted_procfs_removals(
+    test: &str,
+    runs: Vec<(&'static str, &'static str, &'static str)>,
+) {
+    let guest = omitted_procfs_names_guest();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut compared = Vec::new();
+    for (backend, level, mode) in runs {
+        let report = directory
+            .path()
+            .join(format!("{backend}-{level}-{mode}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let level_arg = format!("--proc={level}");
+        let mut args = match mode {
+            "verified" => vec![
+                "--backend",
+                backend,
+                "run",
+                "--strict",
+                &level_arg,
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                &report_arg,
+                "--base-env=minimal",
+            ],
+            "no-metadata" => vec![
+                "--backend",
+                backend,
+                "run",
+                "--strict",
+                &level_arg,
+                "--no-virtualize-metadata",
+                "--base-env=minimal",
+            ],
+            "recorded" => vec!["record", "--verify", &level_arg],
+            _ => panic!("{test}: unknown mode {mode}"),
+        };
+        args.extend(["--", guest.to_str().expect("guest path is UTF-8")]);
+        if level == "minimal" {
+            args.push("--minimal");
+        }
+        if backend == "kvm" {
+            args.push("--kvm-local-procfs");
+        }
+        match mode {
+            "no-metadata" => args.push("--kernel-listings"),
+            "recorded" => args.push("--recorded"),
+            _ => {}
+        }
+        args.push("--removals");
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        match mode {
+            "verified" => {
+                let verdict: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&report).expect("read the verification report"),
+                )
+                .expect("parse the verification report");
+                assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+                let messages = &verdict["compared_log_messages"];
+                assert!(
+                    messages["left"].as_u64().is_some_and(|count| count > 0)
+                        && messages["left"] == messages["right"],
+                    "{backend} compared no INFO messages: {verdict}"
+                );
+            }
+            "recorded" => assert!(
+                stderr(&output).contains("Success: replay matched recording."),
+                "replay must match the recording: {output:?}"
+            ),
+            _ => {}
+        }
+        assert_eq!(
+            stdout(&output),
+            "removing a name procfs does not have: as Linux\n",
+            "{backend} at {level}"
+        );
+        compared.push(format!("{backend}/{level}/{mode}"));
+    }
+    eprintln!("{test} compared {compared:?}");
+}
+
+/// Removing a `/proc` name in no `--proc` level fails as Linux fails it for a
+/// name procfs does not have (ENOENT), in every run of
+/// `detcore_omits_the_procfs_names_outside_the_level_on_every_backend` that
+/// makes changes on Hermit's procfs mount: its backends but KVM (whose own
+/// /proc is checked by
+/// `detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm`) at
+/// both levels, ptrace without virtualized metadata, and ptrace's record and
+/// replay. Linux refuses a removal on a read-only mount before it looks the
+/// name up, so these need that mount to be writable.
+#[test]
+fn detcore_refuses_removing_the_procfs_names_outside_the_level_on_every_backend() {
+    // The original test's selection, so exactly its backends run and the same
+    // ones are named as not yet or not compared.
+    let backends =
+        procfs_backends("detcore_omits_the_procfs_names_outside_the_level_on_every_backend");
+    let mut runs = Vec::new();
+    for level in ["standard", "minimal"] {
+        runs.extend(
+            backends
+                .iter()
+                .filter(|backend| **backend != "kvm")
+                .map(|backend| (*backend, level, "verified")),
+        );
+    }
+    runs.extend([
+        ("ptrace", "standard", "no-metadata"),
+        ("ptrace", "standard", "recorded"),
+        ("ptrace", "minimal", "recorded"),
+    ]);
+    check_omitted_procfs_removals(
+        "detcore_refuses_removing_the_procfs_names_outside_the_level_on_every_backend",
+        runs,
+    );
+}
+
+/// The same two removals on KVM's own /proc, at both levels and verified, as
+/// `detcore_omits_the_procfs_names_outside_the_level_on_every_backend` runs
+/// KVM: they fail with ENOENT there too. KVM is selected, or named as not
+/// compared, by that test's selection.
+#[test]
+fn detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm() {
+    let backends =
+        procfs_backends("detcore_omits_the_procfs_names_outside_the_level_on_every_backend");
+    if !backends.contains(&"kvm") {
+        return;
+    }
+    check_omitted_procfs_removals(
+        "detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm",
+        vec![
+            ("kvm", "standard", "verified"),
+            ("kvm", "minimal", "verified"),
+        ],
     );
 }
 
@@ -6334,7 +6486,8 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
 /// leads no process and no reaped child (by a wait with or without status,
 /// or automatically); `task` names the threads, also through a descriptor a
 /// child inherited; every listed entry exists with the inode a stat of it
-/// reports. The guest checks the same relations natively first. The ptrace
+/// reports. The guest checks the same relations natively first, in a fresh
+/// read-only procfs of its own. The ptrace
 /// and KVM runs reach bitwise parity and print the same listings, with pids
 /// shown by role (before this, KVM's root listed nothing); KVM's own /proc
 /// cannot open a process's directory yet, so its run checks the root only,
@@ -6355,8 +6508,22 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
 fn detcore_lists_procfs_from_its_model_on_every_backend() {
     let test = "detcore_lists_procfs_from_its_model_on_every_backend";
     let guest = procfs_listings_guest();
-    let native = Command::new(guest)
-        .arg("--host")
+    // Natively, in a fresh read-only procfs of its own (new user, mount and
+    // PID namespaces), so that no mount over a /proc file, as container
+    // runtimes mask /proc/kmsg, changes the inodes it compares.
+    let native = Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--pid",
+            "--fork",
+            "--",
+            "/bin/sh",
+            "-c",
+            "mount -t proc -o ro,nosuid,nodev,noexec proc /proc && exec \"$0\" --host",
+        ])
+        .arg(guest)
         .output()
         .expect("run procfs-listings natively");
     assert!(native.status.success(), "native: {native:?}");
@@ -7042,6 +7209,18 @@ fn a_received_rendered_descriptor_is_refused_under_relaxed_threads() {
     );
 }
 
+/// The relations `detcore_renders_process_cgroup_on_every_backend` checks
+/// under Hermit hold natively, where the file's bytes are the host's: the
+/// guest run outside Hermit. The host kernel decides this obligation, not
+/// Detcore, so it is its own test and the backends' checks do not wait on it.
+#[test]
+fn rendered_process_files_hold_linuxs_relations_natively() {
+    let native = Command::new(rendered_process_files_guest())
+        .output()
+        .expect("run rendered-process-files natively");
+    assert!(native.status.success(), "native: {native:?}");
+}
+
 /// Detcore renders a process's cgroup file, `/proc/<pid>/cgroup`, for every
 /// task its process table holds, without the backend opening a kernel object
 /// (package K slice K1 of https://github.com/rrnewton/hermit/issues/4213):
@@ -7059,18 +7238,15 @@ fn a_received_rendered_descriptor_is_refused_under_relaxed_threads() {
 /// reports them; under Hermit every backend gives the guest every
 /// capability in its namespace, which the test requires, so a write-mode
 /// open succeeds and every write through it is refused without changing the
-/// file. The guest checks the same relations natively first, where the
-/// file's bytes are the host's. Every backend that runs Detcore is compared
-/// (`procfs_backends`), but one not available here, named as not compared,
-/// and one `PROCFS_NOT_YET` lists, named with its issue.
+/// file. The guest checks the same relations natively in
+/// `rendered_process_files_hold_linuxs_relations_natively`. Every backend
+/// that runs Detcore is compared (`procfs_backends`), but one not available
+/// here, named as not compared, and one `PROCFS_NOT_YET` lists, named with
+/// its issue.
 #[test]
 fn detcore_renders_process_cgroup_on_every_backend() {
     let test = "detcore_renders_process_cgroup_on_every_backend";
     let guest = rendered_process_files_guest();
-    let native = Command::new(guest)
-        .output()
-        .expect("run rendered-process-files natively");
-    assert!(native.status.success(), "native: {native:?}");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut outputs = Vec::new();
     for backend in procfs_backends(test) {
@@ -35041,6 +35217,15 @@ fn a_namespace_only_guests_kill_0_never_reaches_hermits_group() {
         format!("{no_new_privs}\nSeccomp:\t2\n"),
         "unexpected output: {output:?}"
     );
+}
+
+/// The `--namespace-only` kill filter that
+/// `a_namespace_only_guests_kill_0_never_reaches_hermits_group` relies on is
+/// required: a guest that cannot install it is never started
+/// (https://github.com/rrnewton/hermit/issues/4065). The nested run creates
+/// its own user namespace inside the outer run's procfs.
+#[test]
+fn a_nested_namespace_only_run_is_refused_without_its_kill_filter() {
     // A guest that cannot install the filter is not started: here a nested
     // --namespace-only run, whose filter cannot add a second listener (EBUSY).
     // The refusal is named (exit 122), and the outer run passes it on.
