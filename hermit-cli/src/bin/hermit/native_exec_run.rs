@@ -244,10 +244,10 @@ impl CapturedNativeOutput {
         execution: Result<()>,
         refused: Option<detcore::PidfdSelfQualificationRefusal>,
     ) -> Result<()> {
-        if matches!(self.output, Some(NativeRunOutput::Output(_))) {
-            if let Some(refused) = refused {
-                return detcore::combine_finalization(execution, Err(refused.into()));
-            }
+        if matches!(self.output, Some(NativeRunOutput::Output(_)))
+            && let Some(refused) = refused
+        {
+            return detcore::combine_finalization(execution, Err(refused.into()));
         }
         execution
     }
