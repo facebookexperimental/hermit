@@ -140,6 +140,7 @@ pub fn needs_directory_placeholder(backend: &reverie::BackendCapabilities) -> bo
 mod tool_local;
 pub mod util;
 mod wait_signal_end;
+pub mod watch;
 
 pub mod detlog;
 pub mod preemptions;
@@ -5409,6 +5410,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     inotify_queue: None,
                     call_parts: None,
                     traced_call: Default::default(),
+                    // Debug registers are not inherited.
+                    watch: Default::default(),
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,
                         dettid,
@@ -5811,6 +5814,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // exec's reconnect asks for a turn, and every request first publishes
         // the process's dispositions, which must be the new image's.
         crate::syscalls::signal_shadow::at_exec(guest);
+        // Linux cleared the thread's debug registers; one that was told the
+        // watches are due arms again here, before the new image runs
+        // (`crate::watch`).
+        guest.thread_state_mut().watch.exec();
+        crate::watch::rearm_after_exec(guest);
         // A nonleader exec preserves the survivor's state and PMU counter, but
         // Linux changes its TID. Bind that state before any image callback RPC.
         match tool_global::reconnect_exec(guest).await {

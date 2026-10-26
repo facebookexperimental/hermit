@@ -5853,6 +5853,19 @@ impl Scheduler {
                 ))
             })
         });
+        // `--watch` writes its hits into the trace; `hermit run` refuses it
+        // without one.
+        let access_trace = match access_trace {
+            Some(mut writer) if !cfg.watch.is_empty() => {
+                writer.enable_watch(cfg.watch_from);
+                Some(writer)
+            }
+            None if !cfg.watch.is_empty() => exit_on_scheduler_refusal(
+                &"hermit: --watch records its hits in the access trace; add \
+                  --record-access-trace-to=PATH",
+            ),
+            other => other,
+        };
 
         let (backend_failure_sender, backend_failure_wake) = oneshot::channel();
         Self {
@@ -23049,6 +23062,8 @@ impl Scheduler {
                 skid_overshoots: None,
                 skid_overshoot_reports: None,
                 seed_reproducible: None,
+                // GlobalState takes it from the access trace.
+                watch: None,
             },
             info_reprio_descrip,
         ))
@@ -23167,6 +23182,70 @@ impl Scheduler {
             .checked_sub(1)
             .expect("record_event recorded this event");
         writer.observe(index, ev, access.map(|access| *access), &self.thread_tree);
+    }
+
+    /// `--watch`: note the watch state the thread reported with the event
+    /// [`Self::record_event`] just recorded. It only feeds the trace's
+    /// summary.
+    pub(crate) fn note_watch(
+        &mut self,
+        ev: &SchedEvent,
+        status: Option<crate::watch::WatchStatus>,
+    ) {
+        let Some(status) = status else {
+            return;
+        };
+        let index = self
+            .recorded_event_count
+            .checked_sub(1)
+            .expect("record_event recorded this event");
+        // Every thread alive has a next turn, from its creation to its exit,
+        // but the one recording this event may hold its turn.
+        let live: Vec<DetTid> = self
+            .next_turns
+            .keys()
+            .copied()
+            .chain(std::iter::once(ev.dettid))
+            .collect();
+        let recorded = self.recorded_event_count;
+        let Some(writer) = self.access_trace.as_mut() else {
+            return;
+        };
+        // The watches are due once `recorded` reaches `--watch-from`: seed
+        // at the event that makes them so, before any thread can exit
+        // unobserved, not at the next one.
+        writer.seed_watch(recorded, live);
+        writer.note_watch(ev.dettid, index, status);
+    }
+
+    /// `--watch`: what to tell a thread at a stop (`crate::watch`): whether
+    /// the watches are due, from the recorded event count alone. `None`
+    /// without watches.
+    pub(crate) fn watch_order(&self) -> Option<crate::watch::WatchOrder> {
+        self.access_trace
+            .as_ref()?
+            .watch_order(self.recorded_event_count)
+    }
+
+    /// `--watch`: a hit, which lies after the events recorded so far. It is
+    /// appended to the trace and changes nothing else.
+    pub(crate) fn record_watch_hit(&mut self, hit: &reverie::WatchHit) {
+        let after = self.recorded_event_count;
+        if let Some(writer) = self.access_trace.as_mut() {
+            let stack = hit
+                .backtrace
+                .as_ref()
+                .map(crate::access_trace::stack_frames)
+                .unwrap_or_default();
+            writer.watch_hit(
+                after,
+                DetTid::from_raw(hit.tid.as_raw()),
+                hit.slot,
+                hit.spec.addr,
+                hit.ip,
+                stack,
+            );
+        }
     }
 
     // Return whether we should print the stacktrace after recording this event.
@@ -38257,6 +38336,64 @@ mod test {
         assert!(scheduler.run_queue.contains_tid(target));
         assert!(scheduler.inbound_signals(target).is_empty());
         assert!(is_futex_request(&scheduler.next_turns[&target]));
+    }
+
+    /// `--watch`: the threads alive when the watches become due are summarized
+    /// even if one is killed parked, before it records an event: at the
+    /// threshold, and when the event that crosses it is the exit_group
+    /// whose teardown kills the peer.
+    #[test]
+    fn a_peer_alive_when_watches_become_due_is_summarized_if_killed_parked() {
+        use detcore_model::access_trace::TraceRecord;
+        use detcore_model::access_trace::WatchSummaryRecord;
+        use detcore_model::access_trace::WatchUnarmed;
+
+        use crate::watch::WatchStatus;
+        let main = DetTid::from_raw(3);
+        let peer = DetTid::from_raw(4);
+        for crossing in [
+            SchedEvent::branches(main, 1),
+            SchedEvent::syscall(main, Sysno::exit_group, SyscallPhase::Prehook),
+        ] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let (mut writer, bytes) = crate::access_trace::in_memory_writer();
+            // Due once 2 events are recorded.
+            writer.enable_watch(2);
+            scheduler.access_trace = Some(writer);
+            register_known_thread(&mut scheduler, main);
+            register_known_thread(&mut scheduler, peer);
+            for event in [SchedEvent::branches(main, 1), crossing.clone()] {
+                scheduler.recorded_event_count += 1;
+                scheduler.note_watch(&event, Some(WatchStatus::Pending));
+            }
+            // The exit_group's teardown: the parked peer is gone without
+            // another event.
+            scheduler.next_turns.remove(&peer);
+            let writer = scheduler.access_trace.take().unwrap();
+            writer.finish(2).unwrap();
+            let trace =
+                detcore_model::access_trace::read_access_trace(&bytes.lock().unwrap()[..]).unwrap();
+            let summaries: Vec<&WatchSummaryRecord> = trace
+                .records
+                .iter()
+                .filter_map(|record| match record {
+                    TraceRecord::WatchSummary(summary) => Some(summary),
+                    _ => None,
+                })
+                .collect();
+            let unarmed = |tid| WatchSummaryRecord {
+                tid,
+                armed_before: None,
+                unarmed: Some(WatchUnarmed::NoStop),
+                hits: 0,
+                recorded: 0,
+            };
+            assert_eq!(
+                summaries,
+                vec![&unarmed(main), &unarmed(peer)],
+                "{crossing:?}"
+            );
+        }
     }
 
     /// The access trace's futex edges: each wake ends at the woken waiter's

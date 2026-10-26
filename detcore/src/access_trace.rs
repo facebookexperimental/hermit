@@ -55,6 +55,7 @@ use detcore_model::access_trace::RETURNED_DIGEST_SEED;
 use detcore_model::access_trace::ReturnedBytes;
 use detcore_model::access_trace::SignalRecord;
 use detcore_model::access_trace::SignalSender;
+use detcore_model::access_trace::StackFrame;
 use detcore_model::access_trace::SyncObject;
 use detcore_model::access_trace::SyscallRecord;
 use detcore_model::access_trace::Task;
@@ -63,6 +64,11 @@ use detcore_model::access_trace::TimerOp;
 use detcore_model::access_trace::TraceEnd;
 use detcore_model::access_trace::TraceHeader;
 use detcore_model::access_trace::TraceRecord;
+use detcore_model::access_trace::WATCH_HITS_KEPT_LAST;
+use detcore_model::access_trace::WATCH_HITS_WITH_STACKS;
+use detcore_model::access_trace::WatchHitRecord;
+use detcore_model::access_trace::WatchSummaryRecord;
+use detcore_model::access_trace::WatchUnarmed;
 use detcore_model::access_trace::returned_digest;
 use reverie::syscalls::Addr;
 use reverie::syscalls::MemoryAccess;
@@ -914,6 +920,20 @@ fn lifetime_accesses(f: &CallFacts<'_>, out: &mut Vec<Access>) {
     }
 }
 
+/// A Reverie stack, innermost frame first, as the trace stores it: the
+/// instruction pointers alone, which a reader symbolizes.
+pub(crate) fn stack_frames(backtrace: &reverie::Backtrace) -> Vec<StackFrame> {
+    Vec::<reverie::Frame>::from(backtrace.clone())
+        .into_iter()
+        .map(|frame| StackFrame {
+            ip: frame.ip,
+            function: None,
+            file: None,
+            line: None,
+        })
+        .collect()
+}
+
 /// kill(0)'s target as the guest thread writes it: the caller's own process
 /// group, which only the scheduler's process table knows.
 pub(crate) const OWN_PROCESS_GROUP: DetPid = DetPid::from_raw(0);
@@ -1009,6 +1029,44 @@ pub struct AccessTraceWriter {
     pairs: BTreeMap<OpenFileId, ChannelId>,
     /// What the synchronization edges need (design section 7).
     edges: EdgeState,
+    /// `--watch`: each thread's watch state and hits; `None` without watches.
+    watch: Option<WatchLedger>,
+}
+
+/// What the writer keeps for `--watch` (`crate::watch`).
+#[derive(Debug)]
+struct WatchLedger {
+    /// `--watch-from`: the watches are due once this many events are
+    /// recorded.
+    due_at: EventIndex,
+    /// Whether the threads alive when the watches became due were entered.
+    seeded: bool,
+    threads: BTreeMap<DetTid, WatchThreadLedger>,
+}
+
+#[derive(Debug, Default)]
+struct WatchThreadLedger {
+    /// The first event the thread recorded with its watches armed.
+    armed_before: Option<EventIndex>,
+    /// The last state it reported once the watches were due.
+    status: Option<crate::watch::WatchStatus>,
+    hits: u64,
+    recorded: u64,
+    /// Its last hits after the first [`WATCH_HITS_WITH_STACKS`], without
+    /// stacks, written when the run ends.
+    last: std::collections::VecDeque<WatchHitRecord>,
+}
+
+impl WatchThreadLedger {
+    fn unarmed(&self) -> Option<WatchUnarmed> {
+        use crate::watch::WatchStatus;
+        match (self.armed_before, self.status) {
+            (Some(_), _) => None,
+            (None, Some(WatchStatus::SigtrapBlocked)) => Some(WatchUnarmed::SigtrapBlocked),
+            (None, Some(WatchStatus::SigtrapIgnored)) => Some(WatchUnarmed::SigtrapIgnored),
+            (None, _) => Some(WatchUnarmed::NoStop),
+        }
+    }
 }
 
 /// The writer's view of who synchronized with whom, kept to emit an edge
@@ -1231,6 +1289,7 @@ impl AccessTraceWriter {
             open: BTreeMap::new(),
             pairs: BTreeMap::new(),
             edges: EdgeState::default(),
+            watch: None,
         })
     }
 
@@ -1854,6 +1913,148 @@ impl AccessTraceWriter {
         }
     }
 
+    /// `--watch`: keep the watches' ledger; they are due once `due_at`
+    /// events are recorded.
+    pub fn enable_watch(&mut self, due_at: EventIndex) {
+        self.watch = Some(WatchLedger {
+            due_at,
+            seeded: false,
+            threads: BTreeMap::new(),
+        });
+    }
+
+    /// `--watch`: what to tell a thread at a stop, once `recorded` events are
+    /// recorded: whether the watches are due.
+    pub fn watch_order(&self, recorded: u64) -> Option<crate::watch::WatchOrder> {
+        let ledger = self.watch.as_ref()?;
+        Some(crate::watch::WatchOrder {
+            epoch: u64::from(recorded >= ledger.due_at),
+        })
+    }
+
+    /// `--watch`: once `recorded` events are recorded, which makes the
+    /// watches due when it reaches `--watch-from` (the same test as
+    /// [`Self::watch_order`]), enter every thread alive then (`live`). A
+    /// thread that never reports its state again, because it stays parked
+    /// until it is killed, is then summarized as one that never stopped
+    /// (`no_stop`) instead of missing from the summaries.
+    pub fn seed_watch(&mut self, recorded: u64, live: impl IntoIterator<Item = DetTid>) {
+        let Some(ledger) = self.watch.as_mut() else {
+            return;
+        };
+        if ledger.seeded || recorded < ledger.due_at {
+            return;
+        }
+        ledger.seeded = true;
+        for tid in live {
+            ledger.threads.entry(tid).or_default();
+        }
+    }
+
+    /// `--watch`: `tid` recorded the event at `index` in watch state
+    /// `status`. A thread is summarized once it records an event when the
+    /// watches are due, or was alive then ([`Self::seed_watch`]).
+    pub fn note_watch(
+        &mut self,
+        tid: DetTid,
+        index: EventIndex,
+        status: crate::watch::WatchStatus,
+    ) {
+        let Some(ledger) = self.watch.as_mut() else {
+            return;
+        };
+        if index < ledger.due_at {
+            return;
+        }
+        let thread = ledger.threads.entry(tid).or_default();
+        thread.status = Some(status);
+        if status == crate::watch::WatchStatus::Armed && thread.armed_before.is_none() {
+            thread.armed_before = Some(index);
+        }
+    }
+
+    /// `--watch`: a hit by `tid`, made after `after` events were recorded. A
+    /// thread's first [`WATCH_HITS_WITH_STACKS`] hits are written now; its
+    /// last [`WATCH_HITS_KEPT_LAST`] after those, without stacks, when the run
+    /// ends; the rest are counted.
+    pub fn watch_hit(
+        &mut self,
+        after: EventIndex,
+        tid: DetTid,
+        slot: u8,
+        addr: u64,
+        ip: u64,
+        stack: Vec<StackFrame>,
+    ) {
+        let from = self.from;
+        let Some(ledger) = self.watch.as_mut() else {
+            return;
+        };
+        let thread = ledger.threads.entry(tid).or_default();
+        thread.hits += 1;
+        let mut record = WatchHitRecord {
+            after,
+            tid,
+            slot,
+            addr,
+            ip,
+            stack,
+        };
+        if after < from {
+            return;
+        }
+        if thread.hits <= WATCH_HITS_WITH_STACKS {
+            thread.recorded += 1;
+            self.write(TraceRecord::WatchHit(record));
+        } else {
+            record.stack.clear();
+            if thread.last.len() as u64 == WATCH_HITS_KEPT_LAST {
+                thread.last.pop_front();
+            }
+            thread.last.push_back(record);
+        }
+    }
+
+    /// `--watch`: how many threads armed, which never did, and every hit.
+    pub fn watch_run_summary(&self) -> Option<detcore_model::summary::WatchRunSummary> {
+        let ledger = self.watch.as_ref()?;
+        Some(detcore_model::summary::WatchRunSummary {
+            armed: ledger
+                .threads
+                .values()
+                .filter(|thread| thread.armed_before.is_some())
+                .count() as u64,
+            unarmed: ledger
+                .threads
+                .iter()
+                .filter_map(|(tid, thread)| thread.unarmed().map(|why| (*tid, why)))
+                .collect(),
+            hits: ledger.threads.values().map(|thread| thread.hits).sum(),
+        })
+    }
+
+    /// Write the kept last hits, then one summary per watched thread.
+    fn finish_watch(&mut self) {
+        let Some(mut ledger) = self.watch.take() else {
+            return;
+        };
+        for thread in ledger.threads.values_mut() {
+            for record in std::mem::take(&mut thread.last) {
+                thread.recorded += 1;
+                self.write(TraceRecord::WatchHit(record));
+            }
+        }
+        for (tid, thread) in &ledger.threads {
+            self.write(TraceRecord::WatchSummary(WatchSummaryRecord {
+                tid: *tid,
+                armed_before: thread.armed_before,
+                unarmed: thread.unarmed(),
+                hits: thread.hits,
+                recorded: thread.recorded,
+            }));
+        }
+    }
+
     /// Write the calls that never returned and the end line, and flush.
     /// `events` is the number of events the run recorded.
     pub fn finish(mut self, events: u64) -> io::Result<()> {
@@ -1863,6 +2064,7 @@ impl AccessTraceWriter {
         for record in open {
             self.finish_record(record);
         }
+        self.finish_watch();
         let records = self.records;
         if self.capped {
             return Ok(());
@@ -2099,6 +2301,7 @@ mod tests {
                 DetPid::from_raw(3),
                 false,
                 Some(Box::new(payload)),
+                Some(crate::watch::WatchStatus::Armed),
             );
             let wire = bincode::serde::encode_to_vec(&request, bincode::config::legacy()).unwrap();
             let (back, _): (crate::tool_global::GlobalRequest, usize) =
@@ -3929,5 +4132,121 @@ mod tests {
             "{:?}",
             writer.edges.signals
         );
+    }
+
+    /// `--watch`: the watches are due from `--watch-from` on; a thread's
+    /// first 64 hits are written with stacks as they happen, its last 64
+    /// after those without stacks at the end, the rest only counted; each
+    /// thread seen once the watches were due, or alive when they became due,
+    /// gets a summary, which says when it armed or why it never did.
+    #[test]
+    fn watch_hits_are_capped_and_every_thread_is_summarized() {
+        use crate::watch::WatchStatus;
+        assert_eq!((WATCH_HITS_WITH_STACKS, WATCH_HITS_KEPT_LAST), (64, 64));
+        let (mut writer, bytes) = in_memory_writer();
+        assert_eq!(writer.watch_order(5), None, "no watches, no order");
+        writer.enable_watch(2);
+        assert_eq!(writer.watch_order(1).map(|o| o.epoch), Some(0));
+        assert_eq!(writer.watch_order(2).map(|o| o.epoch), Some(1));
+        // Before the watches are due (one event recorded) no thread is
+        // entered.
+        writer.seed_watch(1, [tid(3), tid(7)]);
+        writer.note_watch(tid(3), 0, WatchStatus::Pending);
+        // When the second event is recorded they become due, and the threads
+        // alive are entered, once: thread 6 stays parked and never reports
+        // again. The status at that event (index 1) is from before.
+        writer.seed_watch(2, [tid(3), tid(6)]);
+        writer.note_watch(tid(3), 1, WatchStatus::Pending);
+        writer.seed_watch(3, [tid(8)]);
+        writer.note_watch(tid(3), 2, WatchStatus::Pending);
+        writer.note_watch(tid(4), 3, WatchStatus::SigtrapBlocked);
+        writer.note_watch(tid(3), 4, WatchStatus::Armed);
+        writer.note_watch(tid(3), 6, WatchStatus::Armed);
+        writer.note_watch(tid(5), 1, WatchStatus::Pending);
+        let frame = StackFrame {
+            ip: 0x401000,
+            function: None,
+            file: None,
+            line: None,
+        };
+        // 200 hits, each with its own event and instruction.
+        for n in 0..200 {
+            writer.watch_hit(
+                5 + n,
+                tid(3),
+                0,
+                0x404010,
+                0x401000 + n,
+                vec![frame.clone()],
+            );
+        }
+        assert_eq!(
+            writer.watch_run_summary(),
+            Some(detcore_model::summary::WatchRunSummary {
+                armed: 1,
+                unarmed: vec![
+                    (tid(4), WatchUnarmed::SigtrapBlocked),
+                    (tid(6), WatchUnarmed::NoStop),
+                ],
+                hits: 200,
+            })
+        );
+        writer.finish(500).unwrap();
+
+        let trace =
+            detcore_model::access_trace::read_access_trace(&bytes.lock().unwrap()[..]).unwrap();
+        let written: Vec<(u64, u64, u64, usize)> = trace
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::WatchHit(hit) => {
+                    assert_eq!((hit.tid, hit.slot), (tid(3), 0));
+                    Some((hit.after, hit.ip, hit.addr, hit.stack.len()))
+                }
+                _ => None,
+            })
+            .collect();
+        // Hits 0-63 with their stacks, then hits 136-199 without.
+        let expected: Vec<(u64, u64, u64, usize)> = (0..64)
+            .map(|n| (5 + n, 0x401000 + n, 0x404010, 1))
+            .chain((136..200).map(|n| (5 + n, 0x401000 + n, 0x404010, 0)))
+            .collect();
+        assert_eq!(written.len(), 128);
+        assert_eq!(written, expected);
+        let summaries: Vec<&WatchSummaryRecord> = trace
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::WatchSummary(summary) => Some(summary),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            summaries,
+            vec![
+                &WatchSummaryRecord {
+                    tid: tid(3),
+                    armed_before: Some(4),
+                    unarmed: None,
+                    hits: 200,
+                    recorded: 128,
+                },
+                &WatchSummaryRecord {
+                    tid: tid(4),
+                    armed_before: None,
+                    unarmed: Some(WatchUnarmed::SigtrapBlocked),
+                    hits: 0,
+                    recorded: 0,
+                },
+                &WatchSummaryRecord {
+                    tid: tid(6),
+                    armed_before: None,
+                    unarmed: Some(WatchUnarmed::NoStop),
+                    hits: 0,
+                    recorded: 0,
+                },
+            ]
+        );
+        assert!(trace.end.is_some());
     }
 }

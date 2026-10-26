@@ -90,8 +90,10 @@ pub enum TraceRecord {
     Signal(SignalRecord),
     /// One synchronization edge Detcore observed.
     Edge(EdgeRecord),
-    /// One hardware watchpoint hit.
+    /// One hardware watchpoint hit (`--watch`).
     WatchHit(WatchHitRecord),
+    /// One thread's watch outcome (`--watch`), written before the end line.
+    WatchSummary(WatchSummaryRecord),
     /// Last line of a trace whose run finished cleanly.
     End(TraceEnd),
 }
@@ -810,7 +812,12 @@ pub struct StackFrame {
     pub line: Option<u32>,
 }
 
-/// A hardware watchpoint hit (reserved for `--watch`; no writer emits it yet).
+/// A hardware watchpoint hit (`--watch`): an access a thread's own
+/// instruction made to watched bytes. A thread's first
+/// [`WATCH_HITS_WITH_STACKS`] hits are written as they happen, with the stack
+/// when it could be unwound; the last [`WATCH_HITS_KEPT_LAST`] after those are
+/// written without stacks before the [`WatchSummaryRecord`]s; the rest are only
+/// counted there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchHitRecord {
     /// Schedule events recorded before the hit: it lies between event
@@ -827,6 +834,47 @@ pub struct WatchHitRecord {
     /// Stack, when it was unwound.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stack: Vec<StackFrame>,
+}
+
+/// How many of a thread's hits are written as they happen, with stacks.
+pub const WATCH_HITS_WITH_STACKS: u64 = 64;
+
+/// How many of a thread's later hits are kept, the last ones, and written
+/// without stacks when the run ends.
+pub const WATCH_HITS_KEPT_LAST: u64 = 64;
+
+/// One thread's watch outcome (`--watch`): whether and when it armed, and its
+/// hits. Written for every thread that recorded an event once the watches
+/// were due (`--watch-from`), in tid order, before the end line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchSummaryRecord {
+    /// The thread.
+    pub tid: DetTid,
+    /// The first event the thread recorded with its watches armed: it armed
+    /// at a stop before it. `None` when it never armed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed_before: Option<EventIndex>,
+    /// Why it never armed, when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unarmed: Option<WatchUnarmed>,
+    /// Every hit the thread had, written or not.
+    pub hits: u64,
+    /// The hits written as [`WatchHitRecord`]s.
+    pub recorded: u64,
+}
+
+/// Why a thread never armed its watches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchUnarmed {
+    /// It blocked SIGTRAP at every stop it could have armed at: Linux reports
+    /// a hit by forcing a SIGTRAP, which would unblock it.
+    SigtrapBlocked,
+    /// Its process ignored SIGTRAP at every such stop: a hit would reset the
+    /// action to the default.
+    SigtrapIgnored,
+    /// It made no stop at which it could arm, once the watches were due.
+    NoStop,
 }
 
 impl TraceRecord {
@@ -1415,9 +1463,23 @@ mod tests {
                     line: Some(12),
                 }],
             }),
+            TraceRecord::WatchSummary(WatchSummaryRecord {
+                tid: tid(5),
+                armed_before: Some(9001),
+                unarmed: None,
+                hits: 200,
+                recorded: 128,
+            }),
+            TraceRecord::WatchSummary(WatchSummaryRecord {
+                tid: tid(6),
+                armed_before: None,
+                unarmed: Some(WatchUnarmed::SigtrapBlocked),
+                hits: 0,
+                recorded: 0,
+            }),
             TraceRecord::End(TraceEnd {
                 events: 9004,
-                records: 14,
+                records: 16,
             }),
         ]
     }
@@ -1443,7 +1505,7 @@ mod tests {
             trace.end,
             Some(TraceEnd {
                 events: 9004,
-                records: 14
+                records: 16
             })
         );
     }

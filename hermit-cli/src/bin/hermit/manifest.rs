@@ -99,11 +99,13 @@ pub(crate) const MAX_TIMESLICE_KEY: &str = "max-timeslice";
 /// them would overwrite the original run's log, cores and reports.
 const GLOBAL_OUTPUTS: &[&str] = &["log-file"];
 const RUN_OUTPUTS: &[&str] = &[
-    // Not outputs themselves, but they only shape the access trace, and a
-    // rerun without the trace refuses them.
+    // Not outputs themselves, but they only shape the access trace or write
+    // into it, and a rerun without the trace refuses them.
     "access-trace-from",
     "access-trace-max-bytes",
     "access-trace-max-records",
+    "watch",
+    "watch-from",
     "backend-engagement-json",
     "record-access-trace-to",
     "record-networking",

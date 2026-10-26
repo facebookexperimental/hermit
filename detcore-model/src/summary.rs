@@ -471,6 +471,11 @@ pub struct RunSummary {
     /// [`RunSummary::record_skid_overshoots`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_reproducible: Option<bool>,
+    /// `--watch`: which threads armed their hardware watchpoints, and the hits.
+    /// Shown in the full report, not the INFO view, so a watch leaves what
+    /// `--verify` compares as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchRunSummary>,
 }
 
 fn is_zero(count: &u64) -> bool {
@@ -661,6 +666,36 @@ pub struct DesyncNote {
     pub message: String,
 }
 
+/// The `--watch` part of a [`RunSummary`].
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct WatchRunSummary {
+    /// Threads that armed their watches.
+    pub armed: u64,
+    /// Threads that never did, and why.
+    pub unarmed: Vec<(DetTid, crate::access_trace::WatchUnarmed)>,
+    /// Hits on every thread.
+    pub hits: u64,
+}
+
+impl fmt::Display for WatchRunSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Watch: {} thread(s) armed their watches, {} hit(s)",
+            self.armed, self.hits
+        )?;
+        if !self.unarmed.is_empty() {
+            let unarmed: Vec<String> = self
+                .unarmed
+                .iter()
+                .map(|(tid, why)| format!("thread {tid} ({why:?})"))
+                .collect();
+            write!(f, "; never armed: {}", unarmed.join(", "))?;
+        }
+        writeln!(f)
+    }
+}
+
 /// The full human-readable report, including recorded launch configuration.
 impl fmt::Display for RunSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -783,6 +818,7 @@ impl RunSummary {
             skid_overshoots,
             skid_overshoot_reports,
             seed_reproducible: _,
+            watch,
         } = self;
         if let Some(bound) = run_timeout_secs {
             writeln!(
@@ -860,6 +896,9 @@ impl RunSummary {
         }
         if include_report_metadata && let Some(post_crash) = post_crash {
             writeln!(f, "{post_crash}")?;
+        }
+        if include_report_metadata && let Some(watch) = watch {
+            write!(f, "{watch}")?;
         }
 
         if include_report_metadata {

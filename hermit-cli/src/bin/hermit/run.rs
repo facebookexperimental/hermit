@@ -6537,6 +6537,109 @@ fn work_span_report_is_refused_where_there_are_no_turns() {
     }
 }
 
+/// Why `--watch` (or `--watch-from`) cannot run as given, if it cannot: its
+/// hits go to the access trace, the backend must set hardware watchpoints
+/// (`slots`, the backend's count, `None` when it sets none), and a thread
+/// holds at most that many.
+fn watch_refusal(config: &DetConfig, slots: u8, backend: &str) -> Option<String> {
+    let Some(first) = config.watch.first() else {
+        return (config.watch_from != 0).then(|| {
+            format!(
+                "--watch-from={} only says when --watch arms; add --watch=ADDR, or drop it",
+                config.watch_from
+            )
+        });
+    };
+    if config.access_trace.is_none() {
+        return Some(format!(
+            "--watch={first} records its hits in the access trace; add \
+             --record-access-trace-to=PATH, or drop --watch"
+        ));
+    }
+    match slots {
+        0 => Some(format!(
+            "--watch needs hardware watchpoints, and backend `{backend}` sets none on this \
+             architecture; use --backend=ptrace on x86-64, or drop --watch"
+        )),
+        slots if config.watch.len() > usize::from(slots) => Some(format!(
+            "{} --watch flags, and a thread holds {slots} hardware watchpoints; drop {}",
+            config.watch.len(),
+            config.watch.len() - usize::from(slots)
+        )),
+        _ => None,
+    }
+}
+
+/// `--watch` is refused where it would watch nothing or could not arm: without
+/// the access trace its hits go to, beyond the backend's watchpoint count, on
+/// a backend without watchpoints, and `--watch-from` without a watch.
+#[test]
+fn watch_is_refused_where_it_could_not_arm_or_report() {
+    let base = [
+        "hermit",
+        "run",
+        "--record-preemptions-to=/var/e",
+        "--record-access-trace-to=/var/a",
+    ];
+    let with = |extra: &[&str]| {
+        let argv: Vec<&str> = base.iter().chain(extra).chain(&["prog"]).copied().collect();
+        run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .err()
+            .map(|error| error.to_string())
+    };
+    assert_eq!(with(&["--watch=0x404010:8:w", "--watch-from=3"]), None);
+    let five: Vec<String> = (0..5)
+        .map(|i| format!("--watch={:#x}", 0x404010 + 8 * i))
+        .collect();
+    let five: Vec<&str> = five.iter().map(String::as_str).collect();
+    let error = with(&five).expect("five watches");
+    assert!(
+        error.contains("5 --watch flags, and a thread holds 4 hardware watchpoints; drop 1"),
+        "{error}"
+    );
+    // A watch the hardware cannot hold does not parse.
+    let misaligned = <crate::Args as clap::CommandFactory>::command()
+        .try_get_matches_from(["hermit", "run", "--watch=0x404014:8", "prog"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        misaligned.contains("use 0x404010:8 or a shorter length"),
+        "{misaligned}"
+    );
+
+    let no_trace = run_opts_for(&["hermit", "run", "--watch=0x404010", "prog"])
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        no_trace.contains("add --record-access-trace-to=PATH, or drop --watch"),
+        "{no_trace}"
+    );
+    let from_alone = run_opts_for(&["hermit", "run", "--watch-from=5", "prog"])
+        .validate_args_with_perf_support(true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        from_alone.contains("--watch-from=5 only says when --watch arms"),
+        "{from_alone}"
+    );
+
+    // A backend without watchpoints (every one but ptrace, and ptrace off
+    // x86-64) refuses, naming itself.
+    let config = DetConfig {
+        access_trace: Some("/var/a".into()),
+        watch: vec!["0x404010".parse().unwrap()],
+        ..DetConfig::default()
+    };
+    let error = watch_refusal(&config, 0, "kvm").expect("no watchpoints");
+    assert!(
+        error.contains("backend `kvm` sets none") && error.contains("--backend=ptrace"),
+        "{error}"
+    );
+    assert_eq!(watch_refusal(&config, 4, "ptrace"), None);
+}
+
 /// `--record-access-trace-to` is refused wherever its records would name no
 /// recorded schedule or no turns: without a recorded schedule, without
 /// sequentialized threads, with `--namespace-only`, and on backends other
@@ -6650,9 +6753,9 @@ fn access_trace_is_refused_where_its_records_would_name_nothing() {
 }
 
 /// A run manifest leaves the access trace out, as it does every output
-/// destination, and `--access-trace-from`, `--access-trace-max-records` and
-/// `--access-trace-max-bytes` with it, which a rerun without the trace would
-/// refuse.
+/// destination, and `--access-trace-from`, `--access-trace-max-records`,
+/// `--access-trace-max-bytes`, `--watch` and `--watch-from` with it, which a
+/// rerun without the trace would refuse.
 #[test]
 fn a_manifest_leaves_out_the_access_trace() {
     let argv = [
@@ -6663,6 +6766,8 @@ fn a_manifest_leaves_out_the_access_trace() {
         "--access-trace-from=4",
         "--access-trace-max-records=9",
         "--access-trace-max-bytes=4096",
+        "--watch=0x404010",
+        "--watch-from=7",
         "/bin/true",
     ];
     let matches = <crate::app::Args as clap::CommandFactory>::command()
@@ -6678,11 +6783,19 @@ fn a_manifest_leaves_out_the_access_trace() {
     assert!(run.contains_key("access-trace-from"), "{run:?}");
     assert!(run.contains_key("access-trace-max-records"), "{run:?}");
     assert!(run.contains_key("access-trace-max-bytes"), "{run:?}");
+    assert!(
+        run.contains_key("watch") && run.contains_key("watch-from"),
+        "{run:?}"
+    );
     crate::app::manifest::drop_outputs(&mut global, &mut run);
     assert!(!run.contains_key("record-access-trace-to"), "{run:?}");
     assert!(!run.contains_key("access-trace-from"), "{run:?}");
     assert!(!run.contains_key("access-trace-max-records"), "{run:?}");
     assert!(!run.contains_key("access-trace-max-bytes"), "{run:?}");
+    assert!(
+        !run.contains_key("watch") && !run.contains_key("watch-from"),
+        "{run:?}"
+    );
 }
 
 /// A run manifest leaves `--work-span-report` out, as it does every output
@@ -12193,6 +12306,13 @@ impl RunOpts {
                 "{shaping} only shapes an access trace; add --record-access-trace-to=PATH, or \
                  drop it"
             );
+        }
+        if let Some(refusal) = watch_refusal(
+            config,
+            hermit::backend_capabilities(backend).hardware_watchpoints,
+            backend.as_str(),
+        ) {
+            anyhow::bail!(refusal);
         }
         if let Some(cpus) = config.virtual_cpus {
             if self.namespace_only {

@@ -58,6 +58,36 @@ struct Guests {
     /// `tests/fixtures/access_trace_open_kinds.c`: opens a regular file,
     /// /dev/null and a pipe for writing.
     open_kinds: PathBuf,
+    /// racewrite again, at a fixed address (`-no-pie`), and the address of
+    /// the global both processes write, `chosen`.
+    racewrite_fixed: (PathBuf, u64),
+    /// `tests/fixtures/watch_sigtrap_blocked.c`, at a fixed address, and its
+    /// global `watched`, which a worker that blocks SIGTRAP writes.
+    sigtrap_blocked: (PathBuf, u64),
+    /// `tests/fixtures/watch_sigtrap_ignored.c`, at a fixed address, and its
+    /// global `watched`, which it writes after ignoring SIGTRAP.
+    sigtrap_ignored: (PathBuf, u64),
+    /// `tests/fixtures/watch_exec_into.c` (position independent, so nothing
+    /// of it sits at the other's address), which execs its argument, and
+    /// `tests/fixtures/watch_store_first_nostdlib.c`, at a fixed address,
+    /// whose first instructions store its global `watched`.
+    exec_into: PathBuf,
+    store_first: (PathBuf, u64),
+}
+
+/// The address of `symbol` in the non-PIE executable `binary`.
+fn symbol_address(binary: &Path, symbol: &str) -> u64 {
+    let output = Command::new("nm").arg(binary).output().expect("run nm");
+    assert!(output.status.success(), "nm {}", binary.display());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            (fields.len() == 3 && fields[2] == symbol)
+                .then(|| u64::from_str_radix(fields[0], 16).unwrap())
+        })
+        .unwrap_or_else(|| panic!("no symbol {symbol} in {}", binary.display()))
 }
 
 fn guests() -> &'static Guests {
@@ -120,6 +150,50 @@ fn guests() -> &'static Guests {
                 &["-O0", "-g"],
                 "open_kinds",
             ),
+            racewrite_fixed: {
+                let binary = compile(
+                    repository.join("tests/c/simple/racewrite_nostdlib.c"),
+                    &["-g", "-nostdlib", "-no-pie"],
+                    "racewrite_fixed",
+                );
+                let chosen = symbol_address(&binary, "chosen");
+                (binary, chosen)
+            },
+            sigtrap_blocked: {
+                let binary = compile(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/watch_sigtrap_blocked.c"),
+                    &["-O0", "-g", "-pthread", "-no-pie"],
+                    "sigtrap_blocked",
+                );
+                let watched = symbol_address(&binary, "watched");
+                (binary, watched)
+            },
+            exec_into: compile(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/watch_exec_into.c"),
+                &["-O0", "-g", "-fPIE", "-pie"],
+                "exec_into",
+            ),
+            store_first: {
+                let binary = compile(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/watch_store_first_nostdlib.c"),
+                    &["-O0", "-g", "-nostdlib", "-static", "-no-pie"],
+                    "store_first",
+                );
+                let watched = symbol_address(&binary, "watched");
+                (binary, watched)
+            },
+            sigtrap_ignored: {
+                let binary = compile(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/watch_sigtrap_ignored.c"),
+                    &["-O0", "-g", "-no-pie"],
+                    "sigtrap_ignored",
+                );
+                let watched = symbol_address(&binary, "watched");
+                (binary, watched)
+            },
         }
     })
 }
@@ -190,6 +264,18 @@ fn run_traced(
     schedule: Option<&Path>,
     trace: Option<u64>,
 ) -> Replay {
+    run_traced_with(guest, directory, name, schedule, trace, &[])
+}
+
+/// [`run_traced`] with `extra` arguments to `hermit run`.
+fn run_traced_with(
+    guest: &Path,
+    directory: &Path,
+    name: &str,
+    schedule: Option<&Path>,
+    trace: Option<u64>,
+    extra: &[String],
+) -> Replay {
     let events = directory.join(format!("{name}.events"));
     let log = directory.join(format!("{name}.log"));
     let trace_path = directory.join(format!("{name}.access"));
@@ -209,6 +295,7 @@ fn run_traced(
         args.push(path_arg("--record-access-trace-to", &trace_path));
         args.push(format!("--access-trace-from={from}"));
     }
+    args.extend(extra.iter().cloned());
     args.extend(["--".to_string(), guest.display().to_string()]);
     let output = run(&args);
     assert!(output.status.success(), "{args:?}: {output:?}");
@@ -1183,4 +1270,247 @@ fn signal_child_exit_and_join_edges_name_their_events() {
         3,
         "two threads and a child"
     );
+}
+
+/// The trace's records but for the watch's own (the end line, whose record
+/// count counts them too, is not among them). The first execve's arguments
+/// are blanked: it is Hermit's launcher starting the guest, whose pointers
+/// are into Hermit's own command line, which `--watch` lengthens. Every
+/// other record, a guest's own execve included, is compared as written.
+fn without_watch_records(trace: &AccessTrace) -> Vec<TraceRecord> {
+    let mut launcher = true;
+    trace
+        .records
+        .iter()
+        .filter(|record| {
+            !matches!(
+                record,
+                TraceRecord::WatchHit(_) | TraceRecord::WatchSummary(_)
+            )
+        })
+        .cloned()
+        .map(|mut record| {
+            if let TraceRecord::Syscall(call) = &mut record
+                && call.sysno.name() == "execve"
+                && std::mem::take(&mut launcher)
+            {
+                assert_eq!(call.nth, 1, "the launcher's execve is its first call");
+                call.args = [0; 6];
+            }
+            record
+        })
+        .collect()
+}
+
+/// `--watch` on racewrite's global, which the parent and the forked child
+/// each write once, reports one hit from each, at the global and after the
+/// store, and both processes' threads armed. The watch changes nothing else:
+/// replaying one recorded schedule, and running afresh under chaos, with and
+/// without it give the same exit status, stdout, stderr, recorded schedule,
+/// INFO messages and every other trace record.
+#[test]
+fn watch_hits_name_both_writers_and_leave_the_run_unchanged() {
+    let _guard = hermit_run_guard();
+    let (guest, chosen) = &guests().racewrite_fixed;
+    let watch = vec![format!("--watch={chosen:#x}:8:w")];
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = record(guest, directory.path());
+    let runs = [(Some(schedule.as_path()), "replay"), (None, "chaos")];
+    for (schedule, what) in runs {
+        let plain = run_traced_with(
+            guest,
+            directory.path(),
+            &format!("{what}_plain"),
+            schedule,
+            Some(0),
+            &[],
+        );
+        let watched = run_traced_with(
+            guest,
+            directory.path(),
+            &format!("{what}_watched"),
+            schedule,
+            Some(0),
+            &watch,
+        );
+        assert_same_run(&plain, &watched, what);
+        let (plain, watched) = (plain.trace.unwrap(), watched.trace.unwrap());
+        assert_eq!(
+            without_watch_records(&watched),
+            without_watch_records(&plain),
+            "{what}: the watch changed another record"
+        );
+        let hits: Vec<_> = watched
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::WatchHit(hit) => Some(hit),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits.len(), 2, "{what}: {hits:?}");
+        assert!(
+            hits.iter().all(|hit| hit.addr == *chosen && hit.slot == 0),
+            "{what}"
+        );
+        assert!(hits.iter().all(|hit| !hit.stack.is_empty()), "{what}");
+        assert_ne!(hits[0].tid, hits[1].tid, "{what}: one hit from each writer");
+        let summaries: Vec<_> = watched
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::WatchSummary(summary) => Some(summary),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(summaries.len(), 2, "{what}: {summaries:?}");
+        for hit in &hits {
+            let summary = summaries.iter().find(|s| s.tid == hit.tid).unwrap();
+            assert_eq!(
+                (summary.hits, summary.recorded, summary.unarmed),
+                (1, 1, None)
+            );
+            assert!(summary.armed_before.is_some(), "{what}: {summary:?}");
+        }
+    }
+}
+
+/// A worker that blocks SIGTRAP at every stop never arms its watches: the
+/// run completes, the trace's summary for it says why, and Hermit says so on
+/// stderr, so a reader does not take its missing hits for an absent access.
+#[test]
+fn a_thread_that_blocks_sigtrap_never_arms_and_the_trace_says_so() {
+    let _guard = hermit_run_guard();
+    let (guest, watched) = &guests().sigtrap_blocked;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let run = run_traced_with(
+        guest,
+        directory.path(),
+        "blocked",
+        None,
+        Some(0),
+        &[format!("--watch={watched:#x}:8:w")],
+    );
+    assert_eq!(String::from_utf8_lossy(&run.output.stdout), "2\n");
+    let trace = run.trace.unwrap();
+    let summaries: Vec<_> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::WatchSummary(summary) => Some(summary),
+            _ => None,
+        })
+        .collect();
+    let unarmed: Vec<_> = summaries
+        .iter()
+        .filter(|s| s.armed_before.is_none())
+        .collect();
+    assert_eq!(unarmed.len(), 1, "{summaries:?}");
+    assert_eq!(
+        unarmed[0].unarmed,
+        Some(detcore_model::access_trace::WatchUnarmed::SigtrapBlocked)
+    );
+    assert_eq!(unarmed[0].hits, 0, "an unarmed thread reports no hit");
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert!(
+        stderr.contains("--watch: some threads never armed their watches")
+            && stderr.contains(&format!("thread {} (SigtrapBlocked)", unarmed[0].tid)),
+        "{stderr}"
+    );
+}
+
+/// A hit that resets the guest's SIGTRAP action (the guest ignores SIGTRAP,
+/// and the hit's forced SIGTRAP resets that to the default) stops the run
+/// with Hermit's refusal status, naming the thread and what Reverie says the
+/// SIGTRAP did (that it reset the action, or that it could not tell),
+/// instead of running on with a guest the watch changed.
+#[test]
+fn a_hit_that_resets_an_ignored_sigtrap_stops_the_run() {
+    let _guard = hermit_run_guard();
+    let (guest, watched) = &guests().sigtrap_ignored;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let output = run(&[
+        "run".to_string(),
+        EPOCH.to_string(),
+        path_arg(
+            "--record-preemptions-to",
+            &directory.path().join("p.events"),
+        ),
+        path_arg(
+            "--record-access-trace-to",
+            &directory.path().join("p.access"),
+        ),
+        format!("--watch={watched:#x}:8:w"),
+        "--".to_string(),
+        guest.display().to_string(),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "{output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("hermit: --watch refused: a watchpoint hit on thread")
+            && ["ActionReset", "Unknown"].iter().any(|state| {
+                stderr.contains(&format!(
+                    "may have changed the guest's SIGTRAP state ({state})"
+                ))
+            }),
+        "{stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "the guest stopped before it printed"
+    );
+}
+
+/// Exec clears a thread's debug registers, and the new image's first
+/// instructions can store to a watched global before its first syscall. The
+/// thread arms again at the exec itself, so that store is reported: one hit,
+/// by the thread that exec'd, after the exec's event.
+#[test]
+fn a_watch_survives_exec_into_an_image_that_stores_first() {
+    let _guard = hermit_run_guard();
+    let guests = guests();
+    let (store_first, watched) = &guests.store_first;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let trace_path = directory.path().join("exec.access");
+    let args = vec![
+        "run".to_string(),
+        EPOCH.to_string(),
+        path_arg(
+            "--record-preemptions-to",
+            &directory.path().join("exec.events"),
+        ),
+        path_arg("--record-access-trace-to", &trace_path),
+        format!("--watch={watched:#x}:8:w"),
+        "--".to_string(),
+        guests.exec_into.display().to_string(),
+        store_first.display().to_string(),
+    ];
+    let output = run(&args);
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    let trace = read_access_trace(fs::read(&trace_path).expect("no trace").as_slice())
+        .expect("trace does not parse");
+    let execs: Vec<&SyscallRecord> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::Syscall(call) if call.sysno.name() == "execve" => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(execs.len(), 2, "the launcher's and the guest's: {execs:?}");
+    let hits: Vec<_> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::WatchHit(hit) => Some(hit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!((hits[0].tid, hits[0].addr), (execs[1].tid, *watched));
+    assert!(hits[0].after > execs[1].pre, "{hits:?} {execs:?}");
 }

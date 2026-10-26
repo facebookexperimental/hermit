@@ -1443,6 +1443,8 @@ fn record_or_replay_config_with_timer_support(
         access_trace_from: 0,
         access_trace_max_records: None,
         access_trace_max_bytes: None,
+        watch: Vec::new(),
+        watch_from: 0,
         preemption_stacktrace: false,
         preemption_stacktrace_log_file: None,
         stop_after_turn: None,
