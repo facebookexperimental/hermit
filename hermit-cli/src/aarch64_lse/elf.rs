@@ -118,7 +118,9 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
     if bytes.len() < 4 || bytes[..4] != *goblin::elf::header::ELFMAG {
         return Ok(None);
     }
-    let mut relocated: Vec<(u64, u64)> = Vec::new();
+    // The byte ranges relocations cover, filled inside the block below, which
+    // is where the parsed ELF lives.
+    let relocated: Vec<(u64, u64)>;
     let mut relr_unreadable = false;
     let sections = {
         let elf = Elf::parse(bytes)?;
@@ -133,52 +135,10 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
             })
             .map(|ph| (ph.p_vaddr, ph.p_vaddr.saturating_add(ph.p_memsz)))
             .collect();
-        // SHT_RELR = 19: packed relative relocations, which the ELF reader
-        // does not report. The format is its own: an even entry is an
-        // address, and each odd entry that follows is a bitmap of the next
-        // 63 words after it. Decode them rather than refuse the image, since
-        // every aarch64 system binary now uses them.
-        for sh in &elf.section_headers {
-            if sh.sh_type != 19 || sh.sh_size == 0 {
-                continue;
-            }
-            let (start, end) = (sh.sh_offset as usize, (sh.sh_offset + sh.sh_size) as usize);
-            if end > bytes.len() {
-                relr_unreadable = true;
-                continue;
-            }
-            let mut where_ = 0u64;
-            for entry in bytes[start..end].as_chunks::<8>().0 {
-                let entry = u64::from_le_bytes(*entry);
-                if entry & 1 == 0 {
-                    relocated.push((entry, entry + 8));
-                    where_ = entry + 8;
-                    continue;
-                }
-                let mut bits = entry >> 1;
-                let mut at = where_;
-                while bits != 0 {
-                    if bits & 1 == 1 {
-                        relocated.push((at, at + 8));
-                    }
-                    bits >>= 1;
-                    at += 8;
-                }
-                where_ += 63 * 8;
-            }
-        }
-        if elf.section_headers.is_empty() {
-            let mut report = FileReport::default();
-            report
-                .skipped_segments
-                .push("the file has no section headers, so code cannot be told from data".into());
-            return Ok(Some(report));
-        }
         // A relocation's own width is not in the entry, so take the widest
         // aarch64 relocation (8 bytes): any sequence those bytes touch is
-        // refused. DT_RELR entries are not in goblin's lists, so an image
-        // that has a .relr.dyn section is refused wholesale further down.
-        relocated = elf
+        // refused.
+        let mut relocations: Vec<(u64, u64)> = elf
             .shdr_relocs
             .iter()
             .flat_map(|(_, relocs)| relocs.iter().map(|reloc| reloc.r_offset))
@@ -187,6 +147,36 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
             .chain(elf.pltrelocs.iter().map(|reloc| reloc.r_offset))
             .map(|offset| (offset, offset + 8))
             .collect();
+        // SHT_RELR = 19: packed relative relocations, which the ELF reader
+        // does not report, so they are decoded here and ADDED to that list.
+        // The format is its own: an even entry is an address, and each odd
+        // entry after it is a bitmap of the 63 words that follow. Decoding
+        // them keeps the images that use them (every current aarch64 system
+        // binary) rewritable instead of refusing them whole.
+        for sh in &elf.section_headers {
+            if sh.sh_type != 19 || sh.sh_size == 0 {
+                continue;
+            }
+            let Some(end) = sh
+                .sh_offset
+                .checked_add(sh.sh_size)
+                .and_then(|end| usize::try_from(end).ok())
+                .filter(|end| *end <= bytes.len())
+            else {
+                relr_unreadable = true;
+                continue;
+            };
+            let start = sh.sh_offset as usize;
+            relocations.extend(decode_relr(&bytes[start..end]));
+        }
+        relocated = relocations;
+        if elf.section_headers.is_empty() {
+            let mut report = FileReport::default();
+            report
+                .skipped_segments
+                .push("the file has no section headers, so code cannot be told from data".into());
+            return Ok(Some(report));
+        }
         elf.section_headers
             .iter()
             .filter(|sh| {
