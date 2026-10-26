@@ -600,7 +600,7 @@ mod tests {
             );
         }
         assert!(
-            scan_text(file, &body).is_empty(),
+            scan_text(file, body).is_empty(),
             "LiteInst in-guest program tests contain an undeclared colliding exit status"
         );
     }

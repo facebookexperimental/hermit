@@ -63,7 +63,7 @@ fn main() {
         ForkResult::Child => {
             fdread.close().expect("close failed");
 
-            let proc_self = "/proc/self/exe\0".as_ptr() as *const libc::c_char;
+            let proc_self = c"/proc/self/exe".as_ptr();
 
             // Execute thyself, passing in the pipe's file descriptor.
             unsafe {
