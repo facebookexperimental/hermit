@@ -694,12 +694,16 @@ pub enum EdgeKind {
     FutexRequeue,
     /// A thread or process creation to the child's first event.
     Create,
-    /// A thread's exit, through its clear-child-tid wake, to the joiner's
-    /// wait return.
+    /// A thread's exit, through its clear-child-tid wake (or the wake of a
+    /// robust futex it held), to the woken waiter's return, from the
+    /// exiting thread's last event.
     ExitJoin,
-    /// A child process's exit to the parent's wait4 or waitid return.
+    /// A child process's exit, from its last event, to the parent's wait4
+    /// or waitid return.
     ChildExit,
-    /// A signal send to its delivery.
+    /// A signal send (kill, tkill, tgkill, rt_sigqueueinfo,
+    /// rt_tgsigqueueinfo) or a POSIX timer's arm (timer_settime), from its
+    /// prehook, to the delivery it caused.
     Signal,
 }
 

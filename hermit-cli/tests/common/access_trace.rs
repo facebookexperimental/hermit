@@ -18,9 +18,12 @@ use std::sync::OnceLock;
 use detcore_model::access_trace::Access;
 use detcore_model::access_trace::AccessTrace;
 use detcore_model::access_trace::ChannelId;
+use detcore_model::access_trace::EdgeKind;
+use detcore_model::access_trace::EdgeRecord;
 use detcore_model::access_trace::FdOp;
 use detcore_model::access_trace::LifetimeOp;
 use detcore_model::access_trace::ObservedSignalDisposition;
+use detcore_model::access_trace::SyncObject;
 use detcore_model::access_trace::SyscallRecord;
 use detcore_model::access_trace::Task;
 use detcore_model::access_trace::TimerOp;
@@ -44,6 +47,9 @@ struct Guests {
     /// has a cache. The default container makes a new copy for each run,
     /// whose inode and mtime differ in the recorded host-input metadata.
     ld_so_cache: Option<PathBuf>,
+    /// `tests/fixtures/futex_ping_pong.c`: two threads hand a futex word
+    /// back and forth.
+    ping_pong: PathBuf,
 }
 
 fn guests() -> &'static Guests {
@@ -90,6 +96,11 @@ fn guests() -> &'static Guests {
                 "mix",
             ),
             ld_so_cache,
+            ping_pong: compile(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/futex_ping_pong.c"),
+                &["-O0", "-g", "-pthread"],
+                "ping_pong",
+            ),
         }
     })
 }
@@ -375,6 +386,16 @@ fn access_trace_indices_name_the_runs_own_events() {
                 assert_eq!(event["dettid"], signal.tid.as_raw(), "{event}");
                 assert!(event["op"].get("SignalReceived").is_some(), "{event}");
             }
+            TraceRecord::Edge(edge) => {
+                assert!(edge.from.event < edge.to.event, "{edge:?}");
+                for end in [edge.from, edge.to] {
+                    assert_eq!(
+                        events[end.event as usize]["dettid"],
+                        end.tid.as_raw(),
+                        "{edge:?}"
+                    );
+                }
+            }
             other => panic!("unexpected record {other:?}"),
         }
     }
@@ -586,6 +607,7 @@ fn access_trace_from_leaves_out_only_earlier_records() {
     let last_event = |record: &TraceRecord| match record {
         TraceRecord::Syscall(call) => call.post.unwrap_or(call.pre),
         TraceRecord::Signal(signal) => signal.event,
+        TraceRecord::Edge(edge) => edge.to.event,
         other => panic!("unexpected record {other:?}"),
     };
     assert_eq!(part.header.from, from);
@@ -673,5 +695,174 @@ fn access_trace_from_leaves_out_only_earlier_records() {
     assert!(
         warnings[0].contains(&bounded_path.display().to_string()),
         "{stderr}"
+    );
+}
+
+fn edges(trace: &AccessTrace) -> Vec<&EdgeRecord> {
+    trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::Edge(edge) => Some(edge),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The event at `index` of a re-recorded schedule, as JSON.
+fn event_at(events: &[serde_json::Value], index: u64) -> &serde_json::Value {
+    &events[index as usize]
+}
+
+fn is_futex(event: &serde_json::Value, phase: &str) -> bool {
+    event["op"]["Syscall"] == serde_json::json!([libc::SYS_futex, phase])
+}
+
+/// Two threads hand a futex word back and forth ten times. Each blocking
+/// wait is ended by the other thread's wake, so the futex edges alternate
+/// direction, and each runs from the waker's FUTEX_WAKE prehook to the
+/// waiter's FUTEX_WAIT posthook in the run's own schedule. The worker's
+/// creation is an edge from main's clone to the worker's first event.
+#[test]
+fn a_futex_ping_pong_yields_alternating_wake_edges() {
+    let _guard = hermit_run_guard();
+    let guest = &guests().ping_pong;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = record(guest, directory.path());
+    let traced = replay(guest, &schedule, directory.path(), "traced", Some(0));
+    assert!(traced.output.status.success(), "{:?}", traced.output);
+    assert_eq!(traced.output.stdout, b"10 rounds\n");
+    let trace = traced.trace.unwrap();
+    let events: serde_json::Value = serde_json::from_slice(&traced.events).unwrap();
+    let events = events["global"].as_array().unwrap();
+
+    let wakes: Vec<&EdgeRecord> = edges(&trace)
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::FutexWake)
+        .collect();
+    assert!(
+        wakes.len() >= 18,
+        "only {} wake edges: {wakes:?}",
+        wakes.len()
+    );
+    for edge in &wakes {
+        assert_ne!(edge.from.tid, edge.to.tid, "{edge:?}");
+        assert!(edge.from.event < edge.to.event, "{edge:?}");
+        let (from, to) = (
+            event_at(events, edge.from.event),
+            event_at(events, edge.to.event),
+        );
+        assert_eq!(from["dettid"], edge.from.tid.as_raw(), "{edge:?}");
+        assert!(is_futex(from, "Prehook"), "{edge:?}: {from}");
+        assert_eq!(to["dettid"], edge.to.tid.as_raw(), "{edge:?}");
+        assert!(is_futex(to, "Posthook"), "{edge:?}: {to}");
+        assert!(matches!(edge.object, SyncObject::Futex(_)), "{edge:?}");
+    }
+    for pair in wakes.windows(2) {
+        assert!(pair[0].to.event < pair[1].from.event, "{pair:?}");
+        assert_eq!(
+            pair[0].to.tid, pair[1].from.tid,
+            "the woken thread wakes next: {pair:?}"
+        );
+        assert_eq!(pair[0].from.tid, pair[1].to.tid, "{pair:?}");
+    }
+
+    let creates: Vec<&EdgeRecord> = edges(&trace)
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::Create)
+        .collect();
+    assert_eq!(creates.len(), 1, "{creates:?}");
+    let create = creates[0];
+    let first = events
+        .iter()
+        .position(|event| event["dettid"] == create.to.tid.as_raw())
+        .unwrap();
+    assert_eq!(create.to.event, first as u64, "the child's first event");
+    assert_eq!(create.object, SyncObject::Thread(create.to.tid));
+    let clone = event_at(events, create.from.event);
+    assert_eq!(clone["dettid"], create.from.tid.as_raw());
+    assert_eq!(clone["op"]["Syscall"][1], "Prehook", "{clone}");
+}
+
+/// The mixed guest's other edges: a timer's expiry is a signal edge from
+/// its timer_settime to the delivery, the reaped child's exit is an edge
+/// to the parent's wait4 return, and a join that waited is an exit edge
+/// to the joiner's futex return.
+#[test]
+fn signal_child_exit_and_join_edges_name_their_events() {
+    let _guard = hermit_run_guard();
+    let guest = &guests().mix;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = record(guest, directory.path());
+    let traced = replay(guest, &schedule, directory.path(), "traced", Some(0));
+    assert!(traced.output.status.success(), "{:?}", traced.output);
+    let trace = traced.trace.unwrap();
+    let events: serde_json::Value = serde_json::from_slice(&traced.events).unwrap();
+    let events = events["global"].as_array().unwrap();
+    let of_kind = |kind: EdgeKind| -> Vec<&EdgeRecord> {
+        edges(&trace)
+            .into_iter()
+            .filter(|edge| edge.kind == kind)
+            .collect()
+    };
+    let syscall_at = |index: u64| -> (i64, String) {
+        let op = &event_at(events, index)["op"]["Syscall"];
+        (
+            op[0].as_i64().unwrap_or(-1),
+            op[1].as_str().unwrap_or("").to_string(),
+        )
+    };
+
+    let signal = of_kind(EdgeKind::Signal);
+    assert_eq!(signal.len(), 1, "{signal:?}");
+    assert_eq!(
+        syscall_at(signal[0].from.event),
+        (libc::SYS_timer_settime, "Prehook".to_string())
+    );
+    assert_eq!(
+        event_at(events, signal[0].to.event)["op"]["SignalReceived"],
+        "SIGUSR1"
+    );
+
+    let child = of_kind(EdgeKind::ChildExit);
+    assert_eq!(child.len(), 1, "{child:?}");
+    assert_eq!(
+        syscall_at(child[0].to.event),
+        (libc::SYS_wait4, "Posthook".to_string())
+    );
+    let SyncObject::Process(pid) = child[0].object else {
+        panic!("{child:?}");
+    };
+    let last_of_child = events
+        .iter()
+        .rposition(|event| event["dettid"] == pid.as_raw())
+        .unwrap();
+    assert_eq!(
+        child[0].from.event, last_of_child as u64,
+        "the child's last event"
+    );
+
+    // Main joins worker a while it still runs (it lingers), so the join's
+    // futex wait ends at a's exit: an edge from a's last event to main's
+    // futex return.
+    let joins = of_kind(EdgeKind::ExitJoin);
+    assert!(!joins.is_empty(), "no join waited for its thread");
+    let main = events[0]["dettid"].as_i64().unwrap() as i32;
+    for join in joins {
+        assert_eq!(join.to.tid.as_raw(), main, "{join:?}");
+        assert_eq!(
+            syscall_at(join.to.event),
+            (libc::SYS_futex, "Posthook".to_string())
+        );
+        let last_of_thread = events
+            .iter()
+            .rposition(|event| event["dettid"] == join.from.tid.as_raw())
+            .unwrap();
+        assert_eq!(join.from.event as usize, last_of_thread, "{join:?}");
+    }
+    assert_eq!(
+        of_kind(EdgeKind::Create).len(),
+        3,
+        "two threads and a child"
     );
 }

@@ -9,8 +9,8 @@
 // Two threads race over the resources the access trace names: a contended
 // mutex (futex wake and wait), a pipe closed by close_range, a file opened,
 // duplicated (once onto an open number), seeked and closed, an anonymous
-// mapping, a POSIX timer, a handled signal and a forked child that is waited
-// for. Which thread writes each line first depends on
+// mapping, a POSIX timer, a handled signal, a thread joined while it still
+// runs and a forked child that is waited for. Which thread writes each line first depends on
 // the schedule, so the output is racy; everything else is checked.
 
 #include <fcntl.h>
@@ -57,6 +57,12 @@ static void* worker(void* name) {
   }
   char byte = ((char*)name)[0];
   must(write(pipe_fds[1], &byte, 1) == 1, "write pipe");
+  if (byte == 'a') {
+    // Outlive main's pthread_join call, so the join waits on the futex the
+    // kernel clears and wakes at this thread's exit.
+    struct timespec linger = {.tv_nsec = 20000000};
+    nanosleep(&linger, NULL);
+  }
   return NULL;
 }
 

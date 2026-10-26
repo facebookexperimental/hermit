@@ -64,6 +64,8 @@ use std::time::Duration;
 use std::vec::IntoIter;
 
 pub use detcore_model::TerminalOutcome;
+use detcore_model::access_trace::EdgeKind;
+use detcore_model::access_trace::SyncObject;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Position;
 use detcore_model::happens_before::Strength;
@@ -9522,12 +9524,12 @@ impl Scheduler {
     /// Reschedule all threads blocked on a particular futex.
     pub fn wake_futex_waiters(
         &mut self,
-        waker_dettid: DetTid,
+        waker: DetTid,
         futexid: FutexID,
         max_to_wake: i32,
         wake_mask: u32,
     ) -> u64 {
-        self.wake_futex_waiters_until_pi(waker_dettid, futexid, max_to_wake, wake_mask)
+        self.wake_futex_waiters_until_pi(waker, futexid, max_to_wake, wake_mask)
             .0
     }
 
@@ -9536,7 +9538,20 @@ impl Scheduler {
     /// after waking the waiters before it (`Self::take_futex_wakees`).
     pub(crate) fn wake_futex_waiters_until_pi(
         &mut self,
-        _waker_dettid: DetTid,
+        waker: DetTid,
+        futexid: FutexID,
+        max_to_wake: i32,
+        wake_mask: u32,
+    ) -> (u64, bool) {
+        self.wake_futex_waiters_as(EdgeKind::FutexWake, waker, futexid, max_to_wake, wake_mask)
+    }
+
+    /// [`Self::wake_futex_waiters`], telling the access trace that `waker`
+    /// released each woken waiter by a `kind` edge.
+    fn wake_futex_waiters_as(
+        &mut self,
+        kind: EdgeKind,
+        waker: DetTid,
         futexid: FutexID,
         max_to_wake: i32,
         wake_mask: u32,
@@ -9544,9 +9559,24 @@ impl Scheduler {
         let (to_wake, met_pi) = self.take_futex_wakees(futexid, max_to_wake, wake_mask);
         let num_woken = to_wake.len();
         for waiter in to_wake {
+            self.note_wake_edge(kind, waker, waiter.dettid, SyncObject::Futex(futexid));
             self.wake_futex_waiter(waiter);
         }
         (num_woken as u64, met_pi)
+    }
+
+    /// Tell the access trace (`--record-access-trace-to`) that `waker`
+    /// released `waiter` through `object`. It changes no scheduling state.
+    fn note_wake_edge(
+        &mut self,
+        kind: EdgeKind,
+        waker: DetTid,
+        waiter: DetTid,
+        object: SyncObject,
+    ) {
+        if let Some(writer) = self.access_trace.as_mut() {
+            writer.note_wake(kind, waker, waiter, object);
+        }
     }
 
     /// `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE` on plain (non-PI) futexes, as
@@ -9577,6 +9607,7 @@ impl Scheduler {
     /// (`PiFutexOwner::handed`).
     pub fn requeue_futex_waiters(
         &mut self,
+        waker: DetTid,
         from: FutexID,
         to: FutexID,
         nr_wake: usize,
@@ -9620,6 +9651,14 @@ impl Scheduler {
         if !kept.is_empty() {
             self.blocked.futex_waiters.insert(from, kept);
         }
+        for waiter in &moved {
+            self.note_wake_edge(
+                EdgeKind::FutexRequeue,
+                waker,
+                waiter.dettid,
+                SyncObject::Futex(to),
+            );
+        }
         if !moved.is_empty() {
             self.blocked
                 .futex_waiters
@@ -9629,6 +9668,12 @@ impl Scheduler {
         }
         let num_woken = woken.len() as u64;
         for waiter in woken {
+            self.note_wake_edge(
+                EdgeKind::FutexWake,
+                waker,
+                waiter.dettid,
+                SyncObject::Futex(from),
+            );
             self.wake_futex_waiter(waiter);
         }
         trace!(
@@ -9989,12 +10034,18 @@ impl Scheduler {
     ) -> Vec<u64> {
         wakes
             .iter()
-            .map(|(_owner, futexid)| {
+            .map(|(owner, futexid)| {
                 // A PI waiter in the way ends the wake, as `futex_wake`'s
                 // EINVAL, which the kernel's exit path ignores.
                 let (to_wake, _) = self.take_futex_wakees(*futexid, 1, u32::MAX);
                 let num_woken = to_wake.len();
                 for waiter in to_wake {
+                    self.note_wake_edge(
+                        EdgeKind::ExitJoin,
+                        *owner,
+                        waiter.dettid,
+                        SyncObject::Futex(*futexid),
+                    );
                     self.admit_futex_waiter_after_exit(waiter);
                 }
                 num_woken as u64
@@ -10029,7 +10080,7 @@ impl Scheduler {
             // cleanup now: the stopped scheduler will never drain admissions,
             // and no waiter can receive another grant.
             assert!(!self.run_queue.tentative_pop_in_progress());
-            self.wake_futex_waiters(dettid, futid, 1, u32::MAX);
+            self.wake_futex_waiters_as(EdgeKind::ExitJoin, dettid, futid, 1, u32::MAX);
         } else {
             // A thread's retirement can arrive while a tentative selection is
             // open, where a direct run-queue push is illegal. Keep the same
@@ -19545,7 +19596,13 @@ impl Scheduler {
         } else {
             None
         };
-        let print_stack2 = if record { self.record_event(&ev) } else { None };
+        let print_stack2 = if record {
+            let stack = self.record_event(&ev);
+            self.record_access(&ev, None);
+            stack
+        } else {
+            None
+        };
         if print_stack1.is_some() || print_stack2.is_some() {
             crate::util::capped_eprintln!(
                 ":: Guest tid {}, at thread time {}, backtrace requested but not available post-exit!\n",
@@ -20924,14 +20981,14 @@ impl Scheduler {
         ev: &SchedEvent,
         access: Option<Box<crate::access_trace::AccessPayload>>,
     ) {
-        let (Some(writer), Some(access)) = (self.access_trace.as_mut(), access) else {
+        let Some(writer) = self.access_trace.as_mut() else {
             return;
         };
         let index = self
             .recorded_event_count
             .checked_sub(1)
             .expect("record_event recorded this event");
-        writer.observe(index, ev, *access, &self.thread_tree);
+        writer.observe(index, ev, access.map(|access| *access), &self.thread_tree);
     }
 
     // Return whether we should print the stacktrace after recording this event.
@@ -33128,6 +33185,286 @@ mod test {
         assert!(is_futex_request(&scheduler.next_turns[&target]));
     }
 
+    /// The access trace's futex edges: each wake ends at the woken waiter's
+    /// posthook and starts at the waker's FUTEX_WAKE prehook, whichever
+    /// waiter the wake takes. With `--fuzz-futexes` the waiter is a random
+    /// pick, and the edge follows the pick.
+    #[test]
+    fn a_futex_wake_edge_names_the_waiter_the_wake_took() {
+        use detcore_model::access_trace::EdgeRecord;
+        use detcore_model::access_trace::EventRef;
+
+        use crate::access_trace::AccessPayload;
+        use crate::access_trace::SyscallEntry;
+        use crate::access_trace::SyscallOutcome;
+        for (fuzz, seed) in [(false, 0), (true, 1), (true, 2), (true, 3)] {
+            let config = Config {
+                fuzz_futexes: fuzz,
+                fuzz_seed: Some(seed),
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&config);
+            let (writer, bytes) = crate::access_trace::in_memory_writer();
+            scheduler.access_trace = Some(writer);
+            let waiters = [100, 101, 102].map(DetTid::from_raw);
+            let waker = DetTid::from_raw(103);
+            let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+            let entry = || {
+                Some(AccessPayload::SyscallEntry(SyscallEntry {
+                    pid: DetPid::from_raw(100),
+                    nth: 1,
+                    sysno: Sysno::futex,
+                    args: [0; 6],
+                    accesses: Vec::new(),
+                }))
+            };
+            let observe = |scheduler: &mut Scheduler, index, tid, phase, payload| {
+                let event = SchedEvent::syscall(tid, Sysno::futex, phase);
+                let writer = scheduler.access_trace.as_mut().unwrap();
+                writer.observe(index, &event, payload, &ThreadTree::default());
+            };
+            for (index, waiter) in waiters.into_iter().enumerate() {
+                register_known_thread(&mut scheduler, waiter);
+                observe(
+                    &mut scheduler,
+                    index as u64,
+                    waiter,
+                    SyscallPhase::Prehook,
+                    entry(),
+                );
+                scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
+            }
+            observe(&mut scheduler, 3, waker, SyscallPhase::Prehook, entry());
+            assert_eq!(scheduler.wake_futex_waiters(waker, futex, 1, u32::MAX), 1);
+            let woken: Vec<DetTid> = waiters
+                .into_iter()
+                .filter(|waiter| !scheduler.is_parked_futex_waiter(*waiter))
+                .collect();
+            assert_eq!(woken.len(), 1, "fuzz {fuzz}, seed {seed}");
+            let outcome = || {
+                Some(AccessPayload::SyscallExit(Box::new(SyscallOutcome {
+                    result: 0,
+                    accesses: Vec::new(),
+                    returned: None,
+                    out_bytes: None,
+                })))
+            };
+            observe(&mut scheduler, 4, waker, SyscallPhase::Posthook, outcome());
+            observe(
+                &mut scheduler,
+                5,
+                woken[0],
+                SyscallPhase::Posthook,
+                outcome(),
+            );
+            scheduler.access_trace.take().unwrap().finish(6).unwrap();
+            assert_eq!(
+                crate::access_trace::edges_of(&bytes),
+                vec![EdgeRecord {
+                    kind: EdgeKind::FutexWake,
+                    from: EventRef {
+                        tid: waker,
+                        event: 3
+                    },
+                    to: EventRef {
+                        tid: woken[0],
+                        event: 5
+                    },
+                    object: SyncObject::Futex(futex),
+                }],
+                "fuzz {fuzz}, seed {seed}"
+            );
+        }
+    }
+
+    /// A requeue's edges: the waiter it woke gets a wake edge, and the
+    /// waiter it moved gets a requeue edge, then the later wake's edge,
+    /// both ending at that waiter's own return.
+    #[test]
+    fn a_requeue_edge_waits_for_the_moved_waiters_return() {
+        use detcore_model::access_trace::EventRef;
+
+        let mut scheduler = Scheduler::new(&Config::default());
+        let (mut writer, bytes) = crate::access_trace::in_memory_writer();
+        let (first, second, requeuer, unlocker) = (
+            DetTid::from_raw(100),
+            DetTid::from_raw(101),
+            DetTid::from_raw(102),
+            DetTid::from_raw(103),
+        );
+        let mm = MmId::initial(DetPid::from_raw(100));
+        let (cond, mutex) = (FutexID::private(mm, 0x1000), FutexID::private(mm, 0x2000));
+        for (index, tid) in [first, second, requeuer, unlocker].into_iter().enumerate() {
+            writer.observe(
+                index as u64,
+                &SchedEvent::branches(tid, 1),
+                None,
+                &ThreadTree::default(),
+            );
+        }
+        scheduler.access_trace = Some(writer);
+        for waiter in [first, second] {
+            register_known_thread(&mut scheduler, waiter);
+            scheduler.sleep_futex_waiter(&waiter, cond, None, u32::MAX, None);
+        }
+        assert_eq!(
+            scheduler.requeue_futex_waiters(requeuer, cond, mutex, 1, 1),
+            (1, 1)
+        );
+        assert_eq!(
+            scheduler.wake_futex_waiters(unlocker, mutex, 1, u32::MAX),
+            1
+        );
+        let outcome = || {
+            Some(crate::access_trace::AccessPayload::SyscallExit(Box::new(
+                crate::access_trace::SyscallOutcome {
+                    result: 0,
+                    accesses: Vec::new(),
+                    returned: None,
+                    out_bytes: None,
+                },
+            )))
+        };
+        // A posthook ends only the edges of a syscall the writer saw begin;
+        // the waiters' waits began before this test's events, so the edges
+        // end at their next posthooks after an entry.
+        let writer = scheduler.access_trace.as_mut().unwrap();
+        for (index, tid) in [(10, first), (11, second)] {
+            writer.observe(
+                index,
+                &SchedEvent::syscall(tid, Sysno::futex, SyscallPhase::Prehook),
+                Some(crate::access_trace::AccessPayload::SyscallEntry(
+                    crate::access_trace::SyscallEntry {
+                        pid: DetPid::from_raw(100),
+                        nth: 1,
+                        sysno: Sysno::futex,
+                        args: [0; 6],
+                        accesses: Vec::new(),
+                    },
+                )),
+                &ThreadTree::default(),
+            );
+            writer.observe(
+                index + 10,
+                &SchedEvent::syscall(tid, Sysno::futex, SyscallPhase::Posthook),
+                outcome(),
+                &ThreadTree::default(),
+            );
+        }
+        scheduler.access_trace.take().unwrap().finish(30).unwrap();
+        let edges: Vec<(EdgeKind, DetTid, EventRef, SyncObject)> =
+            crate::access_trace::edges_of(&bytes)
+                .into_iter()
+                .map(|edge| (edge.kind, edge.from.tid, edge.to, edge.object))
+                .collect();
+        assert_eq!(
+            edges,
+            vec![
+                (
+                    EdgeKind::FutexWake,
+                    requeuer,
+                    EventRef {
+                        tid: first,
+                        event: 20
+                    },
+                    SyncObject::Futex(cond)
+                ),
+                (
+                    EdgeKind::FutexRequeue,
+                    requeuer,
+                    EventRef {
+                        tid: second,
+                        event: 21
+                    },
+                    SyncObject::Futex(mutex)
+                ),
+                (
+                    EdgeKind::FutexWake,
+                    unlocker,
+                    EventRef {
+                        tid: second,
+                        event: 21
+                    },
+                    SyncObject::Futex(mutex)
+                ),
+            ]
+        );
+    }
+
+    /// An exit's clear-child-tid wake is an exit-to-join edge from the
+    /// exiting thread's last event, on both of its wake paths.
+    #[test]
+    fn a_clear_child_tid_wake_is_a_join_edge() {
+        use detcore_model::access_trace::EventRef;
+
+        let mut scheduler = Scheduler::new(&Config::default());
+        let (mut writer, bytes) = crate::access_trace::in_memory_writer();
+        let (joiner, exiting) = (DetTid::from_raw(100), DetTid::from_raw(101));
+        writer.observe(
+            0,
+            &SchedEvent::branches(joiner, 1),
+            None,
+            &ThreadTree::default(),
+        );
+        writer.observe(
+            1,
+            &SchedEvent::branches(exiting, 1),
+            None,
+            &ThreadTree::default(),
+        );
+        scheduler.access_trace = Some(writer);
+        register_known_thread(&mut scheduler, joiner);
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x7000);
+        scheduler.sleep_futex_waiter(&joiner, futex, None, u32::MAX, None);
+        scheduler.wake_futex_child_cleartid(futex, exiting);
+        let writer = scheduler.access_trace.as_mut().unwrap();
+        writer.observe(
+            2,
+            &SchedEvent::syscall(joiner, Sysno::futex, SyscallPhase::Prehook),
+            Some(crate::access_trace::AccessPayload::SyscallEntry(
+                crate::access_trace::SyscallEntry {
+                    pid: DetPid::from_raw(100),
+                    nth: 1,
+                    sysno: Sysno::futex,
+                    args: [0; 6],
+                    accesses: Vec::new(),
+                },
+            )),
+            &ThreadTree::default(),
+        );
+        writer.observe(
+            3,
+            &SchedEvent::syscall(joiner, Sysno::futex, SyscallPhase::Posthook),
+            Some(crate::access_trace::AccessPayload::SyscallExit(Box::new(
+                crate::access_trace::SyscallOutcome {
+                    result: 0,
+                    accesses: Vec::new(),
+                    returned: None,
+                    out_bytes: None,
+                },
+            ))),
+            &ThreadTree::default(),
+        );
+        scheduler.access_trace.take().unwrap().finish(4).unwrap();
+        let edges = crate::access_trace::edges_of(&bytes);
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        assert_eq!(edges[0].kind, EdgeKind::ExitJoin);
+        assert_eq!(
+            edges[0].from,
+            EventRef {
+                tid: exiting,
+                event: 1
+            }
+        );
+        assert_eq!(
+            edges[0].to,
+            EventRef {
+                tid: joiner,
+                event: 3
+            }
+        );
+    }
+
     /// A `FUTEX_WAKE` of one waiter wakes the longest waiter, as Linux does for
     /// waiters of equal priority. Waking the newest one let a thread that re-waits
     /// after every wake take every wake, and an older waiter never ran
@@ -33255,7 +33592,7 @@ mod test {
         let on_to = park_futex_waiters(&mut scheduler, to, 100, 1, u32::MAX);
         let on_from = park_futex_waiters(&mut scheduler, from, 101, 4, u32::MAX);
         assert_eq!(
-            scheduler.requeue_futex_waiters(from, to, 1, 2),
+            scheduler.requeue_futex_waiters(DetTid::from_raw(98), from, to, 1, 2),
             (1, 2, false)
         );
         assert!(scheduler.run_queue.contains_tid(on_from[0]));
@@ -33290,7 +33627,13 @@ mod test {
             let mut scheduler = Scheduler::new(&Config::default());
             let waiters = park_futex_waiters(&mut scheduler, from, 100, 3, 0b01);
             assert_eq!(
-                scheduler.requeue_futex_waiters(from, to, nr_wake, nr_requeue),
+                scheduler.requeue_futex_waiters(
+                    DetTid::from_raw(98),
+                    from,
+                    to,
+                    nr_wake,
+                    nr_requeue
+                ),
                 expected,
                 "nr_wake {nr_wake} nr_requeue {nr_requeue}"
             );
@@ -33318,12 +33661,18 @@ mod test {
         let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
         let waiters = park_futex_waiters(&mut scheduler, futex, 100, 3, u32::MAX);
         assert_eq!(
-            scheduler.requeue_futex_waiters(futex, futex, 0, i32::MAX as usize),
+            scheduler.requeue_futex_waiters(
+                DetTid::from_raw(98),
+                futex,
+                futex,
+                0,
+                i32::MAX as usize
+            ),
             (0, 3, false)
         );
         assert_eq!(futex_waiter_order(&scheduler, futex), waiters);
         assert_eq!(
-            scheduler.requeue_futex_waiters(futex, futex, 1, 1),
+            scheduler.requeue_futex_waiters(DetTid::from_raw(98), futex, futex, 1, 1),
             (1, 1, false)
         );
         assert_eq!(futex_waiter_order(&scheduler, futex), waiters[1..].to_vec());

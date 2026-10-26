@@ -40,7 +40,10 @@ use detcore_model::access_trace::ChannelKind;
 use detcore_model::access_trace::ChannelOp;
 use detcore_model::access_trace::CursorOp;
 use detcore_model::access_trace::DataOp;
+use detcore_model::access_trace::EdgeKind;
+use detcore_model::access_trace::EdgeRecord;
 use detcore_model::access_trace::EventIndex;
+use detcore_model::access_trace::EventRef;
 use detcore_model::access_trace::FdOp;
 use detcore_model::access_trace::FutexOp;
 use detcore_model::access_trace::LifetimeOp;
@@ -51,6 +54,7 @@ use detcore_model::access_trace::RETURNED_DIGEST_SEED;
 use detcore_model::access_trace::ReturnedBytes;
 use detcore_model::access_trace::SignalRecord;
 use detcore_model::access_trace::SignalSender;
+use detcore_model::access_trace::SyncObject;
 use detcore_model::access_trace::SyscallRecord;
 use detcore_model::access_trace::Task;
 use detcore_model::access_trace::TimerId;
@@ -171,6 +175,8 @@ pub struct SignalNote {
     pub addr: Option<u64>,
     /// `si_pid` of a signal sent by kill, sigqueue, tkill or tgkill.
     pub sender: Option<SignalSender>,
+    /// `si_tid` of a POSIX timer's expiry (`SI_TIMER`): the timer's id.
+    pub timer: Option<i32>,
     /// Installed disposition sampled at the event, not its eventual outcome.
     pub observed_disposition: ObservedSignalDisposition,
 }
@@ -194,6 +200,7 @@ pub(crate) fn signal_note(
             code: 0,
             addr: None,
             sender: None,
+            timer: None,
             observed_disposition,
         };
     };
@@ -216,11 +223,13 @@ pub(crate) fn signal_note(
             pid: DetPid::from_raw(pid),
             tid: None,
         });
+    let timer = (code == libc::SI_TIMER).then(|| int(info, 16)).flatten();
     SignalNote {
         signo,
         code,
         addr,
         sender,
+        timer,
         observed_disposition,
     }
 }
@@ -969,6 +978,73 @@ pub struct AccessTraceWriter {
     open: BTreeMap<DetTid, SyscallRecord>,
     /// The channel identity of each end of a pipe or socketpair.
     pairs: BTreeMap<OpenFileId, ChannelId>,
+    /// What the synchronization edges need (design section 7).
+    edges: EdgeState,
+}
+
+/// The writer's view of who synchronized with whom, kept to emit an edge
+/// once its later end is recorded.
+#[derive(Debug, Default)]
+struct EdgeState {
+    /// Each thread's first and latest recorded event.
+    first_event: BTreeMap<DetTid, EventIndex>,
+    last_event: BTreeMap<DetTid, EventIndex>,
+    /// The process of each thread, from its syscalls.
+    process_of: BTreeMap<DetTid, DetPid>,
+    /// The latest event of any thread of each process.
+    process_last: BTreeMap<DetPid, EventRef>,
+    /// Edges that end at their waiter's next posthook: a futex wake, a
+    /// requeue, an exit's clear-child-tid wake.
+    at_posthook: BTreeMap<DetTid, Vec<PendingEdge>>,
+    /// Creation edges whose child has not run yet.
+    at_first_event: BTreeMap<DetTid, PendingEdge>,
+    /// Signals sent and not yet delivered, in send order.
+    signals: Vec<PendingSignal>,
+}
+
+/// An edge whose `to` end is not recorded yet.
+#[derive(Debug, Clone)]
+struct PendingEdge {
+    kind: EdgeKind,
+    from: EventRef,
+    object: SyncObject,
+}
+
+/// A signal a thread sent (kill, tkill, tgkill, rt_sigqueueinfo,
+/// rt_tgsigqueueinfo) or a timer it armed (timer_settime), waiting for the
+/// delivery it causes.
+#[derive(Debug, Clone, PartialEq)]
+struct PendingSignal {
+    from: EventRef,
+    sender: DetPid,
+    signo: i32,
+    target: Task,
+    /// For a timer: its id. A timer's expiry carries it as `si_tid`.
+    timer: Option<i32>,
+    /// The call's posthook, once recorded: it succeeded.
+    post: Option<EventIndex>,
+    /// For a timer arm: its timer was deleted since.
+    deleted: bool,
+    /// For a group target: the members listed at its posthook, less the
+    /// ones reaped since.
+    members: Option<Vec<DetPid>>,
+    /// For a group target: the processes it reached already.
+    reached: Vec<DetPid>,
+}
+
+/// Sends and arms kept waiting for their delivery, at most. Past it, one
+/// goes: the oldest arm of a deleted timer, else the oldest send, else the
+/// oldest arm, because a live timer's arm can cause expiries for the rest
+/// of the run.
+const MAX_PENDING_SIGNALS: usize = 4096;
+
+impl PendingSignal {
+    /// Whether a group send has reached every member listed at its posthook.
+    fn reached_all(&self) -> bool {
+        self.members
+            .as_ref()
+            .is_some_and(|members| members.iter().all(|m| self.reached.contains(m)))
+    }
 }
 
 /// The process table facts the writer resolves a group signal with.
@@ -1009,7 +1085,7 @@ impl AccessTraceWriter {
     }
 
     /// Write the header of a trace to `out`.
-    fn new(
+    pub(crate) fn new(
         mut out: Box<dyn Write + Send>,
         from: EventIndex,
         max_records: Option<u64>,
@@ -1029,20 +1105,30 @@ impl AccessTraceWriter {
             name: "the access trace".to_string(),
             open: BTreeMap::new(),
             pairs: BTreeMap::new(),
+            edges: EdgeState::default(),
         })
     }
 
-    /// Take the payload of the event the scheduler just recorded at `index`.
+    /// Take the event the scheduler just recorded at `index`, and its payload.
     pub fn observe(
         &mut self,
         index: EventIndex,
         event: &SchedEvent,
-        payload: AccessPayload,
+        payload: Option<AccessPayload>,
         groups: &dyn ProcessGroups,
     ) {
         let tid = event.dettid;
+        self.note_event(tid, index);
+        let Some(payload) = payload else {
+            return;
+        };
         match (payload, &event.op) {
             (AccessPayload::SyscallEntry(entry), Op::Syscall(_, SyscallPhase::Prehook)) => {
+                self.edges.process_of.insert(tid, entry.pid);
+                self.edges
+                    .process_last
+                    .insert(entry.pid, EventRef { tid, event: index });
+                self.note_signal_send(EventRef { tid, event: index }, &entry);
                 // A call that never reached its posthook (a restarted wait,
                 // a successful execve) ends when its thread enters the next.
                 if let Some(unfinished) = self.open.remove(&tid) {
@@ -1075,17 +1161,38 @@ impl AccessTraceWriter {
                 record.accesses = resolve_groups(outcome.accesses, record.pid, groups);
                 record.returned = outcome.returned;
                 record.out_bytes = outcome.out_bytes;
+                let to = EventRef { tid, event: index };
+                for edge in self.edges.at_posthook.remove(&tid).unwrap_or_default() {
+                    self.write_edge(edge, to);
+                }
+                self.syscall_edges(&record, to);
                 self.finish_record(record);
             }
             (AccessPayload::Signal(note), Op::SignalReceived(_)) => {
+                let to = EventRef { tid, event: index };
+                let sent = self.take_signal_send(&note, tid, groups);
+                if let Some(from) = sent {
+                    self.write_edge(
+                        PendingEdge {
+                            kind: EdgeKind::Signal,
+                            from,
+                            object: SyncObject::Signal(note.signo),
+                        },
+                        to,
+                    );
+                }
                 if index >= self.from {
+                    let sender = note.sender.map(|sender| SignalSender {
+                        tid: sent.map(|from| from.tid),
+                        ..sender
+                    });
                     self.write(TraceRecord::Signal(SignalRecord {
                         event: index,
                         tid,
                         signo: note.signo,
                         code: note.code,
                         addr: note.addr,
-                        sender: note.sender,
+                        sender,
                         observed_disposition: note.observed_disposition,
                     }));
                 }
@@ -1094,6 +1201,341 @@ impl AccessTraceWriter {
                 "[access trace] dropped a payload that does not match its event {:?}: {:?}",
                 op, payload
             ),
+        }
+    }
+
+    /// A thread's event at `index`: the first one of a new thread ends the
+    /// creation edge that started it.
+    fn note_event(&mut self, tid: DetTid, index: EventIndex) {
+        let to = EventRef { tid, event: index };
+        if let std::collections::btree_map::Entry::Vacant(first) = self.edges.first_event.entry(tid)
+        {
+            first.insert(index);
+            if let Some(edge) = self.edges.at_first_event.remove(&tid) {
+                self.write_edge(edge, to);
+            }
+        }
+        self.edges.last_event.insert(tid, index);
+        if let Some(pid) = self.edges.process_of.get(&tid).copied() {
+            self.edges.process_last.insert(pid, to);
+        }
+    }
+
+    /// `waker`'s operation released `waiter` through `object`: a futex wake
+    /// or requeue (from the waker's syscall) or an exit's wake (from the
+    /// exiting thread's last event). The edge ends at the waiter's next
+    /// posthook, the return of the wait it was released from.
+    pub fn note_wake(&mut self, kind: EdgeKind, waker: DetTid, waiter: DetTid, object: SyncObject) {
+        let syscall = self.open.get(&waker).map(|record| record.pre);
+        let last = self.edges.last_event.get(&waker).copied();
+        let from = match kind {
+            EdgeKind::ExitJoin => last,
+            _ => syscall.or(last),
+        };
+        let Some(event) = from else {
+            return;
+        };
+        self.edges
+            .at_posthook
+            .entry(waiter)
+            .or_default()
+            .push(PendingEdge {
+                kind,
+                from: EventRef { tid: waker, event },
+                object,
+            });
+    }
+
+    /// The edges a finished syscall ends or starts: a clone's child, a
+    /// reaped child's exit, and a failed send that will deliver nothing.
+    fn syscall_edges(&mut self, record: &SyscallRecord, to: EventRef) {
+        let result = record.result.unwrap_or(-1);
+        let from = EventRef {
+            tid: record.tid,
+            event: record.pre,
+        };
+        match record.sysno {
+            Sysno::clone | Sysno::clone3 | Sysno::fork | Sysno::vfork if result > 0 => {
+                let child = DetTid::from_raw(result as i32);
+                let edge = PendingEdge {
+                    kind: EdgeKind::Create,
+                    from,
+                    object: SyncObject::Thread(child),
+                };
+                // The child may have run before its parent's clone returned.
+                match self.edges.first_event.get(&child).copied() {
+                    Some(first) if first > record.pre => self.write_edge(
+                        edge,
+                        EventRef {
+                            tid: child,
+                            event: first,
+                        },
+                    ),
+                    _ => {
+                        self.edges.first_event.remove(&child);
+                        self.edges.at_first_event.insert(child, edge);
+                    }
+                }
+            }
+            Sysno::wait4 | Sysno::waitid => {
+                let mut reaped = Vec::new();
+                for access in &record.accesses {
+                    if let Access::Lifetime {
+                        target: Task::Process(child),
+                        op: LifetimeOp::Wait,
+                    } = access
+                    {
+                        reaped.push(*child);
+                        if let Some(exit) = self.edges.process_last.get(child).copied()
+                            && exit.event < to.event
+                        {
+                            self.write_edge(
+                                PendingEdge {
+                                    kind: EdgeKind::ChildExit,
+                                    from: exit,
+                                    object: SyncObject::Process(*child),
+                                },
+                                to,
+                            );
+                        }
+                    }
+                }
+                for child in reaped {
+                    self.forget_reaped(child);
+                }
+            }
+            _ => {}
+        }
+        self.settle_signal_send(record);
+    }
+
+    /// At a send's posthook: drop it if it failed; otherwise mark it
+    /// completed and fix a group target and its members. A timer_delete
+    /// marks its timer's arms deleted: one expiry dequeued before the
+    /// delete can still be delivered after it.
+    fn settle_signal_send(&mut self, record: &SyscallRecord) {
+        let result = record.result.unwrap_or(-1);
+        if record.sysno == Sysno::timer_delete && result == 0 {
+            let timer = Some(record.args[0] as i32);
+            for signal in &mut self.edges.signals {
+                if signal.timer == timer && signal.sender == record.pid {
+                    signal.deleted = true;
+                }
+            }
+        }
+        let from = EventRef {
+            tid: record.tid,
+            event: record.pre,
+        };
+        let Some(position) = self.edges.signals.iter().position(|s| s.from == from) else {
+            return;
+        };
+        if result < 0 {
+            self.edges.signals.remove(position);
+            return;
+        }
+        let signal = &mut self.edges.signals[position];
+        signal.post = record.post;
+        if matches!(signal.target, Task::ProcessGroup(_)) {
+            let mut members = Vec::new();
+            for access in &record.accesses {
+                if let Access::Lifetime { target, .. } = access {
+                    match target {
+                        Task::ProcessGroup(group) => signal.target = Task::ProcessGroup(*group),
+                        Task::Process(member) => members.push(*member),
+                        Task::Thread(_) => {}
+                    }
+                }
+            }
+            signal.members = Some(members);
+            if signal.reached_all() {
+                self.edges.signals.remove(position);
+            }
+        }
+    }
+
+    /// `child` was reaped, so nothing pending can reach it any more: drop
+    /// the sends to it or its threads and its timers' arms, and take it out
+    /// of the group sends still waiting for it.
+    fn forget_reaped(&mut self, child: DetPid) {
+        let process_of = &self.edges.process_of;
+        self.edges.signals.retain_mut(|signal| match signal.target {
+            _ if signal.timer.is_some() => signal.sender != child,
+            Task::Process(target) => target != child,
+            Task::Thread(thread) => process_of.get(&thread) != Some(&child),
+            Task::ProcessGroup(_) => {
+                if let Some(members) = &mut signal.members {
+                    members.retain(|member| *member != child);
+                }
+                !signal.reached_all()
+            }
+        });
+    }
+
+    /// Make room for one more pending send (see [`MAX_PENDING_SIGNALS`]).
+    fn evict_pending_signal(&mut self) {
+        let signals = &self.edges.signals;
+        let victim = signals
+            .iter()
+            .position(|signal| signal.deleted)
+            .or_else(|| signals.iter().position(|signal| signal.timer.is_none()))
+            .unwrap_or(0);
+        self.edges.signals.remove(victim);
+    }
+
+    /// Note a signal a syscall entry sends, or a timer it arms.
+    fn note_signal_send(&mut self, from: EventRef, entry: &SyscallEntry) {
+        let raw = |i: usize| entry.args[i] as i32;
+        let pid = DetPid::from_raw;
+        let (target, signo, timer) = match entry.sysno {
+            Sysno::kill => {
+                let target = match raw(0) {
+                    p if p > 0 => Task::Process(pid(p)),
+                    0 => Task::ProcessGroup(OWN_PROCESS_GROUP),
+                    -1 => return,
+                    p => Task::ProcessGroup(pid(p.wrapping_neg())),
+                };
+                (target, raw(1), None)
+            }
+            Sysno::tkill => (Task::Thread(pid(raw(0))), raw(1), None),
+            Sysno::tgkill | Sysno::rt_tgsigqueueinfo => (Task::Thread(pid(raw(1))), raw(2), None),
+            Sysno::rt_sigqueueinfo => (Task::Process(pid(raw(0))), raw(1), None),
+            // The expiry's signal comes from the sigevent timer_create
+            // named, so a timer arm matches any signal carrying its id.
+            Sysno::timer_settime => (Task::Process(entry.pid), 0, Some(raw(0))),
+            _ => return,
+        };
+        if signo == 0 && timer.is_none() {
+            return;
+        }
+        if self.edges.signals.len() == MAX_PENDING_SIGNALS {
+            self.evict_pending_signal();
+        }
+        self.edges.signals.push(PendingSignal {
+            from,
+            sender: entry.pid,
+            signo,
+            target,
+            timer,
+            post: None,
+            deleted: false,
+            members: None,
+            reached: Vec::new(),
+        });
+    }
+
+    /// The send that caused `note`'s delivery to `tid`, if one is pending.
+    ///
+    /// A candidate is a send of that signal, to that thread, its process or
+    /// its group, from the process `si_pid` names. The delivery takes the
+    /// earliest candidate and uses up that one alone (a group send only for
+    /// this process, until it has reached every member listed at its
+    /// posthook). That holds for standard signals too, whose sends merge:
+    /// the k-th delivery is never matched with a send later than the
+    /// latest cause among the first k deliveries, so no edge claims more
+    /// order than the run had. Taking the latest send instead is unsound:
+    /// on ptrace the kernel dequeues a signal before the stop at which its
+    /// delivery is recorded, so a send recorded in between can queue a
+    /// second instance, and a send to the process and one to the thread
+    /// queue separately and deliver twice.
+    ///
+    /// The induction needs the candidates' sends to have run in the order
+    /// of their prehooks. A send runs in its prehook's turn (handle_kill and
+    /// handle_tgkill request no turn before record_or_replay), except that
+    /// a `--happens-before` checkpoint requests one between them. So the
+    /// earliest candidate gives an edge only when its posthook comes before
+    /// every later candidate's prehook, which a later call of the same
+    /// thread always satisfies; otherwise it is used up without an edge.
+    /// The merged sends a delivery leaves pending stay until the cap or
+    /// reaping removes them: they can give weaker edges, never false ones.
+    ///
+    /// A timer's expiry takes the oldest live arm of the timer whose id it
+    /// carries, for the same reason. A timer holds one queued signal, so
+    /// once an expiry recorded after a newer arm's posthook has matched the
+    /// oldest arm, that arm can cause no more; after timer_delete, at most
+    /// one expiry dequeued before it remains.
+    fn take_signal_send(
+        &mut self,
+        note: &SignalNote,
+        tid: DetTid,
+        groups: &dyn ProcessGroups,
+    ) -> Option<EventRef> {
+        let process = self.edges.process_of.get(&tid).copied();
+        let signals = &mut self.edges.signals;
+        if let Some(timer) = note.timer {
+            let process = process?;
+            let arms: Vec<usize> = (0..signals.len())
+                .filter(|&i| signals[i].timer == Some(timer) && signals[i].sender == process)
+                .collect();
+            let oldest = *arms.first()?;
+            let from = signals[oldest].from;
+            if signals[oldest].deleted {
+                signals.retain(|s| !(s.timer == Some(timer) && s.sender == process && s.deleted));
+            } else if arms[1..].iter().any(|&i| signals[i].post.is_some()) {
+                signals.remove(oldest);
+            }
+            return Some(from);
+        }
+        let sender = note.sender?.pid;
+        let group = process.and_then(|p| groups.group_of(p));
+        let candidate = |signal: &PendingSignal| {
+            let target = match signal.target {
+                Task::ProcessGroup(OWN_PROCESS_GROUP) => {
+                    Task::ProcessGroup(groups.group_of(signal.sender).unwrap_or(OWN_PROCESS_GROUP))
+                }
+                target => target,
+            };
+            signal.timer.is_none()
+                && signal.signo == note.signo
+                && signal.sender == sender
+                && match target {
+                    Task::Thread(thread) => thread == tid,
+                    Task::Process(target) => Some(target) == process,
+                    Task::ProcessGroup(target) => {
+                        Some(target) == group
+                            && process.is_some_and(|p| !signal.reached.contains(&p))
+                    }
+                }
+        };
+        let candidates: Vec<usize> = (0..signals.len())
+            .filter(|&i| candidate(&signals[i]))
+            .collect();
+        let chosen = *candidates.first()?;
+        let post = signals[chosen].post;
+        let ran_first = candidates[1..]
+            .iter()
+            .all(|&i| post.is_some_and(|post| post < signals[i].from.event));
+        let signal = &mut signals[chosen];
+        let from = ran_first.then_some(signal.from);
+        let used_up = match signal.target {
+            Task::ProcessGroup(_) => {
+                signal.reached.extend(process);
+                signal.reached_all()
+            }
+            _ => true,
+        };
+        if used_up {
+            signals.remove(chosen);
+        }
+        from
+    }
+
+    /// Write `edge` ending at `to`, unless `to` is before
+    /// `--access-trace-from`.
+    fn write_edge(&mut self, edge: PendingEdge, to: EventRef) {
+        // Every edge source names an event recorded before its later end;
+        // a backward edge would be a writer bug, not a property of the run.
+        debug_assert!(
+            edge.from.event < to.event,
+            "a backward edge {edge:?} to {to:?}"
+        );
+        if to.event >= self.from && edge.from.event < to.event {
+            self.write(TraceRecord::Edge(EdgeRecord {
+                kind: edge.kind,
+                from: edge.from,
+                to,
+                object: edge.object,
+            }));
         }
     }
 
@@ -1204,6 +1646,42 @@ impl AccessTraceWriter {
         TraceRecord::End(TraceEnd { events, records }).write_line(&mut out)?;
         out.flush()
     }
+}
+
+/// A writer whose trace stays in memory, and the bytes it wrote, for the
+/// scheduler's tests.
+#[cfg(test)]
+pub(crate) fn in_memory_writer() -> (AccessTraceWriter, std::sync::Arc<Mutex<Vec<u8>>>) {
+    #[derive(Clone)]
+    struct Shared(std::sync::Arc<Mutex<Vec<u8>>>);
+    impl Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let writer =
+        AccessTraceWriter::new(Box::new(Shared(bytes.clone())), 0, None, None).expect("in memory");
+    (writer, bytes)
+}
+
+/// The edges of a finished in-memory trace.
+#[cfg(test)]
+pub(crate) fn edges_of(bytes: &Mutex<Vec<u8>>) -> Vec<EdgeRecord> {
+    let bytes = bytes.lock().unwrap().clone();
+    detcore_model::access_trace::read_access_trace(&bytes[..])
+        .expect("trace parses")
+        .records
+        .into_iter()
+        .filter_map(|record| match record {
+            TraceRecord::Edge(edge) => Some(edge),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Add one process target per member to each group signal, and resolve the
@@ -1921,9 +2399,12 @@ mod tests {
 
     struct Groups;
 
+    /// Processes 3 and 4 form group 3.
     impl ProcessGroups for Groups {
         fn group_of(&self, pid: DetPid) -> Option<DetPid> {
-            (pid == DetPid::from_raw(3)).then_some(DetPid::from_raw(3))
+            [3, 4]
+                .contains(&pid.as_raw())
+                .then_some(DetPid::from_raw(3))
         }
         fn members(&self, group: DetPid) -> Vec<DetPid> {
             if group == DetPid::from_raw(3) {
@@ -2257,11 +2738,11 @@ mod tests {
                 AccessTraceWriter::new(Box::new(file_contents.clone()), 0, max, None).unwrap();
             for n in 0..3 {
                 let getpid = || entry(Sysno::getpid, n + 1);
-                writer.observe(2 * n, &prehook(3, Sysno::getpid), getpid(), &Groups);
+                writer.observe(2 * n, &prehook(3, Sysno::getpid), Some(getpid()), &Groups);
                 writer.observe(
                     2 * n + 1,
                     &posthook(3, Sysno::getpid),
-                    exit(3, vec![]),
+                    Some(exit(3, vec![])),
                     &Groups,
                 );
             }
@@ -2339,20 +2820,20 @@ mod tests {
         writer.observe(
             0,
             &prehook(3, Sysno::socketpair),
-            entry(Sysno::socketpair, 1),
+            Some(entry(Sysno::socketpair, 1)),
             &Groups,
         );
         writer.observe(
             1,
             &posthook(3, Sysno::socketpair),
-            exit(0, vec![open(3, file(3, 1)), open(4, file(3, 2))]),
+            Some(exit(0, vec![open(3, file(3, 1)), open(4, file(3, 2))])),
             &Groups,
         );
         // A write on the second end gets the pair's identity.
         writer.observe(
             2,
             &prehook(5, Sysno::write),
-            entry(Sysno::write, 1),
+            Some(entry(Sysno::write, 1)),
             &Groups,
         );
         let send = Access::Channel {
@@ -2361,12 +2842,17 @@ mod tests {
             channel: ChannelKind::Socket,
             op: ChannelOp::Write,
         };
-        writer.observe(3, &posthook(5, Sysno::write), exit(1, vec![send]), &Groups);
+        writer.observe(
+            3,
+            &posthook(5, Sysno::write),
+            Some(exit(1, vec![send])),
+            &Groups,
+        );
         // A call that never returns.
         writer.observe(
             4,
             &prehook(3, Sysno::exit_group),
-            entry(Sysno::exit_group, 2),
+            Some(entry(Sysno::exit_group, 2)),
             &Groups,
         );
         writer.finish(5).unwrap();
@@ -2399,6 +2885,553 @@ mod tests {
                 op: LifetimeOp::Exit
             }],
             "a call that never returns keeps what its prehook knew"
+        );
+    }
+
+    fn at(t: i32, event: EventIndex) -> EventRef {
+        EventRef { tid: tid(t), event }
+    }
+
+    fn entry_with(sysno: Sysno, pid: i32, args: [u64; 6]) -> Option<AccessPayload> {
+        Some(AccessPayload::SyscallEntry(SyscallEntry {
+            pid: DetPid::from_raw(pid),
+            nth: 1,
+            sysno,
+            args,
+            accesses: Vec::new(),
+        }))
+    }
+
+    #[test]
+    fn a_clone_starts_its_child_whichever_runs_first() {
+        for child_first in [true, false] {
+            let (mut writer, bytes) = in_memory_writer();
+            writer.observe(
+                10,
+                &prehook(3, Sysno::clone),
+                entry_with(Sysno::clone, 3, [0; 6]),
+                &Groups,
+            );
+            let (child_event, parent_post) = if child_first { (11, 12) } else { (12, 11) };
+            let child = SchedEvent::branches(tid(8), 1);
+            let parent = posthook(3, Sysno::clone);
+            if child_first {
+                writer.observe(child_event, &child, None, &Groups);
+                writer.observe(parent_post, &parent, Some(exit(8, vec![])), &Groups);
+            } else {
+                writer.observe(parent_post, &parent, Some(exit(8, vec![])), &Groups);
+                writer.observe(child_event, &child, None, &Groups);
+            }
+            writer.finish(13).unwrap();
+            assert_eq!(
+                edges_of(&bytes),
+                vec![EdgeRecord {
+                    kind: EdgeKind::Create,
+                    from: at(3, 10),
+                    to: at(8, child_event),
+                    object: SyncObject::Thread(tid(8)),
+                }],
+                "child first: {child_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exit_wake_ends_at_the_joiners_wait_return() {
+        let (mut writer, bytes) = in_memory_writer();
+        let futex = FutexID::private(mm(), 0x5000);
+        writer.observe(
+            4,
+            &prehook(5, Sysno::futex),
+            entry_with(Sysno::futex, 3, [0; 6]),
+            &Groups,
+        );
+        writer.observe(
+            6,
+            &prehook(8, Sysno::exit),
+            entry_with(Sysno::exit, 3, [0; 6]),
+            &Groups,
+        );
+        writer.note_wake(EdgeKind::ExitJoin, tid(8), tid(5), SyncObject::Futex(futex));
+        writer.observe(
+            9,
+            &posthook(5, Sysno::futex),
+            Some(exit(0, vec![])),
+            &Groups,
+        );
+        writer.finish(10).unwrap();
+        assert_eq!(
+            edges_of(&bytes),
+            vec![EdgeRecord {
+                kind: EdgeKind::ExitJoin,
+                from: at(8, 6),
+                to: at(5, 9),
+                object: SyncObject::Futex(futex),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_reaped_childs_exit_orders_the_wait() {
+        let (mut writer, bytes) = in_memory_writer();
+        writer.observe(
+            2,
+            &prehook(9, Sysno::exit_group),
+            entry_with(Sysno::exit_group, 9, [0; 6]),
+            &Groups,
+        );
+        writer.observe(
+            3,
+            &prehook(3, Sysno::wait4),
+            entry_with(Sysno::wait4, 3, [9, 0, 0, 0, 0, 0]),
+            &Groups,
+        );
+        let reaped = vec![Access::Lifetime {
+            target: Task::Process(DetPid::from_raw(9)),
+            op: LifetimeOp::Wait,
+        }];
+        writer.observe(
+            7,
+            &posthook(3, Sysno::wait4),
+            Some(exit(9, reaped)),
+            &Groups,
+        );
+        writer.finish(8).unwrap();
+        assert_eq!(
+            edges_of(&bytes),
+            vec![EdgeRecord {
+                kind: EdgeKind::ChildExit,
+                from: at(9, 2),
+                to: at(3, 7),
+                object: SyncObject::Process(DetPid::from_raw(9)),
+            }]
+        );
+    }
+
+    /// Deliveries of `signo` to `tid`, with siginfo naming `code` and
+    /// `union` (si_pid for a send, si_tid for a timer).
+    fn delivered(signo: i32, code: i32, union: i32) -> Option<AccessPayload> {
+        let mut info = [0u8; 128];
+        info[8..12].copy_from_slice(&code.to_ne_bytes());
+        info[16..20].copy_from_slice(&union.to_ne_bytes());
+        Some(AccessPayload::Signal(signal_note(
+            signo,
+            Some(&info),
+            ObservedSignalDisposition::Handler,
+        )))
+    }
+
+    fn received(t: i32, signo: i32) -> SchedEvent {
+        SchedEvent {
+            op: Op::SignalReceived(crate::types::SigWrapper(signo)),
+            ..SchedEvent::branches(tid(t), 1)
+        }
+    }
+
+    /// A syscall `sysno` of thread 3 (process 3) with `args`, from its
+    /// prehook at `pre` to its posthook at `pre + 1` with `result` and
+    /// `accesses`.
+    fn call(
+        writer: &mut AccessTraceWriter,
+        pre: EventIndex,
+        sysno: Sysno,
+        args: [u64; 6],
+        result: i64,
+        accesses: Vec<Access>,
+    ) {
+        writer.observe(pre, &prehook(3, sysno), entry_with(sysno, 3, args), &Groups);
+        writer.observe(
+            pre + 1,
+            &posthook(3, sysno),
+            Some(exit(result, accesses)),
+            &Groups,
+        );
+    }
+
+    /// Thread 4 of process 4 makes a syscall, so the writer knows its
+    /// process.
+    fn thread_4_runs(writer: &mut AccessTraceWriter, index: EventIndex) {
+        writer.observe(
+            index,
+            &prehook(4, Sysno::getpid),
+            entry_with(Sysno::getpid, 4, [0; 6]),
+            &Groups,
+        );
+    }
+
+    fn signal_edges(bytes: &Mutex<Vec<u8>>) -> Vec<(EventRef, EventRef)> {
+        edges_of(bytes)
+            .into_iter()
+            .filter(|edge| edge.kind == EdgeKind::Signal)
+            .map(|edge| (edge.from, edge.to))
+            .collect()
+    }
+
+    /// A send that fails delivers nothing; a delivery after a successful
+    /// one takes it. The record names the sending thread only where a
+    /// send matched.
+    #[test]
+    fn a_failed_send_orders_no_delivery() {
+        let usr1 = libc::SIGUSR1;
+        let kill = [4, usr1 as u64, 0, 0, 0, 0];
+        let (mut writer, bytes) = in_memory_writer();
+        thread_4_runs(&mut writer, 1);
+        call(
+            &mut writer,
+            2,
+            Sysno::kill,
+            kill,
+            -(libc::EPERM as i64),
+            vec![],
+        );
+        writer.observe(
+            4,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        call(&mut writer, 5, Sysno::kill, kill, 0, vec![]);
+        writer.observe(
+            7,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.finish(8).unwrap();
+        assert_eq!(signal_edges(&bytes), vec![(at(3, 5), at(4, 7))]);
+        let senders: Vec<Option<DetTid>> = read_access_trace(&bytes.lock().unwrap()[..])
+            .unwrap()
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::Signal(signal) => Some(signal.sender.and_then(|s| s.tid)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(senders, vec![None, Some(tid(3))]);
+    }
+
+    /// Two sends of a standard signal from one sender, then two
+    /// deliveries: on ptrace the first delivery can be dequeued before the
+    /// second send queues another, so each delivery takes the earliest
+    /// send left, and neither edge claims the later send for the first.
+    #[test]
+    fn two_sends_from_one_sender_order_two_deliveries_in_send_order() {
+        let usr1 = libc::SIGUSR1;
+        let kill = [4, usr1 as u64, 0, 0, 0, 0];
+        let (mut writer, bytes) = in_memory_writer();
+        thread_4_runs(&mut writer, 1);
+        call(&mut writer, 2, Sysno::kill, kill, 0, vec![]);
+        call(&mut writer, 5, Sysno::kill, kill, 0, vec![]);
+        writer.observe(
+            8,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.observe(
+            9,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.finish(10).unwrap();
+        assert_eq!(
+            signal_edges(&bytes),
+            vec![(at(3, 2), at(4, 8)), (at(3, 5), at(4, 9))]
+        );
+    }
+
+    /// Two threads of one process send: the first thread's kill may run
+    /// after the second's (a `--happens-before` checkpoint between its
+    /// prehook and its kill), so while its posthook is not before the
+    /// second's prehook, the first delivery is used up without an edge.
+    /// The next takes the second send.
+    #[test]
+    fn overlapping_sends_from_two_threads_order_nothing() {
+        let usr1 = libc::SIGUSR1;
+        let kill = [4, usr1 as u64, 0, 0, 0, 0];
+        let (mut writer, bytes) = in_memory_writer();
+        thread_4_runs(&mut writer, 1);
+        writer.observe(
+            2,
+            &prehook(3, Sysno::kill),
+            entry_with(Sysno::kill, 3, kill),
+            &Groups,
+        );
+        writer.observe(
+            3,
+            &prehook(5, Sysno::kill),
+            entry_with(Sysno::kill, 3, kill),
+            &Groups,
+        );
+        writer.observe(4, &posthook(5, Sysno::kill), Some(exit(0, vec![])), &Groups);
+        writer.observe(
+            5,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.observe(6, &posthook(3, Sysno::kill), Some(exit(0, vec![])), &Groups);
+        writer.observe(
+            7,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.finish(8).unwrap();
+        assert_eq!(signal_edges(&bytes), vec![(at(5, 3), at(4, 7))]);
+    }
+
+    /// A send to the process and one to the thread queue separately (the
+    /// shared and the private pending sets), so the thread gets two
+    /// deliveries, one for each send.
+    #[test]
+    fn a_process_send_and_a_thread_send_each_order_one_delivery() {
+        let usr1 = libc::SIGUSR1;
+        let (mut writer, bytes) = in_memory_writer();
+        thread_4_runs(&mut writer, 1);
+        call(
+            &mut writer,
+            2,
+            Sysno::kill,
+            [4, usr1 as u64, 0, 0, 0, 0],
+            0,
+            vec![],
+        );
+        call(
+            &mut writer,
+            4,
+            Sysno::tgkill,
+            [4, 4, usr1 as u64, 0, 0, 0],
+            0,
+            vec![],
+        );
+        writer.observe(
+            6,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_TKILL, 3),
+            &Groups,
+        );
+        writer.observe(
+            7,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.finish(8).unwrap();
+        assert_eq!(
+            signal_edges(&bytes),
+            vec![(at(3, 2), at(4, 6)), (at(3, 4), at(4, 7))]
+        );
+    }
+
+    /// Realtime signals queue: each delivery takes the earliest send left.
+    #[test]
+    fn realtime_signal_deliveries_take_their_sends_in_order() {
+        let rt = 34; // SIGRTMIN + 2
+        let send = [4, rt as u64, 0, 0, 0, 0];
+        let (mut writer, bytes) = in_memory_writer();
+        thread_4_runs(&mut writer, 1);
+        call(&mut writer, 2, Sysno::kill, send, 0, vec![]);
+        call(&mut writer, 4, Sysno::kill, send, 0, vec![]);
+        writer.observe(
+            6,
+            &received(4, rt),
+            delivered(rt, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.observe(
+            7,
+            &received(4, rt),
+            delivered(rt, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.observe(
+            8,
+            &received(4, rt),
+            delivered(rt, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.finish(9).unwrap();
+        assert_eq!(
+            signal_edges(&bytes),
+            vec![(at(3, 2), at(4, 6)), (at(3, 4), at(4, 7))]
+        );
+    }
+
+    /// A timer's expiry takes its oldest live arm. The oldest arm retires
+    /// once an expiry recorded after a newer arm's posthook has matched it;
+    /// an expiry between the re-arm's prehook and posthook keeps it. After
+    /// timer_delete one more expiry, dequeued before the delete, can still
+    /// match, and then nothing does.
+    #[test]
+    fn a_timer_expiry_takes_its_oldest_live_arm() {
+        let usr2 = libc::SIGUSR2;
+        let arm = [0, 0, 0x3000, 0, 0, 0];
+        let expiry = || delivered(usr2, libc::SI_TIMER, 0);
+        let (mut writer, bytes) = in_memory_writer();
+        call(&mut writer, 2, Sysno::timer_settime, arm, 0, vec![]);
+        writer.observe(
+            4,
+            &prehook(3, Sysno::timer_settime),
+            entry_with(Sysno::timer_settime, 3, arm),
+            &Groups,
+        );
+        writer.observe(5, &received(3, usr2), expiry(), &Groups);
+        writer.observe(
+            6,
+            &posthook(3, Sysno::timer_settime),
+            Some(exit(0, vec![])),
+            &Groups,
+        );
+        writer.observe(7, &received(3, usr2), expiry(), &Groups);
+        writer.observe(8, &received(3, usr2), expiry(), &Groups);
+        call(&mut writer, 9, Sysno::timer_delete, [0; 6], 0, vec![]);
+        writer.observe(11, &received(3, usr2), expiry(), &Groups);
+        assert!(
+            writer.edges.signals.is_empty(),
+            "{:?}",
+            writer.edges.signals
+        );
+        writer.observe(12, &received(3, usr2), expiry(), &Groups);
+        writer.finish(13).unwrap();
+        assert_eq!(
+            signal_edges(&bytes),
+            vec![
+                (at(3, 2), at(3, 5)),
+                (at(3, 2), at(3, 7)),
+                (at(3, 4), at(3, 8)),
+                (at(3, 4), at(3, 11)),
+            ]
+        );
+    }
+
+    /// Past the cap a send goes before a live timer's arm, which can cause
+    /// expiries for the rest of the run.
+    #[test]
+    fn the_cap_evicts_sends_before_a_live_timers_arm() {
+        let (mut writer, _) = in_memory_writer();
+        call(
+            &mut writer,
+            0,
+            Sysno::timer_settime,
+            [0, 0, 0x3000, 0, 0, 0],
+            0,
+            vec![],
+        );
+        for n in 1..=MAX_PENDING_SIGNALS as u64 {
+            call(
+                &mut writer,
+                2 * n,
+                Sysno::kill,
+                [4, 34, 0, 0, 0, 0],
+                0,
+                vec![],
+            );
+        }
+        let signals = &writer.edges.signals;
+        assert_eq!(signals.len(), MAX_PENDING_SIGNALS);
+        assert_eq!(signals[0].timer, Some(0), "the arm stayed");
+        assert_eq!(signals[1].from, at(3, 4), "the oldest send went");
+    }
+
+    /// A signal to the caller's own group reaches each member listed at its
+    /// posthook once, and is used up after the last one.
+    #[test]
+    fn a_group_send_reaches_each_member_once() {
+        let usr1 = libc::SIGUSR1;
+        let (mut writer, bytes) = in_memory_writer();
+        thread_4_runs(&mut writer, 1);
+        let group = vec![Access::Lifetime {
+            target: Task::ProcessGroup(OWN_PROCESS_GROUP),
+            op: LifetimeOp::Signal { signo: usr1 },
+        }];
+        call(
+            &mut writer,
+            2,
+            Sysno::kill,
+            [0, usr1 as u64, 0, 0, 0, 0],
+            0,
+            group,
+        );
+        assert_eq!(
+            writer.edges.signals[0].members,
+            Some(vec![DetPid::from_raw(3), DetPid::from_raw(4)])
+        );
+        writer.observe(
+            4,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.observe(
+            5,
+            &received(3, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        assert!(
+            writer.edges.signals.is_empty(),
+            "{:?}",
+            writer.edges.signals
+        );
+        writer.observe(
+            6,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.finish(7).unwrap();
+        assert_eq!(
+            signal_edges(&bytes),
+            vec![(at(3, 2), at(4, 4)), (at(3, 2), at(3, 5))]
+        );
+    }
+
+    /// Reaping a member takes it out of a group send still waiting for it,
+    /// and drops the sends to it.
+    #[test]
+    fn reaping_forgets_the_sends_waiting_for_the_child() {
+        let usr1 = libc::SIGUSR1;
+        let (mut writer, _) = in_memory_writer();
+        thread_4_runs(&mut writer, 1);
+        let group = vec![Access::Lifetime {
+            target: Task::ProcessGroup(OWN_PROCESS_GROUP),
+            op: LifetimeOp::Signal { signo: usr1 },
+        }];
+        call(
+            &mut writer,
+            2,
+            Sysno::kill,
+            [0, usr1 as u64, 0, 0, 0, 0],
+            0,
+            group,
+        );
+        call(
+            &mut writer,
+            4,
+            Sysno::kill,
+            [4, usr1 as u64, 0, 0, 0, 0],
+            0,
+            vec![],
+        );
+        writer.observe(
+            6,
+            &received(3, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        assert_eq!(writer.edges.signals.len(), 2, "a's send waits for 4");
+        let reaped = vec![Access::Lifetime {
+            target: Task::Process(DetPid::from_raw(4)),
+            op: LifetimeOp::Wait,
+        }];
+        call(&mut writer, 7, Sysno::wait4, [4, 0, 0, 0, 0, 0], 4, reaped);
+        assert!(
+            writer.edges.signals.is_empty(),
+            "{:?}",
+            writer.edges.signals
         );
     }
 }
