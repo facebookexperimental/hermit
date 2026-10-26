@@ -937,6 +937,19 @@ pub(crate) fn summarize_output<E>(
     })
 }
 
+/// Whether `sysno` creates a thread or process and returns its tid: clone,
+/// clone3, and x86_64's legacy fork and vfork. aarch64's generic table
+/// (include/uapi/asm-generic/unistd.h) has no fork or vfork; its C library
+/// calls clone with SIGCHLD (and CLONE_VM | CLONE_VFORK) instead.
+fn creates_a_task(sysno: Sysno) -> bool {
+    match sysno {
+        Sysno::clone | Sysno::clone3 => true,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::fork | Sysno::vfork => true,
+        _ => false,
+    }
+}
+
 /// Whether `sysno` returns two connected descriptors: pipe2, socketpair,
 /// and x86_64's legacy pipe.
 fn creates_a_channel_pair(sysno: Sysno) -> bool {
@@ -1255,7 +1268,7 @@ impl AccessTraceWriter {
             event: record.pre,
         };
         match record.sysno {
-            Sysno::clone | Sysno::clone3 | Sysno::fork | Sysno::vfork if result > 0 => {
+            sysno if creates_a_task(sysno) && result > 0 => {
                 let child = DetTid::from_raw(result as i32);
                 let edge = PendingEdge {
                     kind: EdgeKind::Create,
