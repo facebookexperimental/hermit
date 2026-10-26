@@ -654,7 +654,7 @@ async fn backend_failure_cleanup_does_not_build_an_invalid_run_summary() {
         let mut sched = state.sched.lock().unwrap();
         let writer = sched.preemption_writer.as_mut().unwrap();
         writer.register_thread(tid, DEFAULT_PRIORITY);
-        writer.insert_reprioritization(tid, time, 23, DEFAULT_PRIORITY, DEFAULT_PRIORITY + 1);
+        writer.insert_reprioritization(tid, time, 23, DEFAULT_PRIORITY, DEFAULT_PRIORITY + 1, None);
     }
     assert!(!recording.exists());
     state.report_backend_failure(failure(tid));

@@ -53,6 +53,7 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ChaosEpochTransition;
 use crate::resources::Device;
 use crate::resources::ExternalOpId;
+use crate::resources::InstructionOffset;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -7052,6 +7053,27 @@ pub struct ThreadState<T> {
     /// other the recording stopped, and its RIP is checked.
     #[serde(default)]
     pub replayed_stopless_end: Option<u64>,
+    /// Where `last_rcb_timer` was armed when it was armed past its branch
+    /// target (`--chaos-instruction-offset`): it may then retire up to that
+    /// many more conditional branches than `last_rcb_timer` says, one per
+    /// step.
+    #[serde(default)]
+    pub armed_instruction_offset: Option<InstructionOffset>,
+
+    /// The steps past its branch target this chaos timeslice's timer is armed
+    /// for (`--chaos-instruction-offset`), `0` for none.
+    #[serde(default)]
+    pub slice_instruction_offset: u64,
+
+    /// Where the recorded timeslice being replayed had its timer armed, if
+    /// `--chaos-instruction-offset` delivered it past its branch target.
+    #[serde(default)]
+    pub replay_instruction_offset: Option<InstructionOffset>,
+
+    /// How many instruction offsets this thread has drawn: the position of
+    /// its next draw in its own stream (`chaos_instruction_offset_draw`).
+    #[serde(default)]
+    pub chaos_instruction_offset_draws: u64,
 
     /// Are we past the global moment when the guest's first execve of its root binary completes
     /// (with a successful exit code).
@@ -7217,6 +7239,28 @@ pub(crate) fn chaos_per_thread_slowdown_factor(
     let u: f64 = prng.random::<f64>();
     let exponent = 2.0 * u - 1.0;
     RcbTimeMultiplier::from_f64(max_factor.powf(exponent))
+}
+
+/// The `draw`-th instruction offset of thread `dettid` under
+/// `--chaos-instruction-offset=max`: uniform in `0..=max`.
+///
+/// A pure function of `(sched_seed, dettid, draw)`, in a stream of its own,
+/// as `chaos_per_thread_slowdown_factor` is: drawing it takes nothing from the
+/// thread's `chaos_prng`, so every timeslice length and priority a seed draws
+/// is the same with the option on as with it off.
+pub(crate) fn chaos_instruction_offset_draw(
+    sched_seed: u64,
+    dettid: DetTid,
+    draw: u64,
+    max: u64,
+) -> u64 {
+    const OFFSET_SALT: u64 = 0x6f66_6673_6574_7321; // "offsets!"
+    const DRAW_GOLDEN: u64 = 0xbf58_476d_1ce4_e5b9;
+    let mixed = sched_seed
+        ^ OFFSET_SALT
+        ^ ((dettid.as_raw() as u32 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        ^ draw.wrapping_mul(DRAW_GOLDEN);
+    Pcg64Mcg::seed_from_u64(mixed).random_range(0..=max)
 }
 
 impl<T> ThreadState<T> {
@@ -7921,6 +7965,10 @@ impl<T> ThreadState<T> {
             lone_slice_end_at_check_in: false,
             lone_replay_unsound: false,
             replayed_stopless_end: None,
+            armed_instruction_offset: None,
+            slice_instruction_offset: 0,
+            replay_instruction_offset: None,
+            chaos_instruction_offset_draws: 0,
             record_or_replay,
             preemption_points: None,
             past_global_first_execve: false,
@@ -8483,6 +8531,7 @@ impl<T> ThreadState<T> {
             priority_row: None,
             slice_expired: false,
             zero_length_sleep: false,
+            instruction_offset: None,
         }
     }
 
@@ -9736,6 +9785,8 @@ impl<T> ThreadState<T> {
 
             let mut result = None;
             self.replay_rcb_end = None;
+            self.slice_instruction_offset = 0;
+            self.replay_instruction_offset = None;
             let replay_controls_deadline =
                 self.preemption_points.is_some() || self.follows_replayed_schedule(cfg);
 
@@ -9773,9 +9824,9 @@ impl<T> ThreadState<T> {
                         }
                         next
                     } else {
-                        thi.next_with_rcbs()
+                        thi.next_with_offset()
                     };
-                    if let Some((end_time, prio, replay_rcb_end)) = next {
+                    if let Some((end_time, prio, replay_rcb_end, offset)) = next {
                         debug!(
                             "[dtid {}] next timeslice (T{}), set by recording to {:?} (current {}), priority {}",
                             self.dettid,
@@ -9818,6 +9869,10 @@ impl<T> ThreadState<T> {
                         }
                         self.end_of_timeslice = Some(end_time);
                         self.replay_rcb_end = replay_rcb_end;
+                        // An offset is only meaningful against the exact RCB
+                        // end it was recorded with.
+                        self.replay_instruction_offset =
+                            offset.filter(|_| replay_rcb_end.is_some());
                         result = Some(prio);
                     } else {
                         let max = LogicalTime::MAX;
@@ -9919,6 +9974,21 @@ impl<T> ThreadState<T> {
                     // Add one to prevent generating a zero time slice:
                     let rcbs = 1 + exp.sample(&mut self.chaos_prng) as u64;
                     detlog!("[dtid {}] CHAOSRAND => next_rcbs = {}", self.dettid, rcbs);
+                    if cfg.chaos_instruction_offset > 0 {
+                        let offset = chaos_instruction_offset_draw(
+                            cfg.sched_seed(),
+                            self.dettid,
+                            self.chaos_instruction_offset_draws,
+                            cfg.chaos_instruction_offset,
+                        );
+                        self.chaos_instruction_offset_draws += 1;
+                        self.slice_instruction_offset = offset;
+                        detlog!(
+                            "[dtid {}] CHAOSRAND => instruction_offset = {}",
+                            self.dettid,
+                            offset
+                        );
+                    }
                     rcbs
                 } else {
                     target_timeout_rcbs as u64
@@ -9989,6 +10059,7 @@ impl<T> ThreadState<T> {
 
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
+            self.armed_instruction_offset = None;
             self.reset_timeslice_stats(current_ns);
             result
         } else {
@@ -9997,6 +10068,9 @@ impl<T> ThreadState<T> {
             self.max_timeslice_end = None;
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
+            self.armed_instruction_offset = None;
+            self.slice_instruction_offset = 0;
+            self.replay_instruction_offset = None;
             None
         }
     }
@@ -10031,6 +10105,15 @@ impl<T> ThreadState<T> {
     }
 }
 
+/// A recorded slice as `ThreadHistoryIterator::next_with_offset` yields it: its end, priority, RCB
+/// target and where its timer was armed past that target.
+type RecordedSlice = (
+    LogicalTime,
+    Priority,
+    Option<u64>,
+    Option<InstructionOffset>,
+);
+
 /// The first recorded slice of an edited record (`--replay-edited-preemptions`)
 /// still ahead of a thread at logical time `now` and committed PMU count
 /// `rcbs`, and how many recorded slices before it were skipped.
@@ -10050,16 +10133,16 @@ fn next_edited_slice(
     now: LogicalTime,
     rcbs: u64,
     margin: Duration,
-) -> (Option<(LogicalTime, Priority, Option<u64>)>, usize) {
+) -> (Option<RecordedSlice>, usize) {
     let mut skipped = 0;
     loop {
-        match history.next_with_rcbs() {
+        match history.next_with_offset() {
             None => return (None, skipped),
-            Some((end, prio, Some(target))) if target >= rcbs => {
-                return (Some((end, prio, Some(target))), skipped);
+            Some((end, prio, Some(target), offset)) if target >= rcbs => {
+                return (Some((end, prio, Some(target), offset)), skipped);
             }
-            Some((end, prio, _)) if end >= now + margin => {
-                return (Some((end, prio, None)), skipped);
+            Some((end, prio, _, offset)) if end >= now + margin => {
+                return (Some((end, prio, None, offset)), skipped);
             }
             Some(_) => skipped += 1,
         }
@@ -11764,6 +11847,130 @@ mod timeslice_tests {
         state.next_timeslice(&config);
         assert_eq!(state.replay_rcb_end, Some(4));
         assert!(state.timeslice_expired());
+    }
+
+    /// `--chaos-instruction-offset=N` draws each timeslice's offset uniformly
+    /// from `0..=N`, as a pure function of the seed, the thread and the draw.
+    #[test]
+    fn an_instruction_offset_draw_is_seeded_bounded_and_per_thread() {
+        let (three, four) = (DetTid::from_raw(3), DetTid::from_raw(4));
+        let mut seen = [false; 9];
+        for draw in 0..200 {
+            let k = chaos_instruction_offset_draw(7, three, draw, 8);
+            assert_eq!(k, chaos_instruction_offset_draw(7, three, draw, 8));
+            seen[usize::try_from(k).unwrap()] = true;
+            assert!(chaos_instruction_offset_draw(7, three, draw, 1) <= 1);
+            assert!(chaos_instruction_offset_draw(7, three, draw, 65_536) <= 65_536);
+        }
+        assert!(
+            seen.iter().all(|seen| *seen),
+            "0..=8 not all drawn: {seen:?}"
+        );
+        let stream = |seed, tid| -> Vec<u64> {
+            (0..32)
+                .map(|draw| chaos_instruction_offset_draw(seed, tid, draw, 1_000))
+                .collect()
+        };
+        assert_ne!(stream(7, three), stream(7, four));
+        assert_ne!(stream(7, three), stream(8, three));
+    }
+
+    /// The offsets come from a stream of their own: a seed draws the same
+    /// timeslice ends with the option as without it, and without it draws no
+    /// offset at all.
+    #[test]
+    fn an_instruction_offset_leaves_the_chaos_draws_alone() {
+        let off = Config {
+            chaos: true,
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let on = Config {
+            chaos_instruction_offset: 8,
+            ..off.clone()
+        };
+        let tid = DetTid::from_raw(3);
+        let mut without = ThreadState::new(tid, &off, ());
+        let mut with = ThreadState::new(tid, &on, ());
+        let mut offsets = Vec::new();
+        for _ in 0..20 {
+            without.next_timeslice(&off);
+            with.next_timeslice(&on);
+            assert_eq!(with.end_of_timeslice, without.end_of_timeslice);
+            assert_eq!(with.max_timeslice_end, without.max_timeslice_end);
+            assert_eq!(without.slice_instruction_offset, 0);
+            assert!(with.slice_instruction_offset <= 8);
+            offsets.push(with.slice_instruction_offset);
+        }
+        assert_eq!(without.chaos_instruction_offset_draws, 0);
+        assert_eq!(with.chaos_instruction_offset_draws, 20);
+        let expected: Vec<u64> = (0..20)
+            .map(|draw| chaos_instruction_offset_draw(off.sched_seed(), tid, draw, 8))
+            .collect();
+        assert_eq!(offsets, expected);
+    }
+
+    /// A new timeslice drops the offset the old timer was armed with (the
+    /// hooks hand it to the change point that ends the slice), and a replayed
+    /// timeslice takes the offset its row recorded, only together with that
+    /// row's exact RCB end.
+    #[test]
+    fn a_timeslice_offset_reaches_its_record_and_its_replay() {
+        let chaos = Config {
+            chaos: true,
+            chaos_instruction_offset: 8,
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &chaos, ());
+        state.next_timeslice(&chaos);
+        let armed = InstructionOffset {
+            rcb_target: 40,
+            instructions: 3,
+        };
+        state.armed_instruction_offset = Some(armed);
+        // A reset that ends no timeslice of its own drops the offset with
+        // the timer, so no later change point can file it.
+        state.next_timeslice(&chaos);
+        assert_eq!(state.armed_instruction_offset, None);
+
+        let replay = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &replay, ());
+        let now = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (now + Duration::from_nanos(70), DEFAULT_PRIORITY),
+                (now + Duration::from_nanos(800), DEFAULT_PRIORITY),
+            ])
+            .with_preemption_rcbs(vec![42, 80])
+            .with_preemption_instruction_offsets(vec![Some(armed), None]);
+        state.preemption_points = Some(history.into_iter());
+        state.next_timeslice(&replay);
+        assert_eq!(state.replay_rcb_end, Some(42));
+        assert_eq!(state.replay_instruction_offset, Some(armed));
+        state.thread_logical_time.add_rcbs(42);
+        state.committed_clock_value = 42;
+        assert!(state.timeslice_expired());
+        state.next_timeslice(&replay);
+        assert_eq!(state.replay_rcb_end, Some(80));
+        assert_eq!(state.replay_instruction_offset, None);
+
+        // A row without an exact RCB end is replayed by logical time, which
+        // an offset cannot refine.
+        let mut state = ThreadState::new(DetPid::from_raw(5), &replay, ());
+        state.preemption_points = Some(
+            ThreadHistory::new()
+                .with_prio_changes(vec![(now + Duration::from_nanos(70), DEFAULT_PRIORITY)])
+                .with_preemption_instruction_offsets(vec![Some(armed)])
+                .into_iter(),
+        );
+        state.next_timeslice(&replay);
+        assert_eq!(state.replay_rcb_end, None);
+        assert_eq!(state.replay_instruction_offset, None);
     }
 
     #[test]

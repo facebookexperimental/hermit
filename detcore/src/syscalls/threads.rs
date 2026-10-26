@@ -5138,7 +5138,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             match sched_yield_route(&self.cfg) {
                 SchedYieldRoute::ChaosReprioritize => {
                     let change_time = guest.thread_state().thread_logical_time.as_nanos();
-                    let request = Self::random_priority_changepoint_request(guest, change_time);
+                    let request =
+                        Self::random_priority_changepoint_request(guest, change_time, None);
                     resource_request(guest, request).await;
                 }
                 SchedYieldRoute::ReplayStrongYield => {

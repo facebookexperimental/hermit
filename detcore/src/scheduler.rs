@@ -18478,7 +18478,14 @@ impl Scheduler {
                 .preemption_writer
                 .as_ref()
                 .map(|writer| writer.reprioritization_count(dettid));
-            let answer = self.perform_priority_changepoint(dettid, priority, *time, *rcbs, epochs);
+            let answer = self.perform_priority_changepoint(
+                dettid,
+                priority,
+                *time,
+                *rcbs,
+                epochs,
+                rs.instruction_offset.as_deref().copied(),
+            );
             // (The expiry's row omission is marked centrally in
             // `perform_priority_changepoint`, for every priority decision
             // a raw schedule replay takes without recording it.)
@@ -18553,14 +18560,31 @@ impl Scheduler {
                 0 => Ok(()),
                 1 => {
                     let (rid, perm) = rs.resources.iter().next().unwrap();
-                    let blocked = self.block_for_one_resource(
-                        dettid,
-                        rid,
-                        perm,
-                        rs.signal_interrupt_errno(),
-                        rs.blocked_signal_mask,
-                        resp,
-                    );
+                    let blocked = match rid {
+                        // The end of a timeslice armed with an instruction
+                        // offset carries it beside the change point
+                        // (`Resources::instruction_offset`).
+                        ResourceID::PriorityChangePoint(prio, change_time, rcbs, epochs)
+                            if rs.instruction_offset.is_some() =>
+                        {
+                            self.perform_priority_changepoint(
+                                dettid,
+                                *prio,
+                                *change_time,
+                                *rcbs,
+                                epochs,
+                                rs.instruction_offset.as_deref().copied(),
+                            )
+                        }
+                        _ => self.block_for_one_resource(
+                            dettid,
+                            rid,
+                            perm,
+                            rs.signal_interrupt_errno(),
+                            rs.blocked_signal_mask,
+                            resp,
+                        ),
+                    };
                     if blocked.is_err() {
                         self.work_span_note_wait(dettid, rs);
                     }
@@ -18893,8 +18917,10 @@ impl Scheduler {
             }
 
             // Thread requests change in priority
+            // A request that carries an instruction offset is taken in
+            // `step4_resource_block`, which sees the whole request.
             ResourceID::PriorityChangePoint(prio, change_time, rcbs, epochs) => {
-                self.perform_priority_changepoint(dettid, *prio, *change_time, *rcbs, epochs)
+                self.perform_priority_changepoint(dettid, *prio, *change_time, *rcbs, epochs, None)
             }
 
             // For now, all other resource types are immediately granted.
@@ -19583,6 +19609,7 @@ impl Scheduler {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1151)
         chaos_epochs: &[crate::resources::ChaosEpochTransition],
+        instruction_offset: Option<crate::resources::InstructionOffset>,
     ) -> Result<(), SkipTurn> {
         assert!(runqueue::is_ordinary_priority(new_priority));
         self.chaos_turns_in_slice.remove(&dettid);
@@ -19671,6 +19698,7 @@ impl Scheduler {
                         guest_rcbs,
                         old_prio,
                         new_priority,
+                        instruction_offset,
                     );
                 }
             }
@@ -40090,7 +40118,8 @@ mod test {
                     DEFAULT_PRIORITY,
                     LogicalTime::from_nanos(1),
                     1,
-                    &[]
+                    &[],
+                    None
                 )
                 .is_err()
         );
@@ -40359,7 +40388,14 @@ mod test {
         );
         assert!(
             scheduler
-                .perform_priority_changepoint(spinner, drawn, LogicalTime::from_nanos(at), at, &[])
+                .perform_priority_changepoint(
+                    spinner,
+                    drawn,
+                    LogicalTime::from_nanos(at),
+                    at,
+                    &[],
+                    None
+                )
                 .is_err()
         );
     }

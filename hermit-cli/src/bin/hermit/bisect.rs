@@ -203,6 +203,7 @@ impl BisectOpts {
             sources.trial_format()?;
             sources.validate_reserved_inputs()?;
         }
+        analyzer.refuse_instruction_offsets(&[("--good", &self.good), ("--bad", &self.bad)])?;
         // Every replay's schedule is written anew, stamped with the replays'
         // guest IDs, so they are resolved before the first.
         analyzer.prepare_trial_guest_ids(&[("--good", &self.good), ("--bad", &self.bad)])?;

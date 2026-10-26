@@ -419,6 +419,7 @@ pub use types::DetTid;
 use types::*;
 pub use util::punch_out_print;
 
+use crate::resources::InstructionOffset;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::scheduler::itimer_coalesce::GuestSigalrmTarget;
@@ -489,8 +490,63 @@ fn report_rcb_overshoot(
     error!("{}", message);
 }
 
-fn rcb_timer_overshot(delta_rcbs: u64, last_timer: u64) -> bool {
-    delta_rcbs > last_timer
+/// Where a replayed timeslice's timer is armed (`post_handler_hook`).
+#[derive(Debug, PartialEq, Eq)]
+enum ReplayTimer {
+    /// At this absolute PMU branch count: the recorded offset's branch
+    /// target, or the recorded end of a timeslice without an offset.
+    Recorded(u64),
+    /// The thread is already at or past this recorded offset's branch
+    /// target (`report_replay_inside_offset`).
+    InsideOffset(InstructionOffset),
+}
+
+fn replay_timer_target(
+    offset: Option<InstructionOffset>,
+    replay_rcb_end: u64,
+    current: u64,
+) -> ReplayTimer {
+    match offset {
+        Some(offset) if offset.rcb_target > current => ReplayTimer::Recorded(offset.rcb_target),
+        Some(offset) => ReplayTimer::InsideOffset(offset),
+        None => ReplayTimer::Recorded(replay_rcb_end),
+    }
+}
+
+/// A replay of a timeslice recorded with an instruction offset found the
+/// thread at `current` PMU branches, at or past the recorded branch target.
+/// Nothing in the original run stopped the thread between that target and
+/// its delivery point, so only a stop whose place host timing decided can
+/// have done so here, and the recorded point can no longer be reached: fail
+/// closed with the retryable skid marker, as a late PMU interrupt does. The
+/// caller then arms the next branch without the offset.
+#[cold]
+fn report_replay_inside_offset(
+    panic_on_rcb_overshoot: bool,
+    offset: InstructionOffset,
+    current: u64,
+) {
+    let message = format!(
+        "{} posthook: replay stopped the thread at PMU RCB {} inside a recorded instruction \
+         offset (+{} steps past RCB {})",
+        reverie::SKID_OVERSHOOT_MARKER,
+        current,
+        offset.instructions,
+        offset.rcb_target
+    );
+    if panic_on_rcb_overshoot {
+        panic!("{}", message);
+    }
+    reverie::record_skid_overshoot();
+    error!("{}", message);
+}
+
+/// Whether the clock passed the point the last timer was armed for:
+/// `last_timer` branches, plus, for a timer armed `instruction_offset` single
+/// steps past its branch target (`--chaos-instruction-offset`), at most one
+/// more branch per step.
+fn rcb_timer_overshot(delta_rcbs: u64, last_timer: u64, instruction_offset: u64) -> bool {
+    delta_rcbs > last_timer.saturating_add(instruction_offset)
 }
 
 /// The branches from `now` to the point the last handler armed the thread's
@@ -559,6 +615,38 @@ where
 
 fn kept_timer_rcbs(committed: u64, armed: u64, now: u64) -> u64 {
     committed.saturating_add(armed).saturating_sub(now).max(1)
+}
+
+/// What `keep_timer_across_dropped_signal` does with a timer the stop
+/// cancelled (`kept_timer_schedule`).
+enum KeptTimer {
+    /// Arm this again: it reaches the point the timer was armed for.
+    Rearm(TimerSchedule),
+    /// The stop came at or past `target`, the branch target of a timer armed
+    /// past it (`--chaos-instruction-offset`): during its single steps, at a
+    /// point no clock value names.
+    InsideOffset { target: u64 },
+}
+
+/// The timer that reaches the point the last handler armed: `armed` branches
+/// past `committed` (`kept_timer_rcbs`), or, for a timer armed past its
+/// branch target, the same target and steps while the clock is short of the
+/// target.
+fn kept_timer_schedule(
+    committed: u64,
+    armed: u64,
+    offset: Option<InstructionOffset>,
+    now: u64,
+) -> KeptTimer {
+    match offset {
+        Some(offset) if now < offset.rcb_target => KeptTimer::Rearm(
+            TimerSchedule::RcbsAndInstructions(offset.rcb_target - now, offset.instructions),
+        ),
+        Some(offset) => KeptTimer::InsideOffset {
+            target: offset.rcb_target,
+        },
+        None => KeptTimer::Rearm(TimerSchedule::Rcbs(kept_timer_rcbs(committed, armed, now))),
+    }
 }
 
 fn choose_rcb_timer(
@@ -1729,8 +1817,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             slice_boundary::callbacks::Callback::PmuTimer
         };
+        // An event armed past its branch target lands after other
+        // instructions; only one at the target follows a branch at once.
+        let precise_branch = guest.thread_state().armed_instruction_offset.is_none();
         let boundary_token = self
-            .pre_handler_hook_observed(guest, true, CheckIn::Event, Some(boundary_entry))
+            .pre_handler_hook_observed(guest, precise_branch, CheckIn::Event, Some(boundary_entry))
             .await;
         if guest.config().no_rcb_time && guest.thread_state().last_rcb_timer_is_max {
             let max_timeslice_end = guest
@@ -1781,6 +1872,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 thread_state.max_timeslice_end = Some(replay_deadline);
                 thread_state.last_rcb_timer = None;
                 thread_state.last_rcb_timer_is_max = false;
+                thread_state.armed_instruction_offset = None;
                 thread_state.stats.reset_timeslice();
             } else if guest.thread_state().own_signal_turn_hold.is_none() {
                 slice_boundary::no_rcb_maximum(guest.thread_state_mut())
@@ -1950,8 +2042,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             thread_state.committed_clock_value = clock_value;
 
             if thread_state.end_of_timeslice.is_some() {
+                let instruction_offset = thread_state
+                    .armed_instruction_offset
+                    .map_or(0, |offset| offset.instructions);
                 if let Some(last_timer) = thread_state.last_rcb_timer
-                    && rcb_timer_overshot(delta_rcbs, last_timer)
+                    && rcb_timer_overshot(delta_rcbs, last_timer, instruction_offset)
                     && precise_timers
                 {
                     report_rcb_overshoot(
@@ -2735,11 +2830,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             return;
         };
         let thread_state_committed = thread_state.committed_clock_value;
+        let armed_offset = thread_state.armed_instruction_offset;
         // The stop cancelled the event: an unreadable clock leaves the thread
         // unpreempted, so it fails closed, as every handler's clock read does.
         let now = guest.read_clock().expect("Couldn't read clock");
         assert!(thread_state_committed <= now);
-        let schedule = TimerSchedule::Rcbs(kept_timer_rcbs(thread_state_committed, armed, now));
+        let schedule = match kept_timer_schedule(thread_state_committed, armed, armed_offset, now) {
+            KeptTimer::Rearm(schedule) => schedule,
+            // The host-timed stop came during the steps toward the delivery
+            // point, and how many had run is not known here, so the event
+            // cannot be placed where the guest alone decides. Fail closed
+            // with the retryable marker, as a late PMU interrupt does.
+            KeptTimer::InsideOffset { target } => {
+                report_rcb_overshoot(
+                    self.cfg.panic_on_rcb_overshoot,
+                    now,
+                    now - thread_state_committed,
+                    target - thread_state_committed,
+                );
+                TimerSchedule::Rcbs(1)
+            }
+        };
         let armed = if guest.config().imprecise_timers {
             guest.set_timer(schedule)
         } else {
@@ -3399,11 +3510,33 @@ impl<T: RecordOrReplay> Detcore<T> {
                     endpoint
                 ));
             }
+            let mut replay_offset = guest.thread_state().replay_instruction_offset;
             let (ns_remaining, max_rcbs_remaining) = if let Some(replay_rcb_end) = replay_rcb_end {
+                // A timeslice recorded past its branch target is armed exactly
+                // as it was recorded: its end can lie up to one branch per step
+                // beyond that target. Decided before the deadline check below,
+                // because the recorded end of an offset within straight-line
+                // code is the target itself, which a replay stopped inside the
+                // offset has reached.
+                let target =
+                    match replay_timer_target(replay_offset, replay_rcb_end, current_pmu_rcbs) {
+                        ReplayTimer::Recorded(target) => target,
+                        ReplayTimer::InsideOffset(offset) => {
+                            report_replay_inside_offset(
+                                self.cfg.panic_on_rcb_overshoot,
+                                offset,
+                                current_pmu_rcbs,
+                            );
+                            replay_offset = None;
+                            // Nothing recorded is left to arm: the slice ends
+                            // at the next branch, in a run already marked.
+                            current_pmu_rcbs + 1
+                        }
+                    };
                 assert!(
-                    replay_rcb_end > current_pmu_rcbs,
+                    target > current_pmu_rcbs,
                     "recorded PMU RCB deadline {} is not ahead of current {}",
-                    replay_rcb_end,
+                    target,
                     current_pmu_rcbs
                 );
                 let logical_remaining = if max_timeslice_end > current_time {
@@ -3411,7 +3544,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     LogicalTime::ZERO
                 };
-                (logical_remaining, replay_rcb_end - current_pmu_rcbs)
+                (logical_remaining, target - current_pmu_rcbs)
             } else {
                 let logical_remaining = max_timeslice_end - current_time;
                 (
@@ -3460,9 +3593,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                     rcbs_remaining,
                     guest.thread_state().thread_logical_time.rcbs()
                 );
+                // The timeslice's own end may be armed past its branch
+                // target (`--chaos-instruction-offset`); a manual interrupt
+                // never is.
+                let armed_offset = if !timer_is_max {
+                    None
+                } else if replay_rcb_end.is_some() {
+                    replay_offset
+                } else {
+                    let instructions = guest.thread_state().slice_instruction_offset;
+                    (instructions > 0).then_some(InstructionOffset {
+                        rcb_target: current_pmu_rcbs + rcbs_remaining,
+                        instructions,
+                    })
+                };
                 let replaying = guest.thread_state().replaying_lone_slice_end.is_some();
                 let end = current_pmu_rcbs + rcbs_remaining;
-                if replaying || self.skips_lone_slice_end(guest, timer_is_max, end) {
+                // A slice end armed past its branch target is never taken
+                // without a stop (`Config::slice_ends_need_a_stop`): the
+                // offset's steps run from that stop.
+                if armed_offset.is_none()
+                    && (replaying || self.skips_lone_slice_end(guest, timer_is_max, end))
+                {
                     // No stop at this slice end: the thread's next entry into
                     // Detcore processes it at this branch count. While a
                     // skipped end is processed, the next one is only noted;
@@ -3471,6 +3623,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     thread_state.lone_slice_end = Some(end);
                     thread_state.last_rcb_timer = None;
                     thread_state.last_rcb_timer_is_max = false;
+                    thread_state.armed_instruction_offset = None;
                     if !replaying {
                         arm_lone_backstop(guest, rcbs_remaining);
                     }
@@ -3480,6 +3633,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         thread_state.lone_slice_end = None;
                         thread_state.last_rcb_timer = Some(rcbs_remaining);
                         thread_state.last_rcb_timer_is_max = timer_is_max;
+                        thread_state.armed_instruction_offset = armed_offset;
                     }
 
                     if guest.config().imprecise_timers {
@@ -3487,19 +3641,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
                             .expect("Failed to set timer");
                     } else {
+                        let schedule = match armed_offset {
+                            Some(offset) => TimerSchedule::RcbsAndInstructions(
+                                rcbs_remaining,
+                                offset.instructions,
+                            ),
+                            None => TimerSchedule::Rcbs(rcbs_remaining),
+                        };
                         guest
-                            .set_timer_precise(TimerSchedule::Rcbs(rcbs_remaining))
+                            .set_timer_precise(schedule)
                             .expect("Failed to set timer");
                     }
                 }
             } else {
                 guest.thread_state_mut().last_rcb_timer = None;
                 guest.thread_state_mut().last_rcb_timer_is_max = false;
+                guest.thread_state_mut().armed_instruction_offset = None;
             }
         } else {
             assert!(guest.config().max_timeslice.is_none());
             guest.thread_state_mut().last_rcb_timer = None;
             guest.thread_state_mut().last_rcb_timer_is_max = false;
+            guest.thread_state_mut().armed_instruction_offset = None;
         }
 
         if guest.thread_state().replaying_lone_slice_end.is_some() {
@@ -3585,6 +3748,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 None
             };
+            // Where the timer of the timeslice this ends was armed, for one
+            // armed with `--chaos-instruction-offset`: taken only where the
+            // slice really ends, and filed with the change point that ends
+            // it. A later pass of this loop ends no armed slice.
+            let mut ended_offset = None;
             let (maybe_prio, boundary) = {
                 let thread = guest.thread_state_mut();
                 if replay_checkpoint && !expiry_due {
@@ -3594,6 +3762,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // update that authority normally; do not snapshot it here.
                     (None, None)
                 } else if let Some(mut observed) = thread.slice_boundary.take() {
+                    ended_offset = thread.armed_instruction_offset.take();
                     let result =
                         observed.close_slice(thread, &self.cfg, explicit_sched_yield, None);
                     thread.slice_boundary = Some(observed);
@@ -3602,6 +3771,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     });
                     (closed.next_priority, Some(Box::new(closed.boundary)))
                 } else {
+                    ended_offset = thread.armed_instruction_offset.take();
                     (thread.next_timeslice(&self.cfg), None)
                 }
             };
@@ -3638,11 +3808,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     guest,
                     end_time,
                     scheduler::runqueue::DEFAULT_PRIORITY,
+                    None,
                 )
             } else if let Some(prio) = maybe_prio {
-                Self::priority_changepoint_request(guest, end_time, prio)
+                Self::priority_changepoint_request(guest, end_time, prio, ended_offset)
             } else if chaos {
-                Self::random_priority_changepoint_request(guest, end_time)
+                Self::random_priority_changepoint_request(guest, end_time, ended_offset)
             } else if explicit_sched_yield && self.cfg.replay_schedule_from.is_none() {
                 Self::sched_yield_request(guest)
             } else {
@@ -5629,6 +5800,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     lone_slice_end_at_check_in: false,
                     lone_replay_unsound: false,
                     replayed_stopless_end: None,
+                    armed_instruction_offset: None,
+                    slice_instruction_offset: 0,
+                    replay_instruction_offset: None,
+                    chaos_instruction_offset_draws: 0,
 
                     record_or_replay,
                     preemption_points: None,
@@ -8847,6 +9022,7 @@ mod rcb_overshoot_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use reverie::TimerSchedule;
     use tracing::Event;
     use tracing::Id;
     use tracing::Level;
@@ -8858,7 +9034,12 @@ mod rcb_overshoot_tests {
     use tracing::span::Record;
     use tracing::subscriber::with_default;
 
+    use super::InstructionOffset;
+    use super::KeptTimer;
+    use super::ReplayTimer;
+    use super::kept_timer_schedule;
     use super::rcb_timer_overshot;
+    use super::replay_timer_target;
     use super::report_rcb_overshoot;
 
     struct ErrorSubscriber(Arc<Mutex<Option<String>>>);
@@ -9020,11 +9201,80 @@ mod rcb_overshoot_tests {
         );
     }
 
+    /// A timer a dropped signal's stop cancelled is armed again for the same
+    /// point: the same branch target and steps while the clock is short of
+    /// the target, and no point the clock can name once it is not.
+    #[test]
+    fn a_kept_timer_reaches_the_same_instruction_offset() {
+        let offset = InstructionOffset {
+            rcb_target: 150,
+            instructions: 3,
+        };
+        assert!(matches!(
+            kept_timer_schedule(100, 50, Some(offset), 120),
+            KeptTimer::Rearm(TimerSchedule::RcbsAndInstructions(30, 3))
+        ));
+        for now in [150, 152] {
+            assert!(matches!(
+                kept_timer_schedule(100, 50, Some(offset), now),
+                KeptTimer::InsideOffset { target: 150 }
+            ));
+        }
+        assert!(matches!(
+            kept_timer_schedule(100, 50, None, 120),
+            KeptTimer::Rearm(TimerSchedule::Rcbs(30))
+        ));
+        assert!(matches!(
+            kept_timer_schedule(100, 50, None, 151),
+            KeptTimer::Rearm(TimerSchedule::Rcbs(1))
+        ));
+    }
+
+    /// A replayed timeslice with a recorded offset is armed at the recorded
+    /// branch target while the clock is short of it; at or past it the
+    /// recorded point cannot be reached, so the hook fails closed instead of
+    /// arming it. A timeslice without an offset keeps its recorded end.
+    #[test]
+    fn a_replay_inside_a_recorded_offset_is_not_armed_there() {
+        let offset = InstructionOffset {
+            rcb_target: 150,
+            instructions: 3,
+        };
+        assert_eq!(
+            replay_timer_target(Some(offset), 152, 149),
+            ReplayTimer::Recorded(150)
+        );
+        for current in [150, 151] {
+            assert_eq!(
+                replay_timer_target(Some(offset), 152, current),
+                ReplayTimer::InsideOffset(offset)
+            );
+        }
+        // Within straight-line code the recorded end is the target itself.
+        assert_eq!(
+            replay_timer_target(Some(offset), 150, 149),
+            ReplayTimer::Recorded(150)
+        );
+        assert_eq!(
+            replay_timer_target(Some(offset), 150, 150),
+            ReplayTimer::InsideOffset(offset)
+        );
+        assert_eq!(
+            replay_timer_target(None, 152, 151),
+            ReplayTimer::Recorded(152)
+        );
+    }
+
     #[test]
     fn exact_rcb_timer_hit_is_not_an_overshoot() {
-        assert!(!rcb_timer_overshot(100, 100));
-        assert!(!rcb_timer_overshot(99, 100));
-        assert!(rcb_timer_overshot(101, 100));
+        assert!(!rcb_timer_overshot(100, 100, 0));
+        assert!(!rcb_timer_overshot(99, 100, 0));
+        assert!(rcb_timer_overshot(101, 100, 0));
+        // A timer armed 3 steps past its target may retire up to 3 more
+        // branches, one per step, and no more.
+        assert!(!rcb_timer_overshot(103, 100, 3));
+        assert!(rcb_timer_overshot(104, 100, 3));
+        assert!(!rcb_timer_overshot(u64::MAX, u64::MAX - 1, 3));
     }
 
     #[test]

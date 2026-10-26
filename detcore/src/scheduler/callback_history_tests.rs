@@ -1118,4 +1118,45 @@ mod callback_history_scheduler_tests {
             "{text}"
         );
     }
+
+    /// The end of a timeslice armed with `--chaos-instruction-offset` carries
+    /// where its timer was armed beside its change point
+    /// (`Resources::instruction_offset`), and the scheduler records it on that
+    /// row; the same change point without one records none.
+    #[test]
+    fn a_change_point_records_the_instruction_offset_it_carries() {
+        use crate::resources::InstructionOffset;
+        let thread = tid(3);
+        let offset = InstructionOffset {
+            rcb_target: 40,
+            instructions: 3,
+        };
+        for carried in [Some(offset), None] {
+            let mut s = Scheduler::new(&Config {
+                record_preemptions: true,
+                ..Config::default()
+            });
+            s.preemption_writer
+                .as_mut()
+                .unwrap()
+                .register_thread(thread, 200);
+            let mut request = priority(thread, false);
+            request.instruction_offset = carried.map(Box::new);
+            install(&mut s, thread, 200, request);
+            let (selected, filed, response) = s.step3_peek().unwrap();
+            assert_eq!(selected, thread);
+            let filed = filed.try_read().unwrap().unwrap();
+            // A change point ends the turn whether or not it carries an offset.
+            assert!(s.step4_resource_block(thread, &filed, &response).is_err());
+            let record: serde_json::Value =
+                serde_json::from_str(&s.preemption_writer.take().unwrap().into_string()).unwrap();
+            let offsets =
+                record["per_thread"][thread.to_string()]["preemption_instruction_offsets"].clone();
+            let expected = match carried {
+                Some(_) => serde_json::json!([{"rcb_target": 40, "instructions": 3}]),
+                None => serde_json::Value::Null,
+            };
+            assert_eq!(offsets, expected, "{record}");
+        }
+    }
 }

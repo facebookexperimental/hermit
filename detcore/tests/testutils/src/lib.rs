@@ -250,6 +250,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        chaos_instruction_offset: 0,
     }
     .with_backend(|backend| {
         detcore::set_kernel_signal_facts(backend, false);
@@ -395,6 +396,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        chaos_instruction_offset: 0,
     }
     .with_backend(|backend| {
         detcore::set_kernel_signal_facts(backend, false);
@@ -540,6 +542,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        chaos_instruction_offset: 0,
     }
     .with_backend(|backend| {
         detcore::set_kernel_signal_facts(backend, false);

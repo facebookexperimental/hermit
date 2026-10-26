@@ -911,6 +911,22 @@ pub struct Config {
     #[clap(long, default_value = "0", value_name = "nanos")]
     pub chaos_epoch_length_ns: u64,
 
+    /// Let a chaos preemption land up to this many instructions past the
+    /// conditional branch its timeslice ends on. `0` (the default) is off.
+    ///
+    /// A chaos timeslice ends after a retired conditional branch, so a race
+    /// window with no conditional branch in it is never split. With this set,
+    /// each timeslice that ends on its timer is delivered `k` single steps
+    /// past that branch instead, `k` drawn uniformly from `0..=N` for each
+    /// timeslice from the seed, so a preemption can land inside straight-line
+    /// code. A preemption record keeps each `k` and its branch count, and its
+    /// replay stops at the same instruction. Each step is one ptrace stop, so
+    /// a preemption costs up to `N` more. Needs `--chaos` and the ptrace
+    /// backend's precise timers on x86_64; at most 256.
+    #[serde(default)]
+    #[clap(long, default_value = "0", value_name = "instructions")]
+    pub chaos_instruction_offset: u64,
+
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
     #[clap(long)]
@@ -2201,6 +2217,17 @@ impl Config {
         self.max_timeslice.is_some() && !self.no_rcb_time
     }
 
+    /// Whether every chaos timeslice end needs the guest really stopped at
+    /// its PMU branch target: `--chaos-instruction-offset` single-steps from
+    /// that stop to where the timeslice ends. Any optimization that takes a
+    /// slice end without stopping the guest there (for example a lone
+    /// runnable thread's slice end processed at its branch count) must be
+    /// off while this holds, or the offset is lost and a replay of the
+    /// record no longer stops where the recorded run did.
+    pub fn slice_ends_need_a_stop(&self) -> bool {
+        self.chaos && self.chaos_instruction_offset > 0
+    }
+
     /// Whether a `FUTEX_WAKE` that woke `woken` waiters makes the waker yield
     /// to them (`--futex-wake-yields`).
     ///
@@ -2486,6 +2513,13 @@ impl fmt::Display for Config {
             if self.chaos_epoch_length_ns > 0 {
                 write!(f, " --chaos-epoch-length-ns={}", self.chaos_epoch_length_ns)?;
             }
+        }
+        if self.chaos_instruction_offset > 0 {
+            write!(
+                f,
+                " --chaos-instruction-offset={}",
+                self.chaos_instruction_offset
+            )?;
         }
         if let Some(m) = self.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
@@ -4970,6 +5004,20 @@ mod tests {
         }
         let point: TimesliceRange = "4321..4321".parse().unwrap();
         assert_eq!(point.log_uniform(0.7), 4321.0);
+    }
+
+    /// `--chaos-instruction-offset` needs a real stop at every chaos slice
+    /// end; nothing else does, and the option is inert without `--chaos`.
+    #[test]
+    fn only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end() {
+        let mut config = Config::default();
+        assert!(!config.slice_ends_need_a_stop());
+        config.chaos_instruction_offset = 8;
+        assert!(!config.slice_ends_need_a_stop());
+        config.chaos = true;
+        assert!(config.slice_ends_need_a_stop());
+        config.chaos_instruction_offset = 0;
+        assert!(!config.slice_ends_need_a_stop());
     }
 
     /// The four capabilities split out of

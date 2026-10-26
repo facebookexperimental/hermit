@@ -121,6 +121,12 @@
       "why": "tests/c/bpf_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/branch_free_race.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/branch_free_race.c is owned by hermit-cli/tests/cli.rs: chaos_instruction_offset_splits_a_branch_free_window runs it under strict --chaos with 200 us slices on seeds 1-4, where two threads race on a load/add/store with no conditional branch in the window, and requires no lost update without --chaos-instruction-offset and at least one with --chaos-instruction-offset=8; a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets requires run --strict --verify --verify-strict at bitwise parity with the option and a --replay-preemptions-from replay that loses the same updates. Each run parses the guest's own lost-update count, so it remains a guest fixture rather than a manifest cell."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/cachestat_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",

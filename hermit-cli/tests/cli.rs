@@ -338,6 +338,8 @@ static PARKED_WAIT_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_READ_SIGNAL_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_SPINNER_AND_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_DESYNC_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(target_arch = "x86_64")]
+static BRANCH_FREE_RACE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3532,6 +3534,33 @@ fn parked_read_signal_then_exec_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "parked-read-signal-then-exec guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn branch_free_race_guest() -> &'static Path {
+    BRANCH_FREE_RACE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("branch-free-race");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the branch-free-race guest directory");
+        let guest = build_root.join("branch_free_race");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/branch_free_race.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the branch-free-race guest");
+        assert!(
+            output.status.success(),
+            "branch-free-race guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -25641,6 +25670,137 @@ fn a_draw_without_a_range_draws_from_the_recommended_range() {
     );
     assert_eq!(plain, 200_000_000);
     assert!(record(&plain_record).get("chaos_timeslice").is_none());
+}
+
+/// Runs tests/c/branch_free_race.c under strict `--chaos` with 200 us
+/// timeslices and the given seed and extra arguments, and returns the updates
+/// it lost.
+#[cfg(target_arch = "x86_64")]
+fn branch_free_race_lost(seed: u64, extra: &[&str]) -> u64 {
+    let guest = branch_free_race_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let seed = format!("--sched-seed={seed}");
+    let mut args = vec![
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--chaos",
+        &seed,
+        "--max-timeslice=200000",
+    ];
+    args.extend(extra);
+    args.extend(["--", guest, "100000"]);
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    parse_branch_free_race(&stdout(&output))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parse_branch_free_race(stdout: &str) -> u64 {
+    stdout
+        .trim_end()
+        .rsplit_once(" lost=")
+        .and_then(|(_, lost)| lost.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected branch_free_race output {stdout:?}"))
+}
+
+/// A race window with no conditional branch in it is never split by chaos:
+/// every preemption lands right after the loop's branch, before the load. So
+/// no seed loses an update. With `--chaos-instruction-offset=8` a preemption
+/// can land up to 8 instructions later, inside the window, and the same seeds
+/// lose updates (natively the guest loses about half of them on nearly every
+/// run).
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn chaos_instruction_offset_splits_a_branch_free_window() {
+    let _guard = hermit_run_guard();
+    let seeds = 1..=4;
+    let without: Vec<u64> = seeds
+        .clone()
+        .map(|seed| branch_free_race_lost(seed, &[]))
+        .collect();
+    assert!(without.iter().all(|lost| *lost == 0), "{without:?}");
+    let with: Vec<u64> = seeds
+        .map(|seed| branch_free_race_lost(seed, &["--chaos-instruction-offset=8"]))
+        .collect();
+    assert!(with.iter().any(|lost| *lost > 0), "{with:?}");
+}
+
+/// A run with `--chaos-instruction-offset` is deterministic at the strict
+/// level (bitwise parity, INFO messages compared), its preemption record
+/// keeps where each offset timeslice's timer was armed, and a replay of the
+/// record under another seed stops each thread at the same instructions: it
+/// loses the same updates.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets() {
+    let _guard = hermit_run_guard();
+    let offset = ["--chaos-instruction-offset=8"];
+    let seed = (1..=8)
+        .find(|seed| branch_free_race_lost(*seed, &offset) > 0)
+        .expect("one of seeds 1-8 should lose an update");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = format!("--verify-json={}", report.display());
+    branch_free_race_lost(
+        seed,
+        &[offset[0], "--verify", "--verify-strict", &report_arg],
+    );
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
+            .expect("strict verification verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "no INFO messages compared: {verdict}"
+        );
+    }
+
+    let recorded = directory.path().join("recorded.json");
+    let record_arg = format!("--record-preemptions-to={}", recorded.display());
+    let lost = branch_free_race_lost(seed, &[offset[0], &record_arg]);
+    assert!(lost > 0);
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&recorded).expect("no preemption record")).unwrap();
+    let offsets: Vec<&serde_json::Value> = json["per_thread"]
+        .as_object()
+        .expect("per_thread")
+        .values()
+        .flat_map(|thread| thread["preemption_instruction_offsets"].as_array().unwrap())
+        .filter(|offset| !offset.is_null())
+        .collect();
+    assert!(
+        !offsets.is_empty(),
+        "no instruction offset recorded: {json}"
+    );
+    assert!(
+        offsets.iter().all(|offset| offset["instructions"]
+            .as_u64()
+            .is_some_and(|k| (1..=8).contains(&k))),
+        "{offsets:?}"
+    );
+
+    let guest = branch_free_race_guest().to_str().unwrap();
+    let replay_arg = format!("--replay-preemptions-from={}", recorded.display());
+    let args = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--chaos",
+        "--sched-seed=99",
+        "--max-timeslice=200000",
+        &replay_arg,
+        "--",
+        guest,
+        "100000",
+    ];
+    let replay = hermit(&args);
+    assert_success(&replay, &args);
+    assert_eq!(parse_branch_free_race(&stdout(&replay)), lost);
 }
 
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn

@@ -1480,6 +1480,7 @@ fn record_or_replay_config_with_timer_support(
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        chaos_instruction_offset: 0,
         fuzz_seed: None,
     }
     .with_backend(|backend| {

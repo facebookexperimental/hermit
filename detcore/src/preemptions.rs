@@ -34,6 +34,7 @@ use serde::Serialize;
 use tracing::trace;
 
 use crate::resources::ChaosEpochTransition;
+pub use crate::resources::InstructionOffset;
 use crate::scheduler::Priority;
 use crate::scheduler::runqueue::DEFAULT_PRIORITY;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
@@ -1089,6 +1090,7 @@ impl PreemptionRecord {
         for history in self.per_thread.values_mut() {
             history.prio_changes = Vec::new();
             history.preemption_rcbs = Vec::new();
+            history.preemption_instruction_offsets = Vec::new();
             history.chaos_epochs = Vec::new();
             history.final_prio = 1000;
         }
@@ -1181,6 +1183,7 @@ impl PreemptionRecord {
                     final_prio: DEFAULT_PRIORITY,
                     prio_changes: Vec::new(),
                     preemption_rcbs: Vec::new(),
+                    preemption_instruction_offsets: Vec::new(),
                     chaos_epochs: Vec::new(),
                 }
             } else {
@@ -1206,6 +1209,7 @@ impl PreemptionRecord {
                     final_prio,
                     prio_changes,
                     preemption_rcbs: Vec::new(),
+                    preemption_instruction_offsets: Vec::new(),
                     chaos_epochs: Vec::new(),
                 }
             };
@@ -1478,6 +1482,35 @@ impl PreemptionRecord {
                     history.preemption_rcbs.len()
                 ));
             }
+            if !history.preemption_instruction_offsets.is_empty()
+                && history.preemption_instruction_offsets.len() != history.prio_changes.len()
+            {
+                return Err(format!(
+                    "thread {} has {} preemption times but {} instruction offsets",
+                    tid,
+                    history.prio_changes.len(),
+                    history.preemption_instruction_offsets.len()
+                ));
+            }
+            if !history.preemption_instruction_offsets.is_empty()
+                && history.preemption_rcbs.is_empty()
+            {
+                return Err(format!(
+                    "thread {} has instruction offsets but no RCB targets",
+                    tid
+                ));
+            }
+            if history
+                .preemption_instruction_offsets
+                .iter()
+                .flatten()
+                .any(|offset| offset.instructions == 0)
+            {
+                return Err(format!(
+                    "thread {} has an instruction offset of zero steps",
+                    tid
+                ));
+            }
             if history
                 .preemption_rcbs
                 .windows(2)
@@ -1654,6 +1687,9 @@ impl PreemptionRecord {
                 if !thread_history.preemption_rcbs.is_empty() {
                     thread_history.preemption_rcbs.pop();
                 }
+                if !thread_history.preemption_instruction_offsets.is_empty() {
+                    thread_history.preemption_instruction_offsets.pop();
+                }
                 thread_history.final_prio = removed_prio;
             } else {
                 // There were no prio changes for any threads, so just remove the last
@@ -1672,7 +1708,6 @@ impl PreemptionRecord {
     Eq,
     Clone,
     Hash,
-    Serialize,
     Deserialize,
 )]
 pub struct ThreadHistory {
@@ -1696,6 +1731,14 @@ pub struct ThreadHistory {
     #[serde(default)]
     preemption_rcbs: Vec<u64>,
 
+    /// Where each matching timeslice's timer was armed, for a timeslice that
+    /// `--chaos-instruction-offset` delivered past its branch target (`None`
+    /// for the others). Empty when no timeslice had one, as in every record
+    /// written without the option and by older versions; a written record
+    /// then omits it (see `Serialize`).
+    #[serde(default)]
+    preemption_instruction_offsets: Vec<Option<InstructionOffset>>,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     /// Exact per-thread slowdown transitions. Empty artifacts from older Hermit
@@ -1706,6 +1749,34 @@ pub struct ThreadHistory {
     chaos_epochs: Vec<ChaosEpochTransition>,
 }
 
+/// Written by hand only to leave out empty instruction offsets from a written
+/// (human-readable) record, so that a record made without
+/// `--chaos-instruction-offset` is byte for byte what it was before the
+/// option existed. `ThreadHistory` also crosses Detcore's RPC, whose encoding
+/// is not self-describing and needs every field, in declaration order.
+impl Serialize for ThreadHistory {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let omit_offsets =
+            serializer.is_human_readable() && self.preemption_instruction_offsets.is_empty();
+        let mut fields =
+            serializer.serialize_struct("ThreadHistory", if omit_offsets { 4 } else { 5 })?;
+        fields.serialize_field("final_prio", &self.final_prio)?;
+        fields.serialize_field("prio_changes", &self.prio_changes)?;
+        fields.serialize_field("preemption_rcbs", &self.preemption_rcbs)?;
+        if omit_offsets {
+            fields.skip_field("preemption_instruction_offsets")?;
+        } else {
+            fields.serialize_field(
+                "preemption_instruction_offsets",
+                &self.preemption_instruction_offsets,
+            )?;
+        }
+        fields.serialize_field("chaos_epochs", &self.chaos_epochs)?;
+        fields.end()
+    }
+}
+
 impl ThreadHistory {
     /// An empty thread history, with default priority only.
     pub fn new() -> Self {
@@ -1713,6 +1784,7 @@ impl ThreadHistory {
             final_prio: DEFAULT_PRIORITY,
             prio_changes: Vec::new(),
             preemption_rcbs: Vec::new(),
+            preemption_instruction_offsets: Vec::new(),
             chaos_epochs: Vec::new(),
         }
     }
@@ -1743,6 +1815,23 @@ impl ThreadHistory {
     pub(crate) fn with_preemption_rcbs(mut self, preemption_rcbs: Vec<u64>) -> Self {
         self.preemption_rcbs = preemption_rcbs;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_preemption_instruction_offsets(
+        mut self,
+        offsets: Vec<Option<InstructionOffset>>,
+    ) -> Self {
+        self.preemption_instruction_offsets = offsets;
+        self
+    }
+
+    /// Whether any timeslice of this history was delivered past its branch
+    /// target (`--chaos-instruction-offset`).
+    pub fn has_instruction_offsets(&self) -> bool {
+        self.preemption_instruction_offsets
+            .iter()
+            .any(Option::is_some)
     }
 
     /// Flatten the time series into a uniform representation.
@@ -1832,12 +1921,32 @@ impl ThreadHistoryIterator {
     /// Return the next recorded logical boundary and its exact RCB target when
     /// the artifact was produced by a version that records one.
     pub fn next_with_rcbs(&mut self) -> Option<(LogicalTime, Priority, Option<u64>)> {
+        self.next_with_offset()
+            .map(|(time, priority, rcbs, _)| (time, priority, rcbs))
+    }
+
+    /// [`Self::next_with_rcbs`], with where the recorded timeslice's timer
+    /// was armed if `--chaos-instruction-offset` delivered it past its branch
+    /// target.
+    pub fn next_with_offset(
+        &mut self,
+    ) -> Option<(
+        LogicalTime,
+        Priority,
+        Option<u64>,
+        Option<InstructionOffset>,
+    )> {
         let ix = self.ix;
         self.next().map(|(time, priority)| {
             (
                 time,
                 priority,
                 self.full_history.preemption_rcbs.get(ix).copied(),
+                self.full_history
+                    .preemption_instruction_offsets
+                    .get(ix)
+                    .copied()
+                    .flatten(),
             )
         })
     }
@@ -3219,6 +3328,114 @@ mod tests {
         assert_eq!(history.advance_chaos_epoch(LogicalTime::MAX), None);
     }
 
+    /// The instruction offsets ride in a thread's history beside its RCB
+    /// targets: empty until a timeslice has one (so a record written without
+    /// `--chaos-instruction-offset` is the same as before), then one entry per
+    /// row, kept in step when a row is dropped or the contents stripped,
+    /// through JSON, and checked by `validate`.
+    #[test]
+    fn instruction_offsets_ride_beside_their_rows() {
+        let tid = DetTid::from_raw(3);
+        let at = |ns| LogicalTime::from_nanos(ns);
+        let mut off = PreemptionWriter::new(None);
+        off.register_thread(tid, DEFAULT_PRIORITY);
+        off.insert_reprioritization(tid, at(10), 1, DEFAULT_PRIORITY, 5, None);
+        let off = off.into_string();
+        assert!(!off.contains("preemption_instruction_offsets"), "{off}");
+
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let mut writer = PreemptionWriter::new(None);
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_reprioritization(tid, at(10), 1, DEFAULT_PRIORITY, 5, None);
+        writer.insert_reprioritization(tid, at(20), 20, 5, 6, Some(offset));
+        writer.insert_reprioritization(tid, at(30), 30, 6, 7, None);
+        let record: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+        record.validate().unwrap();
+        let history = &record.per_thread[&tid];
+        assert_eq!(
+            history.preemption_instruction_offsets,
+            vec![None, Some(offset), None]
+        );
+        assert!(history.has_instruction_offsets());
+        // The RPC's encoding keeps every field, empty or not.
+        for history in [history.clone(), ThreadHistory::new()] {
+            let config = bincode::config::standard();
+            let encoded = bincode::serde::encode_to_vec(&history, config).unwrap();
+            let (decoded, _): (ThreadHistory, usize) =
+                bincode::serde::decode_from_slice(&encoded, config).unwrap();
+            assert_eq!(decoded, history);
+        }
+        let mut rows = history.clone().into_iter();
+        assert_eq!(
+            rows.next_with_offset(),
+            Some((at(10), DEFAULT_PRIORITY, Some(1), None))
+        );
+        assert_eq!(
+            rows.next_with_offset(),
+            Some((at(20), 5, Some(20), Some(offset)))
+        );
+        assert_eq!(rows.next_with_rcbs(), Some((at(30), 6, Some(30))));
+
+        let dropped = record.with_latest_preempt_removed();
+        dropped.validate().unwrap();
+        assert_eq!(
+            dropped.per_thread[&tid].preemption_instruction_offsets,
+            vec![None, Some(offset)]
+        );
+        let stripped = record.clone().strip_contents();
+        assert!(!stripped.per_thread[&tid].has_instruction_offsets());
+        stripped.validate().unwrap();
+
+        let mut short = record.clone();
+        short
+            .per_thread
+            .get_mut(&tid)
+            .unwrap()
+            .preemption_instruction_offsets
+            .pop();
+        assert!(
+            short
+                .validate()
+                .unwrap_err()
+                .contains("instruction offsets")
+        );
+        let mut zero = record.clone();
+        zero.per_thread
+            .get_mut(&tid)
+            .unwrap()
+            .preemption_instruction_offsets[1] = Some(InstructionOffset {
+            rcb_target: 18,
+            instructions: 0,
+        });
+        assert!(zero.validate().unwrap_err().contains("zero steps"));
+        let mut without_rcbs = record.clone();
+        without_rcbs
+            .per_thread
+            .get_mut(&tid)
+            .unwrap()
+            .preemption_rcbs
+            .clear();
+        assert!(
+            without_rcbs
+                .validate()
+                .unwrap_err()
+                .contains("no RCB targets")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (with, without) = (
+            dir.path().join("with.json"),
+            dir.path().join("without.json"),
+        );
+        std::fs::write(&with, record.to_string()).unwrap();
+        std::fs::write(&without, &off).unwrap();
+        assert_eq!(read_recorded_instruction_offsets(&with), Ok(true));
+        assert_eq!(read_recorded_instruction_offsets(&without), Ok(false));
+    }
+
     /// <https://github.com/rrnewton/hermit/issues/3411>: the epoch a record was
     /// made under survives serialization, the preemptions-only copy, and the
     /// non-panicking CLI reader; records written before it was stored read as
@@ -3235,6 +3452,7 @@ mod tests {
             7,
             DEFAULT_PRIORITY,
             5,
+            None,
         );
         let encoded = writer.into_string();
 
@@ -3281,12 +3499,12 @@ mod tests {
         pw.register_thread(tid1, 1000);
         pw.register_thread(tid2, 1000);
 
-        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(3), 3, 1000, 3);
-        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(30), 30, 3, 30);
-        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(300), 300, 30, 300);
-        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(2), 2, 1000, 2);
-        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(20), 20, 2, 20);
-        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(200), 200, 20, 200);
+        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(3), 3, 1000, 3, None);
+        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(30), 30, 3, 30, None);
+        pw.insert_reprioritization(tid1, LogicalTime::from_nanos(300), 300, 30, 300, None);
+        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(2), 2, 1000, 2, None);
+        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(20), 20, 2, 20, None);
+        pw.insert_reprioritization(tid2, LogicalTime::from_nanos(200), 200, 20, 200, None);
 
         // First, round trip through a pretty-printed string
         // ------------------------------------------------
@@ -4490,6 +4708,7 @@ impl PreemptionWriter {
                     final_prio: prio,
                     prio_changes: Vec::new(),
                     preemption_rcbs: Vec::new(),
+                    preemption_instruction_offsets: Vec::new(),
                     chaos_epochs: Vec::new(),
                 },
             )
@@ -4507,6 +4726,9 @@ impl PreemptionWriter {
     ///
     /// For now it (redundantly) takes both the priority of the timeslice just finished,
     /// and the next one coming up.  This serves as a sanity check.
+    ///
+    /// `offset` says where the timeslice's timer was armed when
+    /// `--chaos-instruction-offset` delivered it past its branch target.
     pub fn insert_reprioritization(
         &mut self,
         tid: DetTid,
@@ -4514,6 +4736,7 @@ impl PreemptionWriter {
         rcbs: u64,
         prior_prio: Priority,
         next_prio: Priority,
+        offset: Option<InstructionOffset>,
     ) {
         let history = self.inner.per_thread.get_mut(&tid).unwrap_or_else(|| {
             panic!(
@@ -4525,6 +4748,14 @@ impl PreemptionWriter {
 
         if let Some((last, _prio)) = history.prio_changes.last() {
             assert!(&time > last);
+        }
+        // The offsets stay empty until a timeslice has one, so a record
+        // written without the option is the same as before it existed; the
+        // first one fills in `None` for the rows before it.
+        let offsets = &mut history.preemption_instruction_offsets;
+        if offset.is_some() || !offsets.is_empty() {
+            offsets.resize(history.prio_changes.len(), None);
+            offsets.push(offset);
         }
         history.prio_changes.push((time, prior_prio));
         history.preemption_rcbs.push(rcbs);
@@ -4883,6 +5114,31 @@ pub fn read_recorded_rng_seed(path: &Path) -> Result<Option<u64>, String> {
         rng_seed: Option<u64>,
     }
     Ok(boundary_recording::read_settings::<RngSeedOnly>(path)?.rng_seed)
+}
+
+/// Whether any timeslice in a preemption record file was delivered past its
+/// branch target (`--chaos-instruction-offset`). A replay of such a record
+/// needs the precise single steps that only the ptrace backend takes.
+pub fn read_recorded_instruction_offsets(path: &Path) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct OffsetsOnly {
+        #[serde(default)]
+        preemption_instruction_offsets: Vec<Option<InstructionOffset>>,
+    }
+    #[derive(Deserialize)]
+    struct HistoriesOnly {
+        #[serde(default)]
+        per_thread: BTreeMap<DetTid, OffsetsOnly>,
+    }
+    Ok(boundary_recording::read_settings::<HistoriesOnly>(path)?
+        .per_thread
+        .values()
+        .any(|history| {
+            history
+                .preemption_instruction_offsets
+                .iter()
+                .any(Option::is_some)
+        }))
 }
 
 /// Read only the `--pipe-wake-latency` stored in a preemption record file, as

@@ -2787,6 +2787,7 @@ impl AnalyzeOpts {
         self.adopt_recorded_timeslice(&recordings)?;
         self.refuse_unsound_continuation_timeslice()?;
         self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
+        self.refuse_instruction_offsets(&recordings)?;
         self.prepare_trial_guest_ids(&recordings)
     }
 

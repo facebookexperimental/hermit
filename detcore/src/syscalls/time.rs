@@ -35,6 +35,7 @@ use crate::cpu_clock::ClockLookup;
 use crate::cpu_clock::ClockTask;
 use crate::detlog;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::InstructionOffset;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -659,27 +660,34 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Construct a random PriorityChangePoint request using the local PRNG.
+    /// `instruction_offset` is where the timer of the timeslice this change
+    /// point ends was armed, for one armed with `--chaos-instruction-offset`.
     pub fn random_priority_changepoint_request<G: Guest<Self>>(
         guest: &mut G,
         change_time: LogicalTime,
+        instruction_offset: Option<InstructionOffset>,
     ) -> Resources {
         let entropy = guest.thread_state_mut().chaos_prng_next_u64("priority");
         let new_priority = entropy_to_priority(entropy);
-        Self::priority_changepoint_request(guest, change_time, new_priority)
+        Self::priority_changepoint_request(guest, change_time, new_priority, instruction_offset)
     }
 
-    /// Construct a PriorityChangePoint request using the supplied time and priority.
+    /// Construct a PriorityChangePoint request using the supplied time and
+    /// priority, and `instruction_offset` as above.
     pub fn priority_changepoint_request<G: Guest<Self>>(
         guest: &mut G,
         change_time: LogicalTime,
         new_priority: Priority,
+        instruction_offset: Option<InstructionOffset>,
     ) -> Resources {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1151)
         let epochs = guest.thread_state_mut().take_pending_chaos_epochs();
         let rcbs = guest.thread_state().committed_clock_value;
         let resource = ResourceID::PriorityChangePoint(new_priority, change_time, rcbs, epochs);
-        guest.thread_state().mk_request(resource, Permission::W)
+        let mut request = guest.thread_state().mk_request(resource, Permission::W);
+        request.instruction_offset = instruction_offset.map(Box::new);
+        request
     }
 
     /// gettimeofday

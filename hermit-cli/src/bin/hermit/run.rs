@@ -6076,6 +6076,106 @@ fn replay_refuses_another_sleep_registration() {
     }
 }
 
+/// A replay of a record whose timeslices `--chaos-instruction-offset` ended
+/// past their branch targets is refused where it cannot single-step to them:
+/// off the ptrace backend, with imprecise or disabled timers, and from the
+/// record's schedule trace. A record without offsets replays as before.
+#[test]
+fn replay_of_instruction_offsets_is_refused_where_unsupported() {
+    use detcore::preemptions::InstructionOffset;
+    use detcore::preemptions::PreemptionWriter;
+    let dir = tempfile::tempdir().unwrap();
+    let record = |name: &str, offset: Option<InstructionOffset>| {
+        let path = dir.path().join(name);
+        let tid = detcore::types::DetTid::from_raw(3);
+        let mut writer = PreemptionWriter::new(None);
+        writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
+        writer.insert_reprioritization(
+            tid,
+            detcore::types::LogicalTime::from_nanos(10),
+            12,
+            detcore::DEFAULT_PRIORITY,
+            5,
+            offset,
+        );
+        std::fs::write(&path, writer.into_string()).unwrap();
+        path
+    };
+    let with = record(
+        "with.json",
+        Some(InstructionOffset {
+            rcb_target: 10,
+            instructions: 4,
+        }),
+    );
+    let without = record("without.json", None);
+    for (path, flag, extra, refused) in [
+        (&with, "--replay-preemptions-from", None, None),
+        (
+            &with,
+            "--replay-preemptions-from",
+            Some("--imprecise-timers"),
+            Some("--imprecise-timers takes no single steps"),
+        ),
+        (
+            &with,
+            "--replay-preemptions-from",
+            Some("--max-timeslice=disabled"),
+            Some("the PMU timer that steps to them is disabled"),
+        ),
+        (
+            &with,
+            "--replay-schedule-from",
+            None,
+            Some("its schedule trace does not record the instruction offsets"),
+        ),
+        (&without, "--replay-schedule-from", None, None),
+        (
+            &without,
+            "--replay-preemptions-from",
+            Some("--imprecise-timers"),
+            None,
+        ),
+    ] {
+        let mut argv = vec!["hermit".to_owned(), "run".to_owned()];
+        argv.push(format!("{flag}={}", path.display()));
+        argv.extend(extra.map(str::to_owned));
+        argv.push("fakeprog".to_owned());
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let result = run_opts_for(&argv).refuse_instruction_offset_replay_where_unsupported();
+        match refused {
+            None => assert!(result.is_ok(), "{argv:?}: {result:?}"),
+            Some(expected) => {
+                let error = format!("{:#}", result.expect_err(&format!("{argv:?}")));
+                assert!(
+                    error.contains(expected) && error.contains("--chaos-instruction-offset"),
+                    "{argv:?}: {error}"
+                );
+            }
+        }
+    }
+    let kvm = format!("--replay-preemptions-from={}", with.display());
+    let error = run_opts_for(&["hermit", "--backend=kvm", "run", &kvm, "fakeprog"])
+        .refuse_instruction_offset_replay_where_unsupported()
+        .expect_err("kvm cannot single-step to the offsets");
+    assert!(
+        format!("{error:#}").contains("backend `kvm` cannot single-step to them"),
+        "{error:#}"
+    );
+    // On aarch64 the replay is a policy refusal, as recording is.
+    let ptrace = format!("--replay-preemptions-from={}", with.display());
+    let opts = run_opts_for(&["hermit", "run", &ptrace, "fakeprog"]);
+    let error = opts
+        .refuse_instruction_offset_replay_on(true)
+        .expect_err("aarch64 single steps are not validated");
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("validated only on x86_64"),
+        "{error:#}"
+    );
+    opts.refuse_instruction_offset_replay_on(false).unwrap();
+}
+
 /// A replay of a record made under another `--pipe-wake-latency` is refused,
 /// in both directions and for a different latency, under both replay flags;
 /// `0` is not off; a record without the field is off
@@ -6373,6 +6473,156 @@ fn skid_margin_override_needs_a_timer_delivering_backend() {
         assert!(
             message.contains("cannot deliver Detcore preemption timer events"),
             "{message}"
+        );
+    }
+}
+
+/// `--chaos-instruction-offset` parses, is rendered into the reproduce
+/// command and round-trips. It is refused where a run would ignore it or a
+/// replay could not stop where it stopped: without `--chaos`, past the
+/// step bound, off the ptrace backend, with imprecise or disabled timers,
+/// with a replay or the strict slice-boundary protocol.
+#[test]
+fn chaos_instruction_offset_round_trips_and_is_refused_where_inert() {
+    let mut opts = RunOpts::parse_from([
+        "fakehermit",
+        "--chaos",
+        "--chaos-instruction-offset=16",
+        "fakeprog",
+    ]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(opts.det_opts.det_config.chaos_instruction_offset, 16);
+    let rendered = format!("{opts}");
+    assert!(
+        rendered.contains(" --chaos-instruction-offset=16"),
+        "{rendered}"
+    );
+    let mut reparsed_args = vec!["fakehermit".to_owned()];
+    reparsed_args.extend(shell_words::split(&rendered).unwrap());
+    let mut reparsed = RunOpts::parse_from(reparsed_args);
+    reparsed.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(reparsed.det_opts.det_config.chaos_instruction_offset, 16);
+
+    let mut default = RunOpts::parse_from(["fakehermit", "--chaos", "fakeprog"]);
+    default.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(default.det_opts.det_config.chaos_instruction_offset, 0);
+    assert!(!format!("{default}").contains("instruction-offset"));
+
+    let mut bound = RunOpts::parse_from([
+        "fakehermit",
+        "--chaos",
+        "--chaos-instruction-offset=256",
+        "fakeprog",
+    ]);
+    bound.validate_args_with_perf_support(true).unwrap();
+
+    // aarch64's single steps are not validated yet: a policy refusal there.
+    let error = refuse_chaos_instruction_offset(&bound.det_opts.det_config, Backend::Ptrace, true)
+        .unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("validated only on x86_64"),
+        "{error:#}"
+    );
+    refuse_chaos_instruction_offset(&bound.det_opts.det_config, Backend::Ptrace, false).unwrap();
+
+    // A readable record, so that validation reaches the offset refusal
+    // rather than stopping where it first reads the record (the drawn
+    // timeslice it may state, `resolve_chaos_timeslice_range`).
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("record.json");
+    detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+        .write_to_disk(&record)
+        .unwrap();
+    let replay_arg = format!("--replay-preemptions-from={}", record.display());
+    for (argv, expected) in [
+        (
+            vec!["hermit", "run", "--chaos-instruction-offset=4", "fakeprog"],
+            "it needs --chaos",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--chaos",
+                "--chaos-instruction-offset=257",
+                "fakeprog",
+            ],
+            "is above 256",
+        ),
+        (
+            vec![
+                "hermit",
+                "--backend=kvm",
+                "run",
+                "--chaos",
+                "--chaos-instruction-offset=4",
+                "fakeprog",
+            ],
+            "backend `kvm` is refused",
+        ),
+        (
+            vec![
+                "hermit",
+                "--backend=e9patch",
+                "run",
+                "--chaos",
+                "--chaos-instruction-offset=4",
+                "fakeprog",
+            ],
+            "backend `e9patch` is refused",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--chaos",
+                "--chaos-instruction-offset=4",
+                "--imprecise-timers",
+                "fakeprog",
+            ],
+            "--imprecise-timers takes no single steps",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--chaos",
+                "--chaos-instruction-offset=4",
+                "--max-timeslice=disabled",
+                "fakeprog",
+            ],
+            "--max-timeslice=disabled turns off",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--chaos",
+                "--chaos-instruction-offset=4",
+                replay_arg.as_str(),
+                "fakeprog",
+            ],
+            "a replay takes its offsets from the record",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--chaos",
+                "--chaos-instruction-offset=4",
+                "--strict-schedule-boundaries",
+                "fakeprog",
+            ],
+            "--strict-schedule-boundaries",
+        ),
+    ] {
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .expect_err(&format!("{argv:?} should be refused"));
+        assert!(
+            format!("{error:#}").contains(expected),
+            "{argv:?}: {error:#}"
         );
     }
 }
@@ -9519,6 +9769,74 @@ fn virtual_cpus_need_a_host_directory_per_cpu() {
     assert!(error.contains("run without --virtual-cpus"), "{error}");
 }
 
+/// The largest `--chaos-instruction-offset`: each step is one ptrace stop of
+/// the preempted thread, so this bounds what one preemption can add (about
+/// 35 us a step on x86_64), and the longer the steps, the more often a
+/// host-timed stop lands among them and fails the run closed.
+const MAX_CHAOS_INSTRUCTION_OFFSET: u64 = 256;
+
+/// Refuse `--chaos-instruction-offset` where it would be ignored or could not
+/// be replayed. (The argument parser already refuses `--chaos` with
+/// `--namespace-only`.) `aarch64` is whether this build runs on aarch64,
+/// where the single steps the option relies on are not validated yet: that
+/// is a policy refusal (exit status 122), not a usage error.
+fn refuse_chaos_instruction_offset(
+    config: &detcore::Config,
+    backend: Backend,
+    aarch64: bool,
+) -> Result<(), Error> {
+    let offset = config.chaos_instruction_offset;
+    if offset > MAX_CHAOS_INSTRUCTION_OFFSET {
+        anyhow::bail!(
+            "--chaos-instruction-offset={offset} is above {MAX_CHAOS_INSTRUCTION_OFFSET}: every \
+             instruction is one ptrace stop of a preemption"
+        );
+    }
+    if !config.chaos {
+        anyhow::bail!(
+            "--chaos-instruction-offset moves where a chaos timeslice ends; it needs --chaos"
+        );
+    }
+    if aarch64 {
+        return Err(Error::new(PolicyRefusal).context(
+            "--chaos-instruction-offset is validated only on x86_64: on aarch64 the ptrace \
+             backend's single steps past a branch target are not yet checked to count each \
+             instruction exactly once, so a recorded offset could not be trusted to replay",
+        ));
+    }
+    if backend != Backend::Ptrace {
+        anyhow::bail!(
+            "--chaos-instruction-offset single-steps the guest with the ptrace backend's precise \
+             timer; backend `{}` is refused",
+            backend.as_str()
+        );
+    }
+    if config.imprecise_timers {
+        anyhow::bail!(
+            "--chaos-instruction-offset needs precise timers: --imprecise-timers takes no single \
+             steps"
+        );
+    }
+    if config.max_timeslice.is_none() {
+        anyhow::bail!(
+            "--chaos-instruction-offset needs the PMU timer that --max-timeslice=disabled turns off"
+        );
+    }
+    if config.replay_preemptions_from.is_some() || config.replay_schedule_from.is_some() {
+        anyhow::bail!(
+            "--chaos-instruction-offset draws new offsets; a replay takes its offsets from the \
+             record it replays"
+        );
+    }
+    if config.strict_schedule_boundaries {
+        anyhow::bail!(
+            "--chaos-instruction-offset is not part of the strict slice-boundary protocol; it \
+             cannot be combined with --strict-schedule-boundaries"
+        );
+    }
+    Ok(())
+}
+
 fn validate_e9patch_mount_target(path: &Path) -> Result<(), Error> {
     if !path.is_absolute() {
         anyhow::bail!("e9patch mount target must be absolute: {}", path.display());
@@ -10040,6 +10358,65 @@ impl RunOpts {
                 false,
             ) {
                 return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse to replay a record whose timeslices
+    /// `--chaos-instruction-offset` delivered past their branch targets where
+    /// the replay cannot stop at the same instructions: without the ptrace
+    /// backend's precise timer, and from its schedule trace, which does not
+    /// carry the offsets. The record is read before anything is launched.
+    fn refuse_instruction_offset_replay_where_unsupported(&self) -> Result<(), Error> {
+        self.refuse_instruction_offset_replay_on(cfg!(target_arch = "aarch64"))
+    }
+
+    /// [`Self::refuse_instruction_offset_replay_where_unsupported`], where
+    /// `aarch64` is whether this build runs on aarch64, whose single steps
+    /// past a branch target are not validated yet (as for recording, see
+    /// `refuse_chaos_instruction_offset`).
+    fn refuse_instruction_offset_replay_on(&self, aarch64: bool) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            if !detcore::preemptions::read_recorded_instruction_offsets(path).map_err(Error::msg)? {
+                continue;
+            }
+            let refusal = if config.replay_schedule_from.is_some() {
+                Some("its schedule trace does not record the instruction offsets".to_owned())
+            } else if aarch64 {
+                Some(
+                    "single steps past a branch target are validated only on x86_64, not on \
+                     aarch64"
+                        .to_owned(),
+                )
+            } else if self.selected_backend() != Backend::Ptrace {
+                Some(format!(
+                    "backend `{}` cannot single-step to them; replay it with the ptrace backend",
+                    self.selected_backend().as_str()
+                ))
+            } else if config.imprecise_timers {
+                Some("--imprecise-timers takes no single steps".to_owned())
+            } else if config.max_timeslice.is_none() {
+                Some("the PMU timer that steps to them is disabled".to_owned())
+            } else {
+                None
+            };
+            if let Some(why) = refusal {
+                return Err(Error::new(PolicyRefusal).context(format!(
+                    "{option} {} ends timeslices at instruction offsets past their branch \
+                     targets (--chaos-instruction-offset), and this replay cannot stop there: {why}",
+                    path.display()
+                )));
             }
         }
         Ok(())
@@ -11523,6 +11900,7 @@ impl RunOpts {
         // Refused here too, before stdin is read; each run's preparation
         // below sets the configuration from the same record.
         self.annotated_priority_replay_admission()?;
+        self.refuse_instruction_offset_replay_where_unsupported()?;
         // As `--seed-from` prints the seed it chose: the value pins this
         // run's maximum with `--max-timeslice`.
         if let Some(drawn) = self.seeded_chaos_timeslice() {
@@ -12055,6 +12433,12 @@ impl RunOpts {
                     backend.as_str()
                 );
             }
+        }
+        // `--chaos-instruction-offset` asks the backend's precise timer for
+        // single steps past a branch target, which only the ptrace backend
+        // takes; elsewhere the request would be ignored or refused mid-run.
+        if config.chaos_instruction_offset > 0 {
+            refuse_chaos_instruction_offset(config, backend, cfg!(target_arch = "aarch64"))?;
         }
         // `--signal-at` is sent by Detcore's scheduler, through the signal
         // path of the ptrace backend (with or without e9patch preprocessing).
