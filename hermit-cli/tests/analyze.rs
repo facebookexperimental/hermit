@@ -1278,6 +1278,28 @@ fn analyze_race_then_with(
     (output, report)
 }
 
+/// [`analyze_race_then_with`], asserting that analyze succeeded and wrote a
+/// report naming a critical event: the combined output and the report.
+fn analyze_race_then(
+    label: &str,
+    then: &str,
+    analyze_opts: &[&str],
+) -> (String, serde_json::Value) {
+    let (output, report) = analyze_race_then_with(then, analyze_opts, &[]);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label} failed: {}\n{combined}",
+        output.status
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    assert!(
+        report["critical_event1"]["event_index"].is_u64(),
+        "{label}: {report}"
+    );
+    (combined, report)
+}
+
 /// A race found only at a short timeslice: at the run's own 100 us, thread a
 /// is preempted before it claims even without chaos, so the scheduler alone
 /// meets the target and gives the prefix search nothing to bisect against.
@@ -1732,4 +1754,108 @@ fn analyze_starts_from_a_recorded_target_run() {
         "{label}: a missed replay: {}\n{combined}",
         output.status
     );
+/// `--trial-budget` ends a prefix search with a partial report and exit 120,
+/// naming a bracket that holds the deciding event, and keeps the workspace
+/// even without --keep-tmp. `--resume` with that workspace answers the runs
+/// the first invocation journaled instead of running them, finishes the
+/// search, and finds the deciding event an uninterrupted analysis finds.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn a_budget_ends_analyze_with_a_partial_report_that_resume_finishes() {
+    let label = "analyze --prefix-search --trial-budget=4 analyze_race_then exit";
+    let (combined, uninterrupted) = analyze_race_then(label, "exit", &["--prefix-search"]);
+    // The deciding event; a timing decision's critical events are positions
+    // in its continuations instead.
+    let decision = uninterrupted["deciding_event"]["event_index"]
+        .as_u64()
+        .or(uninterrupted["critical_event1"]["event_index"].as_u64())
+        .unwrap_or_else(|| panic!("{label}: {uninterrupted}\n{combined}"));
+
+    let seed = race_then_target_seed("exit", &[]);
+    let _guard = analyze_lock();
+    let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
+    let report_file = report_dir.path().join("report.json");
+    let tmp_dir = tmp_dir_in(report_dir.path());
+    let analyze = |extra: &[String]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .arg("analyze")
+            .args([
+                "--target-stdout=b-first",
+                "--target-exit-code=0",
+                "--trial-timeout=3",
+                "--prefix-search",
+            ])
+            .args(extra)
+            .arg(format!("--run1-seed={seed}"))
+            .arg(format!("--report-file={}", report_file.display()))
+            .arg(format!("--tmp-dir={}", tmp_dir.display()))
+            .args(["--", "--chaos", "--"])
+            .arg(&workloads().race_then)
+            .arg("exit");
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        let report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&report_file).unwrap_or_else(|error| {
+                panic!("{label}: no report ({error})\n{}", combined_output(&output))
+            }))
+            .unwrap();
+        (output, report)
+    };
+
+    let (output, partial) = analyze(&["--trial-budget=4".to_owned()]);
+    let said = combined_output(&output);
+    assert_eq!(output.status.code(), Some(120), "{label}\n{said}");
+    assert!(
+        said.contains("HERMIT_ANALYZE_PARTIAL class=trial-budget phase=prefix-search"),
+        "{label}: no class line\n{said}"
+    );
+    let details = &partial["partial"];
+    assert_eq!(details["reason"], "trial-budget", "{partial}");
+    assert_eq!(details["runs_started"], 4, "{partial}");
+    let bracket = &details["bracket"];
+    let (misses, meets) = (
+        bracket["misses"].as_u64().unwrap(),
+        bracket["meets"].as_u64().unwrap(),
+    );
+    assert!(
+        misses <= decision && decision < meets,
+        "{label}: event {decision} is not in the bracket {bracket}"
+    );
+    assert!(
+        partial["header"]
+            .as_str()
+            .unwrap()
+            .starts_with("PARTIAL RESULT."),
+        "{partial}"
+    );
+    let workspace = PathBuf::from(details["workspace"].as_str().unwrap());
+    assert!(
+        workspace.join("analyze-journal.jsonl").is_file(),
+        "{label}: the workspace was not kept\n{said}"
+    );
+    assert!(
+        details["resume_command"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("--resume={}", workspace.display())),
+        "{partial}"
+    );
+
+    let (output, resumed) = analyze(&[format!("--resume={}", workspace.display())]);
+    let said = combined_output(&output);
+    assert!(output.status.success(), "{label}: resume failed\n{said}");
+    assert_eq!(
+        said.matches("answered from the journal of an earlier invocation")
+            .count(),
+        4,
+        "{label}\n{said}"
+    );
+    assert!(resumed.get("partial").is_none(), "{resumed}");
+    for field in ["deciding_event", "critical_event1", "critical_event2"] {
+        assert_eq!(
+            resumed[field]["event_index"], uninterrupted[field]["event_index"],
+            "{label}: the resumed analysis found another {field} than the uninterrupted one\n{said}"
+        );
+    }
+    assert_no_workspace_left(label, &tmp_dir, &said);
 }

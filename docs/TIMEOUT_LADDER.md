@@ -44,6 +44,7 @@ agreeing with each other.
 | validate run budget | the whole outer validate graph | `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS` or `--run-timeout` | dagrun stops admitting work and records unfinished nodes | incomplete validation, with named unfinished nodes |
 | validate systemd scope | the same outer run plus teardown grace | validate's safe-ci scope | systemd stops the whole process tree | outer-scope timeout |
 | `safehermit --sh-deadline` | **the whole wrapped process tree** | `bin/safehermit`, default 3600s | `systemd-run --user RuntimeMaxSec`, a **cgroup kill** | exit 124, `safehermit: bound.wall=` |
+| `hermit analyze --time-budget D` / `--trial-budget N` | **one analyze invocation**: all of its runs | the caller's argument | checked before every run; each run's `--timeout` is shortened to the time left, and a run that shortened bound ends is thrown away, not counted. Nothing is killed: analyze stops starting runs and reports its best answer so far | exit **120**, `HERMIT_ANALYZE_PARTIAL class=time-budget` (or `class=trial-budget`), workspace kept |
 
 Distribution of the selected CI-cell values calibrated at that cutoff:
 
@@ -263,6 +264,7 @@ greppable marker, and that marker — not the status — is what a caller keys o
 | `HERMIT_RUN_TIMEOUT_FALLBACK` | the bound expired and **the unwind itself did not finish** within the grace. This is a hermit defect, not a slow guest. | investigate the wedged teardown |
 | `HERMIT_INTERNAL_FAILURE class=cli-error` with "did not exit within the ... finalize budget" | the run had published its result, but the container child did not exit within the finalize budget and hermit cancelled it; the published result was discarded | a teardown stall: raise `HERMIT_FINALIZE_BUDGET_MS` on an overloaded host, or investigate the child's teardown |
 | `safehermit: bound.wall=APPLIED` … then a kill | the outermost cgroup deadline reaped the tree | the run escaped every inner bound |
+| `HERMIT_ANALYZE_PARTIAL class=time-budget` or `class=trial-budget`, exit 120 | `hermit analyze` spent its own budget and reported its best answer so far; it killed nothing it did not throw away. Distinct from 124: no deadline killed a run whose outcome counts | `--resume=WORKSPACE`, as the report says, or a larger budget |
 | a nextest-named test with wrapper exit 100 | the test **process** exceeded its per-test cap | `.config/nextest.toml` |
 | exit 124 with **no marker at all** | something outside hermit killed it — `timeout(1)` on the cell, or a harness | the cell's `timeout_seconds`, or a missing inner bound |
 | `HERMIT_BINDER_EXIT_REPORT_MISSING` above `HERMIT_POLICY_REFUSAL class=policy-refusal`, exit **122** | the binder exit-report backstop fired: a binder call admitted to run alone waited 60s for a retired thread's final exit report, which the backend never delivered. A Hermit or backend defect, not a slow guest. | report it, with the thread the line names |

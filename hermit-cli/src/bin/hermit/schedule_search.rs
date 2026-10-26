@@ -165,7 +165,7 @@ pub fn scoring_function(first: SchedEvent, second: SchedEvent) -> i32 {
 /// A trial that returns `Err` ends the search: no further trial runs and the
 /// error is returned as it is.
 pub fn search_for_critical_schedule<F>(
-    mut tester: F,
+    tester: F,
     initial_passing_schedule: Vec<SchedEvent>,
     initial_failing_schedule: Vec<SchedEvent>,
     cfg: &Config,
@@ -173,42 +173,105 @@ pub fn search_for_critical_schedule<F>(
 where
     F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
-    eprintln!("Verifying pass/fail endpoints of the search, using schedule-trace replay:");
-    // The endpoints are the search's inputs (`hermit bisect`'s --good and
-    // --bad too): one that does not reproduce its outcome ends the search as
-    // an `AnalyzePrecondition`, not as a failure of Hermit.
-    let (passing_endpoint_passes, _) = tester(&initial_passing_schedule)?;
-    if !passing_endpoint_passes {
-        return Err(AnalyzePrecondition::baseline_not_reproduced(
-            "the passing schedule endpoint did not reproduce a passing outcome",
-        )
-        .into());
-    }
-    let (failing_endpoint_passes, _) = tester(&initial_failing_schedule)?;
-    if failing_endpoint_passes {
-        return Err(AnalyzePrecondition::target_not_reproduced(
-            "the failing schedule endpoint did not reproduce the target failure",
-        )
-        .into());
-    }
+    search_for_critical_schedule_observed(
+        tester,
+        initial_passing_schedule,
+        initial_failing_schedule,
+        cfg,
+        SearchStart::Endpoints,
+        &mut |_| {},
+    )
+}
+
+/// The search's interval at the start of one pass of its event-level
+/// search: a schedule whose replay passes, one whose replay fails, and how
+/// far apart they are. Every pass narrows it.
+pub struct Interval<'a> {
+    /// The pass, from 0.
+    pub pass: usize,
+    /// Whether the event-level search is running the pass, rather than the
+    /// alignment search (`Config::needleman_search`), which falls back to it.
+    pub event_level: bool,
+    pub passing: &'a [SchedEvent],
+    pub failing: &'a [SchedEvent],
+    pub edit_distance: usize,
+    pub swap_distance: usize,
+}
+
+/// Where a search starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchStart {
+    /// From its two endpoints, which it replays first to check that one
+    /// passes and the other fails.
+    Endpoints,
+    /// From an interval that a search between the same endpoints showed its
+    /// observer at the start of pass `pass` ([`Interval`]): the passing and
+    /// failing schedules given are that interval's, classified already, and
+    /// the search goes on as that one did from there.
+    Interval { pass: usize, event_level: bool },
+}
+
+/// [`search_for_critical_schedule`] from `start`, showing `observe` the
+/// interval at the start of every pass, before its trial: the closest pair
+/// found so far, which is what a search stopped during that trial has to
+/// show, and where a later search can start ([`SearchStart::Interval`]).
+pub fn search_for_critical_schedule_observed<F>(
+    mut tester: F,
+    initial_passing_schedule: Vec<SchedEvent>,
+    initial_failing_schedule: Vec<SchedEvent>,
+    cfg: &Config,
+    start: SearchStart,
+    observe: &mut dyn FnMut(Interval<'_>),
+) -> anyhow::Result<CriticalSchedule>
+where
+    F: FnMut(&[SchedEvent]) -> TrialOutcome,
+{
+    let (first_pass, event_level) = match start {
+        SearchStart::Endpoints => {
+            eprintln!("Verifying pass/fail endpoints of the search, using schedule-trace replay:");
+            // The endpoints are the search's inputs (`hermit bisect`'s --good and
+            // --bad too): one that does not reproduce its outcome ends the search as
+            // an `AnalyzePrecondition`, not as a failure of Hermit.
+            let (passing_endpoint_passes, _) = tester(&initial_passing_schedule)?;
+            if !passing_endpoint_passes {
+                return Err(AnalyzePrecondition::baseline_not_reproduced(
+                    "the passing schedule endpoint did not reproduce a passing outcome",
+                )
+                .into());
+            }
+            let (failing_endpoint_passes, _) = tester(&initial_failing_schedule)?;
+            if failing_endpoint_passes {
+                return Err(AnalyzePrecondition::target_not_reproduced(
+                    "the failing schedule endpoint did not reproduce the target failure",
+                )
+                .into());
+            }
+            (0, !cfg.needleman_search)
+        }
+        SearchStart::Interval { pass, event_level } => (pass, event_level || !cfg.needleman_search),
+    };
 
     // Do the first level search at the event level
     let EventLevelSearchResult {
         passing_schedule,
         failing_schedule,
-    } = if cfg.needleman_search {
-        needleman_level_search(
-            &mut tester,
-            initial_passing_schedule,
-            initial_failing_schedule,
-            cfg,
-        )?
-    } else {
+    } = if event_level {
         event_level_search(
             &mut tester,
             initial_passing_schedule,
             initial_failing_schedule,
             cfg,
+            first_pass,
+            observe,
+        )?
+    } else {
+        needleman_level_search(
+            &mut tester,
+            initial_passing_schedule,
+            initial_failing_schedule,
+            cfg,
+            first_pass,
+            observe,
         )?
     };
 
@@ -538,12 +601,22 @@ fn needleman_level_search<F>(
     mut passing_schedule: Vec<SchedEvent>,
     mut failing_schedule: Vec<SchedEvent>,
     cfg: &Config,
+    first_pass: usize,
+    observe: &mut dyn FnMut(Interval<'_>),
 ) -> anyhow::Result<EventLevelSearchResult>
 where
     F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
-    for pass_number in 0..cfg.max_event_level_search_passes {
+    for pass_number in first_pass..cfg.max_event_level_search_passes {
         let (edit_distance, swap_distance) = just_distance(&passing_schedule, &failing_schedule);
+        observe(Interval {
+            pass: pass_number,
+            event_level: false,
+            passing: &passing_schedule,
+            failing: &failing_schedule,
+            edit_distance,
+            swap_distance,
+        });
         if edit_distance == 1 && swap_distance == 1 {
             return Ok(EventLevelSearchResult {
                 passing_schedule,
@@ -555,7 +628,7 @@ where
                 ":: Needleman-Wunsch endpoints contain {} insertion/deletion edits; falling back to event permutation search",
                 edit_distance - swap_distance,
             );
-            return event_level_search(tester, passing_schedule, failing_schedule, cfg);
+            return event_level_search(tester, passing_schedule, failing_schedule, cfg, 0, observe);
         }
 
         let mut needleman = NeedlemanWunsch {
@@ -575,7 +648,14 @@ where
                     ":: Needleman-Wunsch alignment requires {} cells (limit {}); falling back to event permutation search",
                     cells, max_cells,
                 );
-                return event_level_search(tester, passing_schedule, failing_schedule, cfg);
+                return event_level_search(
+                    tester,
+                    passing_schedule,
+                    failing_schedule,
+                    cfg,
+                    0,
+                    observe,
+                );
             }
         };
         if global_alignment.is_empty() {
@@ -583,7 +663,7 @@ where
                 ":: Needleman-Wunsch produced no alignment difference on pass {}; falling back to event permutation search",
                 pass_number,
             );
-            return event_level_search(tester, passing_schedule, failing_schedule, cfg);
+            return event_level_search(tester, passing_schedule, failing_schedule, cfg, 0, observe);
         }
         let requested_midpoint_schedule =
             needleman.generate_midpoint_schedule(start_index, global_alignment);
@@ -597,7 +677,7 @@ where
                 ":: Needleman-Wunsch midpoint did not strictly reduce both sides of the {}:{} interval; falling back to event permutation search",
                 edit_distance, swap_distance,
             );
-            return event_level_search(tester, passing_schedule, failing_schedule, cfg);
+            return event_level_search(tester, passing_schedule, failing_schedule, cfg, 0, observe);
         }
 
         let (midpoint_passes, selected_new_point) =
@@ -663,14 +743,18 @@ fn event_level_search<F>(
     mut passing_schedule: Vec<SchedEvent>,
     mut failing_schedule: Vec<SchedEvent>,
     cfg: &Config,
+    first_pass: usize,
+    observe: &mut dyn FnMut(Interval<'_>),
 ) -> anyhow::Result<EventLevelSearchResult>
 where
     F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
+    // For the verbose report only: a search started from an interval
+    // measures from that interval.
     let orig_passing_schedule = passing_schedule.clone();
     let orig_failing_schedule = failing_schedule.clone();
 
-    for pass_number in 0..cfg.max_event_level_search_passes {
+    for pass_number in first_pass..cfg.max_event_level_search_passes {
         let (swap_dist, edit_dist, requested_midpoint_schedule) = {
             let mut bubbles = align(&passing_schedule, &failing_schedule);
             (
@@ -688,6 +772,14 @@ where
                 / (passing_schedule.len() + failing_schedule.len()) as f64),
             requested_midpoint_schedule.len()
         );
+        observe(Interval {
+            pass: pass_number,
+            event_level: true,
+            passing: &passing_schedule,
+            failing: &failing_schedule,
+            edit_distance: edit_dist,
+            swap_distance: swap_dist,
+        });
 
         let unmatched_total =
             passing_schedule.len() + failing_schedule.len() - 2 * requested_midpoint_schedule.len();
@@ -2109,5 +2201,178 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(calls, 2);
+    }
+
+    /// The trial the budget would not let start.
+    #[derive(Debug)]
+    struct OutOfTrials;
+
+    impl std::fmt::Display for OutOfTrials {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "out of trials")
+        }
+    }
+
+    impl std::error::Error for OutOfTrials {}
+
+    /// A search stopped between trials has its last observed interval to
+    /// show: a schedule that passes and one that fails, closer than the
+    /// endpoints. Run again with the outcomes of the trials it ran answered
+    /// from a journal, it makes the same decisions, runs only the trials it
+    /// had not, and finds what the uninterrupted search finds.
+    #[test]
+    fn a_stopped_search_shows_its_closest_pair_and_resumes_to_the_same_answer() {
+        let (passing, failing) = flaky_cas_endpoints();
+        let trial = |sched: &[SchedEvent]| -> TrialOutcome {
+            Ok((flaky_cas_passes(sched), sched.to_owned()))
+        };
+        let mut uninterrupted_trials = 0;
+        let uninterrupted = search_for_critical_schedule(
+            |sched: &[SchedEvent]| {
+                uninterrupted_trials += 1;
+                trial(sched)
+            },
+            passing.clone(),
+            failing.clone(),
+            &Config::default(),
+        )
+        .unwrap();
+
+        // The journal: each trial's outcome, keyed as analyze keys it, by
+        // the trial (its place in the search, which names it) and the
+        // schedule it replayed.
+        type Key = (usize, Vec<SchedEvent>);
+        let mut journal: std::collections::HashMap<Key, (bool, Vec<SchedEvent>)> =
+            std::collections::HashMap::new();
+        // Stopped halfway, after the endpoint checks and some passes.
+        let budget = uninterrupted_trials / 2;
+        assert!(budget > 2, "{uninterrupted_trials} trials");
+        let mut started = 0;
+        let mut intervals = Vec::new();
+        let stopped = search_for_critical_schedule_observed(
+            |sched: &[SchedEvent]| {
+                if started == budget {
+                    return Err(OutOfTrials.into());
+                }
+                started += 1;
+                let outcome = trial(sched)?;
+                journal.insert((started, sched.to_vec()), outcome.clone());
+                Ok(outcome)
+            },
+            passing.clone(),
+            failing.clone(),
+            &Config::default(),
+            SearchStart::Endpoints,
+            &mut |interval| {
+                intervals.push((
+                    interval.pass,
+                    interval.passing.to_vec(),
+                    interval.failing.to_vec(),
+                    interval.edit_distance,
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            stopped.downcast_ref::<OutOfTrials>().is_some(),
+            "{stopped:#}"
+        );
+        let (pass, closest_passing, closest_failing, distance) = intervals.last().unwrap();
+        assert!(*pass > 0, "the search stopped before narrowing anything");
+        assert!(flaky_cas_passes(closest_passing));
+        assert!(!flaky_cas_passes(closest_failing));
+        assert!(*distance < just_distance(&passing, &failing).0);
+
+        let (mut asked, mut resumed_trials) = (0, 0);
+        let resumed = search_for_critical_schedule(
+            |sched: &[SchedEvent]| {
+                asked += 1;
+                match journal.get(&(asked, sched.to_vec())) {
+                    Some(outcome) => Ok(outcome.clone()),
+                    None => {
+                        resumed_trials += 1;
+                        trial(sched)
+                    }
+                }
+            },
+            passing,
+            failing,
+            &Config::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.critical_event_index,
+            uninterrupted.critical_event_index
+        );
+        assert_eq!(resumed.passing_schedule, uninterrupted.passing_schedule);
+        assert_eq!(resumed.failing_schedule, uninterrupted.failing_schedule);
+        assert_eq!(budget + resumed_trials, uninterrupted_trials);
+    }
+
+    /// A search started from an interval a stopped search showed its
+    /// observer goes on as the stopped one would have: it runs only the
+    /// trials that search had not run when it reached the interval, and
+    /// finds what the uninterrupted search finds. This is how a resumed
+    /// analysis continues a bisection whose trials kept no schedules.
+    #[test]
+    fn a_search_started_from_an_observed_interval_finds_the_same_answer() {
+        let (passing, failing) = flaky_cas_endpoints();
+        let trial = |sched: &[SchedEvent]| -> TrialOutcome {
+            Ok((flaky_cas_passes(sched), sched.to_owned()))
+        };
+        let started = std::cell::Cell::new(0);
+        let mut intervals = Vec::new();
+        let uninterrupted = search_for_critical_schedule_observed(
+            |sched: &[SchedEvent]| {
+                started.set(started.get() + 1);
+                trial(sched)
+            },
+            passing.clone(),
+            failing.clone(),
+            &Config::default(),
+            SearchStart::Endpoints,
+            &mut |interval| {
+                intervals.push((
+                    interval.pass,
+                    interval.event_level,
+                    interval.passing.to_vec(),
+                    interval.failing.to_vec(),
+                    started.get(),
+                ))
+            },
+        )
+        .unwrap();
+        let uninterrupted_trials = started.get();
+        assert!(intervals.len() > 2, "{} passes", intervals.len());
+
+        for (pass, event_level, closest_passing, closest_failing, before) in &intervals[1..] {
+            let mut resumed_trials = 0;
+            let resumed = search_for_critical_schedule_observed(
+                |sched: &[SchedEvent]| {
+                    resumed_trials += 1;
+                    trial(sched)
+                },
+                closest_passing.clone(),
+                closest_failing.clone(),
+                &Config::default(),
+                SearchStart::Interval {
+                    pass: *pass,
+                    event_level: *event_level,
+                },
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(
+                resumed.critical_event_index, uninterrupted.critical_event_index,
+                "from pass {pass}"
+            );
+            assert_eq!(resumed.passing_schedule, uninterrupted.passing_schedule);
+            assert_eq!(resumed.failing_schedule, uninterrupted.failing_schedule);
+            assert_eq!(
+                before + resumed_trials,
+                uninterrupted_trials,
+                "from pass {pass}"
+            );
+        }
     }
 }

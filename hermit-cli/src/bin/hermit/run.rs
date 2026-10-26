@@ -17604,6 +17604,23 @@ impl RunOpts {
         self.timeout = Some(self.timeout.map_or(seconds, |own| own.min(seconds)));
     }
 
+    /// The `--timeout` bound in whole seconds, as [`Self::set_run_timeout`]
+    /// takes it back: `hermit analyze` shortens a run's bound to the time its
+    /// budget has left and restores the run's own afterwards.
+    pub(crate) fn run_timeout_seconds(&self) -> Option<NonZeroU64> {
+        self.timeout
+    }
+
+    pub(crate) fn set_run_timeout(&mut self, seconds: Option<NonZeroU64>) {
+        self.timeout = seconds;
+    }
+
+    /// The guest program, as the run arguments name it: none when `--image`
+    /// leaves it to the image's Entrypoint/Cmd.
+    pub(crate) fn program(&self) -> Option<&Path> {
+        self.program.as_deref()
+    }
+
     /// `--strict` promises a deterministic run, and on the ptrace and e9patch
     /// backends the virtual clock and the preemption points are the guest's
     /// retired conditional branches, read from a performance counter. Where

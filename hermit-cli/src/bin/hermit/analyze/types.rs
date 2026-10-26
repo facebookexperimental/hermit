@@ -21,7 +21,18 @@ use serde::Deserialize;
 use serde::Serialize;
 use tracing::metadata::LevelFilter;
 
+use crate::app::analyze::budget::Budget;
+use crate::app::analyze::budget::BudgetKind;
+use crate::app::analyze::budget::TimeBudget;
+use crate::app::analyze::budget::TrialBudget;
+use crate::app::analyze::checkpoint::BisectInterval;
+use crate::app::analyze::checkpoint::Journal;
+use crate::app::analyze::checkpoint::Phase;
+use crate::app::analyze::checkpoint::PrefixBracket;
+use crate::app::analyze::checkpoint::Progress;
+use crate::app::analyze::checkpoint::ProgressHandle;
 use crate::app::analyze::races::RacingAccesses;
+use crate::app::analyze::rundata::TrialRunner;
 use crate::app::analyze::verdict::Verdict;
 use crate::app::analyze::verdict::VerdictReason;
 
@@ -354,6 +365,54 @@ pub struct AnalyzeOpts {
     #[clap(long)]
     pub keep_tmp: bool,
 
+    /// Wall-clock time this invocation may spend before it reports what it has found so far:
+    /// `off` (the default), or a whole number of seconds, minutes or hours (`1800`, `30m`,
+    /// `2h`).
+    ///
+    /// The budget is checked before every run, and each run's `--timeout` is shortened to the
+    /// time left. A run the budget cuts short is thrown away, not counted as not meeting the
+    /// target, so the budget decides only when analyze stops, never what it finds. When it runs
+    /// out, analyze reports its best answer so far and exits 120 (a partial result): the
+    /// default search's current pair of schedules, whose replays miss and meet the target, and
+    /// the first event at which they differ; or `--prefix-search`'s bracket, the longest prefix
+    /// known to miss the target and the shortest known to meet it. The report says that it is
+    /// partial, why, and which phase was running, after the stderr line
+    /// `HERMIT_ANALYZE_PARTIAL class=time-budget`. The workspace is then kept, even without
+    /// --keep-tmp, and the report gives the command that continues the analysis (--resume).
+    /// The default search's report replays its two schedules for their stacks only when two
+    /// such runs fit min(120 s, 5% of the budget) after it ran out; the report says when they
+    /// did not. Computation between runs (the default search's schedule distances) is not
+    /// interrupted, so analyze may overrun the budget by that much.
+    #[clap(long, value_name = "DURATION|off", default_value = "off")]
+    pub time_budget: TimeBudget,
+
+    /// How many runs this invocation may start before it reports what it has found so far:
+    /// `off` (the default) or a number. Ends like --time-budget does
+    /// (`HERMIT_ANALYZE_PARTIAL class=trial-budget`, exit 120). Runs a resumed analysis
+    /// answers from its journal (--resume) do not count.
+    #[clap(long, value_name = "N|off", default_value = "off")]
+    pub trial_budget: TrialBudget,
+
+    /// Continue the analysis whose workspace this is, instead of starting a new one.
+    ///
+    /// Analyze writes, as it goes, every finished run's outcome into its workspace
+    /// (analyze-journal.jsonl), with what the analysis is of (analyze-checkpoint.json) and the
+    /// search's current interval or bracket (analyze-progress.json). A workspace a budget kept
+    /// (see --time-budget), or that --keep-tmp kept or a SIGKILL left, can be resumed: pass the
+    /// same arguments and --resume=WORKSPACE. The analysis then runs again from its start, and
+    /// every run the journal holds takes its recorded outcome instead of running; the default
+    /// search restarts at the pass whose interval the progress names, from that interval's two
+    /// schedules. So it makes the same decisions as before and goes on from where it stopped:
+    /// a resumed analysis reports what an uninterrupted one would. It refuses (exit 122) when
+    /// the hermit binary, the guest program, the run arguments, the target criteria, the search
+    /// options and --max-log-bytes, the record or schedule files given as runs, or
+    /// --analyze-seed differ from the recorded ones, and names each difference. It is refused
+    /// with an `--image` run (exit 122), as --time-budget and --trial-budget are: analyze
+    /// cannot show an image's guest unchanged. --tmp-dir is not used. The workspace is removed or kept as for any analysis once the resumed
+    /// analysis finishes; one that errors or is stopped keeps it.
+    #[clap(long, value_name = "WORKSPACE")]
+    pub resume: Option<PathBuf>,
+
     /// Specify that analyze itself should return a non-zero exit code on success.
     /// This is needed under esoteric invocation scenarios. It is an exit status, 0 to 255, and
     /// 2 and 120 to 127 are refused: analyze exits 2 when its inputs do not give it what it
@@ -410,6 +469,40 @@ pub struct AnalyzeOpts {
     /// (`crate::app::time_skip_carry`). Shared by every copy of these options.
     #[clap(skip)]
     pub time_skip_sources: crate::app::time_skip_carry::SharedTimeSkipSources,
+
+    /// The invocation's --time-budget and --trial-budget, counted from
+    /// `AnalyzeOpts::main`; shared by every copy of these options.
+    #[clap(skip)]
+    pub budget: Budget,
+
+    /// The journal of finished runs in the workspace (`checkpoint`); off
+    /// until `AnalyzeOpts::main` opens it, and for `hermit bisect`.
+    #[clap(skip)]
+    pub journal: Journal,
+
+    /// The phase running and the search's interval or bracket, written into
+    /// the workspace as they change.
+    #[clap(skip)]
+    pub progress: ProgressHandle,
+
+    /// Whether `--analyze-seed` was drawn from system randomness by this
+    /// analysis rather than given (its warnings still say so).
+    #[clap(skip)]
+    pub analyze_seed_drawn: bool,
+
+    /// Set once a partial report is written: the workspace is then kept.
+    #[clap(skip)]
+    pub partial_report_written: bool,
+
+    /// `--resume`: the progress the earlier invocation wrote, whose interval
+    /// the default search restarts from.
+    #[clap(skip)]
+    pub resumed_progress: Option<Progress>,
+
+    /// What runs each trial's guest; unset, `RunData::run_now` does. Tests
+    /// set it to drive the searches without a guest.
+    #[clap(skip)]
+    pub trial_runner: TrialRunner,
 }
 
 /// `--continuation-timeslice`.
@@ -683,6 +776,44 @@ pub struct Report {
     /// event (`--no-racing-accesses` leaves it out).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub racing_accesses: Option<RacingAccesses>,
+
+    /// Set when a budget (--time-budget, --trial-budget) ended the analysis
+    /// before it found the critical events: what it found so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialReport>,
+}
+
+/// What a partial report adds: why the analysis stopped, where, its best
+/// answer so far, and how to continue it.
+#[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+pub struct PartialReport {
+    /// The budget that ran out.
+    pub reason: BudgetKind,
+    /// The phase that was running.
+    pub phase: Phase,
+    /// Wall-clock seconds this invocation ran, and its budget, if any.
+    pub elapsed_seconds: u64,
+    pub time_budget_seconds: Option<u64>,
+    /// Runs this invocation started, its budget, if any, and the runs it
+    /// answered from the journal of an earlier invocation.
+    pub runs_started: u64,
+    pub trial_budget: Option<u64>,
+    pub runs_from_journal: u64,
+    /// The run the time budget cut short, whose outcome was not counted.
+    pub cut_run: Option<String>,
+    /// The default search's interval, if it got that far.
+    pub interval: Option<BisectInterval>,
+    /// `--prefix-search`'s bracket, if it got that far.
+    pub bracket: Option<PrefixBracket>,
+    /// The search's result, if it had one before the stack traces.
+    pub decided: Option<String>,
+    /// Whether the stack traces were taken, or why not.
+    pub stacks: String,
+    /// Commands that replay the runs the report rests on.
+    pub replay_commands: Vec<String>,
+    /// The kept workspace, and the command that continues the analysis.
+    pub workspace: PathBuf,
+    pub resume_command: String,
 }
 
 /// Runtime context for a critical event included in the analyze report.

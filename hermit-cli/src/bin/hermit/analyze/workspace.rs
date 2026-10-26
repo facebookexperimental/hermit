@@ -73,18 +73,33 @@ impl Workspace {
         })
     }
 
+    /// The workspace of an earlier analysis at `path`, which `--resume`
+    /// continues: removed or kept as `retention` says, like a fresh one.
+    pub fn adopt(path: &Path, retention: Retention) -> anyhow::Result<Self> {
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("cannot resume in {}", path.display()))?;
+        anyhow::ensure!(
+            path.is_dir(),
+            "cannot resume in {}: not a directory",
+            path.display()
+        );
+        Ok(Self {
+            path,
+            retention,
+            closed: false,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Keep the workspace, `because` (said on the line that names it), if it
-    /// was to be removed.
+    /// Keep the workspace whatever its retention said, `because` of this.
     pub fn keep(&mut self, because: &'static str) {
-        if self.retention == Retention::Remove {
-            self.retention = Retention::Keep {
-                because: Some(because),
-            };
-        }
+        self.retention = Retention::Keep {
+            because: Some(because),
+        };
     }
 
     /// Remove the workspace, or keep it, and return the line that says

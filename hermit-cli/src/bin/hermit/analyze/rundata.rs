@@ -33,6 +33,11 @@ use hermit::process::Bind;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
 
+use crate::app::analyze::budget::BudgetExpired;
+use crate::app::analyze::checkpoint::Journal;
+use crate::app::analyze::checkpoint::JournalEntry;
+use crate::app::analyze::checkpoint::RecordedEnd;
+use crate::app::analyze::checkpoint::RecordedFile;
 use crate::app::analyze::consts::*;
 use crate::app::analyze::stop;
 use crate::app::analyze::types::AnalyzeOpts;
@@ -48,6 +53,25 @@ use crate::app::analyze::verdict::TimingSetting;
 use crate::app::container::RunTimeoutMarker;
 use crate::app::global_opts::GlobalOpts;
 use crate::app::run::RunOpts;
+
+/// What runs a trial's guest in place of [`RunData::run_now`]. Production
+/// never sets one: it is a seam for tests, which drive analyze's searches,
+/// the journal and resume through [`RunData::launch`] without a guest.
+pub type TrialFn = dyn Fn(&mut RunData) -> anyhow::Result<()> + Send + Sync;
+
+/// [`AnalyzeOpts::trial_runner`]: unset, or a [`TrialFn`].
+#[derive(Clone, Default)]
+pub struct TrialRunner(pub Option<std::sync::Arc<TrialFn>>);
+
+impl std::fmt::Debug for TrialRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "TrialRunner(set)"
+        } else {
+            "TrialRunner(unset)"
+        })
+    }
+}
 
 /// A single run plus the results of the run, either in memory or on disk.
 pub struct RunData {
@@ -84,6 +108,12 @@ pub struct RunData {
     trial_bound: Option<NonZeroU64>,
     /// How long the run took, once it finished.
     wall: Option<Duration>,
+    /// The log file the run wrote, once it launched (`--verbose` or
+    /// `--selfcheck`).
+    logged_to: Option<PathBuf>,
+    /// The size of that log as the journal recorded it, for a run the
+    /// journal answered.
+    journaled_log_bytes: Option<u64>,
 }
 
 impl RunData {
@@ -301,7 +331,219 @@ impl RunData {
     ///
     /// Once a stop signal has arrived (`stop`), no run starts, and the run it
     /// ended reports the stop instead of its own outcome.
+    ///
+    /// With the journal on (`checkpoint`), a run the journal already holds,
+    /// with the files it wrote still there, takes its recorded outcome
+    /// instead of running, and a run that finished, or that its own bound or
+    /// a refusal stopped, is journaled before its outcome is read. Once a
+    /// budget has run out no run starts (`BudgetExpired`). A run gets at most
+    /// the time the budget has left as its `--timeout`; one that this
+    /// shortened bound ends is cut: its outcome came from the budget, not the
+    /// guest, so it is not journaled and the analysis stops
+    /// (`BudgetExpired`), to run it again when resumed.
     pub fn launch(&mut self) -> anyhow::Result<()> {
+        stop::check()?;
+        let journal = self.analyze_opts.journal.clone();
+        let key = if journal.is_on() {
+            Some(self.journal_key())
+        } else {
+            None
+        };
+        if let Some(key) = &key
+            && let Some(entry) = journal.lookup(key)
+            && let Some(answered) = self.answer_from_journal(&entry)?
+        {
+            journal.note_answered();
+            return answered;
+        }
+        let own_timeout = self.runopts.run_timeout_seconds();
+        let shortened = self.bound_by_budget()?;
+        let launched = match self.analyze_opts.trial_runner.0.clone() {
+            Some(run) => run(self),
+            None => self.run_now(own_timeout),
+        };
+        self.runopts.set_run_timeout(own_timeout);
+        if shortened
+            && launched
+                .as_ref()
+                .is_err_and(|error| error.downcast_ref::<RunTimeoutMarker>().is_some())
+        {
+            return Err(self.analyze_opts.budget.cut(&self.runname).into());
+        }
+        if let Some(key) = key {
+            self.journal_outcome(&journal, key, &launched)?;
+        }
+        launched
+    }
+
+    /// Start the budget's count of this run and shorten its `--timeout` to
+    /// the time left; whether it shortened it. `Err` once a budget has run
+    /// out. A backend on which analyze cannot bound a run with `--timeout`
+    /// gets no shorter bound: the budget then stops analyze between runs.
+    fn bound_by_budget(&mut self) -> Result<bool, BudgetExpired> {
+        let Some(left) = self.analyze_opts.budget.start_trial()? else {
+            return Ok(false);
+        };
+        if !self.runopts.accepts_run_timeout()
+            || self
+                .runopts
+                .run_timeout_seconds()
+                .is_some_and(|own| own <= left)
+        {
+            return Ok(false);
+        }
+        self.runopts.bound_run_timeout(left);
+        Ok(true)
+    }
+
+    /// What names this run in the journal: its name, its `hermit run`
+    /// command (with its own `--timeout`, never the budget's), and the
+    /// contents of the schedule or record it replays.
+    fn journal_key(&self) -> String {
+        let mut material = format!("{}\n{}\n", self.runname, self.to_repro());
+        let config = &self.runopts.det_opts.det_config;
+        for input in [
+            &config.replay_schedule_from,
+            &config.replay_preemptions_from,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let digest = detcore::Digest::digest_path(input)
+                .map_or_else(|_| "unreadable".to_owned(), |digest| digest.to_string());
+            material.push_str(&format!("{}={digest}\n", input.display()));
+        }
+        detcore::Digest::new(material.as_bytes()).to_string()
+    }
+
+    /// Take `entry`'s outcome instead of running, as `launch` returns it:
+    /// `None` when a file the run wrote is gone or changed, and the run must
+    /// run again. A recording that analyze removed is restored from the
+    /// schedule it replayed when the two hold the same events.
+    fn answer_from_journal(
+        &mut self,
+        entry: &JournalEntry,
+    ) -> anyhow::Result<Option<anyhow::Result<()>>> {
+        let workspace = self.analyze_opts.get_tmp()?.to_path_buf();
+        let mut restored = None;
+        if let Some((recorded, replayed)) = &entry.recording_replays_input {
+            let (recorded_path, replayed_path) =
+                (workspace.join(recorded), workspace.join(replayed));
+            if !recorded_path.exists() && replayed_path.exists() {
+                std::fs::copy(&replayed_path, &recorded_path).with_context(|| {
+                    format!(
+                        "cannot restore {} from {}",
+                        recorded_path.display(),
+                        replayed_path.display()
+                    )
+                })?;
+                restored = Some(recorded);
+            }
+        }
+        for output in &entry.outputs {
+            if restored == Some(&output.path) {
+                continue;
+            }
+            match detcore::Digest::digest_path(workspace.join(&output.path)) {
+                Ok(digest) if digest.to_string() == output.sha256 => {}
+                _ => return Ok(None),
+            }
+        }
+        self.logged_to = self.trial_global_opts().log_file;
+        self.journaled_log_bytes = entry.log_bytes;
+        eprintln!(
+            ":: {} answered from the journal of an earlier invocation: {}",
+            self.runname,
+            match entry.end {
+                RecordedEnd::Finished { matched: true } => "met the target",
+                RecordedEnd::Finished { matched: false } => "missed the target",
+                RecordedEnd::Timeout => "its bound stopped it",
+                RecordedEnd::Refusal => "Hermit refused it",
+            }
+        );
+        Ok(Some(match entry.end {
+            RecordedEnd::Finished { matched } => {
+                self.is_a_match = Some(matched);
+                self.wall = entry.wall_ms.map(Duration::from_millis);
+                Ok(())
+            }
+            RecordedEnd::Timeout => {
+                Err(self.name_the_trial_bound(anyhow::Error::new(RunTimeoutMarker)))
+            }
+            RecordedEnd::Refusal => Err(anyhow::Error::new(crate::app::container::PolicyRefusal)),
+        }))
+    }
+
+    /// Journal the run that `launched` as it did, keyed `key`. A run that
+    /// ended any other way than finishing, its own bound or a refusal is not
+    /// journaled: it ends the analysis, and a resume runs it again.
+    fn journal_outcome(
+        &mut self,
+        journal: &Journal,
+        key: String,
+        launched: &anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let end = match launched {
+            Ok(()) => RecordedEnd::Finished {
+                matched: self.is_a_match(),
+            },
+            Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                RecordedEnd::Timeout
+            }
+            Err(error) if guest_reached_a_refusal(error) => RecordedEnd::Refusal,
+            Err(_) => return Ok(()),
+        };
+        let workspace = self.analyze_opts.get_tmp()?.to_path_buf();
+        let relative = |path: &Path| path.strip_prefix(&workspace).unwrap_or(path).to_path_buf();
+        let root = self.root_path();
+        let config = &self.runopts.det_opts.det_config;
+        // Not its log: a trial log can be hundreds of megabytes, and nothing
+        // decides from it; its size is in `log_bytes`.
+        let mut written = vec![root.with_extension("stdout"), root.with_extension("stderr")];
+        written.extend(config.record_preemptions_to.clone());
+        written.extend(
+            config
+                .stacktrace_event
+                .iter()
+                .filter_map(|(_, path)| path.clone()),
+        );
+        let mut outputs = Vec::new();
+        for path in written {
+            if let Ok(digest) = detcore::Digest::digest_path(&path) {
+                outputs.push(RecordedFile {
+                    path: relative(&path),
+                    sha256: digest.to_string(),
+                });
+            }
+        }
+        let recording_replays_input =
+            match (&config.record_preemptions_to, &config.replay_schedule_from) {
+                (Some(recorded), Some(replayed)) if recorded.exists() && replayed.exists() => {
+                    let events = |path: &Path| PreemptionReader::new(path).load_all();
+                    (events(recorded).schedevents() == events(replayed).schedevents())
+                        .then(|| (relative(recorded), relative(replayed)))
+                }
+                _ => None,
+            };
+        journal.record(JournalEntry {
+            run: self.runname.clone(),
+            key,
+            end,
+            wall_ms: self.wall.map(|wall| wall.as_millis() as u64),
+            log_bytes: self
+                .logged_to
+                .as_ref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len()),
+            outputs,
+            recording_replays_input,
+        })
+    }
+
+    /// Run it: the part of `launch` that starts the guest. `own_timeout` is
+    /// the run's `--timeout` before the budget shortened it, which its
+    /// reproducer carries.
+    fn run_now(&mut self, own_timeout: Option<NonZeroU64>) -> anyhow::Result<()> {
         stop::check()?;
         let root = self.root_path();
         let gopts = self.trial_global_opts();
@@ -312,6 +554,7 @@ impl RunData {
         // /tmp -- but the fix is the same and costs nothing.
         let mut gopts = gopts;
         gopts.open_log_file()?;
+        self.logged_to = gopts.log_file.clone();
         let final_record_path = self
             .runopts
             .det_opts
@@ -334,8 +577,7 @@ impl RunData {
         // numbering of the guest's process IDs.
         self.runopts.prepare_trial_guest_ids()?;
 
-        let repro_file = self.root_path().with_extension("repro");
-        std::fs::write(repro_file, self.to_repro() + "\n")?;
+        self.write_repro(own_timeout)?;
         self.runopts.write_debug_options_dump()?;
 
         let started = Instant::now();
@@ -385,6 +627,18 @@ impl RunData {
         Ok(())
     }
 
+    /// Write the run's reproducer, `<run>.repro`, with `own_timeout`, its
+    /// `--timeout` before the budget shortened it: a command to replay it
+    /// does not carry the time an invocation happened to have left.
+    fn write_repro(&mut self, own_timeout: Option<NonZeroU64>) -> anyhow::Result<()> {
+        let bounded = self.runopts.run_timeout_seconds();
+        self.runopts.set_run_timeout(own_timeout);
+        let repro = self.to_repro();
+        self.runopts.set_run_timeout(bounded);
+        std::fs::write(self.root_path().with_extension("repro"), repro + "\n")?;
+        Ok(())
+    }
+
     /// Bound the run's wall-clock time ([`AnalyzeOpts::trial_bound`]) by the
     /// endpoint runs measured before it was created.
     fn apply_trial_bound(&mut self) {
@@ -425,12 +679,25 @@ impl RunData {
             return None;
         }
         let wall = self.wall?;
-        let log_bytes = self
-            .trial_global_opts()
-            .log_file
-            .and_then(|path| std::fs::metadata(path).ok())
-            .map(|metadata| metadata.len());
+        let log_bytes = self.journaled_log_bytes.or_else(|| {
+            self.logged_to
+                .as_ref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len())
+        });
         Some((wall, log_bytes))
+    }
+
+    /// A test's trial runner ([`TrialRunner`]) ends a run as `run_now`
+    /// would: its output written, whether it `matched` and its `wall` time.
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&mut self, matched: bool, wall: Duration) {
+        let root = self.root_path();
+        let said = if matched { "FAILED\n" } else { "PASSED\n" };
+        std::fs::write(root.with_extension("stdout"), said).unwrap();
+        std::fs::write(root.with_extension("stderr"), "").unwrap();
+        self.is_a_match = Some(matched);
+        self.wall = Some(wall);
     }
 
     /// This run's name in the workspace.
@@ -524,6 +791,8 @@ impl RunData {
             log_level,
             trial_bound: None,
             wall: None,
+            logged_to: None,
+            journaled_log_bytes: None,
         };
 
         // By default we save the config for every run.
@@ -651,6 +920,12 @@ impl RunData {
         Ok(())
     }
 
+    /// The run arguments as `hermit run` parses them, before analyze changes
+    /// anything.
+    pub fn raw_runopts(aopts: &AnalyzeOpts) -> RunOpts {
+        Self::get_raw_runopts(aopts)
+    }
+
     /// The raw, unvarnished, RunOpts.
     fn get_raw_runopts(aopts: &AnalyzeOpts) -> RunOpts {
         // Bogus arg 0 for CLI argument parsing:
@@ -747,6 +1022,8 @@ impl RunData {
             is_a_match: Some(true),
             trial_bound: None,
             wall: None,
+            logged_to: None,
+            journaled_log_bytes: None,
         }
     }
 
@@ -774,6 +1051,8 @@ impl RunData {
             is_a_match: None,
             trial_bound: None,
             wall: None,
+            logged_to: None,
+            journaled_log_bytes: None,
         }
     }
 
@@ -4584,6 +4863,284 @@ mod tests {
         assert_ne!(normalized, record, "normalizing renumbers the priorities");
         assert_eq!(run.preempts_path_out(), recorded.as_path());
         assert_eq!(run.preempts_out(), &record);
+    }
+
+    /// Analyze options with their workspace in `dir` and the journal on.
+    fn journaled_options(dir: &Path) -> AnalyzeOpts {
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", "--", "--chaos", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(dir.to_path_buf());
+        options.journal = Journal::open(dir).unwrap();
+        options
+    }
+
+    /// A run the journal holds, with the files it wrote unchanged, takes its
+    /// recorded outcome and wall time instead of running: `launch` here would
+    /// otherwise start a guest. A changed file makes it run again.
+    #[test]
+    fn a_journaled_run_takes_its_recorded_outcome_instead_of_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = journaled_options(dir.path());
+        let mut first = RunData::new_baseline(&options, "prefix_round_007".into()).unwrap();
+        let stdout = first.root_path().with_extension("stdout");
+        std::fs::write(&stdout, "FAILED\n").unwrap();
+        first.is_a_match = Some(true);
+        first.wall = Some(Duration::from_millis(2500));
+        let key = first.journal_key();
+        first
+            .journal_outcome(&options.journal, key.clone(), &Ok(()))
+            .unwrap();
+        let entry = options.journal.lookup(&key).unwrap();
+        assert_eq!(entry.end, RecordedEnd::Finished { matched: true });
+        assert_eq!(entry.wall_ms, Some(2500));
+        assert_eq!(entry.outputs.len(), 1, "{:?}", entry.outputs);
+        assert_eq!(entry.outputs[0].path, Path::new("prefix_round_007.stdout"));
+
+        // A later invocation's run of the same trial: answered.
+        let reopened = journaled_options(dir.path());
+        let mut again = RunData::new_baseline(&reopened, "prefix_round_007".into()).unwrap();
+        again.launch().unwrap();
+        assert!(again.is_a_match());
+        assert_eq!(
+            again.measurement(),
+            Some((Duration::from_millis(2500), None))
+        );
+        assert_eq!(reopened.journal.answered(), 1);
+
+        // Another trial (another name, so another key) is not.
+        let other = RunData::new_baseline(&reopened, "prefix_round_008".into()).unwrap();
+        assert_ne!(other.journal_key(), key);
+
+        // A file it wrote changed: it runs again.
+        std::fs::write(&stdout, "PASSED\n").unwrap();
+        let mut changed = RunData::new_baseline(&reopened, "prefix_round_007".into()).unwrap();
+        assert!(changed.answer_from_journal(&entry).unwrap().is_none());
+    }
+
+    /// A run its own bound stopped is journaled as such, and answered as the
+    /// same unfinished trial; one a refusal stopped likewise.
+    #[test]
+    fn a_journaled_timeout_or_refusal_is_answered_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = journaled_options(dir.path());
+        for (name, error, expected) in [
+            (
+                "bisect_round_001",
+                anyhow::Error::new(RunTimeoutMarker),
+                TrialEnd::Unfinished(Stop::Bound),
+            ),
+            (
+                "bisect_round_002",
+                anyhow::Error::new(crate::app::container::PolicyRefusal),
+                TrialEnd::Unfinished(Stop::Refusal),
+            ),
+        ] {
+            let mut first = RunData::new_baseline(&options, name.into()).unwrap();
+            let key = first.journal_key();
+            first
+                .journal_outcome(&options.journal, key, &Err(error))
+                .unwrap();
+            let mut again = RunData::new_baseline(&options, name.into()).unwrap();
+            assert_eq!(again.launch_trial().unwrap(), expected, "{name}");
+        }
+        // Any other error is not journaled: it ends the analysis, and a
+        // resume runs the trial again.
+        let mut failed = RunData::new_baseline(&options, "bisect_round_003".into()).unwrap();
+        let key = failed.journal_key();
+        failed
+            .journal_outcome(
+                &options.journal,
+                key.clone(),
+                &Err(anyhow::anyhow!("log cap")),
+            )
+            .unwrap();
+        assert_eq!(options.journal.lookup(&key), None);
+    }
+
+    /// A recording that analyze removed after reading it (to save disk) is
+    /// restored from the schedule the run replayed, when the two held the
+    /// same events, instead of running the trial again.
+    #[test]
+    fn a_removed_recording_is_restored_from_the_schedule_it_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = journaled_options(dir.path());
+        let events = vec![
+            SchedEvent::branches(detcore::types::DetTid::from_raw(3), 5),
+            SchedEvent::branches(detcore::types::DetTid::from_raw(4), 2),
+        ];
+        let make = || {
+            let mut run = RunData::new_baseline(&options, "bisect_round_004".into())
+                .unwrap()
+                .with_schedule_replay()
+                .with_schedule_recording();
+            let replayed = run.sched_path_in().to_path_buf();
+            options
+                .write_trial_schedule(events.clone(), &replayed)
+                .unwrap();
+            run
+        };
+        let mut first = make();
+        let recorded = first.sched_path_out().to_path_buf();
+        PreemptionRecord::from_sched_events(events.clone())
+            .write_to_disk(&recorded)
+            .unwrap();
+        first.is_a_match = Some(false);
+        let key = first.journal_key();
+        first
+            .journal_outcome(&options.journal, key.clone(), &Ok(()))
+            .unwrap();
+        assert!(
+            options
+                .journal
+                .lookup(&key)
+                .unwrap()
+                .recording_replays_input
+                .is_some()
+        );
+        std::fs::remove_file(&recorded).unwrap();
+        std::fs::remove_file(first.sched_path_in()).unwrap();
+
+        let mut again = make();
+        again.launch().unwrap();
+        assert!(!again.is_a_match());
+        assert_eq!(again.sched_out().unwrap(), &events);
+    }
+
+    /// The budget shortens a run's `--timeout` to the time it has left,
+    /// unless the run's own bound is shorter, and no run starts once it is
+    /// spent.
+    #[test]
+    fn the_budget_bounds_each_run_and_starts_none_once_spent() {
+        use crate::app::analyze::budget::Budget;
+        use crate::app::analyze::budget::BudgetKind;
+        use crate::app::analyze::budget::TimeBudget;
+        use crate::app::analyze::budget::TrialBudget;
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = journaled_options(dir.path());
+        options.budget = Budget::with_clock(
+            TimeBudget::Limit(Duration::from_secs(100)),
+            TrialBudget::Limit(NonZeroU64::new(2).unwrap()),
+            std::sync::Arc::new(|| Duration::from_secs(40)),
+        );
+        let mut run = RunData::new_baseline(&options, "prefix_round_001".into()).unwrap();
+        assert_eq!(run.runopts.run_timeout_seconds(), None);
+        assert!(run.bound_by_budget().unwrap());
+        assert_eq!(run.runopts.run_timeout_seconds(), NonZeroU64::new(60));
+
+        let mut own = RunData::new_baseline(&options, "prefix_round_002".into()).unwrap();
+        own.runopts.bound_run_timeout(NonZeroU64::new(30).unwrap());
+        assert!(!own.bound_by_budget().unwrap(), "its own 30 s is shorter");
+        assert_eq!(own.runopts.run_timeout_seconds(), NonZeroU64::new(30));
+
+        // The trial budget of two is spent: launch starts nothing.
+        let mut third = RunData::new_baseline(&options, "prefix_round_003".into()).unwrap();
+        let error = third.launch().unwrap_err();
+        let expired = error.downcast_ref::<BudgetExpired>().unwrap();
+        assert_eq!(expired.kind, BudgetKind::TrialBudget);
+        assert!(!third.has_launched());
+    }
+
+    /// The key names the contents of the schedule a run replays, not only
+    /// its name and command: the same trial replaying another schedule is
+    /// another run.
+    #[test]
+    fn the_key_names_what_the_run_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = journaled_options(dir.path());
+        let events = |count| {
+            vec![SchedEvent::branches(
+                detcore::types::DetTid::from_raw(3),
+                count,
+            )]
+        };
+        let mut run = RunData::new_baseline(&options, "bisect_round_005".into())
+            .unwrap()
+            .with_schedule_replay();
+        let path = run.sched_path_in().to_path_buf();
+        options.write_trial_schedule(events(5), &path).unwrap();
+        let first = run.journal_key();
+        options.write_trial_schedule(events(6), &path).unwrap();
+        assert_ne!(run.journal_key(), first);
+        options.write_trial_schedule(events(5), &path).unwrap();
+        assert_eq!(run.journal_key(), first);
+    }
+
+    /// A run that the budget's shortened `--timeout` ends is cut: the
+    /// analysis stops with the budget's error, journals nothing (a resume
+    /// runs it again) and gives the run its own bound back. The same end
+    /// under the run's own, shorter bound is the run's outcome, journaled as
+    /// a timeout.
+    #[test]
+    fn a_run_the_budgets_bound_ends_is_cut_and_not_journaled() {
+        use crate::app::analyze::budget::Budget;
+        use crate::app::analyze::budget::BudgetKind;
+        use crate::app::analyze::budget::TimeBudget;
+        use crate::app::analyze::budget::TrialBudget;
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = journaled_options(dir.path());
+        options.budget = Budget::with_clock(
+            TimeBudget::Limit(Duration::from_secs(100)),
+            TrialBudget::Off,
+            std::sync::Arc::new(|| Duration::from_secs(40)),
+        );
+        let bounds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bounds.clone();
+        options.trial_runner = TrialRunner(Some(std::sync::Arc::new(move |run: &mut RunData| {
+            seen.lock().unwrap().push(run.runopts.run_timeout_seconds());
+            Err(anyhow::Error::new(RunTimeoutMarker))
+        })));
+
+        let mut own = RunData::new_baseline(&options, "prefix_round_001".into()).unwrap();
+        own.runopts.bound_run_timeout(NonZeroU64::new(30).unwrap());
+        assert_eq!(
+            own.launch_trial().unwrap(),
+            TrialEnd::Unfinished(Stop::Bound)
+        );
+        assert_eq!(options.journal.len(), 1, "its own bound ended it");
+
+        let mut cut = RunData::new_baseline(&options, "prefix_round_002".into()).unwrap();
+        let error = cut.launch().unwrap_err();
+        let expired = error
+            .downcast_ref::<BudgetExpired>()
+            .unwrap_or_else(|| panic!("{error:#}"));
+        assert_eq!(expired.kind, BudgetKind::TimeBudget);
+        assert_eq!(expired.cut.as_deref(), Some("prefix_round_002"));
+        assert_eq!(options.journal.len(), 1, "the cut run is not journaled");
+        assert_eq!(cut.runopts.run_timeout_seconds(), None);
+        assert_eq!(
+            *bounds.lock().unwrap(),
+            [NonZeroU64::new(30), NonZeroU64::new(60)]
+        );
+    }
+
+    /// A run's reproducer carries its own `--timeout`, never the shorter one
+    /// the budget gave it.
+    #[test]
+    fn the_reproducer_carries_the_runs_own_bound() {
+        use crate::app::analyze::budget::Budget;
+        use crate::app::analyze::budget::TimeBudget;
+        use crate::app::analyze::budget::TrialBudget;
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = journaled_options(dir.path());
+        options.budget = Budget::with_clock(
+            TimeBudget::Limit(Duration::from_secs(100)),
+            TrialBudget::Off,
+            std::sync::Arc::new(|| Duration::from_secs(40)),
+        );
+        for (name, own) in [
+            ("prefix_round_001", None),
+            ("prefix_round_002", NonZeroU64::new(200)),
+        ] {
+            let mut run = RunData::new_baseline(&options, name.into()).unwrap();
+            run.runopts.set_run_timeout(own);
+            assert!(run.bound_by_budget().unwrap());
+            assert_eq!(run.runopts.run_timeout_seconds(), NonZeroU64::new(60));
+            run.write_repro(own).unwrap();
+            let repro = std::fs::read_to_string(run.root_path().with_extension("repro")).unwrap();
+            assert!(!repro.contains("--timeout=60"), "{repro}");
+            assert_eq!(repro.contains("--timeout=200"), own.is_some(), "{repro}");
+            assert_eq!(run.runopts.run_timeout_seconds(), NonZeroU64::new(60));
+        }
     }
 }
 
