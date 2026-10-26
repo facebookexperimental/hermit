@@ -12,9 +12,12 @@
 //! the target continuation takes the two accesses' stacks.
 //!
 //! The section never fails the analysis: whatever stops it (a backend or mode
-//! the access trace refuses, a replay that left its schedule, an unreadable
-//! trace) becomes status `unavailable` with the reason, and a stack replay
-//! that goes wrong leaves the stacks out with a note.
+//! the access trace refuses, an unreadable trace) becomes status
+//! `unavailable` with the reason, and a stack replay that goes wrong leaves
+//! the stacks out with a note. A replay that left its schedule before the
+//! deciding event (the two-seed search's interleavings cannot always be
+//! realized) is compared as it ran: from the first event at which the two
+//! replays run different threads, the event the stack recovery uses too.
 
 use std::fs::File;
 use std::io::BufRead;
@@ -167,21 +170,64 @@ impl AnalyzeOpts {
     /// The section for `target` and `baseline`, two replays whose schedules
     /// agree before `decision`. `stack_run` builds the replay of the target
     /// continuation the stacks are taken from (it gets the run's name).
+    ///
+    /// When a replay left its schedule before `decision`, the two replays
+    /// are compared as they ran instead, from the first event at which their
+    /// realized schedules run different threads: before it they ran alike,
+    /// so the window lemma holds there, and the traces record what ran. That
+    /// takes `target_met`, the target replay still meeting the target: two
+    /// runs that both pass would otherwise yield a confident pair, so
+    /// without it a replay that left its schedule leaves the section
+    /// unavailable.
     pub(super) fn racing_accesses(
         &self,
         decision: usize,
         target: TracedReplay,
         baseline: TracedReplay,
+        target_met: bool,
         stack_run: impl FnOnce(&str) -> anyhow::Result<RunData>,
     ) -> RacingAccesses {
-        let decision = decision as EventIndex;
-        let traces = [&target, &baseline].map(|replay| self.read_trace(decision, replay));
+        let mut decision = decision as EventIndex;
+        let realized = if target_met {
+            realized_window(decision, &target, &baseline)
+        } else {
+            None
+        };
+        if let Some((split, _)) = &realized {
+            decision = *split;
+        }
+        let as_ran = realized.is_some();
+        let traces = [&target, &baseline].map(|replay| self.read_trace(decision, replay, as_ran));
         let [target_trace, baseline_trace] = match traces {
             [Ok(target), Ok(baseline)] => [target, baseline],
             [Err(reason), _] | [_, Err(reason)] => {
                 return RacingAccesses::unavailable(decision, reason);
             }
         };
+        // A replay that left its schedule before its trace begins left too
+        // early to compare the two as they ran: no --access-trace-from of the
+        // final replays reaches back there.
+        if as_ran {
+            let first = target_trace
+                .trace
+                .header
+                .from
+                .max(baseline_trace.trace.header.from);
+            if decision < first {
+                let role = [&target, &baseline]
+                    .into_iter()
+                    .find(|replay| replay.departure.is_some())
+                    .map_or("target", |replay| replay.role);
+                return RacingAccesses::unavailable(
+                    decision,
+                    format!(
+                        "the {role} replay left its schedule too early: the two replays first \
+                         run different threads at event {decision}, before their traces begin \
+                         (event {first})"
+                    ),
+                );
+            }
+        }
         // The root process's thread runs the first event of every schedule;
         // as a thread-group leader its thread id is its process id.
         let root = target
@@ -211,6 +257,9 @@ impl AnalyzeOpts {
                 ));
             }
         }
+        if let Some((_, note)) = realized {
+            result.notes.insert(0, note);
+        }
         result.trace_files = vec![target_trace.file.clone(), baseline_trace.file.clone()];
         if matches!(
             result.status,
@@ -221,8 +270,15 @@ impl AnalyzeOpts {
         result
     }
 
-    /// Read one side's trace, or say why the section cannot use it.
-    fn read_trace(&self, decision: EventIndex, replay: &TracedReplay) -> Result<ReadTrace, String> {
+    /// Read one side's trace, or say why the section cannot use it. With
+    /// `as_ran`, the replays are compared as they ran, so leaving the
+    /// schedule does not disqualify one.
+    fn read_trace(
+        &self,
+        decision: EventIndex,
+        replay: &TracedReplay,
+        as_ran: bool,
+    ) -> Result<ReadTrace, String> {
         let role = replay.role;
         if let Some(error) = &replay.schedule_error {
             return Err(format!(
@@ -231,7 +287,7 @@ impl AnalyzeOpts {
                 replay.realized_path.display()
             ));
         }
-        if let Some(departure) = &replay.departure {
+        if let Some(departure) = replay.departure.as_ref().filter(|_| !as_ran) {
             return Err(format!(
                 "the {role} replay left its schedule at or before the deciding event (it \
                  {departure}), \
@@ -365,6 +421,45 @@ fn guest_reached_a_refusal(error: &anyhow::Error) -> bool {
             .is_some()
 }
 
+/// Where to compare `target` and `baseline` as they ran, when one of them
+/// left its schedule before `decision`: the first event at which their
+/// realized schedules run different threads (or the shorter one ends), with
+/// the note that says so. `None` when both followed their schedules, or a
+/// realized schedule is missing or unreadable.
+fn realized_window(
+    decision: EventIndex,
+    target: &TracedReplay,
+    baseline: &TracedReplay,
+) -> Option<(EventIndex, String)> {
+    let (role, departure) = [target, baseline]
+        .into_iter()
+        .find_map(|replay| Some((replay.role, replay.departure.as_ref()?)))?;
+    if [target, baseline]
+        .iter()
+        .any(|replay| replay.schedule_error.is_some() || replay.realized.is_empty())
+    {
+        return None;
+    }
+    let split = first_thread_difference(&target.realized, &baseline.realized)? as EventIndex;
+    Some((
+        split,
+        format!(
+            "The {role} replay left its schedule at or before the deciding event {decision} (it \
+             {departure}), so the two replays are compared as they ran, from event {split}, the \
+             first at which they run different threads; event numbers here are theirs."
+        ),
+    ))
+}
+
+/// The first index at which `a` and `b` run different threads, or at which
+/// the shorter one ends; `None` when they run the same threads throughout.
+fn first_thread_difference(a: &[SchedEvent], b: &[SchedEvent]) -> Option<usize> {
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x.dettid != y.dettid)
+        .or_else(|| (a.len() != b.len()).then(|| a.len().min(b.len())))
+}
+
 /// The trace at `path`, read up to `window` records whose last event is at or
 /// after `decision`; whether the window stopped the read.
 fn read_capped(
@@ -487,11 +582,185 @@ mod tests {
         let replay = request.ran(&requested, &realized_path, 1);
         assert_eq!(replay.departure, None);
         let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
-        let reason = options.read_trace(0, &replay).err().unwrap();
+        let reason = options.read_trace(0, &replay, false).err().unwrap();
         assert!(
             reason.starts_with("the target replay's realized schedule")
                 && reason.contains("cannot be read"),
             "{reason}"
+        );
+    }
+
+    #[test]
+    fn the_first_thread_difference_is_where_realized_schedules_part() {
+        let events = |tids: &[i32]| -> Vec<SchedEvent> {
+            tids.iter()
+                .map(|&t| SchedEvent::branches(detcore::types::DetTid::from_raw(t), 10))
+                .collect()
+        };
+        assert_eq!(
+            first_thread_difference(&events(&[3, 3, 5, 7]), &events(&[3, 3, 5, 9])),
+            Some(3)
+        );
+        assert_eq!(
+            first_thread_difference(&events(&[3, 5]), &events(&[3, 5, 7])),
+            Some(2)
+        );
+        assert_eq!(
+            first_thread_difference(&events(&[3, 5]), &events(&[3, 5])),
+            None
+        );
+    }
+
+    /// A target replay that left its schedule before the deciding event is
+    /// compared as it ran, from the first event at which the two replays
+    /// run different threads, with a note; with no realized schedule to go
+    /// by, the section stays unavailable.
+    #[test]
+    fn a_replay_that_left_its_schedule_is_compared_as_it_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = detcore::types::DetTid::from_raw;
+        let events = |tids: &[i32]| -> Vec<SchedEvent> {
+            tids.iter()
+                .map(|&t| SchedEvent::branches(tid(t), 10))
+                .collect()
+        };
+        // One call each, entered before event 3 and alike in both runs, and
+        // a call after it whose result differs.
+        let write_trace_from = |name: &str, result: i64, from: u64| {
+            let path = dir.path().join(name);
+            let lines = [
+                format!(
+                    r#"{{"kind":"header","format":"hermit-access-trace","version":1,"from":{from}}}"#
+                ),
+                r#"{"kind":"syscall","pre":1,"post":2,"tid":3,"pid":3,"nth":1,"sysno":"getpid","args":[0,0,0,0,0,0],"result":3}"#
+                    .to_string(),
+                format!(
+                    r#"{{"kind":"syscall","pre":4,"post":5,"tid":5,"pid":3,"nth":1,"sysno":"getppid","args":[0,0,0,0,0,0],"result":{result}}}"#
+                ),
+                r#"{"kind":"end","events":6,"records":2}"#.to_string(),
+            ];
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            path
+        };
+        let write_trace = |name: &str, result: i64| write_trace_from(name, result, 0);
+        let replay = |role, trace, departure, realized| TracedReplay {
+            role,
+            trace: Ok(trace),
+            departure,
+            realized,
+            realized_path: dir.path().join(format!("{role}_out.preempts")),
+            schedule_error: None,
+        };
+        let left = Departure::OtherEvent {
+            index: 1,
+            expected: SchedEvent::branches(tid(3), 10),
+            ran: SchedEvent::branches(tid(3), 12),
+        };
+        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let no_stacks = |_: &str| -> anyhow::Result<RunData> { anyhow::bail!("no stacks here") };
+        let r = options.racing_accesses(
+            1,
+            replay(
+                "target",
+                write_trace("target.access", 1),
+                Some(left.clone()),
+                events(&[3, 3, 3, 5, 5]),
+            ),
+            replay(
+                "baseline",
+                write_trace("baseline.access", 2),
+                None,
+                events(&[3, 3, 3, 7, 5]),
+            ),
+            true,
+            no_stacks,
+        );
+        assert_ne!(r.status, RaceStatus::Unavailable, "{}", r.reason);
+        assert_eq!(r.decision, 3);
+        assert!(
+            r.notes[0].starts_with(
+                "The target replay left its schedule at or before the deciding event 1 (it ran"
+            ) && r.notes[0].contains("compared as they ran, from event 3"),
+            "{:?}",
+            r.notes
+        );
+
+        // Without the realized schedules there is nothing to compare by.
+        let r = options.racing_accesses(
+            1,
+            replay(
+                "target",
+                write_trace("target.access", 1),
+                Some(left.clone()),
+                Vec::new(),
+            ),
+            replay(
+                "baseline",
+                write_trace("baseline.access", 2),
+                None,
+                Vec::new(),
+            ),
+            true,
+            no_stacks,
+        );
+        assert_eq!(r.status, RaceStatus::Unavailable);
+        assert!(
+            r.reason.starts_with("the target replay left its schedule"),
+            "{}",
+            r.reason
+        );
+
+        // A target replay that left its schedule and no longer met the
+        // target is not compared as it ran: two passing runs would give a
+        // confident pair.
+        let r = options.racing_accesses(
+            1,
+            replay(
+                "target",
+                write_trace("target.access", 1),
+                Some(left.clone()),
+                events(&[3, 3, 3, 5, 5]),
+            ),
+            replay(
+                "baseline",
+                write_trace("baseline.access", 2),
+                None,
+                events(&[3, 3, 3, 7, 5]),
+            ),
+            false,
+            no_stacks,
+        );
+        assert_eq!(r.status, RaceStatus::Unavailable);
+        assert!(
+            r.reason.starts_with("the target replay left its schedule"),
+            "{}",
+            r.reason
+        );
+
+        // Traces that begin after the first thread difference: the replay
+        // left its schedule too early, not a matter of --access-trace-from.
+        let r = options.racing_accesses(
+            1,
+            replay(
+                "target",
+                write_trace_from("target_late.access", 1, 4),
+                Some(left.clone()),
+                events(&[3, 3, 3, 5, 5]),
+            ),
+            replay(
+                "baseline",
+                write_trace_from("baseline_late.access", 2, 4),
+                None,
+                events(&[3, 3, 3, 7, 5]),
+            ),
+            true,
+            no_stacks,
+        );
+        assert_eq!(r.status, RaceStatus::Unavailable);
+        assert_eq!(
+            r.reason,
+            "the target replay left its schedule too early: the two replays first run different \
+             threads at event 3, before their traces begin (event 4)"
         );
     }
 }

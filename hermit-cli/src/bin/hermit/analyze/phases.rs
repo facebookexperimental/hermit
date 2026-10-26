@@ -1276,17 +1276,19 @@ impl AnalyzeOpts {
     /// `decision`: `target` replayed the first `len` events of `schedule` and
     /// `baseline` one fewer, both then continuing at `continuation`. The
     /// stacks come from a replay of the target's continuation. `None` when a
-    /// side recorded no trace (`--no-racing-accesses`).
+    /// side recorded no trace (`--no-racing-accesses`). `target_met`: whether
+    /// the target replay met the target.
     fn prefix_racing_accesses(
         &self,
         decision: usize,
         (schedule, len, continuation): (&PreemptionRecord, usize, MaybeTimeslice),
         target: Option<TracedReplay>,
         baseline: Option<TracedReplay>,
+        target_met: bool,
     ) -> Option<RacingAccesses> {
         let (target, baseline) = (target?, baseline?);
         let record = continued_record(schedule, len, &target.realized);
-        let racing = self.racing_accesses(decision, target, baseline, |runname| {
+        let racing = self.racing_accesses(decision, target, baseline, target_met, |runname| {
             self.prefix_trial(runname, &record, record.schedevents().len(), continuation)
         });
         Some(racing)
@@ -1418,6 +1420,7 @@ impl AnalyzeOpts {
             (&schedule, decision + 1, timeslice),
             target_trace,
             baseline_trace,
+            target_met,
         );
 
         let report = self.prefix_report(
@@ -1714,11 +1717,16 @@ impl AnalyzeOpts {
             println!("{warning}");
         }
         println!("{}", header);
+        // `target_met` is the stack-trace replay's (final_target_for_stacktraces)
+        // while `target_trace` is final_target_schedule's, above: both replay the
+        // same first `decision + 1` events of `schedule` and continue at
+        // `continuation`, so they agree on whether the target is met.
         let racing_accesses = self.prefix_racing_accesses(
             decision,
             (schedule, decision + 1, continuation),
             target_trace,
             baseline_trace.take(),
+            target_met,
         );
         println!("Thread {thread} at the deciding event #{decision}:");
         Self::print_stack("the deciding thread's stack", deciding);
@@ -2420,15 +2428,20 @@ impl AnalyzeOpts {
             stack1.map(|(stack, _)| stack),
             stack2.map(|(stack, _)| stack),
         );
+        let target_met = target.finished && target.met_target;
         let racing_accesses = match (target.traced.take(), baseline.traced.take()) {
             (Some(target), Some(baseline)) => {
                 let realized = target.realized_path.clone();
-                Some(
-                    self.racing_accesses(critical_event_index - 1, target, baseline, |runname| {
+                Some(self.racing_accesses(
+                    critical_event_index - 1,
+                    target,
+                    baseline,
+                    target_met,
+                    |runname| {
                         Ok(RunData::new_baseline(self, runname.to_string())?
                             .with_schedule_replay_from(realized))
-                    }),
-                )
+                    },
+                ))
             }
             _ => None,
         };
