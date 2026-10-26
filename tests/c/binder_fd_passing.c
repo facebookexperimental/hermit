@@ -9,10 +9,18 @@
 // Pass a file descriptor over binder from one process to another, then use
 // it in the receiver.
 //
-// Usage: binder_fd_passing <binderfs mount>. The guest adds a device of its
-// own to that binderfs instance through its binder-control file
-// (BINDER_CTL_ADD; an existing one is reused), so it needs no default device
-// and no servicemanager.
+// Usage: binder_fd_passing <binderfs mount> [poll|block|ping]. The guest adds a
+// device of its own to that binderfs instance through its binder-control
+// file (BINDER_CTL_ADD; an existing one is reused), so it needs no default
+// device and no servicemanager.
+//
+// In "poll" mode, the default, both processes open the device nonblocking
+// and wait in poll() before each read, so no binder ioctl waits in the
+// kernel. In "block" and "ping" mode they open it blocking, so each read
+// waits inside ioctl(BINDER_WRITE_READ) until the other process sends it
+// work: the mode every real binder thread pool uses. "ping" sends an empty
+// transaction instead of one carrying a descriptor, so it needs nothing of
+// the receiver but the round trip.
 //
 // The parent becomes the device's context manager, with a node that accepts
 // descriptors, and the child sends it a
@@ -42,13 +50,20 @@
 
 #define MAP_SIZE (128 * 1024)
 
+// Whether the binder device is opened nonblocking and polled before each
+// read ("poll"), or opened blocking so each read waits in the kernel.
+static int nonblocking = 1;
+
+// Whether the transaction carries a file descriptor.
+static int pass_fd = 1;
+
 static void die(const char* what) {
   fprintf(stderr, "binder_fd_passing: %s: %s\n", what, strerror(errno));
   exit(1);
 }
 
 static int open_device(const char* path) {
-  int fd = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+  int fd = open(path, O_RDWR | O_CLOEXEC | (nonblocking ? O_NONBLOCK : 0));
   if (fd < 0) {
     die("open");
   }
@@ -72,9 +87,11 @@ static void write_commands(int fd, const void* commands, size_t size) {
 // number of bytes Linux wrote.
 static size_t read_commands(int fd, void* buffer, size_t size) {
   for (;;) {
-    struct pollfd pfd = {.fd = fd, .events = POLLIN};
-    if (poll(&pfd, 1, -1) < 0) {
-      die("poll");
+    if (nonblocking) {
+      struct pollfd pfd = {.fd = fd, .events = POLLIN};
+      if (poll(&pfd, 1, -1) < 0) {
+        die("poll");
+      }
     }
     struct binder_write_read bwr = {
         .read_size = size,
@@ -121,14 +138,16 @@ static uint32_t wait_for(
 
 static int client(const char* path) {
   int fd = open_device(path);
-  int file = memfd_create("binder_fd_passing", MFD_CLOEXEC);
-  if (file < 0 || write(file, "hello", 5) != 5 || lseek(file, 0, SEEK_SET)) {
-    die("memfd");
-  }
   struct binder_fd_object object = {
       .hdr.type = BINDER_TYPE_FD,
-      .fd = file,
   };
+  if (pass_fd) {
+    int file = memfd_create("binder_fd_passing", MFD_CLOEXEC);
+    if (file < 0 || write(file, "hello", 5) != 5 || lseek(file, 0, SEEK_SET)) {
+      die("memfd");
+    }
+    object.fd = file;
+  }
   binder_size_t offsets[1] = {0};
   struct {
     uint32_t cmd;
@@ -140,8 +159,8 @@ static int client(const char* path) {
               .target.handle = 0,
               .code = 1,
               .flags = TF_ACCEPT_FDS,
-              .data_size = sizeof(object),
-              .offsets_size = sizeof(offsets),
+              .data_size = pass_fd ? sizeof(object) : 0,
+              .offsets_size = pass_fd ? sizeof(offsets) : 0,
               .data.ptr.buffer = (binder_uintptr_t)&object,
               .data.ptr.offsets = (binder_uintptr_t)offsets,
           },
@@ -173,9 +192,20 @@ static char* add_device(const char* mount, const char* name) {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s <binderfs mount>\n", argv[0]);
+  if (argc < 2 || argc > 3) {
+    fprintf(stderr, "usage: %s <binderfs mount> [poll|block|ping]\n", argv[0]);
     return 2;
+  }
+  if (argc == 3) {
+    if (strcmp(argv[2], "block") == 0) {
+      nonblocking = 0;
+    } else if (strcmp(argv[2], "ping") == 0) {
+      nonblocking = 0;
+      pass_fd = 0;
+    } else if (strcmp(argv[2], "poll") != 0) {
+      fprintf(stderr, "usage: %s <binderfs mount> [poll|block|ping]\n", argv[0]);
+      return 2;
+    }
   }
   const char* path = add_device(argv[1], "binder-fd-passing");
   int fd = open_device(path);
@@ -201,25 +231,29 @@ int main(int argc, char** argv) {
 
   struct binder_transaction_data data;
   wait_for(fd, BR_TRANSACTION, &data);
-  if (data.offsets_size != sizeof(binder_size_t)) {
+  if (!pass_fd) {
+    printf("received transaction from pid %d\n", data.sender_pid);
+    fflush(stdout);
+  } else if (data.offsets_size != sizeof(binder_size_t)) {
     fprintf(stderr, "binder_fd_passing: expected one object\n");
     return 1;
+  } else {
+    const binder_size_t* offsets =
+        (const binder_size_t*)(uintptr_t)data.data.ptr.offsets;
+    const struct binder_fd_object* object =
+        (const void*)(uintptr_t)(data.data.ptr.buffer + offsets[0]);
+    if (object->hdr.type != BINDER_TYPE_FD) {
+      fprintf(stderr, "binder_fd_passing: not a descriptor object\n");
+      return 1;
+    }
+    int received = (int)object->fd;
+    char text[6] = {0};
+    if (read(received, text, 5) != 5) {
+      die("read from the received descriptor");
+    }
+    printf("received fd %d: %s\n", received, text);
+    fflush(stdout);
   }
-  const binder_size_t* offsets =
-      (const binder_size_t*)(uintptr_t)data.data.ptr.offsets;
-  const struct binder_fd_object* object =
-      (const void*)(uintptr_t)(data.data.ptr.buffer + offsets[0]);
-  if (object->hdr.type != BINDER_TYPE_FD) {
-    fprintf(stderr, "binder_fd_passing: not a descriptor object\n");
-    return 1;
-  }
-  int received = (int)object->fd;
-  char text[6] = {0};
-  if (read(received, text, 5) != 5) {
-    die("read from the received descriptor");
-  }
-  printf("received fd %d: %s\n", received, text);
-  fflush(stdout);
 
   // Free the transaction's buffer and reply with an empty status.
   int32_t status = 0;

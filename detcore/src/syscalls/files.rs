@@ -13897,11 +13897,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         if crate::syscalls::binder::is_write_read(request) {
             self.note_binder_transaction(guest);
         }
-        let result = self.record_or_replay(guest, call).await?;
-        // `handle_ioctl` runs the call in the caller's turn, so no other
-        // task can have closed or replaced a delivered number yet.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // A binder call that waits for another process must not hold the
+        // caller's turn: the guest's other threads, which send the work it
+        // waits for, would never run. Such a call runs on the background
+        // path instead, as a blocking read of an external descriptor does.
+        let (result, backgrounded) = self
+            .run_binder_call(guest, call, fd, request, argument)
+            .await?;
+        // Recorded only where the call ran in this thread's turn: on the
+        // background path another task may have closed or replaced the
+        // numbers before this one resumed, as for a receive.
         // TODO-HUMAN-REVIEW(PR-4736)
-        if binder_read && result >= 0 {
+        if binder_read && !backgrounded && result >= 0 {
             let delivered =
                 crate::syscalls::binder::delivered(&guest.memory(), argument, already_consumed);
             let recorded = self
@@ -13944,6 +13952,90 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// statfs: report deterministic filesystem statistics.
     ///
+    /// Run `call`, a binder `ioctl`, the way Linux runs it, without letting
+    /// a half that waits for another process hold the caller's turn. Returns
+    /// its result and whether any half ran on the background path.
+    ///
+    /// The call is issued whole, as the guest made it. Before it goes to the
+    /// background, a zero-timeout `ppoll` asks whether this thread already
+    /// has work: a read that would not wait keeps its turn, which is what
+    /// lets the descriptors it delivers be recorded. A call that would wait
+    /// runs on the background path with its write half, which the schedule
+    /// therefore does not order against sibling threads; splitting the two
+    /// halves is left for the change that records the rejoin order.
+    // TODO-HUMAN-REVIEW(PR-4742)
+    async fn run_binder_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ioctl,
+        fd: RawFd,
+        request: u64,
+        argument: usize,
+    ) -> Result<(i64, bool), Error> {
+        use crate::syscalls::binder;
+        let written = binder::write_read(&guest.memory(), argument);
+        let nonblocking = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.is_nonblocking())
+            .unwrap_or(false);
+        let waits = binder::blocking(
+            request,
+            written.as_ref(),
+            binder::freeze_info(&guest.memory(), argument).as_ref(),
+            nonblocking,
+        );
+        let Some(waits) = waits else {
+            return Ok((self.record_or_replay(guest, call).await?, false));
+        };
+        // A call whose read half has work waiting does not wait at all, so it
+        // keeps the caller's turn, and the descriptors it delivers are
+        // recorded.
+        if self.binder_has_work(guest, fd).await? {
+            return Ok((self.record_or_replay(guest, call).await?, false));
+        }
+        binder::note_blocking(waits);
+        Ok((
+            self.record_or_replay_blocking(guest, Syscall::Ioctl(call))
+                .await?,
+            true,
+        ))
+    }
+
+    /// Whether this thread already has binder work waiting, from a
+    /// zero-timeout `ppoll` on the descriptor in the caller's turn. False
+    /// when the poll cannot be made or reports nothing: the call then takes
+    /// the background path, which is correct for a call that waits and only
+    /// costs the in-turn recording of its descriptors for one that would
+    /// not.
+    async fn binder_has_work<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<bool, Error> {
+        let mut stack = guest.stack().await;
+        let fds = stack.push(libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        let timeout = stack.push(reverie::syscalls::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        });
+        let guard = stack.commit()?;
+        let call = syscalls::Ppoll::new()
+            .with_fds(Some(unsafe {
+                reverie::syscalls::AddrMut::from_raw_unchecked(fds.as_raw())
+            }))
+            .with_nfds(1)
+            .with_timeout(Some(unsafe {
+                reverie::syscalls::AddrMut::from_raw_unchecked(timeout.as_raw())
+            }));
+        let ready = guest.inject_with_retry(call).await;
+        drop(guard);
+        Ok(matches!(ready, Ok(count) if count > 0))
+    }
+
     /// The kernel's `statfs` reflects live host state: the free-block counts
     /// (`f_bfree`, `f_bavail`), the free-inode count (`f_ffree`) and the device
     /// id (`f_fsid`) all vary between runs as the underlying host filesystem

@@ -60411,23 +60411,18 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
     );
 }
 
-/// A descriptor one process sends another in a binder transaction is usable
-/// in the receiver under Hermit. Linux installs it when the receiver reads
-/// the transaction (`binder_apply_fd_fixups`), with no call naming it as new,
-/// so Detcore records it from the read's return commands; before, the
-/// receiver's first read through it failed with EBADF. The guest adds a
-/// device to a private binderfs instance, which the test mounts in a user and
-/// mount namespace of its own. Where the kernel has no binder filesystem, or will
-/// not mount one there, the test says so and skips.
-#[test]
-fn a_descriptor_received_in_a_binder_transaction_is_usable() {
+/// Run the binder guest in `mode` on a private binderfs instance this test
+/// mounts in a user and mount namespace of its own, and return its output,
+/// or `None` where the kernel has no binder filesystem or will not mount one
+/// here. The run is bounded: the failures these tests pin are hangs.
+fn binder_guest_output(mode: &str) -> Option<Output> {
     let filesystems = fs::read_to_string("/proc/filesystems").unwrap_or_default();
     if !filesystems
         .lines()
         .any(|line| line.split_whitespace().last() == Some("binder"))
     {
         eprintln!("skipping: this kernel has no binder filesystem (CONFIG_ANDROID_BINDERFS)");
-        return;
+        return None;
     }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mountpoint = directory.path().join("binderfs");
@@ -60435,13 +60430,12 @@ fn a_descriptor_received_in_a_binder_transaction_is_usable() {
     let hermit = env!("CARGO_BIN_EXE_hermit");
     let guest = binder_fd_passing_guest().display().to_string();
     let mountpoint = mountpoint.display().to_string();
-    // The mount's own failure is told apart from the run's by a marker on
-    // stdout, which neither the guest nor hermit prints. The run is bounded:
-    // before this change the guest waited for a reply that never came.
+    // A refused mount is told apart from a failed run by a marker on stdout,
+    // which neither the guest nor hermit prints.
     let script = format!(
         "mount -t binder binder {mountpoint} || {{ echo NO-BINDERFS; exit 0; }}; \
          exec timeout --kill-after 5s 120s {hermit} run --base-env=minimal -- \
-         {guest} {mountpoint}"
+         {guest} {mountpoint} {mode}"
     );
     let mut command = Command::new("unshare");
     command.args(["--user", "--map-root-user", "--mount", "sh", "-c", &script]);
@@ -60452,10 +60446,24 @@ fn a_descriptor_received_in_a_binder_transaction_is_usable() {
             "skipping: binderfs cannot be mounted in a user namespace here: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        return;
+        return None;
     }
+    Some(output)
+}
+
+/// A descriptor one process sends another in a binder transaction is usable
+/// in the receiver under Hermit. Linux installs it when the receiver reads
+/// the transaction (`binder_apply_fd_fixups`), with no call naming it as new,
+/// so Detcore records it from the read's return commands; before, the
+/// receiver's first read through it failed with EBADF. Both processes poll
+/// and read without blocking, so every binder call returns in its turn.
+#[test]
+fn a_descriptor_received_in_a_binder_transaction_is_usable() {
+    let Some(output) = binder_guest_output("poll") else {
+        return;
+    };
     assert_success(&output, &["binder_fd_passing"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout(&output);
     assert!(
         stdout.starts_with("received fd ") && stdout.trim_end().ends_with(": hello"),
         "{stdout}"
@@ -62909,5 +62917,26 @@ fn run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
     assert!(
         log.contains("a descriptor's fdinfo of Hermit's own init, cannot be served"),
         "kvm init: the refusal does not name its reason: {log}"
+/// A binder read that waits for another process does not hold the guest's
+/// only turn. Both processes open the device blocking, so each read waits
+/// inside `ioctl(BINDER_WRITE_READ)` until the other sends it work: the way
+/// every binder thread pool works. Detcore runs such a call on the
+/// background path, so the other guest process runs and the pair completes;
+/// before, the first read held the turn and nothing else ever ran.
+#[test]
+fn a_blocking_binder_read_does_not_hold_the_guests_turn() {
+    let Some(output) = binder_guest_output("ping") else {
+        return;
+    };
+    assert_success(&output, &["binder_fd_passing", "ping"]);
+    assert!(
+        stdout(&output).starts_with("received transaction from pid "),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("HERMIT_EXTERNAL_INPUT source=binder"),
+        "the run does not say its binder calls are external input: {}",
+        stderr(&output)
     );
 }

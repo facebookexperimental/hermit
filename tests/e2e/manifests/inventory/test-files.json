@@ -112,7 +112,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/binder_fd_passing.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/binder_fd_passing.c is owned by hermit-cli/tests/cli.rs: a_descriptor_received_in_a_binder_transaction_is_usable compiles it and runs it on a private binderfs device the test mounts in a user and mount namespace of its own, where the kernel has binder; it remains a guest fixture because a generic manifest cannot mount binderfs or skip on a kernel without it."
+      "why": "tests/c/binder_fd_passing.c is owned by hermit-cli/tests/cli.rs: a_descriptor_received_in_a_binder_transaction_is_usable and a_blocking_binder_read_does_not_hold_the_guests_turn compile it and run its poll and ping modes on a private binderfs device the test mounts in a user and mount namespace of its own, where the kernel has binder; it remains a guest fixture because a generic manifest cannot mount binderfs or skip on a kernel without it."
     },
     {
       "disposition": "manifest-test",

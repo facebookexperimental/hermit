@@ -40,9 +40,8 @@ use reverie::syscalls::MemoryAccess;
 
 use crate::syscalls::scm_rights::Delivered;
 
-/// `BINDER_WRITE_READ`: `_IOWR('b', 1, struct binder_write_read)`, whose
-/// struct is six 64-bit words.
-pub(crate) const BINDER_WRITE_READ: u64 = 0xc030_6201;
+/// `_IOWR('b', 1, struct binder_write_read)`.
+pub(crate) const BINDER_WRITE_READ: u64 = binder_request(3, 1, size_of::<WriteRead>());
 
 /// `_IOR('r', 2, struct binder_transaction_data)`.
 const BR_TRANSACTION: u32 = 0x8040_7202;
@@ -72,11 +71,118 @@ const MAX_COMMAND_BYTES: usize = 64 * 1024;
 /// The most objects read from one transaction's offsets array.
 const MAX_OBJECTS: usize = 4096;
 
+/// `struct binder_write_read`, the argument of `BINDER_WRITE_READ`: six
+/// 64-bit words on a 64-bit kernel, in the uapi header's order.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WriteRead {
+    pub(crate) write_size: u64,
+    pub(crate) write_consumed: u64,
+    pub(crate) write_buffer: u64,
+    pub(crate) read_size: u64,
+    pub(crate) read_consumed: u64,
+    pub(crate) read_buffer: u64,
+}
+
+/// `struct binder_freeze_info`, the argument of `BINDER_FREEZE`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct FreezeInfo {
+    _pid: u32,
+    enable: u32,
+    timeout_ms: u32,
+}
+
+/// `_IOC(dir, 'b', nr, size)` for binder's own requests.
+const fn binder_request(dir: u64, nr: u64, size: usize) -> u64 {
+    (dir << 30) | ((size as u64) << 16) | ((b'b' as u64) << 8) | nr
+}
+
+/// `_IOW('b', 14, struct binder_freeze_info)`, its size from the structure
+/// rather than written out, so a test cannot share a wrong number.
+const BINDER_FREEZE: u64 = binder_request(1, 14, size_of::<FreezeInfo>());
+
 /// Whether `request`, an `ioctl` request word, is `BINDER_WRITE_READ`.
 /// Only the low 32 bits are the request: the kernel's `cmd` is an
 /// `unsigned int`.
 pub(crate) fn is_write_read(request: u64) -> bool {
     request & 0xffff_ffff == BINDER_WRITE_READ
+}
+
+/// Why a binder `ioctl` waits in the kernel until another process acts, so
+/// that Detcore runs it as a blocking external call rather than in the
+/// caller's turn. `None` for every request that returns on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Blocking {
+    /// A `BINDER_WRITE_READ` whose read half waits for work for this thread:
+    /// a transaction, a reply, or a death notification
+    /// (`binder_thread_read` -> `binder_wait_for_work`).
+    Read,
+    /// A `BINDER_FREEZE` that waits for another process's outstanding
+    /// transactions to drain, up to its own timeout
+    /// (`binder_ioctl_freeze`).
+    Freeze,
+}
+
+/// `WriteRead` of the call whose argument is at `argument`, read from guest
+/// memory; `None` when it cannot be read.
+pub(crate) fn write_read<M: MemoryAccess>(memory: &M, argument: usize) -> Option<WriteRead> {
+    let address = Addr::<WriteRead>::from_raw(argument)?;
+    memory.read_value(address).ok()
+}
+
+impl WriteRead {
+    /// Whether this call has a read half, which is the half that waits.
+    pub(crate) fn reads(&self) -> bool {
+        self.read_size > self.read_consumed
+    }
+}
+
+/// Why `request` waits in the kernel, from the call's argument already read
+/// from guest memory: `None` when it returns on its own. `nonblocking` is the
+/// descriptor's `O_NONBLOCK`, which makes a read return `EAGAIN` instead of
+/// waiting (`binder_thread_read`). A read is classified as waiting whenever
+/// it asks for bytes; the caller may then find work already queued and run
+/// it in the caller's turn anyway.
+pub(crate) fn blocking(
+    request: u64,
+    write_read: Option<&WriteRead>,
+    freeze: Option<&[u32; 3]>,
+    nonblocking: bool,
+) -> Option<Blocking> {
+    match request & 0xffff_ffff {
+        BINDER_WRITE_READ if !nonblocking => write_read
+            .filter(|call| call.reads())
+            .map(|_| Blocking::Read),
+        BINDER_FREEZE => freeze
+            .filter(|info| info[1] != 0 && info[2] != 0)
+            .map(|_| Blocking::Freeze),
+        _ => None,
+    }
+}
+
+/// `struct binder_freeze_info` at `argument`, read from guest memory.
+pub(crate) fn freeze_info<M: MemoryAccess>(memory: &M, argument: usize) -> Option<[u32; 3]> {
+    let address = Addr::<[u32; 3]>::from_raw(argument)?;
+    memory.read_value(address).ok()
+}
+
+/// Warn once per Hermit process that this run's binder calls are external
+/// input: their results come from processes Hermit does not schedule, so two
+/// runs can differ wherever those processes do.
+pub(crate) fn note_blocking(waits: Blocking) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let call = match waits {
+            Blocking::Read => "a binder read (BINDER_WRITE_READ)",
+            Blocking::Freeze => "a binder freeze (BINDER_FREEZE)",
+        };
+        tracing::warn!(
+            "[detcore] HERMIT_EXTERNAL_INPUT source=binder: {call} waits for another process, \
+             which Hermit does not schedule. It runs as a blocking external call, so when it \
+             finishes, and what it reads, are this host's, not the schedule's"
+        );
+    }
 }
 
 /// The `read_consumed` of the `struct binder_write_read` at `argument`,
@@ -291,6 +397,55 @@ mod tests {
         object
     }
 
+    /// A read half that wants bytes blocks, unless the descriptor is
+    /// nonblocking; a write-only call and a freeze without a timeout do not.
+    #[test]
+    fn a_binder_call_blocks_when_it_waits_for_another_process() {
+        let reading = WriteRead {
+            read_size: 256,
+            ..WriteRead::default()
+        };
+        let writing = WriteRead {
+            write_size: 64,
+            ..WriteRead::default()
+        };
+        assert_eq!(
+            blocking(BINDER_WRITE_READ, Some(&reading), None, false),
+            Some(Blocking::Read)
+        );
+        assert_eq!(
+            blocking(BINDER_WRITE_READ, Some(&reading), None, true),
+            None
+        );
+        assert_eq!(
+            blocking(BINDER_WRITE_READ, Some(&writing), None, false),
+            None
+        );
+        // A read whose buffer the caller has already filled wants nothing.
+        let consumed = WriteRead {
+            read_size: 256,
+            read_consumed: 256,
+            ..WriteRead::default()
+        };
+        assert_eq!(
+            blocking(BINDER_WRITE_READ, Some(&consumed), None, false),
+            None
+        );
+        assert_eq!(
+            blocking(BINDER_FREEZE, None, Some(&[7, 1, 100]), false),
+            Some(Blocking::Freeze)
+        );
+        assert_eq!(blocking(BINDER_FREEZE, None, Some(&[7, 1, 0]), false), None);
+        assert_eq!(
+            blocking(BINDER_FREEZE, None, Some(&[7, 0, 100]), false),
+            None
+        );
+        // Binder's own other requests, and another driver's, wait for nothing.
+        let max_threads = binder_request(1, 5, size_of::<u32>());
+        assert_eq!(blocking(max_threads, Some(&reading), None, false), None);
+        assert_eq!(blocking(0x4004_6205, Some(&reading), None, false), None);
+    }
+
     /// The command codes are the uapi header's, from their `_IOR` parts.
     #[test]
     fn the_command_codes_encode_their_payload_sizes() {
@@ -300,6 +455,10 @@ mod tests {
         assert_eq!(BR_REPLY, ior(3, 64));
         let iowr = (3u64 << 30) | (48 << 16) | (u64::from(b'b') << 8) | 1;
         assert_eq!(BINDER_WRITE_READ, iowr);
+        let iow = (1u64 << 30) | (12 << 16) | (u64::from(b'b') << 8) | 14;
+        assert_eq!(BINDER_FREEZE, iow);
+        assert_eq!(BINDER_FREEZE, 0x400c_620e);
+        assert_eq!(BINDER_WRITE_READ, 0xc030_6201);
         assert!(is_write_read(BINDER_WRITE_READ | 0xffff_ffff_0000_0000));
         assert!(!is_write_read(0x4004_6205));
     }
