@@ -39,6 +39,7 @@ use crate::app::analyze::phases::departure;
 use crate::app::analyze::phases::stack_thread;
 use crate::app::analyze::races::OutcomeCriteria;
 use crate::app::analyze::races::RaceStatus;
+use crate::app::analyze::races::RacingAccess;
 use crate::app::analyze::races::RacingAccesses;
 use crate::app::analyze::races::Window;
 use crate::app::analyze::races::find_racing_accesses;
@@ -211,7 +212,10 @@ impl AnalyzeOpts {
             }
         }
         result.trace_files = vec![target_trace.file.clone(), baseline_trace.file.clone()];
-        if matches!(result.status, RaceStatus::Found | RaceStatus::Timing) {
+        if matches!(
+            result.status,
+            RaceStatus::Found | RaceStatus::Timing | RaceStatus::Candidates
+        ) {
             self.attach_stacks(&mut result, &target_trace.trace, stack_run);
         }
         result
@@ -260,17 +264,28 @@ impl AnalyzeOpts {
         target: &AccessTrace,
         stack_run: impl FnOnce(&str) -> anyhow::Result<RunData>,
     ) {
-        let entries: Vec<Option<EventIndex>> = result
-            .accesses
+        // The reported pair's accesses, or the first candidate's: one replay
+        // takes both. The other candidates rank lower and keep no stacks, so
+        // a report pays for one replay whatever the status.
+        let RacingAccesses {
+            accesses,
+            candidates,
+            notes,
+            ..
+        } = result;
+        let pair: &mut [RacingAccess] = match candidates.first_mut() {
+            Some(first) if accesses.is_empty() => &mut first.accesses,
+            _ => accesses.as_mut_slice(),
+        };
+        let entries: Vec<Option<EventIndex>> = pair
             .iter()
             .map(|access| entry_event(target, access.thread, access.nth))
             .collect();
         match self.replay_for_access_stacks(&entries, stack_run) {
             Ok(stacks) => {
-                for ((access, entry), stack) in result.accesses.iter_mut().zip(&entries).zip(stacks)
-                {
+                for ((access, entry), stack) in pair.iter_mut().zip(&entries).zip(stacks) {
                     if access.ended_first_by.is_some() {
-                        result.notes.push(format!(
+                        notes.push(format!(
                             "Thread {}'s {} runs in the baseline only, so the target replay \
                              takes no stack for it.",
                             access.thread,
@@ -282,20 +297,20 @@ impl AnalyzeOpts {
                         Some(stack) if stack_thread(&stack) == Some(access.thread) => {
                             access.stack = Some(stack);
                         }
-                        Some(_) => result.notes.push(format!(
+                        Some(_) => notes.push(format!(
                             "The stack replay ran another thread than thread {} at event {}, so \
                              that access's stack is left out.",
                             access.thread,
                             entry.unwrap_or_default()
                         )),
-                        None => result.notes.push(format!(
+                        None => notes.push(format!(
                             "The stack replay took no stack for thread {}'s access.",
                             access.thread
                         )),
                     }
                 }
             }
-            Err(error) => result.notes.push(format!(
+            Err(error) => notes.push(format!(
                 "The stacks are not available: the stack replay failed ({error:#})."
             )),
         }

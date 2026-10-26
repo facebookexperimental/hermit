@@ -3700,6 +3700,7 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
                 lines.push(format!("  {}. {}.", i + 1, c.evidence));
                 let [a, b] = &c.accesses;
                 lines.extend(access_lines([a, b]).into_iter().map(|l| format!("   {l}")));
+                lines.extend(stack_lines([a, b]));
             }
             if let Some(o) = &r.outcome {
                 lines.push(format!(
@@ -3727,16 +3728,7 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
         if let Some(hb) = &r.happens_before {
             lines.push(happens_before_sentence(hb, [first, second]));
         }
-        for access in [first, second] {
-            if let Some(stack) = &access.stack {
-                lines.push(format!(
-                    "{} at {}, the stack at its entry:",
-                    access_name(access),
-                    event_text(access.event)
-                ));
-                lines.push(stack.to_string().trim_end().to_string());
-            }
-        }
+        lines.extend(stack_lines([first, second]));
     }
     if !r.also_reordered.is_empty() {
         lines.push("Also reordered:".to_string());
@@ -3757,6 +3749,22 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
     }
     lines.extend(r.notes.iter().cloned());
     lines.join("\n")
+}
+
+/// Each access's stack at its entry, when the report took it.
+fn stack_lines(accesses: [&RacingAccess; 2]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for access in accesses {
+        if let Some(stack) = &access.stack {
+            lines.push(format!(
+                "{} at {}, the stack at its entry:",
+                access_name(access),
+                event_text(access.event)
+            ));
+            lines.push(stack.to_string().trim_end().to_string());
+        }
+    }
+    lines
 }
 
 /// `thread 9's close`.
@@ -7620,6 +7628,27 @@ mod tests {
         );
         assert!(
             !text.contains("thread 7's lseek at #7589, the stack"),
+            "{text}"
+        );
+
+        // A candidate's accesses print their stacks under its entry too.
+        let mut candidates = r.clone();
+        candidates.status = RaceStatus::Candidates;
+        let [first, second] = std::mem::take(&mut candidates.accesses).try_into().unwrap();
+        candidates.candidates = vec![RaceCandidate {
+            resource: candidates.resource.clone(),
+            accesses: [first, second],
+            order: candidates.order.clone().unwrap(),
+            reaches_outcome: true,
+            events_before_outcome: Some(10),
+            evidence: "the evidence".to_string(),
+        }];
+        let text = render_racing_accesses(&candidates);
+        assert!(
+            text.contains("  1. the evidence.\n")
+                && text.contains(
+                    "thread 9's close at #7587, the stack at its entry:\nStack trace for thread 9"
+                ),
             "{text}"
         );
 
