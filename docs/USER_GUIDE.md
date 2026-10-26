@@ -1024,8 +1024,22 @@ signal ends the run in progress and starts no other; analyze then removes the
 workspace and that run's own temporary directories, and dies of the signal, so
 a shell reports 128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to
 keep the workspace, for example to rerun a reproducer; `--verbose` keeps it
-too, since the per-run logs it adds are written there. The report file
-(`--report-file`) and the `--tmp-dir` directory itself are never removed.
+too, since the reproducers it prints name its files, and so does
+`--trial-log` above `warn`. The report file (`--report-file`) and the
+`--tmp-dir` directory itself are never removed.
+
+Every run analyze starts logs at the `warn` level to analyze's stderr, as
+`hermit run` does. `--trial-log=info` or `--trial-log=debug` writes each run's
+log at that level into a file of its own in the workspace (`<run>.log`), and
+`--trial-log=off` drops the runs' warnings but keeps their errors, among them
+the reason Hermit gives when it refuses a trial; `--verbose` prints analyze's
+own detail and leaves the runs' level alone. Without `--trial-log`,
+`--guest-log` (or HERMIT_LOG) gives the level. A debug log can grow to
+gigabytes per run and make the run several times slower, so a trial that a
+bound stops gets through less of the program. `--selfcheck` compares the
+target run's log with its replay's, so the runs whose logs it may compare (the
+target run, the `--search` run that becomes it, the `--minimize` runs and the
+replay) log at `debug` or above into their files, whatever `--trial-log` says.
 
 While analyze runs, a bisection trial's schedules, as large as the endpoints'
 (hundreds of MB for a few million events), are removed as soon as the trial's
@@ -1072,9 +1086,10 @@ completed runs may already have been printed. This also applies when the
 default non-chaos baseline times out; analyze
 does not replace it with a prefix search. Retry with a larger trial bound if the
 guest can finish. `--trial-timeout=off` removes analyze's time and log bounds,
-while leaving a user-supplied `--timeout` in force. Bounded trials' verbose or
-self-check log files are capped at max(64 MiB, 10 times the largest measured
-endpoint log), within `HERMIT_LOG_MAX_BYTES`; setting that variable to `0`
+while leaving a user-supplied `--timeout` in force. The log files bounded
+trials write under `--trial-log` above warn or `--selfcheck` are capped at
+max(64 MiB, 10 times the largest measured endpoint log), within
+`HERMIT_LOG_MAX_BYTES`; setting that variable to `0`
 lifts both file caps. These host resource limits may stop a trial on a slow
 machine; they never change a stopped trial into a completed outcome.
 

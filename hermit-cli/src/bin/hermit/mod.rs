@@ -291,6 +291,14 @@ fn args_from_matches_with_schema(
     });
     let run_epoch_source = run_matches.and_then(|run| run.value_source("epoch"));
     let mut args = Args::from_arg_matches(matches)?;
+    // Analyze names HERMIT_LOG when it keeps its workspace for the level that
+    // variable gave (`AnalyzeOpts::guest_log_from_env`).
+    if let (Subcommand::Analyze(analyze), Some(analyze_matches)) =
+        (&mut args.command, matches.subcommand_matches("analyze"))
+    {
+        analyze.guest_log_from_env =
+            analyze_matches.value_source("guest_log") == Some(ValueSource::EnvVariable);
+    }
     if let Some(run_matches) = run_matches {
         match &mut args.command {
             Subcommand::Run(run) => run.capture_max_timeslice_source(run_matches),
@@ -1842,6 +1850,37 @@ mod tests {
                     run.mut_arg("epoch", |arg| arg.env(None::<&str>))
                 })
             })
+    }
+
+    /// `hermit analyze` notes when `--guest-log` came from its environment
+    /// variable, HERMIT_LOG, so that a workspace kept for that level names
+    /// the variable (`AnalyzeOpts::trial_log_files_option`).
+    #[test]
+    fn analyze_notes_a_guest_log_level_from_the_environment() {
+        const VARIABLE: &str = "HERMIT_ANALYZE_GUEST_LOG_TEST_ONLY_VARIABLE";
+        // SAFETY: no other code reads or writes this test-only variable.
+        unsafe { std::env::set_var(VARIABLE, "debug") };
+        let command = Args::command().mut_subcommand("analyze", |analyze| {
+            analyze.mut_arg("guest_log", |arg| arg.env(VARIABLE))
+        });
+        for (argv, from_env) in [
+            (&["hermit", "analyze", "--", "/bin/true"][..], true),
+            (
+                &["hermit", "analyze", "-g", "debug", "--", "/bin/true"][..],
+                false,
+            ),
+        ] {
+            let matches = command.clone().try_get_matches_from(argv).unwrap();
+            let args = args_from_matches_with_clock(&matches, std::time::SystemTime::now).unwrap();
+            let Subcommand::Analyze(analyze) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            assert_eq!(
+                analyze.guest_log,
+                Some(tracing::metadata::LevelFilter::DEBUG)
+            );
+            assert_eq!(analyze.guest_log_from_env, from_env, "{argv:?}");
+        }
     }
 
     fn parse_at<const N: usize>(argv: [&str; N], now: std::time::SystemTime) -> Args {

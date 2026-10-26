@@ -62,9 +62,16 @@ pub struct AnalyzeOpts {
     #[clap(long, default_value = "nonzero", value_name = "NUM|nonzero|any")]
     pub target_exit_code: ExitStatusConstraint,
 
-    /// What level of logging to enable for the guest runs.
+    /// The trials' log level, as --trial-log sets it, which wins when both are given. This
+    /// also accepts `error` and `trace`; a level above warn writes each trial's log into its
+    /// own file in the workspace. Errors are kept at `off` too, as with --trial-log=off.
     #[clap(short, long, value_name = "LEVEL", env = "HERMIT_LOG")]
     pub guest_log: Option<LevelFilter>,
+
+    /// Whether `guest_log` came from its environment variable, HERMIT_LOG, which the
+    /// workspace's retention names.
+    #[clap(skip)]
+    pub guest_log_from_env: bool,
 
     /// Insist on perfect determinism before proceeding with the analysis.
     #[clap(long)]
@@ -220,12 +227,30 @@ pub struct AnalyzeOpts {
     #[clap(long)]
     pub analyze_seed: Option<u64>,
 
-    /// Print quite a bit of extra information so that you can see exactly what is happening.
+    /// Print quite a bit of extra information so that you can see exactly what is happening:
+    /// every run's reproducer command, the guest's output and the search's steps.
     ///
-    /// Each run then writes its log into the workspace (see --tmp-dir), and analyze keeps the
-    /// workspace when it exits, as --keep-tmp does, so that the logs can be read.
+    /// Analyze keeps the workspace when it exits, as --keep-tmp does, so that the files the
+    /// reproducers name can be read. It does not raise the trials' log level: --trial-log
+    /// does.
     #[clap(long, short)]
     pub verbose: bool,
+
+    /// How much each run analyze starts logs, and where: `warn` (the default), `off`, `info`
+    /// or `debug`.
+    ///
+    /// At `warn` a run's warnings and errors go to analyze's stderr, as those of `hermit run`
+    /// do, and `off` drops the warnings: errors still go there, since the reason Hermit gives
+    /// when it refuses a trial is one. At `info` or `debug` each run writes its log, at that level,
+    /// into a file of its own in the workspace (`<run>.log`, see --tmp-dir), and analyze keeps
+    /// the workspace when it exits, as --keep-tmp does, so that the logs can be read. A debug
+    /// log can grow to gigabytes per run and make the run several times slower, so a trial a
+    /// bound stops then gets through less of the program. --selfcheck logs the runs whose logs
+    /// it compares (the target run, the --search run that becomes it, the runs of --minimize
+    /// and the target's replay) at debug or above, into their files, whatever this says.
+    /// When this option is not given, --guest-log gives the level, if given.
+    #[clap(long, value_name = "LEVEL", value_enum)]
+    pub trial_log: Option<TrialLog>,
 
     /// The maximum amount of schedule jitter (deviation) to tolerater while performing the bisection search.
     #[clap(long)]
@@ -241,7 +266,8 @@ pub struct AnalyzeOpts {
     ///
     /// By default the workspace is created in the system's temporary directory: $TMPDIR, or
     /// /tmp when TMPDIR is unset. Analyze removes the workspace when it exits, unless
-    /// --keep-tmp or --verbose or an error ended it; this directory itself stays.
+    /// --keep-tmp, --verbose, or --trial-log above warn, or an error ended it; this directory
+    /// itself stays.
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
 
@@ -260,8 +286,9 @@ pub struct AnalyzeOpts {
     ///
     /// The bound needs a backend on which `hermit run --timeout` is qualified; elsewhere `auto`
     /// gives no bound and an explicit number is refused. Use an outer timeout there.
-    /// While trials are bounded, their `--verbose`/`--selfcheck` log files are capped at
-    /// max(64 MiB, 10 times the largest measured endpoint log), within HERMIT_LOG_MAX_BYTES.
+    /// While trials are bounded, the log files they write under `--trial-log` above warn or
+    /// `--selfcheck` are capped at max(64 MiB, 10 times the largest measured endpoint log),
+    /// within HERMIT_LOG_MAX_BYTES.
     /// HERMIT_LOG_MAX_BYTES=0 lifts both file caps; `off` lifts analyze's file cap.
     #[clap(long, value_name = "SECONDS|auto|off", default_value = "auto")]
     pub trial_timeout: TrialTimeout,
@@ -284,10 +311,10 @@ pub struct AnalyzeOpts {
     /// report, and when SIGTERM, SIGINT or SIGHUP stops it; after an error it keeps it, since
     /// the error can name trial files in it. A stop signal ends the run in progress and starts
     /// no other; analyze then removes the workspace and dies of that signal (a shell reports
-    /// 128 plus its number, 143 for SIGTERM). --verbose keeps the workspace too. The report file
-    /// (--report-file) is never removed. Without --keep-tmp, even with --verbose, a bisection
-    /// trial's schedules are removed as soon as its outcome is read, and every run's recording
-    /// with event times once analyze has written it without them.
+    /// 128 plus its number, 143 for SIGTERM). --verbose, and --trial-log above warn, keep the
+    /// workspace too. The report file (--report-file) is never removed. Without --keep-tmp, even
+    /// with --verbose, a bisection trial's schedules are removed as soon as its outcome is read,
+    /// and every run's recording with event times once analyze has written it without them.
     ///
     /// Analyze cannot clean up after SIGKILL, nor after a stop signal it does not handle: one it
     /// inherits as ignored stays ignored, and an analyze that is PID 1 of its PID namespace
@@ -384,6 +411,36 @@ impl FromStr for ContinuationTimeslice {
                  got {s:?}",
                 detcore_model::time::NANOS_PER_RCB
             )),
+        }
+    }
+}
+
+/// The least a run analyze starts logs: errors, among them the reason Hermit
+/// gives when it refuses the run at an operation it does not support, which
+/// the refusal's warning points at.
+pub const TRIAL_LOG_LEAST: LevelFilter = LevelFilter::ERROR;
+
+/// `--trial-log`: how much each run analyze starts logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TrialLog {
+    /// Errors only, to analyze's stderr: the reason Hermit refuses a trial is one.
+    Off,
+    /// Warnings and errors, to analyze's stderr.
+    Warn,
+    /// Info and above, into the run's own log file.
+    Info,
+    /// Debug and above, into the run's own log file.
+    Debug,
+}
+
+impl TrialLog {
+    /// The level a run logs at. `off` keeps errors ([`TRIAL_LOG_LEAST`]).
+    pub fn level(self) -> LevelFilter {
+        match self {
+            TrialLog::Off => TRIAL_LOG_LEAST,
+            TrialLog::Warn => LevelFilter::WARN,
+            TrialLog::Info => LevelFilter::INFO,
+            TrialLog::Debug => LevelFilter::DEBUG,
         }
     }
 }

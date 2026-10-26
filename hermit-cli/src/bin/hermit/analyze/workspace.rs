@@ -24,7 +24,8 @@ const PREFIX: &str = "hermit_analyze";
 pub enum Retention {
     /// Removed.
     Remove,
-    /// Kept, because of the option named (`--keep-tmp`, `--verbose`), or
+    /// Kept, because of the option named (`--keep-tmp`, `--verbose`,
+    /// `--trial-log`), or
     /// because the command always keeps it (`hermit bisect`).
     Keep { because: Option<&'static str> },
 }

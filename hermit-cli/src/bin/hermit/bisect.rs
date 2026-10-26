@@ -50,7 +50,8 @@ pub struct BisectOpts {
     #[clap(long, default_value = "nonzero", value_name = "NUM|nonzero|any")]
     target_exit_code: ExitStatusConstraint,
 
-    /// Logging level for replayed guest runs.
+    /// Logging level for replayed guest runs. Above warn, each replay writes its log into a
+    /// file of its own in the workspace.
     #[clap(short, long, value_name = "LEVEL", env = "HERMIT_LOG")]
     guest_log: Option<LevelFilter>,
 
@@ -109,6 +110,8 @@ impl BisectOpts {
             target_stderr: self.target_stderr.clone(),
             target_exit_code: self.target_exit_code.clone(),
             guest_log: self.guest_log,
+            // Bisect keeps its workspace whatever its log level.
+            guest_log_from_env: false,
             selfcheck: false,
             search: false,
             run_needleman: self.needleman,
@@ -125,6 +128,8 @@ impl BisectOpts {
             report_file: self.report_file.clone(),
             analyze_seed: None,
             verbose: self.verbose,
+            // The replays log at --guest-log's level (warn without it).
+            trial_log: None,
             jitter_dist: self.jitter_dist,
             execution_context: self.execution_context,
             tmp_dir: None,
