@@ -1298,6 +1298,8 @@ fn record_or_replay_config_with_timer_support(
         // and the recording; see `record_or_replay_config`'s callers.
         cpu_profile: default_config.cpu_profile,
         cpu_profile_host: None,
+        // `hermit record` keeps the files it replays; nothing is rewritten.
+        rewrite_exclusives_in_memory: false,
         cpu_profile_source: None,
         // Record and replay run under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),

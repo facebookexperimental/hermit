@@ -265,6 +265,13 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub counter_reads: BTreeMap<String, u64>,
 
+    /// aarch64, `--rewrite-exclusives` in a run without a mount namespace:
+    /// what rewriting the exclusive loops in the guest's memory did to each
+    /// guest path it touched. A function of the files' bytes and the guest's
+    /// mappings, so it is in the INFO view. Empty elsewhere.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exclusive_rewrites: BTreeMap<String, ExclusiveRewrite>,
+
     /// **Nondeterministic:** aarch64, in runs that record or replay
     /// preemptions: the store-exclusives the guest failed, each of which
     /// retried its loop and added retired branches, and those it executed.
@@ -348,6 +355,22 @@ pub struct RunSummary {
 
 fn is_zero(count: &u64) -> bool {
     *count == 0
+}
+
+/// What rewriting one file's exclusive loops in a guest's memory did. Every
+/// exclusive pair the scan found in the file's executable mappings is in
+/// exactly one count.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExclusiveRewrite {
+    /// Loops the guest's memory holds as single LSE atomics.
+    pub rewritten: u64,
+    /// Loops left as the file has them: refused by the rewriter, in a shared
+    /// or writable mapping, crossing a mapping's end, or not the file's bytes
+    /// in memory.
+    pub left: u64,
+    /// Loops the rewrite could not write; a mapping that could not be read
+    /// counts one. These still retry.
+    pub failed: u64,
 }
 
 /// The store-exclusives a run's guest speculatively executed that failed,
@@ -558,6 +581,7 @@ impl RunSummary {
             host_inputs_changed: _,
             exclusive_pairs,
             counter_reads,
+            exclusive_rewrites,
             store_exclusives,
             store_exclusives_unavailable,
             guest_deadlock,
@@ -674,6 +698,24 @@ impl RunSummary {
             )?;
             for (path, reads) in counter_reads {
                 writeln!(f, "  {path}: {reads}")?;
+            }
+        }
+        if !exclusive_rewrites.is_empty() {
+            writeln!(
+                f,
+                "Exclusive loops rewritten in the guest's memory, in {} file(s):",
+                exclusive_rewrites.len()
+            )?;
+            for (path, rewrite) in exclusive_rewrites {
+                let ExclusiveRewrite {
+                    rewritten,
+                    left,
+                    failed,
+                } = rewrite;
+                writeln!(
+                    f,
+                    "  {path}: {rewritten} rewritten, {left} left, {failed} not written"
+                )?;
             }
         }
 

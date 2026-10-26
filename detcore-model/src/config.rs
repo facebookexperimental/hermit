@@ -241,6 +241,14 @@ pub struct Config {
     #[serde(default)]
     pub cpu_profile: crate::cpu_profile::CpuProfile,
 
+    /// aarch64: rewrite the canonical load/store-exclusive retry loops of
+    /// every executable file mapping in the guest's memory, as each is
+    /// mapped. Set by the CLI for `--rewrite-exclusives` in a run that has no
+    /// mount namespace to carry rewritten files; never read from a recording.
+    #[clap(skip)]
+    #[serde(default)]
+    pub rewrite_exclusives_in_memory: bool,
+
     /// The host facts a v3 guest's leaf 0xD and xstate answers come from, set
     /// by the CLI after the host qualifies; `None` under v2. Neither profile
     /// field enters the legacy form the DBT runtime reads (DBT refuses v3).

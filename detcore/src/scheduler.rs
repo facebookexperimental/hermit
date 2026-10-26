@@ -5470,6 +5470,7 @@ impl Scheduler {
                 .with_queued_sleeps_registered_at_first_pass(
                     queued_sleeps_registered_at_first_pass,
                 );
+                .with_rewrite_exclusives_in_memory(cfg.rewrite_exclusives_in_memory);
             // A run that follows no record writes the newest format. A replay
             // writes the format of the record it follows, whose rules it ran
             // by. A replay of a format-1 record (`TimeSkipMode::Legacy`) takes
@@ -21985,6 +21986,7 @@ impl Scheduler {
                 // store-exclusive sequences (aarch64).
                 exclusive_pairs: Default::default(),
                 counter_reads: Default::default(),
+                exclusive_rewrites: Default::default(),
                 store_exclusives: None,
                 store_exclusives_unavailable: None,
                 guest_deadlock,

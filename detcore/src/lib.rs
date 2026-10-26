@@ -4485,6 +4485,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 subscription.syscalls([Sysno::alarm, Sysno::pause]);
             }
 
+            // Detcore's exclusive-loop scan (aarch64) follows every call that
+            // changes where executable file text is, and the in-memory
+            // rewrite every call that makes some; `mmap`, `munmap`, `mremap`
+            // and `madvise` are listed above.
+            // Only where the scan runs: under record or replay it does not, and
+            // their event stream stays as it was.
+            #[cfg(target_arch = "aarch64")]
+            if crate::store_exclusive::reads_guest_tasks(config) {
+                subscription.syscalls([Sysno::mprotect, Sysno::pkey_mprotect]);
+            }
+
             if config.virtualize_metadata {
                 subscription.syscalls([Sysno::getdents64, Sysno::fstat, Sysno::statx]);
                 #[cfg(target_arch = "x86_64")]
