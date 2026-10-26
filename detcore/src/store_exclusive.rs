@@ -80,15 +80,39 @@ mod decode {
     /// this many instructions before it.
     pub(crate) const PAIR_WINDOW: u64 = 16;
 
-    /// Counts the exclusive pairs in a stream of instruction words.
+    /// `MRS <Xt>, <system register>` with the system register fixed and only
+    /// `Rt` (bits 4:0) free.
+    const MRS_MASK: u32 = !0x1F;
+    /// The virtual counter, read from EL0: `MRS Xt, CNTVCT_EL0` and its
+    /// self-synchronized form `CNTVCTSS_EL0`. Linux lets every task read it
+    /// directly (or, on CPUs with a counter erratum, traps and emulates the
+    /// read in the kernel), so the guest gets the host's count with no stop
+    /// Hermit sees and nothing Detcore can virtualize. It is this
+    /// architecture's `RDTSC`, without `PR_SET_TSC` to trap it.
+    ///
+    /// Not counted: `CNTPCT_EL0`, `CNTPCTSS_EL0` and the timer registers
+    /// (`CNTV_TVAL_EL0` and the like), whose EL0 access Linux disables, so a
+    /// read faults with `SIGILL`, which is visible and deterministic; and
+    /// `CNTFRQ_EL0`, a constant frequency rather than a time.
+    const COUNTER_READS: [u32; 2] = [0xD53B_E040, 0xD53B_E0C0];
+
+    /// Whether `insn` reads the virtual counter from EL0.
+    pub(crate) fn is_counter_read(insn: u32) -> bool {
+        COUNTER_READS.contains(&(insn & MRS_MASK))
+    }
+
+    /// What one pass over a code range finds: the exclusive pairs, whose
+    /// retries make a branch count depend on host interrupts, and the EL0
+    /// counter reads, which bypass virtual time outright.
     #[derive(Clone, Debug, Default)]
-    pub(crate) struct PairCounter {
+    pub(crate) struct CodeScan {
         index: u64,
         last_load: Option<u64>,
         pairs: u64,
+        counter_reads: u64,
     }
 
-    impl PairCounter {
+    impl CodeScan {
         /// Take the next instruction word.
         pub(crate) fn push(&mut self, insn: u32) {
             match classify(insn) {
@@ -100,7 +124,7 @@ mod decode {
                 {
                     self.pairs += 1
                 }
-                _ => {}
+                _ => self.counter_reads += u64::from(is_counter_read(insn)),
             }
             self.index += 1;
         }
@@ -117,6 +141,11 @@ mod decode {
         /// The pairs counted so far.
         pub(crate) fn pairs(&self) -> u64 {
             self.pairs
+        }
+
+        /// The EL0 counter reads counted so far.
+        pub(crate) fn counter_reads(&self) -> u64 {
+            self.counter_reads
         }
     }
 
@@ -157,12 +186,18 @@ mod decode {
             .collect()
     }
 
+    /// One pass over `words`.
+    #[cfg(test)]
+    pub(crate) fn scan_words(words: impl IntoIterator<Item = u32>) -> CodeScan {
+        let mut scan = CodeScan::default();
+        words.into_iter().for_each(|word| scan.push(word));
+        scan
+    }
+
     /// The exclusive pairs in `words`.
     #[cfg(test)]
     pub(crate) fn count_pairs(words: impl IntoIterator<Item = u32>) -> u64 {
-        let mut counter = PairCounter::default();
-        words.into_iter().for_each(|word| counter.push(word));
-        counter.pairs()
+        scan_words(words).pairs()
     }
 }
 
@@ -257,52 +292,96 @@ mod model {
         Some((value, running >= enabled))
     }
 
-    /// One address space's pairs of one file, by mapped file range (offset,
-    /// length).
-    type RangePairs = BTreeMap<(u64, u64), u64>;
+    /// What a scan of one mapping found.
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        Default,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        serde::Deserialize
+    )]
+    pub struct Found {
+        /// Exclusive pairs: a branch count that depends on host interrupts.
+        pub pairs: u64,
+        /// EL0 generic-timer counter reads: time the guest sees that virtual
+        /// time does not control.
+        pub counter_reads: u64,
+    }
 
-    /// The exclusive pairs a run's scans found, by guest path, address space
-    /// and mapped file range.
+    /// What a scan of one mapping found, with the mapping. It crosses to the
+    /// global tool in a `Report`, which is reachable from the crate's public
+    /// RPC types, so it serializes and is nominally `pub`.
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ScannedMapping {
+        /// The guest path of the mapped file.
+        pub path: String,
+        /// The mapped range of that file.
+        pub offset: u64,
+        pub len: u64,
+        pub found: Found,
+    }
+
+    /// One address space's counts for one file, by mapped file range
+    /// (offset, length).
+    type RangeCounts = BTreeMap<(u64, u64), Found>;
+
+    /// What a run's scans found, by guest path, address space and mapped
+    /// file range.
     #[derive(Debug, Default)]
     pub(crate) struct PairTally {
-        pairs: BTreeMap<String, BTreeMap<(String, u64), RangePairs>>,
+        found: BTreeMap<String, BTreeMap<(String, u64), RangeCounts>>,
     }
 
     impl PairTally {
-        /// Take one scan of address space `space`: each mapping's guest path,
-        /// file offset, length and pairs. A mapping replaces the ranges of
-        /// the same file it overlaps, so a mapping split and rejoined by
-        /// mprotect counts once.
-        pub(crate) fn note(&mut self, space: &(String, u64), mappings: &[(String, u64, u64, u64)]) {
-            for (path, offset, len, pairs) in mappings {
+        /// Take one scan of address space `space`. A mapping replaces the
+        /// ranges of the same file it overlaps, so a mapping split and
+        /// rejoined by mprotect counts once.
+        pub(crate) fn note(&mut self, space: &(String, u64), mappings: &[ScannedMapping]) {
+            for mapping in mappings {
                 let ranges = self
-                    .pairs
-                    .entry(path.clone())
+                    .found
+                    .entry(mapping.path.clone())
                     .or_default()
                     .entry(space.clone())
                     .or_default();
-                let end = offset.saturating_add(*len);
+                let end = mapping.offset.saturating_add(mapping.len);
                 ranges.retain(|&(from, length), _| {
-                    end <= from || from.saturating_add(length) <= *offset
+                    end <= from || from.saturating_add(length) <= mapping.offset
                 });
-                ranges.insert((*offset, *len), *pairs);
+                ranges.insert((mapping.offset, mapping.len), mapping.found);
             }
         }
 
-        /// The pairs of each guest path: the sum over the ranges one address
-        /// space mapped, and the largest such sum over address spaces, so
-        /// that a library many processes map counts once.
-        pub(crate) fn per_path(&self) -> BTreeMap<String, u64> {
-            self.pairs
+        /// The exclusive pairs of each guest path that has any.
+        pub(crate) fn pairs_per_path(&self) -> BTreeMap<String, u64> {
+            self.per_path(|found| found.pairs)
+        }
+
+        /// The EL0 counter reads of each guest path that has any.
+        pub(crate) fn counter_reads_per_path(&self) -> BTreeMap<String, u64> {
+            self.per_path(|found| found.counter_reads)
+        }
+
+        /// One count of each guest path that has a nonzero one: the sum over
+        /// the ranges one address space mapped, and the largest such sum over
+        /// address spaces, so that a library many processes map counts once.
+        /// A path is tallied when its mapping has either kind of finding, so
+        /// the zero of the other kind is left out here.
+        fn per_path(&self, of: impl Fn(&Found) -> u64) -> BTreeMap<String, u64> {
+            self.found
                 .iter()
                 .map(|(path, spaces)| {
                     let most = spaces
                         .values()
-                        .map(|ranges| ranges.values().sum::<u64>())
+                        .map(|ranges| ranges.values().map(&of).sum::<u64>())
                         .max()
                         .unwrap_or(0);
                     (path.clone(), most)
                 })
+                .filter(|(_, count)| *count != 0)
                 .collect()
         }
     }
@@ -314,6 +393,7 @@ pub(crate) use runtime::*;
 #[cfg(target_arch = "aarch64")]
 mod runtime {
     use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::ffi::CString;
     use std::fs::File;
     use std::fs::OpenOptions;
@@ -341,11 +421,13 @@ mod runtime {
     use tracing::info;
     use tracing::warn;
 
-    use super::decode::PairCounter;
+    use super::decode::CodeScan;
     use super::decode::elf_section_table;
     use super::decode::executable_sections;
     use super::model::CpuPmu;
+    use super::model::Found;
     use super::model::PairTally;
+    use super::model::ScannedMapping;
     use super::model::arm_cpu_pmus;
     use super::model::combine;
     use super::model::covering;
@@ -407,9 +489,23 @@ mod runtime {
         Pairs {
             /// The scanned address space (see [`ScannedRanges::space`]).
             space: (String, u64),
-            /// Guest path, file offset, length and pairs of each mapping.
-            mappings: Vec<(String, u64, u64, u64)>,
+            /// What the scan found in each mapping that has anything.
+            mappings: Vec<ScannedMapping>,
         },
+    }
+
+    /// Say once per run and file that it reads the virtual counter from EL0.
+    /// Unlike an exclusive pair, which only makes a branch count
+    /// host-dependent, this hands the guest a host time Detcore never sees.
+    fn warn_counter_reads(path: &str, reads: u64) {
+        warn!(
+            "[store-exclusive] {path} reads the generic timer's virtual counter from EL0 ({}). \
+             Those reads make no stop Hermit sees, so Detcore cannot virtualize them: a guest \
+             whose control flow depends on one is not deterministic, and a recorded schedule \
+             may not replay. Reading the counter directly is this architecture's RDTSC, and \
+             Linux has no per-process switch to trap it.",
+            counted(reads, "CNTVCT_EL0 or CNTVCTSS_EL0 read")
+        );
     }
 
     /// A run that executed at least this many store-exclusives warns even
@@ -432,6 +528,8 @@ mod runtime {
         counts: Option<Result<StoreExclusiveCounts, String>>,
         /// What the end-of-run read found uncounted, to warn about.
         uncounted: Vec<String>,
+        /// The guest paths this run has warned read the counter from EL0.
+        warned_counter_reads: BTreeSet<String>,
     }
 
     impl RunTally {
@@ -443,7 +541,16 @@ mod runtime {
                         self.counters = Some(Counters::open(*root));
                     }
                 }
-                Report::Pairs { space, mappings } => self.pairs.note(space, mappings),
+                Report::Pairs { space, mappings } => {
+                    for mapping in mappings {
+                        if mapping.found.counter_reads != 0
+                            && self.warned_counter_reads.insert(mapping.path.clone())
+                        {
+                            warn_counter_reads(&mapping.path, mapping.found.counter_reads);
+                        }
+                    }
+                    self.pairs.note(space, mappings);
+                }
             }
         }
 
@@ -470,7 +577,8 @@ mod runtime {
         /// Fill the summary: the per-path pairs (INFO view and full report),
         /// and the counts or why there are none (full report only).
         pub(crate) fn fill_summary(&mut self, summary: &mut RunSummary) {
-            summary.exclusive_pairs = self.pairs.per_path();
+            summary.exclusive_pairs = self.pairs.pairs_per_path();
+            summary.counter_reads = self.pairs.counter_reads_per_path();
             match self.counts() {
                 Some(Ok(counts)) => summary.store_exclusives = Some(*counts),
                 Some(Err(reason)) => summary.store_exclusives_unavailable = Some(reason.clone()),
@@ -518,7 +626,7 @@ mod runtime {
             };
             let libraries: Vec<String> = self
                 .pairs
-                .per_path()
+                .pairs_per_path()
                 .iter()
                 .filter(|(_, pairs)| **pairs > 0)
                 .map(|(path, pairs)| format!("{path} ({pairs})"))
@@ -988,7 +1096,7 @@ mod runtime {
         Counted {
             size: u64,
             mtime: (i64, i64),
-            pairs: u64,
+            found: Found,
         },
         Failed,
     }
@@ -998,7 +1106,7 @@ mod runtime {
 
     /// The exclusive pairs of one mapping, or `None` where it cannot be
     /// scanned.
-    fn scan_mapping(tid: Pid, path: &Path, key: FileRange) -> Option<u64> {
+    fn scan_mapping(tid: Pid, path: &Path, key: FileRange) -> Option<Found> {
         let cached = SCANS.lock().unwrap().get(&key).copied();
         if let Some(Scan::Failed) = cached {
             return None;
@@ -1014,15 +1122,15 @@ mod runtime {
                 ));
             }
             let (size, mtime) = (metadata.size(), (metadata.mtime(), metadata.mtime_nsec()));
-            let pairs = match cached {
+            let found = match cached {
                 Some(Scan::Counted {
                     size: was,
                     mtime: then,
-                    pairs,
-                }) if (was, then) == (size, mtime) => pairs,
-                _ => count_file(&file, size, &key)?,
+                    found,
+                }) if (was, then) == (size, mtime) => found,
+                _ => scan_file(&file, size, &key)?,
             };
-            Ok(Scan::Counted { size, mtime, pairs })
+            Ok(Scan::Counted { size, mtime, found })
         })();
         let scan = result.unwrap_or_else(|error: std::io::Error| {
             debug!(
@@ -1034,7 +1142,7 @@ mod runtime {
         });
         SCANS.lock().unwrap().insert(key, scan);
         match scan {
-            Scan::Counted { pairs, .. } => Some(pairs),
+            Scan::Counted { found, .. } => Some(found),
             Scan::Failed => None,
         }
     }
@@ -1080,19 +1188,20 @@ mod runtime {
         Ok(unsafe { File::from_raw_fd(fd as i32) })
     }
 
-    /// Count the exclusive pairs in the mapped range of a file of `size`
-    /// bytes, in its executable ELF sections only.
-    fn count_file(file: &File, size: u64, key: &FileRange) -> std::io::Result<u64> {
+    /// Scan the mapped range of a file of `size` bytes, in its executable
+    /// ELF sections only, for what [`Found`] names.
+    fn scan_file(file: &File, size: u64, key: &FileRange) -> std::io::Result<Found> {
         // A mapping can extend past the end of its file.
         let mapped = (key.offset, size.min(key.offset.saturating_add(key.len)));
-        let mut pairs = 0;
+        let mut found = Found::default();
         for (start, end) in code_ranges(file, mapped)? {
             // A pair cannot span two sections.
-            let mut section = PairCounter::default();
+            let mut section = CodeScan::default();
             read_words(file, start, end, &mut section)?;
-            pairs += section.pairs();
+            found.pairs += section.pairs();
+            found.counter_reads += section.counter_reads();
         }
-        Ok(pairs)
+        Ok(found)
     }
 
     /// The parts of `mapped` (a file range) that hold instructions: its
@@ -1125,7 +1234,7 @@ mod runtime {
         file: &File,
         start: u64,
         end: u64,
-        counter: &mut PairCounter,
+        counter: &mut CodeScan,
     ) -> std::io::Result<()> {
         let mut buffer = vec![0u8; (1 << 20).min((end - start) as usize)];
         let mut at = start;
@@ -1192,17 +1301,29 @@ mod runtime {
             };
             let shown = path.display().to_string();
             match scan_mapping(guest.tid(), path, key) {
-                Some(0) => {}
-                Some(pairs) => {
+                Some(found) if found == Found::default() => {}
+                Some(found) => {
+                    // Only what was found: a mapping with pairs alone keeps the
+                    // line it always had.
+                    let what = [
+                        (found.pairs, "store-exclusive (LL/SC) pair"),
+                        (found.counter_reads, "EL0 generic-timer counter read"),
+                    ]
+                    .into_iter()
+                    .filter(|(count, _)| *count != 0)
+                    .map(|(count, noun)| counted(count, noun))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
                     info!(
                         "[detcore, dtid {}] {} in executable mapping {} (offset {:#x}, {:#x} bytes)",
-                        dettid,
-                        counted(pairs, "store-exclusive (LL/SC) pair"),
-                        shown,
-                        key.offset,
-                        key.len
+                        dettid, what, shown, key.offset, key.len
                     );
-                    mappings.push((shown, key.offset, key.len, pairs));
+                    mappings.push(ScannedMapping {
+                        path: shown,
+                        offset: key.offset,
+                        len: key.len,
+                        found,
+                    });
                 }
                 None => info!(
                     "[detcore, dtid {}] store-exclusive (LL/SC) pairs not scanned in executable \
@@ -1295,15 +1416,19 @@ mod runtime {
 
 #[cfg(test)]
 mod tests {
+    use super::decode::CodeScan;
     use super::decode::Exclusive;
     use super::decode::PAIR_WINDOW;
-    use super::decode::PairCounter;
     use super::decode::classify;
     use super::decode::count_pairs;
     use super::decode::elf_section_table;
     use super::decode::executable_sections;
+    use super::decode::is_counter_read;
+    use super::decode::scan_words;
     use super::model::CpuPmu;
+    use super::model::Found;
     use super::model::PairTally;
+    use super::model::ScannedMapping;
     use super::model::arm_cpu_pmus;
     use super::model::combine;
     use super::model::covering;
@@ -1471,15 +1596,15 @@ mod tests {
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .collect();
-        let mut whole = PairCounter::default();
+        let mut whole = CodeScan::default();
         whole.push_bytes(&bytes);
         assert_eq!(whole.pairs(), 1);
-        let mut split = PairCounter::default();
+        let mut split = CodeScan::default();
         split.push_bytes(&bytes[..8]);
         split.push_bytes(&bytes[8..]);
         assert_eq!(split.pairs(), 1);
         // Big-endian words are other instructions.
-        let mut swapped = PairCounter::default();
+        let mut swapped = CodeScan::default();
         for word in [LDAXR_X0_X2, STLXR_W3_X1_X2] {
             swapped.push_bytes(&word.to_be_bytes());
         }
@@ -1574,33 +1699,106 @@ mod tests {
         assert_eq!(combine(&[(0, 0, 0)]), Some((0, true)));
     }
 
+    /// A mapping as the scan reports it, for the tally tests.
+    fn mapping(path: &str, offset: u64, len: u64, pairs: u64) -> ScannedMapping {
+        ScannedMapping {
+            path: path.to_owned(),
+            offset,
+            len,
+            found: Found {
+                pairs,
+                counter_reads: 0,
+            },
+        }
+    }
+
     #[test]
     fn tallies_pairs_per_address_space_and_path() {
         let libc = "/lib64/libc.so.6".to_owned();
         let parent = ("0".to_owned(), 1);
         let child = ("01".to_owned(), 0);
         let mut tally = PairTally::default();
-        tally.note(&parent, &[(libc.clone(), 0, 0x1000, 19)]);
+        tally.note(&parent, &[mapping(&libc, 0, 0x1000, 19)]);
         // Two ranges of one file in one address space add up.
-        tally.note(&parent, &[(libc.clone(), 0x4000, 0x1000, 2)]);
-        assert_eq!(tally.per_path()[&libc], 21);
+        tally.note(&parent, &[mapping(&libc, 0x4000, 0x1000, 2)]);
+        assert_eq!(tally.pairs_per_path()[&libc], 21);
         // The same ranges in another address space count once.
-        tally.note(&child, &[(libc.clone(), 0, 0x1000, 19)]);
-        assert_eq!(tally.per_path()[&libc], 21);
+        tally.note(&child, &[mapping(&libc, 0, 0x1000, 19)]);
+        assert_eq!(tally.pairs_per_path()[&libc], 21);
         // mprotect split the first range and rejoined it: the new ranges
         // replace the ones they overlap.
         tally.note(
             &parent,
             &[
-                (libc.clone(), 0, 0x800, 12),
-                (libc.clone(), 0x800, 0x800, 7),
+                mapping(&libc, 0, 0x800, 12),
+                mapping(&libc, 0x800, 0x800, 7),
             ],
         );
-        assert_eq!(tally.per_path()[&libc], 21);
-        tally.note(&parent, &[(libc.clone(), 0, 0x1000, 19)]);
-        assert_eq!(tally.per_path()[&libc], 21);
+        assert_eq!(tally.pairs_per_path()[&libc], 21);
+        tally.note(&parent, &[mapping(&libc, 0, 0x1000, 19)]);
+        assert_eq!(tally.pairs_per_path()[&libc], 21);
         // A later image of the same process is another address space.
-        tally.note(&(parent.0.clone(), 2), &[(libc.clone(), 0, 0x1000, 19)]);
-        assert_eq!(tally.per_path()[&libc], 21);
+        tally.note(&(parent.0.clone(), 2), &[mapping(&libc, 0, 0x1000, 19)]);
+        assert_eq!(tally.pairs_per_path()[&libc], 21);
+    }
+
+    /// The virtual counter, read from EL0: `MRS Xt, CNTVCT_EL0` and
+    /// `CNTVCTSS_EL0`, with every `Rt`. Encodings from GNU as.
+    #[test]
+    fn counts_the_virtual_counter_reads_an_image_can_make() {
+        for encoding in [0xd53b_e040u32, 0xd53b_e0c0] {
+            for rt in 0..32 {
+                assert!(is_counter_read(encoding | rt), "{:#010x}", encoding | rt);
+            }
+        }
+        // Not counted: `CNTPCT_EL0` and `CNTPCTSS_EL0`, which fault at EL0 on
+        // Linux; `CNTFRQ_EL0`, a constant; `CNTV_TVAL_EL0`, a timer register
+        // that also faults; `CNTKCTL_EL1`, EL1 state; a `NOP` and a
+        // load-exclusive.
+        for other in [
+            0xd53b_e020u32,
+            0xd53b_e0a0,
+            0xd53b_e000,
+            0xd53b_e300,
+            0xd538_e104,
+            0xd503_201f,
+            0xc85f_fc64,
+        ] {
+            assert!(!is_counter_read(other), "{other:#010x}");
+        }
+        // One pass counts both kinds, and a counter read is not mistaken for
+        // part of an exclusive pair: ldaxr; mrs x1, cntvct_el0; stlxr; cbnz.
+        let scan = scan_words([0xc85f_fc64, 0xd53b_e041, 0xc805_fc64, 0x35ff_ffa5]);
+        assert_eq!(scan.pairs(), 1);
+        assert_eq!(scan.counter_reads(), 1);
+    }
+
+    /// A mapping is tallied when it has either kind of finding, and each
+    /// per-path view leaves out the paths with none of its kind.
+    #[test]
+    fn tallies_each_finding_only_where_there_is_one() {
+        let space = ("0".to_owned(), 1);
+        let mut tally = PairTally::default();
+        let linker = ScannedMapping {
+            path: "/system/bin/linker64".to_owned(),
+            offset: 0,
+            len: 0x1000,
+            found: Found {
+                pairs: 0,
+                counter_reads: 1,
+            },
+        };
+        tally.note(&space, &[linker, mapping("/lib64/libc.so.6", 0, 0x1000, 3)]);
+        assert_eq!(
+            tally.pairs_per_path().into_iter().collect::<Vec<_>>(),
+            vec![("/lib64/libc.so.6".to_owned(), 3)]
+        );
+        assert_eq!(
+            tally
+                .counter_reads_per_path()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![("/system/bin/linker64".to_owned(), 1)]
+        );
     }
 }

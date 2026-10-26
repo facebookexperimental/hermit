@@ -255,6 +255,16 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub exclusive_pairs: BTreeMap<String, u64>,
 
+    /// aarch64: the reads of the generic timer's virtual counter from EL0
+    /// (`MRS Xt, CNTVCT_EL0` or `CNTVCTSS_EL0`) in the guest's executable
+    /// file mappings, by guest path, for the files that have any. Such a
+    /// read makes no stop Hermit sees, so Detcore cannot virtualize it and a
+    /// guest whose control flow depends on one is not deterministic. A
+    /// function of the files' bytes, so it is in the INFO view. Empty
+    /// elsewhere.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub counter_reads: BTreeMap<String, u64>,
+
     /// **Nondeterministic:** aarch64, in runs that record or replay
     /// preemptions: the store-exclusives the guest failed, each of which
     /// retried its loop and added retired branches, and those it executed.
@@ -496,6 +506,7 @@ impl RunSummary {
             host_inputs: _,
             host_inputs_changed: _,
             exclusive_pairs,
+            counter_reads,
             store_exclusives,
             store_exclusives_unavailable,
             guest_deadlock,
@@ -576,6 +587,17 @@ impl RunSummary {
             )?;
             for (path, pairs) in exclusive_pairs {
                 writeln!(f, "  {path}: {pairs}")?;
+            }
+        }
+        if !counter_reads.is_empty() {
+            writeln!(
+                f,
+                "EL0 generic-timer counter reads, which Detcore cannot virtualize, in executable \
+                 mappings of {} file(s):",
+                counter_reads.len()
+            )?;
+            for (path, reads) in counter_reads {
+                writeln!(f, "  {path}: {reads}")?;
             }
         }
 
