@@ -45,7 +45,11 @@
 //!    wait's return to the victim, or the waiter's own change of course
 //!    reaching the outcome. Otherwise that wait is the first candidate, and
 //!    the other timed calls that flip, around the victim or among themselves,
-//!    may be scheduling noise and follow it.
+//!    may be scheduling noise and follow it. A victim fed by a thread that
+//!    changed course is an effect of that change: the candidates are the
+//!    change against the deciding event, then the timed waits whose return
+//!    order flips around the change (those in flight across the deciding
+//!    event before the evidenced pairs, the others after them).
 //!
 //! Two calls are ordered by their entry and return events: a pair flips when
 //! one call enters before the other enters (or returns) in one run and after
@@ -502,25 +506,52 @@ pub fn find_racing_accesses(
                 finder.timing(timing)
             } else if !pairs.is_empty() || timing.is_some() {
                 // Where a victim takes its data from a thread that changed
-                // course, that change and the deciding event; then pairs off
-                // the outcome's causal path, or whose flip rests on a partner
-                // with no place in the baseline; then timed calls that may be
-                // scheduling noise.
+                // course, that change and the deciding event; then the timed
+                // waits in flight across the deciding event whose return
+                // flips around such a change; then the evidenced pairs off
+                // the outcome's causal path; then the other waits that flip
+                // around a change, weak alone; then pairs whose flip rests on
+                // a partner with no place in the baseline; then timed calls
+                // that may be scheduling noise.
                 let mut candidates = Vec::new();
                 let mut upstream = BTreeSet::new();
+                let mut changes = Vec::new();
                 for pair in &pairs {
                     if let Some((thread, candidate)) = finder.upstream_candidate(pair, o)
                         && upstream.insert(thread)
                     {
                         candidates.push(candidate);
+                        changes.extend(finder.course_change(thread));
                     }
                 }
-                candidates.extend(
-                    pairs
-                        .iter()
-                        .filter(|p| finder.upstream_candidate(p, o).is_none())
-                        .map(|p| finder.pair_candidate(p, o)),
-                );
+                // Each wait once, against the first change it flips around.
+                let mut seen = Vec::new();
+                let mut in_flight = Vec::new();
+                let mut weak = Vec::new();
+                for &change in &changes {
+                    for s in finder.timed_flips_around(change) {
+                        if timed_kind(s.op.target) != Some(Timed::Wait)
+                            || seen.iter().any(|&t| std::ptr::eq(t, s.op.target))
+                        {
+                            continue;
+                        }
+                        seen.push(s.op.target);
+                        let candidate = finder.course_timing_candidate(change, s, o);
+                        if finder.waits_across(s.op) {
+                            in_flight.push(candidate);
+                        } else {
+                            weak.push(candidate);
+                        }
+                    }
+                }
+                let (evidenced, unevidenced): (Vec<_>, Vec<_>) = pairs
+                    .iter()
+                    .filter(|p| finder.upstream_candidate(p, o).is_none())
+                    .partition(|p| finder.evidenced(p));
+                candidates.extend(in_flight);
+                candidates.extend(evidenced.into_iter().map(|p| finder.pair_candidate(p, o)));
+                candidates.extend(weak);
+                candidates.extend(unevidenced.into_iter().map(|p| finder.pair_candidate(p, o)));
                 if let Some(TimingChoice::Several(timings)) = &timing {
                     candidates.extend(timings.iter().map(|t| finder.timing_candidate(t, o)));
                 }
@@ -1610,6 +1641,33 @@ impl<'a> Finder<'a> {
                 .is_some_and(|p| p >= self.decision && p <= self.end)
     }
 
+    /// The timed calls on threads other than `anchor`'s whose return order
+    /// flips around it, ranked: waits in flight across the deciding event
+    /// first, those still waiting at the outcome first among them, then the
+    /// nearest return.
+    fn timed_flips_around(&self, anchor: Side<'a>) -> Vec<Side<'a>> {
+        let flips = |s: &&Side<'a>| {
+            s.op.target.tid != anchor.op.target.tid
+                && (s.target_key() < anchor.target_key())
+                    != (s.baseline_key() < anchor.baseline_key())
+        };
+        let mut around: Vec<Side<'a>> = self
+            .timed_returns(false)
+            .iter()
+            .filter(flips)
+            .copied()
+            .collect();
+        let waiting = |s: &Side<'a>| s.op.target.post.is_none_or(|p| p > self.end);
+        around.sort_by_key(|s| {
+            (
+                !self.waits_across(s.op),
+                !waiting(s),
+                s.target_key().abs_diff(anchor.target_key()),
+            )
+        });
+        around
+    }
+
     /// Whether something besides the count corroborates that `wait`, the one
     /// wait in flight across the deciding event whose return flips around
     /// `victim`, times it: in the run where the wait returns first, an edge
@@ -1662,22 +1720,8 @@ impl<'a> Finder<'a> {
                 op: victim,
                 at: AccessPoint::Return,
             };
-            let flips = |s: &&Side<'a>| {
-                s.op.target.tid != victim.target.tid
-                    && (s.target_key() < v.target_key()) != (s.baseline_key() < v.baseline_key())
-            };
-            let mut around: Vec<Side<'a>> = timed.iter().filter(flips).copied().collect();
+            let around = self.timed_flips_around(v);
             let across = |s: &Side<'a>| self.waits_across(s.op);
-            // Waits in flight across the decision first, those still waiting
-            // at the outcome first among them, then the nearest return.
-            let waiting = |s: &Side<'a>| s.op.target.post.is_none_or(|p| p > self.end);
-            around.sort_by_key(|s| {
-                (
-                    !across(s),
-                    !waiting(s),
-                    s.target_key().abs_diff(v.target_key()),
-                )
-            });
             let clock = (timed_kind(victim.target) == Some(Timed::Clock)).then_some(victim);
             let pair = |s: Side<'a>| TimingPair {
                 sides: if s.target_key() < v.target_key() {
@@ -2051,6 +2095,18 @@ impl<'a> Finder<'a> {
             .min_by_key(|change| change.side.op.target.nth)
     }
 
+    /// `thread`'s change of course when the baseline makes that call too
+    /// (its sysno or arguments differ), at its entry in both runs: a place
+    /// in both runs that timed waits can flip around. A call the baseline
+    /// does not make, or does not return from, has none.
+    fn course_change(&self, thread: DetTid) -> Option<Side<'a>> {
+        let change = self.change_point(thread)?;
+        (change.kind == ChangeKind::Differs && change.side.op.baseline.is_some()).then_some(Side {
+            at: AccessPoint::Entry,
+            ..change.side
+        })
+    }
+
     /// Whether `side`'s target event happens before the outcome (program
     /// order and observed edges), and how many events before it; `None`
     /// without an outcome or a target event.
@@ -2263,6 +2319,73 @@ impl<'a> Finder<'a> {
                 evidence,
             },
         ))
+    }
+
+    /// A timed wait whose return order flips around `change`, a thread's
+    /// change of course whose call the baseline makes too (compared entry
+    /// against entry), as a candidate. A short wait that did not span the
+    /// deciding event lands next to most points that moved, so it is weak
+    /// evidence alone.
+    fn course_timing_candidate(
+        &self,
+        change: Side<'a>,
+        timed: Side<'a>,
+        outcome: Option<&OutcomeRef>,
+    ) -> RaceCandidate {
+        let sys = change.op.target;
+        let after = timed.target_key() > change.target_key();
+        let (target_side, baseline_side) = if after {
+            ("after", "before")
+        } else {
+            ("before", "after")
+        };
+        let weak = if self.waits_across(timed.op) {
+            format!(
+                "{} was in flight across the deciding event {}",
+                who(timed.op.target),
+                self.decision
+            )
+        } else {
+            "weak alone: a poller sleeps near most moved points".to_string()
+        };
+        let toward = self.toward_outcome(change, outcome);
+        let evidence = format!(
+            "thread {}'s calls change course at its call {} (#{} in the target{}); {} returns \
+             {target_side} it in the target and {baseline_side} it in the baseline; {weak}; {}",
+            sys.tid,
+            sys.nth,
+            sys.pre,
+            change
+                .op
+                .baseline
+                .map_or(String::new(), |b| format!(", #{} in the baseline", b.pre)),
+            who(timed.op.target),
+            outcome_clause(who(sys), toward.as_ref())
+        );
+        let shown = Side {
+            op: Op {
+                target: sys,
+                baseline: None,
+            },
+            at: AccessPoint::Entry,
+        };
+        let sides = if after {
+            [shown, timed]
+        } else {
+            [timed, shown]
+        };
+        RaceCandidate {
+            resource: None,
+            order: self.order_of(if after {
+                [change, timed]
+            } else {
+                [timed, change]
+            }),
+            accesses: sides.map(|side| self.access_of(side)),
+            reaches_outcome: toward.as_ref().is_some_and(|(v, _)| v.ordered),
+            events_before_outcome: toward.map(|(_, d)| d),
+            evidence,
+        }
     }
 
     /// A flipped pair as a candidate.
@@ -4492,17 +4615,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_reader_fed_by_a_thread_that_changed_course_is_no_race() {
-        // A shutdown thread (21) removes a client in memory; the deciding
-        // event is the return of its log write. The server thread (53) then
-        // finds the client gone: its log line differs (its call 150), so its
-        // calls have no counterpart from there on, though it sends a
-        // response the same size in both runs, which the client thread (3,
-        // the outcome thread) reads with different bytes. The response is
-        // ordered before the read by its own bytes in both runs, so the two
-        // are an effect of the server's change, not a race; the candidate is
-        // that change against the deciding event.
+    /// The client and server shape of the next tests: a shutdown thread
+    /// (21) whose log write returns at the deciding event, a server thread
+    /// (53) whose log line differs from its call 150 on and whose same-size
+    /// response the client thread (3, the outcome thread) reads with
+    /// different bytes; with `poller`, a thread (7) that naps in short steps,
+    /// one of which returns between the server's change of course in the
+    /// target (#110) and in the baseline (#112).
+    fn fed_by_a_changed_course(poller: bool) -> (Vec<SyscallRecord>, Vec<SyscallRecord>) {
         let log = |pre, tid, nth, len| {
             call(
                 pre,
@@ -4544,18 +4664,36 @@ mod tests {
         };
         let mut shutdown = log(98, 21, 40, 30);
         shutdown.post = Some(S);
-        let target = trace(vec![
+        let mut target = vec![
             shutdown.clone(),
             log(110, 53, 150, 106),
             send(120),
             receive(130, 1),
-        ]);
-        let baseline = trace(vec![
-            shutdown,
-            log(112, 53, 150, 121),
-            send(122),
-            receive(132, 2),
-        ]);
+        ];
+        let mut baseline = vec![shutdown, log(112, 53, 150, 121), send(122), receive(132, 2)];
+        if poller {
+            for calls in [&mut target, &mut baseline] {
+                calls.push(nap(101, 7, 60, Some(105)));
+                calls.push(nap(106, 7, 61, Some(111)));
+                calls.push(nap(113, 7, 62, Some(117)));
+            }
+        }
+        (target, baseline)
+    }
+
+    #[test]
+    fn a_reader_fed_by_a_thread_that_changed_course_is_no_race() {
+        // A shutdown thread (21) removes a client in memory; the deciding
+        // event is the return of its log write. The server thread (53) then
+        // finds the client gone: its log line differs (its call 150), so its
+        // calls have no counterpart from there on, though it sends a
+        // response the same size in both runs, which the client thread (3,
+        // the outcome thread) reads with different bytes. The response is
+        // ordered before the read by its own bytes in both runs, so the two
+        // are an effect of the server's change, not a race; the candidate is
+        // that change against the deciding event.
+        let (target, baseline) = fed_by_a_changed_course(false);
+        let (target, baseline) = (trace(target), trace(baseline));
         let r = find_at(&target, &baseline, (3, 140));
         assert_eq!(r.status, RaceStatus::Candidates, "{}", r.reason);
         let [candidate] = r.candidates.as_slice() else {
@@ -4587,6 +4725,90 @@ mod tests {
         assert_eq!(json["status"], "candidates");
         assert_eq!(json["candidates"][0]["accesses"][1]["thread"], 53);
         assert_eq!(json["candidates"][0]["reaches_outcome"], true);
+    }
+
+    #[test]
+    fn a_poller_nap_around_a_changed_course_is_a_weak_candidate() {
+        // A poller's nap returns after the server's change of course in the
+        // target and before it in the baseline: a candidate after the change
+        // against the deciding event, marked weak, since a poller naps next
+        // to most points that moved.
+        let (target, baseline) = fed_by_a_changed_course(true);
+        let r = find_at(&trace(target), &trace(baseline), (3, 140));
+        assert_eq!(r.status, RaceStatus::Candidates, "{}", r.reason);
+        assert_eq!(
+            r.candidates
+                .iter()
+                .map(|c| c
+                    .accesses
+                    .iter()
+                    .map(|a| (a.thread, a.nth))
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![(t(21), 40), (t(53), 150)],
+                vec![(t(53), 150), (t(7), 61)],
+            ]
+        );
+        let poller = &r.candidates[1];
+        assert_eq!(poller.order.baseline, [1, 0]);
+        assert!(poller.reaches_outcome);
+        assert!(
+            poller.evidence.starts_with("thread 53's calls change course at its call 150 (#110 in the target, #112 in the baseline); thread 7's clock_nanosleep returns after it in the target and before it in the baseline; weak alone: a poller sleeps near most moved points; thread 53's write is 30 events before the outcome"),
+            "{}",
+            poller.evidence
+        );
+    }
+
+    #[test]
+    fn a_weak_nap_ranks_after_the_evidenced_pairs() {
+        // The same shape, plus a pair off the outcome's causal path whose
+        // flip rests on evidence: thread 9 dups onto fd 6 before thread 5's
+        // seek on it in the target and after it in the baseline. The weak
+        // nap comes after that pair.
+        let (mine, piped) = (Some(file(9, 1)), Some(file(9, 2)));
+        let dup = |pre| {
+            call(
+                pre,
+                9,
+                5,
+                Sysno::dup2,
+                &[4, 6],
+                Some(6),
+                vec![fd(6, piped, FdOp::Dup { source: 4 })],
+            )
+        };
+        let seek = |pre, reached, result| {
+            call(
+                pre,
+                5,
+                8,
+                Sysno::lseek,
+                &[6, 0, 0],
+                Some(result),
+                vec![fd(6, reached, FdOp::Use)],
+            )
+        };
+        let (mut target, mut baseline) = fed_by_a_changed_course(true);
+        target.extend([dup(102), seek(103, piped, -29)]);
+        baseline.extend([seek(101, mine, 0), dup(104)]);
+        let r = find_at(&trace(target), &trace(baseline), (3, 140));
+        assert_eq!(r.status, RaceStatus::Candidates, "{}", r.reason);
+        assert_eq!(
+            r.candidates
+                .iter()
+                .map(|c| c
+                    .accesses
+                    .iter()
+                    .map(|a| (a.thread, a.nth))
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![(t(21), 40), (t(53), 150)],
+                vec![(t(9), 5), (t(5), 8)],
+                vec![(t(53), 150), (t(7), 61)],
+            ]
+        );
     }
 
     #[test]
