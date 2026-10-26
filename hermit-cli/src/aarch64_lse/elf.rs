@@ -14,10 +14,18 @@
 //! symbol, relocation and build id stays as it was, and the loader maps it
 //! exactly as it mapped the original.
 //!
-//! Only `PT_LOAD` segments that are executable are scanned, and a segment
-//! that is also writable is refused rather than rewritten: writable text is
-//! either a loader bug or a runtime that rewrites itself, and rewriting it
-//! would race whatever writes it.
+//! Only sections marked executable (`SHF_EXECINSTR`, so `.text`, `.plt`,
+//! `.init` and the like) are scanned. An executable `PT_LOAD` segment also
+//! carries the ELF header, the dynamic symbol and relocation tables and
+//! read-only data, and those bytes decode as instructions as readily as code
+//! does: measured on one Android test binary, scanning whole segments found
+//! 69 "exclusive instructions" of which 66 were in data before `.text` even
+//! began. A file with no section headers is left alone and reported, because
+//! nothing in it can be told apart from data.
+//!
+//! A section in a segment that is both writable and executable is refused
+//! too: writable text is either a loader quirk or a runtime that rewrites
+//! itself, and rewriting it would race whatever writes it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -25,6 +33,7 @@ use std::path::Path;
 use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::program_header;
+use goblin::elf::section_header;
 
 use super::rewrite;
 use super::rewrite::Idiom;
@@ -33,7 +42,7 @@ use super::rewrite::Refusal;
 /// What a rewrite did to one file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileReport {
-    /// Exclusive instructions found in executable segments.
+    /// Exclusive instructions found in executable sections.
     pub exclusive_instructions: usize,
     /// Rewritten sequences, by idiom.
     pub patched: BTreeMap<&'static str, usize>,
@@ -41,7 +50,7 @@ pub struct FileReport {
     pub refused: BTreeMap<&'static str, usize>,
     /// Addresses of the first few refusals, for reporting.
     pub refused_examples: Vec<(u64, String)>,
-    /// Executable segments skipped entirely, with the reason.
+    /// Executable sections skipped entirely, with the reason.
     pub skipped_segments: Vec<String>,
 }
 
@@ -96,42 +105,57 @@ fn refusal_detail(reason: &Refusal) -> String {
 /// error: a caller that was handed the wrong file should say so and run the
 /// original.
 pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::error::Error> {
-    let segments = {
+    let sections = {
         let elf = Elf::parse(bytes)?;
         if elf.header.e_machine != header::EM_AARCH64 {
             return Ok(None);
         }
-        elf.program_headers
+        let writable_executable: Vec<(u64, u64)> = elf
+            .program_headers
             .iter()
-            .filter(|ph| ph.p_type == program_header::PT_LOAD && ph.is_executable())
-            .map(|ph| {
-                (
-                    ph.p_offset,
-                    ph.p_filesz,
-                    ph.p_vaddr,
-                    ph.is_write(),
-                    ph.p_align,
-                )
+            .filter(|ph| {
+                ph.p_type == program_header::PT_LOAD && ph.is_executable() && ph.is_write()
+            })
+            .map(|ph| (ph.p_vaddr, ph.p_vaddr.saturating_add(ph.p_memsz)))
+            .collect();
+        if elf.section_headers.is_empty() {
+            let mut report = FileReport::default();
+            report
+                .skipped_segments
+                .push("the file has no section headers, so code cannot be told from data".into());
+            return Ok(Some(report));
+        }
+        elf.section_headers
+            .iter()
+            .filter(|sh| {
+                sh.sh_type == section_header::SHT_PROGBITS
+                    && sh.sh_flags & u64::from(section_header::SHF_EXECINSTR) != 0
+                    && sh.sh_size != 0
+            })
+            .map(|sh| {
+                let writable = writable_executable
+                    .iter()
+                    .any(|(start, end)| sh.sh_addr >= *start && sh.sh_addr < *end);
+                (sh.sh_offset, sh.sh_size, sh.sh_addr, writable)
             })
             .collect::<Vec<_>>()
     };
     let mut report = FileReport::default();
-    for (offset, filesz, vaddr, writable, align) in segments {
+    for (offset, filesz, vaddr, writable) in sections {
         let start = offset as usize;
         let end = start.saturating_add(filesz as usize);
         if end > bytes.len() || start % 4 != 0 || vaddr % 4 != 0 {
             report.skipped_segments.push(format!(
-                "segment at file offset {offset:#x} is truncated or unaligned"
+                "executable section at file offset {offset:#x} is truncated or unaligned"
             ));
             continue;
         }
         if writable {
             report.skipped_segments.push(format!(
-                "segment at file offset {offset:#x} is writable and executable"
+                "executable section at {vaddr:#x} is in a writable mapping"
             ));
             continue;
         }
-        let _ = align;
         let count = (end - start) / 4;
         let mut words: Vec<u32> = (0..count)
             .map(|i| {
@@ -161,8 +185,9 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
 }
 
 /// Read `input`, rewrite it, and write the result to `output` with `input`'s
-/// permissions. The output is written whole, so a failed rewrite leaves no
-/// partial file behind under that name.
+/// permissions. The output is written whole and renamed into place, so a
+/// failed rewrite leaves no partial file behind under that name and a
+/// concurrent writer of the same output cannot be seen half-written.
 pub fn rewrite_file(
     input: impl AsRef<Path>,
     output: impl AsRef<Path>,
@@ -173,7 +198,12 @@ pub fn rewrite_file(
         Some(report) => report,
         None => return Ok(None),
     };
-    let temporary = output.as_ref().with_extension("partial");
+    // A unique temporary: two runs may rewrite the same input into the same
+    // cached output at the same time, and a shared temporary name would let
+    // one rename pull the file out from under the other.
+    let temporary = output
+        .as_ref()
+        .with_extension(format!("partial.{}", std::process::id()));
     std::fs::write(&temporary, &bytes)?;
     let mode = std::fs::metadata(input)?.permissions();
     std::fs::set_permissions(&temporary, mode)?;
