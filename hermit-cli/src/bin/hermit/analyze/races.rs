@@ -1920,21 +1920,37 @@ fn timed_kind(sys: &SyscallRecord) -> Option<Timed> {
             ];
             waits.contains(&cmd) && a[3] != 0
         }
-        Sysno::poll => a[2] as i32 > 0,
-        Sysno::epoll_wait | Sysno::epoll_pwait => a[3] as i32 > 0,
+        Sysno::epoll_pwait => a[3] as i32 > 0,
         Sysno::ppoll => a[2] != 0,
         Sysno::epoll_pwait2 => a[3] != 0,
-        Sysno::select | Sysno::pselect6 => a[4] != 0,
+        Sysno::pselect6 => a[4] != 0,
+        // The legacy calls only x86_64 has; aarch64's generic table
+        // (include/uapi/asm-generic/unistd.h) has ppoll, epoll_pwait and
+        // pselect6 above instead.
+        #[cfg(target_arch = "x86_64")]
+        Sysno::poll => a[2] as i32 > 0,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::epoll_wait => a[3] as i32 > 0,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::select => a[4] != 0,
         _ => timerfd_read,
     };
     if wait {
         return Some(Timed::Wait);
     }
-    matches!(
-        sys.sysno,
-        Sysno::clock_gettime | Sysno::gettimeofday | Sysno::time
-    )
-    .then_some(Timed::Clock)
+    reads_a_clock(sys.sysno).then_some(Timed::Clock)
+}
+
+/// Whether `sysno` reads a clock: clock_gettime, gettimeofday, and
+/// x86_64's time, which aarch64 lacks (its C library builds time(2) on
+/// clock_gettime).
+fn reads_a_clock(sysno: Sysno) -> bool {
+    match sysno {
+        Sysno::clock_gettime | Sysno::gettimeofday => true,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::time => true,
+        _ => false,
+    }
 }
 
 /// `FUTEX_LOCK_PI2` (Linux 5.14), not in every libc release.
@@ -2118,6 +2134,7 @@ fn call_text(sys: &SyscallRecord) -> String {
     let args: Vec<String> = match sys.sysno {
         Sysno::close | Sysno::fsync | Sysno::fdatasync | Sysno::dup | Sysno::syncfs => vec![fd(0)],
         Sysno::exit | Sysno::exit_group => vec![int(0)],
+        #[cfg(target_arch = "x86_64")]
         Sysno::dup2 => vec![fd(0), fd(1)],
         Sysno::dup3 => vec![fd(0), fd(1), plain(2)],
         Sysno::write if sys.out_bytes.is_some() => {
@@ -3607,7 +3624,7 @@ mod tests {
                 pre,
                 9,
                 11,
-                Sysno::dup2,
+                Sysno::dup3,
                 &[4, 6],
                 Some(6),
                 vec![
@@ -3649,7 +3666,7 @@ mod tests {
             vec!["close(6)", "lseek(6, 2048, SEEK_SET)"]
         );
         assert_eq!(
-            r.also_reordered[0].accesses[0].call, "dup2(4, 6)",
+            r.also_reordered[0].accesses[0].call, "dup3(4, 6, 0)",
             "the dup is listed after it"
         );
     }
@@ -4174,17 +4191,17 @@ mod tests {
 
     #[test]
     fn an_fd_access_is_ordered_at_its_entry() {
-        // Thread 7 dup2s another file onto fd 6, then writes the pipe that
+        // Thread 7 dup3s another file onto fd 6, then writes the pipe that
         // thread 9's blocking read(6) returns. The read reached fd 6 at its
         // entry, before the write, so the pipe edge to its return does not
-        // order the dup2 before the fd access.
+        // order the dup3 before the fd access.
         let (old, new) = (Some(file(7, 1)), Some(file(7, 9)));
         let dup2 = |pre| {
             call(
                 pre,
                 7,
                 30,
-                Sysno::dup2,
+                Sysno::dup3,
                 &[5, 6],
                 Some(6),
                 vec![fd(6, old, FdOp::Close), fd(6, new, FdOp::Dup { source: 5 })],
@@ -4222,7 +4239,7 @@ mod tests {
         let r = find(&target, &baseline, Some(9));
         assert_eq!(r.status, RaceStatus::Found, "{}", r.reason);
         assert_eq!(r.resource.as_ref().unwrap().kind, ResourceKind::Fd);
-        assert_eq!(r.accesses[0].call, "dup2(5, 6)");
+        assert_eq!(r.accesses[0].call, "dup3(5, 6, 0)");
         assert_eq!(r.happens_before.unwrap().target, unordered());
     }
 
