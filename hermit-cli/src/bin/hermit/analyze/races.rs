@@ -1674,6 +1674,9 @@ impl<'a> Finder<'a> {
     /// chain leads from its return to the victim; or the waiter's own change
     /// of course reaches the outcome. After the decision nearly every clock
     /// read differs, and any long sleeper spanning it flips around one.
+    /// [`Self::change_point`] counts a call that returns in the target only,
+    /// not one that returns in the baseline only, so a waiter whose sleep
+    /// returns in the baseline only is not corroborated by its own change.
     fn corroborated(&self, wait: Side<'a>, victim: Side<'a>, outcome: Option<&OutcomeRef>) -> bool {
         let runs = [
             (&self.target, Some(wait.op.target), Some(victim.op.target)),
@@ -1743,7 +1746,10 @@ impl<'a> Finder<'a> {
             // first one that differs. Waits rank before clock reads and longer
             // waits first (one still waiting at the outcome is the longest):
             // a poller's short naps, one of which is always in flight, land
-            // next to most points.
+            // next to most points. Lengths count by their power of two, and
+            // among waits of a similar length the one returning nearer the
+            // deciding event comes first, so a watchdog's long nap does not
+            // push out a nearer wait of about its length.
             let mut ranked: Vec<(Side<'a>, Side<'a>)> = around.iter().map(|&s| (v, s)).collect();
             if clock.is_some() {
                 // The victim thread's other clock reads, each against the
@@ -1795,10 +1801,12 @@ impl<'a> Finder<'a> {
                     .unwrap_or(self.end)
                     .saturating_sub(s.op.target.pre)
             };
+            let returns = |s: &Side<'a>| s.op.target.post.unwrap_or(self.end);
             ranked.sort_by_key(|(a, s)| {
                 (
                     !is_wait(s),
-                    std::cmp::Reverse(length(s)),
+                    std::cmp::Reverse(length(s).checked_ilog2()),
+                    returns(s).abs_diff(self.decision),
                     s.target_key().abs_diff(a.target_key()),
                 )
             });
@@ -4511,6 +4519,33 @@ mod tests {
                     .collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
             vec![vec![(t(9), 31), (t(5), 3)], vec![(t(9), 30), (t(7), 10)]]
+        );
+    }
+
+    #[test]
+    fn a_nearer_wait_of_similar_length_ranks_before_a_long_nap() {
+        // Two waits in flight across the deciding event flip around the
+        // producer's clock read: a watchdog's nap (thread 7, 40 events) and
+        // a consumer's sleep (thread 5, 36 events) that returns nearer the
+        // deciding event. Of about the same length, the nearer comes first.
+        let target = trace(vec![
+            nap(90, 5, 3, Some(126)),
+            nap(95, 7, 4, Some(135)),
+            clock_read(121, 9, 30, 1),
+        ]);
+        let baseline = trace(vec![
+            nap(90, 5, 3, Some(118)),
+            nap(95, 7, 4, Some(119)),
+            clock_read(121, 9, 30, 2),
+        ]);
+        let r = find_at(&target, &baseline, (9, 160));
+        assert_eq!(r.status, RaceStatus::Candidates, "{}", r.reason);
+        assert_eq!(
+            r.candidates
+                .iter()
+                .map(|c| c.accesses.iter().map(|a| a.thread).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![t(9), t(5)], vec![t(9), t(7)]]
         );
     }
 
