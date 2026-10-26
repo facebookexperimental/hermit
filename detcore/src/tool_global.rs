@@ -6390,7 +6390,9 @@ impl GlobalState {
                 // whenever its parent runs on after the clone, as recorded
                 // schedules usually have it, so this is a sign that the
                 // replay lost its guide only once it has left the record.
-                if sched.replay_registration_priority(child_dettid, initial_priority) {
+                if sched.replay_registration_priority(child_dettid, initial_priority)
+                    && !is_replay_root(&self.cfg, child_dettid)
+                {
                     if sched.replay_left_its_record() {
                         warn!(
                             "[detcore, dtid {}] registered before the replayed schedule switched to it, created by process {}; it takes its starting priority {}",
@@ -10363,6 +10365,30 @@ pub(crate) fn child_tid_clear_address(flags: CloneFlags, address: usize) -> usiz
     }
 }
 
+/// The priority a thread starts with under `--replay-schedule-from`, until
+/// the replayed schedule switches to it: the foreground for the guest's first
+/// thread, which the schedule's first event names, and the deferred priority
+/// for every other. The first thread is 3 in Hermit's PID namespace, and the
+/// chosen base under `--no-namespace` with chosen IDs (`GuestIds::Chosen`).
+/// Treating the base as any other thread left the first thread deferred
+/// beside its children, so that, until a context switch set the priorities,
+/// the run queue's order alone chose between it and an older child: a spliced
+/// schedule (`hermit analyze`'s two-seed bisection) with no switch between
+/// two clones ran the first child at the second clone's posthook, where the
+/// schedule had the parent.
+fn replay_starting_priority(config: &Config, dettid: DetTid) -> Priority {
+    if is_replay_root(config, dettid) {
+        REPLAY_FOREGROUND_PRIORITY
+    } else {
+        REPLAY_DEFERRED_PRIORITY
+    }
+}
+
+/// Whether `dettid` is the guest's first thread (`replay_starting_priority`).
+fn is_replay_root(config: &Config, dettid: DetTid) -> bool {
+    dettid <= DetTid::from_raw(3) || config.guest_ids.base() == Some(dettid.as_raw())
+}
+
 /// Global method RPC for the parent to add a child-thread to the round-robin pool.
 ///
 /// Nonblocking: future returning does not guarantee anything about the central scheduler,
@@ -10386,12 +10412,7 @@ where
         // side of the rpc, in recv_create_child_thread.
         None
     } else if guest.config().replay_schedule_from.is_some() {
-        // FIXME!  Find a cleaner way to make the root thread start off high-priority:
-        if child_dettid <= DetTid::from_raw(3) {
-            Some(REPLAY_FOREGROUND_PRIORITY)
-        } else {
-            Some(REPLAY_DEFERRED_PRIORITY)
-        }
+        Some(replay_starting_priority(guest.config(), child_dettid))
     } else if guest.config().chaos {
         let entropy = guest
             .thread_state_mut()
@@ -10473,11 +10494,7 @@ pub async fn create_vfork_child_thread<G, T>(
     let starting_priority = if guest.config().replay_preemptions_from.is_some() {
         None
     } else if guest.config().replay_schedule_from.is_some() {
-        Some(if child_dettid <= DetTid::from_raw(3) {
-            REPLAY_FOREGROUND_PRIORITY
-        } else {
-            REPLAY_DEFERRED_PRIORITY
-        })
+        Some(replay_starting_priority(guest.config(), child_dettid))
     } else if guest.config().chaos {
         Some(entropy_to_priority(vfork.child_priority_entropy.expect(
             "vfork child priority entropy missing in chaos mode",
@@ -13475,6 +13492,33 @@ mod tests {
     /// (`GlobalResponse::Granted`).
     fn granted(response: super::GlobalResponse) -> super::GlobalResponse {
         super::GlobalResponse::Granted(Box::new(response))
+    }
+
+    /// Under `--replay-schedule-from` the guest's first thread starts in the
+    /// foreground and every other deferred, however the guest is numbered:
+    /// thread 3 in Hermit's PID namespace, the chosen base under
+    /// `--no-namespace` (`GuestIds::Chosen`), whose first thread a spliced
+    /// schedule otherwise left deferred beside its children.
+    #[test]
+    fn the_first_guest_thread_starts_a_schedule_replay_in_the_foreground_however_numbered() {
+        use detcore_model::pid::GuestIds;
+        let namespace = super::Config::default();
+        assert_eq!(namespace.guest_ids, GuestIds::Namespace);
+        let chosen = super::Config {
+            guest_ids: GuestIds::Chosen {
+                base: 31744,
+                refuse_host_ids: true,
+            },
+            ..Default::default()
+        };
+        let starts = |config: &super::Config, tid: i32| {
+            super::replay_starting_priority(config, super::DetTid::from_raw(tid))
+        };
+        assert_eq!(starts(&namespace, 3), super::REPLAY_FOREGROUND_PRIORITY);
+        assert_eq!(starts(&namespace, 4), super::REPLAY_DEFERRED_PRIORITY);
+        assert_eq!(starts(&chosen, 31744), super::REPLAY_FOREGROUND_PRIORITY);
+        assert_eq!(starts(&chosen, 31745), super::REPLAY_DEFERRED_PRIORITY);
+        assert_eq!(starts(&chosen, 40000), super::REPLAY_DEFERRED_PRIORITY);
     }
 
     /// A process reads its current image's vector; a forked child its
