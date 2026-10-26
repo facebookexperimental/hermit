@@ -104,6 +104,13 @@ pub enum Insn {
         rn: Reg,
         operand: Operand,
     },
+    /// UXTB/UXTH: a zero extension, which proves the bits above its width
+    /// are clear in the destination.
+    ZeroExtend {
+        bits: u32,
+        rd: Reg,
+        rn: Reg,
+    },
     /// SUBS with a discarded result: CMP, register or immediate.
     Cmp {
         sf: bool,
@@ -206,11 +213,12 @@ pub fn decode(word: u32) -> Insn {
         let imm = (word >> 10) & 0xfff;
         let rn = ((word >> 5) & 0x1f) as Reg;
         let rd = (word & 0x1f) as Reg;
-        if shift12 {
-            return Insn::Other;
-        }
+        // An add or subtract may shift its immediate left by 12; the decoded
+        // operand is the shifted value, which is what the rewrite must
+        // materialise.
+        let imm = if shift12 { imm << 12 } else { imm };
         return match (set_flags, sub, rd) {
-            (true, true, ZR) => Insn::Cmp {
+            (true, true, ZR) if !shift12 => Insn::Cmp {
                 sf,
                 rn,
                 operand: Operand::Imm(imm),
@@ -284,6 +292,23 @@ pub fn decode(word: u32) -> Insn {
             operand: Operand::Reg(rm),
         };
     }
+    // Unsigned bitfield move (32-bit, immr = 0): UXTB is UBFM Wd, Wn, #0, #7
+    // and UXTH is UBFM Wd, Wn, #0, #15.
+    // sf=0, opc=10 (UBFM is opc=10 for the unsigned form), 100110, N=0.
+    if (word >> 22) & 0x3ff == 0b01_0100_1100 {
+        let imms = (word >> 10) & 0x3f;
+        let immr = (word >> 16) & 0x3f;
+        let rn = ((word >> 5) & 0x1f) as Reg;
+        let rd = (word & 0x1f) as Reg;
+        if immr == 0 && (imms == 7 || imms == 15) {
+            return Insn::ZeroExtend {
+                bits: imms + 1,
+                rd,
+                rn,
+            };
+        }
+        return Insn::Other;
+    }
     // Compare and branch (immediate): sf 011010 op imm19 Rt.
     if (word >> 25) & 0x3f == 0b011010 {
         return Insn::CompareBranch {
@@ -330,7 +355,25 @@ pub fn mov_reg(sf: bool, rd: Reg, rm: Reg) -> u32 {
 
 /// `MOV Rd, #imm16` (MOVZ, no shift).
 pub fn movz(sf: bool, rd: Reg, imm16: u32) -> u32 {
-    sf_bit(sf) | 0x5280_0000 | (imm16 << 5) | rd as u32
+    movz_shifted(sf, rd, imm16, 0)
+}
+
+/// `MOVZ Rd, #imm16, LSL #(16 * hw)`.
+pub fn movz_shifted(sf: bool, rd: Reg, imm16: u32, hw: u32) -> u32 {
+    sf_bit(sf) | 0x5280_0000 | (hw << 21) | (imm16 << 5) | rd as u32
+}
+
+/// The single MOVZ that materialises `value`, if one exists: the immediate is
+/// 16 bits at a multiple-of-16 shift, so only a value whose nonzero bits fall
+/// inside one such window can be built in one instruction.
+pub fn movz_for(sf: bool, rd: Reg, value: u64) -> Option<u32> {
+    for hw in 0..if sf { 4 } else { 2 } {
+        let shift = 16 * hw;
+        if value >> shift << shift == value && (value >> shift) <= 0xffff {
+            return Some(movz_shifted(sf, rd, (value >> shift) as u32, hw));
+        }
+    }
+    None
 }
 
 /// `MOVN Rd, #imm16`: Rd = !imm16, so `movn(imm - 1)` materialises `-imm`.

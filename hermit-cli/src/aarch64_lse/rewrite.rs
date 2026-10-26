@@ -313,6 +313,7 @@ fn match_sequence(
                 rn,
                 sf,
                 zero_status,
+                start.checked_sub(1).map(|i| decoded[i]),
             )?,
         ),
         _ => return Err(Refusal::NotCanonical),
@@ -440,9 +441,17 @@ fn rmw(
     // original loop also writes before anything reads it.
     let (materialise, atomic_op) = match (op, operand) {
         (AluOp::Add, Operand::Reg(rm)) => (insn::mov_reg(sf, rs, rm), AtomicOp::Add),
-        (AluOp::Add, Operand::Imm(k)) if k <= 0xffff => (insn::movz(sf, rs, k), AtomicOp::Add),
+        // A plain 12-bit immediate, or one the instruction shifted left by 12,
+        // whenever a single MOVZ can build it.
+        (AluOp::Add, Operand::Imm(k)) => (
+            insn::movz_for(sf, rs, u64::from(k)).ok_or(Refusal::UnsupportedOperation)?,
+            AtomicOp::Add,
+        ),
         (AluOp::Sub, Operand::Reg(rm)) => (insn::neg(sf, rs, rm), AtomicOp::Add),
-        // MOVN materialises -k as !(k - 1); k is a 12-bit CMP/ADD immediate.
+        // MOVN materialises -k as !(k - 1); k is a 12-bit immediate. A
+        // subtraction of a shifted immediate has no one-instruction negation:
+        // MOVN's result is one less than a multiple of 4096, never equal to
+        // one.
         (AluOp::Sub, Operand::Imm(k)) if (1..=0x10000).contains(&k) => {
             (insn::movn(sf, rs, k - 1), AtomicOp::Add)
         }
@@ -473,6 +482,7 @@ fn cas_compare(
     rn: Reg,
     sf: bool,
     zero_status: u32,
+    before: Option<Insn>,
 ) -> Result<Vec<u32>, Refusal> {
     let (cmp_sf, cmp_rn, operand) = match cmp {
         Insn::Cmp { sf, rn, operand } => (sf, rn, operand),
@@ -499,8 +509,18 @@ fn cas_compare(
         // A sub-word compare against a register compares the zero-extended
         // loaded value over the full register, while CASB/CASH compare only
         // the low bits, so the two disagree whenever the register's high bits
-        // are set. An immediate that fits the access width cannot disagree.
-        Operand::Reg(_) if !matches!(size, Size::W | Size::X) => {
+        // are set -- unless the instruction just before the loop zero-extended
+        // that very register to the access width, which is what the compiler's
+        // own outline-atomics helpers do.
+        Operand::Reg(rm)
+            if !matches!(size, Size::W | Size::X)
+                && !matches!(
+                    before,
+                    Some(Insn::ZeroExtend { bits, rd, .. })
+                        if rd == rm && bits == if matches!(size, Size::B) { 8 } else { 16 }
+                ) =>
+        {
+            let _ = rm;
             return Err(Refusal::Registers("a sub-word compare against a register"));
         }
         Operand::Reg(rm) => insn::mov_reg(sf, rt, rm),
@@ -736,6 +756,73 @@ mod tests {
         );
         assert_eq!(words[0], insn::NOP);
         assert_eq!(*words.last().unwrap(), insn::NOP);
+    }
+
+    #[test]
+    fn an_immediate_the_instruction_shifted_by_twelve_is_materialised() {
+        // ldxr x9,[x8]; add x9,x9,#0x100,lsl #12; stxr w10,x9,[x8]; cbnz w10
+        // becomes movz x10,#0x10,lsl #16; ldadd x10,x9,[x8]; <the add>; mov w10,wzr.
+        let words = [0xc85f_7d09, 0x9144_0129, 0xc80a_7d09, 0x35ff_ffaa];
+        let report = plan(&words, BASE);
+        assert_eq!(report.refused, vec![]);
+        assert_eq!(
+            report.patched[0].words,
+            vec![0xd2a0_020a, 0xf82a_0109, 0x9144_0129, 0x2a1f_03ea]
+        );
+
+        // The same subtraction has no one-instruction negation: MOVN yields one
+        // less than a multiple of 4096.
+        let words = [0xc85f_7d09, 0xd160_0129, 0xc80a_7d09, 0x35ff_ffaa];
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![]);
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::UnsupportedOperation)
+        );
+    }
+
+    #[test]
+    fn a_zero_extension_before_the_loop_admits_a_sub_word_register_compare() {
+        // uxtb w16,w0; ldaxrb w0,[x2]; cmp w0,w16; b.ne out; stlxrb w17,w1,[x2]; cbnz w17
+        // is the compiler's own byte compare-and-swap helper: the zero extension
+        // proves the high bits of w16 are clear, so CASALB compares what CMP does.
+        let loop_words = [
+            0x085f_fc40,
+            0x6b10_001f,
+            0x5400_0081,
+            0x0811_fc41,
+            0x35ff_ff91,
+        ];
+        let mut words = vec![0x5300_1c10];
+        words.extend_from_slice(&loop_words);
+        let report = plan(&words, BASE);
+        assert_eq!(report.refused, vec![], "{report:?}");
+        assert_eq!(
+            report.patched[0].words,
+            vec![
+                0x2a10_03e0,
+                0x08e0_fc41,
+                0x6b10_001f,
+                0x5400_0061,
+                0x2a1f_03f1
+            ]
+        );
+
+        // Without the zero extension the same loop stays refused.
+        let report = plan(&loop_words, BASE);
+        assert_eq!(report.patched, vec![]);
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::Registers("a sub-word compare against a register"))
+        );
+
+        // A zero extension of the wrong width, or of another register, does not.
+        for before in [0x5300_3c10u32, 0x5300_1c13] {
+            let mut words = vec![before];
+            words.extend_from_slice(&loop_words);
+            let report = plan(&words, BASE);
+            assert_eq!(report.patched, vec![], "{before:#010x}");
+        }
     }
 
     #[test]
