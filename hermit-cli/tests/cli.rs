@@ -13174,18 +13174,17 @@ fn no_namespace_validates_parent_signal_before_choosing_an_id() {
 }
 
 /// A schedule replay runs first, after a clone, the side its record ran
-/// first, whatever `--runs-post-fork` the replay has. Under `--no-namespace`
-/// with chosen IDs (each run the init of a PID namespace of its own, as above),
-/// the record here runs the parent on after its `pthread_create`
+/// first, whatever `--runs-post-fork` the replay has, under `--no-namespace`
+/// with chosen IDs (each run the init of a PID namespace of its own, as
+/// above). The record here runs the parent on after its `pthread_create`
 /// (`--runs-post-fork=parent`) and the replay explicitly chooses the child
-/// (`--runs-post-fork=child`), in both schedule formats.
-/// The child registers before the replayed schedule switches to it, at the
-/// same starting priority as the root, so the post-fork side alone chose who
-/// ran: the replay ran the child's first slice where the record had the
-/// parent's clone posthook, and left its schedule there. A chaos record whose
-/// priorities ran the parent on did the same, so on a host without PID
-/// namespaces every `hermit analyze` trial left its schedule at the guest's
-/// first thread.
+/// (`--runs-post-fork=child`), in both schedule formats. The replay used to
+/// start the guest's first thread, the chosen base, at the deferred priority
+/// of every thread it creates, so the post-fork side alone chose who ran: it
+/// ran the child's first slice where the record had the parent's clone
+/// posthook, and left its schedule there. On a host without PID namespaces
+/// every `hermit analyze` trial left its schedule at the guest's first
+/// thread.
 #[test]
 fn a_no_namespace_schedule_replay_runs_first_after_a_clone_the_side_its_record_did() {
     let guest = hb_two_threads_guest();
