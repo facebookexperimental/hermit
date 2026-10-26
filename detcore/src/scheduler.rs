@@ -5397,6 +5397,20 @@ pub struct ConsumeResult {
     pub event_ix: u64,
 }
 
+/// A slice length that no recorded slice exceeds, for the schedule replay of
+/// a record whose slices ran without the `--max-timeslice` bound: `latest`,
+/// the latest logical time the recorded run reached at an event
+/// (`PreemptionRecord::uncapped_slices`), plus the bound. A recorded slice
+/// begins and ends within the record, so a backstop this long never ends one
+/// early. A slice's end is not marked as such in the event stream (a thread
+/// also traces its branch count before each syscall), so nothing shorter is
+/// known to be safe. Once the record has run out the replay goes back to the
+/// bound (`Scheduler::uncapped_backstop`).
+fn uncapped_replay_backstop_for(latest: u64, cfg: &Config) -> LogicalTime {
+    let bound = cfg.max_timeslice.map_or(0, std::num::NonZeroU64::get);
+    LogicalTime::from_nanos(latest.saturating_add(bound))
+}
+
 /// Any non-None response means that the guest should print its stack trace before proceeding, and
 /// a response that further includes a path means print to a file at that location.
 pub type MaybePrintStack = Option<Option<PathBuf>>;
@@ -5711,6 +5725,9 @@ impl Scheduler {
                 charge_replayed_switch_ins = recording.charges_replayed_switch_ins();
                 match recording {
                     Recording::Legacy(record) => {
+                        uncapped_replay_backstop = record
+                            .uncapped_slices()
+                            .map(|latest| uncapped_replay_backstop_for(latest, cfg));
                         callback_checkpoints = record
                             .callback_checkpoints()
                             .iter()
@@ -23744,6 +23761,25 @@ mod test {
     use crate::tool_local::RobustListExit;
     use crate::tool_local::RobustListWake;
     use crate::tool_local::ThreadState;
+
+    /// The backstop for an uncapped record outlasts every recorded slice: it
+    /// runs from a thread's start past the latest logical time the record
+    /// states, by the configured bound.
+    #[test]
+    fn an_uncapped_records_backstop_outlasts_its_latest_event() {
+        let config = Config {
+            max_timeslice: std::num::NonZeroU64::new(100_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            uncapped_replay_backstop_for(9_400_000, &config),
+            LogicalTime::from_nanos(9_500_000)
+        );
+        assert_eq!(
+            uncapped_replay_backstop_for(0, &config),
+            LogicalTime::from_nanos(100_000)
+        );
+    }
 
     #[test]
     fn initial_current_birth_binds_both_identities_without_a_turn() {

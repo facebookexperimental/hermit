@@ -170,6 +170,7 @@ impl BisectOpts {
             resumed_progress: None,
             trial_runner: Default::default(),
             hermit_run: Default::default(),
+            trial_schedules_uncapped: Default::default(),
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
@@ -220,6 +221,7 @@ impl BisectOpts {
         // Every replay's schedule is written anew, stamped with the replays'
         // guest IDs, so they are resolved before the first.
         analyzer.prepare_trial_guest_ids(&[("--good", &self.good), ("--bad", &self.bad)])?;
+        analyzer.adopt_uncapped_slices(&[self.good.as_path(), self.bad.as_path()])?;
         let (mut good, mut bad) = (good, bad);
         // Analyze's trial outputs omit optional event timestamps. Put these
         // admitted search inputs in that same representation: bisection edits

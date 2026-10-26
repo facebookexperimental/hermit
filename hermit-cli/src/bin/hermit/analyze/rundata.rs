@@ -1943,6 +1943,10 @@ impl AnalyzeOpts {
     /// omitted one would be accepted, or refused, when replayed under another
     /// value
     /// (<https://github.com/rrnewton/hermit/issues/4380>).
+    /// It also carries the uncapped-slices mark of the schedules the trials
+    /// come from (`trial_schedules_uncapped`): a trial's schedule has no event
+    /// times, so without the mark its replay would end their long slices at
+    /// `--max-timeslice` and leave the schedule.
     pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
         let record = record
             .with_pipe_wake_latency(self.trial_pipe_wake_latency())
@@ -1955,7 +1959,8 @@ impl AnalyzeOpts {
                 self.trial_sleep_registration() == SleepRegistration::FirstPass,
             )
             .with_rewrite_exclusives(self.trial_rewrite_exclusives())
-            .with_post_crash_timeslice(self.trial_post_crash_timeslice());
+            .with_post_crash_timeslice(self.trial_post_crash_timeslice())
+            .with_uncapped_slices(self.trial_schedules_uncapped.get());
         // Under `--no-namespace`, the guest IDs every trial takes, resolved
         // before the first (`prepare_trial_guest_ids`): a record without them
         // reads as numbered by a PID namespace, which no trial can replay.
@@ -1980,6 +1985,19 @@ impl AnalyzeOpts {
     /// A refusal here comes before any trial.
     pub fn prepare_trial_guest_ids(&self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
         RunData::get_raw_runopts(self).prepare_trial_guest_ids_for_inputs(recordings)
+    }
+
+    /// Take the uncapped-slices mark of the schedule files `paths` for the
+    /// trial schedules made from them: the latest time any of them states.
+    pub fn adopt_uncapped_slices(&self, paths: &[&Path]) -> anyhow::Result<()> {
+        let mut latest = None;
+        for path in paths {
+            let mark = detcore::preemptions::read_recorded_uncapped_slices(path)
+                .map_err(anyhow::Error::msg)?;
+            latest = latest.max(mark);
+        }
+        self.trial_schedules_uncapped.set(latest);
+        Ok(())
     }
 
     /// Write `events`, a schedule a search built from the schedules of

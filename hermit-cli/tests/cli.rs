@@ -26010,7 +26010,8 @@ fn a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay() {
     let marked = |path: &str| -> bool {
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap();
-        json.get("uncapped_slices").is_some_and(|mark| mark == true)
+        json.get("uncapped_slices")
+            .is_some_and(serde_json::Value::is_u64)
     };
 
     run(&[
