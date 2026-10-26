@@ -919,7 +919,7 @@ async fn legacy_callback_expired_deadline_trial_recording(annotated: bool, owner
     let peer_event = SchedEvent::syscall(peer, Sysno::getpid, detcore_model::schedule::SyscallPhase::Posthook);
     if owner_switch { writer.register_thread(peer, DEFAULT_PRIORITY); writer.insert_schedevent(peer_event.clone()); }
     writer.insert_schedevent(SchedEvent::branches(tid, 90));
-    writer.insert_schedevent(SchedEvent { dettid: tid, op: Op::OtherInstructions, count: 1, start_rip: None, end_rip: None, end_time: None });
+    writer.insert_schedevent(SchedEvent { dettid: tid, op: Op::OtherInstructions, count: 1, start_rip: None, end_rip: None, end_time: None, stopless: false });
     writer.insert_schedevent(SchedEvent::syscall(tid, Sysno::close, detcore_model::schedule::SyscallPhase::Prehook));
     writer.insert_reprioritization(tid, at, 11, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
     if annotated { writer.insert_callback_checkpoint(tid, Origin { callback: Callback::PmuTimer, site: Site::Prehook, progress: 11, last_op: Some(Op::Branch), time: at, rcbs: 11 }); }

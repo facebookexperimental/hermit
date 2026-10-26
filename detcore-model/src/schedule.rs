@@ -28,7 +28,7 @@ pub mod boundary;
 
 /// A scheduled action by one thread in the system.  This can be recorded, or replayed to guide the
 /// schedule.
-#[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Hash, Deserialize)]
 pub struct SchedEvent {
     /// The thread that originated the event.
     pub dettid: DetTid,
@@ -43,6 +43,77 @@ pub struct SchedEvent {
     /// An optional snapshot of the thread logical time at this point.
     /// This includes time waiting on the global scheduler.
     pub end_time: Option<LogicalTime>,
+    /// Set on the branches up to a timeslice end the run took without
+    /// stopping the guest, because no other thread could run before the
+    /// thread next entered Detcore (a lone thread's slice end). The guest was
+    /// stopped later, so the event has no `end_rip`. A schedule replay may
+    /// take such an end without a stop too, where its thread runs alone.
+    #[serde(default)]
+    pub stopless: bool,
+}
+
+/// Written by hand so that a human-readable record (JSON) leaves `stopless`
+/// out when it is false, as every record made before the field existed did,
+/// while a binary encoding keeps every field: `SchedEvent` crosses Reverie's
+/// RPC, which is bincode, positional and not self-describing, so a field
+/// skipped there would misalign every field after it.
+impl Serialize for SchedEvent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Destructured so that a new field cannot be left out unnoticed.
+        let Self {
+            dettid,
+            op,
+            count,
+            start_rip,
+            end_rip,
+            end_time,
+            stopless,
+        } = self;
+        let written_stopless = *stopless || !serializer.is_human_readable();
+        let mut state =
+            serializer.serialize_struct("SchedEvent", 6 + usize::from(written_stopless))?;
+        state.serialize_field("dettid", dettid)?;
+        state.serialize_field("op", op)?;
+        state.serialize_field("count", count)?;
+        state.serialize_field("start_rip", start_rip)?;
+        state.serialize_field("end_rip", end_rip)?;
+        state.serialize_field("end_time", end_time)?;
+        if written_stopless {
+            state.serialize_field("stopless", stopless)?;
+        } else {
+            state.skip_field("stopless")?;
+        }
+        state.end()
+    }
+}
+
+/// As derived, but without `stopless` when it is false, so that the logs of
+/// a run without slice ends taken without a stop read as before the field
+/// existed.
+impl fmt::Debug for SchedEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            dettid,
+            op,
+            count,
+            start_rip,
+            end_rip,
+            end_time,
+            stopless,
+        } = self;
+        let mut s = f.debug_struct("SchedEvent");
+        s.field("dettid", dettid)
+            .field("op", op)
+            .field("count", count)
+            .field("start_rip", start_rip)
+            .field("end_rip", end_rip)
+            .field("end_time", end_time);
+        if *stopless {
+            s.field("stopless", stopless);
+        }
+        s.finish()
+    }
 }
 
 /// A more compact printing.
@@ -61,6 +132,9 @@ impl fmt::Display for SchedEvent {
         if let Some(time) = self.end_time {
             write!(f, " time={}", time)?;
         }
+        if self.stopless {
+            write!(f, " stopless")?;
+        }
         write!(f, " {:?})", self.op)?;
         Ok(())
     }
@@ -77,6 +151,7 @@ impl SchedEvent {
             start_rip: None,
             end_rip: None,
             end_time: None,
+            stopless: false,
         }
     }
 
@@ -89,6 +164,7 @@ impl SchedEvent {
             start_rip: None, // TODO: track the start of the interval as well.
             end_rip: None,
             end_time: None,
+            stopless: false,
         }
     }
 
@@ -113,6 +189,36 @@ impl SchedEvent {
     /// Set the end_rip field.  The instruction pointer after the event completed.
     pub fn with_end_rip(mut self, end_rip: InstructionPointer) -> Self {
         self.end_rip = Some(end_rip);
+        self
+    }
+
+    /// Whether the two events are the same operation by the same thread at
+    /// the same instruction pointers, whichever way each run took a timeslice
+    /// end there: a stop reads the `end_rip` that an end taken without one
+    /// (`stopless`) does not have. Counts and times are not compared. Not
+    /// transitive (two stops at different RIPs are each the same kind as the
+    /// end without one), so it compares two events and cannot key a hash.
+    pub fn same_kind(&self, other: &SchedEvent) -> bool {
+        let rips_known = !(self.stopless || other.stopless);
+        (self.dettid, self.op, self.start_rip) == (other.dettid, other.op, other.start_rip)
+            && (!rips_known || self.end_rip == other.end_rip)
+    }
+
+    /// [`SchedEvent::same_kind`], with the same count and time too: the same
+    /// guest operations, however each run took a timeslice end there.
+    pub fn same_operations(&self, other: &SchedEvent) -> bool {
+        self.same_kind(other) && (self.count, self.end_time) == (other.count, other.end_time)
+    }
+
+    /// Mark these branches as ending at a timeslice end taken without a stop
+    /// (`stopless`): they have no `end_rip`.
+    pub fn taken_without_stop(mut self) -> Self {
+        assert_eq!(self.op, Op::Branch, "only branches end at a timeslice end");
+        assert!(
+            self.end_rip.is_none(),
+            "a slice end without a stop has no RIP"
+        );
+        self.stopless = true;
         self
     }
 }
@@ -243,6 +349,98 @@ impl FromStr for SigWrapper {
 impl From<Signal> for SigWrapper {
     fn from(signal: Signal) -> Self {
         Self(signal as i32)
+    }
+}
+
+#[cfg(test)]
+mod sched_event_tests {
+    use super::*;
+
+    fn event(stopless: bool) -> SchedEvent {
+        SchedEvent {
+            end_time: Some(LogicalTime::from_nanos(1_250)),
+            stopless,
+            ..SchedEvent::branches(DetTid::from_raw(3), 100)
+        }
+    }
+
+    /// A record without slice ends taken without a stop is written exactly as
+    /// before the field existed, and a record written before then reads as
+    /// one whose every slice end had its stop.
+    #[test]
+    fn json_leaves_out_a_false_stopless_and_reads_its_absence_as_false() {
+        let before = r#"{"dettid":3,"op":"Branch","count":100,"start_rip":null,"end_rip":null,"end_time":1250}"#;
+        assert_eq!(serde_json::to_string(&event(false)).unwrap(), before);
+        assert_eq!(
+            serde_json::from_str::<SchedEvent>(before).unwrap(),
+            event(false)
+        );
+        let stopless = serde_json::to_string(&event(true)).unwrap();
+        assert_eq!(
+            stopless,
+            r#"{"dettid":3,"op":"Branch","count":100,"start_rip":null,"end_rip":null,"end_time":1250,"stopless":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SchedEvent>(&stopless).unwrap(),
+            event(true)
+        );
+    }
+
+    /// The RPC's encoding is positional: the field is written whatever its
+    /// value, and both values come back.
+    #[test]
+    fn a_binary_encoding_keeps_stopless_in_place() {
+        for stopless in [false, true] {
+            let pair = (event(stopless), 7u32);
+            let wire = bincode::serde::encode_to_vec(&pair, bincode::config::legacy()).unwrap();
+            let (back, _): ((SchedEvent, u32), usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(back, pair);
+        }
+    }
+
+    /// A stop and a stopless end at the same branch count are the same
+    /// operations; any other difference is not.
+    #[test]
+    fn same_operations_ignores_only_how_a_slice_end_was_taken() {
+        let stopped = SchedEvent {
+            end_rip: InstructionPointer::new(0x1000),
+            ..event(false)
+        };
+        assert!(stopped.same_operations(&event(true)));
+        assert!(event(true).same_operations(&stopped));
+        assert!(stopped.same_operations(&stopped.clone()));
+        let elsewhere = SchedEvent {
+            end_rip: InstructionPointer::new(0x2000),
+            ..stopped.clone()
+        };
+        assert!(!stopped.same_operations(&elsewhere));
+        let later = SchedEvent {
+            count: 101,
+            ..event(true)
+        };
+        assert!(!stopped.same_operations(&later));
+    }
+
+    #[test]
+    fn debug_shows_stopless_only_when_set() {
+        let plain = format!("{:?}", event(false));
+        assert_eq!(
+            plain,
+            "SchedEvent { dettid: DetPid(3), op: Branch, count: 100, start_rip: None, end_rip: None, end_time: Some(LogicalTime(1250)) }"
+        );
+        assert_eq!(
+            format!("{:?}", event(true)),
+            plain.replace(" }", ", stopless: true }")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a slice end without a stop has no RIP")]
+    fn a_slice_end_without_a_stop_has_no_rip() {
+        let _ = SchedEvent::branches(DetTid::from_raw(3), 1)
+            .with_end_rip(InstructionPointer::new(0x1000).unwrap())
+            .taken_without_stop();
     }
 }
 

@@ -6,14 +6,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use anyhow::bail;
 use colored::Colorize;
+use detcore::edit_distance::BubbleSortIter;
 use detcore::edit_distance::NeedlemanWunsch;
 use detcore::edit_distance::NeedlemanWunschError;
 use detcore::edit_distance::generate_permutation;
-use detcore::edit_distance::iterable_bubble_sort;
+use detcore::edit_distance::iterable_bubble_sort_from_perm;
 use detcore::types::Op;
 use detcore::types::SchedEvent;
 
@@ -141,11 +143,7 @@ pub struct CriticalSchedule {
 /// return -2 otherwise
 pub fn scoring_function(first: SchedEvent, second: SchedEvent) -> i32 {
     let mut score = -2;
-    if (first.dettid == second.dettid)
-        && (first.op == second.op)
-        && (first.start_rip == second.start_rip)
-        && (first.end_rip == second.end_rip)
-    {
+    if first.same_kind(&second) {
         score += 1;
     } else {
         return score;
@@ -217,7 +215,11 @@ where
             .bold()
     );
     let critical_event_index = {
-        let (common_prefix, _) = get_common_pre_and_postfix(&passing_schedule, &failing_schedule);
+        let (common_prefix, _) = get_common_pre_and_postfix(
+            &passing_schedule,
+            &failing_schedule,
+            SchedEvent::same_operations,
+        );
         common_prefix.len() + 1
     };
     eprintln!("Critical event index {}", critical_event_index);
@@ -228,9 +230,42 @@ where
     })
 }
 
+/// What two runs' schedules are aligned on (`generate_permutation`): each
+/// event as recorded, except that a Branch event stands for the branches it
+/// covers, as its thread's total branch count at its end, rather than for how
+/// the run took the timeslice end there. A stop reads an `end_rip` that an
+/// end taken without one (`SchedEvent::stopless`) does not have, and two runs
+/// differ in which ends their thread ran alone at. The total also keeps apart
+/// batches of the same size that the RIP told apart.
+fn alignment_keys(schedule: &[SchedEvent]) -> Vec<(SchedEvent, u64)> {
+    let mut branches = HashMap::new();
+    schedule
+        .iter()
+        .map(|event| {
+            let mut key = event.clone();
+            key.stopless = false;
+            let mut total = 0;
+            if event.op == Op::Branch {
+                let thread_total: &mut u64 = branches.entry(event.dettid).or_default();
+                *thread_total += u64::from(event.count);
+                total = *thread_total;
+                key.end_rip = None;
+            }
+            (key, total)
+        })
+        .collect()
+}
+
+/// Bubble sort `source` into `target`'s order, matching events by
+/// `alignment_keys`.
+fn align<'a>(source: &'a [SchedEvent], target: &[SchedEvent]) -> BubbleSortIter<'a, SchedEvent> {
+    let permutation = generate_permutation(&alignment_keys(source), &alignment_keys(target));
+    iterable_bubble_sort_from_perm(source, permutation)
+}
+
 // Return edit distance and swap distance.
 fn just_distance(sched1: &[SchedEvent], sched2: &[SchedEvent]) -> (usize, usize) {
-    let bubbles = iterable_bubble_sort(sched1, sched2);
+    let bubbles = align(sched1, sched2);
     (bubbles.edit_distance(), bubbles.swap_distance())
 }
 
@@ -513,7 +548,10 @@ fn print_unmatched_events(
     failing_schedule: &[SchedEvent],
     max_to_print: usize,
 ) {
-    let perm = generate_permutation(passing_schedule, failing_schedule);
+    let perm = generate_permutation(
+        &alignment_keys(passing_schedule),
+        &alignment_keys(failing_schedule),
+    );
     for ix in perm.unmatched_source_indices.iter().take(max_to_print) {
         eprintln!(
             " :: unmatched source evt #{}: {}",
@@ -561,7 +599,7 @@ where
 
     for pass_number in 0..cfg.max_event_level_search_passes {
         let (swap_dist, edit_dist, requested_midpoint_schedule) = {
-            let mut bubbles = iterable_bubble_sort(&passing_schedule, &failing_schedule);
+            let mut bubbles = align(&passing_schedule, &failing_schedule);
             (
                 bubbles.swap_distance(),
                 bubbles.edit_distance(),
@@ -683,15 +721,16 @@ where
     );
 }
 
-/// Returns `(prefix, postfix)` respectively.
-fn get_common_pre_and_postfix<'a, T>(sched_1: &'a [T], sched_2: &[T]) -> (&'a [T], &'a [T])
-where
-    T: Eq,
-{
+/// Returns `(prefix, postfix)` respectively, of events that are `same`.
+fn get_common_pre_and_postfix<'a, T>(
+    sched_1: &'a [T],
+    sched_2: &[T],
+    same: impl Fn(&T, &T) -> bool,
+) -> (&'a [T], &'a [T]) {
     let common_prefix_len = sched_1
         .iter()
         .zip(sched_2.iter())
-        .take_while(|(e1, e2)| e1 == e2)
+        .take_while(|(e1, e2)| same(e1, e2))
         .count();
 
     let common_postfix_len = if sched_1.len() == sched_2.len() && sched_1.len() == common_prefix_len
@@ -702,7 +741,7 @@ where
             .iter()
             .rev()
             .zip(sched_2.iter().rev())
-            .take_while(|(e1, e2)| e1 == e2)
+            .take_while(|(e1, e2)| same(e1, e2))
             .count()
     };
 
@@ -744,7 +783,11 @@ fn sub_event_search<F>(
 where
     F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
-    let (prefix, postfix) = get_common_pre_and_postfix(&passing_schedule, &failing_schedule);
+    let (prefix, postfix) = get_common_pre_and_postfix(
+        &passing_schedule,
+        &failing_schedule,
+        SchedEvent::same_operations,
+    );
     if passing_schedule.len() != failing_schedule.len()
         || prefix.len() + postfix.len() + 2 != passing_schedule.len()
     {
@@ -904,11 +947,10 @@ where
 }
 
 fn same_event_except_count(first: &SchedEvent, second: &SchedEvent) -> bool {
-    let mut first = first.clone();
-    let mut second = second.clone();
-    first.count = 0;
-    second.count = 0;
-    first == second
+    first.same_operations(&SchedEvent {
+        count: first.count,
+        ..*second
+    })
 }
 
 fn can_split_event(event: &SchedEvent) -> bool {
@@ -920,7 +962,12 @@ where
     F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
     let (passes, actual) = tester(requested)?;
-    if actual != requested {
+    let realized = actual.len() == requested.len()
+        && actual
+            .iter()
+            .zip(requested)
+            .all(|(actual, requested)| actual.same_operations(requested));
+    if !realized {
         eprintln!(
             ":: Skipping sub-event refinement: replay did not realize a requested branch boundary exactly (requested {} events, realized {})",
             requested.len(),
@@ -979,6 +1026,9 @@ fn sched_event_fragment(
         count,
         start_rip: keeps_start.then_some(original.start_rip).flatten(),
         end_rip: keeps_end.then_some(original.end_rip).flatten(),
+        // Only the fragment that ends where the original did ends at its
+        // slice end.
+        stopless: keeps_end && original.stopless,
         ..*original
     }
 }
@@ -1033,10 +1083,50 @@ mod tests {
 
     use super::*;
 
+    /// Two runs that differ only in which slice ends they took without a
+    /// stop align event for event, and batches of the same size stay apart:
+    /// each stands for its thread's branches up to its end.
+    #[test]
+    fn schedules_align_however_their_slice_ends_were_taken() {
+        let a = DetTid::from_raw(3);
+        let b = DetTid::from_raw(4);
+        let stop = |tid, count, rip| {
+            SchedEvent::branches(tid, count)
+                .with_end_rip(detcore::types::InstructionPointer::new(rip).unwrap())
+        };
+        let stopped = vec![
+            stop(a, 100, 0x10),
+            stop(a, 100, 0x20),
+            SchedEvent::syscall(a, Sysno::write, SyscallPhase::Prehook),
+            stop(b, 100, 0x30),
+        ];
+        let mut taken_alone = stopped.clone();
+        taken_alone[0] = SchedEvent::branches(a, 100).taken_without_stop();
+        taken_alone[1] = SchedEvent::branches(a, 100).taken_without_stop();
+        assert_eq!(just_distance(&stopped, &taken_alone), (0, 0));
+        assert_eq!(
+            get_common_pre_and_postfix(&stopped, &taken_alone, SchedEvent::same_operations)
+                .0
+                .len(),
+            stopped.len()
+        );
+        let swapped = vec![
+            stopped[0].clone(),
+            stopped[3].clone(),
+            stopped[1].clone(),
+            stopped[2].clone(),
+        ];
+        assert_ne!(just_distance(&stopped, &swapped), (0, 0));
+        assert_eq!(
+            just_distance(&taken_alone, &swapped),
+            just_distance(&stopped, &swapped)
+        );
+    }
+
     #[test]
     fn test_common_pre_and_postfix() {
         assert_eq!(
-            get_common_pre_and_postfix(b"abABcde", b"abBAcde"),
+            get_common_pre_and_postfix(b"abABcde", b"abBAcde", |a, b| a == b),
             (b"ab".as_slice(), b"cde".as_slice())
         );
     }

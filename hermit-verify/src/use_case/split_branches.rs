@@ -38,6 +38,8 @@ fn split_one(event: SchedEvent) -> Vec<SchedEvent> {
             end_time: first_end_time,
             start_rip: None,
             end_rip: None,
+            // A new cut: no recorded end, taken without a stop or not, is here.
+            stopless: false,
             ..event
         },
         SchedEvent {
@@ -112,6 +114,7 @@ mod tests {
             count: 3,
             dettid: DetPid::from_raw(3),
             end_time: Some(LogicalTime::from_nanos(10000)),
+            stopless: false,
             op: Op::Branch,
             start_rip: None,
             end_rip: None,
@@ -139,6 +142,7 @@ mod tests {
             op: Op::Branch,
             start_rip: None,
             end_rip: Some(rip),
+            stopless: false,
         };
         let rips: Vec<_> = split_one(event)
             .into_iter()

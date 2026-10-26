@@ -198,7 +198,9 @@ impl BisectOpts {
         for event in good.iter_mut().chain(&mut bad) {
             event.end_time = None;
         }
-        if good == bad {
+        let same_events =
+            good.len() == bad.len() && good.iter().zip(&bad).all(|(g, b)| g.same_operations(b));
+        if same_events {
             bail!("the --good and --bad schedules contain identical event traces");
         }
         Ok((analyzer, good, bad))

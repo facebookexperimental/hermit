@@ -1742,6 +1742,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         start_rip: None,
                         end_rip: None,
                         end_time: None,
+                        stopless: false,
                     },
                 );
                 let ev = with_guest_rip(guest, ev).await;
@@ -1801,6 +1802,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             return;
         };
         let reached = guest.read_clock().expect("Couldn't read clock");
+        // Every end up to `reached` is past, so each is processed here
+        // without a stop, the first by the grant's decision and the rest at
+        // the counts the post-hook notes. A recording marks them all; a
+        // faithful replay enters Detcore at the same count and finds the
+        // same ends marked. A replay that does not is already desynced, and
+        // the missing RIP is reported as a desync at that end.
         while end <= reached {
             {
                 let thread_state = guest.thread_state_mut();
@@ -1827,26 +1834,59 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .lone_slice_end
                 .expect("a processed slice end notes the next one");
         }
-        if !guest.thread_state().lone_grant {
+        let thread_state = guest.thread_state();
+        if !(thread_state.lone_grant && self.replay_allows_stopless_end(thread_state, end)) {
             stop_skipping_lone_slice_end(guest);
         }
     }
 
-    /// Whether the post-hook may leave the slice end it is about to arm
-    /// without a stop (`Config::replays_lone_preemptions`): the latest grant
-    /// found the thread alone, the timer is for the maximum (not a manual
-    /// interrupt), and the thread replays nothing, holds no turn for a
+    /// Whether the post-hook may leave the slice end it is about to arm, at
+    /// branch `end`, without a stop (`Config::replays_lone_preemptions`): the
+    /// latest grant found the thread alone, the timer is for the maximum (not
+    /// a manual interrupt), a replay allows it
+    /// (`replay_allows_stopless_end`), and the thread holds no turn for a
     /// signal to its own process and owes no pipe hand-off.
-    fn skips_lone_slice_end<G: Guest<Self>>(&self, guest: &G, timer_is_max: bool) -> bool {
+    fn skips_lone_slice_end<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        timer_is_max: bool,
+        end: u64,
+    ) -> bool {
         let thread_state = guest.thread_state();
         self.cfg.replays_lone_preemptions()
             && thread_state.lone_grant
             && timer_is_max
-            && thread_state.replay_rcb_end.is_none()
-            && thread_state.preemption_points.is_none()
+            && self.replay_allows_stopless_end(thread_state, end)
             && thread_state.slice_boundary.is_none()
             && thread_state.own_signal_turn_hold.is_none()
             && thread_state.pipe_handoff_due.is_none()
+    }
+
+    /// Whether a replay lets a lone thread take its slice end at branch `end`
+    /// without a stop. A schedule replay checks the RIP the recording saw at
+    /// each end it stopped at, so it takes only an end the recording took
+    /// without a stop (`ThreadState::replayed_stopless_end`). A preemption
+    /// replay reads nothing at an end but its branch count and the recorded
+    /// priority, so its recorded end (`ThreadState::replay_rcb_end`), or the
+    /// thread's own maximum past the record, may go without a stop, as in a
+    /// run that replays nothing. A record with per-thread chaos rates
+    /// (`--chaos-per-thread-slowdown`) installs a recorded rate at slice ends
+    /// whatever this run's flags say; those ends keep their stops, as the
+    /// flag keeps them in a run that records it.
+    fn replay_allows_stopless_end<U>(&self, thread_state: &ThreadState<U>, end: u64) -> bool {
+        if thread_state
+            .preemption_points
+            .as_ref()
+            .is_some_and(preemptions::ThreadHistoryIterator::has_chaos_epochs)
+        {
+            return false;
+        }
+        if self.cfg.replay_schedule_from.is_some() {
+            return thread_state.replayed_stopless_end == Some(end);
+        }
+        thread_state
+            .replay_rcb_end
+            .is_none_or(|recorded| recorded == end)
     }
 
     /// Update logical thread time with any outstanding ticks of the Reverie clock.  Returns a list
@@ -1943,7 +1983,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .expect("should not have more than 2^32 branches at once"),
                     ),
                 );
-                let ev = if precise_branch {
+                let ev = if guest.thread_state().replaying_lone_slice_end.is_some() {
+                    // A slice end taken without a stop: the guest stopped
+                    // later, so no RIP is this end's.
+                    ev.taken_without_stop()
+                } else if precise_branch {
                     with_guest_rip(guest, ev).await
                 } else {
                     ev
@@ -1971,6 +2015,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             start_rip: None,
                             end_rip: None,
                             end_time: None,
+                            stopless: false,
                         },
                     );
                     // Fill in end_rip because current rip represents the end of this event.
@@ -2337,6 +2382,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     start_rip: None,
                     end_rip: None,
                     end_time: Some(nanos),
+                    stopless: false,
                 },
                 true,
                 access,
@@ -2431,6 +2477,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     start_rip: None,
                     end_rip: None,
                     end_time: Some(nanos),
+                    stopless: false,
                 },
                 true,
                 access,
@@ -3393,13 +3440,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     guest.thread_state().thread_logical_time.rcbs()
                 );
                 let replaying = guest.thread_state().replaying_lone_slice_end.is_some();
-                if replaying || self.skips_lone_slice_end(guest, timer_is_max) {
+                let end = current_pmu_rcbs + rcbs_remaining;
+                if replaying || self.skips_lone_slice_end(guest, timer_is_max, end) {
                     // No stop at this slice end: the thread's next entry into
                     // Detcore processes it at this branch count. While a
                     // skipped end is processed, the next one is only noted;
                     // the counter has already passed it or the caller arms.
                     let thread_state = guest.thread_state_mut();
-                    thread_state.lone_slice_end = Some(current_pmu_rcbs + rcbs_remaining);
+                    thread_state.lone_slice_end = Some(end);
                     thread_state.last_rcb_timer = None;
                     thread_state.last_rcb_timer_is_max = false;
                     if !replaying {
@@ -4659,6 +4707,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         start_rip: None,
                         end_rip: None,
                         end_time: Some(nanos),
+                        stopless: false,
                     },
                     true,
                 )
@@ -4749,6 +4798,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         start_rip: None,
                         end_rip: None,
                         end_time: None,
+                        stopless: false,
                     },
                 );
                 trace_schedevent(guest, ev, true).await;
@@ -5547,6 +5597,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     lone_slice_end: None,
                     replaying_lone_slice_end: None,
                     lone_replay_unsound: false,
+                    replayed_stopless_end: None,
 
                     record_or_replay,
                     preemption_points: None,
@@ -5702,6 +5753,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // The exec's own entry processed the ends the old image ran past; the
         // new image's first slice is installed fresh, by the exec continuation.
         guest.thread_state_mut().lone_slice_end = None;
+        // A replayed end is named by the old image's branch count.
+        guest.thread_state_mut().replayed_stopless_end = None;
         // The new image's first stop is at the exit of the exec Detcore did not
         // finish (A5 step 3.2). The old image's delivery counts are logged
         // under the identity they were taken under, and the new image counts

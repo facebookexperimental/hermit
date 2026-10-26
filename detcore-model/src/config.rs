@@ -2002,14 +2002,17 @@ impl Config {
     /// timeslice end reads nothing from the guest but its branch count, and
     /// nothing but the thread's next entry could act before the next one:
     /// precise PMU timers keyed to retired branches at one virtual-time rate,
-    /// no recorded or replayed schedule or preemptions (they capture guest
-    /// state at each end), no slice-boundary protocol, no stack traces at
-    /// preemptions or events, no turn-numbered triggers (`--stop-after-turn`,
-    /// `--stop-after-iter`, `--signal-at`), no happens-before program, no
-    /// manual interrupt points and no syscall-boundary deadline
-    /// (`--target-timeslice`). Never with a gdbserver either: a debugger is
-    /// served at the stops, and between skipped ends it would see Detcore's
-    /// slice bookkeeping lag the guest's program counter.
+    /// no slice-boundary protocol, no stack traces at preemptions or events,
+    /// no turn-numbered triggers (`--stop-after-turn`, `--stop-after-iter`,
+    /// `--signal-at`), no happens-before program, no manual interrupt points
+    /// and no syscall-boundary deadline (`--target-timeslice`). Never with a
+    /// gdbserver either: a debugger is served at the stops, and between skipped
+    /// ends it would see Detcore's slice bookkeeping lag the guest's program
+    /// counter. A recorded schedule writes such an end without the RIP it has
+    /// no stop to read (`SchedEvent::stopless`), and a schedule replay takes
+    /// without a stop only the ends its recording took that way. Detcore's
+    /// `replay_allows_stopless_end` decides each end of a replay, including the
+    /// per-thread rates a preemption record may carry.
     pub fn replays_lone_preemptions(&self) -> bool {
         !self.eager_lone_preemptions
             && self.use_preemption_timer()
@@ -2017,10 +2020,7 @@ impl Config {
             && self.sequentialize_threads
             && !self.imprecise_timers
             && !self.chaos_per_thread_slowdown
-            && !self.record_preemptions
             && !self.strict_schedule_boundaries
-            && self.replay_preemptions_from.is_none()
-            && self.replay_schedule_from.is_none()
             && self.target_timeslice.is_none()
             && !self.preemption_stacktrace
             && self.stacktrace_event.is_empty()
@@ -7583,30 +7583,9 @@ mod tests {
                 },
             ),
             (
-                "--record-preemptions",
-                Config {
-                    record_preemptions: true,
-                    ..base.clone()
-                },
-            ),
-            (
                 "--strict-schedule-boundaries",
                 Config {
                     strict_schedule_boundaries: true,
-                    ..base.clone()
-                },
-            ),
-            (
-                "--replay-preemptions-from",
-                Config {
-                    replay_preemptions_from: Some("p".into()),
-                    ..base.clone()
-                },
-            ),
-            (
-                "--replay-schedule-from",
-                Config {
-                    replay_schedule_from: Some("s".into()),
                     ..base.clone()
                 },
             ),
@@ -7681,6 +7660,36 @@ mod tests {
         ];
         for (option, config) in off {
             assert!(!config.replays_lone_preemptions(), "{option}");
+        }
+        // Recording and both replays keep them: a recording writes a lone
+        // end's event without a RIP, and a replay takes without a stop only
+        // the ends it may (`Detcore::replay_allows_stopless_end`).
+        let on: Vec<(&str, Config)> = vec![
+            (
+                "--record-preemptions",
+                Config {
+                    record_preemptions: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--replay-preemptions-from",
+                Config {
+                    replay_preemptions_from: Some("p".into()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--replay-schedule-from",
+                Config {
+                    replay_schedule_from: Some("s".into()),
+                    record_preemptions: true,
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (option, config) in on {
+            assert!(config.replays_lone_preemptions(), "{option}");
         }
     }
 

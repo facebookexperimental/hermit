@@ -18,6 +18,8 @@ use detcore_model::schedule::SyscallPhase;
 use detcore_model::summary::ReplayPosition;
 use detcore_model::time::LogicalTime;
 use reverie::syscalls::Sysno;
+use serde::Deserialize;
+use serde::Serialize;
 use tracing::debug;
 use tracing::info;
 use tracing::trace;
@@ -195,13 +197,36 @@ pub enum StopReason {
     ReplayExausted,
 }
 
+/// Where a replayed thread's timeslice ends: the branches to its next
+/// recorded timeslice end (`Replayer::resolve_time_to_run`), as the logical
+/// time they take, and whether the recording took that end without a stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayedSliceEnd {
+    /// The branches to the end, relative to the thread's clock.
+    pub length: LogicalTime,
+    /// The recorded end is a lone thread's, taken without a stop
+    /// (`SchedEvent::stopless`). The replay may take it the same way where
+    /// its thread runs alone; otherwise it stops there.
+    pub stopless: bool,
+}
+
+impl ReplayedSliceEnd {
+    /// The same end, taken with a stop.
+    fn with_a_stop(self) -> Self {
+        Self {
+            stopless: false,
+            ..self
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReplayAction {
-    Continue(Option<LogicalTime>),
+    Continue(Option<ReplayedSliceEnd>),
     Stop(StopReason),
     /// The boolean indicates if the context switch should be immediate (or wait till the current
     /// thread blocks itself and naturally yields control).
-    ContextSwitch(bool, DetTid, Option<LogicalTime>),
+    ContextSwitch(bool, DetTid, Option<ReplayedSliceEnd>),
 }
 
 /// Exit has no returning guest continuation to background. Its synthetic
@@ -288,7 +313,7 @@ fn hard_desync_fields(observed: &SchedEvent, expected: &SchedEvent) -> Vec<&'sta
     if expected.start_rip.is_some() && observed.start_rip != expected.start_rip {
         fields.push("start_rip");
     }
-    if expected.end_rip.is_some() && observed.end_rip != expected.end_rip {
+    if expected.end_rip.is_some() && observed.end_rip != expected.end_rip && !expected.stopless {
         fields.push("end_rip");
     }
     fields
@@ -310,6 +335,14 @@ fn is_hard_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
     if expected.end_rip.is_none() {
         strip1.end_rip = None;
     }
+    // How a run took a slice end is not part of what the guest did. A
+    // replay that stopped at an end its recording took without a stop has a
+    // RIP the recording could not have.
+    if expected.stopless {
+        strip1.end_rip = None;
+    }
+    strip1.stopless = false;
+    strip2.stopless = false;
     strip1 != strip2
 }
 
@@ -483,7 +516,26 @@ impl Replayer {
     /// branch count would land on the instructions between the last branch
     /// and the check-in and end the slice there, with a scheduler turn the
     /// recording does not have.
-    fn resolve_time_to_run(&self, next: &SchedEvent) -> Option<LogicalTime> {
+    ///
+    /// Branches a lone thread ran to a slice end taken without a stop
+    /// (`SchedEvent::stopless`) always end a timeslice, whatever follows: the
+    /// thread's own check-in may follow with no branch between, which the
+    /// rule above would read as branches that reach a check-in.
+    fn resolve_time_to_run(&self, next: &SchedEvent) -> Option<ReplayedSliceEnd> {
+        let branches = if next.stopless {
+            Some(next.count)
+        } else {
+            self.timer_preemption_branches(next)
+        };
+        branches.map(|count| ReplayedSliceEnd {
+            length: LogicalTime::from_rcbs(u64::from(count)),
+            stopless: next.stopless,
+        })
+    }
+
+    /// The branch count a timer preemption the recording took with a stop
+    /// ends at, when `next` is one.
+    fn timer_preemption_branches(&self, next: &SchedEvent) -> Option<u32> {
         let SchedEvent {
             op: Op::Branch,
             count,
@@ -501,7 +553,7 @@ impl Replayer {
                 .is_some_and(|following| following.op == Op::Branch || following.dettid != *dettid);
         timer_preemption.then(|| {
             trace!("branch count to stop at before the next event: {}", count);
-            LogicalTime::from_rcbs(u64::from(*count))
+            *count
         })
     }
 
@@ -535,6 +587,13 @@ impl Replayer {
     /// neither: the release drained the cursor, and no start is due
     /// (`pending_background_start`).
     pub(super) fn next_resume(&self) -> Option<(DetTid, Option<LogicalTime>)> {
+        self.next_slice_end()
+            .map(|(thread, end)| (thread, end.map(|end| end.length)))
+    }
+
+    /// [`Self::next_resume`] with the replayed slice end itself: its length,
+    /// and whether the recording took it without a stop.
+    fn next_slice_end(&self) -> Option<(DetTid, Option<ReplayedSliceEnd>)> {
         if let Some((thread, _)) = self.pending_background_start() {
             return Some((thread, None));
         }
@@ -832,7 +891,7 @@ impl Replayer {
                 self.unmatched_run = 0;
             }
 
-            let action = self.check_context_switch(observed);
+            let action = self.check_context_switch(observed, !in_hard_desync_mode);
             if let ReplayAction::ContextSwitch(_, next_tid, _) = action
                 && in_hard_desync_mode
             {
@@ -983,7 +1042,12 @@ impl Replayer {
         }
     }
 
-    fn check_context_switch(&mut self, observed: &SchedEvent) -> ReplayAction {
+    /// `matched`: the observed event matched the recording's and was popped.
+    /// Only then may the reply let the thread take its next end without a
+    /// stop: that end must be the observing thread's own next event. A
+    /// context switch hands the length to the wrong thread (or to the
+    /// grant), and an unmatched head names no end of this thread's.
+    fn check_context_switch(&mut self, observed: &SchedEvent, matched: bool) -> ReplayAction {
         // We run after the pop of any matched action, so the next action in replay represents the
         // FUTURE not the PRESENT/PAST.
         //
@@ -991,11 +1055,12 @@ impl Replayer {
         // decision, before its next event or after its last one: its thread
         // runs next only to begin its call (`take_background_start`), with no
         // slice length (`next_resume`).
-        let next = self.next_resume();
+        let next = self.next_slice_end();
         if let Some((next_tid, timeslice)) = next {
             let mytid = observed.dettid;
             let time = observed.end_time.expect("timestamps required for now");
             let is_prehook = matches!(observed.op, Op::Syscall(_, SyscallPhase::Prehook));
+            let with_a_stop = timeslice.map(ReplayedSliceEnd::with_a_stop);
 
             if next_tid != observed.dettid {
                 if is_prehook {
@@ -1028,11 +1093,13 @@ impl Replayer {
                 ReplayAction::ContextSwitch(
                     !(is_prehook || is_terminal_posthook(observed)),
                     next_tid,
-                    timeslice,
+                    with_a_stop,
                 )
-            } else {
+            } else if matched {
                 // We're still running the next event.
                 ReplayAction::Continue(timeslice)
+            } else {
+                ReplayAction::Continue(with_a_stop)
             }
         } else {
             ReplayAction::Continue(None)
@@ -1062,6 +1129,7 @@ mod builder {
                 start_rip: None,
                 end_rip: InstructionPointer::new(end_rip),
                 end_time: Some(self.time.as_nanos()),
+                stopless: false,
                 op: Op::Syscall(sys_no, SyscallPhase::Prehook),
             }
         }
@@ -1074,6 +1142,7 @@ mod builder {
                 start_rip: None,
                 end_rip: InstructionPointer::new(end_rip),
                 end_time: Some(self.time.as_nanos()),
+                stopless: false,
                 op: Op::Syscall(sys_no, SyscallPhase::Posthook),
             }
         }
@@ -1084,6 +1153,7 @@ mod builder {
                 dettid: tid,
                 start_rip: None,
                 end_time: Some(self.time.as_nanos()),
+                stopless: false,
                 op: Op::OtherInstructions,
                 end_rip: InstructionPointer::new(end_rip),
             }
@@ -1096,6 +1166,7 @@ mod builder {
                 dettid: tid,
                 end_rip: None,
                 end_time: Some(self.time.as_nanos()),
+                stopless: false,
                 op: Op::Branch,
                 start_rip: None,
             }
@@ -1118,6 +1189,14 @@ mod tests {
     use super::*;
 
     const SOME_RIP: usize = 1234566;
+
+    /// A replayed slice end at a stop, `branches` ahead.
+    fn stop_after(branches: u64) -> ReplayedSliceEnd {
+        ReplayedSliceEnd {
+            length: LogicalTime::from_rcbs(branches),
+            stopless: false,
+        }
+    }
 
     fn tid(raw: i32) -> DetTid {
         DetTid::from_raw(raw)
@@ -1790,7 +1869,7 @@ mod tests {
         let mut replayer = Replayer::new(schedule.clone());
         assert_eq!(
             replayer.observe_event(&schedule[0]),
-            ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
+            ReplayAction::Continue(Some(stop_after(123)))
         );
     }
 
@@ -1807,7 +1886,89 @@ mod tests {
         let mut replayer = Replayer::new(schedule.clone());
         assert_eq!(
             replayer.observe_event(&schedule[0]),
-            ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
+            ReplayAction::Continue(Some(stop_after(123)))
+        );
+    }
+
+    /// A lone thread's slice end the recording took without a stop is
+    /// replayed as a slice end, marked so the replay may take it the same
+    /// way, even when its own check-in follows with no branch between: the
+    /// unmarked shape (branches, then the thread's OtherInstructions and its
+    /// syscall) reaches a check-in and gets no end at all.
+    #[test]
+    fn a_stopless_end_is_a_slice_end_whatever_follows() {
+        for stopless in [true, false] {
+            let mut b = builder::SchedTestBuilder::new();
+            let schedule = vec![
+                b.other(SOME_RIP, tid(3)),
+                SchedEvent {
+                    stopless,
+                    ..b.branch(123, tid(3))
+                },
+                b.other(SOME_RIP, tid(3)),
+                b.syscall_pre(Sysno::write, SOME_RIP, tid(3)),
+            ];
+            let mut replayer = Replayer::new(schedule.clone());
+            let end = stopless.then_some(ReplayedSliceEnd {
+                length: LogicalTime::from_rcbs(123),
+                stopless: true,
+            });
+            assert_eq!(
+                replayer.observe_event(&schedule[0]),
+                ReplayAction::Continue(end),
+                "stopless: {stopless}"
+            );
+        }
+    }
+
+    /// A replay that stopped at an end its recording took without a stop
+    /// (its thread did not run alone there) matches it: the stop's RIP is
+    /// one the recording could not have. Taking an end without a stop where
+    /// the recording stopped is a desync, because the RIP it checks is gone.
+    #[test]
+    fn a_stop_where_the_recording_had_none_matches_but_not_the_reverse() {
+        let mut b = builder::SchedTestBuilder::new();
+        let stopless = b.branch(100, tid(3)).taken_without_stop();
+        let stopped = SchedEvent {
+            end_rip: std::num::NonZeroUsize::new(SOME_RIP),
+            stopless: false,
+            ..stopless.clone()
+        };
+        assert!(events_match(&stopped, &stopless));
+        assert!(!is_hard_desync(&stopped, &stopless));
+        assert!(hard_desync_fields(&stopped, &stopless).is_empty());
+        assert!(!events_match(&stopless, &stopped));
+        assert_eq!(hard_desync_fields(&stopless, &stopped), vec!["end_rip"]);
+    }
+
+    /// Only the thread whose own next recorded event is a stopless end,
+    /// right after its event matched, may take that end without a stop. A
+    /// context switch hands the end's length to another thread, and an
+    /// unmatched event leaves the cursor at an end this thread may not have
+    /// reached the recording's way: both take the end with a stop.
+    #[test]
+    fn a_stopless_end_goes_only_to_its_own_thread_after_a_match() {
+        let mut b = builder::SchedTestBuilder::new();
+        let switch = vec![
+            b.other(SOME_RIP, tid(5)),
+            b.branch(100, tid(3)).taken_without_stop(),
+        ];
+        let mut replayer = Replayer::new(switch.clone());
+        assert_eq!(
+            replayer.observe_event(&switch[0]),
+            ReplayAction::ContextSwitch(true, tid(3), Some(stop_after(100)))
+        );
+
+        let mut b = builder::SchedTestBuilder::new();
+        let unmatched = vec![
+            b.branch(100, tid(3)).taken_without_stop(),
+            b.syscall_pre(Sysno::write, SOME_RIP, tid(3)),
+        ];
+        let mut replayer = Replayer::new(unmatched);
+        let observed = b.syscall_pre(Sysno::read, SOME_RIP, tid(3));
+        assert_eq!(
+            replayer.observe_event(&observed),
+            ReplayAction::Continue(Some(stop_after(100)))
         );
     }
 

@@ -111,6 +111,7 @@ use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::MaybePrintStack;
 use crate::scheduler::OwnProcessSignalInputs;
 use crate::scheduler::Priority;
+use crate::scheduler::ReplayedSliceEnd;
 use crate::scheduler::SchedResponse;
 use crate::scheduler::SchedValue;
 use crate::scheduler::Scheduler;
@@ -7700,7 +7701,11 @@ impl GlobalState {
                 if response == SchedulerRpcResult::ThreadExited {
                     return SchedulerRpcResult::ThreadExited;
                 }
-                end_of_timeslice = timeslice;
+                // The grant carries only the length: this end takes a stop.
+                end_of_timeslice = timeslice.map(|length| ReplayedSliceEnd {
+                    length,
+                    stopless: false,
+                });
                 trace!(
                     "[detcore, dtid {}] Thread reactivated after yielding for replay schedule",
                     &ev.dettid,
@@ -11753,7 +11758,7 @@ where
 #[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
 pub struct TraceSchedEventResponse {
     print_stack_strace: MaybePrintStack,
-    timeslice: Option<LogicalTime>,
+    timeslice: Option<ReplayedSliceEnd>,
     /// Whether the replay has dropped the rest of its schedule
     /// (`Scheduler::schedule_released`).
     schedule_released: bool,
@@ -11780,8 +11785,8 @@ impl std::fmt::Debug for SchedEventForLog<'_> {
         if !self.command_bootstrap {
             return std::fmt::Debug::fmt(self.event, f);
         }
-        f.debug_struct("SchedEvent")
-            .field("dettid", &self.event.dettid)
+        let mut s = f.debug_struct("SchedEvent");
+        s.field("dettid", &self.event.dettid)
             .field("op", &self.event.op)
             .field("count", &self.event.count)
             .field(
@@ -11792,8 +11797,11 @@ impl std::fmt::Debug for SchedEventForLog<'_> {
                 "end_rip",
                 &self.event.end_rip.map(CommandBootstrapInstructionPointer),
             )
-            .field("end_time", &self.event.end_time)
-            .finish()
+            .field("end_time", &self.event.end_time);
+        if self.event.stopless {
+            s.field("stopless", &self.event.stopless);
+        }
+        s.finish()
     }
 }
 
@@ -11895,9 +11903,25 @@ pub async fn trace_schedevent_with_access<G, T>(
                 write_backtrace(guest, m_path.as_ref());
             }
 
+            let mut stopless_end = None;
             if let Some(timeslice) = timeslice {
-                install_replayed_timeslice(guest, timeslice);
+                install_replayed_timeslice(guest, timeslice.length);
+                // Each reply decides anew which end, if any, the thread may
+                // take without a stop
+                // (`Detcore::replay_allows_stopless_end`): only the one this
+                // reply names.
+                if guest.thread_state().past_global_first_execve {
+                    let thread_state = guest.thread_state_mut();
+                    // The replayer's length is the recorded branch count
+                    // (`LogicalTime::from_rcbs`), which `into_rcbs` gives back
+                    // exactly. Where the clock runs at another rate the armed
+                    // end differs from this count, and the end keeps its stop.
+                    stopless_end = timeslice.stopless.then(|| {
+                        thread_state.committed_clock_value + timeslice.length.into_rcbs()
+                    });
+                }
             }
+            guest.thread_state_mut().replayed_stopless_end = stopless_end;
         }
         _ => {
             unreachable!()
@@ -23102,6 +23126,7 @@ mod tests {
             start_rip: None,
             end_rip: None,
             end_time: Some(LogicalTime::from_nanos(1)),
+            stopless: false,
         };
         let next_event = SchedEvent {
             dettid: next_tid,
