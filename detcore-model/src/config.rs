@@ -38,10 +38,11 @@ const fn default_backend_capabilities() -> BackendCapabilities {
 
 /// The capabilities a [`Config`] has before the host prepares it for the
 /// backend that runs it: ptrace's, the backend Detcore's own tests use, except
-/// that eight facts stay off (`supports_blocked_wait_signal_interruption` and
+/// that nine facts stay off (`supports_blocked_wait_signal_interruption` and
 /// the four split out of it, which [`set_kernel_signal_facts`] clears
 /// together, `delivers_preemption_timer_events`,
-/// `runs_guest_code_between_injections`, `reports_sigreturns`). Until
+/// `runs_guest_code_between_injections`, `reports_sigreturns`,
+/// `hardware_watchpoints`). Until
 /// `supports_blocked_wait_signal_interruption`,
 /// `delivers_preemption_timer_events` and
 /// `runs_guest_code_between_injections` became backend capabilities they were
@@ -49,7 +50,7 @@ const fn default_backend_capabilities() -> BackendCapabilities {
 /// and were false otherwise; a configuration nobody prepared keeps that
 /// behaviour, and the four readings of the first with it. A configuration
 /// nobody prepared cannot know that sigreturns are reported, so that is off
-/// too (the DBT runtime's standalone
+/// too, and it sets no hardware watchpoints (the DBT runtime's standalone
 /// fallback starts from these). `reports_kernel_child_exit_signals` keeps
 /// ptrace's value, as `reports_child_exit_publication` does: it took over the
 /// child-exit ledger's gates from that field, so such a configuration behaves
@@ -61,6 +62,7 @@ pub const DEFAULT_BACKEND_CAPABILITIES: BackendCapabilities = {
     backend.delivers_preemption_timer_events = false;
     backend.runs_guest_code_between_injections = false;
     backend.reports_sigreturns = false;
+    backend.hardware_watchpoints = 0;
     backend
 };
 
@@ -3584,7 +3586,7 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// can express, which includes every backend's own constant except for
 /// capabilities added after the legacy form froze: those never enter it, as
 /// `record_host_inputs` does not, and read back as their default. There are
-/// thirteen. `process_exits_complete_asynchronously` and
+/// fifteen. `process_exits_complete_asynchronously` and
 /// `virtualizes_guest_sigalrm` are true only for in-guest LiteInst, which
 /// never travels through this DBT-only form.
 /// `supports_blocked_wait_signal_interruption`,
@@ -3605,6 +3607,7 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// too. `rcb_clock_contract` reads back as `None`, DBT's value; ptrace, the
 /// one backend that states a contract, travels through this form only
 /// inside the versioned envelope as well.
+/// `hardware_watchpoints` reads back as 0, DBT's.
 ///
 /// `cpuid_virtualized_by_backend` supplies no capability either: it said the
 /// backend installed a CPUID policy of its own, which no backend does any
