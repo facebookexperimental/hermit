@@ -12,6 +12,9 @@ mod exec_posix_timers;
 #[path = "common/fault_sites.rs"]
 mod fault_sites;
 
+#[path = "common/pidfd_forwarding.rs"]
+mod pidfd_forwarding;
+
 #[path = "common/timerfd_virtual_time.rs"]
 mod timerfd_virtual_time;
 
@@ -47886,6 +47889,96 @@ fn pidfd_send_signal_flags_and_proc_descriptors_answer_as_linux_does_at_bitwise_
         serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
             .expect("the verdict must be JSON");
     assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
+/// A library embedder whose process carries a seccomp filter Hermit did not
+/// install gets the typed refusal for the guest's first self-sentinel
+/// `pidfd_send_signal` as an `Err` from the launch, and goes on to launch
+/// another guest. Under a foreign filter the ptrace backend cannot qualify how
+/// the kernel spells the sentinel (the filter could fabricate its probe's
+/// success), so it refuses rather than guess. The filter cannot be removed, so
+/// it is installed in a child process; the same launch from this unfiltered
+/// process succeeds.
+#[test]
+fn a_filtered_library_embedder_gets_the_typed_pidfd_self_refusal_and_lives() {
+    const CHILD: &str = "HERMIT_PIDFD_SELF_LIBRARY_CHILD";
+    const NAME: &str = "a_filtered_library_embedder_gets_the_typed_pidfd_self_refusal_and_lives";
+    const ALIVE: &str = "embedder alive after the refusal";
+    let guest = futex_c_guest(&PIDFD_SEND_SIGNAL_FLAGS_GUEST, "pidfd_send_signal_flags");
+    // The exit code, or whether the error is a policy refusal, and its text.
+    let launch = |program: &Path| {
+        let program = program.to_owned();
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let config = hermit::DetConfig {
+                    max_timeslice: None,
+                    ..Default::default()
+                };
+                match hermit::run_with_output(
+                    reverie::process::Command::new(&program),
+                    config,
+                    false,
+                    &None,
+                ) {
+                    Ok(output) => Ok(output.status.code()),
+                    Err(error) => {
+                        let text = format!("{error:#}");
+                        let kind = hermit::SerializableError::from(error).kind();
+                        Err((kind == hermit::FailureKind::PolicyRefusal, text))
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .expect("the launching thread failed")
+    };
+    if std::env::var_os(CHILD).is_some() {
+        let allow = [libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        }];
+        let program = libc::sock_fprog {
+            len: 1,
+            filter: allow.as_ptr().cast_mut(),
+        };
+        // SAFETY: an allow-everything filter, installed after no_new_privs.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &program as *const libc::sock_fprog,
+                ),
+                0
+            );
+        }
+        let (refused, text) = launch(guest).expect_err("a filtered embedder's launch succeeded");
+        assert!(refused, "not a policy refusal: {text}");
+        assert!(
+            text.contains("pidfd_send_signal through the self sentinel -10000 is refused"),
+            "{text}"
+        );
+        assert_eq!(launch(Path::new("/bin/true")), Ok(Some(0)));
+        println!("{ALIVE}");
+        return;
+    }
+    assert_eq!(launch(guest), Ok(Some(0)));
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(ALIVE),
+        "{}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// A `/proc/<pid>` descriptor for Hermit's own process, PID 1 of the guest's

@@ -7339,6 +7339,7 @@ mod tests {
             let gap = in_guest_liteinst_program_gap(&mut command);
             match launch {
                 Ok(program) => {
+                    assert!(program.is_absolute());
                     let gap = gap.unwrap().expect("the static image was not refused");
                     assert!(gap.contains("is statically linked"), "{gap}");
                     assert_eq!(Path::new(command.get_program()), program);
@@ -7375,14 +7376,19 @@ mod tests {
             command.env_clear().env("PATH", &search);
             command
         }));
-        // Without a cleared environment the command's explicit PATH still
-        // wins over the inherited one (Reverie cf745200 makes program lookup
-        // read the environment the child receives), so both find the image.
-        assert!(check(&|| {
+        // An explicit PATH overrides the inherited one without clearing the
+        // base environment. The launch and the check must select this fixture
+        // and keep the caller's argv[0] when the program is pinned.
+        let explicit_path = || {
             let mut command = Command::new(name);
-            command.env("PATH", &search);
+            command.env("PATH", &search).arg0("kept-argv0");
             command
-        }));
+        };
+        assert_eq!(
+            fs::canonicalize(explicit_path().find_program().unwrap()).unwrap(),
+            fs::canonicalize(&static_elf).unwrap()
+        );
+        assert!(check(&explicit_path));
         // A cleared environment without PATH (`--base-env=empty`) searches
         // Hermit's working directory, not the guest's and not /bin:/usr/bin.
         assert!(!check(&|| {

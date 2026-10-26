@@ -904,7 +904,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             .as_ref()
             .map_or(syscall, |translated| translated.call);
         crate::reserved_input::before_native_call(guest, call)?;
-        let result = if crate::record_or_replay::injects_only::<T>() {
+        // A self-sentinel `pidfd_send_signal` the executing kernel spells
+        // differently from the guest: the model and the record or replay
+        // tool see the guest's call, and only its injection is respelled.
+        // Boxed, so the adapter's futures stay out of every other forwarded
+        // call's future.
+        let result = if let Some(respelling) = guest.thread_state().pidfd_respelling {
+            Box::pin(self.respelled_record_or_replay(guest, respelling, call)).await
+        } else if crate::record_or_replay::injects_only::<T>() {
             // What the tool's handler would have done (`NoopTool`), here:
             // the same single injection of the same call, awaited at the
             // same point, with its errno converted the same way.
@@ -918,6 +925,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             Box::pin(Self::finish_translated_call(guest, translated)).await;
         }
         result
+    }
+
+    /// What [`Self::translated_record_or_replay`] does with `call`, through
+    /// the respelling adapter, which lives in this future and so in its box.
+    async fn respelled_record_or_replay<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        respelling: crate::pidfd_self::PhysicalRespelling,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let mut physical = crate::pidfd_self::PhysicalSpelling::new(guest, respelling);
+        if crate::record_or_replay::injects_only::<T>() {
+            physical.inject(call).await.map_err(Error::from)
+        } else {
+            self.record_or_replay
+                .handle_syscall_event(&mut physical.into_guest(), call)
+                .await
+        }
     }
 
     /// Helper function for delegating the injection of a syscall to the
@@ -6209,6 +6234,15 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) wait_signal_end: Option<crate::wait_signal_end::WaitSignalEnd>,
 
+    /// While this thread's `pidfd_send_signal` handler runs on a self
+    /// sentinel that the executing kernel spells differently from the guest:
+    /// the guest's call and its physical form, which
+    /// `translated_record_or_replay` injects in its place
+    /// (`pidfd_self::ArmedRespelling`). `None` on every other call, for every
+    /// new thread and after an exec.
+    #[serde(skip)]
+    pub(crate) pidfd_respelling: Option<crate::pidfd_self::PhysicalRespelling>,
+
     /// With `delivery_interruption` `AfterFrame`, the handler address the
     /// kernel's frame jumps to: a further delivery at the same exit, before
     /// any guest instruction, stops with the instruction pointer there.
@@ -7343,6 +7377,7 @@ impl<T> ThreadState<T> {
             signal_shadow_lost: false,
             delivery_interruption: None,
             wait_signal_end: None,
+            pidfd_respelling: None,
             delivery_frame_handler: 0,
             delivery_frame_signal: 0,
             delivery_frame_orig_ax: 0,

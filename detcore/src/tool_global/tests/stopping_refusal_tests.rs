@@ -373,3 +373,45 @@ async fn with_the_gate_off_a_stopping_refusal_is_recorded_and_answered_without_t
     assert_eq!(reply, GlobalResponse::PolicyRefusal(()));
     assert_eq!(state.policy_refusal(), Some(reason));
 }
+
+/// A self-sentinel `pidfd_send_signal` refusal filed with the coordinator is
+/// answered as a policy refusal, recorded as the run's policy refusal (what
+/// the in-guest launcher reads), and kept as its type for the DBT launcher,
+/// which takes it once. The first filed refusal is the one kept.
+#[tokio::test]
+async fn a_filed_pidfd_self_refusal_is_recorded_as_its_type_and_as_a_policy_refusal() {
+    let config = Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        in_guest_signal_delivery: false,
+        ..Config::default()
+    };
+    let state = GlobalState::initialize(&config, false);
+    let detpid = DetPid::from_raw(CHILD.as_raw());
+    state
+        .sched
+        .lock()
+        .unwrap()
+        .thread_tree
+        .add_child(CHILD, CHILD, true);
+    install_test_registration(&state, CHILD, Ivar::new());
+    let first = crate::PidfdSelfQualificationRefusal { sentinel: -10001 };
+    for sentinel in [-10001, -10000] {
+        let (_, reply) = state
+            .receive_rpc(
+                Tid::from_raw(CHILD.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(detpid),
+                    GlobalRequest::PidfdSelfQualificationRefusal(
+                        crate::PidfdSelfQualificationRefusal { sentinel },
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(reply, GlobalResponse::PolicyRefusal(()));
+    }
+    assert_eq!(state.policy_refusal(), Some(first.to_string()));
+    assert_eq!(state.take_pidfd_self_qualification_refusal(), Some(first));
+    assert_eq!(state.take_pidfd_self_qualification_refusal(), None);
+}

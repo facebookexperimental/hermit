@@ -157,8 +157,9 @@ fn is_policy_refusal(err: &Error) -> bool {
     if detcore::ReplayDepartureError::in_error(err).is_some() {
         return true;
     }
-    // Detcore's refusal of an unsupported syscall, and reverie-ptrace's end of
-    // a run in which the guest made a syscall through Reverie's untraced
+    // Detcore's refusal of an unsupported syscall, Detcore's refusal of a
+    // self-sentinel pidfd_send_signal its backend could not qualify, and
+    // reverie-ptrace's end of a run in which the guest made a syscall through Reverie's untraced
     // private-page stub, which no tool saw
     // (https://github.com/rrnewton/reverie/issues/1064).
     fn refuses(cause: &(dyn std::error::Error + 'static)) -> bool {
@@ -166,6 +167,7 @@ fn is_policy_refusal(err: &Error) -> bool {
             || cause.is::<detcore::preemptions::RecordAdmissionRefusal>()
             || cause.is::<detcore::preemptions::RecordFormatRefusal>()
             || cause.is::<detcore::ChosenBinaryInputRefusal>()
+            || cause.is::<detcore::PidfdSelfQualificationRefusal>()
             || cause.is::<detcore::TerminalReplayRefusal>()
             || cause.is::<detcore::PriorityHistoryRefusal>()
             || cause.is::<detcore::ReplayDepartureError>()
@@ -741,6 +743,27 @@ mod tests {
                 reverie::Error::Tool(Error::new(crate::SchedulerEndedRun::new(outcome, None)));
             assert_eq!(classify_ptrace_primary(&primary), FailureKind::Error);
         }
+    /// Detcore's refusal of a self-sentinel pidfd_send_signal whose backend
+    /// could not qualify its spelling is a policy refusal, through ptrace's
+    /// Tool wrapper and across the container boundary, and keeps its reason.
+    #[test]
+    fn an_unqualified_pidfd_self_sentinel_is_a_policy_refusal() {
+        let refusal = || detcore::PidfdSelfQualificationRefusal { sentinel: -10001 };
+        let primary = reverie::Error::Tool(Error::new(refusal()));
+        assert_eq!(
+            classify_ptrace_primary(&primary),
+            FailureKind::PolicyRefusal
+        );
+        let wrapped = Error::new(reverie::Error::Tool(Error::new(refusal())))
+            .context("the ptrace backend failed");
+        assert_eq!(classify_unwrapped(&wrapped), FailureKind::PolicyRefusal);
+        let serialized = SerializableError::from(Error::new(refusal()));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(
+            serialized.error.contains("self sentinel -10001"),
+            "{}",
+            serialized.error
+        );
     }
 
     /// An in-guest-trap refusal names that backend and keeps the same class.

@@ -1250,6 +1250,12 @@ pub(crate) fn pidfd_signal_scope(flags: u32) -> Result<PidfdSignalScope, Errno> 
 const PIDFD_SELF_THREAD: RawFd = -10000;
 /// `pidfd_send_signal`'s sentinel for the calling thread's thread group.
 const PIDFD_SELF_THREAD_GROUP: RawFd = -10001;
+// The sentinels the guest is shown are the ones whose physical spelling
+// `pidfd_self` qualifies.
+const _: () = assert!(
+    PIDFD_SELF_THREAD == crate::pidfd_self::GUEST_SELF_THREAD
+        && PIDFD_SELF_THREAD_GROUP == crate::pidfd_self::GUEST_SELF_THREAD_GROUP
+);
 
 /// The task a `PIDFD_SELF_*` sentinel names, and the scope Linux gives it when
 /// no flag is set: the calling thread (thread-directed) or its thread group
@@ -16369,7 +16375,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`PIDFD_SELF_THREAD`, thread-directed unless a flag says otherwise)
         // or its thread group (`PIDFD_SELF_THREAD_GROUP`)
         // (https://github.com/rrnewton/hermit/issues/4147).
-        let named = if let Some((target, default)) = pidfd_self_target(guest, pidfd) {
+        let self_target = pidfd_self_target(guest, pidfd);
+        let named = if let Some((target, default)) = self_target {
             if flags == 0 {
                 scope = default;
             }
@@ -16500,6 +16507,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return refused;
         }
+        // A self sentinel reaches the kernel in the spelling the backend
+        // qualified on the kernel that executes its injections, after every
+        // check above and before anything below forwards, reserves or
+        // commits (`pidfd_self`).
+        let respelling = if self_target.is_some() {
+            match crate::pidfd_self::preflight(guest.pidfd_self_spelling(), call, pidfd) {
+                crate::pidfd_self::SentinelPreflight::Canonical => None,
+                crate::pidfd_self::SentinelPreflight::Respell(respelling) => Some(respelling),
+                crate::pidfd_self::SentinelPreflight::Unsupported => {
+                    return self.refuse_unsupported_pidfd_self(guest, pidfd).await;
+                }
+                crate::pidfd_self::SentinelPreflight::Unknown => {
+                    return self.refuse_unqualified_pidfd_self(guest, pidfd).await;
+                }
+            }
+        } else {
+            None
+        };
+        let mut armed = crate::pidfd_self::ArmedRespelling::arm(guest, respelling);
+        let guest = &mut *armed;
         let process = match named {
             Some(named) => Some(signal_target_process(guest, named).await.unwrap_or(named)),
             None => None,

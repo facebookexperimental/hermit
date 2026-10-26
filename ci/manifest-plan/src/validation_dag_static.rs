@@ -33,25 +33,22 @@ pub(super) const WORKSPACE_WALL_SECONDS: i64 = 1200;
 /// `build.workspace`; see HOSTED_WORKSPACE_WALL_DESCRIPTION.
 pub(super) const HOSTED_WORKSPACE_WALL_SECONDS: i64 = 2100;
 const _: () = assert!(HOSTED_WORKSPACE_WALL_SECONDS >= WORKSPACE_WALL_SECONDS);
-pub(super) const HOSTED_WORKSPACE_WALL_DESCRIPTION: &str = r########" HOSTED WALL BOUND 2026-10-06: this hosted twin's wall is 2100 seconds; the local node keeps 1200, sized for its 32-worker preference, and the command, CPU bound and memory hints here are the local node's. GitHub's hosted portable job runs this node on whatever hardware the runner pool assigns, and its scheduler caps the node to the run's three-CPU budget (logged as "exceeds the run total CPU-core budget --max-cpus 3; capping its guest width and per-step cpu.max to 3"). In https://github.com/rrnewton/hermit/actions/runs/37383177918 (Hermit f43c990b3c96, AMD EPYC 9V45) the node passed in 752.75 seconds: Cargo reported 73 seconds for detcore-dbt and 643 for the workspace (37 crates compiled after a partial cache restore), and the rest, chiefly preparation, took about 37. In https://github.com/rrnewton/hermit/actions/runs/37440093209 (Hermit 47896b1a15dd, AMD EPYC 7763) the same phases took 120 and 1048 seconds (33 crates compiled), 1.6 times longer each, and the node was killed at 1200.07 seconds, 20 seconds into the dev-profile nextest-cpu-wrapper build that took 18 seconds on the faster host; at the same ratio it needed about 1240. The two runs built different Hermit revisions, so this is not an isolated comparison; but the slower run compiled fewer crates and both Cargo phases slowed by the same factor, which points to the runner rather than the build. 2100 is the next 300-second bucket above 1.5 times both the killed run's lower bound of 1200 seconds (1800.1) and the 1240-second estimate (1860). Under the three-CPU cpu.max cap, 2100 seconds of wall allow at most 6300 CPU seconds, inside the 11100-second CPU bound (raised 2026-11-01; see the compile node's re-derivation). The host pressure graph (ci/compat-envelope/pressure-test.rs) clones this node as its build.workspace and so carries the same wall."########;
+pub(super) const HOSTED_WORKSPACE_WALL_DESCRIPTION: &str = r########" HOSTED WALL BOUND 2026-10-06: this hosted twin's wall is 2100 seconds; the local node keeps 1200, sized for its 32-worker preference, and the command, CPU bound and memory hints here are the local node's. GitHub's hosted portable job runs this node on whatever hardware the runner pool assigns, and its scheduler caps the node to the run's three-CPU budget (logged as "exceeds the run total CPU-core budget --max-cpus 3; capping its guest width and per-step cpu.max to 3"). In https://github.com/rrnewton/hermit/actions/runs/37383177918 (Hermit f43c990b3c96, AMD EPYC 9V45) the node passed in 752.75 seconds: Cargo reported 73 seconds for detcore-dbt and 643 for the workspace (37 crates compiled after a partial cache restore), and the rest, chiefly preparation, took about 37. In https://github.com/rrnewton/hermit/actions/runs/37440093209 (Hermit 47896b1a15dd, AMD EPYC 7763) the same phases took 120 and 1048 seconds (33 crates compiled), 1.6 times longer each, and the node was killed at 1200.07 seconds, 20 seconds into the dev-profile nextest-cpu-wrapper build that took 18 seconds on the faster host; at the same ratio it needed about 1240. The two runs built different Hermit revisions, so this is not an isolated comparison; but the slower run compiled fewer crates and both Cargo phases slowed by the same factor, which points to the runner rather than the build. 2100 is the next 300-second bucket above 1.5 times both the killed run's lower bound of 1200 seconds (1800.1) and the 1240-second estimate (1860). Under the three-CPU cpu.max cap, 2100 seconds of wall allow at most 6300 CPU seconds, inside the unchanged 7200-second CPU bound. The host pressure graph (ci/compat-envelope/pressure-test.rs) clones this node as its build.workspace and so carries the same wall."########;
 /// Wall bound of the authored `check.script_unit_tests` node, which the local
-/// lanes run. 1500 since 2026-11-02 (900 before): under four concurrent full
-/// validations two runs were killed at the 900-second WALL bound with 3688
-/// and 3759 CPU-seconds used, inside the 7200 CPU bound; 1500 is the next
-/// 300-second bucket above 1.5 times that 901-second wall (step_limits.rs).
-pub(super) const SCRIPT_UNIT_TESTS_WALL_SECONDS: i64 = 1500;
+/// lanes run.
+pub(super) const SCRIPT_UNIT_TESTS_WALL_SECONDS: i64 = 900;
 /// Wall bound of `check.script_unit_tests_on_host`, the hosted twin of
 /// `check.script_unit_tests`; see HOSTED_SCRIPT_UNIT_TESTS_WALL_DESCRIPTION.
 pub(super) const HOSTED_SCRIPT_UNIT_TESTS_WALL_SECONDS: i64 = 1500;
 const _: () = assert!(HOSTED_SCRIPT_UNIT_TESTS_WALL_SECONDS >= SCRIPT_UNIT_TESTS_WALL_SECONDS);
-pub(super) const HOSTED_SCRIPT_UNIT_TESTS_WALL_DESCRIPTION: &str = r########" HOSTED WALL BOUND 2026-10-06: this hosted twin's wall is 1500 seconds; the local node kept 900 until 2026-11-02 and has the same 1500 since (SCRIPT_UNIT_TESTS_WALL_SECONDS), and the command, CPU bound and memory hints here are the local node's. GitHub's hosted portable job runs this node beside check.lint_checks and the selftest.* nodes, and its scheduler caps the node's width (HERMIT_SCRIPT_TEST_JOBS) at the run's three-CPU budget (--max-cpus 3). That run is unboxed: no cgroup holds the node to three CPUs, and its log reports that the node's CPU bound cannot be enforced there, so only the wall applies. In https://github.com/rrnewton/hermit/actions/runs/37543769782 (Hermit d7441caea790) the node was killed at 900.16 seconds. Its other units had finished by 615 seconds; the one test still running was the scripts/validate.rs submodule service-result fixture, started at about 630 seconds, whose child compiles a copied validate.rs with rust-script under its own 300-second bound. That child had run 266.96 seconds and had been compiling its last crate, the validate binary (28.6 seconds locally at three CPUs), for 11.83 seconds, so it would have reached its own bound first and no node wall would have let that revision pass. On the host recorded for this node in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"), a run of this node at three CPUs with a cold rust-script cache took 724.57 seconds, and the hosted run reached the same milestones 1.5 to 2.6 times later. The fixture child now compiles at Cargo opt-level 0: a cold three-CPU build of its package fell from 147.71 to 50.85 seconds, and the fixture alone at four CPUs from 146.19 to 84.17. Scaling the hosted child's compile by that ratio and taking 2.6 times the fixture's local non-compile time (about 34 seconds) gives an estimate of about 850 seconds for the hosted node; that is not a hosted measurement, and 900 seconds would leave less than the project's 50% headroom over it. 1500 is the next 300-second bucket above 1.5 times both the measured lower bound of 900.16 seconds (1350.2) and the 850-second estimate (1275). At a width of three, 1500 seconds of wall come to about 4500 CPU seconds, inside the unchanged 7200-second CPU bound wherever a run can enforce it. 2026-10-17 (test audit B8): the submodule service-result fixture test this bound was sized around no longer runs in this node; that real bracket, with its cold copied-source compile, now runs only in selftest.validate_rs, and scripts/validate.rs's unit tests check the fixture's run-state isolation with a stub child instead. The measurements above are history; the bound is unchanged until a hosted run measures the node without the fixture."########;
+pub(super) const HOSTED_SCRIPT_UNIT_TESTS_WALL_DESCRIPTION: &str = r########" HOSTED WALL BOUND 2026-10-06: this hosted twin's wall is 1500 seconds; the local node keeps 900, and the command, CPU bound and memory hints here are the local node's. GitHub's hosted portable job runs this node beside check.lint_checks and the selftest.* nodes, and its scheduler caps the node's width (HERMIT_SCRIPT_TEST_JOBS) at the run's three-CPU budget (--max-cpus 3). That run is unboxed: no cgroup holds the node to three CPUs, and its log reports that the node's CPU bound cannot be enforced there, so only the wall applies. In https://github.com/rrnewton/hermit/actions/runs/37543769782 (Hermit d7441caea790) the node was killed at 900.16 seconds. Its other units had finished by 615 seconds; the one test still running was the scripts/validate.rs submodule service-result fixture, started at about 630 seconds, whose child compiles a copied validate.rs with rust-script under its own 300-second bound. That child had run 266.96 seconds and had been compiling its last crate, the validate binary (28.6 seconds locally at three CPUs), for 11.83 seconds, so it would have reached its own bound first and no node wall would have let that revision pass. On the host recorded for this node in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"), a run of this node at three CPUs with a cold rust-script cache took 724.57 seconds, and the hosted run reached the same milestones 1.5 to 2.6 times later. The fixture child now compiles at Cargo opt-level 0: a cold three-CPU build of its package fell from 147.71 to 50.85 seconds, and the fixture alone at four CPUs from 146.19 to 84.17. Scaling the hosted child's compile by that ratio and taking 2.6 times the fixture's local non-compile time (about 34 seconds) gives an estimate of about 850 seconds for the hosted node; that is not a hosted measurement, and 900 seconds would leave less than the project's 50% headroom over it. 1500 is the next 300-second bucket above 1.5 times both the measured lower bound of 900.16 seconds (1350.2) and the 850-second estimate (1275). At a width of three, 1500 seconds of wall come to about 4500 CPU seconds, inside the unchanged 7200-second CPU bound wherever a run can enforce it. 2026-10-17 (test audit B8): the submodule service-result fixture test this bound was sized around no longer runs in this node; that real bracket, with its cold copied-source compile, now runs only in selftest.validate_rs, and scripts/validate.rs's unit tests check the fixture's run-state isolation with a stub child instead. The measurements above are history; the bound is unchanged until a hosted run measures the node without the fixture."########;
 pub(super) const RUST_SCRIPT_PRODUCER_RSS_BASELINE_BYTES: i64 = 7 * 1024 * 1024 * 1024;
 pub(super) const RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES: i64 = 10 * 1024 * 1024 * 1024;
 pub(super) const RUST_SCRIPT_PRODUCER_INNER_JOBS: i64 = 16;
 pub(super) const RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS: i64 = 1200;
 pub(super) const MANIFEST_GATE_INNER_JOBS: i64 = 2;
-pub(super) const MANIFEST_GATE_CPU_SECONDS: i64 = 900;
-const MANIFEST_GATE_DESCRIPTION: &str = r########"SELF-TESTS MOVED OUT 2026-09-29: every product node waits on this gate, and the local validation of Hermit 98a621f42935d585e1306262b11d64488dd51614 was killed here by the 900-second CPU cap while the gate was still running repository-tool self-tests. Those self-tests (scorecard, pressure_test, validate_rs, manifest_cli, dbt_budget; TOOL_SELF_TESTS in validation_dag.rs) now run as selftest.<name> leaf nodes that still decide the verdict but block nothing. The gate keeps only what product nodes consume: the manifest-plan audits run in process (DAG/manifest correspondence, budget ordering, determinism-stress evidence, CLI brackets and the expected-cell plan, which define the cells and commands the product nodes execute), and `generate-test-footprints --check`, which proves the committed ci/test-footprints.json still matches ci/dag/validate.json and Cargo metadata, so hosted test selection picks product nodes from current data. Measured 2026-09-29 on the measurement host recorded for gate.manifest in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts") at load average 215-233: `test-harness validate` took 2.88 s wall and 2.53 CPU seconds (1.99 user, 0.54 system, 29440 KiB largest process RSS), against 664 s of wall before it was killed at 900 CPU seconds with the self-tests included. The 120 CPU seconds are 47 times that sample and bound a hang, not the work; the ordinary and quick/super gates share the constant. The 900-second wall is unchanged because the committed portable preflight critical path is built from it (3780 seconds, then 3900 once setup.manifest_plan's wall cap went from 180 to 300 seconds). HERMIT_VALIDATE_AUDIT_JOBS=1 and the two-core width are retained; with one remaining child audit they no longer change the schedule. The history below describes the former seven-audit gate. AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-core width for each audit's internal Cargo and helper work, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into every child. The ordinary and quick/super variants set HERMIT_VALIDATE_AUDIT_JOBS=1 so their top-level audits run serially inside the shared aggregate budget (seven when measured; six since slice S13 of https://github.com/rrnewton/hermit/issues/3301 retired the tests/backend-parity/split_asymmetric_pr.py self-test): the exact concurrent scheduler path consumed 601.132 CPU seconds and was killed by the unchanged 600-second cap, while isolated scorecard and pressure controls consumed 327.344 and 70.699 CPU seconds. The separately bounded hosted-privileged variant retains its prior two-worker schedule. jobs_flag is explicitly empty so dagrun does not also append its default -j argument to test-harness. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged. CPU BOUND 2026-09-28: the ordinary and quick/super gates now carry 900 CPU seconds; the hosted-privileged variant keeps 600 with its 180-second wall. The audit work did not grow. At Hermit 81ca8822, b280bc48 and 1bd45c15 each audit's waited user+sys CPU agreed within 1% (scorecard 254.6-256.6, pressure 62.5-63.0, validate.rs 28.4-28.8 seconds), and across the 46 retained local validation profiles of this step from 2026-09-22 to 2026-09-28 user CPU stayed at or below 316.2 seconds while system CPU ranged from 32 to 374 seconds. The variable part is process creation. One complete gate at 81ca8822 runs 4011 git commands (scorecard 3182, validate.rs 509, pressure 204, DBT budget 65), and the local validation host resolves git to a telemetry wrapper that measured 51-85 ms of CPU per call against 5.1-5.2 ms for the git it wraps, spawning five further git processes and a detached logger for each call. On an unthrottled host the complete gate consumed 512.0 (b280bc48) and 535.7 (1bd45c15) CPU seconds with that wrapper first on PATH, and 305.5 and 300.7 with the wrapped git first. Three consecutive local runs on 2026-09-28 reached the old 600-second cap inside audits 5-7 with 340-374 seconds of system CPU. The largest observed user CPU, 316.2 seconds, times one plus the largest observed system/user ratio, 1.655, is 839.5 CPU seconds; 900 leaves 60.5 seconds above that product. It remains a runaway bound: a two-core spin is killed after 450 seconds, half of the unchanged 900-second wall. CPU RE-DERIVATION 2026-11-01: across 296 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) the gate's worst valid CPU was 577.1 seconds (p99 467.4, median 3.9), so the former 120-second cap sat at 0.21 times the observed worst and the constant returns to 900, the next 300-second bucket above 1.5 times 577.1 (865.6)."########;
+pub(super) const MANIFEST_GATE_CPU_SECONDS: i64 = 120;
+const MANIFEST_GATE_DESCRIPTION: &str = r########"SELF-TESTS MOVED OUT 2026-09-29: every product node waits on this gate, and the local validation of Hermit 98a621f42935d585e1306262b11d64488dd51614 was killed here by the 900-second CPU cap while the gate was still running repository-tool self-tests. Those self-tests (scorecard, pressure_test, validate_rs, manifest_cli, dbt_budget; TOOL_SELF_TESTS in validation_dag.rs) now run as selftest.<name> leaf nodes that still decide the verdict but block nothing. The gate keeps only what product nodes consume: the manifest-plan audits run in process (DAG/manifest correspondence, budget ordering, determinism-stress evidence, CLI brackets and the expected-cell plan, which define the cells and commands the product nodes execute), and `generate-test-footprints --check`, which proves the committed ci/test-footprints.json still matches ci/dag/validate.json and Cargo metadata, so hosted test selection picks product nodes from current data. Measured 2026-09-29 on the measurement host recorded for gate.manifest in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts") at load average 215-233: `test-harness validate` took 2.88 s wall and 2.53 CPU seconds (1.99 user, 0.54 system, 29440 KiB largest process RSS), against 664 s of wall before it was killed at 900 CPU seconds with the self-tests included. The 120 CPU seconds are 47 times that sample and bound a hang, not the work; the ordinary and quick/super gates share the constant. The 900-second wall is unchanged because the committed portable preflight critical path is built from it (3780 seconds, then 3900 once setup.manifest_plan's wall cap went from 180 to 300 seconds). HERMIT_VALIDATE_AUDIT_JOBS=1 and the two-core width are retained; with one remaining child audit they no longer change the schedule. The history below describes the former seven-audit gate. AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-core width for each audit's internal Cargo and helper work, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into every child. The ordinary and quick/super variants set HERMIT_VALIDATE_AUDIT_JOBS=1 so their top-level audits run serially inside the shared aggregate budget (seven when measured; six since slice S13 of https://github.com/rrnewton/hermit/issues/3301 retired the tests/backend-parity/split_asymmetric_pr.py self-test): the exact concurrent scheduler path consumed 601.132 CPU seconds and was killed by the unchanged 600-second cap, while isolated scorecard and pressure controls consumed 327.344 and 70.699 CPU seconds. The separately bounded hosted-privileged variant retains its prior two-worker schedule. jobs_flag is explicitly empty so dagrun does not also append its default -j argument to test-harness. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged. CPU BOUND 2026-09-28: the ordinary and quick/super gates now carry 900 CPU seconds; the hosted-privileged variant keeps 600 with its 180-second wall. The audit work did not grow. At Hermit 81ca8822, b280bc48 and 1bd45c15 each audit's waited user+sys CPU agreed within 1% (scorecard 254.6-256.6, pressure 62.5-63.0, validate.rs 28.4-28.8 seconds), and across the 46 retained local validation profiles of this step from 2026-09-22 to 2026-09-28 user CPU stayed at or below 316.2 seconds while system CPU ranged from 32 to 374 seconds. The variable part is process creation. One complete gate at 81ca8822 runs 4011 git commands (scorecard 3182, validate.rs 509, pressure 204, DBT budget 65), and the local validation host resolves git to a telemetry wrapper that measured 51-85 ms of CPU per call against 5.1-5.2 ms for the git it wraps, spawning five further git processes and a detached logger for each call. On an unthrottled host the complete gate consumed 512.0 (b280bc48) and 535.7 (1bd45c15) CPU seconds with that wrapper first on PATH, and 305.5 and 300.7 with the wrapped git first. Three consecutive local runs on 2026-09-28 reached the old 600-second cap inside audits 5-7 with 340-374 seconds of system CPU. The largest observed user CPU, 316.2 seconds, times one plus the largest observed system/user ratio, 1.655, is 839.5 CPU seconds; 900 leaves 60.5 seconds above that product. It remains a runaway bound: a two-core spin is killed after 450 seconds, half of the unchanged 900-second wall."########;
 
 /// The controlled writer a static validation step invokes.
 ///
@@ -65,44 +62,35 @@ pub(super) enum StructuredResultProducerKind {
     Envelope,
     Applications,
     Conformance,
-    KvmGapLedger,
 }
 
 impl StructuredResultProducerKind {
     /// The exact structured-result schema this producer writes: schema 4 for a
     /// harness node of a bucket in
     /// [`crate::validation_dag::DIAGNOSTIC_MANIFEST_BUCKETS`], which runs with
-    /// `--diagnostic-results`, and for a KVM gap-ledger node, whose failing gap
-    /// rows are diagnostic failures (never passes); schema 5 for a Nextest
-    /// node, whose counted writer classifies runtime skips from the run's
-    /// `HERMIT_TEST_SKIP_FILE` sidecar; the default schema 2 for every other
-    /// producer.
+    /// `--diagnostic-results`; the default schema 2 for every other producer.
     pub(super) fn declaration(
         self,
         owner: String,
         manifest_category: Option<&str>,
     ) -> StructuredTestResultsManifest {
-        let diagnostic = self == Self::KvmGapLedger
-            || self == Self::TestHarness
-                && manifest_category.is_some_and(|category| {
-                    crate::validation_dag::DIAGNOSTIC_MANIFEST_BUCKETS.contains(&category)
-                });
+        let diagnostic = self == Self::TestHarness
+            && manifest_category.is_some_and(|category| {
+                crate::validation_dag::DIAGNOSTIC_MANIFEST_BUCKETS.contains(&category)
+            });
         if diagnostic {
             StructuredTestResultsManifest::diagnostic(owner)
-        } else if self == Self::Nextest {
-            StructuredTestResultsManifest::skipped(owner)
         } else {
             StructuredTestResultsManifest::current(owner)
         }
     }
 
-    pub(super) const ALL: [Self; 6] = [
+    pub(super) const ALL: [Self; 5] = [
         Self::Nextest,
         Self::TestHarness,
         Self::Envelope,
         Self::Applications,
         Self::Conformance,
-        Self::KvmGapLedger,
     ];
 
     pub(super) const fn command_marker(self) -> &'static str {
@@ -112,7 +100,6 @@ impl StructuredResultProducerKind {
             Self::Envelope => "write-structured-test-counts.sh",
             Self::Applications => "tests/e2e/lib/applications/run_all.sh",
             Self::Conformance => "ci/conformance-test-counts.sh",
-            Self::KvmGapLedger => "ci/kvm-gap-ledger.rs run",
         }
     }
 
@@ -123,7 +110,6 @@ impl StructuredResultProducerKind {
             Self::Envelope => ENVELOPE_RESULT_PRODUCERS,
             Self::Applications => APPLICATION_RESULT_PRODUCERS,
             Self::Conformance => CONFORMANCE_RESULT_PRODUCERS,
-            Self::KvmGapLedger => KVM_GAP_LEDGER_RESULT_PRODUCERS,
         }
     }
 }
@@ -290,14 +276,6 @@ pub(super) const CONFORMANCE_RESULT_PRODUCERS: &[&str] = &[
     "test.isolation_matrix_dbt_in_guest",
     "privileged-test.isolation_matrix_kvm",
 ];
-/// Nodes that run a Hermit test suite on KVM through `ci/kvm-gap-ledger.rs
-/// run`, held to the suite's known-gap ledger: required tests pass, gap rows
-/// that fail as their rows say are diagnostic failures, and a gap row that
-/// passes or fails another way fails the node. Each has its ledger in
-/// crate::known_gaps::DECLARATIONS, which `materialize` writes into its
-/// environment.
-pub(super) const KVM_GAP_LEDGER_RESULT_PRODUCERS: &[&str] =
-    &["privileged-test.deadline_slice_cap_kvm"];
 
 pub(super) const PMU_MEMORY_FAILURE_FAMILY: &str = "super.Weekly PMU parallel memory diagnostic";
 pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
@@ -311,7 +289,6 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 /// an empty or narrowed run refuse. Update these only after enumerating the
 /// corresponding shipped command and accounting for changed test identities.
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
-    ("super.pmu_analyze_hello_race_stress_calibrated_skid", 4),
     // Measured 189 - 185 embedded qualifier tests = four allocator/source-copy
     // cases. The same 185 qualifier identities now run once through the existing
     // allocator producer's script-test harness, with none dropped or ignored.
@@ -323,9 +300,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.isolated_dbt_workdir", 3),
     // Inherited-terminal regressions: native and DBT direct, exec, and peer-flags
     // cases. The authored target has six identities; it is separate from CLI.
-    // The three DBT cases are #[ignore]d as a named loss while DBT guests hang
-    // (https://github.com/rrnewton/hermit/issues/5023): 6 - 3 = 3 executed.
-    ("test.inherited_terminal_read", 3),
+    ("test.inherited_terminal_read", 6),
     ("test.isolated_detcore_workdir", 1),
     // Prepared inventories retain all prior identities and add four reporting
     // tests to regular crates and nine to Hermit's library/binary selection.
@@ -496,7 +471,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_malformed_corpus_is_refused, placeholders_resolve_or_refuse,
     // a_direct_shell_word_expands_its_placeholders_in_the_shell,
     // runner::tests::a_shipped_compat_row_keeps_the_strict_compatibility_probe_flags,
-    // and test-harness a_no_retry_manifest_cell_is_retried_after_a_product_failure)
+    // and test-harness a_no_retry_cell_is_not_retried_after_a_product_failure)
     // retain all 757 prior identities.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
     // runner::tests::a_relative_hermit_bin_names_a_checkout_path, added when the
@@ -729,7 +704,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // manifest_metadata::tests::a_reproducer_selects_exactly_its_cell_including_focused_run_types
     // retains all 899 (the same listing gives 703 with it).
     // runner::tests::a_replay_cell_is_not_retried_after_a_product_failure and
-    // test-harness tests::a_replay_cell_is_retried_after_a_product_failure
+    // test-harness tests::a_replay_cell_is_not_retried_after_a_product_failure
     // retain all 900 (the same listing gives 705 with them).
     // Folding the rr-compat-only run type into each row's own test removes
     // manifest_corpus::tests::a_replay_variant_runs_only_its_replay_cell_with_its_budget,
@@ -1016,13 +991,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (hermit-manifest-plan, https://github.com/rrnewton/hermit/issues/4029)
     // retains all 1039: 1040.
     // The required allocator prerequisite mutation test retains all 1039 prior identities: 1040.
-    // The four retained cell-results tests in ledger::tests (memory cut for
-    // validate-status) retain all 1042: 1046.
+    // The four retained cell-results tests in ledger::tests
+    // (https://github.com/rrnewton/dev-hermit/issues/552) retain all 1042: 1046.
     // happens_before::tests::{a_posthook_anchor_is_counted_at_entry_and_refused_on_no_return_syscalls,
     // a_posthook_anchor_shares_its_counter_and_starts_windows_at_its_entry}
     // (https://github.com/rrnewton/hermit/issues/3929) retain all 1046: 1048.
     // The four retained-census, transcoding, depth and key-order tests in
-    // ledger::tests (memory cut for validate-status) retain all 1048: 1052.
+    // ledger::tests (https://github.com/rrnewton/dev-hermit/issues/552)
+    // retain all 1048: 1052.
     // The DBT startup-authority refusal regression retains all 1048 prior identities.
     // The depth-boundary test in ledger::tests and the repeated-census-key and
     // extension-count tests in ledger::admission::tests retain all 1053: 1056.
@@ -1207,64 +1183,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And runner::tests::a_chaos_floor_failure_over_matched_attempts_is_named_not_a_crash
     // and stress_series::tests::a_chaos_floor_failure_is_an_errored_product_failure_of_a_chaos_cell
     // (a chaos floor failed over matched attempts is chaos-floor-failure): 1864, listed.
-    // Atomic native-client publication adds one real linker/loader overlap test.
-    // And detcore-dbt's
-    // tests::startup_refuses_another_trees_coordinator_before_reading_its_frame
-    // (the DBT runtime checks the coordinator's fingerprint): 1866, listed.
-    // And detcore-model's
-    // syscall_histogram::tests::the_finished_form_keeps_only_nonzero_slots_and_sums_back_exactly
-    // (finished threads keep sparse histograms): 1867, listed.
-    // --virtual-cpus: config's virtual_cpus_never_enter_the_legacy_form and
-    // virtual_cpus_parse_from_1_to_128: 1882.
-    // The shared caller/ABI16 companion adds detcore-dbt's
-    // capability_clear_image_readiness_preserves_legacy_conditions: 1883, listed.
-    // RPC6 strict-loader union re-listed with this node's unchanged selection: 1894.
-    // Train 6 recount (measured on 21f770f6 base): 1899.
-    // Batch 16 (be1bdf07) adds detcore-testutils'
-    // forked_child_acquires_the_session_serializer_while_a_sibling_holds_its_mutex
-    // and forked_child_takes_over_an_inherited_session_serializer_installation_lock:
-    // 1906 + 2 = 1908.
-    // Trains since then add four (measured with `cargo nextest list` at
-    // 11c35a504a6): 1908 + 4 = 1912 was the pre-exclusion listing in that
-    // recount, but the tuple stayed at the executed 1910. Re-measured
-    // with `cargo nextest list --workspace --exclude hermit-detcore
-    // --exclude hermit-detcore-tests --exclude hermit-run --exclude
-    // hermetic_infra_hermit_flaky-tests` at 2436823aeb9: 1910 listed,
-    // matching the full validate at c00dc58e0cd, which ran 1910 in this
-    // selection (1909 passed; the one failure was the hosted-pin
-    // assertion for the twin below, not a count refusal on this node).
-    // Re-measured at 3bdd41fda38 (PR 4736 tip): `cargo nextest list
-    // --profile ci --workspace --exclude hermit-detcore --exclude
-    // hermit-detcore-tests --exclude hermit-run --exclude
-    // hermetic_infra_hermit_flaky-tests` lists 1913, matching the full
-    // validate at that tip (1913 executed, all passed).
-    // PR 4679 adds two detcore-model units and three inventory-driven
-    // manifest-plan cases: 1913 + 5 = 1918, re-measured at this integration head.
-    // PR 4738 adds nine detcore-model units: 1918 + 9 = 1927, re-measured at this integration head.
-    // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
-    // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
-    // The retry stack adds three: 1929 + 3 = 1932, re-measured 2026-10-31.
-    // The integrated chain adds six: 1932 + 6 = 1938, re-measured in the
-    // test.regular_crates tight loop at 351565c0ae (1937 passed, one failed).
-    // The known-gap ledger module (hermit-manifest-plan known_gaps) adds twenty
-    // units: 1938 + 20 = 1958, as test.regular_crates executed in the pinned root.
-    // Full validate run1470 at 87daeb34 executed 1959 (one more than the
-    // pin): 1958 + 1 = 1959, re-measured at this tip.
-    // The composite-verdict schema adds two service_result units:
-    // 1959 + 2 = 1961, measured in the full validate at 73d15dd67f
-    // (1961 passed).
-    // The typedlog module adds four units: 1961 + 4 = 1965, measured
-    // in the full validate at 508bd6faea (1965 passed).
-    // The KVM inexact-counter admission (strict_run_arms_the_preemption_timer)
-    // adds six hermit-manifest-plan tests: five runner units (three for the
-    // timer-arming backends, two for the timeslice spellings hermit accepts
-    // and refuses) and one test-harness run: 1965 + 6 = 1971, measured by
-    // nextest list.
-    // Full validate at 85b8cec25a executed 1973, all passed, against the
-    // 1971 pin: 1971 + 2 = 1973, measured by that run.
-    // Train 5 recount (measured by the ccb5080910 full validate):
-    // Composed on measured main ffe313b1: 1944 + 2 = 1946 (Train 5 delta +2).
-    ("test.regular_crates", 1951),
+    ("test.regular_crates", 1864),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1897,85 +1816,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed with the existing feature selection and exclusions unchanged.
     // Caller-owned DBT private placement adds one library launch regression,
     // measured with the existing feature selection and exclusions unchanged:
-    // 1105.
-    // And tests::a_dbt_runtime_without_the_fingerprint_check_is_refused (Hermit
-    // refuses a DBT runtime built before its coordinator fingerprint check):
-    // 1106, listed.
-    // And package K slice P1's four container units:
-    // the_placeholder_directory_is_a_hidden_empty_read_only_tmpfs,
-    // the_placeholder_directory_mounts_and_leaves_procfs_mountable,
-    // an_image_roots_table_leaves_the_placeholder_directory_out and
-    // a_later_mount_covers_the_placeholder_directory_by_any_spelling: 1110,
-    // listed.
-    // And tests::defined_dynamic_symbols_are_read_from_the_dynamic_segment_alone
-    // and tests::the_dynamic_symbol_count_comes_from_the_hash_table (that check
-    // reads only the runtime's dynamic symbols): 1112, listed.
-    // And A5 slice 3c.1e B's forced-gate harness (in_guest_delivery_harness):
-    // the_parent_runner_never_forces_the_gate and six forced_gate_* rows:
-    // 1121, listed (1114 on main plus seven).
-    // And the fourteen pinned_cpu::tests units, which choose the CPU a run is
-    // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
-    // RPC6 strict-loader union re-listed with this node's unchanged selection: 1172.
-    // Train 6 recount (measured on 21f770f6 base): 1187.
-    // Trains since then add 23 (measured with `cargo nextest list` at
-    // 11c35a504a6, less the five real_random_ skips: 1230 - 5; the full
-    // validate at 24fbff99c7a saw 1224 before 11c35a504a6 added one):
-    // 1202 + 23 = 1225.
-    // Six analyze outcome controls replace the timeout-as-baseline warning test: +5.
-    // And PR 4715's a_trial_writes_what_it_replays_only_into_the_workspace
-    // (a trial never writes into a --replay-schedule-from or
-    // --replay-preemptions-from file of the run arguments): 1226 + 1 = 1227.
-    // Re-measured at 3bdd41fda38: the selection lists 1245 with
-    // `cargo nextest list --profile ci`, less the node's five
-    // `--skip ptrace_completion::tests::real_random_` /
-    // `kvm_execution_tests::` cases: 1240, matching the full validate
-    // at that tip (1240 executed, all passed).
-    // PR 4826 adds two rundata units
-    // (analyzer_reproducer_starts_in_the_trials_directory,
-    // a_reproducers_directory_is_quoted_for_the_shell): 1240 + 2 = 1242,
-    // re-measured at this integration head.
-    // PR 4836 adds run::detlog_anon_is_ptrace_only: 1242 + 1 = 1243, re-measured at this integration head.
-    // PR 4619 adds seven hermit-run units: 1243 + 7 = 1250, re-measured at this integration head.
-    // PR 4725 adds fourteen hermit-run units: 1250 + 14 = 1264, re-measured at this integration head.
-    // PR 4679 adds eight hermit-run units: 1264 + 8 = 1272, re-measured at this integration head.
-    // PR 4865 adds one hermit-run unit: 1272 + 1 = 1273, re-measured at this integration head.
-    // PR 4607 adds two hermit-run units: 1273 + 2 = 1275, re-measured at this integration head.
-    // The loader-cache provenance fix adds two hermit-run units: 1275 + 2 = 1277, re-measured at this integration head.
-    // PR 4738 adds two hermit-run units: 1277 + 2 = 1279, re-measured at this integration head.
-    // PR 4896 adds two hermit-run units: 1279 + 2 = 1281, re-measured at this integration head.
-    // The 4843 overshoot fix adds six hermit-run units: 1281 + 6 = 1287, re-measured at this integration head.
-    // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
-    // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
-    // H1 host-input evidence adds one hermit-run unit: 1289 + 1 = 1290.
-    // The integrated chain adds twenty-nine hermit-run units: 1290 + 29 =
-    // 1319, re-measured at 4892f76e6a (1319 passed in the full validate).
-    // Recount at bc48233db5: 1323 executed (the validate measured 1323; the
-    // local listing less its --skip filters agrees), all passing.
-    // Full validate run1470 at 87daeb34 executed 1325 (two more than the
-    // pin): 1323 + 2 = 1325, re-measured at this tip. The rest of the KVM
-    // preemption timer flip (T2) and a late timer event's replay refusal
-    // add four more in the merged selection: 1325 + 4 = 1329, executed
-    // in the batched round's targeted rerun at the merged head (the six
-    // forced-gate rows fail only for want of a locally built liteinst
-    // runtime, which the validate builds; they pass there).
-    // The KVM executor's refusals by name as policy refusals
-    // (https://github.com/rrnewton/hermit/issues/4768) add one hermit-run
-    // unit: 1329 + 1 = 1330.
-    // kvm_failure_tests::kvm_vfork_child_refusals_are_policy_refusals
-    // (https://github.com/rrnewton/hermit/issues/5025): 1330 + 1 = 1331,
-    // measured by nextest list.
-    // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
-    // hermit-run units: 1331 + 2 = 1333, measured by the 216dbc929a full
-    // validate.
-    // The podman database-lock wait (29fb0079a4) adds two hermit-run
-    // units (podman_store::tests::database_locked_matches_only_the_lock_diagnostic
-    // and lock_wait_refuses_once_the_budget_is_spent): 1333 + 2 = 1335,
-    // measured by musetrain's cd856249a9 full validate (1343 executed
-    // against the 1341 the old pin expected; both new units PASS).
-    // The split retains nine additional core identities: 1335 + 9 = 1344.
-    // Train 5 recount (measured by the ccb5080910 full validate):
-    // Composed on measured main ffe313b1: 1212 + 1 = 1213 (Train 5 delta +1).
-    ("test.hermit_unit", 1239),
+    // 1105 (A5 3c.1e B's seven harness units were reverted with that slice).
+    // Four PIDFD policy-refusal/output cases extend the existing population.
+    ("test.hermit_unit", 1109),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3118,145 +2961,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4710): 2606, listed.
     // And detcore's five syscall_histogram::tests outcome units for
     // the per-run syscall histogram (dh-te7ep): 2611, listed.
-    // And syscalls::inotify's nine cookie units (the numbering by first
-    // observation, a half and an instance read after 70,000 other renames,
-    // the event offsets, buffer filling, overlapping iovecs found, the
-    // iovecs read before the call, concatenated offsets mapped to guest
-    // addresses, only changed cookies written, and a write-only destination)
-    // and config's two units for the global RPC revision in the runtimes'
-    // fingerprint (https://github.com/rrnewton/hermit/issues/4765): 2622,
-    // listed.
-    // And package K slice F1's nineteen units: procfs::fd_directory's nine
-    // (the own directories classified, the entries at Linux positions, the
-    // end at the table's capacity, a leader without a table, the capacity's
-    // powers of two, paging, lseek, tags, the lookup base of a bound
-    // directory), syscalls::files::descriptor_directory's six (a name below
-    // a directory, a path through a descriptor link, the bytes of the rest
-    // of such a path, the links before a descriptor link, a procfs root told
-    // without opening anything, the respelled operands) and tool_local's
-    // four (the descriptor capacity, an unmodelled descriptor, a failed
-    // dup's growth, an unmodelled descriptor's close-on-exec changes): 2641,
-    // listed.
-    // And package K slice E1's five units: syscalls::namespace::own_links's
-    // three (the own links of every spelling, the working directory getcwd
-    // gives, a target d_path cannot hold) and exec_record's two
-    // (a_renamed_directory_above_the_image_is_not_its_path,
-    // only_a_directory_samples_as_one): 2646, listed.
-    // And package K slice P1's twelve units: procfs::fd_directory's
-    // a_placeholder_names_its_directory_and_its_lock, procfs::locks'
-    // placeholder_flocks_lock_each_directory_apart and
-    // a_placeholder_flock_follows_its_descriptions_references, and
-    // syscalls::files::descriptor_directory's every_spelling_of_proc_itself_is_the_root,
-    // a_dotdot_resolves_over_procfs_directories_only,
-    // the_answered_calls_name_their_descriptor,
-    // the_refused_writes_of_a_directory_follow_linux_order,
-    // the_calls_that_follow_a_final_link_are_told_apart,
-    // a_descriptor_links_prefix_ends_past_the_link,
-    // every_descriptor_directory_spelling_is_told,
-    // access_ok_refuses_a_wrapping_or_kernel_range and
-    // a_directory_read_checks_in_linux_order; F1's
-    // a_procfs_root_is_told_without_opening_anything stays, for the
-    // placeholder's object: 2646 + 12 = 2658, listed.
-    // And its round-three units: syscalls::files::descriptor_directory's
-    // every_call_a_placeholder_answers_passes_the_prefilter and procfs::locks'
-    // a_placeholder_lock_never_rests_on_a_copy_in_flight and
-    // an_exec_never_lets_a_surviving_lock_go: 2658 + 3 = 2661, listed.
-    // And syscalls::inotify's a_read_into_overlapping_buffers_is_left_alone
-    // (the overlap decision, without global state): 2662, listed.
-    // And the five shared runtime-FD readlink handler regressions, including
-    // numeric-parent scratch overlap and syscall precedence: 2667, listed.
-    // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
-    // And A5 slice 3c.1e B's unit: threads' disposition_mask_tests::
-    // a_gated_managed_wait_reads_the_guest_mask_without_replacing_it: 2682,
-    // listed.
-    // And syscalls::inotify's nine units for a read that faults (the cookies
-    // found depend only on where the copy ended, only a rename cookie is cut,
-    // a cookie before the fault is whole, the copy ends at the first page the
-    // guest cannot write, the events found account for the bytes the queue
-    // lost, rewrites leave no host cookie byte, the bytes taken past a count,
-    // the probe stays within the bytes taken, and an unreadable page ends the
-    // copy only where the count proves it): 2691, listed.
-    // And passthru_opt_intercepts_the_protection_key_calls (the inotify
-    // fault path's protection-key record under --passthru-opt): 2692, listed.
-    // And package K slice P2b deletes procfs_inode's
-    // only_kvms_synthetic_procfs_device_is_proved_by_its_stat_fields with the
-    // KVM /proc anchor's device check it tested: 2695 - 1 = 2694, listed.
-    // And determinize_stat_reports_one_link_for_directories_only and
-    // determinize_stat_nlink_pin_edges (directory st_nlink pinned to 1):
-    // 2736 + 2 = 2738, listed.
-    // And https://github.com/rrnewton/hermit/issues/4541's
-    // procfs_inode::tests::the_working_directory_is_read_from_procfs_where_descriptors_are,
-    // syscalls::files::leading_climb_tests::a_spelling_climbs_by_its_leading_dotdots
-    // and syscalls::files::listed_directory_tests::a_listing_is_named_by_the_link_only_where_the_entry_is_the_callers:
-    // 2738 + 3 = 2741, listed.
-    // And +6 from 82cbd684: 2747.
-    // Train 6 recount (measured on 21f770f6 base): 2788.
-    // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
-    // replayer test and keeps the population at 2787.
-    // Train 12 adds fourteen detcore units (sleep registration and
-    // MSG_DONTWAIT): 2883 + 14 = 2897, measured with `cargo nextest list`
-    // at 16fb7fbec04 and re-measured at this head.
-    // And the TracerPid unit (32e9ef22f60): 2897 + 1 = 2898.
-    // The P0 revert of PR 4682's first-pass sleep registration
-    // (7322689fae2) removes seven of train 12's sleep-registration units:
-    // 2898 - 7 = 2891, re-measured with `cargo nextest list
-    // -p hermit-detcore --lib --bins` at c00dc58e0cd (2891 listed) and
-    // confirmed by the full validate at that tip (2891 executed, all passed).
-    // PR 4942 adds the ignored-signal shield and lower()-on-Gone units:
-    // 2891 + 2 = 2893, re-measured with `cargo nextest list
-    // -p hermit-detcore --lib --bins` at this integration head (the PR's
-    // own 2899 was measured on its pre-revert base and does not apply here).
-    // Five Binder parsing units and one ioctl admission unit: 2898 + 6 = 2904.
-    // Re-measured at 3bdd41fda38: `cargo nextest list --profile ci
-    // -p hermit-detcore --lib --bins` lists 2914, matching the full
-    // validate at that tip (2914 executed, all passed).
-    // PR 4836 adds three detcore units: 2914 + 3 = 2917, re-measured at this integration head.
-    // PR 4841 adds nine detcore units: 2917 + 9 = 2926, re-measured at this integration head.
-    // PR 4619 adds three detcore units: 2926 + 3 = 2929, re-measured at this integration head.
-    // PR 4725 adds twenty-one detcore units: 2929 + 21 = 2950, re-measured at this integration head.
-    // PR 4679 adds three detcore units: 2950 + 3 = 2953, re-measured at this integration head.
-    // PR 4861 adds two detcore units: 2953 + 2 = 2955, re-measured at this integration head.
-    // PR 4862 adds three detcore units: 2955 + 3 = 2958, re-measured at this integration head.
-    // The loader-cache provenance fix adds one detcore unit: 2958 + 1 = 2959, re-measured at this integration head.
-    // PR 4738 adds twenty detcore units: 2959 + 20 = 2979, re-measured at this integration head.
-    // PR 4897 adds two detcore units: 2979 + 2 = 2981, re-measured at this integration head.
-    // The 4843 overshoot fix adds eighteen detcore units: 2981 + 18 = 2999, re-measured at this integration head.
-    // The socketpair readiness increment adds one detcore unit: 2999 + 1 = 3000, re-measured at this integration head.
-    // Three recvmsg attempt-observation controls bring the measured selection to 3003.
-    // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
-    // The in-flight SCM_RIGHTS queue (https://github.com/rrnewton/hermit/issues/4930) adds seventeen detcore units: 3017 + 17 = 3034, listed.
-    // The inotify fault-boundary repair adds three detcore units: 3034 + 3 = 3037, by nextest list.
-    // The KVM named refusals (NR) add thirty-seven detcore units, thirteen in review
-    // round 1, six in round 2, three in round 3, ten in round 4 and five in round 5:
-    // 3242 + 37 = 3279, listed by cargo nextest list --profile ci -p hermit-detcore --lib --bins.
-    // Recount at 4e916633ca: the selection lists 3321 (3279 + 42, the T2
-    // preemption-timer units among them), by cargo nextest list -p
-    // hermit-detcore --lib --bins; all 3321 pass locally.
-    // N3 (rendered statm/io/arch_status/diskstats) adds twenty-seven
-    // detcore units, measured at its base (3279 + 27 = 3306, listed) and
-    // re-measured at this landing by cargo nextest run -p hermit-detcore
-    // --lib (3348 passed): 3321 + 27 = 3348.
-    // Blocking inotify reads that wait in Detcore's turns
-    // (https://github.com/rrnewton/hermit/issues/4768) add three detcore units:
-    // 3348 + 3 = 3351, by nextest list. Their review fixes add two more (an
-    // unknown blocking mode, and EAGAIN for a read made nonblocking during
-    // its wait): 3351 + 2 = 3353, by nextest list. Their second review adds
-    // one more (a signal a readv part's turn found carries to the next part):
-    // 3353 + 1 = 3354, by nextest list.
-    // K9a-h adds six procfs::memory_map units (four renderer units and two
-    // binding units): 3354 + 6 = 3360, measured by nextest list.
-    // Package K slice K8-d's walk of the `..` spellings of /proc/locks and
-    // fdinfo (a_lock_or_fdinfo_alias_walk_follows_linuxs_lookup): 3360 + 1 =
-    // 3361, measured by nextest list. K8-d's refusal of Hermit's init's fdinfo
-    // (hermits_inits_fdinfo_is_refused_by_name): 3361 + 1 = 3362.
-    // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
-    // Measured 3363 by compiled nextest list at the integration head.
-    // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds 21
-    // sync-edge and access-trace units: 3363 + 21 = 3384, measured by the
-    // 216dbc929a full validate.
-    // Train 5 recount (measured by the ccb5080910 full validate):
-    // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
-    ("test.detcore_unit", 3465),
+    // Ten PIDFD spelling cases and one typed-refusal RPC case; prior main additions retained.
+    ("test.detcore_unit", 2622),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3356,11 +3062,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unrecorded_passed_on_descriptor_misses_no_entry,
     // unrecorded_passed_on_descriptor_follows_repeated_seeks,
     // negative_count_on_unrecorded_received_descriptors): 163.
-    // And tight_stack_received_inotify's test that an inotify descriptor
-    // received and read on a tight stack is recorded and renumbered: 164.
-    // And the in-flight SCM_RIGHTS queue's seventeen scm_rights tests
-    // (https://github.com/rrnewton/hermit/issues/4930): 191 + 17 = 208.
-    ("test.detcore_misc", 209),
+    ("test.detcore_misc", 163),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -3371,9 +3073,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // privileged-test.pmu_detcore_time_cases, because the hosted runner has none
     // (https://github.com/rrnewton/hermit/issues/3663). The two that disable it
     // stay: 31 - 29 = 2, and 2 + 29 = 31 still run under the full label.
-    // And a_capped_preemption_charge_bounds_the_time_short_slices_add, which
-    // disables max_timeslice and is selected by name: 3.
-    ("test.detcore_time", 3),
+    ("test.detcore_time", 2),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
@@ -3598,22 +3298,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 285, listed.
     // And dispatch_stats::ptrace_syscall_histograms_of_two_runs_are_identical
     // (the per-run syscall histogram (dh-te7ep)): 286, listed.
-    // And fatal_core_capture's
-    // a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable (a
-    // thread's fault ends the run by its signal while main waits on a
-    // condition variable): 287, listed.
-    // Recount at 360e99b2e24: a81e8a3fbfd (PR 4862) added two lit tests
-    // without moving this pin; the shard executed 292, all passing, in
-    // the full validate at that head.
-    // Registering the two fifo_jump_replay lit cases adds two and the
-    // guest-held-polls deselection (issue 5001) removes one from the
-    // executed set: 292 + 2 - 1 = 293, re-measured at 185c2c1d3c
-    // (293 passed in the shard's tight loop).
-    // Full validate run1470 at 87daeb34 executed 294 (one more than the
-    // pin): 293 + 1 = 294, re-measured at this tip.
-    // The split moves the copied-child TTY case to its required DynamoRIO
-    // owner: 294 - 1 = 293. Composed source count; re-measure.
-    ("test.hermit_integration_2", 296),
+    ("test.hermit_integration_2", 286),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -3656,21 +3341,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Split the five birth cases into separately bounded identities (+4): 343.
     // And two pure declared-Redis input controls in redis_strict: 345, listed.
     // Name the optional e9patch consumer leg separately; all ten legs remain (+1): 346.
-    // And random_determinism's
-    // a_schedule_replay_hands_the_guest_the_recorded_random_values (a replay
-    // adopts the recorded --rng-seed and refuses another): 347, listed.
-    // Re-measured at 3bdd41fda38 by the full validate at that tip:
-    // 349 executed, all passed (the two added cases are in this shard;
-    // the shard pins 61 + 290 + 349 again sum to the on-host 700).
-    // The integrated chain adds twelve cases in this shard's range:
-    // 349 + 12 = 361, re-measured at fd59b85c73 (361 passed).
-    // The DBT robust-futex named-loss #[ignore] (issue 5023) drops one
-    // executed case: 361 - 1 = 360, measured at bf80a560a9.
-    // The two runtime_private maps/smaps cases hang under DBT --verify
-    // (same issue 5023) and are #[ignore]d as named losses: 360 - 2 = 358.
-    // The split's explicit source/registry package identity adds seven
-    // version_provenance cases: 358 + 7 = 365. Composed source count; re-measure.
-    ("test.hermit_integration_3", 365),
+    ("test.hermit_integration_3", 346),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3847,16 +3518,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 218.
     // And https://github.com/rrnewton/hermit/issues/4262: record_exec_discards_posix_timer_copies_as_on_linux and
     // record_replay_posix_timer_rows_replay_but_diverge_from_linux: 220.
-    // And record_chaos_schedule_replays_under_its_seed: 221.
-    // And record_replay_keeps_the_ownership_recordings_were_made_with and
-    // record_replay_keeps_the_receive_rules_recordings_were_made_with
-    // (https://github.com/rrnewton/hermit/issues/4930): 226 + 2 = 228.
-    // And record_replay_flocks_a_self_created_file_opened_by_relative_path
-    // (https://github.com/rrnewton/hermit/issues/5007): 228 + 1 = 229.
-    // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
-    // record/replay units: 229 + 2 = 231, measured by the 216dbc929a full
-    // validate.
-    ("test.record_replay", 231),
+    ("test.record_replay", 220),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4189,7 +3851,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // verify_tmpdir_does_not_reach_the_guest_environment,
     // a_killed_verify_leaves_its_logs_in_verify_tmpdir_not_tmpdir and
     // an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable
-    // (retained verify logs filled the host /tmp) retain all 294: 297.
+    // (https://github.com/rrnewton/dev-hermit/issues/553) retain all 294: 297.
     // group_kills_never_reach_the_host_without_sequentialized_threads
     // (https://github.com/rrnewton/hermit/issues/4057) retains all 297: 298.
     // a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word
@@ -4541,96 +4203,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Caller-owned DBT private placement adds two CLI launch regressions,
     // measured with the existing feature selection and exclusions unchanged:
     // 614.
-    // Splitting a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take's
-    // 45 rows across three tests adds
-    // a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results
-    // and a_signal_discarded_by_its_named_task_or_namespace_init_reaches_no_take:
-    // 616.
-    // And package K slice P1's procfs_directories_are_served_only_in_a_container,
-    // kept_procfs_directories_are_served_after_a_chroot,
-    // calls_below_a_served_procfs_directory_are_refused_by_name and
-    // namespace_only_mounts_no_placeholder_directory: 620. Their KVM halves,
-    // and run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
-    // (the placeholder is mounted only for KVM), are run_kvm_ tests, which this
-    // node skips and privileged-test.cli_kvm runs.
-    // The 0.5.4 base counts 622.
-    // Splitting four heavy tests so each fits nextest's slow-timeout on a
-    // loaded host (https://github.com/rrnewton/hermit/issues/4783) adds
-    // a_cross_process_sigkill_of_a_child_or_own_group_verifies_at_bitwise_parity,
-    // a_late_or_vectored_sigkill_notification_read_verifies_at_bitwise_parity,
-    // a_positioned_or_self_read_sigkill_notification_verifies_at_bitwise_parity,
-    // a_blocking_fifo_open_with_an_unpublished_or_exclusive_peer_runs_as_on_linux,
-    // a_shells_blocking_fifo_open_verifies_and_shows_its_poll,
-    // a_fifo_shared_by_guests_through_private_tables_does_not_hold_the_turn and
-    // a_fifo_with_only_the_host_at_its_other_end_is_never_polled: 629.
-    // Moving DBT's runs out of detcore_renders_its_procfs_files_on_every_backend
-    // and detcore_omits_the_procfs_names_outside_the_level_on_every_backend
-    // (https://github.com/rrnewton/hermit/issues/4783) adds
-    // detcore_renders_its_procfs_files_on_dbt_as_on_ptrace,
-    // detcore_keeps_its_procfs_files_across_a_chroot_and_trusts_no_forged_placeholder_on_dbt
-    // and detcore_omits_the_procfs_names_outside_the_level_on_dbt: 632, listed.
-    // And a_group_exit_ends_a_sibling_signal_wait_without_sequentializing and
-    // a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity, the ptrace
-    // halves of https://github.com/rrnewton/hermit/issues/4798's two run_kvm_
-    // tests: 632 + 2 = 634.
-    // And in_guest_runtime_survives_a_guest_dup2_onto_each_of_its_descriptors
-    // (https://github.com/rrnewton/hermit/issues/4689): 645.
-    // And relative_names_are_decided_by_the_guests_working_directory,
-    // dotdot_names_are_decided_by_where_they_lead,
-    // the_virtual_cpus_are_listed_by_every_spelling,
-    // descriptor_directory_links_are_read_relative_to_the_working_directory and
-    // dotdot_from_a_received_descriptor_finds_the_guests_own_files, the ptrace
-    // halves of https://github.com/rrnewton/hermit/issues/4541's five run_kvm_
-    // tests: 654 + 5 = 659, listed.
-    // And +1 from 82cbd684: 660.
-    // Train 6 recount (measured on 21f770f6 base): 666.
-    // Train 12 adds five cli tests (run_timeout_names_...,
-    // msg_errqueue_..., a_signal_after_a_sleeps_deadline_...,
-    // kernel_run_sleeps_and_futex_waits_restart_...,
-    // a_recording_whose_stream_cannot_be_written_...): 695 + 5 = 700,
-    // measured with `cargo nextest list` at 16fb7fbec04 and re-measured
-    // at this head.
-    // And the two TracerPid cli tests (32e9ef22f60, 96e9f9db4be):
-    // 700 + 2 = 702.
-    // And 11c35a504a6's two --base-env=minimal cli tests: 702 + 2 = 704,
-    // measured with `cargo nextest list` at 11c35a504a6.
-    // Binder receipt adds one CLI identity (capability-skipped without binderfs):
-    // 703 + 1 = 704.
-    // PR 4836 adds one cli case: 704 + 1 = 705 (the PR's own +1 delta, re-based at this head).
-    // PR 4841 adds a_blocked_vectored_call_moves_bytes_through_the_memory_it_began_with: 705 + 1 = 706.
-    // PR 4844 adds preadv2_and_pwritev2_at_the_current_offset_wait_as_readv_and_writev_do: 706 + 1 = 707.
-    // PR 4619 adds seven cli cases: 707 + 7 = 714, re-measured at this integration head.
-    // PR 4725 adds thirteen cli cases: 714 + 13 = 727, re-measured at this integration head.
-    // PR 4679: re-measured at this integration head by the cli binary's own
-    // list under the node's skip filters, minus ignored cases: 738.
-    // PR 4738 adds three cli cases: 738 + 3 = 741, re-measured at this integration head.
-    // The PR 4853 transplant relocates three timeslice cases to the PMU node: 741 - 2 listed here
-    // (the third is new and never listed here) = 739, re-measured at this integration head.
-    // The 4843 overshoot fix adds one cli case: 739 + 1 = 740, re-measured at this integration head.
-    // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
-    // scm_rights_receipt_is_the_same_whichever_finishes_first and
-    // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
-    // The retry stack adds one cli case: 744 + 1 = 745.
-    // The integrated chain adds eighteen cli cases: 745 + 18 = 763,
-    // re-measured in the test.cli tight loop at 351565c0ae (763 passed).
-    // Recount at bc48233db5: 764 executed in the confirming validate, all
-    // passing.
-    // N3 adds twelve cli cases, measured at its base (763 + 12 = 775 in
-    // its tight loop): 764 + 12 = 776.
-    // a_read_of_an_unmatched_received_inotify_instance_is_refused_by_name
-    // (https://github.com/rrnewton/hermit/issues/4768): 776 + 1 = 777.
-    // run_dbt_received_inotify_instances_are_refused_by_name (the same
-    // issue, DBT's receipts): 777 + 1 = 778.
-    // K9a-h's the_main_stack_is_read_from_maps_as_on_linux: 778 + 1 = 779,
-    // measured by nextest list.
-    // Package K slice K8-d's
-    // the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux: 779 + 1
-    // = 780, measured by nextest list.
-    // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds seven cli
-    // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
-    // Train 5 recount (measured by the ccb5080910 full validate):
-    // Composed on landed batch main: 789 + 5 = 794 (Train 5 delta +5 over 787).
-    ("test.cli", 796),
+    // Library refusal and pinned-Guest forwarding completeness add two PIDFD cases.
+    ("test.cli", 616),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4687,11 +4261,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scratch contract: 192, listed.
     // The 2026-10-17 test audit deleted rr_simple_threads_stress
     // (rr_join_threads without its asserts): 191.
-    // And rr_multiple_pending_signals_sequential's new case, with
-    // rr_multiple_pending_signals no longer ignored, now that Detcore chooses
-    // a process-directed signal's receiving thread
-    // (https://github.com/rrnewton/hermit/issues/4034): 193.
-    ("test.rr_suite_contract", 193),
+    ("test.rr_suite_contract", 191),
     ("privileged-test.pmu_buck_chaos_cases", 6),
     // PMU-subject cases moved out of test.hermit_unit and test.cli so the
     // hosted lane, which has no PMU, does not select them (see
@@ -4713,14 +4283,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // with no syscall, joins them: 14 + 1 = 15.
     // a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later
     // (https://github.com/rrnewton/hermit/issues/4380) joins them: 16, listed.
-    // run_schedule_replay_ends_check_in_slices_where_the_record_did, whose
-    // replay needs a PMU stop on a branch count to go wrong, joins them: 17,
-    // listed.
-    // The PR 4853 transplant adds three timeslice cases here: 18 + 3 = 21, re-measured at this integration head.
-    // a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write,
-    // which only a PMU preemption can end, joins them: 21 + 1 = 22,
-    // re-measured at fd59b85c73 (22 passed).
-    ("privileged-test.pmu_cli_cases", 22),
+    ("privileged-test.pmu_cli_cases", 16),
     // The six x86-64-v3 CLI cases that run a guest, with
     // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
     // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this
@@ -4774,7 +4337,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 2026-10-17 test audit deleted
     // itimer_syscall_heavy_timer_delivers_each_5_ms_period, the 2 ms case's
     // function, guest and bound at a second period in the same regime: 36.
-    ("test.pmu_integration_cases", 41),
+    ("test.pmu_integration_cases", 36),
     // And signal_determinism's
     // ptrace_delivery_check_approves_a_signal_to_a_thread_in_user_code: its
     // spinning guest takes the signal only at a PMU timer preemption (A5 step
@@ -4829,9 +4392,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // raw-exit half split out of run_kvm_notifies_a_child_exit_once_at_bitwise_parity
     // to fit the per-test time limit (https://github.com/rrnewton/hermit/issues/4360;
     // 85, of which 84 are run_kvm_ tests): 85, listed.
-    // And run_kvm_flock_excludes_as_ptrace_does, named
-    // run_kvm_flock_is_a_named_refusal_where_ptrace_excludes until Detcore's
-    // flock model answered flock on KVM
+    // And run_kvm_flock_is_a_named_refusal_where_ptrace_excludes
     // (https://github.com/rrnewton/reverie/issues/1069; 86, of which 85 are
     // run_kvm_ tests): 86, listed.
     // And run_kvm_cpuid_rows_match_ptrace (KVM keeps no CPUID profile of its
@@ -4845,98 +4406,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // empty-signal-boundary opt-in): 90, listed.
     // And run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec
     // (replaced-request parked ownership): 91, listed.
-    // And package K slice P1's KVM halves,
-    // run_kvm_procfs_directories_are_served_only_in_a_container,
-    // run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name and
-    // run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
-    // (94, of which 93 are run_kvm_ tests): 91 + 3 = 94, listed.
-    // And run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing
-    // and run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity
-    // (https://github.com/rrnewton/hermit/issues/4798; 96, of which 95 are
-    // run_kvm_ tests): 94 + 2 = 96, listed.
-    // And run_kvm_relative_names_are_decided_by_the_guests_working_directory,
-    // run_kvm_dotdot_names_are_decided_by_where_they_lead,
-    // run_kvm_the_virtual_cpus_are_listed_by_every_spelling,
-    // run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory
-    // and run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files
-    // (https://github.com/rrnewton/hermit/issues/4541; 101, of which 100 are
-    // run_kvm_ tests): 96 + 5 = 101, listed.
-    // Recount at 254ef2ec731: b45d9e3b7fb added
-    // run_kvm_virtual_timeout_is_reported_from_the_childs_note without
-    // moving this pin; the gate selection lists 103 (102 run_kvm_ plus
-    // the named setup test), all passing in the pinned root.
-    // And run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first
-    // and run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit
-    // (https://github.com/rrnewton/hermit/issues/4930): 103 + 2 = 105.
-    // And run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux
-    // and run_kvm_a_second_path_past_another_process_cmdline_is_refused_by_name
-    // and run_kvm_argument_errors_on_another_process_procfs_answer_as_linux
-    // (the KVM named refusals): 105 + 3 = 108 (107 run_kvm_), listed.
-    // And the two https://github.com/rrnewton/reverie/issues/1225 tests
-    // (finite-RLIMIT_AS launch refusal, host-refused exec): 108 + 2 = 110.
-    // And package K slice K8-h's fdinfo and /proc/locks rendering tests
-    // (https://github.com/rrnewton/hermit/issues/4213): 110 + 2 = 112
-    // (112 run_kvm_ identities, the chaos spinner excluded, plus the
-    // named setup test), listed.
-    // The rest of the KVM preemption timer flip (T2) runs
-    // run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting
-    // again, no longer ignored nor filtered out, and adds
-    // run_kvm_refuses_preemption_stack_traces_by_name,
-    // run_kvm_a_late_timer_event_refuses_the_run_by_name and
-    // run_kvm_a_late_timer_event_is_a_verify_infrastructure_error:
-    // 112 + 4 = 116, listed.
-    // And run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name:
-    // 116 + 1 = 117, listed.
-    // And run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name
-    // (https://github.com/rrnewton/hermit/issues/4768): 117 + 1 = 118.
-    // With K9a-h's run_kvm_the_main_stack_is_read_from_maps_as_on_linux the
-    // selection is 118 + 1 = 119 (118 run_kvm_), measured by cargo nextest list.
-    // And package K slice K8-d's
-    // run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux:
-    // 119 + 1 = 120 (119 run_kvm_ plus the named setup test), measured by
-    // nextest list.
-    // And run_kvm_default_rustc_link_is_a_named_refusal_where_ptrace_links
-    // (https://github.com/rrnewton/reverie/issues/1108): 120 + 1 = 121, listed.
-    // And run_kvm_an_scm_rights_receipt_over_its_own_header_is_a_named_refusal: 121 + 1 = 122,
-    // listed.
-    // And run_kvm_shared_hugetlbfs_view_is_a_named_refusal: 122 + 1 = 123, listed.
-    // And run_kvm_a_robust_word_kvm_cannot_exchange_is_a_named_refusal_where_ptrace_marks_it
-    // (https://github.com/rrnewton/hermit/issues/4529): 123 + 1 = 124, listed.
-    // And N4's run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map:
-    // 124 + 1 = 125, listed.
-    // And run_kvm_a_parent_death_signal_reaches_the_child_as_on_linux (PRCTL
-    // phase 2: KVM's parent-death signals and the refusals it keeps): 125 + 1
-    // = 126, listed.
-    // And package K slice K10's
-    // run_kvm_the_callers_own_proc_directories_answer_as_linux: 126 + 1 = 127
-    // (126 run_kvm_ plus the named setup test), listed.
-    // R1108 (https://github.com/rrnewton/reverie/issues/1108):
-    // run_kvm_default_rustc_link_is_a_named_refusal_where_ptrace_links retired and
-    // run_kvm_shared_file_view_with_a_second_thread_maps_as_natively listed in its place:
-    // 127 - 1 + 1 = 127. R1108's review round lists
-    // run_kvm_shared_file_threads_that_exited_do_not_hold_back_a_fork and
-    // run_kvm_shared_file_fork_beside_a_live_thread_is_refused_by_name: 127 + 2 = 129.
-    ("privileged-test.cli_kvm", 129),
-    // The required tests of hermit-cli/tests/deadline_slice_cap.rs on KVM: the
-    // suite's 42 tests less the rows of its known-gap ledger
-    // (hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv), measured on Hermit
-    // main badaea3ee96 and 2c255403749 with
-    // https://github.com/rrnewton/hermit/issues/4929's first slice on top. ci/kvm-gap-ledger.rs runs all 42 but the skipped rows and refuses a
-    // population that does not leave exactly this many required. Deleting a
-    // row (a gap that now passes) or adding a test raises it.
-    // T2's promotion (578b92a6af) made it 37; the 2026-10-31 deselection of
-    // the four batch-28 itimer gaps (approval on issue 4929) made it 34; the
-    // bf80a560a9 validate showed itimer_a_recorded_schedule_replays passing,
-    // so its row was promoted out of the ledger: 34 + 1 = 35. The rest of
-    // T2's Hermit half makes skipped_slice_ends_survive_the_backstop pass on
-    // KVM (it counts Detcore's backstop line, and a late timer event refuses
-    // the run by name, so the harness retries it): its row J is promoted out
-    // of the ledger, 35 + 1 = 36.
-    // The owner's 2026-11-01 directive turned the six remaining rows into
-    // skipped rows (minibeads dh-j7ocf tracks the fix): the node no longer
-    // runs them, so its counted run executes 36 of the 42 tests and filters
-    // out 6. They were never required, so this count stays 36.
-    ("privileged-test.deadline_slice_cap_kvm", 36),
+    ("privileged-test.cli_kvm", 91),
     // The same three https://github.com/rrnewton/hermit/issues/3260 tests as
     // test.cli; all 99 prior identities retained. The same
     // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli
@@ -4968,7 +4438,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // same runtime) leave the host twin through an exact-name filterset;
     // test.cli keeps them. Listed at this tip with the
     // build.workspace_on_host features (hermit-run/kvm-native-test-support,
-    // hermit-run/liteinst) and this node's arguments: 152 before,
+    // hermit-run/third-party-backends) and this node's arguments: 152 before,
     // 121 after, and the removed set is exactly those 31.
     // The same DBT rdtsc test as test.cli retains all 121: 122, listed the
     // same way.
@@ -5242,62 +4712,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed with the existing feature selection and exclusions unchanged.
     // The same two private-placement regressions remain in the hosted selection,
     // measured with its existing exclusions unchanged: 533.
-    // And the same two tests split out of the discarded-at-send test, not
-    // excluded: 535.
-    // And the same four P1 placeholder tests, not excluded: 539.
-    // The 0.5.4 base counts 541.
-    // And the same seven tests split out of four heavy ones, not excluded:
-    // 548.
-    // And the same three tests holding DBT's procfs runs, not excluded: 551,
-    // listed.
-    // And the same two ptrace group-exit signal-wait tests, not excluded:
-    // 551 + 2 = 553.
-    // And the same in-guest dup2-onto-runtime-descriptors test, not excluded:
-    // 564.
-    // And the same five ptrace working-directory tests, not excluded: 573 +
-    // 5 = 578, listed.
-    // And +1 from 82cbd684: 579.
-    // Train 6 recount (measured on 21f770f6 base): 585.
-    // The same five train-12 cli tests: 614 + 5 = 619, measured with
-    // `cargo nextest list` at 16fb7fbec04 and re-measured at this head.
-    // And the same two TracerPid cli tests: 619 + 2 = 621.
-    // And the same two 11c35a504a6 tests: 621 + 2 = 623.
-    // And the same binder descriptor test, not excluded: 623.
-    // The same PR 4836 cli case: 623 + 1 = 624.
-    // The same PR 4841 cli case: 624 + 1 = 625.
-    // The same PR 4844 cli case: 625 + 1 = 626.
-    // The same seven PR 4619 cli cases: 626 + 7 = 633.
-    // The same thirteen PR 4725 cli cases: 633 + 13 = 646.
-    // PR 4679: the same re-measurement as test.cli with the hosted
-    // exclusions applied: 657.
-    // The same three PR 4738 cases: 657 + 3 = 660.
-    // The same PR 4853 transplant relocation: 660 - 2 = 658.
-    // The same 4843 overshoot fix case: 658 + 1 = 659.
-    // The same two PR 4912 cases: 659 + 2 = 661.
-    // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
-    // The same retry-stack cli case: 663 + 1 = 664.
-    // The same eighteen integrated-chain cli cases: 664 + 18 = 682.
-    // The same recount at bc48233db5 as test.cli: 682 + 1 = 683.
-    // The same twelve N3 cli cases: 683 + 12 = 695.
-    // The same unmatched-received-inotify case: 695 + 1 = 696.
-    // The same DBT received-inotify case: 696 + 1 = 697.
-    // The same K9a-h cli case: 697 + 1 = 698, measured by nextest list.
-    // The same K8-d cli case: 698 + 1 = 699, measured by nextest list.
-    // Train 1 recount (measured by the 216dbc929a full validate, same
-    // growth as test.cli): 699 + 7 = 706.
-    // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
-    ("test.cli_on_host", 715),
-    // The hosted twin carries the local regular_crates selection minus its
-    // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
-    // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
-    // The same four typedlog units: 1947 + 4 = 1951 (carried).
-    // The same six KVM inexact-counter admission tests: 1951 + 6 = 1957. The
-    // local selection with these tests lists 1971, and all fourteen hosted
-    // exclusions are present exactly once: 1971 - 14 = 1957, by nextest list.
-    // The same two added units as the local selection (1973 measured at
-    // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
-    // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
-    ("test.regular_crates_on_host", 1937),
+    // The same two PIDFD cases, with hosted exclusions unchanged.
+    ("test.cli_on_host", 535),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5315,8 +4731,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two directory-size KVM tests (https://github.com/rrnewton/hermit/issues/4162): 84.
     // And run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity, split out of
     // run_kvm_notifies_a_child_exit_once_at_bitwise_parity: 85, listed.
-    // And run_kvm_flock_excludes_as_ptrace_does, formerly
-    // run_kvm_flock_is_a_named_refusal_where_ptrace_excludes
+    // And run_kvm_flock_is_a_named_refusal_where_ptrace_excludes
     // (https://github.com/rrnewton/reverie/issues/1069): 86, listed.
     // And run_kvm_cpuid_rows_match_ptrace: 87, listed.
     // And run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills
@@ -5327,36 +4742,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // empty-signal-boundary opt-in): 90, listed.
     // And run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec
     // (replaced-request parked ownership): 91, listed.
-    // And the same three package K slice P1 KVM tests: 91 + 3 = 94, listed.
-    // And the same two group-exit signal-wait KVM tests: 94 + 2 = 96, listed.
-    // And the same five working-directory KVM tests: 96 + 5 = 101, listed.
-    // Recount at 254ef2ec731: and run_kvm_virtual_timeout_is_reported_
-    // from_the_childs_note (b45d9e3b7fb): 102 + 1 = 103, listed.
-    // And the two SCM_RIGHTS queue KVM tests (https://github.com/rrnewton/hermit/issues/4930): 103 + 2 = 105, listed.
-    // And the masked-ppoll pending-signal, two-path cmdline refusal and procfs argument-error KVM
-    // tests (the KVM named refusals): 105 + 3 = 108, listed.
-    // And the two https://github.com/rrnewton/reverie/issues/1225 tests:
-    // 108 + 2 = 110, listed. And package K slice K8-h's fdinfo and
-    // /proc/locks rendering tests: 110 + 2 = 112, listed.
-    // And the same four tests of the rest of the KVM timer flip (T2):
-    // 112 + 4 = 116, listed. And the same replay refusal test: 117, listed.
-    // And run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name
-    // (https://github.com/rrnewton/hermit/issues/4768): 117 + 1 = 118.
-    // And K9a-h's main-stack maps test: 118 + 1 = 119, measured by cargo nextest
-    // list.
-    // And the same K8-d dot-dot spellings test: 119 + 1 = 120. And the KVM
-    // default rustc link refusal test: 120 + 1 = 121, listed.
-    // And the KVM overlapping SCM_RIGHTS receipt refusal test: 121 + 1 = 122, listed.
-    // And the KVM hugetlbfs view refusal test: 122 + 1 = 123, listed.
-    // And the same unexchangeable robust word refusal test: 124, listed.
-    // And N4's smaps test: 124 + 1 = 125, listed.
-    // And the same PRCTL phase 2 parent-death test: 125 + 1 = 126, listed.
-    // And the same K10 own /proc directories test: 126 + 1 = 127, listed.
-    // R1108 retires the default rustc link refusal test and lists the shared file view beside a
-    // second thread in its place: 127 - 1 + 1 = 127.
-    // And R1108's review round lists the exited-threads fork test and the fork refusal beside a
-    // live thread: 127 + 2 = 129.
-    ("privileged-only-test.cli_kvm", 129),
+    ("privileged-only-test.cli_kvm", 91),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
     // And the KVM unreadable futex word test: 56.
     // And run_kvm_a_parked_sleep_carries_the_deadline_cap: 57.
@@ -5370,8 +4756,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two directory-size KVM tests (https://github.com/rrnewton/hermit/issues/4162): 84.
     // And run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity, split out of
     // run_kvm_notifies_a_child_exit_once_at_bitwise_parity: 85, listed.
-    // And run_kvm_flock_excludes_as_ptrace_does, formerly
-    // run_kvm_flock_is_a_named_refusal_where_ptrace_excludes
+    // And run_kvm_flock_is_a_named_refusal_where_ptrace_excludes
     // (https://github.com/rrnewton/reverie/issues/1069): 86, listed.
     // And run_kvm_cpuid_rows_match_ptrace: 87, listed.
     // And run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills
@@ -5382,33 +4767,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // empty-signal-boundary opt-in): 90, listed.
     // And run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec
     // (replaced-request parked ownership): 91, listed.
-    // And the same three package K slice P1 KVM tests: 91 + 3 = 94, listed.
-    // And the same two group-exit signal-wait KVM tests: 94 + 2 = 96, listed.
-    // And the same five working-directory KVM tests: 96 + 5 = 101, listed.
-    // And run_kvm_virtual_timeout_is_reported_from_the_childs_note: 102 + 1 = 103,
-    // re-measured at the bc60c6a3 fix-forward head (validate run 1436).
-    // And the same two SCM_RIGHTS queue KVM tests: 103 + 2 = 105, listed.
-    // And the same masked-ppoll pending-signal, two-path cmdline refusal and procfs argument-error
-    // KVM tests: 105 + 3 = 108, listed.
-    // And the same two https://github.com/rrnewton/reverie/issues/1225 tests
-    // and package K slice K8-h's fdinfo and /proc/locks tests, on the
-    // identical selection: 108 + 4 = 112, listed.
-    // And the same four tests of the rest of the KVM timer flip (T2), on
-    // the identical selection: 112 + 4 = 116, listed. And the same replay
-    // refusal test: 117, listed.
-    // And the same blocking-inotify refusal KVM test: 117 + 1 = 118.
-    // And the same K9a-h main-stack maps test: 118 + 1 = 119.
-    // And the same K8-d dot-dot spellings test: 119 + 1 = 120. And the same
-    // KVM default rustc link refusal test: 120 + 1 = 121, listed.
-    // And the same KVM overlapping SCM_RIGHTS receipt refusal test: 121 + 1 = 122, listed.
-    // And the same KVM hugetlbfs view refusal test: 122 + 1 = 123, listed.
-    // And the same unexchangeable robust word refusal test: 124, listed.
-    // And the same N4 smaps test: 124 + 1 = 125, listed.
-    // And the same PRCTL phase 2 parent-death test: 125 + 1 = 126, listed.
-    // And the same K10 own /proc directories test: 126 + 1 = 127, listed.
-    // And the same R1108 swap: 127 - 1 + 1 = 127.
-    // And the same two tests of R1108's review round: 127 + 2 = 129.
-    ("privileged-only-test.cli_kvm_on_host", 129),
+    ("privileged-only-test.cli_kvm_on_host", 91),
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
@@ -5423,9 +4782,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twenty D4c-1 proc_stat_lifecycle tests: 157.
     // And the same two A+ tests: 159.
     // And the same four F0a readdir_order variants: 163.
-    // And the same tight-stack received-inotify test: 164.
-    // And the same seventeen SCM_RIGHTS queue tests: 191 + 17 = 208.
-    ("test.detcore_misc_on_host", 209),
+    ("test.detcore_misc_on_host", 163),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -5438,8 +4795,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host node carries the identical library/binary selection.
     // The host twin carries test.detcore_time's PMU-free filter: 2 of 31
     // (https://github.com/rrnewton/hermit/issues/3663).
-    // And the same capped-preemption-charge case: 3.
-    ("test.detcore_time_on_host", 3),
+    ("test.detcore_time_on_host", 2),
     // The two bootstrap-turn scheduler-time tests listed for test.detcore_unit
     // (https://github.com/rrnewton/hermit/issues/3517) retain all 876 prior
     // identities.
@@ -5803,67 +5159,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two capability slice 5 units: 2605, listed.
     // And the same issue 4710 scheduler unit: 2606, listed.
     // And the same five syscall_histogram units: 2611, listed.
-    // And the same nine syscalls::inotify and two config units: 2622,
-    // listed.
-    // And the same nineteen F1 units: 2641, listed.
-    // And the same five E1 units: 2646, listed.
-    // And the same twelve P1 units: 2658, listed.
-    // And the same three P1 round-three units: 2661, listed.
-    // And the same overlap-decision unit: 2662, listed.
-    // And the same five shared runtime-FD readlink regressions: 2667, listed.
-    // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
-    // And the same 3c.1e B unit: 2682, listed.
-    // And the same nine units for a read that faults: 2691, listed.
-    // And the same protection-key subscription unit: 2692, listed.
-    // And the same P2b deletion of the anchor device unit: 2694, listed.
-    // And the same two directory st_nlink units: 2738, listed.
-    // And the same three working-directory units: 2738 + 3 = 2741, listed.
-    // And +6 from 82cbd684: 2747.
-    // Train 6 recount (measured on 21f770f6 base): 2788.
-    // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
-    // replayer test and keeps the population at 2787.
-    // The same fourteen train-12 detcore units: 2883 + 14 = 2897,
-    // measured with `cargo nextest list` at this head.
-    // And the same TracerPid unit: 2898.
-    // The same P0 revert (7322689fae2) removes the same seven units here:
-    // 2898 - 7 = 2891, matching the local twin's recount at c00dc58e0cd.
-    // And the same two PR 4942 units: 2891 + 2 = 2893.
-    // The same six Binder receipt units: 2898 + 6 = 2904.
-    // The same recount at 3bdd41fda38: 2914 (no exclusions on this twin).
-    // The same three PR 4836 units: 2914 + 3 = 2917.
-    // The same nine PR 4841 units: 2917 + 9 = 2926.
-    // The same three PR 4619 units: 2926 + 3 = 2929.
-    // The same twenty-one PR 4725 units: 2929 + 21 = 2950.
-    // The same three PR 4679 units: 2950 + 3 = 2953.
-    // The same two PR 4861 units: 2953 + 2 = 2955.
-    // The same three PR 4862 units: 2955 + 3 = 2958.
-    // The same loader-cache provenance unit: 2958 + 1 = 2959.
-    // The same twenty PR 4738 units: 2959 + 20 = 2979.
-    // The same two PR 4897 units: 2979 + 2 = 2981.
-    // The same eighteen 4843 overshoot fix units: 2981 + 18 = 2999.
-    // The same socketpair readiness unit: 2999 + 1 = 3000.
-    // Three recvmsg attempt-observation controls bring the measured selection to 3003.
-    // The same fourteen kconc/4966 V4c replay-priority units: 3003 + 14 = 3017.
-    // The same seventeen SCM_RIGHTS queue units: 3017 + 17 = 3034.
-    // The same three inotify fault-boundary units: 3034 + 3 = 3037.
-    // The integrated chain tip recount that took test.detcore_unit to
-    // 3242 (2a1a7c67cd) measured the same selection this twin runs; the
-    // twin's pin stayed 3037, so the hosted/local count invariant failed
-    // on main. 3037 -> 3242 to match that measured recount.
-    // The same thirty-seven NR units: 3242 + 37 = 3279.
-    // The same recount at 4e916633ca as test.detcore_unit: 3279 + 42 = 3321.
-    // The same twenty-seven N3 detcore units: 3321 + 27 = 3348.
-    // The same three blocking-inotify units: 3348 + 3 = 3351.
-    // The same two blocking-inotify review-fix units: 3351 + 2 = 3353.
-    // The same blocking-inotify second-review unit: 3353 + 1 = 3354.
-    // The same six K9a-h units: 3354 + 6 = 3360, measured by nextest list.
-    // The same K8-d walk unit: 3360 + 1 = 3361, measured by nextest list.
-    // The same K8-d init-fdinfo unit: 3361 + 1 = 3362.
-    // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
-    // Measured 3363 by compiled nextest list at the integration head.
-    // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
-    // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
-    ("test.detcore_unit_on_host", 3465),
+    // The same eleven PIDFD cases; prior main additions retained.
+    ("test.detcore_unit_on_host", 2622),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5977,24 +5274,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And two pure declared-Redis input controls in redis_strict: 691, listed.
     // Name the optional e9patch consumer leg separately; all ten legs remain (+1): 692.
     // And the same two-run syscall-histogram test: 693, listed.
-    // And the same random_determinism schedule-replay test: 694, listed.
-    // Train 6 recount (measured on 21f770f6 base): 695.
-    // Re-measured at 3bdd41fda38: the on-host selection lists 700 with
-    // `cargo nextest list --profile ci` (the local shards' 61 + 290 + 349).
-    // Recount at 360e99b2e24: shard 2 grew to 292 (see its pin), so the
-    // whole-node twin executes 61 + 292 + 349 = 702.
-    // The integrated chain grows shard 3 to 361 (see its pin): 61 + 292 +
-    // 361 = 714.
-    // Shard 2 then grows to 293 (see its pin): 61 + 293 + 361 = 715.
-    // The DBT robust-futex #[ignore] (issue 5023) drops shard 3 to 360:
-    // 61 + 293 + 360 = 714.
-    // The runtime_private maps/smaps #[ignore]s (same issue) drop shard 3
-    // to 358: 61 + 293 + 358 = 712.
-    // Shard 2 recounts to 294 in run1470: 61 + 294 + 358 = 713.
-    // The split retains seven package-identity cases in version_provenance
-    // and moves the copied-child TTY case to its DynamoRIO owner:
-    // 713 + 7 - 1 = 719. Composed source count; re-measure.
-    ("test.hermit_integration_on_host", 722),
+    ("test.hermit_integration_on_host", 693),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -6236,52 +5516,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Caller-selected DBT environment privacy adds one library regression,
     // listed with the existing feature selection and exclusions unchanged.
     // The same private-placement library regression remains in the hosted
-    // selection, measured with its existing exclusions unchanged: 1105.
-    // And the same DBT runtime fingerprint-check unit: 1106, listed.
-    // And the same four P1 container units: 1110, listed.
-    // And the same two dynamic-symbol units: 1112, listed.
-    // And A5 slice 3c.1e B's harness unit the_parent_runner_never_forces_the_gate;
-    // its six forced_gate_* rows launch in-guest-trap guests, which need CPUID
-    // faulting, so this hosted twin excludes them by exact name
-    // (validation_dag::HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS) while
-    // test.hermit_unit runs all seven: 1115, listed
-    // (1114 on main plus one).
-    // And the same fourteen pinned_cpu::tests units: 1129, listed.
-    // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
-    // Train 6 recount (measured on 21f770f6 base): 1181.
-    // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
-    // The same six analyze outcome controls replace one obsolete warning test: +5.
-    // And the same PR 4715 trial-input workspace test: 1220 + 1 = 1221.
-    // Re-measured at 3bdd41fda38: 1245 listed, less the five `--skip`
-    // cases and this twin's six named forced-gate exclusions: 1234.
-    // The same two PR 4826 rundata units: 1234 + 2 = 1236.
-    // The same PR 4836 unit: 1236 + 1 = 1237.
-    // The same seven PR 4619 units: 1237 + 7 = 1244.
-    // The same fourteen PR 4725 units: 1244 + 14 = 1258.
-    // The same eight PR 4679 units: 1258 + 8 = 1266.
-    // The same one PR 4865 unit: 1266 + 1 = 1267.
-    // The same two PR 4607 units: 1267 + 2 = 1269.
-    // The same two loader-cache provenance units: 1269 + 2 = 1271.
-    // The same two PR 4738 units: 1271 + 2 = 1273.
-    // The same two PR 4896 units: 1273 + 2 = 1275.
-    // The same six 4843 overshoot fix units: 1275 + 6 = 1281.
-    // The same detlog correction unit: 1281 + 1 = 1282.
-    // The same PR 4912 unit: 1282 + 1 = 1283.
-    // The same H1 path-fallback unit: 1283 + 1 = 1284.
-    // The same twenty-nine integrated-chain units: 1284 + 29 = 1313.
-    // The same +2 as test.hermit_unit in the run1470 recount: 1319.
-    // The same four T2 and replay-refusal units as test.hermit_unit:
-    // 1319 + 4 = 1323 (carried: the hosted lane did not run here; the
-    // portable twin executed 1329 in the targeted rerun).
-    // The same KVM named-refusal unit: 1323 + 1 = 1324.
-    // The same KVM vfork-child refusal unit: 1324 + 1 = 1325, measured by
-    // nextest list.
-    // Train 1 recount (same growth as test.hermit_unit): 1325 + 2 = 1327.
-    // The same two podman lock-wait units as test.hermit_unit (neither is
-    // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
-    // The split retains nine additional core identities: 1329 + 9 = 1338.
-    // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
-    ("test.hermit_unit_on_host", 1233),
+    // selection, measured with its existing exclusions unchanged: 1105 (A5
+    // 3c.1e B's harness unit was reverted with that slice).
+    // The same four PIDFD policy-refusal/output cases, with hosted exclusions unchanged.
+    ("test.hermit_unit_on_host", 1109),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6483,49 +5721,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two archived.rs roster units: 1847, listed.
     // And the same inherited-declaration runner test: 1848, listed.
     // And the same two chaos-floor-failure tests: 1850, listed.
-    // The same native-client publication regression is included on the host.
-    // And the same detcore-dbt fingerprint test: 1852, listed.
-    // And the same finished-thread sparse histogram unit: 1853, listed.
-    // The same two --virtual-cpus config tests: 1868.
-    // The same shared caller/ABI16 legacy-readiness test, with all fourteen
-    // hosted exclusions unchanged: 1869, listed.
-    // RPC6 strict-loader union re-listed with this node's unchanged selection: 1880.
-    // Train 6 recount (measured on 21f770f6 base): 1885.
-    // The same two Batch 16 detcore-testutils session-serializer tests:
-    // 1892 + 2 = 1894 (the local twin's fourteen hosted exclusions are
-    // unchanged, so 1894 + 14 = 1908).
-    // And the same four since: 1898.
-    // Recount at 2436823aeb9 (bisect dh-mtrkq): the local selection lists
-    // 1910 and all fourteen hosted exclusions are present exactly once,
-    // so the hosted twin executes 1910 - 14 = 1896. Two of the four added
-    // since 1894 are themselves hosted-excluded, so this twin gains only
-    // two, not four: 1894 + 2 = 1896.
-    // Recount at 3bdd41fda38: the local selection lists 1913 and all
-    // fourteen hosted exclusions are present exactly once, so the
-    // hosted twin executes 1913 - 14 = 1899.
-    // PR 4679: the same five added cases as test.regular_crates, with all
-    // fourteen hosted exclusions present exactly once: 1918 - 14 = 1904.
-    // PR 4738: the same nine added cases: 1927 - 14 = 1913.
-    // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
-    // Its detlog correction: the same one added case: 1929 - 14 = 1915.
-    // The retry stack: the same three added cases: 1932 - 14 = 1918.
-    // The integrated chain: the same six added cases: 1938 - 14 = 1924.
-    // The same twenty known_gaps units, none of them hosted-excluded: 1959 - 14 = 1945.
-    // The same two composite-verdict units: 1961 - 14 = 1947.
-    // The same four typedlog units, none hosted-excluded: 1965 - 14 = 1951.
-    // The same six KVM inexact-counter admission tests, none hosted-excluded:
-    // the local selection with these tests lists 1971, and all fourteen
-    // hosted exclusions are present exactly once: 1971 - 14 = 1957, by
-    // nextest list.
-    // The same two added units as the local selection (1973 measured at
-    // 85b8cec25a), none hosted-excluded: 1957 + 2 = 1959 (1973 - 14).
-    // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
-    ("test.regular_crates_on_host", 1937),
+    ("test.regular_crates_on_host", 1850),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
-    // And the same two multiple-pending-signals cases: 192.
-    ("test.rr_suite_contract_on_host", 192),
+    ("test.rr_suite_contract_on_host", 190),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
     // And the same target-scoped DETLOG forwarding test (13), and the same
@@ -6571,10 +5771,6 @@ pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredRes
             CONFORMANCE_RESULT_PRODUCERS,
             StructuredResultProducerKind::Conformance,
         ),
-        (
-            KVM_GAP_LEDGER_RESULT_PRODUCERS,
-            StructuredResultProducerKind::KvmGapLedger,
-        ),
     ] {
         if tags.contains(&tag) {
             return Some(kind);
@@ -6583,7 +5779,7 @@ pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredRes
     None
 }
 
-pub(crate) fn expected_nextest_count(tag: &str) -> Option<u64> {
+fn expected_nextest_count(tag: &str) -> Option<u64> {
     NEXTEST_EXPECTED_COUNTS
         .iter()
         .find_map(|(candidate, count)| (*candidate == tag).then_some(*count))
@@ -6678,15 +5874,10 @@ impl StaticStepSpec {
             .map(|(name, value)| ((*name).into(), (*value).into()))
             .collect::<BTreeMap<String, String>>();
         if let Some(expected) = expected_nextest_count(&tag) {
-            assert!(
-                matches!(
-                    producer,
-                    Some(
-                        StructuredResultProducerKind::Nextest
-                            | StructuredResultProducerKind::KvmGapLedger
-                    )
-                ),
-                "{tag} has an expected Nextest count but is not a declared Nextest or KVM gap-ledger producer"
+            assert_eq!(
+                producer,
+                Some(StructuredResultProducerKind::Nextest),
+                "{tag} has an expected Nextest count but is not a declared Nextest producer"
             );
             assert!(
                 env.insert("NEXTEST_EXPECTED_EXECUTED".into(), expected.to_string())
@@ -6695,7 +5886,6 @@ impl StaticStepSpec {
             );
         }
         if producer == Some(StructuredResultProducerKind::Nextest)
-            || producer == Some(StructuredResultProducerKind::KvmGapLedger)
             || self.cmd.contains("nextest-binaries.rs executable ")
         {
             let selection = crate::nextest_build_selections::for_step(&tag)
@@ -6710,36 +5900,6 @@ impl StaticStepSpec {
             assert!(
                 env.insert(crate::nextest_binaries::REQUIRED_ENV.into(), "1".into())
                     .is_none()
-            );
-            if producer == Some(StructuredResultProducerKind::Nextest) {
-                // The counted writer publishes schema 5 for this node (see
-                // `declaration`) and reads runtime-skip markers from the
-                // sidecar this variable's value enables.
-                assert!(
-                    env.insert("HERMIT_NEXTEST_RESULTS_SCHEMA".into(), "5".into())
-                        .is_none(),
-                    "{tag} declares HERMIT_NEXTEST_RESULTS_SCHEMA twice"
-                );
-            }
-        }
-        // A known-gap ledger is declared once, in crate::known_gaps::DECLARATIONS, and reaches
-        // its node only through this variable: the node's runner reads the ledger from it, and
-        // the receipt qualifier reads the declaration from ci/dag/validate.json.
-        assert!(
-            !env.contains_key(crate::known_gaps::LEDGER_ENV),
-            "{tag} sets {} by hand; declare its ledger in crate::known_gaps::DECLARATIONS",
-            crate::known_gaps::LEDGER_ENV
-        );
-        let ledger = crate::known_gaps::declaration_for_node(&tag);
-        assert_eq!(
-            ledger.is_some(),
-            producer == Some(StructuredResultProducerKind::KvmGapLedger),
-            "{tag}: every KVM gap-ledger producer, and no other node, declares a ledger in crate::known_gaps::DECLARATIONS"
-        );
-        if let Some(declaration) = ledger {
-            env.insert(
-                crate::known_gaps::LEDGER_ENV.into(),
-                declaration.ledger.into(),
             );
         }
         Step {
@@ -6812,25 +5972,32 @@ pub(super) fn config() -> DagConfig {
         .copied()
         .map(StaticStepSpec::materialize)
         .collect::<Vec<_>>();
-    // The child runs one test of its parent's suite, single-core, so
-    // it carries its own measured bounds rather than the whole suite's
-    // (step_limits.rs): over 579 retained runs to 2026-11-02 the largest were
-    // 34.7 CPU-seconds and 153.6 s of wall.
-    {
-        let (parent, job, description, command, timeout, cpu_timeout) = (
+    for (parent, job, description, command) in [
+        (
+            "cli",
+            "isolated_dbt_workdir",
+            "Verify sequential and concurrent physical DBT working directories, a bound DBT run in the adapter's own user namespace, and retain the existing blocked-input failure control. The exact selected tests require the pinned-root marker, prepared CLI executable, canonical INFO and IO-buffer comparison, and unchanged per-test CPU/wall policy. Retained files additionally inherit a 64 MiB per-file limit; a cap hit remains failure.",
+            concat!(
+                "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ",
+                "test \"${HERMIT_E2E_EMPTY_WORKDIR:-}\" = /test && ",
+                "prlimit --fsize=67108864:67108864 -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ",
+                "${CI:+--profile ci} -p hermit-run --features third-party-backends --test cli -j 1 ",
+                "-E 'test(=run_dbt_verifies_fresh_physical_workdirs) | test(=run_dbt_binds_in_a_user_namespace_of_its_own) | test(=run_dbt_strict_returns_with_blocked_stdin_source)' -- --include-ignored"
+            ),
+        ),
+        (
             "regular_crates",
             "isolated_detcore_workdir",
             "Execute the marked in-process testutils control through its existing prepared regular-crates selection. Require exactly one terminal test covering two generic Tool runs and two Detcore strict-log repetitions, with the original CPU/wall policy and a 64 MiB inherited per-file limit.",
             concat!(
                 "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ",
                 "test \"${HERMIT_E2E_EMPTY_WORKDIR:-}\" = /test && ",
-                "prlimit --fsize=67108864:67108864 -- ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ",
+                "prlimit --fsize=67108864:67108864 -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ",
                 "${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit-detcore-tests --exclude hermit-run --exclude hermetic_infra_hermit_flaky-tests ",
                 "-E 'package(=detcore-testutils) & test(=tests::isolated_workdir_reaches_the_in_process_guest_when_requested)'"
             ),
-            440,
-            55,
-        );
+        ),
+    ] {
         let parent = *STATIC_STEPS
             .iter()
             .find(|step| step.group == "test" && step.job == parent)
@@ -6848,8 +6015,6 @@ pub(super) fn config() -> DagConfig {
                 },
                 jobs_flag: Some(""),
                 jobs_env: Some("NEXTEST_TEST_THREADS"),
-                timeout,
-                cpu_timeout,
                 ..parent
             }
             .materialize(),
@@ -6973,7 +6138,7 @@ const TOOL_SELF_TEST_NODES: &[ToolSelfTestNode] = &[
         desc: "Validation driver self-test",
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness selftest validate_rs"########,
         description: r########"TOOL SELF-TEST NODE 2026-09-29: this self-test used to run inside gate.manifest, which every product node waits on; the local validation of Hermit 98a621f42935d585e1306262b11d64488dd51614 was killed there by the gate's 900-second CPU cap. It now runs as this leaf node through `test-harness selftest validate_rs`: a failure still makes the validation red, and no node depends on it. It keeps the gate's admitted two-core width (preferred_inner_jobs=2 carried through CARGO_BUILD_JOBS, no appended -j). Measurements below were taken 2026-09-29 between 20:39Z and 21:05Z on the measurement host recorded for gate.manifest in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts") at Hermit 98a621f4 plus this change, at load average 215-233, with the telemetry git wrapper first on PATH and the other self-tests running at the same time; they are the worst samples available, not typical ones. `scripts/validate.rs --self-test` passed in 295.67 s wall and 186.07 CPU seconds (11.26 user, 174.81 system, 70828 KiB largest process RSS) through test-harness. An earlier direct run that stopped at the submodule-fixture comparison, because the source tree had uncommitted edits, still consumed 207.54 CPU seconds in 239.53 s wall. Across 39 retained gate logs this audit's wall peaked at 155.2 s. The 600-second wall is 2.03 times the largest measured 295.67 s; the 600 CPU seconds are 2.89 times the largest measured 207.54. Memory keeps the gate's 5-GiB bound."########,
-        timeout: 900,
+        timeout: 600,
         cpu_timeout: 600,
         memory_bytes: 5368709120,
         rss_baseline_bytes: 5368709120,
@@ -6991,12 +6156,12 @@ const TOOL_SELF_TEST_NODES: &[ToolSelfTestNode] = &[
         inner_jobs: 2,
     },
     ToolSelfTestNode {
-        name: "core_build",
-        desc: "Core build wrapper end-to-end self-test",
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness selftest core_build"########,
-        description: r########"TOOL SELF-TEST NODE, CORE BUILD ENTRY: runs `ci/run-with-core-build-test.sh` through `test-harness selftest core_build`. It checks the actual local source pin, malformed/failed-pin refusal before the command, runner-admitted positive width and invalid-width refusal, the selected project working directory, child exit status, and optional Cargo timing diagnostics. It runs no SDK build or calibration. This remains a leaf after gate.manifest: a failure makes validation red, and no product node depends on it. It keeps preferred_inner_jobs=2 carried through CARGO_BUILD_JOBS, with no appended -j. EXISTING BOUNDS, HISTORICAL PREDECESSOR MEASUREMENT: the 2-GiB memory and two-worker limits are unchanged from selftest.dbt_budget, and the wall and CPU bounds take the 2026-11-02 step-limits recalibration of selftest.dbt_budget (step_limits.rs): a 600-second wall and 190 CPU-seconds. On 2026-09-29 between 20:39Z and 21:05Z, on the measurement host recorded for gate.manifest in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"), at Hermit 98a621f4 plus the original self-test-node split, load average 215-233, with the telemetry git wrapper first on PATH and other self-tests concurrent, `ci/run-with-reverie-dbt-budget-test.sh` took 13.89 s wall and 16.94 CPU seconds directly, and 18.78 s wall and 18.32 CPU seconds (180796 KiB largest process RSS) through test-harness; across 39 retained gate logs it peaked at 30.8 s wall. Those are measurements of the former DBT-wrapper control, not measurements of the current core-build control or a transfer of its SDK recipe calibration. Memory is 11 times its largest-process RSS. No limit is raised and no fresh measurement is claimed by the name/registry repair."########,
-        timeout: 600,
-        cpu_timeout: 190,
+        name: "dbt_budget",
+        desc: "DBT budget wrapper end-to-end self-test",
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness selftest dbt_budget"########,
+        description: r########"TOOL SELF-TEST NODE 2026-09-29: this self-test used to run inside gate.manifest, which every product node waits on; the local validation of Hermit 98a621f42935d585e1306262b11d64488dd51614 was killed there by the gate's 900-second CPU cap. It now runs as this leaf node through `test-harness selftest dbt_budget`: a failure still makes the validation red, and no node depends on it. It keeps the gate's admitted two-core width (preferred_inner_jobs=2 carried through CARGO_BUILD_JOBS, no appended -j). Measurements below were taken 2026-09-29 between 20:39Z and 21:05Z on the measurement host recorded for gate.manifest in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts") at Hermit 98a621f4 plus this change, at load average 215-233, with the telemetry git wrapper first on PATH and the other self-tests running at the same time; they are the worst samples available, not typical ones. `ci/run-with-reverie-dbt-budget-test.sh` took 13.89 s wall and 16.94 CPU seconds run directly, and 18.78 s wall and 18.32 CPU seconds (180796 KiB largest process RSS) through test-harness; across 39 retained gate logs it peaked at 30.8 s wall. The 120-second wall is 3.9 times the largest observed 30.8 s; the 60 CPU seconds are 3.3 times the largest measured 18.32; 2 GiB is 11 times the measured RSS."########,
+        timeout: 120,
+        cpu_timeout: 60,
         memory_bytes: 2147483648,
         rss_baseline_bytes: 2147483648,
         inner_jobs: 2,
@@ -7008,7 +6173,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"pre"########,
         job: r########"submodules"########,
         desc: r########"Verify repository submodules without initializing or repairing them"########,
-        description: r########"Checks that every gitlink HEAD records (third-party/rr, agent-utils and reverie, recursively) is declared in .gitmodules and agrees with its index entry. Ordinary entries must be their own populated repositories at exactly the recorded commit with clean worktrees. A nested entry with exactly one update=none declaration in .gitmodules instead requires an existing, completely empty directory, including no hidden files or .git. Missing directories, any content under nested update=none, ambiguous policies, failed policy or directory reads, and top-level or mutable local-config exemptions are refused. ci/verify-submodules.sh first self-tests these cases and its existing refusals (non-repository, wrong HEAD, dirty, conflicted, symlinked, undeclared, unsafe path) on scratch repositories, and never initializes, updates or registers a submodule. Every build and test reads these checkouts, so this keeps the validation on the sources the commit records. A reverie checkout left at an older commit is refused with "submodule HEAD differs from recorded gitlink"; a stray untracked file inside agent-utils is refused as a dirty worktree."########,
+        description: r########"Checks that every gitlink HEAD records (third-party/rr, agent-utils and reverie, recursively) is declared in .gitmodules, is its own populated repository at exactly the recorded commit, and has a clean worktree; ci/verify-submodules.sh first self-tests its refusals (missing, non-repository, wrong HEAD, dirty, conflicted, symlinked, undeclared, unsafe path) on scratch repositories, and never initializes, updates or registers a submodule. Every build and test reads these checkouts, so this keeps the validation on the sources the commit records. A reverie checkout left at an older commit is refused with "submodule HEAD differs from recorded gitlink"; a stray untracked file inside agent-utils is refused as a dirty worktree."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -7104,8 +6269,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
-        cpu_timeout: 2100,
+        timeout: 300,
+        cpu_timeout: 7200,
         jobs_flag: Some(""),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
@@ -7189,7 +6354,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"check"########,
         job: r########"skill_discovery"########,
         desc: r########"Verify Claude and stock Codex discover the same safe product skills"########,
-        description: r########"Makes Claude and stock Codex discover the same product skills from one copy. It compiles and runs scripts/check-skill-discovery.rs, which requires each skill to exist exactly once under .claude/skills and to resolve to that same file through .llms/skills and through one .agents/skills symlink per skill, allows an optional CLAUDE.md that is a regular file starting with @AGENTS.md (a symlink is refused), and requires each SKILL.md to open with frontmatter whose name equals its directory and a quoted description. The packaged set must equal the checker's list, and no parent-workspace coordinator role may appear among the product skills. A skill added without its .agents/skills link, a copied instead of linked SKILL.md, or a frontmatter name that differs from its directory breaks it."########,
+        description: r########"Makes Claude and stock Codex discover the same product skills from one copy. It compiles and runs scripts/check-skill-discovery.rs, which requires each skill to exist exactly once under .claude/skills and to resolve to that same file through .llms/skills and through one .agents/skills symlink per skill, requires CLAUDE.md to link to AGENTS.md, and requires each SKILL.md to open with frontmatter whose name equals its directory and a quoted description. The packaged set must equal the checker's list, and no parent-workspace coordinator role may appear among the product skills. A skill added without its .agents/skills link, a copied instead of linked SKILL.md, or a frontmatter name that differs from its directory breaks it."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -7213,8 +6378,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 240,
-        cpu_timeout: 30,
+        timeout: 60,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7246,8 +6411,41 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 240,
-        cpu_timeout: 30,
+        timeout: 60,
+        cpu_timeout: 7200,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"check"########,
+        job: r########"dbt_runtime_abi"########,
+        desc: r########"Hermit supplies every reverie_dbt_runtime_* callback the DBT client declares"########,
+        description: r########"The DBT client declares and calls every reverie_dbt_runtime_* callback unconditionally, but their upstream definitions sit behind reverie-dbt's prototype-runtime feature, which detcore-dbt disables by design so Hermit can supply Detcore's runtime instead. The two lists are joined by hand and nothing compared them: cargo cannot, because the client is C and the link happens when DynamoRIO loads it. MEASURED 2026-08-20: test.dbt_parity had been red nine days on one missing symbol, and advancing the Reverie pin took the gap from one to five while every build stayed green. This node compares the two dynamic symbol tables and names the missing callbacks, which DynamoRIO's own '<ERROR: using undefined symbol!>' never does. test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301 and its 28 cases became DBT verify cells of the c-programs and system-utils manifests, so e2e.manifest_c_programs, e2e.manifest_system_utils and privileged-e2e.manifest_c_programs depend on this node. THOSE DEPENDENCIES ARE AN ORDERING FIX, NOT A DATA DEPENDENCY: nothing this node produces is consumed; the check runs first so a missing callback is named before eager-exit can cancel it. The cost is that a failure here skips those nodes' cells on every backend for that run, which is already red with the cause named. The e2e _on_host twins do not depend on it: the hosted-portable workflow runs each of them as its own job through ci/run-node.sh, which omits dependencies outside the job's selection, while this node runs in the separate dbt-runtime-abi release-shard job, which an E2E failure cannot cancel; ci/check-shard-coverage.sh therefore refuses an E2E edge to a node that no earlier hosted job supplies. The privileged-only-e2e nodes do not depend on it because this node is not in the privileged or hosted-privileged profiles."########,
+        labels: &[
+            r########"full"########,
+            r########"hosted-portable"########,
+            r########"portable"########,
+        ],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./scripts/check-dbt-runtime-abi.rs"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[r########"build.e2e_artifact"########],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 3.0,
+            rss_baseline_bytes: Some(67108864),
+            hard_mem_max_bytes: Some(536870912),
+            classification: StepClass::Light,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 60,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7279,8 +6477,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
-        cpu_timeout: 190,
+        timeout: 120,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7312,8 +6510,41 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 240,
-        cpu_timeout: 30,
+        timeout: 120,
+        cpu_timeout: 7200,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"check"########,
+        job: r########"e9patch_corpus"########,
+        desc: r########"e9patch corpus driver contracts (typed build-info and engagement readers)"########,
+        description: r########"tests/e9patch/e9patch_corpus.py ratchets e9patch preprocessing parity against golden ptrace, but it needs e9tool and a Hermit built with the e9patch cargo feature, and CI has neither, so no validation lane runs its guests. This node runs tests/e9patch/test_e9patch_corpus.py, which checks the driver without running Hermit or compiling a guest: the build-info reader follows the boolean features.e9patch of a schema-1 `hermit version --json` record and refuses a record without it by field name; the engagement reader follows the producer's candidate, mapped and B0 site counts and refuses a record that lacks one; corpus commands use the caller's private host --tmp root rather than host /tmp; and `e9patch_corpus.py --check` finds exactly the corpus guest sources. The six reader checks ran in check.backend_parity_suites, inside tests/backend-parity/test_verify_tier_evidence.py, until the corpus moved out of tests/backend-parity in slice S13 of https://github.com/rrnewton/hermit/issues/3301. The --tmp check came from tests/backend-parity/test_parallel_validate_paths.py, which no node ran."########,
+        labels: &[
+            r########"full"########,
+            r########"hosted-portable"########,
+            r########"portable"########,
+        ],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 tests/e9patch/test_e9patch_corpus.py"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[r########"build.rust_scripts"########],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 2.0,
+            rss_baseline_bytes: Some(134217728),
+            hard_mem_max_bytes: Some(536870912),
+            classification: StepClass::Light,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 60,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7345,8 +6576,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 440,
-        cpu_timeout: 55,
+        timeout: 60,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7379,7 +6610,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 100,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7411,8 +6642,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 480,
-        cpu_timeout: 60,
+        timeout: 60,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7444,8 +6675,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
-        cpu_timeout: 210,
+        timeout: 120,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7477,8 +6708,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
-        cpu_timeout: 90,
+        timeout: 120,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7573,7 +6804,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 120,
+        cpu_timeout: 1200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7605,8 +6836,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 480,
-        cpu_timeout: 60,
+        timeout: 300,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7638,8 +6869,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 560,
-        cpu_timeout: 70,
+        timeout: 120,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7674,7 +6905,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 80,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7688,7 +6919,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_INSTALL_FORCE_RESTAGE="${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}" && HERMIT_CARGO_TIMINGS_DIR="${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}" ./ci/run-with-core-build.sh cargo build --locked --profile validate -p hermetic_infra_hermit_tests --bins && HERMIT_CARGO_TIMINGS_DIR="${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}" ./ci/run-with-core-build.sh cargo build --locked --profile validate --workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/liteinst && ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/clean-stale-reverie-dbt.sh validate && export HERMIT_INSTALL_FORCE_RESTAGE="${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}" && HERMIT_CARGO_TIMINGS_DIR="${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}" ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate -p hermetic_infra_hermit_tests --bins && HERMIT_CARGO_TIMINGS_DIR="${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}" ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate --workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/third-party-backends && ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -7710,7 +6941,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: WORKSPACE_WALL_SECONDS,
-        cpu_timeout: 11100,
+        cpu_timeout: 7200,
         jobs_flag: Some(r########""########),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
@@ -7718,7 +6949,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"build"########,
         job: r########"liteinst_runtime"########,
         desc: r########"Build the ordinary in-guest Detcore runtime in the liteinst-runtime profile ahead of its packaging finalizer"########,
-        description: r########"PREBUILD 2026-10-18 (the LiteInst packaging prebuild contract). Runs exactly the Cargo command the packaged-LiteInst finalizer (hermit-install/src/bin/stage-detcore-liteinst.rs) runs, `cargo build --locked --offline --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target`, so that its pinned-root twin compiles the ordinary runtime beside build.workspace_compile_in_pinned_root instead of after it. The finalizer is unchanged: it still runs after every producer, invokes the same command (which Cargo then answers from these artifacts, and the receipt records cargo_artifact.fresh), selects Cargo's reported artifact, and performs every qualification, identity, source-close and receipt step. Only build.workspace_in_pinned_root, which runs the finalizer, depends on the twin. The allocator fixtures keep their own dedicated target (build.liteinst_allocator_fixtures). WHY: the cold liteinst-runtime build is the finalizer's cost. At main 359ab376, eight CPUs (CPUQuota 800%, CARGO_BUILD_JOBS=8), the finalizer took 107 s and 456 CPU-s with target/liteinst-runtime absent (cargo build 97 s), 81 s and 195 CPU-s with only the path crates stale (cargo build 71 s; a warm seed leaves them so), and 9.8 s and 5.7 CPU-s when the runtime was already built; all three qualified the same bytes. In the full validations of 4dc66c9c and 359ab376 the finalizer lengthened build.workspace_in_pinned_root from 38-40 s to 135-153 s on the critical path. LOCKS: Cargo locks each profile directory (target/validate/.cargo-lock, target/liteinst-runtime/.cargo-lock); a validate-profile build and this command started together in one target directory logged no `Blocking waiting for file lock` line. MEMORY: cold peak 2.65 GiB (cgroup memory.peak) at eight jobs, so rss_baseline 3 GiB and the hard cap 5 GiB. The build is a chain of path crates (detcore-model, detcore, detcore-liteinst with ThinLTO), 2.7 cores busy on average when only they rebuild, so eight jobs are enough."########,
+        description: r########"PREBUILD 2026-10-18 (liteinst contract, temp/liteinst-status.md "Packaging prebuild contract", 1:51 AM ET). Runs exactly the Cargo command the packaged-LiteInst finalizer (hermit-install/src/bin/stage-detcore-liteinst.rs) runs, `cargo build --locked --offline --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target`, so that its pinned-root twin compiles the ordinary runtime beside build.workspace_compile_in_pinned_root instead of after it. The finalizer is unchanged: it still runs after every producer, invokes the same command (which Cargo then answers from these artifacts, and the receipt records cargo_artifact.fresh), selects Cargo's reported artifact, and performs every qualification, identity, source-close and receipt step. Only build.workspace_in_pinned_root, which runs the finalizer, depends on the twin. The allocator fixtures keep their own dedicated target (build.liteinst_allocator_fixtures). WHY: the cold liteinst-runtime build is the finalizer's cost. At main 359ab376, eight CPUs (CPUQuota 800%, CARGO_BUILD_JOBS=8), the finalizer took 107 s and 456 CPU-s with target/liteinst-runtime absent (cargo build 97 s), 81 s and 195 CPU-s with only the path crates stale (cargo build 71 s; a warm seed leaves them so), and 9.8 s and 5.7 CPU-s when the runtime was already built; all three qualified the same bytes. In the full validations of 4dc66c9c and 359ab376 the finalizer lengthened build.workspace_in_pinned_root from 38-40 s to 135-153 s on the critical path. LOCKS: Cargo locks each profile directory (target/validate/.cargo-lock, target/liteinst-runtime/.cargo-lock); a validate-profile build and this command started together in one target directory logged no `Blocking waiting for file lock` line. MEMORY: cold peak 2.65 GiB (cgroup memory.peak) at eight jobs, so rss_baseline 3 GiB and the hard cap 5 GiB. The build is a chain of path crates (detcore-model, detcore, detcore-liteinst with ThinLTO), 2.7 cores busy on average when only they rebuild, so eight jobs are enough."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"cargo build --locked --offline --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target"########,
         cmdtype: CmdType::Unknown,
@@ -7786,7 +7017,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; case "${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}" in cargo) ./ci/nextest-binaries.rs assert full && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;; buck) ./scripts/build-buck-release.rs --validate-dag-install && hermit_payload=target/ci/hermit-strict ;; *) echo "unknown Hermit release build mode: ${HERMIT_VALIDATE_RELEASE_BUILD_MODE}" >&2; exit 2 ;; esac && mkdir -p target/ci && install -m 755 "$hermit_payload" target/ci/hermit && ./ci/publish-hermit-e2e-artifact.sh target/ci/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path --core-complete target/install_pkg"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; case "${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}" in cargo) ./ci/nextest-binaries.rs assert full && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;; buck) ./scripts/build-buck-release.rs --validate-dag-install && hermit_payload=target/ci/hermit-strict ;; *) echo "unknown Hermit release build mode: ${HERMIT_VALIDATE_RELEASE_BUILD_MODE}" >&2; exit 2 ;; esac && mkdir -p target/ci && install -m 755 "$hermit_payload" target/ci/hermit && sabre_source=target/install_pkg/rsrcs/libdetcore_sabre.so && sabre_before=$(sha256sum "$sabre_source" | cut -d' ' -f1) && install -m 755 "$sabre_source" target/ci/libdetcore_sabre.so && sabre_after=$(sha256sum "$sabre_source" | cut -d' ' -f1) && sabre_copy=$(sha256sum target/ci/libdetcore_sabre.so | cut -d' ' -f1) && test "$sabre_before" = "$sabre_after" && test "$sabre_before" = "$sabre_copy" && sha256sum target/ci/hermit target/ci/libdetcore_sabre.so target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision && ./ci/publish-hermit-e2e-artifact.sh target/ci/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -7807,8 +7038,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 520,
-        cpu_timeout: 65,
+        timeout: 120,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7816,7 +7047,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"build"########,
         job: r########"host_hermit_link"########,
         desc: r########"Link the host target/ci/hermit and artifact pointer to the one Hermit the pinned root published"########,
-        description: r########"The focused compatibility run types (portablecompat, sabrecompat, supercompat, rrcompat) exercise programs installed on the host, which the pinned image does not carry, so they and their fixtures run on the host. (The full-profile bucket e2e.manifest_compat ran here too until 2026-10-30; the pinned image now carries every program its rows name, so it runs in the pinned root and no longer needs this link.) They run the one validate-profile Hermit that build.e2e_artifact_in_pinned_root published, not a second, host-built copy. This node points the host's target/ci/hermit at those exact bytes (ignored/hermetic/split/target is the pinned root's /src/target) and proves the binary runs here. It does because the binary's loader and libraries are the host nix store paths that ci/hermetic/build-image.sh built the image from; if nix garbage collection has removed them, the node fails and names the missing store paths. It also writes the host artifact pointer target/ci/hermit-e2e-artifact.path, naming the same content-addressed bundle by its host path, and verifies it with ci/verify-hermit-e2e-artifact.sh, so the corpus bucket reaches the binary and its resources through the same verified wrapper as every other manifest bucket."########,
+        description: r########"The strict compatibility corpus (e2e.manifest_compat) exercises programs installed on the host, which the pinned image does not carry, so it and its fixtures run on the host. It runs the one validate-profile Hermit that build.e2e_artifact_in_pinned_root published, not a second, host-built copy. This node points the host's target/ci/hermit at those exact bytes (ignored/hermetic/split/target is the pinned root's /src/target) and proves the binary runs here. It does because the binary's loader and libraries are the host nix store paths that ci/hermetic/build-image.sh built the image from; if nix garbage collection has removed them, the node fails and names the missing store paths. It also writes the host artifact pointer target/ci/hermit-e2e-artifact.path, naming the same content-addressed bundle by its host path, and verifies it with ci/verify-hermit-e2e-artifact.sh, so the corpus bucket reaches the binary and its resources through the same verified wrapper as every other manifest bucket."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; hermit=ignored/hermetic/split/target/ci/hermit && test -f "$hermit" && test -x "$hermit" && mkdir -p target/ci && ln -sfnT "../../$hermit" target/ci/hermit && if ! target/ci/hermit --version; then echo "build.host_hermit_link: $hermit does not run on this host. Its loader and libraries are the host nix store paths the pinned image was built from: $(readelf -l "$hermit" | grep -o '/nix/store/[^]]*'). Rebuild the image with ci/hermetic/build-image.sh to restore that closure." >&2; exit 1; fi && pointer=ignored/hermetic/split/target/ci/hermit-e2e-artifact.path && bundle=$(cat "$pointer") && case "$bundle" in /src/target/*) ;; *) echo "build.host_hermit_link: $pointer names $bundle, which is not under the pinned root's /src/target" >&2; exit 1;; esac && printf '%s\n' "$PWD/ignored/hermetic/split/target/${bundle#/src/target/}" > target/ci/hermit-e2e-artifact.path && ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null"########,
         cmdtype: CmdType::Unknown,
@@ -7916,7 +7147,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 450,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7948,8 +7179,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
-        cpu_timeout: 210,
+        timeout: 300,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -7995,7 +7226,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 80,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -8040,7 +7271,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 1080,
+        timeout: 900,
         cpu_timeout: 7200,
         jobs_flag: Some(r########"--jobs"########),
         jobs_env: None,
@@ -8066,7 +7297,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.manifest_guests_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
-            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"setup.pinned_root_fetch"########,
         ],
@@ -8087,15 +7317,15 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 90,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
     StaticStepSpec {
         group: r########"e2e"########,
         job: r########"manifest_compat"########,
-        desc: r########"Portable manifest bucket: compat, the strict compatibility corpus in the pinned root"########,
-        description: r########"The portable strict compatibility corpus (tests/e2e/manifests/compat.yaml): 189 programs installed on the validation host, each one verify cell on ptrace under the corpus's portable flags (--no-virtualize-cpuid, --max-timeslice=disabled, TMPDIR=/tmp, an empty tmpfs /test workdir) and Hermit's strict --verify comparison (--verify-strict: bitwise INFO logs and I/O buffers), so each passing cell is an L2 reference whose log the parity post-pass compares every candidate backend against. 63 rows also have a verify cell on each in-guest LiteInst backend, liteinst and in-guest-trap (the corpus's `additional` entries: 126 cells, six of them on the sabre-compat-only rows df-direct, lua-direct and perl-direct, whose ptrace cells this node does not run), each under --max-timeslice=disabled, which in-guest LiteInst requires, and the global default budget; they need CPUID faulting and the in-guest Detcore runtime the e2e artifact ships, and passed 10 of 10 verify runs each in a local survey on 2026-10-08 (20 of the 63 are rows that passed 10 of 10 in the second survey at the heap-fix tree, with the compat fixtures prepared). Until 2026-10-07 the corpus used the stripped --verify comparison, below L2; measured at Hermit 0d25b6f7, all 189 cells passed --verify-strict in 4 of 4 full runs. Until 2026-10-30 it ran on the host, not in the pinned root, because 25 of the programs were not in the pinned image; the image now carries every program the rows name, so it runs in the pinned root like the other e2e buckets, against the pinned root's validate-profile binary directly. compatprep.fixtures prepares the files the rows read under $VALIDATE_RUN_STATE/strict-compat. Every row is an ordinary cell whose failure fails the node; the five former diagnostic rows (df, ranlib, top, zstd, zstd-roundtrip) passed strict 4 of 4 at Hermit 0d25b6f7. Until 2026-10-01 these programs were 189 separate compat.<program> nodes; in the validation of Hermit 76980bac they took 92.8 s of wall and 60.3 CPU seconds in total, the slowest 3.0 s."########,
+        desc: r########"Portable manifest bucket: compat, the strict compatibility corpus on the host"########,
+        description: r########"The portable strict compatibility corpus (tests/e2e/manifests/compat.yaml): 189 programs installed on the validation host, each one verify cell on ptrace under the corpus's portable flags (--no-virtualize-cpuid, --max-timeslice=disabled, TMPDIR=/tmp, an empty tmpfs /test workdir) and Hermit's strict --verify comparison (--verify-strict: bitwise INFO logs and I/O buffers), so each passing cell is an L2 reference whose log the parity post-pass compares every candidate backend against. 63 rows also have a verify cell on each in-guest LiteInst backend, liteinst and in-guest-trap (the corpus's `additional` entries: 126 cells, six of them on the sabre-compat-only rows df-direct, lua-direct and perl-direct, whose ptrace cells this node does not run), each under --max-timeslice=disabled, which in-guest LiteInst requires, and the global default budget; they need CPUID faulting and the in-guest Detcore runtime the e2e artifact ships, and passed 10 of 10 verify runs each in a local survey on 2026-10-08 (20 of the 63 are rows that passed 10 of 10 in the second survey at the heap-fix tree, with the compat fixtures prepared). Until 2026-10-07 the corpus used the stripped --verify comparison, below L2; measured at Hermit 0d25b6f7, all 189 cells passed --verify-strict in 4 of 4 full runs. It runs on the host, not in the pinned root, because 31 of the programs are not in the pinned image; the Hermit is the pinned root's validate-profile binary, verified through the host artifact pointer build.host_hermit_link publishes. compatprep.fixtures prepares the files the rows read under $VALIDATE_RUN_STATE/strict-compat. Every row is an ordinary cell whose failure fails the node; the five former diagnostic rows (df, ranlib, top, zstd, zstd-roundtrip) passed strict 4 of 4 at Hermit 0d25b6f7. Until 2026-10-01 these programs were 189 separate compat.<program> nodes; in the validation of Hermit 76980bac they took 92.8 s of wall and 60.3 CPU seconds in total, the slowest 3.0 s."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
         cmdtype: CmdType::Unknown,
@@ -8109,8 +7339,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         }),
         integration_test_binaries: None,
         deps: &[
+            r########"build.host_hermit_link"########,
             r########"build.rust_scripts"########,
-            r########"check.dbt_runtime_abi"########,
             r########"compatprep.fixtures"########,
             r########"gate.manifest"########,
         ],
@@ -8131,7 +7361,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 3000,
+        cpu_timeout: 1800,
         jobs_flag: Some(r########"--jobs"########),
         jobs_env: None,
     },
@@ -8139,7 +7369,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"portablecompat"########,
         job: r########"manifest_compat"########,
         desc: r########"The strict compatibility corpus against this lane's release Hermit"########,
-        description: r########"The portable-strict-compat-only run type: the same compat.yaml bucket and selector as e2e.manifest_compat, run on the host against the release Hermit that compatprep.hermit_release_in_pinned_root builds, which the pinned root writes under ignored/hermetic/split/target (HERMIT_BIN=ignored/hermetic/split/target/release/hermit, resolved under the checkout; the harness probes the binary before any cell, so one that cannot run on the host fails every cell rather than passing) and the fixtures portablecompatprep.fixtures writes under $VALIDATE_RUN_STATE/strict-compat, so a corpus-only check needs one release build instead of the full profile's workspace build and test barrier. Each row is one ptrace verify cell under the corpus's portable flags and strict comparison (--verify-strict). The node omits the corpus's liteinst and in-guest-trap cells with --exclude-backend: its release build (cargo build --release -p hermit-run --features liteinst) does not build the in-guest Detcore runtime those backends load (libdetcore_liteinst.so, from the separate detcore-liteinst package), so every such cell would end backend-unavailable; e2e.manifest_compat runs them in the full and portable profiles, whose e2e artifact ships the runtime. A program that diverges or fails under the release Hermit turns it red; until 2026-10-01 these rows were 189 separate portablecompat.<program> nodes."########,
+        description: r########"The portable-strict-compat-only run type: the same compat.yaml bucket and selector as e2e.manifest_compat, run on the host against the release Hermit that compatprep.hermit_release_in_pinned_root builds, which the pinned root writes under ignored/hermetic/split/target (HERMIT_BIN=ignored/hermetic/split/target/release/hermit, resolved under the checkout; the harness probes the binary before any cell, so one that cannot run on the host fails every cell rather than passing) and the fixtures portablecompatprep.fixtures writes under $VALIDATE_RUN_STATE/strict-compat, so a corpus-only check needs one release build instead of the full profile's workspace build and test barrier. Each row is one ptrace verify cell under the corpus's portable flags and strict comparison (--verify-strict). The node omits the corpus's liteinst and in-guest-trap cells with --exclude-backend: its release build (cargo build --release -p hermit-run --features third-party-backends) does not build the in-guest Detcore runtime those backends load (libdetcore_liteinst.so, from the separate detcore-liteinst package), so every such cell would end backend-unavailable; e2e.manifest_compat runs them in the full and portable profiles, whose e2e artifact ships the runtime. A program that diverges or fails under the release Hermit turns it red; until 2026-10-01 these rows were 189 separate portablecompat.<program> nodes."########,
         labels: &[r########"portable-strict-compat-only"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness run --lane portable --category compat --ci-only --prebuilt --diagnostic-results --exclude-backend liteinst --exclude-backend in-guest-trap --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
         cmdtype: CmdType::Unknown,
@@ -8283,6 +7513,52 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         jobs_env: None,
     },
     StaticStepSpec {
+        group: r########"sabrecompat"########,
+        job: r########"manifest_compat"########,
+        desc: r########"The compatibility corpus on SaBRe"########,
+        description: r########"The sabre-compat-only run type: `test-harness run --label sabre-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are each corpus row's SaBRe verify cell (the `focused` section: every row but lsof, netlink-route, netlink-sock-diag and shell-build) and both cells of the 30 rows only this run type has (23 programs the SaBRe corpus had and the strict corpus lacks; lua-direct, perl-direct and df-direct, which keep that corpus's single-image argv for programs whose strict rows run under a bash wrapper; and rustc, javac, java and node, whose ptrace cells get 600 seconds). It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, whose install tree carries the SaBRe loader and libdetcore_sabre.so, against the fixtures sabrecompatprep.fixtures writes; each cell runs Hermit's strict --verify (--verify-strict) once and must also pass the harness's SaBRe execution-path contract (an RPC from the in-guest tool, zero ptrace-fallback and zero trusted shared-object system-call sites). A cell measured red stays enabled with `ci: false` and its failure class's issue (https://github.com/rrnewton/hermit/issues/3486 and the issues it names), so `--ci-only` selects only the cells that pass. The guest's own dynamic loader loads libdetcore_sabre.so against the guest's libc, so the artifact's publication and verification refuse a plugin that records a library search path, needs a library outside glibc, or requires a glibc symbol version newer than 2.34 (https://github.com/rrnewton/hermit/issues/3652). A program that diverges, crashes or leaves SaBRe's measured path turns it red. Until 2026-10-01 these rows were 212 separate sabrecompat.<program> nodes that checked only Hermit's exit status, so a program whose children ran outside SaBRe passed, and on a fresh checkout their release Hermit had no SaBRe loader at all. The node's 2120-second wall bound is the 1820 seconds `scripts/validate.rs --self-test` requires of it as outer headroom, plus 300 seconds for the rest of the bucket, so a hung heavy cell is reported as that cell's timeout rather than ending the node. The self-test models every manifest cell as two attempts with 10 seconds of termination grace each, and its representative 1.5x wall multiplier turns the largest selected cells (rustc and node on ptrace, 600 seconds each) into 900-second windows: 2 x (900 + 10). The two attempts are that conservative model only; compat cells carry the manifest's no_retry_reason, so the harness never retries them."########,
+        labels: &[r########"sabre-compat-only"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --label sabre-compat-only --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
+        cmdtype: CmdType::Unknown,
+        manifest: Some(ManifestSpec {
+            lane: r########"portable"########,
+            category: r########"compat"########,
+            test: None,
+            mode: None,
+            backend: None,
+            label: Some(r########"sabre-compat-only"########),
+        }),
+        integration_test_binaries: None,
+        deps: &[
+            r########"build.host_hermit_link"########,
+            r########"build.rust_scripts"########,
+            r########"gate.manifest"########,
+            r########"pre.reverie_pin"########,
+            r########"sabrecompatprep.fixtures"########,
+            r########"setup.manifest_plan"########,
+        ],
+        env: &[(
+            r########"HERMIT_E2E_EMPTY_WORKDIR"########,
+            r########"/test"########,
+        )],
+        hint: HintSpec {
+            resources: &[(r########"manifest_guest"########, 8)],
+            est_duration_s: 120.0,
+            rss_baseline_bytes: Some(4294967296),
+            hard_mem_max_bytes: Some(6442450944),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: Some(8),
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 2120,
+        cpu_timeout: 1800,
+        jobs_flag: Some(r########"--jobs"########),
+        jobs_env: None,
+    },
+    StaticStepSpec {
         group: r########"e2e"########,
         job: r########"manifest_data_handling"########,
         desc: r########"Portable manifest bucket: data-handling"########,
@@ -8303,7 +7579,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.manifest_guests_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
-            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"setup.pinned_root_fetch"########,
         ],
@@ -8324,7 +7599,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 540,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -8370,7 +7645,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 80,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -8421,7 +7696,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 250,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -8446,7 +7721,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.manifest_guests_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
-            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"setup.pinned_root_fetch"########,
         ],
@@ -8472,7 +7746,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 420,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -8517,8 +7791,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 780,
-        cpu_timeout: 780,
+        timeout: 600,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -8564,7 +7838,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 80,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -8614,8 +7888,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 960,
-        cpu_timeout: 720,
+        timeout: 600,
+        cpu_timeout: 7200,
         jobs_flag: Some(r########""########),
         jobs_env: None,
     },
@@ -8661,7 +7935,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 80,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -8693,8 +7967,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 400,
-        cpu_timeout: 50,
+        timeout: 300,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -8702,13 +7976,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"lint"########,
         job: r########"clippy"########,
         desc: r########"Clippy (cargo clippy --workspace --all-targets --all-features -D warnings)"########,
-        description: r########"FEATURE SCOPE 2026-08-25 (task workspace-clippy-gate-never-sees-the-dbt-feature): --all-features added. Without it this gate ran hermit-cli's default feature set, so the DBT, SaBRe, e9patch and liteinst paths were never linted. --all-features deliberately picks up future features without another manual widening. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 279248896 bytes after the feature widening; the larger width-8 historical calibration of 4.0 GiB governs. The 4-GiB baseline preserves that floor and the 6-GiB hard cap adds 2 GiB of headroom. CPU WIDTH is set by CARGO_BUILD_JOBS and preferred_inner_jobs (16 since 2026-10-17, below); jobs_flag stays empty because appending '-j 8' would reach rustc. See ai_docs/dag-memory-caps-recalibration-20260825.md. PROFILE 2026-09-30: this node stays in Cargo's dev profile and must not take --profile validate. Measured in the pinned root on the one-build target, `cargo clippy --profile validate --workspace --all-targets --all-features` reran hermit-install's build script (its release-derived PROFILE and the widened --all-features feature set make a new build-script unit), which deletes and recreates target/install_pkg while test nodes read it; the dev-profile check leaves it untouched (build script exits for PROFILE=debug) and cost 45 s wall, 379 CPU-s at CARGO_BUILD_JOBS=8. OWN TARGET DIRECTORY 2026-10-15: clippy builds in $CARGO_TARGET_DIR/clippy (in the pinned root, /src/target/clippy). In the shared target/debug it held, and waited on, the build-directory lock that doc.rustdoc and doc.doctests use: on dfce652d all three started at +398 s and ran one after another (rustdoc +398-451, doctests to +531, clippy to +574), each log saying "Blocking waiting for file lock on build directory". clippy itself took 73.7 s cold at 8 jobs when measured alone. Its check-mode units are not shared with the doctests' full builds, and the warm target seeds output directories two levels below the target, so its seed follows it. WIDTH 16 2026-10-17: after a Reverie pin bump this node checks nearly the whole workspace again (884 and 890 CPU-s at 183 s and 207 s of wall in the full validations of b7d160bf and 033b1d55, against 266 CPU-s and 113 s at 62374347), and with the pin-bump workspace compile it ended those validations' step graphs (+503 s and +538 s). Cold `cargo clippy --workspace --all-targets --all-features` on the measurement host named for this node in docs/TESTING_ENVIRONMENTS.md, each in a transient cgroup with CPUQuota at the job count, at load average 288-419: CARGO_BUILD_JOBS=8 took 197, 241 and 243 s (1,014-1,296 CPU-s); 16 took 152, 158, 162, 168 and 180 s (1,022-1,189 CPU-s), the same CPU in less wall. Under a 6-GiB MemoryMax the largest anonymous memory was 3.0 GiB at 8 and 3.8 GiB at 16 (memory.peak, which counts page cache, reached the cap; no memory.max events), so rss_baseline rises from 4 to 5 GiB and the hard cap from 6 to 7 GiB, keeping its 2 GiB of headroom. A partially stale target (only the Reverie units, 30 of 272) checked in 54-58 s at either width. MEMORY 2026-10-18: in the full validation of 4dc66c9c this node peaked at exactly the 7-GiB cap (memory.peak 7516192768) with memory.events max 1694: it was held at the cap and passed by reclaim, which validate reports as a near-miss because whether such a node passes or is OOM-killed depends on reclaim timing. The workspace had grown since the 6.4-6.6 GiB cold memory.peak measured at 16 jobs on 2026-10-17, so rss_baseline rises from 5 to 7 GiB and the hard cap from 7 to 9 GiB (1.36 times the larger measured peak, above the held 7.0); the job count is unchanged."########,
+        description: r########"FEATURE SCOPE 2026-08-25 (task workspace-clippy-gate-never-sees-the-dbt-feature): --all-features added. Without it this gate ran hermit-cli's default feature set, so the DBT, SaBRe, e9patch and third-party-backends paths were never linted. --all-features deliberately picks up future features without another manual widening. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 279248896 bytes after the feature widening; the larger width-8 historical calibration of 4.0 GiB governs. The 4-GiB baseline preserves that floor and the 6-GiB hard cap adds 2 GiB of headroom. CPU WIDTH is set by CARGO_BUILD_JOBS and preferred_inner_jobs (16 since 2026-10-17, below); jobs_flag stays empty because appending '-j 8' would reach rustc. See ai_docs/dag-memory-caps-recalibration-20260825.md. PROFILE 2026-09-30: this node stays in Cargo's dev profile and must not take --profile validate. Measured in the pinned root on the one-build target, `cargo clippy --profile validate --workspace --all-targets --all-features` reran hermit-install's build script (its release-derived PROFILE and the widened --all-features feature set make a new build-script unit), which deletes and recreates target/install_pkg while test nodes read it; the dev-profile check leaves it untouched (build script exits for PROFILE=debug) and cost 45 s wall, 379 CPU-s at CARGO_BUILD_JOBS=8. OWN TARGET DIRECTORY 2026-10-15: clippy builds in $CARGO_TARGET_DIR/clippy (in the pinned root, /src/target/clippy). In the shared target/debug it held, and waited on, the build-directory lock that doc.rustdoc and doc.doctests use: on dfce652d all three started at +398 s and ran one after another (rustdoc +398-451, doctests to +531, clippy to +574), each log saying "Blocking waiting for file lock on build directory". clippy itself took 73.7 s cold at 8 jobs when measured alone. Its check-mode units are not shared with the doctests' full builds, and the warm target seeds output directories two levels below the target, so its seed follows it. WIDTH 16 2026-10-17: after a Reverie pin bump this node checks nearly the whole workspace again (884 and 890 CPU-s at 183 s and 207 s of wall in the full validations of b7d160bf and 033b1d55, against 266 CPU-s and 113 s at 62374347), and with the pin-bump workspace compile it ended those validations' step graphs (+503 s and +538 s). Cold `cargo clippy --workspace --all-targets --all-features` on the measurement host named for this node in docs/TESTING_ENVIRONMENTS.md, each in a transient cgroup with CPUQuota at the job count, at load average 288-419: CARGO_BUILD_JOBS=8 took 197, 241 and 243 s (1,014-1,296 CPU-s); 16 took 152, 158, 162, 168 and 180 s (1,022-1,189 CPU-s), the same CPU in less wall. Under a 6-GiB MemoryMax the largest anonymous memory was 3.0 GiB at 8 and 3.8 GiB at 16 (memory.peak, which counts page cache, reached the cap; no memory.max events), so rss_baseline rises from 4 to 5 GiB and the hard cap from 6 to 7 GiB, keeping its 2 GiB of headroom. A partially stale target (only the Reverie units, 30 of 272) checked in 54-58 s at either width. MEMORY 2026-10-18: in the full validation of 4dc66c9c this node peaked at exactly the 7-GiB cap (memory.peak 7516192768) with memory.events max 1694: it was held at the cap and passed by reclaim, which validate reports as a near-miss because whether such a node passes or is OOM-killed depends on reclaim timing. The workspace had grown since the 6.4-6.6 GiB cold memory.peak measured at 16 jobs on 2026-10-17, so rss_baseline rises from 5 to 7 GiB and the hard cap from 7 to 9 GiB (1.36 times the larger measured peak, above the held 7.0); the job count is unchanged."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}/clippy"; ./ci/run-with-core-build.sh cargo clippy --workspace --all-targets --all-features -- -D warnings"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}/clippy"; ./ci/run-with-reverie-dbt-budget.sh cargo clippy --workspace --all-targets --all-features -- -D warnings"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -8734,14 +8008,14 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     StaticStepSpec {
         group: r########"doc"########,
         job: r########"doctests"########,
-        desc: r########"Test workspace documentation (cargo test --workspace --features liteinst --doc)"########,
+        desc: r########"Test workspace documentation (cargo test --workspace --features third-party-backends --doc)"########,
         description: r########"MEM-CAP DERIVATION 2026-08-04 (task memory-caps-must-scale-with-job-count): pinned_jobs=8 via the scheduler-controlled CARGO_BUILD_JOBS channel (was unset -> cargo defaulted the build phase to nproc). rss_baseline=measured_peak@j8=208MiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm/production-representative (depends on build.workspace); hermit@0f891e43. headroom=+1.5GiB additive -> hard_mem_max_bytes=2.0GiB (was 5GiB). Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv. CPU-WIDTH DERIVATION 2026-08-10 (task p0_dynamorio_build_cache): preferred_inner_jobs=8 is delivered through the CARGO_BUILD_JOBS jobs_env channel. See doc.rustdoc for the shared derivation; jobs_flag is empty so the declaration sizes the cgroup box only and never edits argv. PROFILE 2026-09-30: stays in Cargo's dev profile, like lint.clippy and doc.rustdoc. In the first one-build validation that ran it with --profile validate, the doctest build after the nextest preparation was not fresh: it recompiled reverie-dbt, hermit-install (whose build script restages target/install_pkg), detcore-dbt and hermit in target/validate while prepared test nodes ran, and six of them refused with 'prepared executable, package identity, or runtime file changed'. In the dev profile hermit-install's build script exits immediately and nothing under target/validate is written. MEM-CAP RE-DERIVATION 2026-09-30: the 2-GiB cap above was derived on a WARM host target that a debug workspace build had filled. In the pinned root no node builds dev-profile libraries first (clippy and rustdoc produce metadata only), so this node compiles the workspace libraries cold; with the 2-GiB cap it was OOM-killed after 23 s (4 oom_kill events) in the validation of hermit 63a043595. The cold dev-profile clippy at the same CARGO_BUILD_JOBS=8 completes under its 6-GiB cap, so rss_baseline is 4 GiB and hard_mem_max_bytes 8 GiB until a cold cgroup-recorded peak is measured. OWN TARGET DIRECTORY 2026-10-15: CARGO_TARGET_DIR is target/doctests, as lint.clippy's is target/clippy (9f9eda1c). In the shared target/debug the doctests waited on doc.rustdoc's build-directory lock: in 9fa4cb9a's full validation both started at +412, rustdoc held the lock until +587, and the doctests then compiled until +661 ("Blocking waiting for file lock on build directory"; 248.9 s of wall for 227.6 CPU-seconds). rustdoc's --no-deps documentation checks the dependencies but does not produce the codegen libraries the doctests link, so sharing the directory saved little compile work."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}/doctests"; ./ci/run-with-core-build.sh cargo test --workspace --features liteinst --doc"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}/doctests"; ./ci/run-with-reverie-dbt-budget.sh cargo test --workspace --features third-party-backends --doc"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -8774,7 +8048,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; RUSTDOCFLAGS='-D warnings' ./ci/run-with-core-build.sh cargo doc --workspace --no-deps --all-features"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; RUSTDOCFLAGS='-D warnings' ./ci/run-with-reverie-dbt-budget.sh cargo doc --workspace --no-deps --all-features"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -8792,7 +8066,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 1380,
+        timeout: 900,
         cpu_timeout: 7200,
         jobs_flag: Some(r########""########),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
@@ -8807,7 +8081,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit-detcore-tests --exclude hermit-run --exclude hermetic_infra_hermit_flaky-tests"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit-detcore-tests --exclude hermit-run --exclude hermetic_infra_hermit_flaky-tests"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -8843,7 +8117,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst,kvm-native-test-support --lib --bins -j 1 -- --skip ptrace_completion::tests::real_random_ --skip kvm_execution_tests::"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends,kvm-native-test-support --lib --bins -j 1 -- --skip ptrace_completion::tests::real_random_ --skip kvm_execution_tests::"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -8940,8 +8214,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 1140,
-        cpu_timeout: 720,
+        timeout: 720,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -8979,7 +8253,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 720,
-        cpu_timeout: 90,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -8987,13 +8261,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"detcore_time"########,
         desc: r########"Detcore time integration cases that need no PMU (tests_time, serial execution)"########,
-        description: r########"Runs, selected by exact name, the three tests_time cases that construct a Config with max_timeslice disabled: proc_stat_btime_is_fixed_for_a_fractional_epoch, target_timeslice_yields_at_syscall_boundaries_without_pmu and a_capped_preemption_charge_bounds_the_time_short_slices_add. The other 36 cases enable max_timeslice and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 28 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000, and rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice sets 2000000, and a_futex_wake_hands_a_contended_mutex_to_the_waiter and a_futex_wake_handoff_is_deterministic set 5000000. Without a PMU each of the 36 fails with Perf support required; the hosted runner has none, and the hosted twin failed exactly those 29 of 31 there (https://github.com/rrnewton/hermit/actions/runs/37143469197, https://github.com/rrnewton/hermit/issues/3663). They run in privileged-test.pmu_detcore_time_cases, whose filter is the exact complement of this one, so the full label still runs all 39 cases once each; a case added to tests_time later is selected by that PMU node, whose expected count then fails until the new case is placed deliberately. MEASURED 2026-10-03 at hermit c3f7b2bcfa00 on the measurement host recorded for test.detcore_time in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"): five runs of this selection with cargo nextest run -p hermit-detcore-tests --test tests_time -j 1 and this filter, invoked directly rather than through run-nextest-counted.sh, each ran 2 tests with 29 filtered out, in 1.09-1.20 s of wall time (0.56-0.72 s of nextest time), the largest process peaking at 96-106 MB RSS. The hint keeps the whole-target budget measured 2026-09-29 at hermit 905903e0a7ed, which bounds this subset from above: five serial runs of all 28 then-existing cases, each in its own systemd-run --user --scope unit, peaked at 111661056-115081216 bytes of cgroup memory.peak and took 5.32-6.12 s of wall time, and a sixth used 7.12 CPU-seconds. The 256-MiB scheduling baseline is the next power of two at or above the 115081216-byte maximum plus 20%, the 1-GiB hard cap supplies headroom, and est_duration_s rounds the maximum wall time up to 7 seconds."########,
+        description: r########"Runs, selected by exact name, the two tests_time cases that construct a Config with max_timeslice disabled: proc_stat_btime_is_fixed_for_a_fractional_epoch and target_timeslice_yields_at_syscall_boundaries_without_pmu. The other 36 cases enable max_timeslice and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 28 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000, and rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice sets 2000000, and a_futex_wake_hands_a_contended_mutex_to_the_waiter and a_futex_wake_handoff_is_deterministic set 5000000. Without a PMU each of the 36 fails with Perf support required; the hosted runner has none, and the hosted twin failed exactly those 29 of 31 there (https://github.com/rrnewton/hermit/actions/runs/37143469197, https://github.com/rrnewton/hermit/issues/3663). They run in privileged-test.pmu_detcore_time_cases, whose filter is the exact complement of this one, so the full label still runs all 38 cases once each; a case added to tests_time later is selected by that PMU node, whose expected count then fails until the new case is placed deliberately. MEASURED 2026-10-03 at hermit c3f7b2bcfa00 on the measurement host recorded for test.detcore_time in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"): five runs of this selection with cargo nextest run -p hermit-detcore-tests --test tests_time -j 1 and this filter, invoked directly rather than through run-nextest-counted.sh, each ran 2 tests with 29 filtered out, in 1.09-1.20 s of wall time (0.56-0.72 s of nextest time), the largest process peaking at 96-106 MB RSS. The hint keeps the whole-target budget measured 2026-09-29 at hermit 905903e0a7ed, which bounds this subset from above: five serial runs of all 28 then-existing cases, each in its own systemd-run --user --scope unit, peaked at 111661056-115081216 bytes of cgroup memory.peak and took 5.32-6.12 s of wall time, and a sixth used 7.12 CPU-seconds. The 256-MiB scheduling baseline is the next power of two at or above the 115081216-byte maximum plus 20%, the 1-GiB hard cap supplies headroom, and est_duration_s rounds the maximum wall time up to 7 seconds."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore-tests --test tests_time -j 1 -E 'test(=proc_stat_btime_is_fixed_for_a_fractional_epoch) | test(=target_timeslice_yields_at_syscall_boundaries_without_pmu) | test(=a_capped_preemption_charge_bounds_the_time_short_slices_add)'"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore-tests --test tests_time -j 1 -E 'test(=proc_stat_btime_is_fixed_for_a_fractional_epoch) | test(=target_timeslice_yields_at_syscall_boundaries_without_pmu)'"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -9015,7 +8289,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 720,
-        cpu_timeout: 90,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9029,7 +8303,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test aio_nr_determinism --test arch_prctl --test arch_status_determinism --test block_inflight_determinism --test btrfs_commit_determinism --test btrfs_pinned_bytes_determinism --test btrfs_reservation_determinism --test btrfs_reserved_bytes_determinism --test buddyinfo_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test compression --test container_init_deadline --test copy_file_range_refusal --test cppc_feedback_determinism --test cpufreq_avg_determinism --test cpuidle_determinism --test deadline_slice_cap --test dentry_state_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test external_signal_interrupt --test fatal_core_capture --test file_nr_determinism --test first_seen_mtime --test flock_exclusion --test fp_reduction_determinism --test frontier_app_benchmarks --test full_summary_futex_order --test futex2_refusal --test getitimer_determinism --test hashseed_determinism --test host_kernel_probes --test host_security_identity --test inode_nr_determinism --test integration_matrix --test io_uring_ring_determinism --test ipc_determinism --test irq_per_cpu_determinism --test kernel_keyring --test key_users_determinism --test kvm_harder --test kvm_lifecycle_timing_log_level --test language_runtime_determinism --test leveldb --test lit --test madvise --test meminfo_determinism --test mmap_determinism --test mmap_stress_determinism --test mount_introspection --test name_to_handle_refusal --test netlink_table_determinism --test netns_cookie_determinism --test node_vmstat_determinism --test numa_maps_determinism --test optional_memory_features --test perf_event_refusal --test pidfd_creation --test ppoll_simulation --test prctl_dumpable_determinism --test privileged_observation --test proc_fd_link_determinism --test proc_fdinfo_determinism --test proc_locks_determinism --test process_isolation_refusals --test procfs_determinism --test procfs_positioned_determinism --test prodcons_determinism --test protocols_determinism --test pselect6_simulation --test ptrace_refusal --test pty_nr_determinism --test python_stdlib --test random_determinism --test random_uuid_determinism --test redis_strict --test relaxed_flag_matrix --test remap_file_pages_refusal --test reopened_pipe_progress --test robust_futex_owner_death --test robust_list_queries --test sched_setattr_abi --test sched_setattr_noop --test scheduler_deadlock --test scheduler_policy_queries --test self_sched_determinism --test self_schedstat_determinism --test sigmask_preemption --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test so_incoming_cpu --test socket_cookie_determinism --test socket_ioctl_timestamp_determinism --test socket_timestamp_determinism --test sockstat_determinism --test softnet_stat_determinism --test sqlite_veryquick --test standalone --test stress_suite --test swaps_determinism --test syscall_file_io --test syscall_file_metadata --test syscall_quick_wins --test sysv_legacy_fallbacks --test tcp_info_determinism --test terminal_child_selectors --test thp_stats_determinism --test thread_scheduling_fairness --test thread_self_procfs_determinism --test thread_sync_determinism --test uevent_seqnum_determinism --test unix_socket_table_determinism --test utimensat_mtime --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test version_provenance --test vmstat_determinism --test waitid_signal_interrupt --test writev_determinism --test zero_copy_pipe_fallback -E 'not (test(=preemption_replay_preserves_equal_rcb_software_callback_boundaries) | test(=ptrace_a_handlers_first_restart_syscall_resumes_the_interrupted_timed_futex_wait) | test(=ptrace_child_waits_restart_under_sa_restart) | test(=ptrace_futex_wait_is_ended_by_a_caught_signal_pending_with_a_default_ignored_sigchld) | test(=ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked) | test(=ptrace_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked) | test(=ptrace_futex_wait_of_the_thread_that_forked_the_child_takes_its_sigchld) | test(=ptrace_other_waits_take_a_discarded_default_stop_as_on_linux) | test(=ptrace_poll_and_epoll_are_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_polling_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_polling_futex_wait_is_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_polling_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_polling_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_futex_wait_is_ended_by_a_sigchld_caught_after_it_parked) | test(=ptrace_precise_futex_wait_is_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibling) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_that_kills_itself_beside_a_running_sibling) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_whose_thread_exits_beside_a_running_sibling) | test(=ptrace_a_sleep_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibling) | test(=ptrace_precise_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child) | test(=ptrace_selects_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_selects_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_default_stop) | test(=ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals) | test(=a_timed_wait_ends_a_syscall_spinners_slice_at_its_deadline) | test(=a_futex_wake_carries_the_deadline_cap) | test(=a_self_armed_timer_ends_a_syscall_spinners_slice) | test(=a_new_threads_first_slice_is_capped) | test(=a_parents_continuation_after_clone_is_capped) | test(=the_caps_turns_cost_no_more_than_the_work) | test(=a_fast_periodic_timer_ends_no_slice) | test(=capped_schedules_verify_bitwise) | test(=a_spinner_without_syscalls_keeps_its_maximum_slice) | test(=slice_ends_taken_without_a_stop_leave_the_run_unchanged) | test(=a_timed_waiter_keeps_the_stops_an_untimed_waiter_does_not) | test(=skipped_slice_ends_come_before_a_trapped_instruction) | test(=skipped_slice_ends_come_before_a_signal) | test(=skipped_slice_ends_survive_the_backstop_and_exec) | test(=chaos_sched_yield_route_depends_on_the_heuristic) | test(=a_fast_periodic_timer_does_not_stall_a_cpu_bound_thread) | test(=itimer_expiries_recur_once_per_slice_end) | test(=itimer_syscall_heavy_timer_delivers_each_2_ms_period) | test(=itimer_two_cpu_bound_threads_finish_in_their_work_time) | test(=itimer_a_blocked_expiry_is_delivered_once) | test(=itimer_a_timer_recurs_after_unblocking) | test(=itimer_a_signalfd_dequeue_re_arms_the_timer) | test(=itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue) | test(=itimer_sig_ign_flushes_the_pending_copy) | test(=itimer_a_mid_turn_re_arm_keeps_a_signalfd_reader_timely) | test(=itimer_an_rt_sigtimedwait_dequeue_re_arms_the_timer) | test(=itimer_a_late_consumption_re_arms_after_the_read) | test(=itimer_a_long_handler_takes_one_copy_per_return) | test(=itimer_mixed_masks_keep_the_timer_running) | test(=itimer_an_ignored_blocked_copy_re_arms_when_discarded) | test(=itimer_a_private_copy_does_not_re_arm) | test(=itimer_a_sigsuspend_loop_takes_every_expiry) | test(=itimer_a_private_descriptor_table_consumer_re_arms) | test(=itimer_a_posix_timer_copy_restarts_a_stopped_timer) | test(=itimer_generation_discard_follows_the_wait_mask) | test(=itimer_a_wait_mask_is_withdrawn_when_the_wait_returns) | test(=itimer_coalescing_schedules_verify_bitwise) | test(=itimer_waiting_schedules_verify_bitwise) | test(=itimer_coalescing_verifies_under_the_random_heuristic) | test(=itimer_coalescing_verifies_under_chaos) | test(=itimer_a_recorded_schedule_replays) | test(=ppoll_waits_use_nonblocking_probes_and_verify) | test(=ptrace_delivery_check_approves_a_signal_to_a_thread_in_user_code))'"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test aio_nr_determinism --test arch_prctl --test arch_status_determinism --test block_inflight_determinism --test btrfs_commit_determinism --test btrfs_pinned_bytes_determinism --test btrfs_reservation_determinism --test btrfs_reserved_bytes_determinism --test buddyinfo_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test compression --test container_init_deadline --test copy_file_range_refusal --test cppc_feedback_determinism --test cpufreq_avg_determinism --test cpuidle_determinism --test dbt_copied_tty --test deadline_slice_cap --test dentry_state_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test external_signal_interrupt --test fatal_core_capture --test file_nr_determinism --test first_seen_mtime --test flock_exclusion --test fp_reduction_determinism --test frontier_app_benchmarks --test full_summary_futex_order --test futex2_refusal --test getitimer_determinism --test hashseed_determinism --test host_kernel_probes --test host_security_identity --test inode_nr_determinism --test integration_matrix --test io_uring_ring_determinism --test ipc_determinism --test irq_per_cpu_determinism --test kernel_keyring --test key_users_determinism --test kvm_harder --test kvm_lifecycle_timing_log_level --test language_runtime_determinism --test leveldb --test lit --test madvise --test meminfo_determinism --test mmap_determinism --test mmap_stress_determinism --test mount_introspection --test name_to_handle_refusal --test netlink_table_determinism --test netns_cookie_determinism --test node_vmstat_determinism --test numa_maps_determinism --test optional_memory_features --test perf_event_refusal --test pidfd_creation --test ppoll_simulation --test prctl_dumpable_determinism --test privileged_observation --test proc_fd_link_determinism --test proc_fdinfo_determinism --test proc_locks_determinism --test process_isolation_refusals --test procfs_determinism --test procfs_positioned_determinism --test prodcons_determinism --test protocols_determinism --test pselect6_simulation --test ptrace_refusal --test pty_nr_determinism --test python_stdlib --test random_determinism --test random_uuid_determinism --test redis_strict --test relaxed_flag_matrix --test remap_file_pages_refusal --test reopened_pipe_progress --test robust_futex_owner_death --test robust_list_queries --test sched_setattr_abi --test sched_setattr_noop --test scheduler_deadlock --test scheduler_policy_queries --test self_sched_determinism --test self_schedstat_determinism --test sigmask_preemption --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test so_incoming_cpu --test socket_cookie_determinism --test socket_ioctl_timestamp_determinism --test socket_timestamp_determinism --test sockstat_determinism --test softnet_stat_determinism --test sqlite_veryquick --test standalone --test stress_suite --test swaps_determinism --test syscall_file_io --test syscall_file_metadata --test syscall_quick_wins --test sysv_legacy_fallbacks --test tcp_info_determinism --test terminal_child_selectors --test thp_stats_determinism --test thread_scheduling_fairness --test thread_self_procfs_determinism --test thread_sync_determinism --test uevent_seqnum_determinism --test unix_socket_table_determinism --test utimensat_mtime --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test version_provenance --test vmstat_determinism --test waitid_signal_interrupt --test writev_determinism --test zero_copy_pipe_fallback -E 'not (test(=ptrace_a_handlers_first_restart_syscall_resumes_the_interrupted_timed_futex_wait) | test(=ptrace_child_waits_restart_under_sa_restart) | test(=ptrace_futex_wait_is_ended_by_a_caught_signal_pending_with_a_default_ignored_sigchld) | test(=ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked) | test(=ptrace_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked) | test(=ptrace_futex_wait_of_the_thread_that_forked_the_child_takes_its_sigchld) | test(=ptrace_other_waits_take_a_discarded_default_stop_as_on_linux) | test(=ptrace_poll_and_epoll_are_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_polling_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_polling_futex_wait_is_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_polling_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_polling_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_futex_wait_is_ended_by_a_sigchld_caught_after_it_parked) | test(=ptrace_precise_futex_wait_is_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibling) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_that_kills_itself_beside_a_running_sibling) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_whose_thread_exits_beside_a_running_sibling) | test(=ptrace_a_sleep_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibling) | test(=ptrace_precise_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child) | test(=ptrace_selects_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_selects_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_default_stop) | test(=ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals) | test(=a_timed_wait_ends_a_syscall_spinners_slice_at_its_deadline) | test(=a_futex_wake_carries_the_deadline_cap) | test(=a_self_armed_timer_ends_a_syscall_spinners_slice) | test(=a_new_threads_first_slice_is_capped) | test(=a_parents_continuation_after_clone_is_capped) | test(=the_caps_turns_cost_no_more_than_the_work) | test(=a_fast_periodic_timer_ends_no_slice) | test(=capped_schedules_verify_bitwise) | test(=a_spinner_without_syscalls_keeps_its_maximum_slice) | test(=chaos_sched_yield_route_depends_on_the_heuristic) | test(=a_fast_periodic_timer_does_not_stall_a_cpu_bound_thread) | test(=itimer_expiries_recur_once_per_slice_end) | test(=itimer_syscall_heavy_timer_delivers_each_2_ms_period) | test(=itimer_two_cpu_bound_threads_finish_in_their_work_time) | test(=itimer_a_blocked_expiry_is_delivered_once) | test(=itimer_a_timer_recurs_after_unblocking) | test(=itimer_a_signalfd_dequeue_re_arms_the_timer) | test(=itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue) | test(=itimer_sig_ign_flushes_the_pending_copy) | test(=itimer_a_mid_turn_re_arm_keeps_a_signalfd_reader_timely) | test(=itimer_an_rt_sigtimedwait_dequeue_re_arms_the_timer) | test(=itimer_a_late_consumption_re_arms_after_the_read) | test(=itimer_a_long_handler_takes_one_copy_per_return) | test(=itimer_mixed_masks_keep_the_timer_running) | test(=itimer_an_ignored_blocked_copy_re_arms_when_discarded) | test(=itimer_a_private_copy_does_not_re_arm) | test(=itimer_a_sigsuspend_loop_takes_every_expiry) | test(=itimer_a_private_descriptor_table_consumer_re_arms) | test(=itimer_a_posix_timer_copy_restarts_a_stopped_timer) | test(=itimer_generation_discard_follows_the_wait_mask) | test(=itimer_a_wait_mask_is_withdrawn_when_the_wait_returns) | test(=itimer_coalescing_schedules_verify_bitwise) | test(=itimer_waiting_schedules_verify_bitwise) | test(=itimer_coalescing_verifies_under_the_random_heuristic) | test(=itimer_coalescing_verifies_under_chaos) | test(=itimer_a_recorded_schedule_replays) | test(=ppoll_waits_use_nonblocking_probes_and_verify) | test(=ptrace_delivery_check_approves_a_signal_to_a_thread_in_user_code))'"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[
@@ -9056,6 +8330,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"cppc_feedback_determinism"########,
             r########"cpufreq_avg_determinism"########,
             r########"cpuidle_determinism"########,
+            r########"dbt_copied_tty"########,
             r########"deadline_slice_cap"########,
             r########"dentry_state_determinism"########,
             r########"dispatch_stats"########,
@@ -9189,10 +8464,10 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     StaticStepSpec {
         group: r########"test"########,
         job: r########"inherited_terminal_read"########,
-        desc: r########"Run the three original native inherited-terminal regressions"########,
-        description: r########"Runs the native half of the original six-body inherited_terminal_read target once and serially: direct progress, failed/successful exec alias carry, and peer-cleared nonblocking behavior. The original guest assertions, per-guest 30-second timeout, exact short reads, EAGAIN and stream-EOF checks remain unchanged. These are causal single-run tests, not paired canonical verification. The full profile's shared workspace preparation supplies the exact core selection and published first-party CLI; the transferred diagnostic prerequisite is retained by the actual DR catalog owner. The counted runner requires the three native tests; the three unchanged DR bodies are required by dynamorio-test.inherited_terminal_read. The original six-body union remains required, and this native counted runner requires three tests with no skips or retries and uses its existing per-attempt owned-cgroup cleanup. Initial node limits retain the reviewed focused native envelope (8 CPUs, 16 GiB, 2400 CPU seconds, 900 wall seconds). The combined maintained-node duration and RSS calibration remain unmeasured; no timing value is inferred from the prior separately contained cases."########,
+        desc: r########"Run all six inherited-terminal native and DBT regressions"########,
+        description: r########"Runs the complete inherited_terminal_read integration target once and serially: native and genuine Detcore DBT direct progress, failed/successful exec alias carry, and peer-cleared nonblocking behavior. The original guest assertions, per-guest 30-second timeout, exact short reads, EAGAIN and stream-EOF checks remain unchanged. DBT uses strict mode at DEBUG without relaxations; these are causal single-run tests, not paired canonical verification. The full profile's shared workspace preparation supplies this exact Nextest selection, and build.e2e_artifact plus check.dbt_runtime_abi supplies the matching published CLI and installed DBT resources. The counted runner requires six tests with no skips or retries and uses its existing per-attempt owned-cgroup cleanup. Initial node limits retain the reviewed focused native envelope (8 CPUs, 16 GiB, 2400 CPU seconds, 900 wall seconds). The combined maintained-node duration and RSS calibration remain unmeasured; no timing value is inferred from the prior separately contained cases."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test inherited_terminal_read -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test inherited_terminal_read -j 1"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"inherited_terminal_read"########]),
@@ -9214,7 +8489,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
+        timeout: 900,
         cpu_timeout: 2400,
         // Keep inherited-terminal tests serial without appending a second -j.
         jobs_flag: Some(r########""########),
@@ -9223,10 +8498,10 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     StaticStepSpec {
         group: r########"test"########,
         job: r########"isolation_matrix_ptrace_runtime"########,
-        desc: r########"Isolation matrix on ptrace, held to its expected-mismatch ledger"########,
-        description: r########"Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of ptrace. The former mixed-backend selection measured 218 s serially in the pinned root; the restored first-party selection is unmeasured: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, up to HERMIT_ISOLATION_JOBS cells at once (the cells of one cohort, which share an input fixture across backends, one at a time; output and the ledger check keep the selection order), every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/ptrace-runtime. It publishes one structured result row per cell it checks, through ci/conformance-test-counts.sh, so validate's per-node coverage counts it as executed; until 2026-10-17 it wrote none, and every full validation that planned it was NOT-VALIDATED."########,
+        desc: r########"Isolation matrix on ptrace, e9patch and SaBRe, held to its expected-mismatch ledger"########,
+        description: r########"Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of ptrace, e9patch preprocessing with ptrace and SaBRe (the backends on ptrace's runtime); measured 218 s serially in the pinned root: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, up to HERMIT_ISOLATION_JOBS cells at once (the cells of one cohort, which share an input fixture across backends, one at a time; output and the ledger check keep the selection order), every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/ptrace-runtime. It publishes one structured result row per cell it checks, through ci/conformance-test-counts.sh, so validate's per-node coverage counts it as executed; until 2026-10-17 it wrote none, and every full validation that planned it was NOT-VALIDATED."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/isolation-matrix/ptrace-runtime && mkdir -p target/ci/isolation-matrix && ./ci/conformance-test-counts.sh target/ci/isolation-matrix/ptrace-runtime -- ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --jobs "${HERMIT_ISOLATION_JOBS:-1}" --backends ptrace --artifacts target/ci/isolation-matrix/ptrace-runtime"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/isolation-matrix/ptrace-runtime && mkdir -p target/ci/isolation-matrix && ./ci/conformance-test-counts.sh target/ci/isolation-matrix/ptrace-runtime -- ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --jobs "${HERMIT_ISOLATION_JOBS:-1}" --backends ptrace,e9patch,sabre --artifacts target/ci/isolation-matrix/ptrace-runtime"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -9244,7 +8519,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
+        timeout: 900,
         cpu_timeout: 3600,
         jobs_flag: Some(""),
         jobs_env: Some("HERMIT_ISOLATION_JOBS"),
@@ -9252,14 +8527,17 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     StaticStepSpec {
         group: r########"test"########,
         job: r########"isolation_matrix_dbt_in_guest"########,
-        desc: r########"Isolation matrix on LiteInst and in-guest-trap, held to its expected-mismatch ledger"########,
-        description: r########"Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of LiteInst and in-guest-trap. The former mixed-backend selection measured 219 s serially in the pinned root; the restored first-party selection is unmeasured: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, up to HERMIT_ISOLATION_JOBS cells at once (the cells of one cohort, which share an input fixture across backends, one at a time; output and the ledger check keep the selection order), every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/dbt-in-guest. It publishes one structured result row per cell it checks, through ci/conformance-test-counts.sh, so validate's per-node coverage counts it as executed; until 2026-10-17 it wrote none, and every full validation that planned it was NOT-VALIDATED."########,
+        desc: r########"Isolation matrix on DBT, LiteInst and in-guest-trap, held to its expected-mismatch ledger"########,
+        description: r########"Runs the backend isolation matrix (tests/isolation/conformance.rs, the container contract of https://github.com/rrnewton/hermit/issues/4009) for every required cell of DBT, LiteInst and in-guest-trap; measured 219 s serially in the pinned root: the probe tests/isolation/backend_isolation.c beside a native baseline, each command a bounded child of the local executor, up to HERMIT_ISOLATION_JOBS cells at once (the cells of one cohort, which share an input fixture across backends, one at a time; output and the ledger check keep the selection order), every assertion row checked by hermit-cli/tests/common/backend_isolation.rs. No cell fully matches on any backend yet, so the node holds the matrix to tests/isolation/expected-mismatches.tsv: every cell that collects no guest observations, and every assertion that does not match, must be a ledger row naming its backend and linking its issue, and a row that no longer describes a failure on a backend it names fails the node until it is deleted, so what now matches stays matched. The ledger was measured in this pinned root; two host runs agreed cell for cell. Artifacts (assertion rows, per-backend totals, the required-cell ledger) are kept in target/ci/isolation-matrix/dbt-in-guest. It publishes one structured result row per cell it checks, through ci/conformance-test-counts.sh, so validate's per-node coverage counts it as executed; until 2026-10-17 it wrote none, and every full validation that planned it was NOT-VALIDATED."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/isolation-matrix/dbt-in-guest && mkdir -p target/ci/isolation-matrix && ./ci/conformance-test-counts.sh target/ci/isolation-matrix/dbt-in-guest -- ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --jobs "${HERMIT_ISOLATION_JOBS:-1}" --backends liteinst,in-guest-trap --artifacts target/ci/isolation-matrix/dbt-in-guest"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; rm -rf target/ci/isolation-matrix/dbt-in-guest && mkdir -p target/ci/isolation-matrix && ./ci/conformance-test-counts.sh target/ci/isolation-matrix/dbt-in-guest -- ./tests/isolation/conformance.rs --hermit target/ci/hermit --executor local --expected tests/isolation/expected-mismatches.tsv --jobs "${HERMIT_ISOLATION_JOBS:-1}" --backends dbt,liteinst,in-guest-trap --artifacts target/ci/isolation-matrix/dbt-in-guest"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"build.e2e_artifact"########],
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"check.dbt_runtime_abi"########,
+        ],
         env: &[],
         hint: HintSpec {
             resources: &[],
@@ -9273,7 +8551,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
+        timeout: 900,
         cpu_timeout: 3600,
         jobs_flag: Some(""),
         jobs_env: Some("HERMIT_ISOLATION_JOBS"),
@@ -9288,7 +8566,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test arbitrary_binaries -j 1 -- --skip record_replay_stable_arbitrary_binaries"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test arbitrary_binaries -j 1 -- --skip record_replay_stable_arbitrary_binaries"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"arbitrary_binaries"########]),
@@ -9312,7 +8590,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 900,
-        cpu_timeout: 120,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9320,9 +8598,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"record_replay"########,
         desc: r########"Record/replay integration tests"########,
-        description: r########"Runs every test in hermit-cli/tests/record_replay.rs, eight at a time in the pinned root (see PARALLEL 2026-10-15 below). Most tests run `hermit record start --verify` (some with --strict --verify-strict and a --verify-json verdict, some as separate record and `replay --autopilot` invocations) under a `timeout --kill-after=5s 45s` wrapper with --record-timeout=30, against the C and Rust workloads that build.workspace_in_pinned_root prepares and the prepared Nextest runner names in HERMIT_PREPARED_RECORD_WORKLOADS, and against host programs such as sh, bash, find, sqlite3 and coreutils pipelines; they require exit 0 and "Success: replay matched recording.", and the strict ones require verified and bitwise_parity in the verdict. They protect record/replay of file-system side effects (including a standalone replay of a mkdir and of AT_FDCWD- and descriptor-relative mkdirat calls beneath host directories that only existed at record time), fork and exec chains, pipes (including a blocking read after the guest clears O_NONBLOCK with FIONBIO or F_SETFL) and socketpairs (a blocking read, recv or recvmsg through the original descriptor, a dup and a forked child's inherited descriptor must wait for its writer, also after the guest clears O_NONBLOCK with FIONBIO or F_SETFL, with a pipe as the control), loopback TCP accept and accept4 (a guest that accepts its own connections must print the same echoed bytes, full and truncated peer address, close-on-exec flag, SOCK_NONBLOCK and EAGAIN and EINVAL failures under record and under a replay that serves both calls from the log, and every replay of one recording of a guest that accepts on one thread, on its own listener or on one received over SCM_RIGHTS, while another opens and closes descriptors must end the same way, either with the recorded output or with replay's named refusal of the accept's descriptor slot (https://github.com/rrnewton/hermit/issues/3880); accept4 with address buffers and *addrlen next to unmapped, read-only, write-only or inaccessible pages, or on a guest stack with little room below it, must return the result, length, copied prefix and untouched tail Linux 7.1 gives, writing the length before the address as Linux 7.1 and later do (7.0 and earlier copy the address first; record uses the 7.1 order on every host), and accept must read *addrlen after it has waited for a connection; a socketpair shutdown must reach a live recvmmsg in replay; and record must refuse sendmmsg and recvmmsg on an accepted connection by name), poll, select, ppoll and pselect copy-outs, futexes, clocks and RDTSC; record timeouts that kill the guest and its descendants without committing a partial recording; replay bootstrap from the recorded executable and interpreter; refusal of an unsupported syscall by name in both phases; and replay output that cannot create a host file through /proc/<pid>/root or truncate stdout through /dev/fd. Eight record_workloads unit tests check how those workloads are built and handed over, including that a consumer refuses a prepared workload whose bytes, path or alias set changed after preparation, and that test processes outside the prepared runner share one content-keyed standalone population instead of building one each (https://github.com/rrnewton/hermit/issues/3946). record_replay_matrix is also what super.record_replay_matrix_diagnostic runs alone. All fourteen network_trace tests run here: one checks the TCP fixture natively against its loopback controller; one runs the fixture's poll and ppoll on a readable pipe, each with nfds's high word set and its low word 1, natively and under --record-networking, and requires both runs to print one ready entry for each call, because Linux reads nfds as an unsigned int and record reads the pollfd array before it knows whether the call names a channel; three record and replay it with 4-KiB socket buffers that fill, one checking that a nonblocking send replays EAGAIN at the same offset, one that a blocking send does not stall a sibling thread, and one that replay refuses a blocking send where the recording holds a refused nonblocking send and that record refuses another send on the connection while a blocking send waits; three more check what happens around that wait: one records a client that prints whether the thread that released the peer had run and its monotonic clock before and after the send, replays it offline in the same configuration and requires the same stdout byte for byte and the same sequence of network-send retry lines in the INFO log, one requires record to refuse, with exit 122, a waiting send whose descriptor number another thread replaced with dup2 while a dup kept the original open, and requires that the replacement connection received no byte, and one sends from a shared file mapping whose unsent half a forked child rewrites during the wait and requires that the recorded outputs equal what the peer received and that the recording replays at L2; and three record the fixture's client with --record-networking against that controller and replay it with --replay-networking after the controller is gone, under four schedules at L2, checking that record and replay refuse socket operations outside the model and that replay refuses changed outbound bytes; one records the client waiting on a connection and a pipe with select, pselect6 and glibc's select and pselect, each result checked against Linux's, and checking that poll and ppoll with more entries than RLIMIT_NOFILE fail with EINVAL though the array names the connection, and replays it offline under two schedules, requiring the same stdout, an L2 verdict and an unchanged trace; one records the pinned root's unmodified curl (nixpkgs' curl.bin, added to the image for https://github.com/rrnewton/hermit/issues/3786) fetching from a one-shot loopback HTTP server under --strict with --record-networking, replays it with --replay-networking after the server has exited, and requires the same stdout, a matched `hermit log-diff` of the two INFO logs that compared messages on both sides, and an L2 verdict from a --verify-strict replay; the last checks, without running Hermit, that the stdout comparison the backpressure tests share is exact, apart from the observe mode's own lines, which it removes byte for byte. Record/replay does not enable PMU preemption, so the node needs no performance counters. A replay that diverges from its recording, a recording or replay that hangs until its timeout, a prepared workload that fails that check, or a run that executes other than 140 tests fails the node. record_node_eventfd_epoll_sequence, which records and replays `node -e console.log(42)` under --backend=ptrace --strict --verify --verify-strict, was skipped until the rejoin log of https://github.com/rrnewton/hermit/pull/3908: at hermit d1744e9fc07e its replay rescheduled the backgrounded DetPid(5) where the recording committed DetPid(3) at scheduler turn 144 (https://github.com/rrnewton/hermit/issues/3782). MEASURED 2026-10-05 in the pinned root at 2ab6a514458d (https://github.com/rrnewton/hermit/pull/3795 before its est_duration_s and this paragraph were updated, six tests fewer than now; the mkdir, mkdirat and pipe-clear-nonblock tests added since took 2.9 s, 2.5 s and 2.6 s wall in a debug-build nextest run outside the pinned root on 2026-10-06, and the curl test, unskipped since, took 3.2 s there, with 4.7 CPU-s for the whole `cargo nextest run` of that one test, cargo included), by a full validate run (validate-netreplay-rework-2ab6a514458d-1791233575988436941-3055230-bbd98825, off the record) at load average 14: 103 passed, 2 filtered, in 76.7 s wall and 70.6 CPU-s (cgroup cpu.usage_usec; 22.6 user, 48.0 system), with a cgroup memory peak of 152 MiB and 1.8 s of throttling. The 103 tests' own cgroups sum to 64.8 CPU-s. The six tcp_backpressure tests took 9.7, 8.1, 8.1, 6.8, 4.7 and 2.3 CPU-s (the shared-mapping, nonblocking, blocking, refusal, waited-send and replaced-descriptor tests; wall within 0.1 s of each), each under the 22 CPU-s per-test cap; no other test took more than 1.7 CPU-s. The previous measurement, at a67d9d031189 before the three wait tests were added, was 100 passed in 59.5 s wall and 53.2 CPU-s. Earlier runs of the debug-profile build outside the pinned root took 211 to 290 s wall and up to 285 CPU-s; the validate-profile Hermit and prepared workloads account for the difference, so those numbers no longer set the budget. est_duration_s is the pinned-root wall. The 1-GiB baseline rounds the cgroup peak up and the 3-GiB hard cap adds 2 GiB. The 300-second wall timeout is 1.5 times the wall rounded up to the next 300-second bucket, and the 300-second CPU cap applies the same rule to the CPU time. PARALLEL 2026-10-15: preferred_inner_jobs 8 through NEXTEST_TEST_THREADS (which also sizes the step's cpu.max), and the binary runs outside any serializing nextest group. Every test records into its own tempdir and runs the prepared, read-only workloads; the standalone preparation that local runs use already builds under a file lock, and its Cargo log directory is now unique across PID namespaces (the two tests that re-run themselves as pid 2 had shared one). Measured in the validate profile, each run pinned to as many host CPUs as test threads: 390 s at -j 1 (with two host-network timeouts that passed at -j 8) and 40-48 s at -j 8, all 211 tests passing in each of six runs after that fix. Peak summed RSS of the test process tree at -j 8 was 0.72 GiB, inside the 1-GiB baseline and 3-GiB cap. CPU CAP 2026-10-23: the 300-second CPU cap was set from 70.6 CPU-s for 103 tests; the node now runs 220. In the 15 full validations recorded from 2026-10-21 to 2026-10-23 (Hermit 10e2b504 to cd44c1b1) its cgroup CPU was 147 to 258 s (86% of the cap) at 43 to 80 s wall, and its tests' own cgroups summed to 125 to 219 CPU-s; 805908fb's buck-hybrid validation was stopped by the cap at 303 CPU-s and 83 s wall with 218 of 220 tests done. By the same rule, 1.5 times 303 rounds up to the next 300-second bucket: 600. At that run's 3.7 CPU-s per wall second, 600 CPU-s take about 165 s, inside the unchanged 300-second wall timeout. CPU RE-DERIVATION 2026-11-01: across 223 retained full-run step profiles (ci-hub history node-cpu-budgets, kill samples excluded) the node's worst valid CPU was 608.9 seconds (p99 420.9), above the 600-second cap; the cap is now 1200, the next 300-second bucket above 1.5 times that worst (913.3), with the wall unchanged."########,
+        description: r########"Runs every test in hermit-cli/tests/record_replay.rs, eight at a time in the pinned root (see PARALLEL 2026-10-15 below). Most tests run `hermit record start --verify` (some with --strict --verify-strict and a --verify-json verdict, some as separate record and `replay --autopilot` invocations) under a `timeout --kill-after=5s 45s` wrapper with --record-timeout=30, against the C and Rust workloads that build.workspace_in_pinned_root prepares and the prepared Nextest runner names in HERMIT_PREPARED_RECORD_WORKLOADS, and against host programs such as sh, bash, find, sqlite3 and coreutils pipelines; they require exit 0 and "Success: replay matched recording.", and the strict ones require verified and bitwise_parity in the verdict. They protect record/replay of file-system side effects (including a standalone replay of a mkdir and of AT_FDCWD- and descriptor-relative mkdirat calls beneath host directories that only existed at record time), fork and exec chains, pipes (including a blocking read after the guest clears O_NONBLOCK with FIONBIO or F_SETFL) and socketpairs (a blocking read, recv or recvmsg through the original descriptor, a dup and a forked child's inherited descriptor must wait for its writer, also after the guest clears O_NONBLOCK with FIONBIO or F_SETFL, with a pipe as the control), loopback TCP accept and accept4 (a guest that accepts its own connections must print the same echoed bytes, full and truncated peer address, close-on-exec flag, SOCK_NONBLOCK and EAGAIN and EINVAL failures under record and under a replay that serves both calls from the log, and every replay of one recording of a guest that accepts on one thread, on its own listener or on one received over SCM_RIGHTS, while another opens and closes descriptors must end the same way, either with the recorded output or with replay's named refusal of the accept's descriptor slot (https://github.com/rrnewton/hermit/issues/3880); accept4 with address buffers and *addrlen next to unmapped, read-only, write-only or inaccessible pages, or on a guest stack with little room below it, must return the result, length, copied prefix and untouched tail Linux 7.1 gives, writing the length before the address as Linux 7.1 and later do (7.0 and earlier copy the address first; record uses the 7.1 order on every host), and accept must read *addrlen after it has waited for a connection; a socketpair shutdown must reach a live recvmmsg in replay; and record must refuse sendmmsg and recvmmsg on an accepted connection by name), poll, select, ppoll and pselect copy-outs, futexes, clocks and RDTSC; record timeouts that kill the guest and its descendants without committing a partial recording; replay bootstrap from the recorded executable and interpreter; refusal of an unsupported syscall by name in both phases; and replay output that cannot create a host file through /proc/<pid>/root or truncate stdout through /dev/fd. Eight record_workloads unit tests check how those workloads are built and handed over, including that a consumer refuses a prepared workload whose bytes, path or alias set changed after preparation, and that test processes outside the prepared runner share one content-keyed standalone population instead of building one each (https://github.com/rrnewton/hermit/issues/3946). record_replay_matrix is also what super.record_replay_matrix_diagnostic runs alone. All fourteen network_trace tests run here: one checks the TCP fixture natively against its loopback controller; one runs the fixture's poll and ppoll on a readable pipe, each with nfds's high word set and its low word 1, natively and under --record-networking, and requires both runs to print one ready entry for each call, because Linux reads nfds as an unsigned int and record reads the pollfd array before it knows whether the call names a channel; three record and replay it with 4-KiB socket buffers that fill, one checking that a nonblocking send replays EAGAIN at the same offset, one that a blocking send does not stall a sibling thread, and one that replay refuses a blocking send where the recording holds a refused nonblocking send and that record refuses another send on the connection while a blocking send waits; three more check what happens around that wait: one records a client that prints whether the thread that released the peer had run and its monotonic clock before and after the send, replays it offline in the same configuration and requires the same stdout byte for byte and the same sequence of network-send retry lines in the INFO log, one requires record to refuse, with exit 122, a waiting send whose descriptor number another thread replaced with dup2 while a dup kept the original open, and requires that the replacement connection received no byte, and one sends from a shared file mapping whose unsent half a forked child rewrites during the wait and requires that the recorded outputs equal what the peer received and that the recording replays at L2; and three record the fixture's client with --record-networking against that controller and replay it with --replay-networking after the controller is gone, under four schedules at L2, checking that record and replay refuse socket operations outside the model and that replay refuses changed outbound bytes; one records the client waiting on a connection and a pipe with select, pselect6 and glibc's select and pselect, each result checked against Linux's, and checking that poll and ppoll with more entries than RLIMIT_NOFILE fail with EINVAL though the array names the connection, and replays it offline under two schedules, requiring the same stdout, an L2 verdict and an unchanged trace; one records the pinned root's unmodified curl (nixpkgs' curl.bin, added to the image for https://github.com/rrnewton/hermit/issues/3786) fetching from a one-shot loopback HTTP server under --strict with --record-networking, replays it with --replay-networking after the server has exited, and requires the same stdout, a matched `hermit log-diff` of the two INFO logs that compared messages on both sides, and an L2 verdict from a --verify-strict replay; the last checks, without running Hermit, that the stdout comparison the backpressure tests share is exact, apart from the observe mode's own lines, which it removes byte for byte. Record/replay does not enable PMU preemption, so the node needs no performance counters. A replay that diverges from its recording, a recording or replay that hangs until its timeout, a prepared workload that fails that check, or a run that executes other than 140 tests fails the node. record_node_eventfd_epoll_sequence, which records and replays `node -e console.log(42)` under --backend=ptrace --strict --verify --verify-strict, was skipped until the rejoin log of https://github.com/rrnewton/hermit/pull/3908: at hermit d1744e9fc07e its replay rescheduled the backgrounded DetPid(5) where the recording committed DetPid(3) at scheduler turn 144 (https://github.com/rrnewton/hermit/issues/3782). MEASURED 2026-10-05 in the pinned root at 2ab6a514458d (https://github.com/rrnewton/hermit/pull/3795 before its est_duration_s and this paragraph were updated, six tests fewer than now; the mkdir, mkdirat and pipe-clear-nonblock tests added since took 2.9 s, 2.5 s and 2.6 s wall in a debug-build nextest run outside the pinned root on 2026-10-06, and the curl test, unskipped since, took 3.2 s there, with 4.7 CPU-s for the whole `cargo nextest run` of that one test, cargo included), by a full validate run (validate-netreplay-rework-2ab6a514458d-1791233575988436941-3055230-bbd98825, off the record) at load average 14: 103 passed, 2 filtered, in 76.7 s wall and 70.6 CPU-s (cgroup cpu.usage_usec; 22.6 user, 48.0 system), with a cgroup memory peak of 152 MiB and 1.8 s of throttling. The 103 tests' own cgroups sum to 64.8 CPU-s. The six tcp_backpressure tests took 9.7, 8.1, 8.1, 6.8, 4.7 and 2.3 CPU-s (the shared-mapping, nonblocking, blocking, refusal, waited-send and replaced-descriptor tests; wall within 0.1 s of each), each under the 22 CPU-s per-test cap; no other test took more than 1.7 CPU-s. The previous measurement, at a67d9d031189 before the three wait tests were added, was 100 passed in 59.5 s wall and 53.2 CPU-s. Earlier runs of the debug-profile build outside the pinned root took 211 to 290 s wall and up to 285 CPU-s; the validate-profile Hermit and prepared workloads account for the difference, so those numbers no longer set the budget. est_duration_s is the pinned-root wall. The 1-GiB baseline rounds the cgroup peak up and the 3-GiB hard cap adds 2 GiB. The 300-second wall timeout is 1.5 times the wall rounded up to the next 300-second bucket, and the 300-second CPU cap applies the same rule to the CPU time. PARALLEL 2026-10-15: preferred_inner_jobs 8 through NEXTEST_TEST_THREADS (which also sizes the step's cpu.max), and the binary runs outside any serializing nextest group. Every test records into its own tempdir and runs the prepared, read-only workloads; the standalone preparation that local runs use already builds under a file lock, and its Cargo log directory is now unique across PID namespaces (the two tests that re-run themselves as pid 2 had shared one). Measured in the validate profile, each run pinned to as many host CPUs as test threads: 390 s at -j 1 (with two host-network timeouts that passed at -j 8) and 40-48 s at -j 8, all 211 tests passing in each of six runs after that fix. Peak summed RSS of the test process tree at -j 8 was 0.72 GiB, inside the 1-GiB baseline and 3-GiB cap. CPU CAP 2026-10-23: the 300-second CPU cap was set from 70.6 CPU-s for 103 tests; the node now runs 220. In the 15 full validations recorded from 2026-10-21 to 2026-10-23 (Hermit 10e2b504 to cd44c1b1) its cgroup CPU was 147 to 258 s (86% of the cap) at 43 to 80 s wall, and its tests' own cgroups summed to 125 to 219 CPU-s; 805908fb's buck-hybrid validation was stopped by the cap at 303 CPU-s and 83 s wall with 218 of 220 tests done. By the same rule, 1.5 times 303 rounds up to the next 300-second bucket: 600. At that run's 3.7 CPU-s per wall second, 600 CPU-s take about 165 s, inside the unchanged 300-second wall timeout."########,
         labels: &[r########"full"########, r########"portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test record_replay"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test record_replay"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"record_replay"########]),
@@ -9344,7 +8622,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 300,
-        cpu_timeout: 1200,
+        cpu_timeout: 600,
         jobs_flag: Some(""),
         jobs_env: Some("NEXTEST_TEST_THREADS"),
     },
@@ -9386,7 +8664,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Require scope-free Rust allocation ownership in both actual preload leaves"########,
         description: r########"Four Nextest identities: two genuine leaf matrices and two source-copy factory controls. Shared artifact qualifier unit tests run through the allocator fixture script harness, not this consumer. Each completed leaf matrix requires fixed-input quiet/work pairs S,Z,G,O,R,E,A, actual constructor/launcher bootstrap, six allocation-route positive controls, zero scope depths, private membership and unchanged literal guest/next addresses, breaks and bytes. Only stdin differs. Missing producer/exports/placement or a failed pair fails; raw captures retain actual execution separately from selection. The standalone uses Reverie's public configure_command Strace API; Detcore uses the one prepared Hermit with in-guest-trap, strict settings, fixed epoch and disabled timeslice. libc internals, stacks/TLS/protection and RV's caller/guard controls are separate nonclaims. Existing per-test backstop remains unchanged."########,
         labels: &[r########"full"########, r########"portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M1_ALLOCATOR_FIXTURE_BUNDLE="$PWD/target/ci/m1-allocator-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test liteinst_allocator -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M1_ALLOCATOR_FIXTURE_BUNDLE="$PWD/target/ci/m1-allocator-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test liteinst_allocator -j 1"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"liteinst_allocator"########]),
@@ -9412,8 +8690,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
-        cpu_timeout: 180,
+        timeout: 900,
+        cpu_timeout: 900,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9423,7 +8701,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Require literal fixed placement of actual LiteInst signal and callback stacks"########,
         description: r########"Nine required identities: four genuine leaf rows, two shared stack-observation controls, one actual Detcore constructor-placement row and two constructor-oracle refusal controls. Shared artifact qualifier unit tests run through the allocator fixture script harness, not this consumer. Standalone native Strace SITE1 ALT1 must report the real fixed guarded altstack and absent continuation; ALT0 gets no stack credit; inert loading must reserve nothing. Genuine Detcore trap/site0 ALT1 must reach one actual callback at the exact marker IP/TID/RSP, with one completion and fixed guarded 8-MiB capacity. The additional constructor fixture executes the unchanged M2 workload and requires real bootstrap samples disjoint from both later stack extents including guards. Separate source-bound receipts, unchanged M1/M2 comparators, current constructor-bearing leaf qualification and independent clean H/RV source guards are mandatory. No consumer compilation, warm artifact search, caller-byte equality, full-entry/TLS or interior-write-protection claim. Raw observations remain separate from selection. The scheduler hint est_duration_s is 125 s, the median of the 12 passing full validations of 2026-10-15/16 (112-146 s); at 60 s, dispatch by longest estimate kept it waiting behind shorter nodes once its dependencies were done: in the full validation of 947ad92b it started at +429 s, 40 s after its last dependency ended at +389 s, while all 16 slots ran other nodes, and it set the end of the graph to within 11 s."########,
         labels: &[r########"full"########, r########"portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M2_STACK_FIXTURE_BUNDLE="$PWD/target/ci/m2-stack-fixtures.path"; export HERMIT_COLD_STACK_FIXTURE_BUNDLE="$PWD/target/ci/cold-stack-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-stack-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test liteinst_stacks"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M2_STACK_FIXTURE_BUNDLE="$PWD/target/ci/m2-stack-fixtures.path"; export HERMIT_COLD_STACK_FIXTURE_BUNDLE="$PWD/target/ci/cold-stack-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-stack-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test liteinst_stacks"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"liteinst_stacks"########]),
@@ -9451,7 +8729,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
+        timeout: 900,
         cpu_timeout: 900,
         jobs_flag: Some(r########""########),
         jobs_env: Some(r########"NEXTEST_TEST_THREADS"########),
@@ -9462,7 +8740,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Portable CLI cases (skips KVM/DBT-backend-only cases)"########,
         description: r########"Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. They include real programs (coreutils, sqlite3, Python, jq, perl and the tests/c guests) run under in-guest LiteInst with --max-timeslice=disabled and without --verify (liteinst_in_guest_programs::, formerly the liteinst_advanced binary); those load the libdetcore_liteinst.so that the workspace build writes beside target/validate/hermit, so a missing runtime fails them with Hermit's refusal naming `cargo build -p detcore-liteinst`. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md. PARALLELISM 2026-10-06: the node runs at the width the DAG assigns (preferred 4) through NEXTEST_TEST_THREADS, and .config/nextest.toml keeps the cli binary out of the hermit-serialized group. Nextest runs every test in its own process, so the process-local HERMIT_RUN_LOCK never serialized two tests; until this change the group, and this node's -j 1, kept two cli tests from running at once. Every fixture that the cli binary builds under CARGO_TARGET_TMPDIR, including those in the shared tests/common modules it includes, now goes in a directory named for the test process (process_build_root), so two tests running at once never write, or run, the same file. Measured 2026-10-06 with 15 alternating off-the-record runs, five per width: every run passed 166 of 166 with no retried, flaky, timed-out or leaked test; nextest time was 113.7-114.2 s at 1 thread, 59.0-59.1 s at 2 and 33.2-33.5 s at 4; node CPU stayed at 45.7-47.4 CPU-s at every width; the step's memory.peak was 171-183 MB at 1 thread, 227-267 MB at 2 and 269-276 MB at 4, about 35 MB more per added thread and far below the 4-GiB memory hint, which still comes from width-1 calibration. Like every other node whose width channel is NEXTEST_TEST_THREADS, the width is the DAG allocator's: preferred 4, capped by the run's CPU budget, and wider only if a measured speedup curve for this step justifies it; the longest case (about 27 s) bounds what a wider setting could gain. PARALLELISM 2026-10-15: preferred 8. The node holds the integration_test_binaries.cli token, so its whole wall time is on the critical path (+391 to +540 s, 149 s, in 89264477's full validation). Measured with this node's exact selection (442 tests) in the validate profile, each run pinned to as many host CPUs as threads, four alternating runs per width at host load 280-360: 139-154 s at 4 threads and 72-94 s at 8. Every run had the same six host-only failures (DAP/GDB, namespace, procfs and stdin cases that need the pinned image); beyond those, 8 threads added one PMU skid overshoot (a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity, which run-nextest-counted retries as a typed skid refusal) and one gdbserver port collision on the host's shared network namespace (hermit_run_dap_listen_serves_one_tcp_client, Address already in use; the pinned root runs each node in its own network namespace). PARALLELISM 2026-10-15, later: preferred 16. At width 8 the node took 87-105 s in full validations (4.83 cores), the largest share of the cli-token chain that ends the DAG once the integration shards run eight at a time. Measured the same way, three alternating runs per width: 73.3-75.3 s at 8 threads on 8 CPUs and 41.6-45.6 s at 16 threads on 16 CPUs; at 16 every run failed only the six host-only cases, and the one extra failure in the series was the vfork PMU skid overshoot again, at width 8. test.cli_on_host, the hosted twin, takes its width the same way. The other nodes that run the cli binary keep one thread with -j 1; for test.isolated_dbt_workdir the explicit -j 1 overrides the width it is assigned."########,
         labels: &[r########"full"########, r########"portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_recovers_after_failed_exec --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch --skip run_schedule_replay_ends_check_in_slices_where_the_record_did --skip max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe --skip poll_timeout_returns_on_time_while_another_thread_spins --skip a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait --skip a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later --skip happens_before_relative_anchor_holds_the_first_call_after_its_base --skip happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread --skip happens_before_unfired_relative_anchor_is_refused_with_its_base --skip happens_before_hold_budget_ends_a_hold_a_spinner_never_releases --skip happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name --skip happens_before_hold_in_a_vfork_child_is_refused_by_name --skip cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity --skip cpu_profile_v3_host_loader_sees_exactly_x86_64_v3 --skip cpu_profile_v3_records_and_replays_the_v3_guest --skip cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack --skip cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu --skip cpu_profile_v3_cpuinfo_matches_cpuid --skip proc_cpu_times_agree_with_every_cpu_time_view --skip a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays --skip a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it --skip a_draw_without_a_range_draws_from_the_recommended_range --skip a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test cli -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_recovers_after_failed_exec --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch --skip max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe --skip poll_timeout_returns_on_time_while_another_thread_spins --skip a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait --skip a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later --skip happens_before_relative_anchor_holds_the_first_call_after_its_base --skip happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread --skip happens_before_unfired_relative_anchor_is_refused_with_its_base --skip happens_before_hold_budget_ends_a_hold_a_spinner_never_releases --skip happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name --skip happens_before_hold_in_a_vfork_child_is_refused_by_name --skip cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity --skip cpu_profile_v3_host_loader_sees_exactly_x86_64_v3 --skip cpu_profile_v3_records_and_replays_the_v3_guest --skip cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack --skip cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu --skip cpu_profile_v3_cpuinfo_matches_cpuid"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
@@ -9508,7 +8786,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Portable CLI cases (skips KVM/DBT-backend-only cases)"########,
         description: r########"Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. They include real programs (coreutils, sqlite3, Python, jq, perl and the tests/c guests) run under in-guest LiteInst with --max-timeslice=disabled and without --verify (liteinst_in_guest_programs::, formerly the liteinst_advanced binary); those load the libdetcore_liteinst.so that the workspace build writes beside target/validate/hermit, so a missing runtime fails them with Hermit's refusal naming `cargo build -p detcore-liteinst`. The 40 of them that start the in-guest LiteInst runtime (33 liteinst_in_guest_programs:: cases, the five liteinst_in_guest_verify_ cases, liteinst_backend_stats_report_the_guests_own_dispatch_paths and run_liteinst_finds_the_runtime_staged_as_an_installed_resource) need CPUID faulting, a host capability like the PMU: the GitHub-hosted runner has none, and in portable run 37383177918 each of the first 25 refused there with detcore-liteinst: initialization failed: CPUID faulting is unavailable: No such device (the 26th failed earlier, on the runtime the prebuilt tree did not yet ship). In portable run https://github.com/rrnewton/hermit/actions/runs/37543769782 four later cases (liteinst_in_guest_exit_reaping_matches_ptrace, liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification, liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered and liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse) failed with the same error; liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem starts the same runtime and was reported passed there only because the runner has no FUSE mount, so it returned before launching anything. The ptrace first-image-instruction CPUID sentinel also needs actual CPUID faulting and succeeds only on an intercepted fixed-table answer, so this hosted twin excludes it by its full exact name while test.cli keeps it mandatory in the pinned root. This hosted twin excludes them with an exact-name filterset (-E 'not (test(=...) | ...)'), never a substring --skip, and test.cli keeps running all of them in the pinned root; the LiteInst refusal, fixture-staging and command-construction cases, which launch no real runtime, stay here. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test cli -E 'not (test(=first_instruction_cpuid::ptrace_intercepts_cpuid_at_the_first_image_instruction) | test(=liteinst_backend_stats_report_the_guests_own_dispatch_paths) | test(=liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites) | test(=liteinst_in_guest_programs::in_guest_trap_keeps_site_patching_off_whatever_a_guest_library_does) | test(=liteinst_in_guest_programs::in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on) | test(=liteinst_in_guest_programs::in_guest_trap_sigalrm_scalar_identity_matches_ptrace) | test(=liteinst_in_guest_programs::in_guest_trap_verifies_a_program_with_no_site_patched) | test(=liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name) | test(=liteinst_in_guest_programs::liteinst_in_guest_a_root_that_aborts_ends_with_its_own_status) | test(=liteinst_in_guest_programs::liteinst_in_guest_a_held_parent_death_signal_at_an_unscheduled_death_ends_the_run_by_name) | test(=liteinst_in_guest_programs::liteinst_in_guest_a_held_parent_death_signal_that_would_fire_ends_the_run_by_name) | test(=liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang) | test(=liteinst_in_guest_programs::liteinst_in_guest_admitted_sigalrm_leaves_the_guest_heap_as_the_program_made_it) | test(=liteinst_in_guest_programs::liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest) | test(=liteinst_in_guest_programs::liteinst_in_guest_checks_and_hides_the_config_fingerprint) | test(=liteinst_in_guest_programs::liteinst_in_guest_cpu_limit_changes_are_refused_with_a_warning) | test(=liteinst_in_guest_programs::liteinst_in_guest_close_range_releases_ports_like_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs) | test(=liteinst_in_guest_programs::liteinst_in_guest_alarm_outside_emulated_sleep_keeps_its_loss) | test(=liteinst_in_guest_programs::liteinst_in_guest_default_fatal_alarms_end_emulated_sleeps_and_verify) | test(=liteinst_in_guest_programs::liteinst_in_guest_noninterrupting_alarms_preserve_sleep_and_pending_state) | test(=liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite) | test(=liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites) | test(=liteinst_in_guest_programs::liteinst_in_guest_dup_aliases_share_one_cursor_after_fork) | test(=liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_exit_reaping_matches_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_child_heap_is_the_parents) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging) | test(=liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings) | test(=liteinst_in_guest_programs::liteinst_in_guest_host_timed_producer_completions_are_refused) | test(=liteinst_in_guest_programs::liteinst_in_guest_identity_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_launch_raises_a_soft_cpu_limit_and_refuses_a_hard_one) | test(=liteinst_in_guest_programs::liteinst_in_guest_launch_refuses_an_inherited_signal_producer) | test(=liteinst_in_guest_programs::liteinst_in_guest_library_launch_checks_what_a_caller_callback_leaves) | test(=liteinst_in_guest_programs::liteinst_in_guest_library_launch_refuses_a_configured_producer) | test(=liteinst_in_guest_programs::liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe) | test(=liteinst_in_guest_programs::liteinst_in_guest_parent_death_signals_are_held_or_refused_at_arming) | test(=liteinst_in_guest_programs::liteinst_in_guest_patching_off_by_environment_still_reserves_sigtrap) | test(=liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_entropy) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_random_example) | test(=liteinst_in_guest_programs::liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem) | test(=liteinst_in_guest_programs::liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse) | test(=liteinst_in_guest_programs::liteinst_in_guest_refuses_exec_and_thread_creation_by_name) | test(=liteinst_in_guest_programs::liteinst_in_guest_reserved_group_sends_stay_refused_by_name) | test(=liteinst_in_guest_programs::liteinst_in_guest_reserved_sends_keep_linuxs_siginfo_answers) | test(=liteinst_in_guest_programs::liteinst_in_guest_reserved_sends_to_exited_targets_keep_linuxs_answers) | test(=liteinst_in_guest_programs::liteinst_in_guest_reserved_signal_sends_and_armings_are_refused) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_encoding_and_compression_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_portable_system_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_stdin_filter_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_calls_none_of_the_converted_libc_wrappers) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_leaves_the_guest_heap_as_the_program_made_it) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_owned_self_signals_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_self_signal_deaths_are_scheduled_and_verify) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered) | test(=liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_committed_at_an_instruction_trap_runs_before_exit) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_is_virtual_and_published) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_pending_at_handler_return_runs_before_the_next_syscall) | test(=liteinst_in_guest_programs::liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap) | test(=liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno) | test(=liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time) | test(=liteinst_in_guest_programs::liteinst_sigalrm_scalar_identity_keeps_handler_admission_controls) | test(=liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number) | test(=liteinst_in_guest_verify_compares_the_records_the_guest_forwards) | test(=liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer) | test(=liteinst_in_guest_verify_log_keeps_records_in_ptraces_order) | test(=liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader) | test(=liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result) | test(=run_liteinst_finds_the_runtime_staged_as_an_installed_resource))' -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_recovers_after_failed_exec --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch --skip run_schedule_replay_ends_check_in_slices_where_the_record_did --skip max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe --skip poll_timeout_returns_on_time_while_another_thread_spins --skip a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait --skip a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later --skip happens_before_relative_anchor_holds_the_first_call_after_its_base --skip happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread --skip happens_before_unfired_relative_anchor_is_refused_with_its_base --skip happens_before_hold_budget_ends_a_hold_a_spinner_never_releases --skip happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name --skip happens_before_hold_in_a_vfork_child_is_refused_by_name --skip cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity --skip cpu_profile_v3_host_loader_sees_exactly_x86_64_v3 --skip cpu_profile_v3_records_and_replays_the_v3_guest --skip cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack --skip cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu --skip cpu_profile_v3_cpuinfo_matches_cpuid --skip proc_cpu_times_agree_with_every_cpu_time_view --skip a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays --skip a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it --skip a_draw_without_a_range_draws_from_the_recommended_range --skip a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test cli -E 'not (test(=first_instruction_cpuid::ptrace_intercepts_cpuid_at_the_first_image_instruction) | test(=liteinst_backend_stats_report_the_guests_own_dispatch_paths) | test(=liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites) | test(=liteinst_in_guest_programs::in_guest_trap_keeps_site_patching_off_whatever_a_guest_library_does) | test(=liteinst_in_guest_programs::in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on) | test(=liteinst_in_guest_programs::in_guest_trap_sigalrm_scalar_identity_matches_ptrace) | test(=liteinst_in_guest_programs::in_guest_trap_verifies_a_program_with_no_site_patched) | test(=liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name) | test(=liteinst_in_guest_programs::liteinst_in_guest_a_root_that_aborts_ends_with_its_own_status) | test(=liteinst_in_guest_programs::liteinst_in_guest_a_held_parent_death_signal_at_an_unscheduled_death_ends_the_run_by_name) | test(=liteinst_in_guest_programs::liteinst_in_guest_a_held_parent_death_signal_that_would_fire_ends_the_run_by_name) | test(=liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang) | test(=liteinst_in_guest_programs::liteinst_in_guest_admitted_sigalrm_leaves_the_guest_heap_as_the_program_made_it) | test(=liteinst_in_guest_programs::liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest) | test(=liteinst_in_guest_programs::liteinst_in_guest_checks_and_hides_the_config_fingerprint) | test(=liteinst_in_guest_programs::liteinst_in_guest_cpu_limit_changes_are_refused_with_a_warning) | test(=liteinst_in_guest_programs::liteinst_in_guest_close_range_releases_ports_like_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs) | test(=liteinst_in_guest_programs::liteinst_in_guest_alarm_outside_emulated_sleep_keeps_its_loss) | test(=liteinst_in_guest_programs::liteinst_in_guest_default_fatal_alarms_end_emulated_sleeps_and_verify) | test(=liteinst_in_guest_programs::liteinst_in_guest_noninterrupting_alarms_preserve_sleep_and_pending_state) | test(=liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite) | test(=liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites) | test(=liteinst_in_guest_programs::liteinst_in_guest_dup_aliases_share_one_cursor_after_fork) | test(=liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_exit_reaping_matches_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_child_heap_is_the_parents) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging) | test(=liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings) | test(=liteinst_in_guest_programs::liteinst_in_guest_host_timed_producer_completions_are_refused) | test(=liteinst_in_guest_programs::liteinst_in_guest_identity_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_launch_raises_a_soft_cpu_limit_and_refuses_a_hard_one) | test(=liteinst_in_guest_programs::liteinst_in_guest_launch_refuses_an_inherited_signal_producer) | test(=liteinst_in_guest_programs::liteinst_in_guest_library_launch_checks_what_a_caller_callback_leaves) | test(=liteinst_in_guest_programs::liteinst_in_guest_library_launch_refuses_a_configured_producer) | test(=liteinst_in_guest_programs::liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe) | test(=liteinst_in_guest_programs::liteinst_in_guest_parent_death_signals_are_held_or_refused_at_arming) | test(=liteinst_in_guest_programs::liteinst_in_guest_patching_off_by_environment_still_reserves_sigtrap) | test(=liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_entropy) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_random_example) | test(=liteinst_in_guest_programs::liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem) | test(=liteinst_in_guest_programs::liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse) | test(=liteinst_in_guest_programs::liteinst_in_guest_refuses_exec_and_thread_creation_by_name) | test(=liteinst_in_guest_programs::liteinst_in_guest_reserved_group_sends_stay_refused_by_name) | test(=liteinst_in_guest_programs::liteinst_in_guest_reserved_sends_keep_linuxs_siginfo_answers) | test(=liteinst_in_guest_programs::liteinst_in_guest_reserved_sends_to_exited_targets_keep_linuxs_answers) | test(=liteinst_in_guest_programs::liteinst_in_guest_reserved_signal_sends_and_armings_are_refused) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_encoding_and_compression_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_portable_system_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_stdin_filter_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_calls_none_of_the_converted_libc_wrappers) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_leaves_the_guest_heap_as_the_program_made_it) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_owned_self_signals_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_self_signal_deaths_are_scheduled_and_verify) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered) | test(=liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_committed_at_an_instruction_trap_runs_before_exit) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_is_virtual_and_published) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_pending_at_handler_return_runs_before_the_next_syscall) | test(=liteinst_in_guest_programs::liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap) | test(=liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno) | test(=liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time) | test(=liteinst_in_guest_programs::liteinst_sigalrm_scalar_identity_keeps_handler_admission_controls) | test(=liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number) | test(=liteinst_in_guest_verify_compares_the_records_the_guest_forwards) | test(=liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer) | test(=liteinst_in_guest_verify_log_keeps_records_in_ptraces_order) | test(=liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader) | test(=liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result) | test(=run_liteinst_finds_the_runtime_staged_as_an_installed_resource))' -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_recovers_after_failed_exec --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch --skip max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe --skip poll_timeout_returns_on_time_while_another_thread_spins --skip a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait --skip a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later --skip happens_before_relative_anchor_holds_the_first_call_after_its_base --skip happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread --skip happens_before_unfired_relative_anchor_is_refused_with_its_base --skip happens_before_hold_budget_ends_a_hold_a_spinner_never_releases --skip happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name --skip happens_before_hold_in_a_vfork_child_is_refused_by_name --skip cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity --skip cpu_profile_v3_host_loader_sees_exactly_x86_64_v3 --skip cpu_profile_v3_records_and_replays_the_v3_guest --skip cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack --skip cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu --skip cpu_profile_v3_cpuinfo_matches_cpuid"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
@@ -9539,11 +8817,79 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     },
     StaticStepSpec {
         group: r########"test"########,
+        job: r########"sabre_examples"########,
+        desc: r########"SaBRe smoke test (archived backend): ptrace parity and canonical verify of one guest"########,
+        description: r########"SaBRe is archived (owner, 2026-10-25: no feature work, tests nightly only; ci/manifest-plan/src/archived.rs), so per commit this node is its smoke test, beside the third-party-backends build and Clippy that keep its code compiling. It runs two tests of hermit-cli/tests/sabre_examples.rs, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips: sabre_root_pid_matches_ptrace requires a root-PID shell probe to give identical status, stdout and stderr under ptrace and --backend sabre, the SaBRe controller's diagnostics to stay out of guest stderr, and the SaBRe run to pass `--verify --verify-strict` with bitwise_parity true; sabre_and_ptrace_detlogs_agree_through_post_exec requires the DETLOG records the SaBRe plugin forwards for /bin/true to equal ptrace's through the post-exec AT_RANDOM record. A SaBRe build that cannot start a guest, leaks a controller line into guest stderr, loses determinism under strict verify or stops forwarding Detcore's records is caught. The suite's other tests (time repeatability, getrandom, forwarding-socket refusals, RDTSC, stack limits, program break, exe links) left the per-commit graph with the archival: run them on demand with the same environment and no -E filter. Until 2026-10-25 this node ran all 36."########,
+        labels: &[
+            r########"full"########,
+            r########"hosted-portable"########,
+            r########"portable"########,
+        ],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_SABRE_TEST_BINARY=$PWD/target/ci/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test sabre_examples -j 1 -E 'test(=sabre_root_pid_matches_ptrace) | test(=sabre_and_ptrace_detlogs_agree_through_post_exec)'"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: Some(&[r########"sabre_examples"########]),
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"setup.nextest"########,
+        ],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 90.0,
+            rss_baseline_bytes: Some(1073741824),
+            hard_mem_max_bytes: Some(3221225472),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 900,
+        cpu_timeout: 7200,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"sabrecompat"########,
+        job: r########"sabre_examples"########,
+        desc: r########"SaBRe run type: the sabre_examples tests outside the per-commit smoke pair (archived backend)"########,
+        description: r########"SaBRe is archived (owner, 2026-10-25: no feature work, tests nightly only; ci/manifest-plan/src/archived.rs). test.sabre_examples keeps two tests of hermit-cli/tests/sabre_examples.rs per commit; this node runs the other 34 non-ignored ones, its count pinned by NEXTEST_EXPECTED_EXECUTED, in the SaBRe run type that `scripts/validate.rs --sabre-compat-only` selects and the nightly pressure sweep's sabre-examples part runs. Same environment as test.sabre_examples: one test at a time in the pinned root, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. It covers time repeatability (examples/date.sh and a clock-progress guest over three runs per backend), getrandom parity, the plugin's DETLOG forwarding and its refusals (a guest that closes or dup2s onto the forwarding socket, a guest stderr file or socket at the passed number), guest RDTSC before and after the plugin starts and in a signal handler, Detcore's stack limit at guest start-up, the program break and heap records, exe links, the timerfd refusal and a readied pipe poller across exec. A failure here is a SaBRe regression on an archived backend: it does not block a landing, and the nightly report names it.""########,
+        labels: &[r########"sabre-compat-only"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_SABRE_TEST_BINARY=$PWD/target/ci/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test sabre_examples -j 1 -E 'not (test(=sabre_root_pid_matches_ptrace) | test(=sabre_and_ptrace_detlogs_agree_through_post_exec))'"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: Some(&[r########"sabre_examples"########]),
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"setup.nextest"########,
+        ],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 90.0,
+            rss_baseline_bytes: Some(1073741824),
+            hard_mem_max_bytes: Some(3221225472),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 900,
+        cpu_timeout: 7200,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"test"########,
         job: r########"hermit_modes"########,
         desc: r########"Portable Hermit mode cases (skips default_ and chaos_buck_)"########,
         description: r########"MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 286810112 bytes; the larger 2038853632-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
         labels: &[r########"full"########, r########"portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"hermit_modes"########]),
@@ -9565,7 +8911,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 900,
-        cpu_timeout: 330,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9575,7 +8921,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Portable Hermit mode cases (skips default_ and chaos_buck_)"########,
         description: r########"MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 286810112 bytes; the larger 2038853632-byte historical completed peak governs. The 2-GiB baseline rounds above that floor and the 4-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"hermit_modes"########]),
@@ -9597,7 +8943,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 900,
-        cpu_timeout: 330,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9611,7 +8957,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test app_strict_verify -j 1 -- --ignored --skip java_ --skip javac_ --skip go_hello_is_deterministic_under_strict_verify --skip go_goroutines_are_deterministic_under_strict_verify"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test app_strict_verify -j 1 -- --ignored --skip java_ --skip javac_ --skip go_hello_is_deterministic_under_strict_verify --skip go_goroutines_are_deterministic_under_strict_verify"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"app_strict_verify"########]),
@@ -9633,7 +8979,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 900,
-        cpu_timeout: 130,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9647,7 +8993,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test command_strict_verify -j 1 -- --ignored --skip kernel_pseudofile_commands_are_deterministic_under_strict_verify"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test command_strict_verify -j 1 -- --ignored --skip kernel_pseudofile_commands_are_deterministic_under_strict_verify"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"command_strict_verify"########]),
@@ -9669,7 +9015,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 900,
-        cpu_timeout: 210,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9683,7 +9029,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test epoll_determinism --test rcx_canonicalization -j 1 -- --ignored"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test epoll_determinism --test rcx_canonicalization -j 1 -- --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[
@@ -9708,7 +9054,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 720,
-        cpu_timeout: 100,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9722,7 +9068,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test rr_suite -j 8"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test rr_suite -j 8"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"rr_suite"########]),
@@ -9779,7 +9125,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 900,
-        cpu_timeout: 120,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9810,8 +9156,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 240,
-        cpu_timeout: 30,
+        timeout: 120,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9839,8 +9185,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 240,
-        cpu_timeout: 30,
+        timeout: 40,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9850,7 +9196,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Run the x86-64-v3 CPU-profile CLI cases on a host that must qualify"########,
         description: r########"The six CLI cases that run a guest under --cpu-profile x86-64-v3 (https://github.com/rrnewton/hermit/issues/4243), with HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1. In test.cli and test.cli_on_host each of them accepts either outcome: a run when `hermit host-capabilities --cpu-profile x86-64-v3` qualifies the host, or the typed refusal (exit 122) when it does not, so a host that cannot qualify still runs them. That leaves nothing that fails when a host which should qualify stops qualifying, or when the qualification itself breaks. With the variable set, a refusal fails the case instead, so this node turns red rather than passing on refusals. It carries the cpuid-faulting label, which makes it host-inapplicable where arch_prctl(ARCH_SET_CPUID, 0) fails, because v3 needs Detcore to intercept the guest's CPUID. It depends on privileged-cpuid.faulting, which shows that interception works, and on privileged-pmu.preemption, because the qualification counts interrupts with a pinned PMU counter. test.cli and test.cli_on_host skip the six by name, so they run only here: each starts two to four Hermit processes, every one of which runs the host qualification (2-3 s of wall time on an idle host, 6-15 s at a load average near 200), and in test.cli at a load average near 240 three of them exceeded the per-test 22 CPU-second or 59 s budget. cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify asserts only refusals and does not depend on the host, so it stays only in test.cli. It consumes the shared cli binary published by privileged-build.privileged_tests and holds the integration_test_binaries.cli token like the other consumers."########,
         labels: &[r########"full"########, r########"cpuid-faulting"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test cli -j 1 -E 'test(=cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity) | test(=cpu_profile_v3_host_loader_sees_exactly_x86_64_v3) | test(=cpu_profile_v3_records_and_replays_the_v3_guest) | test(=cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack) | test(=cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu) | test(=cpu_profile_v3_cpuinfo_matches_cpuid)' || status=$?; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test cli -j 1 -E 'test(=cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity) | test(=cpu_profile_v3_host_loader_sees_exactly_x86_64_v3) | test(=cpu_profile_v3_records_and_replays_the_v3_guest) | test(=cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack) | test(=cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu) | test(=cpu_profile_v3_cpuinfo_matches_cpuid)' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
@@ -9876,7 +9222,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 130,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9904,8 +9250,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 240,
-        cpu_timeout: 30,
+        timeout: 30,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9915,7 +9261,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Run the six measured-passing Buck chaos cases under PMU preemption"########,
         description: r########"The six enabled cases passed direct measurement on the privileged host. chaos_buck_nanosleep_parallel remains ignored because an interrupted nanosleep reports EINTR; chaos_buck_mem_race remains ignored because it produced no verdict within 300 seconds. Both remain visible in super.pmu_buck_chaos_cases. Depending on pmu.preemption keeps this coverage in the existing privileged PMU partition without changing quick or portable-only."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"hermit_modes"########]),
@@ -9936,8 +9282,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
-        cpu_timeout: 90,
+        timeout: 120,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9947,7 +9293,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Run the five real-random ptrace completion cases that arm the reverie PMU timer"########,
         description: r########"The five ptrace_completion::tests::real_random_ cases run a real guest under Reverie ptrace with the default timeslice, which arms the PMU timer; without a PMU the run is refused with Perf support required. The hosted runner has no PMU (https://github.com/rrnewton/hermit/actions/runs/36499357369), so test.hermit_unit and its hosted twin skip exactly these five and this node runs them in full, after privileged-pmu.preemption has shown the PMU works. Measured on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts": the five pass in 1.94 s wall with a 33 MB peak RSS; the hint keeps the pmu_buck_chaos_cases budget shape."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst,kvm-native-test-support --lib --bins -j 1 -E 'test(/^ptrace_completion::tests::real_random_/)' || status=$?; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends,kvm-native-test-support --lib --bins -j 1 -E 'test(/^ptrace_completion::tests::real_random_/)' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -9968,8 +9314,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 360,
-        cpu_timeout: 45,
+        timeout: 120,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -9977,9 +9323,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"privileged-test"########,
         job: r########"pmu_cli_cases"########,
         desc: r########"Run the CLI cases whose subject is the PMU"########,
-        description: r########"skid_overshoot_and_guest_failure_have_different_exit_codes asserts that the skid injector induces a PMU overshoot, so the PMU is its subject; on a host without one it fails with skid injector did not induce an overshoot. The hosted runner has no PMU (https://github.com/rrnewton/hermit/actions/runs/36499357369), so test.cli and test.cli_on_host skip exactly this case and this node runs it in full. The four ptrace nonleader-exec cases run_ptrace_nonleader_exec_{preserves_identity_and_time,preserves_preemption,displaces_runnable_leader,refuses_preemption_artifacts} assert the actual PMU counter, the PMU timer and PMU preemption across exec; with perf_event_open blocked (EACCES) they fail with worker clock accounted before exec or actual PMU preemption, or the displaced leader never yields and hits its 54 s wall limit, while run_ptrace_nonleader_exec_exit_only passes and stays in test.cli (https://github.com/rrnewton/hermit/pull/3268). They are skipped by exact name in test.cli and test.cli_on_host and run here, after privileged-pmu.preemption has shown the PMU works. run_chaos_preemption_replay_reuses_the_recorded_epoch (https://github.com/rrnewton/hermit/issues/3413) records a --chaos run, requires its PMU-timer preemption points to be present, and replays them without --epoch; without a PMU the recording has no preemption points and the case fails its own premise check, so it is skipped the same way and runs here. poll_timeout_returns_on_time_while_another_thread_spins requires a 50 ms ppoll to return within 100 ms of virtual time, five times, while another thread spins with no syscalls; only the PMU timer (--max-timeslice) preempts that spinner, so without a PMU the case proves nothing and is skipped the same way (https://github.com/rrnewton/hermit/issues/3952). max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe prints the guest's stack at every PMU timer preemption under --chaos --preemption-stacktrace and requires a 448K-capped run whose stderr is a full unread pipe to end with 123 within its 45 s bound; without a PMU there is no preemption and it fails its own premise check, so it is skipped the same way and runs here. It runs the shared cli binary that build.workspace_in_pinned_root prepared and privileged-build.privileged_tests verifies. Until 2026-10-16 it held the integration_test_binaries.cli token, which made it wait behind test.cli, test.isolated_dbt_workdir, privileged-cpuid.cpu_profile_v3 and privileged-test.cli_kvm: in the full validation of 32e1c019 it started at +541 s, 187 s after its last dependency ended. The token kept the privileged build from relinking that binary under a running consumer, and since the one-build change of 2026-09-30 nothing relinks it, so this node no longer holds the token. Running the same executable beside test.cli is read-only. On the development host, the cli test binary of ac8ad06b in the validate profile ran this node's 16 cases three times alone and three times while test.cli's 474-case selection ran on 16 other CPUs, and the only case that failed was the same in both (skid_overshoot_and_guest_failure_have_different_exit_codes, in 2 of 3 rounds alone and 3 of 3 beside test.cli); test.cli's own failures were the same host-only set in all six of its runs except a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity, the PMU skid case the 8-thread measurement of test.cli already names, which failed once alone and once beside it. Measured on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts": 0.44 s for the skid case alone, 23.2-30.7 s of nextest time for the five cases the node had on 2026-09-29 over 20 runs at one-minute load averages of 63-226, and 40.6-41.6 s for all seven cases together over 5 runs at one-minute load averages of 286-322 on 2026-10-06, so the wall limit is 300 s. poll_timeout_returns_on_time_while_another_thread_spins runs Hermit again, at most five times in all, only when a run exits 122 with the typed skid-overshoot refusal line HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=N and nothing else (https://github.com/rrnewton/hermit/issues/1845, https://github.com/rrnewton/reverie/issues/990), and prints a SKID-RETRY line for every retried attempt; NEXTEST_SUCCESS_OUTPUT=final prints each case's captured output even when it passes, so those lines reach this node's log rather than being discarded with a passing case's output. One attempt of that case cost 8.2-10.7 CPU-s and 8.4-10.9 s of wall time in 13 local validation runs on 2026-10-09, so five attempts need up to about 54 CPU-s and 55 s; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER=4 raises each case's CPU budget from 22 to 88 CPU-s and HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=2 its wall bound from 57 to 114 s, since at the defaults a third attempt would be killed by the CPU budget. The retrying case is bounded by its 114 s wall bound, and with the other seven cases (about 30 s together in the 2026-10-06 measurement) the node stays below its 300 s limit. Six happens-before cases, happens_before_relative_anchor_holds_the_first_call_after_its_base, happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread, happens_before_unfired_relative_anchor_is_refused_with_its_base, happens_before_hold_budget_ends_a_hold_a_spinner_never_releases, happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name and happens_before_hold_in_a_vfork_child_is_refused_by_name, load version-2 specs, which bound every hold by max_hold_ns and need the PMU preemption timer to charge it. Without perf counters Hermit turns the timer off and then refuses each run with HERMIT_HB_HOLD_WITHOUT_PREEMPTION before the guest starts, so none of them reaches what it asserts; all six failed that way in hosted portable run https://github.com/rrnewton/hermit/actions/runs/38110887257. The PMU is not their subject, but they cannot run without it, so test.cli and test.cli_on_host skip them by exact name and this node runs them. happens_before_version_2_without_perf_counters_is_refused_before_stdin, which denies perf_event_open itself to check that refusal, stays in both. Measured 2026-10-11 on the measurement host recorded for this node in docs/TESTING_ENVIRONMENTS.md, at one-minute load averages of 138-140: the six alone took 9.0 s of nextest time at -j 1 (happens_before_hold_budget_ends_a_hold_a_spinner_never_releases 7.4 s, each other case under 0.5 s), and this node's command with all fourteen cases took 114.4 s of nextest time (the max_log_bytes preemption case 48.9 s, the poll spinner 20.2 s), so the node stays below its 300 s limit. a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait (https://github.com/rrnewton/hermit/issues/4132), whose sibling spins with no syscall, makes fifteen: measured 2026-10-14 at one-minute load averages of 37-69, the fifteen took 90.5 s of nextest time at -j 1 (the poll spinner 21.0 s, the new case 13.9 s), with no skid retry. a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later (https://github.com/rrnewton/hermit/issues/4380) pins where a --pipe-wake-latency of 1 ms comes due when thread time counts retired branches: a given loop iteration, and the entry rather than the exit of the next syscall. Without a PMU thread time counts no branches and those rows move, as test.cli's perf-denied rows of the same guest show, so test.cli and test.cli_on_host skip it by exact name and this node runs it: sixteen. It took 0.5 s of nextest time on the development host on 2026-10-15. proc_cpu_times_agree_with_every_cpu_time_view requires a process that burns 50 million loop iterations to show at least one clock tick of user time in /proc/<pid>/stat, times() and getrusage(); thread user time counts retired branches, so without a PMU it stays at 0, the guest's "has used CPU" lines print NO where the native run prints yes, and its comparison with the native run fails; test.cli and test.cli_on_host skip it by exact name and this node runs it: seventeen. run_schedule_replay_ends_check_in_slices_where_the_record_did replays the --chaos schedule of a guest whose slices a syscall's prehook ended and requires the replay to print the virtual clock the recording printed; only a PMU stop on a recorded branch count can end such a slice early, so without a PMU the case proves nothing, and test.cli and test.cli_on_host skip it by exact name: seventeen. It took 2 s of nextest time on an Intel bare-metal host on 2026-10-24. The scheduler hint est_duration_s is 75 s, the median of the 15 passing full validations of 2026-10-15/16 (71-96 s). At 30 s, once its dependencies were done, dispatch by longest path to the end put it behind every other ready node: in the full validation of 876ec26d it waited 118 s for a slot (ready at +341 s, started at +458 s) and set the end of the graph at +533 s. The two existing timeslice-range/run-draw cases and a_draw_without_a_range_draws_from_the_recommended_range require a usable PMU timer; both portable CLI nodes exclude their exact names and this node runs all three. a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write spins without committing calls, so only a PMU preemption ends its slice; test.cli and test.cli_on_host skip it by exact name and this node runs it. They inherit this node's existing 88 CPU-second / 114 wall-second per-case bounds."########,
+        description: r########"skid_overshoot_and_guest_failure_have_different_exit_codes asserts that the skid injector induces a PMU overshoot, so the PMU is its subject; on a host without one it fails with skid injector did not induce an overshoot. The hosted runner has no PMU (https://github.com/rrnewton/hermit/actions/runs/36499357369), so test.cli and test.cli_on_host skip exactly this case and this node runs it in full. The four ptrace nonleader-exec cases run_ptrace_nonleader_exec_{preserves_identity_and_time,preserves_preemption,displaces_runnable_leader,refuses_preemption_artifacts} assert the actual PMU counter, the PMU timer and PMU preemption across exec; with perf_event_open blocked (EACCES) they fail with worker clock accounted before exec or actual PMU preemption, or the displaced leader never yields and hits its 54 s wall limit, while run_ptrace_nonleader_exec_exit_only passes and stays in test.cli (https://github.com/rrnewton/hermit/pull/3268). They are skipped by exact name in test.cli and test.cli_on_host and run here, after privileged-pmu.preemption has shown the PMU works. run_chaos_preemption_replay_reuses_the_recorded_epoch (https://github.com/rrnewton/hermit/issues/3413) records a --chaos run, requires its PMU-timer preemption points to be present, and replays them without --epoch; without a PMU the recording has no preemption points and the case fails its own premise check, so it is skipped the same way and runs here. poll_timeout_returns_on_time_while_another_thread_spins requires a 50 ms ppoll to return within 100 ms of virtual time, five times, while another thread spins with no syscalls; only the PMU timer (--max-timeslice) preempts that spinner, so without a PMU the case proves nothing and is skipped the same way (https://github.com/rrnewton/hermit/issues/3952). max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe prints the guest's stack at every PMU timer preemption under --chaos --preemption-stacktrace and requires a 448K-capped run whose stderr is a full unread pipe to end with 123 within its 45 s bound; without a PMU there is no preemption and it fails its own premise check, so it is skipped the same way and runs here. It runs the shared cli binary that build.workspace_in_pinned_root prepared and privileged-build.privileged_tests verifies. Until 2026-10-16 it held the integration_test_binaries.cli token, which made it wait behind test.cli, test.isolated_dbt_workdir, privileged-cpuid.cpu_profile_v3 and privileged-test.cli_kvm: in the full validation of 32e1c019 it started at +541 s, 187 s after its last dependency ended. The token kept the privileged build from relinking that binary under a running consumer, and since the one-build change of 2026-09-30 nothing relinks it, so this node no longer holds the token. Running the same executable beside test.cli is read-only. On the development host, the cli test binary of ac8ad06b in the validate profile ran this node's 16 cases three times alone and three times while test.cli's 474-case selection ran on 16 other CPUs, and the only case that failed was the same in both (skid_overshoot_and_guest_failure_have_different_exit_codes, in 2 of 3 rounds alone and 3 of 3 beside test.cli); test.cli's own failures were the same host-only set in all six of its runs except a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity, the PMU skid case the 8-thread measurement of test.cli already names, which failed once alone and once beside it. Measured on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts": 0.44 s for the skid case alone, 23.2-30.7 s of nextest time for the five cases the node had on 2026-09-29 over 20 runs at one-minute load averages of 63-226, and 40.6-41.6 s for all seven cases together over 5 runs at one-minute load averages of 286-322 on 2026-10-06, so the wall limit is 300 s. poll_timeout_returns_on_time_while_another_thread_spins runs Hermit again, at most five times in all, only when a run exits 122 with the typed skid-overshoot refusal line HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=N and nothing else (https://github.com/rrnewton/hermit/issues/1845, https://github.com/rrnewton/reverie/issues/990), and prints a SKID-RETRY line for every retried attempt; NEXTEST_SUCCESS_OUTPUT=final prints each case's captured output even when it passes, so those lines reach this node's log rather than being discarded with a passing case's output. One attempt of that case cost 8.2-10.7 CPU-s and 8.4-10.9 s of wall time in 13 local validation runs on 2026-10-09, so five attempts need up to about 54 CPU-s and 55 s; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER=4 raises each case's CPU budget from 22 to 88 CPU-s and HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=2 its wall bound from 57 to 114 s, since at the defaults a third attempt would be killed by the CPU budget. The retrying case is bounded by its 114 s wall bound, and with the other seven cases (about 30 s together in the 2026-10-06 measurement) the node stays below its 300 s limit. Six happens-before cases, happens_before_relative_anchor_holds_the_first_call_after_its_base, happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread, happens_before_unfired_relative_anchor_is_refused_with_its_base, happens_before_hold_budget_ends_a_hold_a_spinner_never_releases, happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name and happens_before_hold_in_a_vfork_child_is_refused_by_name, load version-2 specs, which bound every hold by max_hold_ns and need the PMU preemption timer to charge it. Without perf counters Hermit turns the timer off and then refuses each run with HERMIT_HB_HOLD_WITHOUT_PREEMPTION before the guest starts, so none of them reaches what it asserts; all six failed that way in hosted portable run https://github.com/rrnewton/hermit/actions/runs/38110887257. The PMU is not their subject, but they cannot run without it, so test.cli and test.cli_on_host skip them by exact name and this node runs them. happens_before_version_2_without_perf_counters_is_refused_before_stdin, which denies perf_event_open itself to check that refusal, stays in both. Measured 2026-10-11 on the measurement host recorded for this node in docs/TESTING_ENVIRONMENTS.md, at one-minute load averages of 138-140: the six alone took 9.0 s of nextest time at -j 1 (happens_before_hold_budget_ends_a_hold_a_spinner_never_releases 7.4 s, each other case under 0.5 s), and this node's command with all fourteen cases took 114.4 s of nextest time (the max_log_bytes preemption case 48.9 s, the poll spinner 20.2 s), so the node stays below its 300 s limit. a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait (https://github.com/rrnewton/hermit/issues/4132), whose sibling spins with no syscall, makes fifteen: measured 2026-10-14 at one-minute load averages of 37-69, the fifteen took 90.5 s of nextest time at -j 1 (the poll spinner 21.0 s, the new case 13.9 s), with no skid retry. a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later (https://github.com/rrnewton/hermit/issues/4380) pins where a --pipe-wake-latency of 1 ms comes due when thread time counts retired branches: a given loop iteration, and the entry rather than the exit of the next syscall. Without a PMU thread time counts no branches and those rows move, as test.cli's perf-denied rows of the same guest show, so test.cli and test.cli_on_host skip it by exact name and this node runs it: sixteen. It took 0.5 s of nextest time on the development host on 2026-10-15. The scheduler hint est_duration_s is 75 s, the median of the 15 passing full validations of 2026-10-15/16 (71-96 s). At 30 s, once its dependencies were done, dispatch by longest path to the end put it behind every other ready node: in the full validation of 876ec26d it waited 118 s for a slot (ready at +341 s, started at +458 s) and set the end of the graph at +533 s."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; NEXTEST_SUCCESS_OUTPUT=final ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test cli -j 1 -E 'test(=skid_overshoot_and_guest_failure_have_different_exit_codes) | test(=run_ptrace_nonleader_exec_preserves_identity_and_time) | test(=run_ptrace_nonleader_exec_preserves_preemption) | test(=run_ptrace_nonleader_exec_displaces_runnable_leader) | test(=run_ptrace_nonleader_exec_refuses_preemption_artifacts) | test(=run_chaos_preemption_replay_reuses_the_recorded_epoch) | test(=run_schedule_replay_ends_check_in_slices_where_the_record_did) | test(=max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe) | test(=poll_timeout_returns_on_time_while_another_thread_spins) | test(=a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait) | test(=a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later) | test(=happens_before_relative_anchor_holds_the_first_call_after_its_base) | test(=happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread) | test(=happens_before_unfired_relative_anchor_is_refused_with_its_base) | test(=happens_before_hold_budget_ends_a_hold_a_spinner_never_releases) | test(=happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name) | test(=happens_before_hold_in_a_vfork_child_is_refused_by_name) | test(=proc_cpu_times_agree_with_every_cpu_time_view) | test(=a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays) | test(=a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it) | test(=a_draw_without_a_range_draws_from_the_recommended_range) | test(=a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write)' || status=$?; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; NEXTEST_SUCCESS_OUTPUT=final ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test cli -j 1 -E 'test(=skid_overshoot_and_guest_failure_have_different_exit_codes) | test(=run_ptrace_nonleader_exec_preserves_identity_and_time) | test(=run_ptrace_nonleader_exec_preserves_preemption) | test(=run_ptrace_nonleader_exec_displaces_runnable_leader) | test(=run_ptrace_nonleader_exec_refuses_preemption_artifacts) | test(=run_chaos_preemption_replay_reuses_the_recorded_epoch) | test(=max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe) | test(=poll_timeout_returns_on_time_while_another_thread_spins) | test(=a_guests_sigchld_to_a_futex_waiting_sibling_beside_a_cpu_bound_one_ends_its_wait) | test(=a_readied_pipe_poller_runs_once_the_actors_branch_counted_time_is_the_latency_later) | test(=happens_before_relative_anchor_holds_the_first_call_after_its_base) | test(=happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread) | test(=happens_before_unfired_relative_anchor_is_refused_with_its_base) | test(=happens_before_hold_budget_ends_a_hold_a_spinner_never_releases) | test(=happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name) | test(=happens_before_hold_in_a_vfork_child_is_refused_by_name)' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
@@ -9994,7 +9340,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             ),
             (
                 r########"HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER"########,
-                r########"3"########,
+                r########"2"########,
             ),
         ],
         hint: HintSpec {
@@ -10009,8 +9355,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
-        cpu_timeout: 190,
+        timeout: 300,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -10018,9 +9364,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"privileged-test"########,
         job: r########"pmu_detcore_time_cases"########,
         desc: r########"Run the 36 Detcore time cases that need the PMU (tests_time, serial execution)"########,
-        description: r########"The 36 tests_time cases that construct a Config with max_timeslice enabled and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 28 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000, rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice sets 2000000, and a_futex_wake_hands_a_contended_mutex_to_the_waiter and a_futex_wake_handoff_is_deterministic set 5000000. Without a PMU each fails with Perf support required. The hosted runner has none, and test.detcore_time_on_host failed exactly these 29 of 31 there (https://github.com/rrnewton/hermit/actions/runs/37143469197, https://github.com/rrnewton/hermit/issues/3663), so they moved here, after privileged-pmu.preemption has shown the PMU works. The filter is the exact complement of test.detcore_time's, which keeps the three cases that disable max_timeslice, so the full label still runs all 39 cases once each, and a case added to tests_time later is selected here until it is placed deliberately. tod_gettimeofday_faulting_tz_pkey_write_disabled_leaves_tv_unchanged also needs memory protection keys: on a host whose CPU flags lack pku or ospke, pkey_alloc returns -1 and the test fails rather than skips. MEASURED 2026-10-03 at hermit c3f7b2bcfa00 on the measurement host recorded for privileged-test.pmu_detcore_time_cases in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"): five runs of this selection with cargo nextest run -p hermit-detcore-tests --test tests_time -j 1 and this filter, invoked directly rather than through run-nextest-counted.sh, each ran 29 tests with 2 filtered out, in 4.72-5.90 s of wall time (4.15-5.00 s of nextest time), the largest process peaking at 68-76 MB RSS. The hint keeps test.detcore_time's measured whole-target budget (256-MiB scheduling baseline, 1-GiB hard cap, 7 s estimate, 720 s wall limit), which these runs fit inside."########,
+        description: r########"The 36 tests_time cases that construct a Config with max_timeslice enabled and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 28 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000, rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice sets 2000000, and a_futex_wake_hands_a_contended_mutex_to_the_waiter and a_futex_wake_handoff_is_deterministic set 5000000. Without a PMU each fails with Perf support required. The hosted runner has none, and test.detcore_time_on_host failed exactly these 29 of 31 there (https://github.com/rrnewton/hermit/actions/runs/37143469197, https://github.com/rrnewton/hermit/issues/3663), so they moved here, after privileged-pmu.preemption has shown the PMU works. The filter is the exact complement of test.detcore_time's, which keeps the two cases that disable max_timeslice, so the full label still runs all 38 cases once each, and a case added to tests_time later is selected here until it is placed deliberately. tod_gettimeofday_faulting_tz_pkey_write_disabled_leaves_tv_unchanged also needs memory protection keys: on a host whose CPU flags lack pku or ospke, pkey_alloc returns -1 and the test fails rather than skips. MEASURED 2026-10-03 at hermit c3f7b2bcfa00 on the measurement host recorded for privileged-test.pmu_detcore_time_cases in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"): five runs of this selection with cargo nextest run -p hermit-detcore-tests --test tests_time -j 1 and this filter, invoked directly rather than through run-nextest-counted.sh, each ran 29 tests with 2 filtered out, in 4.72-5.90 s of wall time (4.15-5.00 s of nextest time), the largest process peaking at 68-76 MB RSS. The hint keeps test.detcore_time's measured whole-target budget (256-MiB scheduling baseline, 1-GiB hard cap, 7 s estimate, 720 s wall limit), which these runs fit inside."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore-tests --test tests_time -j 1 -E 'not (test(=proc_stat_btime_is_fixed_for_a_fractional_epoch) | test(=target_timeslice_yields_at_syscall_boundaries_without_pmu) | test(=a_capped_preemption_charge_bounds_the_time_short_slices_add))' || status=$?; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore-tests --test tests_time -j 1 -E 'not (test(=proc_stat_btime_is_fixed_for_a_fractional_epoch) | test(=target_timeslice_yields_at_syscall_boundaries_without_pmu))' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -10041,8 +9387,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 320,
-        cpu_timeout: 40,
+        timeout: 720,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -10052,7 +9398,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Run the 27 external_signal_interrupt ptrace cases, the 35 deadline_slice_cap cases and the chaos sched_yield route case that need the PMU timer"########,
         description: r########"The 27 external_signal_interrupt ptrace cases whose assertions hold only with the PMU preemption timer (25 when measured below; https://github.com/rrnewton/hermit/issues/4304 made the spin role's two cases three, one per child death, and https://github.com/rrnewton/hermit/issues/4333 added the woken-sleep case beside a spinning sibling): each bounds a guest-observed virtual time (a 300 ms timed wait must end within 300-350 virtual ms, a wait ended by a signal within its slack) or requires a spinning guest thread to make progress before a watchdog. GitHub-hosted runners have no PMU, so hermit continues with --max-timeslice=disabled; in https://github.com/rrnewton/hermit/actions/runs/37631051557 at hermit ccbe5ae8 test.hermit_integration_on_host failed exactly these 25, with 300 ms waits taking 454-895 virtual ms. Forcing --max-timeslice=disabled into the cells locally fails the same 25 of the binary's 69 and no other; with the timer all 69 pass. The overshoot without the timer is a product defect of its own, not a test defect, and these assertions keep full force here. test.hermit_integration and its hosted twin skip the 27 by exact name; this node runs the same prepared selection with the complementary filter, so the full label runs each case once, after privileged-pmu.preemption has shown the PMU works. Like the privileged-test PMU nodes it carries only the full label: local scripts/validate.rs full runs it, .github/workflows/ci-privileged.yml does not. The 35 deadline_slice_cap cases (https://github.com/rrnewton/hermit/issues/4121, and 26 for https://github.com/rrnewton/hermit/issues/4139, whose CPU-bound guests take no turn and see no timer expiry without the PMU timer) need the timer too: a thread's slice exists only with a maximum, and the cap they test shortens it, so without the timer the spinning threads never yield. chaos_sched_yield_progress::chaos_sched_yield_route_depends_on_the_heuristic (https://github.com/rrnewton/hermit/issues/4150) needs it as well: it requires a chaos sched_yield to commit as SleepUntil(0) under --sched-heuristic=random and as SchedYield under the default heuristic, and without the timer hermit continues with --max-timeslice=disabled, where both take the chaos reprioritization route. It is in the test group, not privileged-test, because it executes the 111 hermit-cli integration binaries of test.hermit_integration and declares them (ci/audit-test-binary-registration.py requires the declaration to match the executed targets); a privileged-* consumer of those binaries would make each one a fused shared binary of privileged-build.privileged_tests, which this node does not use. Memory hints are test.hermit_integration's, whose selection this is. Measured on the measurement host recorded in docs/TESTING_ENVIRONMENTS.md, 2026-10-07: cargo nextest run --profile ci with this selection and filter, -j 1, ran 25 of 25 passing in 76.3-94.2 s of nextest time over three runs at one-minute load averages of 21-31, so the estimate is 80 s and the wall limit 600 s."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test aio_nr_determinism --test arch_prctl --test arch_status_determinism --test block_inflight_determinism --test btrfs_commit_determinism --test btrfs_pinned_bytes_determinism --test btrfs_reservation_determinism --test btrfs_reserved_bytes_determinism --test buddyinfo_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test compression --test container_init_deadline --test copy_file_range_refusal --test cppc_feedback_determinism --test cpufreq_avg_determinism --test cpuidle_determinism --test deadline_slice_cap --test dentry_state_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test external_signal_interrupt --test fatal_core_capture --test file_nr_determinism --test first_seen_mtime --test flock_exclusion --test fp_reduction_determinism --test frontier_app_benchmarks --test full_summary_futex_order --test futex2_refusal --test getitimer_determinism --test hashseed_determinism --test host_kernel_probes --test host_security_identity --test inode_nr_determinism --test integration_matrix --test io_uring_ring_determinism --test ipc_determinism --test irq_per_cpu_determinism --test kernel_keyring --test key_users_determinism --test kvm_harder --test kvm_lifecycle_timing_log_level --test language_runtime_determinism --test leveldb --test lit --test madvise --test meminfo_determinism --test mmap_determinism --test mmap_stress_determinism --test mount_introspection --test name_to_handle_refusal --test netlink_table_determinism --test netns_cookie_determinism --test node_vmstat_determinism --test numa_maps_determinism --test optional_memory_features --test perf_event_refusal --test pidfd_creation --test ppoll_simulation --test prctl_dumpable_determinism --test privileged_observation --test proc_fd_link_determinism --test proc_fdinfo_determinism --test proc_locks_determinism --test process_isolation_refusals --test procfs_determinism --test procfs_positioned_determinism --test prodcons_determinism --test protocols_determinism --test pselect6_simulation --test ptrace_refusal --test pty_nr_determinism --test python_stdlib --test random_determinism --test random_uuid_determinism --test redis_strict --test relaxed_flag_matrix --test remap_file_pages_refusal --test reopened_pipe_progress --test robust_futex_owner_death --test robust_list_queries --test sched_setattr_abi --test sched_setattr_noop --test scheduler_deadlock --test scheduler_policy_queries --test self_sched_determinism --test self_schedstat_determinism --test sigmask_preemption --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test so_incoming_cpu --test socket_cookie_determinism --test socket_ioctl_timestamp_determinism --test socket_timestamp_determinism --test sockstat_determinism --test softnet_stat_determinism --test sqlite_veryquick --test standalone --test stress_suite --test swaps_determinism --test syscall_file_io --test syscall_file_metadata --test syscall_quick_wins --test sysv_legacy_fallbacks --test tcp_info_determinism --test terminal_child_selectors --test thp_stats_determinism --test thread_scheduling_fairness --test thread_self_procfs_determinism --test thread_sync_determinism --test uevent_seqnum_determinism --test unix_socket_table_determinism --test utimensat_mtime --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test version_provenance --test vmstat_determinism --test waitid_signal_interrupt --test writev_determinism --test zero_copy_pipe_fallback -j 1 -E 'test(=preemption_replay_preserves_equal_rcb_software_callback_boundaries) | test(=ptrace_a_handlers_first_restart_syscall_resumes_the_interrupted_timed_futex_wait) | test(=ptrace_child_waits_restart_under_sa_restart) | test(=ptrace_futex_wait_is_ended_by_a_caught_signal_pending_with_a_default_ignored_sigchld) | test(=ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked) | test(=ptrace_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked) | test(=ptrace_futex_wait_of_the_thread_that_forked_the_child_takes_its_sigchld) | test(=ptrace_other_waits_take_a_discarded_default_stop_as_on_linux) | test(=ptrace_poll_and_epoll_are_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_polling_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_polling_futex_wait_is_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_polling_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_polling_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_futex_wait_is_ended_by_a_sigchld_caught_after_it_parked) | test(=ptrace_precise_futex_wait_is_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibling) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_that_kills_itself_beside_a_running_sibling) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_whose_thread_exits_beside_a_running_sibling) | test(=ptrace_a_sleep_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibling) | test(=ptrace_precise_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child) | test(=ptrace_selects_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_selects_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_default_stop) | test(=ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals) | test(=a_timed_wait_ends_a_syscall_spinners_slice_at_its_deadline) | test(=a_futex_wake_carries_the_deadline_cap) | test(=a_self_armed_timer_ends_a_syscall_spinners_slice) | test(=a_new_threads_first_slice_is_capped) | test(=a_parents_continuation_after_clone_is_capped) | test(=the_caps_turns_cost_no_more_than_the_work) | test(=a_fast_periodic_timer_ends_no_slice) | test(=capped_schedules_verify_bitwise) | test(=a_spinner_without_syscalls_keeps_its_maximum_slice) | test(=slice_ends_taken_without_a_stop_leave_the_run_unchanged) | test(=a_timed_waiter_keeps_the_stops_an_untimed_waiter_does_not) | test(=skipped_slice_ends_come_before_a_trapped_instruction) | test(=skipped_slice_ends_come_before_a_signal) | test(=skipped_slice_ends_survive_the_backstop_and_exec) | test(=chaos_sched_yield_route_depends_on_the_heuristic) | test(=a_fast_periodic_timer_does_not_stall_a_cpu_bound_thread) | test(=itimer_expiries_recur_once_per_slice_end) | test(=itimer_syscall_heavy_timer_delivers_each_2_ms_period) | test(=itimer_two_cpu_bound_threads_finish_in_their_work_time) | test(=itimer_a_blocked_expiry_is_delivered_once) | test(=itimer_a_timer_recurs_after_unblocking) | test(=itimer_a_signalfd_dequeue_re_arms_the_timer) | test(=itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue) | test(=itimer_sig_ign_flushes_the_pending_copy) | test(=itimer_a_mid_turn_re_arm_keeps_a_signalfd_reader_timely) | test(=itimer_an_rt_sigtimedwait_dequeue_re_arms_the_timer) | test(=itimer_a_late_consumption_re_arms_after_the_read) | test(=itimer_a_long_handler_takes_one_copy_per_return) | test(=itimer_mixed_masks_keep_the_timer_running) | test(=itimer_an_ignored_blocked_copy_re_arms_when_discarded) | test(=itimer_a_private_copy_does_not_re_arm) | test(=itimer_a_sigsuspend_loop_takes_every_expiry) | test(=itimer_a_private_descriptor_table_consumer_re_arms) | test(=itimer_a_posix_timer_copy_restarts_a_stopped_timer) | test(=itimer_generation_discard_follows_the_wait_mask) | test(=itimer_a_wait_mask_is_withdrawn_when_the_wait_returns) | test(=itimer_coalescing_schedules_verify_bitwise) | test(=itimer_waiting_schedules_verify_bitwise) | test(=itimer_coalescing_verifies_under_the_random_heuristic) | test(=itimer_coalescing_verifies_under_chaos) | test(=itimer_a_recorded_schedule_replays) | test(=ptrace_delivery_check_approves_a_signal_to_a_thread_in_user_code)'"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test aio_nr_determinism --test arch_prctl --test arch_status_determinism --test block_inflight_determinism --test btrfs_commit_determinism --test btrfs_pinned_bytes_determinism --test btrfs_reservation_determinism --test btrfs_reserved_bytes_determinism --test buddyinfo_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test compression --test container_init_deadline --test copy_file_range_refusal --test cppc_feedback_determinism --test cpufreq_avg_determinism --test cpuidle_determinism --test dbt_copied_tty --test deadline_slice_cap --test dentry_state_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test external_signal_interrupt --test fatal_core_capture --test file_nr_determinism --test first_seen_mtime --test flock_exclusion --test fp_reduction_determinism --test frontier_app_benchmarks --test full_summary_futex_order --test futex2_refusal --test getitimer_determinism --test hashseed_determinism --test host_kernel_probes --test host_security_identity --test inode_nr_determinism --test integration_matrix --test io_uring_ring_determinism --test ipc_determinism --test irq_per_cpu_determinism --test kernel_keyring --test key_users_determinism --test kvm_harder --test kvm_lifecycle_timing_log_level --test language_runtime_determinism --test leveldb --test lit --test madvise --test meminfo_determinism --test mmap_determinism --test mmap_stress_determinism --test mount_introspection --test name_to_handle_refusal --test netlink_table_determinism --test netns_cookie_determinism --test node_vmstat_determinism --test numa_maps_determinism --test optional_memory_features --test perf_event_refusal --test pidfd_creation --test ppoll_simulation --test prctl_dumpable_determinism --test privileged_observation --test proc_fd_link_determinism --test proc_fdinfo_determinism --test proc_locks_determinism --test process_isolation_refusals --test procfs_determinism --test procfs_positioned_determinism --test prodcons_determinism --test protocols_determinism --test pselect6_simulation --test ptrace_refusal --test pty_nr_determinism --test python_stdlib --test random_determinism --test random_uuid_determinism --test redis_strict --test relaxed_flag_matrix --test remap_file_pages_refusal --test reopened_pipe_progress --test robust_futex_owner_death --test robust_list_queries --test sched_setattr_abi --test sched_setattr_noop --test scheduler_deadlock --test scheduler_policy_queries --test self_sched_determinism --test self_schedstat_determinism --test sigmask_preemption --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test so_incoming_cpu --test socket_cookie_determinism --test socket_ioctl_timestamp_determinism --test socket_timestamp_determinism --test sockstat_determinism --test softnet_stat_determinism --test sqlite_veryquick --test standalone --test stress_suite --test swaps_determinism --test syscall_file_io --test syscall_file_metadata --test syscall_quick_wins --test sysv_legacy_fallbacks --test tcp_info_determinism --test terminal_child_selectors --test thp_stats_determinism --test thread_scheduling_fairness --test thread_self_procfs_determinism --test thread_sync_determinism --test uevent_seqnum_determinism --test unix_socket_table_determinism --test utimensat_mtime --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test version_provenance --test vmstat_determinism --test waitid_signal_interrupt --test writev_determinism --test zero_copy_pipe_fallback -j 1 -E 'test(=ptrace_a_handlers_first_restart_syscall_resumes_the_interrupted_timed_futex_wait) | test(=ptrace_child_waits_restart_under_sa_restart) | test(=ptrace_futex_wait_is_ended_by_a_caught_signal_pending_with_a_default_ignored_sigchld) | test(=ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked) | test(=ptrace_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked) | test(=ptrace_futex_wait_of_the_thread_that_forked_the_child_takes_its_sigchld) | test(=ptrace_other_waits_take_a_discarded_default_stop_as_on_linux) | test(=ptrace_poll_and_epoll_are_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_polling_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_polling_futex_wait_is_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_polling_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_polling_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_futex_wait_is_ended_by_a_sigchld_caught_after_it_parked) | test(=ptrace_precise_futex_wait_is_ended_by_the_sigchld_of_an_exiting_child) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibling) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_that_kills_itself_beside_a_running_sibling) | test(=ptrace_precise_futex_wait_takes_the_sigchld_of_a_child_whose_thread_exits_beside_a_running_sibling) | test(=ptrace_a_sleep_takes_the_sigchld_of_a_child_that_exits_beside_a_running_sibling) | test(=ptrace_precise_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child) | test(=ptrace_selects_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_selects_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_default_stop) | test(=ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals) | test(=a_timed_wait_ends_a_syscall_spinners_slice_at_its_deadline) | test(=a_futex_wake_carries_the_deadline_cap) | test(=a_self_armed_timer_ends_a_syscall_spinners_slice) | test(=a_new_threads_first_slice_is_capped) | test(=a_parents_continuation_after_clone_is_capped) | test(=the_caps_turns_cost_no_more_than_the_work) | test(=a_fast_periodic_timer_ends_no_slice) | test(=capped_schedules_verify_bitwise) | test(=a_spinner_without_syscalls_keeps_its_maximum_slice) | test(=chaos_sched_yield_route_depends_on_the_heuristic) | test(=a_fast_periodic_timer_does_not_stall_a_cpu_bound_thread) | test(=itimer_expiries_recur_once_per_slice_end) | test(=itimer_syscall_heavy_timer_delivers_each_2_ms_period) | test(=itimer_two_cpu_bound_threads_finish_in_their_work_time) | test(=itimer_a_blocked_expiry_is_delivered_once) | test(=itimer_a_timer_recurs_after_unblocking) | test(=itimer_a_signalfd_dequeue_re_arms_the_timer) | test(=itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue) | test(=itimer_sig_ign_flushes_the_pending_copy) | test(=itimer_a_mid_turn_re_arm_keeps_a_signalfd_reader_timely) | test(=itimer_an_rt_sigtimedwait_dequeue_re_arms_the_timer) | test(=itimer_a_late_consumption_re_arms_after_the_read) | test(=itimer_a_long_handler_takes_one_copy_per_return) | test(=itimer_mixed_masks_keep_the_timer_running) | test(=itimer_an_ignored_blocked_copy_re_arms_when_discarded) | test(=itimer_a_private_copy_does_not_re_arm) | test(=itimer_a_sigsuspend_loop_takes_every_expiry) | test(=itimer_a_private_descriptor_table_consumer_re_arms) | test(=itimer_a_posix_timer_copy_restarts_a_stopped_timer) | test(=itimer_generation_discard_follows_the_wait_mask) | test(=itimer_a_wait_mask_is_withdrawn_when_the_wait_returns) | test(=itimer_coalescing_schedules_verify_bitwise) | test(=itimer_waiting_schedules_verify_bitwise) | test(=itimer_coalescing_verifies_under_the_random_heuristic) | test(=itimer_coalescing_verifies_under_chaos) | test(=itimer_a_recorded_schedule_replays) | test(=ptrace_delivery_check_approves_a_signal_to_a_thread_in_user_code)'"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[
@@ -10079,6 +9425,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"cppc_feedback_determinism"########,
             r########"cpufreq_avg_determinism"########,
             r########"cpuidle_determinism"########,
+            r########"dbt_copied_tty"########,
             r########"deadline_slice_cap"########,
             r########"dentry_state_determinism"########,
             r########"dispatch_stats"########,
@@ -10206,7 +9553,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 390,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -10234,8 +9581,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 240,
-        cpu_timeout: 30,
+        timeout: 120,
+        cpu_timeout: 7200,
         jobs_flag: Some(r########"--jobs"########),
         jobs_env: None,
     },
@@ -10259,7 +9606,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         deps: &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
-            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"privileged-build.manifest_guests_in_pinned_root"########,
             r########"privileged-build.privileged_tests"########,
@@ -10282,7 +9628,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 80,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -10290,7 +9636,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"privileged-e2e"########,
         job: r########"manifest_c_programs"########,
         desc: r########"Privileged manifest bucket: c-programs"########,
-        description: r########"The selected cells are the four cpuid-probe verify cells (in-guest-trap, kvm, liteinst, ptrace) plus the cpuid-probe replay cell on ptrace: the kvm and ptrace cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301), and the in-guest LiteInst cells (liteinst, and in-guest-trap with site patching off) that returned on the new architecture after the LiteInst reset (https://github.com/rrnewton/hermit/issues/3745), each run with the maximum timeslice disabled. The selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop."########,
+        description: r########"The selected cells are the five cpuid-probe verify cells (dbt, in-guest-trap, kvm, liteinst, ptrace): the kvm and ptrace cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301), the dbt cell that slice S13 of the same issue carried over from the retired DBT parity matrix, and the in-guest LiteInst cells (liteinst, and in-guest-trap with site patching off) that returned on the new architecture after the LiteInst reset (https://github.com/rrnewton/hermit/issues/3745), each run with the maximum timeslice disabled. The selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop."########,
         labels: &[r########"full"########],
         cmd: r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category c-programs --ci-only --prebuilt --results "$E2E_RESULT_ROOT/privileged/manifest_c_programs/results.jsonl" --junit "$E2E_RESULT_ROOT/privileged/manifest_c_programs/junit.xml"'"########,
         cmdtype: CmdType::Unknown,
@@ -10329,7 +9675,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 80,
+        cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
     },
@@ -10353,7 +9699,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         deps: &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
-            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"privileged-build.manifest_guests_in_pinned_root"########,
             r########"privileged-build.privileged_tests"########,
@@ -10376,7 +9721,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 600,
-        cpu_timeout: 80,
+        cpu_timeout: 7200,
         jobs_flag: Some(r########""########),
         jobs_env: None,
     },
@@ -10386,12 +9731,12 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"KVM CLI tests and initialized-VM setup cleanup"########,
         description: r########"Runs all 87 KVM-specific hermit CLI tests and the initialized-VM setup cleanup control after requiring /dev/kvm. The inventory gate requires all 87 distinct, nonignored CLI tests including the self-SIGKILL, synchronous-fault, root-exit reparenting, exec timer, nonleader-exec refusal, unreadable futex word, parked-sleep deadline cap, host-peer FIFO, host-syscall-budget, signal-then-sibling-exit, child-exit-notification, raw-child-exit-notification, sigtimedwait-siginfo, inherited-and-disabled-preemption, procfs-directory-size, first-directory-seek, flock-refusal and child-kill-refusal regressions and exactly the named setup test. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource. Its tests run eight at a time: preferred_inner_jobs 8, passed to nextest as NEXTEST_TEST_THREADS, which also sizes the step's cpu.max. (A literal -j 8 with no inner-jobs hint ran eight tests under the default one-core cpu.max: in 89264477's validation the node used 0.99 cores, was throttled for 494.7 CPU-seconds, took 62 s instead of 76, and run_kvm_notifies_a_child_exit_once_at_bitwise_parity took 41.5 s against its 60-second limit, 7.4 s at -j 1.) They ran one at a time only by inheritance from the July 2026 validate.sh, which passed --test-threads=1 to every suite, and until 2026-10-16 this node held the integration_test_binaries.cli token, so its whole run sat on the critical path: 87 s of the 341-second token chain in 39d822fb's full validation. It no longer holds it: the token kept the privileged build from relinking a binary under a running consumer, which nothing does since the one-build change of 2026-09-30, and this node's cli executable, built with kvm-execution-tests, is not the one test.cli runs. Measured on 2026-10-15 at host load 290-317: -j 1 took 73-80 s; -j 8 took 11.6-16.0 s, with all 84 tests passing in 24 of 24 runs, and a peak summed RSS of 6.47 GiB against 6.08 GiB at -j 1."########,
         labels: &[r########"full"########, r########"kvm"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit-run --features liteinst,kvm-execution-tests --lib --test cli -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] as $selected | ($selected | length == 129) and ([$selected[].key] | unique | length == 129) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == "run_kvm_self_sigkill_from_nonleader_is_group_fatal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_root_segv_preserves_guest_exit")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_orphan_segv_preserves_root_success")] | length == 1) and ([$selected[] | select(.key == "run_kvm_root_exit_reparents_live_child_and_grandchild")] | length == 1) and ([$selected[] | select(.key == "run_kvm_exec_deletes_posix_timers_and_preserves_itimer")] | length == 1) and ([$selected[] | select(.key == "run_kvm_nonleader_exec_is_policy_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_futex_wait_on_an_unreadable_word_matches_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_sleep_carries_the_deadline_cap")] | length == 1) and ([$selected[] | select(.key == "run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_costs_one_host_syscall_per_guest_syscall")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_sibling_may_exit_while_its_signal_is_taken")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does")] | length == 1) and ([$selected[] | select(.key == "run_kvm_with_a_resolved_or_explicitly_disabled_maximum")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_procfs_directory_keeps_its_size")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_directory_descriptors_first_seeks")] | length == 1) and ([$selected[] | select(.key == "run_kvm_flock_excludes_as_ptrace_does")] | length == 1) and ([$selected[] | select(.key == "run_kvm_cpuid_rows_match_ptrace")] | length == 1) and ([$selected[] | select(.key == "run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key == "run_kvm_procfs_directories_are_served_only_in_a_container")] | length == 1) and ([$selected[] | select(.key == "run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_relative_names_are_decided_by_the_guests_working_directory")] | length == 1) and ([$selected[] | select(.key == "run_kvm_dotdot_names_are_decided_by_where_they_lead")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_virtual_cpus_are_listed_by_every_spelling")] | length == 1) and ([$selected[] | select(.key == "run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory")] | length == 1) and ([$selected[] | select(.key == "run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files")] | length == 1) and ([$selected[] | select(.key == "run_kvm_signal_permits_are_per_thread")] | length == 1) and ([$selected[] | select(.key == "run_kvm_virtual_timeout_is_reported_from_the_childs_note")] | length == 1) and ([$selected[] | select(.key == "run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first")] | length == 1) and ([$selected[] | select(.key == "run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit")] | length == 1) and ([$selected[] | select(.key == "run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_second_path_past_another_process_cmdline_is_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_argument_errors_on_another_process_procfs_answer_as_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts")] | length == 1) and ([$selected[] | select(.key == "run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem")] | length == 1) and ([$selected[] | select(.key == "run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences")] | length == 1) and ([$selected[] | select(.key == "run_kvm_renders_proc_locks_from_the_lock_ledger")] | length == 1) and ([$selected[] | select(.key == "run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting")] | length == 1) and ([$selected[] | select(.key == "run_kvm_refuses_preemption_stack_traces_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_late_timer_event_refuses_the_run_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_late_timer_event_is_a_verify_infrastructure_error")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_main_stack_is_read_from_maps_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_file_view_with_a_second_thread_maps_as_natively")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_file_threads_that_exited_do_not_hold_back_a_fork")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_file_fork_beside_a_live_thread_is_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_an_scm_rights_receipt_over_its_own_header_is_a_named_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_hugetlbfs_view_is_a_named_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_robust_word_kvm_cannot_exchange_is_a_named_refusal_where_ptrace_marks_it")] | length == 1) and ([$selected[] | select(.key == "run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parent_death_signal_reaches_the_child_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_callers_own_proc_directories_answer_as_linux")] | length == 1) and ([$selected[] | select(.key | startswith("run_kvm_"))] | length == 128) and ([$selected[] | select(.key == "kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution")] | length == 1)' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 128 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, the host-peer FIFO, the host-syscall budget, the signal-then-sibling exit, the child-exit and raw child-exit notifications, the sigtimedwait siginfo copy-out, the disabled preemption default, the procfs directory size, the first directory seeks, the flock refusal, the KVM CPUID rows, the child-kill refusal, the parked-wait exec, the parked-read signal exec, the three served-procfs-directory tests, the two group-exit signal-wait tests, the five guest working-directory tests, the per-thread signal-permit test, the virtual-timeout note test, the two SCM_RIGHTS queue tests, the masked-ppoll pending-signal test, the two-path cmdline refusal test, the procfs argument-error test, the two exec-refusal tests, the fdinfo and /proc/locks rendering tests, the chaos spinner bound, the preemption stack-trace refusal, the two late timer event refusals, the late timer event replay refusal, the blocking-inotify refusal test, the main-stack maps test, the dot-dot procfs spellings test, the shared file view beside a second thread, the exited-threads fork test, the fork refusal beside a live thread, the overlapping SCM_RIGHTS receipt refusal, the hugetlbfs view refusal, the unexchangeable robust word refusal, the smaps test, the parent-death signal test, the own /proc directories test, and the named setup test; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst,kvm-execution-tests --lib --test cli -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'; exit $?"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit-run --features third-party-backends,kvm-execution-tests --lib --test cli -E '(test(/^run_kvm_/) - test(=run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting)) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] as $selected | ($selected | length == 91) and ([$selected[].key] | unique | length == 91) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == "run_kvm_self_sigkill_from_nonleader_is_group_fatal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_root_segv_preserves_guest_exit")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_orphan_segv_preserves_root_success")] | length == 1) and ([$selected[] | select(.key == "run_kvm_root_exit_reparents_live_child_and_grandchild")] | length == 1) and ([$selected[] | select(.key == "run_kvm_exec_deletes_posix_timers_and_preserves_itimer")] | length == 1) and ([$selected[] | select(.key == "run_kvm_nonleader_exec_is_policy_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_futex_wait_on_an_unreadable_word_matches_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_sleep_carries_the_deadline_cap")] | length == 1) and ([$selected[] | select(.key == "run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_costs_one_host_syscall_per_guest_syscall")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_sibling_may_exit_while_its_signal_is_taken")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does")] | length == 1) and ([$selected[] | select(.key == "run_kvm_with_a_resolved_or_explicitly_disabled_maximum")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_procfs_directory_keeps_its_size")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_directory_descriptors_first_seeks")] | length == 1) and ([$selected[] | select(.key == "run_kvm_flock_is_a_named_refusal_where_ptrace_excludes")] | length == 1) and ([$selected[] | select(.key == "run_kvm_cpuid_rows_match_ptrace")] | length == 1) and ([$selected[] | select(.key == "run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key | startswith("run_kvm_"))] | length == 90) and ([$selected[] | select(.key == "kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution")] | length == 1)' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 90 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, the host-peer FIFO, the host-syscall budget, the signal-then-sibling exit, the child-exit and raw child-exit notifications, the sigtimedwait siginfo copy-out, the disabled preemption default, the procfs directory size, the first directory seeks, the flock refusal, the KVM CPUID rows, the child-kill refusal, the parked-wait exec, the parked-read signal exec, and the named setup test; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends,kvm-execution-tests --lib --test cli -E '(test(/^run_kvm_/) - test(=run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting)) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'; exit $?"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
         deps: &[r########"privileged-build.privileged_tests"########],
-        env: &[(r########"HERMIT_FORBID_SKIPS"########, r########"1"########)],
+        env: &[],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 60.0,
@@ -10404,37 +9749,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 600,
-        cpu_timeout: 600,
-        jobs_flag: Some(""),
-        jobs_env: Some("NEXTEST_TEST_THREADS"),
-    },
-    StaticStepSpec {
-        group: r########"privileged-test"########,
-        job: r########"deadline_slice_cap_kvm"########,
-        desc: r########"deadline_slice_cap on KVM, held to its known-gap ledger"########,
-        description: r########"Runs the 42 tests of hermit-cli/tests/deadline_slice_cap.rs on KVM, less the rows its known-gap ledger marks skipped, after requiring /dev/kvm, held to the suite's known-gap ledger, hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv, which this node declares as HERMIT_KNOWN_GAP_LEDGER (ci/manifest-plan/src/known_gaps.rs, the format the receipt qualifier reads). The suite's own HERMIT_TEST_BACKEND=kvm switch names --backend=kvm on every Hermit run of it, and capped_schedules_verify_bitwise proves it: each of its verified runs must show KVM's backend banner and record kvm in HERMIT_TEST_BACKEND_PROOF, kept beside the node's results as .backend-proof, or the node fails (KVM-BACKEND-UNPROVEN); the proof test must be in the run's selection and results, and cannot be a gap row or ignored. The ptrace nodes run the same 42 tests on ptrace and are unchanged. Until this node the suite ran on KVM only through a shim outside validation, which left the five tests that named --backend=ptrace themselves on ptrace and counted them as KVM passes; four of them fail on KVM, and capped_schedules_verify_bitwise passes there. ci/kvm-gap-ledger.rs checks the ledger first: every row names a test of the suite, its tracking issue as a full URL, and how it must fail (an ordinary failure whose output shows the row's signature, or a stop by the per-test CPU budget) or that the node skips it. It reads the suite's tests from its source with a parser that refuses every attribute form it does not understand (a cfg_attr test, a conditional ignore, a test-generating macro), and compares them, test by test, with Nextest's list of the built suite: the same names, the same ignored tests, and nothing filtered out but the skipped rows, each of which must be, so no test can be ignored, left out or replaced while the counts stay the same. make lint-checks holds the ledger to its committed history (lint-check-known-gap-ledgers): a row is a baseline row only if it has been present, unchanged, since the ledger's introduction, and a row added or changed later (turning a row skipped is a change), or a required test deleted or ignored, needs an approval URL that a commit-message line binds to it. The runner then prints KVM-GAP-SKIPPED for each skipped row and leaves those tests out of the run by name, with a Nextest filter expression it builds from the ledger, lists the suite with the prepared Nextest runner, refuses unless the tests it runs, less the gap rows it runs, number exactly NEXTEST_EXPECTED_EXECUTED, and runs them once each (NEXTEST_RETRIES=0) in one counted run. A required test that fails, fails the node (KVM-REQUIRED-FAIL). A gap row that fails the way its row says is printed as KNOWN-KVM-GAP with its gap and issue and recorded as a diagnostic failure in structured-result schema 4, counted apart from passes and never as one; a gap row that fails another way fails the node (KVM-GAP-WRONG-FAILURE), and one that passes fails it with "now passing, promote to required" (KVM-GAP-NOW-PASSING). The counted run's CPU report and event stream stay beside the node's results (.cpu.json, .events.jsonl), and SCORECARD.md and ci/compat-envelope/known-gaps.json list the rows outside every count. SKIPPED 2026-11-01: by the owner's directive of 2026-11-01 (disable known-failing tests, and file a high-priority task to fix them), the ledger's six remaining rows, the gaps C, D, E, E+F', F' and G of https://github.com/rrnewton/hermit/issues/4929, became skipped rows; until then the node ran them as diagnostics. So the node runs 36 of the 42 tests, all required (NEXTEST_EXPECTED_EXECUTED 36), and filters out the six, which the ptrace nodes still run. Minibeads dh-j7ocf (https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j7ocf.md) tracks the fix. HISTORY: the ledger was introduced on 2026-10-30 with 20 rows: 15 needed KVM's preemption timer (https://github.com/rrnewton/hermit/issues/4954; KVM refused --max-timeslice in 14 of them before the guest started, and the no-syscall spinner was never preempted), and C, D, E, E+F' and G. MEASURED 2026-10-30 in the pinned root, eight tests at a time, on Hermit main cc676e30f2ee, badaea3ee96 and later with that issue's first slice on top: the node took 32-35 s and the counted run 24.3-24.6 s, 22 passed, 20 failed as their rows say, and the schema-4 report held 22 pass and 20 diagnostic_fail rows. The longest test is the gap a_spinner_without_syscalls_keeps_its_maximum_slice, whose spinner KVM never preempts: the ordinary 22-second per-test CPU budget stops it (cpu_timeout after 22.0 s of CPU, 24.3 s of wall time), which is its row's expected outcome; the required tests took at most 8 s each on a host run. If Nextest's 57-second wall backstop stopped it first, its CPU record could be lost and the whole report refused, a red node with no results (https://github.com/rrnewton/hermit/issues/4962). The 180-second wall (as privileged-test.cli_kvm's) is five times the measured run and leaves room for the CPU budget's multiplier on a loaded host; the 7200-second CPU bound and the memory hints are cli_kvm's, whose eight concurrent KVM guests this node's eight match."########,
-        labels: &[r########"full"########, r########"kvm"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'privileged-test.deadline_slice_cap_kvm: /dev/kvm could not be opened, so the suite cannot run on KVM. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; ./ci/kvm-gap-ledger.rs run -- ${CI:+--profile ci} -p hermit-run --features liteinst,kvm-execution-tests --test deadline_slice_cap; exit $?"########,
-        cmdtype: CmdType::Unknown,
-        manifest: None,
-        integration_test_binaries: Some(&[r########"deadline_slice_cap"########]),
-        deps: &[r########"privileged-build.privileged_tests"########],
-        env: &[],
-        hint: HintSpec {
-            resources: &[],
-            est_duration_s: 35.0,
-            rss_baseline_bytes: Some(8589934592),
-            hard_mem_max_bytes: Some(17179869184),
-            classification: StepClass::CpuBound,
-            preferred_inner_jobs: Some(8),
-            measured_effective_cores: None,
-            measured_cpu_utilization: None,
-        },
-        networkonly: false,
-        engine_only: false,
-        timeout: 600,
-        cpu_timeout: 270,
+        timeout: 180,
+        cpu_timeout: 7200,
         jobs_flag: Some(""),
         jobs_env: Some("NEXTEST_TEST_THREADS"),
     },
@@ -10560,9 +9876,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"quick"########,
         job: r########"build"########,
         desc: r########"Build workspace"########,
-        description: r########"In the pinned root (one podman container pinned by digest, no runtime network, source at /src) it runs `cargo build --workspace --features liteinst` in the dev profile, then `./ci/nextest-binaries.rs prepare quick`, which builds and lists the test executables of the quick profile's one prepared Nextest selection (hermit-detcore --lib) and records their hashes, so quick.detcore_unit compiles nothing. The six other quick nodes depend on it; the three smoke runs execute the target/debug/hermit it produces. A compile error anywhere in the workspace, including code behind the liteinst feature, stops the quick profile here, as does a prepare step that cannot find an executable for that selection. WIDTH AND WALL: it runs at 8 CPUs (CpuBound, preferred_inner_jobs 8, passed to Cargo as CARGO_BUILD_JOBS rather than as a trailing -j, which `nextest-binaries.rs prepare` refuses as an extra argument). As a light node it would get dagrun's default one-CPU box, where the workspace build alone costs about 575 CPU-seconds. In the quick-profile validation of Hermit dcbf2768 on 2026-10-08, on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", it took 152 s. The 1200 s wall is 7.9 times that, and equals the wall of build.workspace_compile_in_pinned_root, whose 124 retained runs took 179-227 s. The wall was 3600 s, which made the quick profile refuse every node once preparation passed 600 s of ci-hub's 4200 s run budget (https://github.com/rrnewton/hermit/issues/3906)."########,
+        description: r########"In the pinned root (one podman container pinned by digest, no runtime network, source at /src) it runs `cargo build --workspace --features third-party-backends` in the dev profile, then `./ci/nextest-binaries.rs prepare quick`, which builds and lists the test executables of the quick profile's one prepared Nextest selection (hermit-detcore --lib) and records their hashes, so quick.detcore_unit compiles nothing. The six other quick nodes depend on it; the three smoke runs execute the target/debug/hermit it produces. A compile error anywhere in the workspace, including code behind the third-party-backends feature, stops the quick profile here, as does a prepare step that cannot find an executable for that selection. WIDTH AND WALL: it runs at 8 CPUs (CpuBound, preferred_inner_jobs 8, passed to Cargo as CARGO_BUILD_JOBS rather than as a trailing -j, which `nextest-binaries.rs prepare` refuses as an extra argument). As a light node it would get dagrun's default one-CPU box, where the workspace build alone costs about 575 CPU-seconds. In the quick-profile validation of Hermit dcbf2768 on 2026-10-08, on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", it took 152 s. The 1200 s wall is 7.9 times that, and equals the wall of build.workspace_compile_in_pinned_root, whose 124 retained runs took 179-227 s. The wall was 3600 s, which made the quick profile refuse every node once preparation passed 600 s of ci-hub's 4200 s run budget (https://github.com/rrnewton/hermit/issues/3906)."########,
         labels: &[r########"quick"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features liteinst && ./ci/nextest-binaries.rs prepare quick"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features third-party-backends && ./ci/nextest-binaries.rs prepare quick"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -10776,9 +10092,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"super"########,
         job: r########"build_workspace"########,
         desc: r########"Build workspace"########,
-        description: r########"On the host, runs `cargo build --workspace --features liteinst` in the dev profile and then `./ci/nextest-binaries.rs prepare super`, which builds and lists the test executables of every prepared Nextest selection the super profile's diagnostic nodes name (15 selections, as both 2026-10-08 runs printed) and records their hashes, so none of those nodes compiles. Its 28 dependents are those super.* Nextest diagnostics, super.build_pinned_leveldb_super_fixture, and the KVM and DBT stress nodes and their availability probes, which run the target/debug/hermit it produces. A compile error in any workspace crate, or a super node whose selection lacks HERMIT_PREPARED_NEXTEST_REQUIRED=1 (prepare refuses it), stops most of the super profile here. WIDTH, WALL AND MEMORY: it runs at 8 CPUs (CpuBound, preferred_inner_jobs 8, passed to Cargo as CARGO_BUILD_JOBS rather than as a trailing -j, which `nextest-binaries.rs prepare` refuses). As a light node it got dagrun's default one-CPU box, where its 1022-1305 CPU-seconds cannot fit a 600 s wall (https://github.com/rrnewton/hermit/issues/3911). In the super-profile validation of Hermit 77a3f25a on 2026-10-08, on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", it took 316 s and 1022 CPU-seconds while held at its old 16 GiB memory cap (27341 memory.max events) and CPU-throttled for 309 s. One cold run of the same command at 8 jobs in its own uncapped systemd scope took 433 s, 1305 CPU-seconds and a 19.84 GiB memory.peak (page cache included). The bounds are 1200 s wall (2.8 times 433 s), 7200 CPU-seconds (5.5 times 1305) and a 32 GiB hard memory cap (1.6 times 19.84 GiB) over a 20 GiB working set."########,
+        description: r########"On the host, runs `cargo build --workspace --features third-party-backends` in the dev profile and then `./ci/nextest-binaries.rs prepare super`, which builds and lists the test executables of every prepared Nextest selection the super profile's diagnostic nodes name (15 selections, as both 2026-10-08 runs printed) and records their hashes, so none of those nodes compiles. Its 28 dependents are those super.* Nextest diagnostics, super.build_pinned_leveldb_super_fixture, and the KVM and DBT stress nodes and their availability probes, which run the target/debug/hermit it produces. A compile error in any workspace crate, or a super node whose selection lacks HERMIT_PREPARED_NEXTEST_REQUIRED=1 (prepare refuses it), stops most of the super profile here. WIDTH, WALL AND MEMORY: it runs at 8 CPUs (CpuBound, preferred_inner_jobs 8, passed to Cargo as CARGO_BUILD_JOBS rather than as a trailing -j, which `nextest-binaries.rs prepare` refuses). As a light node it got dagrun's default one-CPU box, where its 1022-1305 CPU-seconds cannot fit a 600 s wall (https://github.com/rrnewton/hermit/issues/3911). In the super-profile validation of Hermit 77a3f25a on 2026-10-08, on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", it took 316 s and 1022 CPU-seconds while held at its old 16 GiB memory cap (27341 memory.max events) and CPU-throttled for 309 s. One cold run of the same command at 8 jobs in its own uncapped systemd scope took 433 s, 1305 CPU-seconds and a 19.84 GiB memory.peak (page cache included). The bounds are 1200 s wall (2.8 times 433 s), 7200 CPU-seconds (5.5 times 1305) and a 32 GiB hard memory cap (1.6 times 19.84 GiB) over a 20 GiB working set."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features liteinst && ./ci/nextest-binaries.rs prepare super"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features third-party-backends && ./ci/nextest-binaries.rs prepare super"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -10808,9 +10124,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"super"########,
         job: r########"build_release_hermit"########,
         desc: r########"Build release Hermit"########,
-        description: r########"Runs `cargo build --release -p hermit-run --features liteinst` on the host, producing the target/release/hermit that the super profile's product probes use: super-compatprep.fixtures and the four compat.* rows behind it (rustc, javac, java, node), and the three ptrace stress nodes (strict verify of /bin/echo, a bash pipeline, and record/replay). It is the same core command as compatprep.hermit_release and qemu.hermit_release in the focused profiles; super needs its own copy because those nodes are not in the super plan. A compile error that appears only with optimisations or only in the hermit package's release build stops all of those dependents. WIDTH AND WALL: it runs at 8 CPUs (CpuBound, preferred_inner_jobs 8, passed to Cargo as CARGO_BUILD_JOBS), the width of compatprep.hermit_release, which runs the same command. As a light node it got dagrun's default one-CPU box, where the build's ~800 CPU-seconds exceed its 600 s wall (https://github.com/rrnewton/hermit/issues/3911). In the super-profile validation of Hermit 77a3f25a on 2026-10-08, on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", it took 171 s, 801 CPU-seconds and a 3.4 GiB peak. The bounds are 600 s wall (3.5 times 171 s) and 2400 CPU-seconds (3.0 times 801)."########,
+        description: r########"Runs `cargo build --release -p hermit-run --features third-party-backends` on the host, producing the target/release/hermit that the super profile's product probes use: super-compatprep.fixtures and the four compat.* rows behind it (rustc, javac, java, node), and the three ptrace stress nodes (strict verify of /bin/echo, a bash pipeline, and record/replay). It is the same core command as compatprep.hermit_release and qemu.hermit_release in the focused profiles; super needs its own copy because those nodes are not in the super plan. A compile error that appears only with optimisations or only in the hermit package's release build stops all of those dependents. WIDTH AND WALL: it runs at 8 CPUs (CpuBound, preferred_inner_jobs 8, passed to Cargo as CARGO_BUILD_JOBS), the width of compatprep.hermit_release, which runs the same command. As a light node it got dagrun's default one-CPU box, where the build's ~800 CPU-seconds exceed its 600 s wall (https://github.com/rrnewton/hermit/issues/3911). In the super-profile validation of Hermit 77a3f25a on 2026-10-08, on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", it took 171 s, 801 CPU-seconds and a 3.4 GiB peak. The bounds are 600 s wall (3.5 times 171 s) and 2400 CPU-seconds (3.0 times 801)."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --release -p hermit-run --features liteinst"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --release -p hermit-run --features third-party-backends"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -10839,7 +10155,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Relaxed Hermit flag matrix"########,
         description: r########"Runs the ignored test meaningful_flag_combinations_run_without_crashing (hermit-cli/tests/relaxed_flag_matrix.rs) through ci/run-nextest-counted.sh on one thread, writing a TSV report to target/relaxed-flag-matrix/results.tsv. It runs 189 cases: 60 ptrace-backend configurations (`--backend=ptrace run --base-env=minimal --max-timeslice=disabled` combined with --no-sequentialize-threads, --no-deterministic-io, --no-virtualize-time, --no-virtualize-metadata, --no-virtualize-cpuid and --verify) plus three passthrough ones (--strace-only, --strace-only --verify, --namespace-only), each against /bin/true, /bin/echo and a compiled threaded probe (tests/c/relaxed_flag_matrix.c), with a 30-second timeout per case. It guards against unusual flag combinations crashing or hanging Hermit; a nondeterministic --verify verdict is recorded in the report, not treated as a failure. A case fails on a panic, segmentation fault or stack overflow message, on timeout exit 124, or when a direct run omits the guest marker. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_FLAG_MATRIX_REPORT=$PWD/target/relaxed-flag-matrix/results.tsv $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test relaxed_flag_matrix meaningful_flag_combinations_run_without_crashing -j 1 --no-capture -- --exact --ignored"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_FLAG_MATRIX_REPORT=$PWD/target/relaxed-flag-matrix/results.tsv $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test relaxed_flag_matrix meaningful_flag_combinations_run_without_crashing -j 1 --no-capture -- --exact --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -10990,7 +10306,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Pselect signal-interruption diagnostic"########,
         description: r########"Runs the whole pselect6_simulation integration binary (three tests: pselect6_preserves_kernel_abi_and_unblocks_scheduler, pselect6_sleeps_under_its_temporary_mask, and pselect6_wrapper_validation_preserves_pending_signals) on one thread. The wrapper-validation test compares native, ptrace, and DBT when enabled, preserving blocked/pending SIGCHLD across the malformed-timeout probe, then delivering it exactly once after unblocking; it also retains wrapper permission and error-order checks. The second compiles tests/c/pselect_temporary_mask.c and runs its five modes under `hermit --log=info run --strict --verify --verify-strict --base-env=minimal`, requiring the guest's own Linux check, a matched verdict, bitwise parity and nonzero compared INFO messages on each side: a SIGALRM that pselect6's temporary mask blocks must not end the call or run its handler during the call, including one that fires as the call starts, and one that only the temporary mask unblocks must end it with EINTR and its handler run before pselect returns, with a timeout the guest prints, the remaining time must hold no host time, and a sibling's rewrite of the mask buffer during the call must change nothing (https://github.com/rrnewton/hermit/issues/3991). The test compiles tests/c/pselect6_simulation.c and runs it twice on the default ptrace backend under a 30-second timeout: `hermit --log=trace run --strict --base-env=minimal`, which must print pselect6-simulation-ok and log "Retry #1 for syscall due to result Ok(0): pselect6(", then `hermit --log=info run --strict --verify --base-env=minimal`, which must print "Determinism verified". The guest checks that Hermit keeps pselect6's kernel ABI: EINVAL and EFAULT ordering, timeout writeback, SIGUSR1 from a helper thread interrupting pselect6 with EINTR and a partly decremented timeout, and a delayed pipe writer waking an infinite wait. If the strict scheduler stopped polling a blocked pselect6 by retry, the trace line is missing; if the wait never returns, the timeout kills the run. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test pselect6_simulation -j 1 --"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test pselect6_simulation -j 1 --"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11019,7 +10335,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Record/replay matrix diagnostic"########,
         description: r########"Runs record_replay_matrix from hermit-cli/tests/record_replay.rs on one thread. For each of ten baseline workloads (c_getpid, c_ioctl_fioclex, c_ioctl_siocethtool, c_recvmsg_scm_rights_mmap, c_ppoll_readv, c_uname, c_sysinfo, c_wait_on_child, c_nanosleep_parallel, rs_clock_gettime), taken from the prepared workload set named by HERMIT_PREPARED_RECORD_WORKLOADS, it runs `hermit record start --verify --record-timeout=30 --data-dir=<tmp> -- <workload>` under a 45-second timeout and requires exit 0 and "Success: replay matched recording." It protects record/replay for basic syscalls, ioctls, SCM_RIGHTS descriptor passing, ppoll, child waits and clock reads; the test notes that record/replay does not enable PMU preemption, so it needs no performance counters. A workload whose replay diverges from its recording, or a recording that hangs until the timeout, fails the test. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test record_replay record_replay_matrix -j 1 -- --exact"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test record_replay record_replay_matrix -j 1 -- --exact"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11048,7 +10364,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Managed JVM strict-verify diagnostics"########,
         description: r########"Runs the ignored tests in hermit-cli/tests/app_strict_verify.rs whose names contain java, on one thread with HERMIT_APP_VERIFY_TIMEOUT=20s: six JVM workloads (java_hello, java_threads, java_thread_counter, java_gc_stress, java_jit_hot_loop, java_hashmap_string) and javac_is_l1_deterministic_under_strict. Each JVM test compiles its class with the host javac and runs the JVM under `hermit --log=info run --strict --verify --no-virtualize-cpuid` with -XX:+UseSerialGC, -XX:ActiveProcessorCount=1 and, except for the JIT test, -Xint, keeping PMU-driven preemption on because the JVM livelocks with --max-timeslice=disabled; it requires exit 0 and "Determinism verified". The javac test compiles Hello.java twice under --strict and byte-compares the class files. The portable test.app_strict_verify node skips these cases, so JVM determinism under strict mode is checked here. A JVM run longer than 20 seconds, or differing class files, fails. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_APP_VERIFY_TIMEOUT=20s RUST_BACKTRACE=1 $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test app_strict_verify java -j 1 --no-capture -- --ignored"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_APP_VERIFY_TIMEOUT=20s RUST_BACKTRACE=1 $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test app_strict_verify java -j 1 --no-capture -- --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11095,7 +10411,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
+        timeout: 180,
         cpu_timeout: 360,
         jobs_flag: None,
         jobs_env: None,
@@ -11124,7 +10440,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
+        timeout: 180,
         cpu_timeout: 360,
         jobs_flag: None,
         jobs_env: None,
@@ -11135,7 +10451,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"IPC determinism diagnostic"########,
         description: r########"Runs ipc_patterns_are_deterministic_across_five_runs from hermit-cli/tests/ipc_determinism.rs. It compiles tests/c/ipc_determinism.c and runs each of five patterns (pipe-order, pipe-capacity, socketpair, eventfd, epoll) five times with `hermit run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled` on the default ptrace backend, without --strict, each under a 15-second timeout. Each pattern's stdout must start with its name and be identical across the five runs, and pipe-capacity must print exactly pipe-capacity:8192:a5, because Hermit must not expose the host's pipe-page pressure. It protects repeatable ordering and capacity results for pipes, socketpairs, eventfd and epoll. A pipe capacity that reflected host state, or epoll readiness reported in a different order on one run, fails the test. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -j 1 -- --exact"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -j 1 -- --exact"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11153,7 +10469,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
+        timeout: 180,
         cpu_timeout: 360,
         jobs_flag: None,
         jobs_env: None,
@@ -11164,7 +10480,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Random-source determinism diagnostic"########,
         description: r########"Runs random_sources_repeat_across_runs_and_change_with_seed from hermit-cli/tests/random_determinism.rs. It compiles tests/c/random_sources.c, which reads randomness through sources including getrandom (libc and raw syscall) and checks flag validation and fault handling, and runs it five times with `hermit run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --rng-seed=17` on the default ptrace backend. The five outputs must be non-empty and identical, and a run with --rng-seed=18 must print something different. It protects seeded randomness: the same seed gives the same bytes, and the seed has an effect. If a random source leaked host entropy, the five runs would differ; if the seed were ignored, the seed-18 output would match and the test fails. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test random_determinism random_sources_repeat_across_runs_and_change_with_seed -j 1 -- --exact"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test random_determinism random_sources_repeat_across_runs_and_change_with_seed -j 1 -- --exact"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11182,7 +10498,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
+        timeout: 180,
         cpu_timeout: 360,
         jobs_flag: None,
         jobs_env: None,
@@ -11193,7 +10509,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Threaded integration matrix diagnostic"########,
         description: r########"Runs the whole integration_matrix binary (one test, integration_matrix, in hermit-cli/tests/integration_matrix.rs). Each case runs twice as `hermit --log=off run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --bind=<fixture>:/tmp/integration-matrix -- <program>` on the default ptrace backend, and a run still going after 30 seconds has its process group killed. Required cases are echo, ls and cat; optional cases, skipped when the program is absent, are sqlite3, python3, a four-worker node script, an eight-thread Java jar and git --version; nginx -t is expected to fail. A pass needs both runs to exit 0, print the expected marker (for example SHARED_FUTEX_NODE_OK workers=4) and give identical exit status, stdout and stderr. It checks that common multi-threaded host programs run repeatably under Hermit. A second node run with different stderr, or nginx -t succeeding, fails the matrix. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test integration_matrix -j 1 --"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test integration_matrix -j 1 --"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11222,7 +10538,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Chaos hello-race verification diagnostic"########,
         description: r########"Runs hello_race_chaos_verify from hermit-cli/tests/hermit_modes.rs. It compiles flaky-tests/hello_race.rs, a deliberately racy two-thread program, and runs `hermit run --verify --verify-allow=both --chaos --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --env=HERMIT_MODE=chaos` on it with the default ptrace backend. --verify-allow=both accepts any guest exit status, so the property under test is that the chaos-mode run repeats itself: stderr must contain "Success: deterministic." and Hermit must exit with a status code, not a signal. It protects reproducibility of chaos scheduling without PMU preemption. If chaos scheduling drew on host timing so the two verify runs took different interleavings, Hermit would report nondeterminism and the test fails with "chaos verification for hello_race failed". A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test hermit_modes hello_race_chaos_verify -j 1 -- --exact"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test hermit_modes hello_race_chaos_verify -j 1 -- --exact"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11247,11 +10563,156 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     },
     StaticStepSpec {
         group: r########"super"########,
+        job: r########"dbt_pipe_backpressure_diagnostic"########,
+        desc: r########"DBT pipe backpressure diagnostic"########,
+        description: r########"Runs run_dbt_verifies_pipe_backpressure from hermit-cli/tests/cli.rs, with Hermit built with third-party-backends so the DBT backend is present. The test runs `hermit --backend dbt run --verify -- /bin/bash -c '{ printf "%4096s" x; <100000-iteration loop>; printf "%1371s" y; } | wc -c'`, which must exit 0, print 5467 and report ":: Success: deterministic. Determinism verified." The shell writes 4096 bytes, spins, then writes 1371 more, so wc must read a split write across a blocking pipe. Review comments tie it to a host-inherited O_NONBLOCK regression (https://github.com/rrnewton/hermit/issues/598) and partial-read semantics (https://github.com/rrnewton/hermit/issues/689). If the guest's pipe behaved as non-blocking or lost part of the split write, wc would print a different count or the verify would fail. A failure is blocking for the super validation."########,
+        labels: &[r########"super"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test cli run_dbt_verifies_pipe_backpressure -j 1 -- --exact"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[r########"super.build_workspace"########],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 0.0,
+            rss_baseline_bytes: Some(8589934592),
+            hard_mem_max_bytes: Some(8589934592),
+            classification: StepClass::Light,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 300,
+        cpu_timeout: 600,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"super"########,
+        job: r########"dbt_failed_exec_recovery_diagnostic"########,
+        desc: r########"DBT failed-exec recovery diagnostic"########,
+        description: r########"Runs run_dbt_recovers_after_failed_exec from hermit-cli/tests/cli.rs, with the DBT backend compiled in through third-party-backends. The test compiles tests/c/dbt_exec_failure.c and runs it with `hermit --backend dbt run --strict --verify`. The guest calls execve on /definitely/missing, requires it to fail with ENOENT, sleeps 1 ms with nanosleep and prints "recovered after failed exec". The run must exit 0, print exactly that line and report ":: Success: deterministic. Determinism verified." It protects the DBT backend's handling of a failed exec: the guest must keep running in its original image after the kernel refuses the exec, and the run must stay deterministic. If the backend tore down or lost track of the process when execve returned an error, the guest would exit non-zero or print nothing, and the test fails. A failure is blocking for the super validation."########,
+        labels: &[r########"super"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test cli run_dbt_recovers_after_failed_exec -j 1 -- --exact"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[r########"super.build_workspace"########],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 0.0,
+            rss_baseline_bytes: Some(8589934592),
+            hard_mem_max_bytes: Some(8589934592),
+            classification: StepClass::Light,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 180,
+        cpu_timeout: 360,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"super"########,
+        job: r########"dbt_unsupported_syscall_aggregation_diagnostic"########,
+        desc: r########"DBT unsupported-syscall aggregation diagnostic"########,
+        description: r########"Runs the exact maintained CLI aggregation test. DBT refuses unsupported restart_syscall by default and under --strict, while explicit opt-out preserves the syscall result and prints one deduplicated warning across ordinary and copied fork/exec children. The test also checks report-channel tampering, child descriptor closure and the unchanged strict refusal. A failure is blocking for super validation."########,
+        labels: &[r########"super"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test cli run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls -j 1 -- --exact"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[r########"super.build_workspace"########],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 0.0,
+            rss_baseline_bytes: Some(8589934592),
+            hard_mem_max_bytes: Some(8589934592),
+            classification: StepClass::Light,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 180,
+        cpu_timeout: 360,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"super"########,
+        job: r########"dbt_strict_blocked_stdin_teardown_diagnostic"########,
+        desc: r########"DBT strict blocked-stdin teardown diagnostic"########,
+        description: r########"Runs run_dbt_strict_returns_with_blocked_stdin_source from hermit-cli/tests/cli.rs, with the DBT backend compiled in. The test starts `sleep 30` with its stdout piped and passes that pipe as stdin to `hermit --backend dbt run --strict -- dbt_unsupported_syscall` (compiled from tests/c/dbt_unsupported_syscall.c, which calls the unsupported restart_syscall), wrapped in `timeout --kill-after 2s 10s`. Hermit must not hit the timeout (exit 124), must fail, and must print "unsupported syscall". It protects strict-mode DBT teardown: when the guest is refused, Hermit must return even though its stdin source is still open and silent. A Hermit that waited for stdin to reach end-of-file before exiting would be killed after 10 seconds, and the test reports "strict DBT hung on stdin". A failure is blocking for the super validation."########,
+        labels: &[r########"super"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test cli run_dbt_strict_returns_with_blocked_stdin_source -j 1 -- --exact"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[r########"super.build_workspace"########],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 0.0,
+            rss_baseline_bytes: Some(8589934592),
+            hard_mem_max_bytes: Some(8589934592),
+            classification: StepClass::Light,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 120,
+        cpu_timeout: 60,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"super"########,
+        job: r########"dbt_guest_stderr_isolation_diagnostic"########,
+        desc: r########"DBT guest-stderr isolation diagnostic"########,
+        description: r########"Runs run_dbt_keeps_diagnostics_out_of_guest_stderr from hermit-cli/tests/cli.rs, with the DBT backend compiled in. First it runs `hermit --log INFO --backend dbt run --strict -- /bin/bash -c ...`, where the script captures the stderr of a static no-libc guest and must print isolated=guest-stderr; Hermit's own stderr must contain "INFO detcore" and "DETLOG [syscall]" but not the guest's text. Then, with HERMIT_LOG unset and set to a sentinel, it runs a log-environment guest with --strict --verify --verify-strict --keep-logs and --verify-json, requiring the exit status to agree with the JSON verdict, exactly two retained logs containing INFO detcore, and no guest output in them. It protects the separation between DBT controller diagnostics and the guest's fd 2 and HERMIT_LOG. If controller logging wrote into the guest's stderr, the captured text would not equal guest-stderr and the test fails. A failure is blocking for the super validation."########,
+        labels: &[r########"super"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test cli run_dbt_keeps_diagnostics_out_of_guest_stderr -j 1 -- --exact"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[r########"super.build_workspace"########],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 0.0,
+            rss_baseline_bytes: Some(8589934592),
+            hard_mem_max_bytes: Some(8589934592),
+            classification: StepClass::Light,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 120,
+        cpu_timeout: 240,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"super"########,
         job: r########"weekly_relaxed_default_mode_cases"########,
         desc: r########"Weekly relaxed default-mode cases"########,
         description: r########"Runs every non-ignored test in hermit-cli/tests/hermit_modes.rs whose name contains default_, on one thread: default_mode_matrix, 44 default_<workload> tests generated by default_workload_tests!, and eight CLI checks (default_minimal_hello, default_lit_networking, default_exit_codes, default_virtualized_uname, default_cat_issue, default_bind_mounts, default_preserved_tmpfs, default_environment_selection). Most run a compiled C, Rust or shell workload with `hermit run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --no-sequentialize-threads --no-deterministic-io` on the default ptrace backend and require exit 0; some also check output, such as uname -nr printing "hermetic-container.local 5.2.0" or exit codes 0, 1 and 42 propagating. It covers Hermit's relaxed default mode, where threads are not sequentialized. Two cases known to block (bind/connect race, clock total order) are ignored and not run. A workload that crashes or exits non-zero in relaxed mode fails its test. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test hermit_modes default_ -j 1 --"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test hermit_modes default_ -j 1 --"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11280,7 +10741,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Weekly portable chaos cases"########,
         description: r########"Runs the non-ignored tests of hermit-cli/tests/stress_suite.rs on one thread: chaos_finds_and_reproduces_order_violation and schedule_bisect_localizes_publish_ordering_race (the --skip of slow_cas_search_and_replay has no effect, as that test is ignored). Both use `hermit run --base-env=minimal --chaos --sched-heuristic=random --max-timeslice=disabled --no-virtualize-cpuid --seed=N` on the default ptrace backend with a 10-second timeout per run, so no PMU is needed. The first requires tests/chaos/order_violation.c to print "Hello world!" without chaos, one of seeds 0-15 to expose the race, and the first such seed to reproduce "ERROR! global_str is null at use." twice. It names no seed, because the seed depends on the guest binary: 9 when built on the validation host, 8 in the pinned validate root. The second records preemptions, under one fixed epoch, for a passing and a failing publish-ordering seed among seeds 0-39 (all of 0-9 expose the race in the pinned root), then requires `hermit bisect` to localize the divergence to two adjacent events with stack traces. The binary also runs in test.hermit_integration. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test stress_suite -j 1 -- --skip slow_cas_search_and_replay"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test stress_suite -j 1 -- --skip slow_cas_search_and_replay"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11309,7 +10770,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Weekly ignored portable chaos cases"########,
         description: r########"Runs only the ignored tests of hermit-cli/tests/stress_suite.rs, minus the PMU-dependent slow_cas_search_and_replay: targeted_chaos_finds_order_violation_at_least_as_often, fast_chaos_matrix and slow_race_matrix. All use chaos mode with --sched-heuristic=random and --max-timeslice=disabled on the default ptrace backend, 10 seconds per run. The targeted test requires --chaos-target-races to expose the order-violation race in at least as many of seeds 0-15 as uniform chaos, and to reproduce it. fast_chaos_matrix runs eight categories of tests/stress/concurrency.rs at 2, 4, 8 and 16 threads over 10 seeds: racy categories must be exposed (two of them only below 16 threads), and correct ones (mutex-correctness, rwlock-fairness, store-buffer) never. slow_race_matrix requires producer-consumer and condvar-lost-wakeup to be exposed at 16 threads within 100 seeds. A correct category reporting a failure, or a guest timeout, fails the test. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test stress_suite -j 1 -- --ignored --skip slow_cas_search_and_replay"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test stress_suite -j 1 -- --ignored --skip slow_cas_search_and_replay"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11338,7 +10799,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"PMU Buck chaos cases"########,
         description: r########"Runs the hermit-cli/tests/hermit_modes.rs tests whose names contain chaos_buck_, with --ignored, which selects only ignored tests: chaos_buck_nanosleep_parallel and chaos_buck_mem_race, not the six non-ignored chaos_buck_ cases that privileged-test.pmu_buck_chaos_cases runs. Each runs `hermit run --verify --chaos --base-env=empty --max-timeslice=1000000 --env=HERMIT_MODE=chaos` on its compiled workload (nanosleep-par.c and the Rust mem_race workload) from the workload's build directory, so chaos preemption uses the PMU branch-counter timer, and requires exit 0. Both are ignored as known PMU chaos failures tracked in https://github.com/rrnewton/hermit/issues/2791: nanosleep_parallel fails after an interrupted nanosleep reports EINTR, and mem_race produced no verdict within 300 seconds. Unless those defects are fixed, this node is expected to fail, and that failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test hermit_modes chaos_buck_ -j 1 -- --ignored"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test hermit_modes chaos_buck_ -j 1 -- --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11365,7 +10826,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"super"########,
         job: r########"pmu_analyze_hello_race_stress_calibrated_skid"########,
         desc: r########"PMU analyze hello-race stress (calibrated skid)"########,
-        description: r########"Calibrates the PMU skid margin on the host, then runs the ignored analyze_hello_race, bisect_rejects_a_timed_out_replay, analyze_stops_on_a_refused_trial and analyze_ends_with_a_refused_target_run tests. The shell command checks four positive-integer settings (ANALYZE_SKID_CALIBRATION_ITERATIONS, default 64; ANALYZE_SKID_CALIBRATION_PERIOD, 1000000; ANALYZE_SKID_MINIMUM_MARGIN, 20000; ANALYZE_SKID_CALIBRATION_TIMEOUT, 30 seconds), compiles tests/util/pmu_skid.c into target/ci-pmu-skid, runs it to read "Recommended margin: N RCB", and passes the larger of N and the floor as HERMIT_ANALYZE_SKID_MARGIN. analyze_hello_race (hermit-cli/tests/analyze.rs) then runs `hermit analyze --run-arg=--base-env=host --run-arg=--skid-margin=<margin> --analyze-seed=0 --search -- --chaos --summary --max-timeslice=400000 -- hello_race`, which must exit 0, print a guest stack trace and name flaky-tests/hello_race.rs:37. It checks that hermit analyze pinpoints the hello_race race with PMU-driven chaos preemption sized to this host's measured skid. The bisect timeout regression runs an endless guest with a one-second Hermit timeout and a 30-second outer bound; it requires exit 124 with the typed run-timeout marker and no successful report or causal claim. The refusal cases require a named restart_syscall refusal, exact policy-refusal exit 122 and no causal report, while distinguishing an ordinary completed guest exit 122. A missing calibration line exits with an error before the tests; a different pinpointed line or a lost timeout classification fails the tests. A failure is blocking for the super validation."########,
+        description: r########"Calibrates the PMU skid margin on the host, then runs the ignored analyze_hello_race test. The shell command checks four positive-integer settings (ANALYZE_SKID_CALIBRATION_ITERATIONS, default 64; ANALYZE_SKID_CALIBRATION_PERIOD, 1000000; ANALYZE_SKID_MINIMUM_MARGIN, 20000; ANALYZE_SKID_CALIBRATION_TIMEOUT, 30 seconds), compiles tests/util/pmu_skid.c into target/ci-pmu-skid, runs it to read "Recommended margin: N RCB", and passes the larger of N and the floor as HERMIT_ANALYZE_SKID_MARGIN. analyze_hello_race (hermit-cli/tests/analyze.rs) then runs `hermit analyze --run-arg=--base-env=host --run-arg=--skid-margin=<margin> --analyze-seed=0 --search -- --chaos --summary --max-timeslice=400000 -- hello_race`, which must exit 0, print a guest stack trace and name flaky-tests/hello_race.rs:37. It checks that hermit analyze pinpoints the hello_race race with PMU-driven chaos preemption sized to this host's measured skid. A missing calibration line exits with an error before the test; a different pinpointed line fails the test. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -u
 iters=${ANALYZE_SKID_CALIBRATION_ITERATIONS:-64}
@@ -11393,7 +10854,7 @@ margin=$rec
 if [ "$margin" -lt "$floor" ]; then margin=$floor; fi
 printf 'Analyze PMU skid margin: calibrated=%s RCB, conservative floor=%s RCB, using=%s RCB\n' \
     "$rec" "$floor" "$margin"
-HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --features liteinst --test analyze -j 1 -E 'test(=analyze_hello_race) | test(=bisect_rejects_a_timed_out_replay) | test(=analyze_stops_on_a_refused_trial) | test(=analyze_ends_with_a_refused_target_run)' -- --ignored"########,
+HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test analyze -j 1 analyze_hello_race -- --exact --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"analyze"########]),
@@ -11454,7 +10915,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         desc: r########"Full LevelDB strict determinism"########,
         description: r########"Runs the ignored full_leveldb_suite_is_deterministic_under_strict test from hermit-cli/tests/leveldb.rs, with HERMIT_LEVELDB_BUILD_DIR set to the fixture built by super.build_pinned_leveldb_super_fixture. The test runs the whole leveldb_tests GoogleTest binary, without a filter, as `hermit --log=info run --strict --verify --base-env=minimal -- leveldb_tests` on the default ptrace backend, and requires exit 0 and "Success: deterministic. Determinism verified." on stderr. It checks that a real storage library's complete suite, including what the ignore reason calls long concurrent and randomized stress cases, passes and repeats exactly under strict mode. If one of LevelDB's threaded tests printed different output in the second verify run, Hermit would report nondeterminism and the test fails; an unset build directory makes it panic. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_LEVELDB_BUILD_DIR=$PWD/target/hermit-leveldb-build-super $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test leveldb full_leveldb_suite_is_deterministic_under_strict -j 1 -- --exact --ignored"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_LEVELDB_BUILD_DIR=$PWD/target/hermit-leveldb-build-super $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test leveldb full_leveldb_suite_is_deterministic_under_strict -j 1 -- --exact --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11483,7 +10944,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         desc: r########"SQLite veryquick strict determinism"########,
         description: r########"Runs the ignored sqlite_veryquick_is_deterministic_under_strict_hermit test, which runs hermit-cli/tests/fixtures/sqlite-veryquick/run.sh with the test's Hermit binary. The script downloads sqlite-src-3510200.zip (SQLite 3.51.2) from sqlite.org and checks its SHA-256, applies root-userns.patch, builds the static testfixture, then runs `hermit --log off run --workdir=RUN_DIR --strict -- testfixture test/veryquick.test --verbose=0` twice. Each run must stall at the known lock4 point (the script watches for "Time: lock3.test " and stops a run whose output stops growing for 30 seconds) with exactly the 13 known pre-stall failures, and the two runs' normalized stdout and stderr must match. The test then requires "SQLite 3.51.2 veryquick: reproduced lock4 stall with 13 identical pre-stall failures." It tracks a reproducible known limitation, not a full pass. A run that finishes instead of stalling, or a different failure list, fails it. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features liteinst --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -j 1 -- --exact --ignored"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -j 1 -- --exact --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11512,7 +10973,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         desc: r########"Build Hermit and the focused test binaries used by the privileged lane"########,
         description: r########"MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which MISSED this privileged-lane build node): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 on all three Cargo commands (was unset -> cargo defaulted build phases to nproc; that cc1plus fan-out is the OOM class the pin bounds; the job-pin is the actual fix). The final command prebuilds the exact cli and hermit_modes integration binaries consumed by the privileged test nodes, so their wall budgets measure test execution instead of Cargo compilation or target-lock waiting. After the bin build, the content-addressed publisher verifies source type/mode/size, hashes before and after copying, verifies the published hash and atomically updates the pointer before any later Cargo invocation can relink target/debug/hermit. This privileged lane deliberately publishes a binary-only artifact; unlike portable DBT/SaBRe/LiteInst cells, it does not consume install_pkg resources. Cap KEPT at the existing generous 8.0GiB: a warm/incremental measurement read peak_bytes~1.64GiB @j8, but that reused build.workspace artifacts and UNDER-estimates a cold from-scratch privileged build, so the 8.0GiB headroom is retained rather than tightened on an unreliable warm figure. rss_baseline=5.0GiB (scheduling reservation). hermit@b384187e."########,
         labels: &[r########"privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit-run --features liteinst --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit-run --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11602,7 +11063,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         desc: r########"Run the six measured-passing Buck chaos cases under PMU preemption"########,
         description: r########"The six enabled cases passed direct measurement on the privileged host. chaos_buck_nanosleep_parallel remains ignored because an interrupted nanosleep reports EINTR; chaos_buck_mem_race remains ignored because it produced no verdict within 300 seconds. Both remain visible in super.pmu_buck_chaos_cases. Depending on pmu.preemption keeps this coverage in the existing privileged PMU partition without changing quick or portable-only."########,
         labels: &[r########"privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"hermit_modes"########]),
@@ -11620,7 +11081,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
+        timeout: 120,
         cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
@@ -11674,7 +11135,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         group: r########"privileged-only-e2e"########,
         job: r########"manifest_c_programs"########,
         desc: r########"Privileged manifest bucket: c-programs"########,
-        description: r########"The selected cells are the four cpuid-probe verify cells (in-guest-trap, kvm, liteinst, ptrace) plus the cpuid-probe replay cell on ptrace: the kvm and ptrace cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301), and the in-guest LiteInst cells (liteinst, and in-guest-trap with site patching off) that returned on the new architecture after the LiteInst reset (https://github.com/rrnewton/hermit/issues/3745), each run with the maximum timeslice disabled. The selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop."########,
+        description: r########"The selected cells are the five cpuid-probe verify cells (dbt, in-guest-trap, kvm, liteinst, ptrace): the kvm and ptrace cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301), the dbt cell that slice S13 of the same issue carried over from the retired DBT parity matrix, and the in-guest LiteInst cells (liteinst, and in-guest-trap with site patching off) that returned on the new architecture after the LiteInst reset (https://github.com/rrnewton/hermit/issues/3745), each run with the maximum timeslice disabled. The selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop."########,
         labels: &[r########"privileged"########],
         cmd: r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category c-programs --ci-only --prebuilt --results "$E2E_RESULT_ROOT/privileged/manifest_c_programs/results.jsonl" --junit "$E2E_RESULT_ROOT/privileged/manifest_c_programs/junit.xml"'"########,
         cmdtype: CmdType::Unknown,
@@ -11766,12 +11227,12 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         desc: r########"KVM CLI tests and initialized-VM setup cleanup"########,
         description: r########"Runs all 87 KVM-specific hermit CLI tests and the initialized-VM setup cleanup control after requiring /dev/kvm. The inventory gate requires all 87 distinct, nonignored CLI tests including the self-SIGKILL, synchronous-fault, root-exit reparenting, exec timer, nonleader-exec refusal, unreadable futex word, parked-sleep deadline cap, host-peer FIFO, host-syscall-budget, signal-then-sibling-exit, child-exit-notification, raw-child-exit-notification, sigtimedwait-siginfo, inherited-and-disabled-preemption, procfs-directory-size, first-directory-seek, flock-refusal and child-kill-refusal regressions and exactly the named setup test. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource. Its tests run eight at a time: preferred_inner_jobs 8, passed to nextest as NEXTEST_TEST_THREADS, which also sizes the step's cpu.max. (A literal -j 8 with no inner-jobs hint ran eight tests under the default one-core cpu.max: in 89264477's validation the node used 0.99 cores, was throttled for 494.7 CPU-seconds, took 62 s instead of 76, and run_kvm_notifies_a_child_exit_once_at_bitwise_parity took 41.5 s against its 60-second limit, 7.4 s at -j 1.) They ran one at a time only by inheritance from the July 2026 validate.sh, which passed --test-threads=1 to every suite, and this node holds the integration_test_binaries.cli token, so its whole run sits on the critical path: 87 s of the 341-second token chain in 39d822fb's full validation. Measured on 2026-10-15 at host load 290-317: -j 1 took 73-80 s; -j 8 took 11.6-16.0 s, with all 84 tests passing in 24 of 24 runs, and a peak summed RSS of 6.47 GiB against 6.08 GiB at -j 1."########,
         labels: &[r########"privileged"########, r########"kvm"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit-run --features liteinst,kvm-execution-tests --lib --test cli -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] as $selected | ($selected | length == 129) and ([$selected[].key] | unique | length == 129) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == "run_kvm_self_sigkill_from_nonleader_is_group_fatal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_root_segv_preserves_guest_exit")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_orphan_segv_preserves_root_success")] | length == 1) and ([$selected[] | select(.key == "run_kvm_root_exit_reparents_live_child_and_grandchild")] | length == 1) and ([$selected[] | select(.key == "run_kvm_exec_deletes_posix_timers_and_preserves_itimer")] | length == 1) and ([$selected[] | select(.key == "run_kvm_nonleader_exec_is_policy_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_futex_wait_on_an_unreadable_word_matches_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_sleep_carries_the_deadline_cap")] | length == 1) and ([$selected[] | select(.key == "run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_costs_one_host_syscall_per_guest_syscall")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_sibling_may_exit_while_its_signal_is_taken")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does")] | length == 1) and ([$selected[] | select(.key == "run_kvm_with_a_resolved_or_explicitly_disabled_maximum")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_procfs_directory_keeps_its_size")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_directory_descriptors_first_seeks")] | length == 1) and ([$selected[] | select(.key == "run_kvm_flock_excludes_as_ptrace_does")] | length == 1) and ([$selected[] | select(.key == "run_kvm_cpuid_rows_match_ptrace")] | length == 1) and ([$selected[] | select(.key == "run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key == "run_kvm_procfs_directories_are_served_only_in_a_container")] | length == 1) and ([$selected[] | select(.key == "run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_relative_names_are_decided_by_the_guests_working_directory")] | length == 1) and ([$selected[] | select(.key == "run_kvm_dotdot_names_are_decided_by_where_they_lead")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_virtual_cpus_are_listed_by_every_spelling")] | length == 1) and ([$selected[] | select(.key == "run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory")] | length == 1) and ([$selected[] | select(.key == "run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files")] | length == 1) and ([$selected[] | select(.key == "run_kvm_signal_permits_are_per_thread")] | length == 1) and ([$selected[] | select(.key == "run_kvm_virtual_timeout_is_reported_from_the_childs_note")] | length == 1) and ([$selected[] | select(.key == "run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first")] | length == 1) and ([$selected[] | select(.key == "run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit")] | length == 1) and ([$selected[] | select(.key == "run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_second_path_past_another_process_cmdline_is_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_argument_errors_on_another_process_procfs_answer_as_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts")] | length == 1) and ([$selected[] | select(.key == "run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem")] | length == 1) and ([$selected[] | select(.key == "run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences")] | length == 1) and ([$selected[] | select(.key == "run_kvm_renders_proc_locks_from_the_lock_ledger")] | length == 1) and ([$selected[] | select(.key == "run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting")] | length == 1) and ([$selected[] | select(.key == "run_kvm_refuses_preemption_stack_traces_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_late_timer_event_refuses_the_run_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_late_timer_event_is_a_verify_infrastructure_error")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_main_stack_is_read_from_maps_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_file_view_with_a_second_thread_maps_as_natively")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_file_threads_that_exited_do_not_hold_back_a_fork")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_file_fork_beside_a_live_thread_is_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_an_scm_rights_receipt_over_its_own_header_is_a_named_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_hugetlbfs_view_is_a_named_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_robust_word_kvm_cannot_exchange_is_a_named_refusal_where_ptrace_marks_it")] | length == 1) and ([$selected[] | select(.key == "run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parent_death_signal_reaches_the_child_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_callers_own_proc_directories_answer_as_linux")] | length == 1) and ([$selected[] | select(.key | startswith("run_kvm_"))] | length == 128) and ([$selected[] | select(.key == "kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution")] | length == 1)' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 128 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, the host-peer FIFO, the host-syscall budget, the signal-then-sibling exit, the child-exit and raw child-exit notifications, the sigtimedwait siginfo copy-out, the disabled preemption default, the procfs directory size, the first directory seeks, the flock refusal, the KVM CPUID rows, the child-kill refusal, the parked-wait exec, the parked-read signal exec, the three served-procfs-directory tests, the two group-exit signal-wait tests, the five guest working-directory tests, the per-thread signal-permit test, the virtual-timeout note test, the two SCM_RIGHTS queue tests, the masked-ppoll pending-signal test, the two-path cmdline refusal test, the procfs argument-error test, the two exec-refusal tests, the fdinfo and /proc/locks rendering tests, the chaos spinner bound, the preemption stack-trace refusal, the two late timer event refusals, the late timer event replay refusal, the blocking-inotify refusal test, the main-stack maps test, the dot-dot procfs spellings test, the shared file view beside a second thread, the exited-threads fork test, the fork refusal beside a live thread, the overlapping SCM_RIGHTS receipt refusal, the hugetlbfs view refusal, the unexchangeable robust word refusal, the smaps test, the parent-death signal test, the own /proc directories test, and the named setup test; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst,kvm-execution-tests --lib --test cli -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'; exit $?"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit-run --features third-party-backends,kvm-execution-tests --lib --test cli -E '(test(/^run_kvm_/) - test(=run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting)) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] as $selected | ($selected | length == 91) and ([$selected[].key] | unique | length == 91) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == "run_kvm_self_sigkill_from_nonleader_is_group_fatal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_root_segv_preserves_guest_exit")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_orphan_segv_preserves_root_success")] | length == 1) and ([$selected[] | select(.key == "run_kvm_root_exit_reparents_live_child_and_grandchild")] | length == 1) and ([$selected[] | select(.key == "run_kvm_exec_deletes_posix_timers_and_preserves_itimer")] | length == 1) and ([$selected[] | select(.key == "run_kvm_nonleader_exec_is_policy_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_futex_wait_on_an_unreadable_word_matches_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_sleep_carries_the_deadline_cap")] | length == 1) and ([$selected[] | select(.key == "run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_costs_one_host_syscall_per_guest_syscall")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_sibling_may_exit_while_its_signal_is_taken")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does")] | length == 1) and ([$selected[] | select(.key == "run_kvm_with_a_resolved_or_explicitly_disabled_maximum")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_procfs_directory_keeps_its_size")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_directory_descriptors_first_seeks")] | length == 1) and ([$selected[] | select(.key == "run_kvm_flock_is_a_named_refusal_where_ptrace_excludes")] | length == 1) and ([$selected[] | select(.key == "run_kvm_cpuid_rows_match_ptrace")] | length == 1) and ([$selected[] | select(.key == "run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key | startswith("run_kvm_"))] | length == 90) and ([$selected[] | select(.key == "kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution")] | length == 1)' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 90 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, the host-peer FIFO, the host-syscall budget, the signal-then-sibling exit, the child-exit and raw child-exit notifications, the sigtimedwait siginfo copy-out, the disabled preemption default, the procfs directory size, the first directory seeks, the flock refusal, the KVM CPUID rows, the child-kill refusal, the parked-wait exec, the parked-read signal exec, and the named setup test; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends,kvm-execution-tests --lib --test cli -E '(test(/^run_kvm_/) - test(=run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting)) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'; exit $?"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
         deps: &[r########"privileged-only-build.privileged_tests"########],
-        env: &[(r########"HERMIT_FORBID_SKIPS"########, r########"1"########)],
+        env: &[],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 60.0,
@@ -11784,7 +11245,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
+        timeout: 180,
         cpu_timeout: 7200,
         jobs_flag: Some(""),
         jobs_env: Some("NEXTEST_TEST_THREADS"),
@@ -11827,8 +11288,11 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         job: r########"hermit_release"########,
         desc: r########"Release Hermit for compatibility"########,
         description: r########"Dedicated release build for the focused compatibility profiles that still run per-program probes (e9patch; the corpus-only profile builds its twin in the pinned root); it preserves their pre-cutover command, budgets, memory cap, and eight-job CPU allocation without selecting the broader full-profile runtime build. The sabre-compat-only, strict-compat-only and rr-compat-only profiles do not take it: their buckets run the validation's one build, the e2e artifact. CPU 2400 s since 2026-10-26: a cold build of the same command at -j 8 measured 148 s of wall and 1,155 CPU-s (1,117 user, 38 sys) with a 2.3-GiB peak, and the former 840 CPU-s cap, sized for a warm target, killed the first e9patch-compat-only run in a fresh checkout after 111 s; the nightly e9patch-corpus part runs this lane in a fresh checkout every night."########,
-        labels: &[r########"portable-strict-compat-only"########],
-        cmd: r########"cargo build --release -p hermit-run --features liteinst"########,
+        labels: &[
+            r########"portable-strict-compat-only"########,
+            r########"e9patch-compat-only"########,
+        ],
+        cmd: r########"cargo build --release -p hermit-run --features third-party-backends"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11855,9 +11319,9 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         group: r########"qemu"########,
         job: r########"hermit_release"########,
         desc: r########"Release Hermit for QEMU L2"########,
-        description: r########"Runs `cargo build --release -p hermit-run --features liteinst` on the host, after gate.manifest, as the only build of the qemu-l2-only focused profile. Its single dependent, qemu.strict_l2_boot, runs tests/qemu-boot/strict_l2_test.sh, which defaults to target/release/hermit and to a verification-report binary beside it. The command is the same as super.build_release_hermit and compatprep.hermit_release; the profile keeps its own copy so it can run without the full validation's builds. A release-mode compile error in the hermit package or a third-party backend stops the profile before any QEMU boot is attempted. WIDTH AND WALL: it runs at 8 CPUs (CpuBound, preferred_inner_jobs 8, passed to Cargo as CARGO_BUILD_JOBS), the width of compatprep.hermit_release, which runs the same command. At dagrun's default one CPU the build costs 747-753 CPU-seconds, more than its wall. In the qemu-l2-only validation of Hermit 7f661023 on 2026-10-08, on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", it took 166 s, and qemu.strict_l2_boot then passed in 373 s. The 600 s wall is 3.6 times 166 s. The wall was 3600 s, which made the qemu-l2-only profile refuse every node once preparation passed 600 s of ci-hub's 4200 s run budget (https://github.com/rrnewton/hermit/issues/3906)."########,
+        description: r########"Runs `cargo build --release -p hermit-run --features third-party-backends` on the host, after gate.manifest, as the only build of the qemu-l2-only focused profile. Its single dependent, qemu.strict_l2_boot, runs tests/qemu-boot/strict_l2_test.sh, which defaults to target/release/hermit and to a verification-report binary beside it. The command is the same as super.build_release_hermit and compatprep.hermit_release; the profile keeps its own copy so it can run without the full validation's builds. A release-mode compile error in the hermit package or a third-party backend stops the profile before any QEMU boot is attempted. WIDTH AND WALL: it runs at 8 CPUs (CpuBound, preferred_inner_jobs 8, passed to Cargo as CARGO_BUILD_JOBS), the width of compatprep.hermit_release, which runs the same command. At dagrun's default one CPU the build costs 747-753 CPU-seconds, more than its wall. In the qemu-l2-only validation of Hermit 7f661023 on 2026-10-08, on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", it took 166 s, and qemu.strict_l2_boot then passed in 373 s. The 600 s wall is 3.6 times 166 s. The wall was 3600 s, which made the qemu-l2-only profile refuse every node once preparation passed 600 s of ci-hub's 4200 s run budget (https://github.com/rrnewton/hermit/issues/3906)."########,
         labels: &[r########"qemu-l2-only"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --release -p hermit-run --features liteinst"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --release -p hermit-run --features third-party-backends"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -11913,9 +11377,9 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         group: r########"envelope"########,
         job: r########"build"########,
         desc: r########"Build workspace for envelope measurement"########,
-        description: r########"Runs `cargo build --workspace --features liteinst` in the debug profile on the host, with the prebuilt rust-script environment exported, to produce the target/debug/hermit that all 15 envelope probes invoke. It depends on gate.manifest and carries only the envelope-only label, so it runs only for `./scripts/validate.rs --envelope-only` or `--envelope-compare FILE`; scripts/progress-report.sh and the progress-rubric skill are the callers. Unlike the probes it stays blocking: validate.rs's own self-check refuses an envelope plan in which this build is nonblocking. A build failure is one of only two ways the measurement profile exits nonzero; the other is a baseline regression. Limits: 600 s wall at 8 CPUs (CpuBound, preferred_inner_jobs 8, passed to Cargo as CARGO_BUILD_JOBS), 7200 CPU-s, 16 GiB. At dagrun's default one CPU this build costs about 575 CPU-seconds, so it needs the width. In the envelope-only validation of Hermit 8e0ec926 on 2026-10-08, on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", it took 83 s; 600 s is 7.2 times that. The wall was 3600 s, which made the envelope profile refuse every node once preparation passed 600 s of ci-hub's 4200 s run budget (https://github.com/rrnewton/hermit/issues/3906). A compile error anywhere in the workspace, third-party backends included, fails this node and skips every probe, and each skipped probe scores 0 in envelope.json."########,
+        description: r########"Runs `cargo build --workspace --features third-party-backends` in the debug profile on the host, with the prebuilt rust-script environment exported, to produce the target/debug/hermit that all 15 envelope probes invoke. It depends on gate.manifest and carries only the envelope-only label, so it runs only for `./scripts/validate.rs --envelope-only` or `--envelope-compare FILE`; scripts/progress-report.sh and the progress-rubric skill are the callers. Unlike the probes it stays blocking: validate.rs's own self-check refuses an envelope plan in which this build is nonblocking. A build failure is one of only two ways the measurement profile exits nonzero; the other is a baseline regression. Limits: 600 s wall at 8 CPUs (CpuBound, preferred_inner_jobs 8, passed to Cargo as CARGO_BUILD_JOBS), 7200 CPU-s, 16 GiB. At dagrun's default one CPU this build costs about 575 CPU-seconds, so it needs the width. In the envelope-only validation of Hermit 8e0ec926 on 2026-10-08, on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", it took 83 s; 600 s is 7.2 times that. The wall was 3600 s, which made the envelope profile refuse every node once preparation passed 600 s of ci-hub's 4200 s run budget (https://github.com/rrnewton/hermit/issues/3906). A compile error anywhere in the workspace, third-party backends included, fails this node and skips every probe, and each skipped probe scores 0 in envelope.json."########,
         labels: &[r########"envelope-only"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features liteinst"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features third-party-backends"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -12488,7 +11952,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         },
         networkonly: false,
         engine_only: false,
-        timeout: 1080,
+        timeout: 900,
         cpu_timeout: 7200,
         jobs_flag: Some(r########"--jobs"########),
         jobs_env: None,
@@ -13060,7 +12524,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         desc: r########"Build Hermit and the focused test binaries used by the privileged lane"########,
         description: r########"MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which MISSED this privileged-lane build node): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 on all three Cargo commands (was unset -> cargo defaulted build phases to nproc; that cc1plus fan-out is the OOM class the pin bounds; the job-pin is the actual fix). The final command prebuilds the exact cli and hermit_modes integration binaries consumed by the privileged test nodes, so their wall budgets measure test execution instead of Cargo compilation or target-lock waiting. After the bin build, the content-addressed publisher verifies source type/mode/size, hashes before and after copying, verifies the published hash and atomically updates the pointer before any later Cargo invocation can relink target/debug/hermit. This privileged lane deliberately publishes a binary-only artifact; unlike portable DBT/SaBRe/LiteInst cells, it does not consume install_pkg resources. Cap KEPT at the existing generous 8.0GiB: a warm/incremental measurement read peak_bytes~1.64GiB @j8, but that reused build.workspace artifacts and UNDER-estimates a cold from-scratch privileged build, so the 8.0GiB headroom is retained rather than tightened on an unreliable warm figure. rss_baseline=5.0GiB (scheduling reservation). hermit@b384187e."########,
         labels: &[r########"hosted-privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit-run --features liteinst --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit-run --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -13147,7 +12611,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         desc: r########"Run the six measured-passing Buck chaos cases under PMU preemption"########,
         description: r########"The six enabled cases passed direct measurement on the privileged host. chaos_buck_nanosleep_parallel remains ignored because an interrupted nanosleep reports EINTR; chaos_buck_mem_race remains ignored because it produced no verdict within 300 seconds. Both remain visible in super.pmu_buck_chaos_cases. Depending on pmu.preemption keeps this coverage in the existing privileged PMU partition without changing quick or portable-only."########,
         labels: &[r########"hosted-privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"hermit_modes"########]),
@@ -13165,7 +12629,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
+        timeout: 120,
         cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
@@ -13243,7 +12707,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         group: r########"privileged-only-e2e"########,
         job: r########"manifest_c_programs_on_host"########,
         desc: r########"Privileged manifest bucket: c-programs"########,
-        description: r########"The selected cells are the four cpuid-probe verify cells (in-guest-trap, kvm, liteinst, ptrace) plus the cpuid-probe replay cell on ptrace: the kvm and ptrace cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301), and the in-guest LiteInst cells (liteinst, and in-guest-trap with site patching off) that returned on the new architecture after the LiteInst reset (https://github.com/rrnewton/hermit/issues/3745), each run with the maximum timeslice disabled. The selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop."########,
+        description: r########"The selected cells are the five cpuid-probe verify cells (dbt, in-guest-trap, kvm, liteinst, ptrace): the kvm and ptrace cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301), the dbt cell that slice S13 of the same issue carried over from the retired DBT parity matrix, and the in-guest LiteInst cells (liteinst, and in-guest-trap with site patching off) that returned on the new architecture after the LiteInst reset (https://github.com/rrnewton/hermit/issues/3745), each run with the maximum timeslice disabled. The selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop."########,
         labels: &[r########"hosted-privileged"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category c-programs --ci-only --prebuilt --results "$E2E_RESULT_ROOT/privileged/manifest_c_programs/results.jsonl" --junit "$E2E_RESULT_ROOT/privileged/manifest_c_programs/junit.xml""########,
         cmdtype: CmdType::Unknown,
@@ -13325,12 +12789,12 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         desc: r########"KVM CLI tests and initialized-VM setup cleanup"########,
         description: r########"Runs all 87 KVM-specific hermit CLI tests and the initialized-VM setup cleanup control after requiring /dev/kvm. The inventory gate requires all 87 distinct, nonignored CLI tests including the self-SIGKILL, synchronous-fault, root-exit reparenting, exec timer, nonleader-exec refusal, unreadable futex word, parked-sleep deadline cap, host-peer FIFO, host-syscall-budget, signal-then-sibling-exit, child-exit-notification, raw-child-exit-notification, sigtimedwait-siginfo, inherited-and-disabled-preemption, procfs-directory-size, first-directory-seek, flock-refusal and child-kill-refusal regressions and exactly the named setup test. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource. Its tests run eight at a time: preferred_inner_jobs 8, passed to nextest as NEXTEST_TEST_THREADS, which also sizes the step's cpu.max. (A literal -j 8 with no inner-jobs hint ran eight tests under the default one-core cpu.max: in 89264477's validation the node used 0.99 cores, was throttled for 494.7 CPU-seconds, took 62 s instead of 76, and run_kvm_notifies_a_child_exit_once_at_bitwise_parity took 41.5 s against its 60-second limit, 7.4 s at -j 1.) They ran one at a time only by inheritance from the July 2026 validate.sh, which passed --test-threads=1 to every suite, and this node holds the integration_test_binaries.cli token, so its whole run sits on the critical path: 87 s of the 341-second token chain in 39d822fb's full validation. Measured on 2026-10-15 at host load 290-317: -j 1 took 73-80 s; -j 8 took 11.6-16.0 s, with all 84 tests passing in 24 of 24 runs, and a peak summed RSS of 6.47 GiB against 6.08 GiB at -j 1."########,
         labels: &[r########"hosted-privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit-run --features liteinst,kvm-execution-tests --lib --test cli -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] as $selected | ($selected | length == 129) and ([$selected[].key] | unique | length == 129) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == "run_kvm_self_sigkill_from_nonleader_is_group_fatal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_root_segv_preserves_guest_exit")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_orphan_segv_preserves_root_success")] | length == 1) and ([$selected[] | select(.key == "run_kvm_root_exit_reparents_live_child_and_grandchild")] | length == 1) and ([$selected[] | select(.key == "run_kvm_exec_deletes_posix_timers_and_preserves_itimer")] | length == 1) and ([$selected[] | select(.key == "run_kvm_nonleader_exec_is_policy_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_futex_wait_on_an_unreadable_word_matches_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_sleep_carries_the_deadline_cap")] | length == 1) and ([$selected[] | select(.key == "run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_costs_one_host_syscall_per_guest_syscall")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_sibling_may_exit_while_its_signal_is_taken")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does")] | length == 1) and ([$selected[] | select(.key == "run_kvm_with_a_resolved_or_explicitly_disabled_maximum")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_procfs_directory_keeps_its_size")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_directory_descriptors_first_seeks")] | length == 1) and ([$selected[] | select(.key == "run_kvm_flock_excludes_as_ptrace_does")] | length == 1) and ([$selected[] | select(.key == "run_kvm_cpuid_rows_match_ptrace")] | length == 1) and ([$selected[] | select(.key == "run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key == "run_kvm_procfs_directories_are_served_only_in_a_container")] | length == 1) and ([$selected[] | select(.key == "run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_relative_names_are_decided_by_the_guests_working_directory")] | length == 1) and ([$selected[] | select(.key == "run_kvm_dotdot_names_are_decided_by_where_they_lead")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_virtual_cpus_are_listed_by_every_spelling")] | length == 1) and ([$selected[] | select(.key == "run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory")] | length == 1) and ([$selected[] | select(.key == "run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files")] | length == 1) and ([$selected[] | select(.key == "run_kvm_signal_permits_are_per_thread")] | length == 1) and ([$selected[] | select(.key == "run_kvm_virtual_timeout_is_reported_from_the_childs_note")] | length == 1) and ([$selected[] | select(.key == "run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first")] | length == 1) and ([$selected[] | select(.key == "run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit")] | length == 1) and ([$selected[] | select(.key == "run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_second_path_past_another_process_cmdline_is_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_argument_errors_on_another_process_procfs_answer_as_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts")] | length == 1) and ([$selected[] | select(.key == "run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem")] | length == 1) and ([$selected[] | select(.key == "run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences")] | length == 1) and ([$selected[] | select(.key == "run_kvm_renders_proc_locks_from_the_lock_ledger")] | length == 1) and ([$selected[] | select(.key == "run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting")] | length == 1) and ([$selected[] | select(.key == "run_kvm_refuses_preemption_stack_traces_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_late_timer_event_refuses_the_run_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_late_timer_event_is_a_verify_infrastructure_error")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_main_stack_is_read_from_maps_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_file_view_with_a_second_thread_maps_as_natively")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_file_threads_that_exited_do_not_hold_back_a_fork")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_file_fork_beside_a_live_thread_is_refused_by_name")] | length == 1) and ([$selected[] | select(.key == "run_kvm_an_scm_rights_receipt_over_its_own_header_is_a_named_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_shared_hugetlbfs_view_is_a_named_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_robust_word_kvm_cannot_exchange_is_a_named_refusal_where_ptrace_marks_it")] | length == 1) and ([$selected[] | select(.key == "run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parent_death_signal_reaches_the_child_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_the_callers_own_proc_directories_answer_as_linux")] | length == 1) and ([$selected[] | select(.key | startswith("run_kvm_"))] | length == 128) and ([$selected[] | select(.key == "kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution")] | length == 1)' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 128 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, the host-peer FIFO, the host-syscall budget, the signal-then-sibling exit, the child-exit and raw child-exit notifications, the sigtimedwait siginfo copy-out, the disabled preemption default, the procfs directory size, the first directory seeks, the flock refusal, the KVM CPUID rows, the child-kill refusal, the parked-wait exec, the parked-read signal exec, the three served-procfs-directory tests, the two group-exit signal-wait tests, the five guest working-directory tests, the per-thread signal-permit test, the virtual-timeout note test, the two SCM_RIGHTS queue tests, the masked-ppoll pending-signal test, the two-path cmdline refusal test, the procfs argument-error test, the two exec-refusal tests, the fdinfo and /proc/locks rendering tests, the chaos spinner bound, the preemption stack-trace refusal, the two late timer event refusals, the late timer event replay refusal, the blocking-inotify refusal test, the main-stack maps test, the dot-dot procfs spellings test, the shared file view beside a second thread, the exited-threads fork test, the fork refusal beside a live thread, the overlapping SCM_RIGHTS receipt refusal, the hugetlbfs view refusal, the unexchangeable robust word refusal, the smaps test, the parent-death signal test, the own /proc directories test, and the named setup test; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features liteinst,kvm-execution-tests --lib --test cli -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'; exit $?"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit-run --features third-party-backends,kvm-execution-tests --lib --test cli -E '(test(/^run_kvm_/) - test(=run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting)) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] as $selected | ($selected | length == 91) and ([$selected[].key] | unique | length == 91) and ($selected | all(.value.ignored == false)) and ([$selected[] | select(.key == "run_kvm_self_sigkill_from_nonleader_is_group_fatal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_root_segv_preserves_guest_exit")] | length == 1) and ([$selected[] | select(.key == "run_kvm_synchronous_orphan_segv_preserves_root_success")] | length == 1) and ([$selected[] | select(.key == "run_kvm_root_exit_reparents_live_child_and_grandchild")] | length == 1) and ([$selected[] | select(.key == "run_kvm_exec_deletes_posix_timers_and_preserves_itimer")] | length == 1) and ([$selected[] | select(.key == "run_kvm_nonleader_exec_is_policy_refusal")] | length == 1) and ([$selected[] | select(.key == "run_kvm_futex_wait_on_an_unreadable_word_matches_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_sleep_carries_the_deadline_cap")] | length == 1) and ([$selected[] | select(.key == "run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux")] | length == 1) and ([$selected[] | select(.key == "run_kvm_costs_one_host_syscall_per_guest_syscall")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_sibling_may_exit_while_its_signal_is_taken")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity")] | length == 1) and ([$selected[] | select(.key == "run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does")] | length == 1) and ([$selected[] | select(.key == "run_kvm_with_a_resolved_or_explicitly_disabled_maximum")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_procfs_directory_keeps_its_size")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_directory_descriptors_first_seeks")] | length == 1) and ([$selected[] | select(.key == "run_kvm_flock_is_a_named_refusal_where_ptrace_excludes")] | length == 1) and ([$selected[] | select(.key == "run_kvm_cpuid_rows_match_ptrace")] | length == 1) and ([$selected[] | select(.key == "run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key == "run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec")] | length == 1) and ([$selected[] | select(.key | startswith("run_kvm_"))] | length == 90) and ([$selected[] | select(.key == "kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution")] | length == 1)' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 90 distinct, nonignored run_kvm_ tests including self-SIGKILL, both synchronous-fault regressions, root-exit reparenting, exec timer lifetime, nonleader-exec refusal, the unreadable futex word, the parked-sleep deadline cap, the host-peer FIFO, the host-syscall budget, the signal-then-sibling exit, the child-exit and raw child-exit notifications, the sigtimedwait siginfo copy-out, the disabled preemption default, the procfs directory size, the first directory seeks, the flock refusal, the KVM CPUID rows, the child-kill refusal, the parked-wait exec, the parked-read signal exec, and the named setup test; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends,kvm-execution-tests --lib --test cli -E '(test(/^run_kvm_/) - test(=run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting)) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'; exit $?"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
         deps: &[r########"privileged-only-build.privileged_tests_on_host"########],
-        env: &[(r########"HERMIT_FORBID_SKIPS"########, r########"1"########)],
+        env: &[],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 60.0,
@@ -13343,7 +12807,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
+        timeout: 180,
         cpu_timeout: 7200,
         jobs_flag: Some(""),
         jobs_env: Some("NEXTEST_TEST_THREADS"),
