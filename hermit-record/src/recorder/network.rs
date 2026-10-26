@@ -1155,9 +1155,17 @@ mod tests {
         assert_eq!(memory.slice(addrlen, 4), &PEER_LEN.to_ne_bytes());
     }
 
+    /// The host's page size: protections apply to whole pages, which are
+    /// 64 KiB on some aarch64 kernels.
+    fn host_page() -> usize {
+        // SAFETY: sysconf has no preconditions.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
     /// Maps `pages` private anonymous pages, each with its own protection.
     fn map_pages(protections: &[libc::c_int]) -> *mut u8 {
-        let len = protections.len() * USER_PAGE_SIZE;
+        let page = host_page();
+        let len = protections.len() * page;
         // SAFETY: a fresh anonymous mapping that nothing else refers to.
         let base = unsafe {
             libc::mmap(
@@ -1171,12 +1179,12 @@ mod tests {
         };
         assert_ne!(base, libc::MAP_FAILED);
         let base = base.cast::<u8>();
-        for (page, &protection) in protections.iter().enumerate() {
+        for (index, &protection) in protections.iter().enumerate() {
             // SAFETY: inside the mapping made above.
             unsafe {
-                let at = base.add(page * USER_PAGE_SIZE);
-                std::ptr::write_bytes(at, page as u8 + 1, USER_PAGE_SIZE);
-                assert_eq!(libc::mprotect(at.cast(), USER_PAGE_SIZE, protection), 0);
+                let at = base.add(index * page);
+                std::ptr::write_bytes(at, index as u8 + 1, page);
+                assert_eq!(libc::mprotect(at.cast(), page, protection), 0);
             }
         }
         base
@@ -1184,7 +1192,7 @@ mod tests {
 
     #[test]
     fn a_user_read_reaches_readable_and_write_only_pages_but_not_inaccessible_ones() {
-        let page = USER_PAGE_SIZE;
+        let page = host_page();
         let base = map_pages(&[libc::PROT_READ, libc::PROT_WRITE, libc::PROT_NONE]) as usize;
         let pid = Pid::this();
         let read = |address: usize| {
@@ -1303,6 +1311,8 @@ mod tests {
         assert_eq!((len, address), (2, family.to_vec()));
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn capture_poll_keeps_outputs_on_efault() {
         let fds = [
@@ -1356,6 +1366,8 @@ mod tests {
         assert_eq!(event.timeout, Some(timeout));
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn capture_poll_keeps_outputs_on_eintr() {
         let fds = [PollFd {
@@ -1375,6 +1387,8 @@ mod tests {
         assert_eq!(event.fds.as_deref(), Some(&fds[..]));
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn early_einval_does_not_read_or_allocate_pollfds() {
         let event = capture_poll_event(
@@ -1471,6 +1485,8 @@ mod tests {
         );
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn capture_poll_preserves_ready_fds() {
         let fds = [PollFd {
@@ -1492,6 +1508,8 @@ mod tests {
         assert_eq!(event.fds.unwrap()[0].revents, PollFlags::POLLIN);
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn capture_poll_keeps_the_result_on_an_error_return() {
         // The defect this fixes: the old `result.and_then(..)` recorded NOTHING
@@ -1505,6 +1523,8 @@ mod tests {
         assert!(event.fds.is_none());
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn capture_poll_early_error_does_not_read_or_allocate_pollfds() {
         // EINVAL must not trigger the best-effort read. An earlier attempt on
