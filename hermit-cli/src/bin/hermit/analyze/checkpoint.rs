@@ -514,6 +514,21 @@ pub struct Progress {
     /// The search's result, once it has one (the stack traces may follow).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided: Option<String>,
+    /// The same result's events, which a partial report carries in its
+    /// structured fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<DecidedEvents>,
+}
+
+/// The events a finished search decided on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecidedEvents {
+    /// `--prefix-search`: the deciding event of the target schedule.
+    Deciding(usize),
+    /// The default search: the critical pair of the failing schedule, the
+    /// event before the critical one and the critical one.
+    CriticalPair(usize, usize),
 }
 
 /// The analysis's progress, written to [`PROGRESS_FILE`] on every change
@@ -580,8 +595,11 @@ impl ProgressHandle {
         self.update(|progress| progress.bracket = Some(bracket));
     }
 
-    pub fn decided(&self, decided: String) {
-        self.update(|progress| progress.decided = Some(decided));
+    pub fn decided(&self, decided: String, events: DecidedEvents) {
+        self.update(|progress| {
+            progress.decided = Some(decided);
+            progress.decision = Some(events);
+        });
     }
 
     /// Change the progress and write it. A write that fails is reported and

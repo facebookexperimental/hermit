@@ -381,8 +381,11 @@ pub struct AnalyzeOpts {
     /// --keep-tmp, and the report gives the command that continues the analysis (--resume).
     /// The default search's report replays its two schedules for their stacks only when two
     /// such runs fit min(120 s, 5% of the budget) after it ran out; the report says when they
-    /// did not. Computation between runs (the default search's schedule distances) is not
-    /// interrupted, so analyze may overrun the budget by that much.
+    /// did not. A budget that runs out after the search decided, during its stack-trace runs,
+    /// still reports the decision: the deciding event or the critical pair, without stacks.
+    /// Computation between runs (the default search's schedule distances) is not
+    /// interrupted, so analyze may overrun the budget by that much; an outer kill bound should
+    /// sit above the budget plus that grace, so that analyze stops itself first.
     #[clap(long, value_name = "DURATION|off", default_value = "off")]
     pub time_budget: TimeBudget,
 

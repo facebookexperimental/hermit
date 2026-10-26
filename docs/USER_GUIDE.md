@@ -1203,10 +1203,23 @@ phase was running:
   long ones meet it, so the report names the longest prefix whose replay
   finished and missed, the shortest whose replay met it, and the range of
   events between them that holds the deciding event.
+- A budget that runs out after the search decided, during its stack-trace
+  runs, still reports the decision, in the fields a complete report uses:
+  `deciding_event` for `--prefix-search` and `critical_event1` and
+  `critical_event2` for the default search, without stacks (`partial.stacks`
+  says why); `--resume` takes them.
 
 In a report file such a report's `verdict` is `partial`, and `partial` holds
-what it found. Its event fields name where the closest pair first differs,
-which is the deciding event or one before it, not critical events.
+what it found. Its event fields name the events the search decided on when it
+had decided (`partial.decided`), and otherwise where the closest pair first
+differs, which is the deciding event or one before it, not critical events.
+
+Analyze stops itself only between runs, and the default search's computation
+between runs and the stack replays after the budget can take a little longer,
+so give a harness's own kill bound (a test timeout, `timeout(1)`) room above
+`--time-budget` plus min(120 s, 5% of it), for example a few minutes more.
+Analyze then stops itself first and writes its partial report and resume
+command, which an outer kill would lose.
 
 Analyze writes its progress into the workspace as it goes: every finished
 run's outcome (`analyze-journal.jsonl`), what the analysis is of
