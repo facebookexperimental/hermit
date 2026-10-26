@@ -532,6 +532,7 @@ mod tests {
             size: 100 + ino as i64,
             mtime_sec: 1_700_000_000,
             mtime_nsec: 0,
+            content: None,
         }
     }
 

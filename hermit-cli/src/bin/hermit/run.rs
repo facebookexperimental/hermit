@@ -2208,6 +2208,13 @@ pub struct RunOpts {
     #[clap(skip)]
     mapped_shared_image: Option<std::sync::Arc<super::mapped_first_admission::RetainedImage>>,
 
+    /// The run's frozen copy of the Android system property area
+    /// (`super::property_snapshot`), taken once before the guest's first exec
+    /// and shared by both runs of a `--verify`; removed when the last holder
+    /// drops it.
+    #[clap(skip)]
+    property_snapshot: Option<std::sync::Arc<super::property_snapshot::PropertySnapshotDir>>,
+
     /// Print a summary of the process tree's execution to stderr before exiting.
     #[clap(long, short = 'u')]
     pub(crate) summary: bool,
@@ -11191,7 +11198,12 @@ impl RunOpts {
             RunDispatch::DapSupervisor => return self.serve_dap(),
             RunDispatch::Run => {}
         }
+        // The caller exits without dropping these options, and a run that
+        // times out unwinds past this frame, so the property snapshot is
+        // removed by this guard, whatever the result.
+        let _remove_property_snapshot = super::property_snapshot::RemoveOnExit;
         let result = self.main_without_core_cleanup(global, adapter, adapter_options);
+        drop(self.property_snapshot.take());
         if let Ok(status) = &result {
             self.finish_manifest(*status);
         }
@@ -11565,6 +11577,8 @@ impl RunOpts {
         if self.rewrite_exclusives {
             self.prepare_exclusive_rewrite(backend)?;
         }
+
+        self.take_property_snapshot()?;
         let private_engagement_summary = if self.backend_engagement_json.is_some()
             && backend == Backend::Ptrace
             && self.application_backend.is_none()
@@ -13803,6 +13817,10 @@ impl RunOpts {
         let mut options = self.clone();
         options.det_opts.det_config.annotated_priority_replay =
             options.annotated_priority_replay_admission()?;
+        // `hermit run` took the snapshot in `main`; a run started another way
+        // (each trial of `hermit analyze`) takes its own here, and a trial
+        // that reads the same properties shares that copy and its path.
+        options.take_property_snapshot()?;
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
         #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
@@ -16813,6 +16831,10 @@ impl RunOpts {
         // A pure function of the flags, so every trial of an analysis and
         // both runs of a `--verify` pair rewrite alike.
         config.rewrite_exclusives_in_memory = self.rewrites_exclusives_in_memory();
+        config.property_snapshot = self
+            .property_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.config());
         config
     }
 
@@ -16825,6 +16847,106 @@ impl RunOpts {
                 RewriteExclusivesMode::Overlay => false,
                 RewriteExclusivesMode::Memory => true,
             }
+    }
+
+    /// Take the run's copy of the Android system property area
+    /// (`super::property_snapshot`) before the guest's first exec, on a host
+    /// that has one. Where it cannot be copied the guest would read the live
+    /// area: `--strict` refuses that, and any other run says so once.
+    fn take_property_snapshot(&mut self) -> Result<(), Error> {
+        // One snapshot per invocation: every run of it (both runs of a
+        // `--verify`, every trial of `hermit analyze`) reads the same copy.
+        static INVOCATION: std::sync::Mutex<
+            Option<std::sync::Arc<super::property_snapshot::PropertySnapshotDir>>,
+        > = std::sync::Mutex::new(None);
+        if self.property_snapshot.is_some() {
+            return Ok(());
+        }
+        let mut invocation = INVOCATION
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(shared) = invocation.as_ref() {
+            self.property_snapshot = Some(shared.clone());
+            return Ok(());
+        }
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let under = std::env::temp_dir();
+        let taken = if !self.no_namespace
+            && under.starts_with("/tmp")
+            && Path::new(super::property_snapshot::PROPERTY_AREA).is_dir()
+        {
+            // The guest and its tracer see the container's own /tmp.
+            super::property_snapshot::Taken::Refused(format!(
+                "its copy would be under {}, which the run's container replaces with its own \
+                 /tmp; set TMPDIR to another directory",
+                under.display()
+            ))
+        } else {
+            super::property_snapshot::take(
+                Path::new(super::property_snapshot::PROPERTY_AREA),
+                &under,
+                euid,
+            )
+        };
+        match taken {
+            super::property_snapshot::Taken::NoPropertyArea => Ok(()),
+            super::property_snapshot::Taken::Snapshot(snapshot) => {
+                tracing::info!(
+                    "the guest reads a copy of the system property area taken now ({} files)",
+                    snapshot.copied()
+                );
+                let inherited = snapshot.inherited_live_descriptors();
+                if !inherited.is_empty() {
+                    let reason = format!(
+                        "the guest would inherit descriptors {inherited:?}, open on live \
+                         property files"
+                    );
+                    if self.strict {
+                        return Err(Error::new(PolicyRefusal).context(format!(
+                            "--strict refuses this run: it cannot freeze the system property \
+                             area for the guest, because {reason}"
+                        )));
+                    }
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "WARNING: HERMIT_PROPERTY_AREA_LIVE: {reason}; reads through them are \
+                         not frozen"
+                    );
+                }
+                let snapshot = std::sync::Arc::new(snapshot);
+                *invocation = Some(snapshot.clone());
+                self.property_snapshot = Some(snapshot);
+                Ok(())
+            }
+            super::property_snapshot::Taken::Refused(reason) if self.strict => {
+                Err(Error::new(PolicyRefusal).context(format!(
+                    "--strict refuses this run: it cannot freeze the system property area \
+                     for the guest, because {reason}"
+                )))
+            }
+            super::property_snapshot::Taken::Refused(reason) => {
+                // Once per invocation: each trial of `hermit analyze` tries
+                // again. Written directly, as `warn_no_namespace` is: this
+                // process's own tracing events are not shown at the default
+                // level, and `eprintln!` would panic when stderr's reader has
+                // gone.
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(());
+                }
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "WARNING: HERMIT_PROPERTY_AREA_LIVE: the guest reads the live system \
+                     property area, which processes outside the run rewrite while it runs, \
+                     because {reason}"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Where and within what bounds the tracer keeps fatal cores, or `None`,

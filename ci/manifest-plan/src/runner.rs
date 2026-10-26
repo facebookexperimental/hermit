@@ -25054,6 +25054,7 @@ exit "$(cat "$PWD/exit-status")"
             size: 100,
             mtime_sec: 1_700_000_000,
             mtime_nsec: 0,
+            content: None,
         };
         let mut report = parity_fixture_verification(Verdict::Diverged);
         report.verdict = Verdict::InfrastructureError;

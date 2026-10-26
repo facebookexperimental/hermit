@@ -77,6 +77,7 @@ mod oci;
 mod owned_container;
 mod pinned_cpu;
 mod podman_store;
+mod property_snapshot;
 mod record;
 mod record_envelope;
 mod record_start;

@@ -21,6 +21,7 @@ mod post_crash;
 mod proc_stat_lifecycle;
 mod procfs_caller_buffer;
 mod procfs_inode;
+mod property_snapshot;
 mod raw_clone;
 mod readdir_order;
 mod scm_rights;

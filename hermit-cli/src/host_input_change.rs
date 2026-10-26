@@ -202,12 +202,36 @@ pub fn find_pattern_difference(run1: &HostInputs, run2: &HostInputs) -> Option<P
         // A kernel object by its path, or by what the open reached (a FIFO,
         // a socket or a device, whose times move with every write, so an
         // open finding its same inode at another time would end the walk
-        // below before a real change at a later open).
-        if is_kernel_object(&left.path) || left.kernel_object || right.kernel_object {
+        // below before a real change at a later open). A snapshot copy
+        // (Android's property area, under /dev) is named by its contents,
+        // not by a kernel object's identity.
+        if (is_kernel_object(&left.path) && left.identity.content.is_none())
+            || left.kernel_object
+            || right.kernel_object
+        {
             continue;
         }
         let (new1, previous1) = pattern1.open(left);
         let (new2, previous2) = pattern2.open(right);
+        // A snapshot copy is the same input in both runs only if its
+        // contents are, even when each run reads it unchanged throughout.
+        if previous1.is_none()
+            && previous2.is_none()
+            && left.identity.content.is_some()
+            && left.identity != right.identity
+            && ![run1, run2]
+                .iter()
+                .any(|run| guest_rebound(&run.mutated, &right.path))
+        {
+            return Some(PatternDifference {
+                run: VerificationRun::Run2,
+                path: right.path.clone(),
+                dtid: right.dtid,
+                syscall: right.syscall,
+                before: left.identity,
+                after: right.identity,
+            });
+        }
         let (run, previous, record) = match (new1, new2) {
             (true, false) => (VerificationRun::Run1, previous1, left),
             (false, true) => (VerificationRun::Run2, previous2, right),
@@ -216,7 +240,13 @@ pub fn find_pattern_difference(run1: &HostInputs, run2: &HostInputs) -> Option<P
         // Both runs find a new identity at a path's first open, so only a
         // path seen before reaches this point.
         let before = previous?;
-        if (before.dev, before.ino) == (record.identity.dev, record.identity.ino) {
+        if (before.dev, before.ino, before.content)
+            == (
+                record.identity.dev,
+                record.identity.ino,
+                record.identity.content,
+            )
+        {
             return None;
         }
         // The guest may have replaced it itself, through operations whose
@@ -340,6 +370,7 @@ mod tests {
             size: 100,
             mtime_sec: 1_700_000_000,
             mtime_nsec: 0,
+            content: None,
         }
     }
 
@@ -395,6 +426,44 @@ mod tests {
             named.into_infrastructure_error().to_string(),
             "host input changed during run 2: /etc/ld.so.cache (dev:ino 0:33:7 size 100 mtime 1700000000.000000000 -> dev:ino 0:33:8 size 100 mtime 1700000000.000000000)"
         );
+    }
+
+    /// A snapshot copy under /dev is compared by its contents: a property
+    /// file whose copy changed between two opens in run 1 only is named,
+    /// while a kernel object under /dev is still skipped.
+    #[test]
+    fn a_snapshot_copy_whose_contents_changed_is_named() {
+        let mut run1 = opens(&[
+            ("/dev/__properties__/properties_serial", 0),
+            ("/dev/null", 5),
+            ("/dev/__properties__/properties_serial", 0),
+        ]);
+        let mut run2 = opens(&[
+            ("/dev/__properties__/properties_serial", 0),
+            ("/dev/null", 6),
+            ("/dev/__properties__/properties_serial", 0),
+        ]);
+        for (records, contents) in [(&mut run1.records, [1, 2]), (&mut run2.records, [1, 1])] {
+            records[0].identity = HostFileIdentity::of_snapshot(4, contents[0]);
+            records[2].identity = HostFileIdentity::of_snapshot(4, contents[1]);
+        }
+        let named = find_pattern_difference(&run1, &run2).unwrap();
+        assert_eq!(
+            (named.run, named.path.as_str(), named.syscall),
+            (
+                VerificationRun::Run1,
+                "/dev/__properties__/properties_serial",
+                12
+            )
+        );
+        run1.records[2].identity = HostFileIdentity::of_snapshot(4, 1);
+        assert_eq!(find_pattern_difference(&run1, &run2), None);
+        // Each run reads its own snapshot unchanged, but the two differ.
+        for index in [0, 2] {
+            run2.records[index].identity = HostFileIdentity::of_snapshot(4, 7);
+        }
+        let named = find_pattern_difference(&run1, &run2).unwrap();
+        assert_eq!((named.run, named.syscall), (VerificationRun::Run2, 10));
     }
 
     /// A file the guest creates and replaces itself has new host inodes in

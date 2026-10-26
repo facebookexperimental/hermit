@@ -1459,6 +1459,7 @@ fn record_or_replay_config_with_timer_support(
         record_host_inputs: false,
         host_input_log: None,
         host_input_snapshots: Vec::new(),
+        property_snapshot: None,
         untraced_code_range: None,
         fatal_core_capture: None,
         fuzz_futexes: false,

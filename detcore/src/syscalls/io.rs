@@ -4390,6 +4390,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         let uservaddr = call.uservaddr();
         let addrlen = call.addrlen();
 
+        // A property the guest sets reaches the live area, not the frozen copy
+        // it reads (`Config::property_snapshot`).
+        if self.cfg.property_snapshot.is_some()
+            && let Some(address) = uservaddr
+        {
+            let mut bytes = [0_u8; std::mem::size_of::<libc::sockaddr_un>()];
+            let len = usize::try_from(addrlen).unwrap_or(0).min(bytes.len());
+            if guest
+                .memory()
+                .read_exact(address.cast::<u8>(), &mut bytes[..len])
+                .is_ok()
+                && names_property_service(&bytes[..len])
+            {
+                warn_property_set_not_visible();
+            }
+        }
+
         if guest.config().sched_heuristic == SchedHeuristic::ConnectBind {
             trace!("Scheduling heuristic: reprioritizing connect");
             let resource = ResourceID::PriorityChangePoint(
@@ -6053,8 +6070,81 @@ where
     guest.memory().read_value(value).ok()
 }
 
+/// Whether `address`, a `struct sockaddr_un` as the guest passed it to
+/// `connect`, names one of init's property service sockets:
+/// `property_service`, or `property_service_for_system`, which system
+/// processes use.
+fn names_property_service(address: &[u8]) -> bool {
+    const PATHS: [&[u8]; 2] = [
+        b"/dev/socket/property_service",
+        b"/dev/socket/property_service_for_system",
+    ];
+    let family = std::mem::size_of::<libc::sa_family_t>();
+    if address.len() < family
+        || libc::sa_family_t::from_ne_bytes([address[0], address[1]]) != libc::AF_UNIX as u16
+    {
+        return false;
+    }
+    let path = &address[family..];
+    let path = path.split(|byte| *byte == 0).next().unwrap_or(path);
+    PATHS.contains(&path)
+}
+
+/// Says once per run that the guest's own property sets are not visible to
+/// it: under `Config::property_snapshot` it reads a copy of the property area
+/// taken before it started, while a set goes through init's property service
+/// to the live area.
+fn warn_property_set_not_visible() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "[detcore] HERMIT_PROPERTY_SET_NOT_VISIBLE: the guest connected to init's property \
+             service. This run reads a frozen copy of the system property area taken before \
+             the guest started, so a property it sets changes the live area and is not visible \
+             to it, and a wait for a property change does not end"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Only init's two property service sockets count: an exact `sun_path`, with
+    /// or without its terminating NUL, under `AF_UNIX`.
+    #[test]
+    fn the_property_service_socket_is_recognized_by_path() {
+        let address = |family: libc::sa_family_t, path: &[u8]| {
+            let mut bytes = family.to_ne_bytes().to_vec();
+            bytes.extend_from_slice(path);
+            bytes
+        };
+        let unix = libc::AF_UNIX as libc::sa_family_t;
+        assert!(super::names_property_service(&address(
+            unix,
+            b"/dev/socket/property_service\0"
+        )));
+        assert!(super::names_property_service(&address(
+            unix,
+            b"/dev/socket/property_service"
+        )));
+        assert!(super::names_property_service(&address(
+            unix,
+            b"/dev/socket/property_service_for_system\0"
+        )));
+        assert!(!super::names_property_service(&address(
+            unix,
+            b"/dev/socket/property_service2\0"
+        )));
+        assert!(!super::names_property_service(&address(
+            unix,
+            b"/dev/socket/logdw\0"
+        )));
+        assert!(!super::names_property_service(&address(
+            libc::AF_INET as libc::sa_family_t,
+            b"/dev/socket/property_service\0"
+        )));
+        assert!(!super::names_property_service(&[]));
+    }
+
     use super::*;
 
     /// A sent entry's `msg_len` (4 bytes at offset 56 of its `mmsghdr`)
