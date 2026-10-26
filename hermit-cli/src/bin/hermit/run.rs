@@ -1719,7 +1719,9 @@ pub struct RunOpts {
     /// of branches. A single atomic instruction cannot retry. This is
     /// preprocessing for the ptrace backend, not a backend: the rewritten copy
     /// is bind-mounted over the original path, and anything that is not a
-    /// fully decoded canonical loop is left alone and reported.
+    /// fully decoded canonical loop is left alone and reported. Incompatible
+    /// with `--no-namespace`, whose guest has no mount namespace to carry the
+    /// overlay.
     #[clap(long)]
     pub(crate) rewrite_exclusives: bool,
 
@@ -1812,7 +1814,8 @@ pub struct RunOpts {
             "network",
             "tmp",
             "namespace_only",
-            "analyze_networking"
+            "analyze_networking",
+            "rewrite_exclusives"
         ]
     )]
     no_namespace: bool,
