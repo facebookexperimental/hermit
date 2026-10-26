@@ -325,6 +325,10 @@ impl RunData {
         }
 
         self.runopts.validate_args()?;
+        // A trial starts through `RunOpts::run`, which applies none of the
+        // preprocessing `RunOpts::main` does, so the trial runs the image its
+        // reproducer names only if it is prepared here.
+        self.runopts.prepare_trial_preprocessing()?;
 
         let repro_file = self.root_path().with_extension("repro");
         std::fs::write(repro_file, self.to_repro() + "\n")?;

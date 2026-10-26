@@ -12941,6 +12941,51 @@ impl RunOpts {
         anyhow::ensure!(
             self.adapter_executable_overlay_plan()? == *plan,
             "executable overlay no longer matches the admitted guest/mount resolution"
+    /// Applies to a trial the preprocessing `RunOpts::main` does before a run
+    /// and `RunOpts::run` does not: the exclusive-loop rewrite of
+    /// `--rewrite-exclusives`. `hermit analyze` and `hermit bisect` start every
+    /// trial through `RunOpts::run`, so without this a trial ran the original
+    /// images while its printed reproducer, which carries the option, ran the
+    /// rewritten ones.
+    ///
+    /// Every trial of one analysis shares the program, the
+    /// `--rewrite-exclusives-also` files, the backend, the mounts and binds and
+    /// the working directory and `PATH` the guest program is resolved with, so
+    /// the overlays are prepared once per process for those inputs and reused:
+    /// one rewrite and one report per analysis, not one per trial. The key is
+    /// all of them, so a second analysis in one process (as tests run) with
+    /// other mounts prepares, and checks, its own.
+    pub(crate) fn prepare_trial_preprocessing(&mut self) -> Result<(), Error> {
+        static PREPARED: std::sync::Mutex<Vec<(String, Vec<ExecutableOverlayMount>)>> =
+            std::sync::Mutex::new(Vec::new());
+        if !self.rewrite_exclusives {
+            return Ok(());
+        }
+        let key = format!(
+            "{:?}",
+            (
+                &self.program,
+                &self.rewrite_exclusives_also,
+                self.selected_backend(),
+                &self.mount,
+                &self.bind,
+                std::env::current_dir().ok(),
+                std::env::var_os("PATH"),
+            )
+        );
+        let mut prepared = PREPARED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, overlays)) = prepared.iter().find(|(seen, _)| *seen == key) {
+            self.exclusive_rewrite_overlays = overlays.clone();
+            return Ok(());
+        }
+        self.exclusive_rewrite_overlays.clear();
+        self.prepare_exclusive_rewrite(self.selected_backend())?;
+        prepared.push((key, self.exclusive_rewrite_overlays.clone()));
+        Ok(())
+    }
+
     /// Rewrite the guest executable's canonical exclusive loops (and those of
     /// any file named by `--rewrite-exclusives-also`) into content-addressed
     /// copies, and overlay each copy on the path the guest loads it from.

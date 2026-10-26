@@ -5551,6 +5551,45 @@ fn run_rejects_subcommand_level_backend() {
     assert_success(&output, &args);
 }
 
+/// `hermit analyze` prepares `--rewrite-exclusives` for its trials, as
+/// `hermit run` does. A trial starts through `RunOpts::run`, which skips the
+/// preprocessing `RunOpts::main` applies, so trials ran the original images
+/// while each trial's printed reproducer carried the option. On a host without
+/// FEAT_LSE, where `hermit run --rewrite-exclusives` refuses, the analysis's
+/// first trial must refuse the same way rather than run the program
+/// unrewritten. This proves the trial path runs the preparation; that its
+/// overlays then reach the trial can only be seen where the rewrite succeeds,
+/// on aarch64 with FEAT_LSE, where this file's tests do not build, so that is
+/// measured by hand (see the pull request).
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let tmp_dir = format!("--tmp-dir={}", directory.path().display());
+    let refusal = "which this host does not execute (no HWCAP_ATOMICS)";
+
+    let run = hermit(&["run", "--rewrite-exclusives", "--", "/bin/false"]);
+    assert!(stderr(&run).contains(refusal), "{}", stderr(&run));
+
+    let analyzed = hermit(&[
+        "analyze",
+        &tmp_dir,
+        "--run1-seed=1",
+        "--",
+        "--chaos",
+        "--rewrite-exclusives",
+        "--",
+        "/bin/false",
+    ]);
+    let log = stderr(&analyzed);
+    assert!(!analyzed.status.success(), "{log}");
+    assert!(
+        log.contains(refusal),
+        "the trial did not prepare the rewrite:\n{log}"
+    );
+}
+
 #[test]
 fn analyze_rejects_backend_in_its_run_arguments() {
     // `hermit analyze` builds its trials' `run` options from --run-arg and its
