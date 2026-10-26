@@ -77,6 +77,8 @@ struct RawRecord {
     format_version: Option<u32>,
     #[serde(default, skip_serializing_if = "super::lists_no_time_skips")]
     time_skips: Option<Vec<TimeSkip>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rejoins: Vec<crate::scheduler::rejoin_log::Rejoin>,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);

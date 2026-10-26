@@ -55,7 +55,15 @@ const HEADER: &str = "hermit-rejoins 1";
 
 /// One readmission: the calls `step2c_process_io_blockers` readmitted together,
 /// in `DetTid` order, and the point at which it did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize
+)]
 pub(crate) struct Rejoin {
     pub(crate) turn: u64,
     /// `Scheduler::empty_queue_wakes` at the readmission.
@@ -131,6 +139,20 @@ impl RejoinWriter {
     pub(crate) fn append(&mut self, rejoin: &Rejoin) -> io::Result<()> {
         self.file.write_all(rejoin.to_line().as_bytes())
     }
+}
+
+/// Whether `rejoins` is a log a replay can follow: its entries must be in
+/// the order the recording made them, since replay walks them once.
+pub(crate) fn ordered(rejoins: &[Rejoin]) -> Result<(), String> {
+    for pair in rejoins.windows(2) {
+        if pair[0].point() > pair[1].point() {
+            return Err(format!(
+                "readmissions out of order: turn {} comes after turn {}",
+                pair[1].turn, pair[0].turn
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Replay side: read the log the recording in `dir` wrote.

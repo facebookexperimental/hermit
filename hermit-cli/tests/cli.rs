@@ -57509,6 +57509,107 @@ fn assert_discard_at_send_rows(rows: &[(&str, &str, Option<&str>)]) {
     }
 }
 
+/// A `hermit run` preemption recording stores where each backgrounded call
+/// rejoined the run queue, and a replay of it readmits the call there, however
+/// the host times it.
+///
+/// `signalfd-inread` is the row of the test above whose readmission is
+/// host-timed (https://github.com/rrnewton/hermit/issues/4359): the worker's
+/// backgrounded signalfd read is woken by main's signal, and the scheduler
+/// readmits it at whatever pass first finds it finished, before or after it
+/// skips global time ahead during main's sleep. A race probe makes the
+/// scheduler miss a finished call at half its checks, an order host timing
+/// alone can produce (docs/RACE_PROBES.md), and each run draws its own probe
+/// seed. The recording must store its readmissions, and every replay must
+/// readmit at the recorded points: the same order of readmissions and time
+/// skips in its INFO log, and a re-recorded record with the same schedule and
+/// the same readmissions. Before, the record stored none, and a replay
+/// readmitted when it found the call finished: 6 of 12 such replays put the
+/// readmission on the other side of a time skip.
+#[test]
+fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
+    let run = |probe_seed: u64, record: &Path, replay: Option<&Path>| {
+        let record_flag = format!("--record-preemptions-to={}", record.display());
+        let replay_flag =
+            replay.map(|path| format!("--replay-preemptions-from={}", path.display()));
+        let mut args = vec![
+            "--log=info",
+            "run",
+            "--base-env=minimal",
+            &epoch,
+            &record_flag,
+        ];
+        args.extend(replay_flag.as_deref());
+        args.extend(["--", guest.as_str(), "signalfd-inread"]);
+        let output = hermit_test::hermit_output(
+            &format!("hermit {args:?} under probe seed {probe_seed}"),
+            hermit_command(&args)
+                .env_remove("HERMIT_EPOCH")
+                .env("HERMIT_RACE_PROBE", "bg_harvest_skip=0@0.5")
+                .env("HERMIT_RACE_PROBE_SEED", probe_seed.to_string())
+                .stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), "signalfd-inread: read 128 0, signal 12\n");
+        output
+    };
+    // The readmissions and time skips of a run, in order.
+    let order = |output: &Output| -> Vec<&'static str> {
+        stderr(output)
+            .lines()
+            .filter_map(|line| {
+                if line.contains("[step2] Reschedule formerly backgrounded dtid") {
+                    Some("readmit")
+                } else if line.contains("Skipping global time ahead") {
+                    Some("skip")
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let read = |path: &Path| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    };
+
+    let record = directory.path().join("record.json");
+    let recorded = run(13, &record, None);
+    let recorded_order = order(&recorded);
+    let recording = read(&record);
+    let rejoins = &recording["rejoins"];
+    assert!(
+        rejoins
+            .as_array()
+            .is_some_and(|rejoins| !rejoins.is_empty()),
+        "the recording stored no readmission; its fields: {:?}",
+        recording
+            .as_object()
+            .map(|fields| fields.keys().collect::<Vec<_>>())
+    );
+    assert!(recorded_order.contains(&"readmit"), "{recorded_order:?}");
+
+    for probe_seed in 21..=26 {
+        let rerecord = directory.path().join(format!("replay-{probe_seed}.json"));
+        let replayed = run(probe_seed, &rerecord, Some(&record));
+        assert_eq!(
+            order(&replayed),
+            recorded_order,
+            "probe seed {probe_seed}: the replay readmitted elsewhere than its recording"
+        );
+        let replay = read(&rerecord);
+        for field in ["global", "per_thread", "rejoins"] {
+            assert_eq!(
+                replay[field], recording[field],
+                "probe seed {probe_seed}: the replay re-recorded another {field}"
+            );
+        }
+    }
+}
+
 /// As `a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take`,
 /// with the discarded copy already pending when the waiter files its wait: a
 /// hard `--happens-before` edge holds the waiter (dettid 5) at the entry of
