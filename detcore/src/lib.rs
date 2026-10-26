@@ -1354,7 +1354,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 dettid, mycount, signal
             );
             guest.thread_state_mut().stats.count_signal();
-            slice_boundary::callbacks::delivered_signal(&mut boundary_token, signal, mycount)
+            preemptions::callback_history::delivered_signal(&mut boundary_token, signal, mycount)
                 .expect("actual signal delivery must link to its entry");
         } else {
             // Counted, and logged with its ordinal, at its commit
@@ -1746,8 +1746,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         precise_branch: bool,
         boundary: CheckIn,
         entry: Option<slice_boundary::callbacks::Callback>,
-    ) -> Option<slice_boundary::callbacks::Token> {
-        let mut token = slice_boundary::callbacks::begin(guest.thread_state_mut(), entry)
+    ) -> Option<preemptions::callback_history::Token> {
+        let mut token = preemptions::callback_history::begin(guest.thread_state_mut(), entry)
             .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
         // A handler that left early (an error return) may not have cleared
         // these; no request made by this new handler belongs to that syscall,
@@ -1779,16 +1779,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The semantic entry is observed after the original guest-RCB update,
         // before any existing path can reset the slice. The owned token stays
         // with this handler across nested callbacks and awaits.
-        slice_boundary::callbacks::pre(guest.thread_state_mut(), &mut token)
+        preemptions::callback_history::pre(guest.thread_state_mut(), &mut token)
             .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
         self.pipe_hand_off_if_due(guest).await;
-        self.end_timeslice_if_needed(guest, boundary).await;
+        self.end_timeslice_if_needed(
+            guest,
+            boundary,
+            &mut token,
+            preemptions::callback_history::Site::Prehook,
+        )
+        .await;
         token
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     /// Yield when accumulated logical time reaches the syscall-boundary target deadline.
-    async fn end_timeslice_if_needed<G: Guest<Self>>(&self, guest: &mut G, boundary: CheckIn) {
+    async fn end_timeslice_if_needed<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        boundary: CheckIn,
+        token: &mut Option<preemptions::callback_history::Token>,
+        site: preemptions::callback_history::Site,
+    ) {
         if let Some(ends) = slice_boundary::replay_expiration(guest.thread_state())
             .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error))
         {
@@ -1807,6 +1819,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             return;
         }
+        if self
+            .replay_callback_checkpoint(guest, boundary, token, site)
+            .await
+        {
+            return;
+        }
+        let thread_state = guest.thread_state();
         let Some(slice_end) = thread_state.end_of_timeslice else {
             return;
         };
@@ -1824,7 +1843,119 @@ impl<T: RecordOrReplay> Detcore<T> {
             thread_state.thread_logical_time.as_nanos(),
             slice_end
         );
-        self.end_timeslice(guest).await;
+        let origin = self.record_callback_origin(guest, token, site);
+        self.end_timeslice_with_checkpoint(guest, false, origin, boundary)
+            .await;
+    }
+
+    fn record_callback_origin<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        token: &Option<preemptions::callback_history::Token>,
+        site: preemptions::callback_history::Site,
+    ) -> Option<preemptions::callback_history::Origin> {
+        if !preemptions::callback_history::recording_enabled(&self.cfg) {
+            return None;
+        }
+        let thread = guest.thread_state();
+        thread.callback_history.origin(thread, token, site)
+    }
+
+    async fn replay_callback_checkpoint<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        boundary: CheckIn,
+        token: &mut Option<preemptions::callback_history::Token>,
+        site: preemptions::callback_history::Site,
+    ) -> bool {
+        if self.cfg.replay_schedule_from.is_none()
+            || self.cfg.strict_schedule_boundaries
+            || guest.thread_state().own_signal_turn_hold.is_some()
+        {
+            return false;
+        }
+        let thread = guest.thread_state();
+        if let Some(token) = token {
+            token.note_cut(thread.callback_history.progress(), site);
+        }
+        let Some(actual) = thread.callback_history.origin(thread, token, site) else {
+            return false;
+        };
+        let Some(origin) = self
+            .take_callback_checkpoint(guest, actual, token.as_ref())
+            .await
+        else {
+            return false;
+        };
+        self.end_timeslice_with_checkpoint(guest, false, Some(origin), boundary)
+            .await;
+        true
+    }
+
+    fn callback_checkpoint_expiry_due<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        boundary: CheckIn,
+        site: preemptions::callback_history::Site,
+    ) -> bool {
+        let thread = guest.thread_state();
+        if thread.own_signal_turn_hold.is_some() {
+            return false;
+        }
+        if site == preemptions::callback_history::Site::PosthookPmuEpsilon {
+            let multiplier = guest.config().clock_multiplier.unwrap_or(1.0)
+                * thread.rcb_time_multiplier().as_f64();
+            let epsilon = Duration::from_nanos((NANOS_PER_RCB * multiplier).ceil() as u64);
+            return thread.replay_rcb_end.is_none()
+                && thread.max_timeslice_end.is_some_and(|maximum| {
+                    thread.thread_logical_time.as_nanos() + epsilon > maximum
+                });
+        }
+        thread.end_of_timeslice.is_some()
+            && match boundary {
+                CheckIn::Event => thread.timeslice_expired(),
+                CheckIn::InstructionTrap => thread.instruction_trap_ends_timeslice(&self.cfg),
+            }
+    }
+
+    async fn take_callback_checkpoint<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        actual: preemptions::callback_history::Origin,
+        token: Option<&preemptions::callback_history::Token>,
+    ) -> Option<preemptions::callback_history::Origin> {
+        loop {
+            match guest
+                .thread_state_mut()
+                .callback_history
+                .check_at(actual.clone(), token)
+            {
+                preemptions::callback_history::Decision::Wait => return None,
+                preemptions::callback_history::Decision::Act(origin) => return Some(origin),
+                preemptions::callback_history::Decision::Mismatch {
+                    checkpoint,
+                    hard,
+                    actual,
+                } => {
+                    let (time, response) = tool_global::send_and_update_time(
+                        guest,
+                        tool_global::GlobalRequest::CallbackCheckpointMismatch {
+                            checkpoint,
+                            hard,
+                            actual,
+                        },
+                    )
+                    .await;
+                    assert_eq!(
+                        (time, response),
+                        (
+                            None,
+                            tool_global::GlobalResponse::CallbackCheckpointMismatch(())
+                        )
+                    );
+                }
+            }
+        }
     }
 
     /// A common hook called at the end of *every* handler, just before returning control
@@ -1841,9 +1972,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         boundary: CheckIn,
-        token: Option<slice_boundary::callbacks::Token>,
+        mut token: Option<preemptions::callback_history::Token>,
     ) {
-        slice_boundary::callbacks::post(guest.thread_state_mut(), token)
+        preemptions::callback_history::post(guest.thread_state_mut(), &token)
             .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
         // Only `kill` and `rt_sigqueueinfo` set the hold, and they wake no
         // futex waiter (https://github.com/rrnewton/hermit/issues/4034).
@@ -1868,7 +1999,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
         self.pipe_hand_off_if_due(guest).await;
-        self.end_timeslice_if_needed(guest, boundary).await;
+        self.end_timeslice_if_needed(
+            guest,
+            boundary,
+            &mut token,
+            preemptions::callback_history::Site::Posthook,
+        )
+        .await;
+        self.replay_callback_checkpoint(
+            guest,
+            boundary,
+            &mut token,
+            preemptions::callback_history::Site::PosthookPmuEpsilon,
+        )
+        .await;
 
         let dettid = guest.thread_state().dettid;
         let mut current_time = guest.thread_state().thread_logical_time.as_nanos();
@@ -1898,7 +2042,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     "posthook [dtid {}] less than one RCB remains before PMU maximum {}; ending slice",
                     dettid, max_timeslice_end
                 );
-                self.end_timeslice(guest).await;
+                let origin = self.record_callback_origin(
+                    guest,
+                    &token,
+                    preemptions::callback_history::Site::PosthookPmuEpsilon,
+                );
+                self.end_timeslice_with_checkpoint(guest, false, origin, boundary)
+                    .await;
                 max_timeslice_end = guest
                     .thread_state()
                     .max_timeslice_end
@@ -2027,13 +2177,27 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn end_timeslice_with_sched_yield<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        explicit_sched_yield: bool,
+    ) {
+        self.end_timeslice_with_checkpoint(guest, explicit_sched_yield, None, CheckIn::Event)
+            .await;
+    }
+
+    async fn end_timeslice_with_checkpoint<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
         mut explicit_sched_yield: bool,
+        mut checkpoint: Option<preemptions::callback_history::Origin>,
+        check_in: CheckIn,
     ) {
         let chaos = guest.config().chaos;
         loop {
             let thread_state = guest.thread_state();
             let dettid = thread_state.dettid;
             let end_time = thread_state.thread_logical_time.as_nanos();
+            if let Some(origin) = &checkpoint {
+                checkpoint = Some(thread_state.callback_history.refresh(thread_state, origin));
+            }
             info!(
                 "[detcore, dtid {}] ending timeslice T{}. {} syscalls and {} signals this timeslice.",
                 dettid,
@@ -2041,9 +2205,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                 thread_state.stats.timeslice_syscall_count,
                 thread_state.stats.timeslice_signal_count,
             );
+            let replay_checkpoint = checkpoint.is_some() && self.cfg.replay_schedule_from.is_some();
+            // Read the live cursor authority after checkpoint acquisition and
+            // any replay handoff. The administrative turn subsumes an expiry
+            // already due at this exact site, including its original reset.
+            let expiry_due = replay_checkpoint
+                && self.callback_checkpoint_expiry_due(
+                    guest,
+                    check_in,
+                    checkpoint.as_ref().unwrap().site,
+                );
             let (maybe_prio, boundary) = {
                 let thread = guest.thread_state_mut();
-                if let Some(mut observed) = thread.slice_boundary.take() {
+                if replay_checkpoint && !expiry_due {
+                    // The event cursor may just have installed a future deadline,
+                    // including through a TraceReplay resume. This administrative
+                    // pass does not draw or reset a slice. Later real grants may
+                    // update that authority normally; do not snapshot it here.
+                    (None, None)
+                } else if let Some(mut observed) = thread.slice_boundary.take() {
                     let result =
                         observed.close_slice(thread, &self.cfg, explicit_sched_yield, None);
                     thread.slice_boundary = Some(observed);
@@ -2057,7 +2237,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
 
             // Depending on chaos mode, a received timer event is either a preemption or a changepoint
-            let mut req = if let Some(prio) = maybe_prio {
+            let mut req = if replay_checkpoint {
+                // The selected scheduler operation reads its current replay
+                // band. This placeholder never changes that band at filing.
+                Self::priority_changepoint_request(
+                    guest,
+                    end_time,
+                    scheduler::runqueue::DEFAULT_PRIORITY,
+                )
+            } else if let Some(prio) = maybe_prio {
                 Self::priority_changepoint_request(guest, end_time, prio)
             } else if chaos {
                 Self::random_priority_changepoint_request(guest, end_time)
@@ -2067,7 +2255,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Self::yield_request(guest)
             };
             req.slice_boundary = boundary;
+            req.callback_checkpoint = checkpoint.clone().map(Box::new);
             resource_request(guest, req).await;
+
+            if self.cfg.replay_schedule_from.is_some()
+                && let Some(origin) = &checkpoint
+            {
+                let thread = guest.thread_state();
+                let actual = thread.callback_history.refresh(thread, origin);
+                checkpoint = self.take_callback_checkpoint(guest, actual, None).await;
+                if checkpoint.is_some() {
+                    continue;
+                }
+                break;
+            }
 
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1151)
@@ -3159,7 +3360,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         };
         let mycount = self.inbound_turn_settled(guest, signal).await;
         let mut boundary_token = held.turn.boundary_token;
-        slice_boundary::callbacks::delivered_signal(&mut boundary_token, signal, mycount)
+        preemptions::callback_history::delivered_signal(&mut boundary_token, signal, mycount)
             .expect("committed announcement must link to its actual delivery ordinal");
         let turn = tool_local::InboundTurn {
             dettid: held.turn.dettid,
@@ -3501,6 +3702,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // Boundary production is not enabled yet; a child must
                     // never inherit its parent's occurrence/hint ownership.
                     slice_boundary: None,
+                    callback_history: Default::default(),
                     detpid: None, // Initialized later.
                     thread_start_entered: false,
                     physical_tid: None,

@@ -23,7 +23,7 @@ use serde::Serialize;
 use super::Observations;
 use crate::ThreadState;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub(crate) enum Callback {
     Syscall(Sysno),
     Cpuid,

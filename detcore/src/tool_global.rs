@@ -2857,6 +2857,21 @@ impl GlobalState {
             }
             return (None, R::RecordDeterminismLoss(()));
         }
+        if let GlobalRequest::CallbackCheckpointMismatch {
+            checkpoint,
+            hard,
+            actual,
+        } = request
+        {
+            let mut sched = self.lock_rpc_scheduler(false).await;
+            if sched.thread_is_logically_killed(dtid)
+                || !sched.rpc_incarnation_matches(dtid, request_mm)
+            {
+                return (None, R::ThreadExited);
+            }
+            sched.callback_checkpoint_mismatch(dtid, &checkpoint, hard, &actual);
+            return (None, R::CallbackCheckpointMismatch(()));
+        }
         // Control traffic for a shared open file description: like the
         // observations above, it carries no logical time, changes no
         // scheduler state, and its answer carries no time back.
@@ -3189,6 +3204,9 @@ impl GlobalState {
             }
             GlobalRequest::RecordDeterminismLoss(_) => {
                 unreachable!("determinism loss answered before clock accounting")
+            }
+            GlobalRequest::CallbackCheckpointMismatch { .. } => {
+                unreachable!("callback mismatch answered before clock accounting")
             }
             GlobalRequest::PublishSignalDispositions(..) => {
                 unreachable!("published dispositions answered before clock accounting")
@@ -3688,7 +3706,29 @@ impl GlobalState {
                     )
                     .await
                 {
-                    SchedulerRpcResult::Continue(history) => R::StartNewThread(history),
+                    SchedulerRpcResult::Continue(history) => {
+                        let sched = self.lock_rpc_scheduler(false).await;
+                        let startup = crate::preemptions::callback_history::Startup {
+                            checkpoints: sched
+                                .callback_checkpoints
+                                .get(&dettid)
+                                .into_iter()
+                                .flatten()
+                                .cloned()
+                                .collect(),
+                            progress: sched
+                                .callback_progress
+                                .get(&dettid)
+                                .cloned()
+                                .unwrap_or_default(),
+                        };
+                        let response = R::StartNewThread(history);
+                        if sched.callback_history_active {
+                            R::WithCallbackHistory(startup, Box::new(response))
+                        } else {
+                            response
+                        }
+                    }
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -5243,6 +5283,7 @@ impl GlobalState {
                     private_sigchld_decides: false,
                     slice_boundary: None,
                     guest_signal_mask: None,
+                    callback_checkpoint: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -5809,9 +5850,16 @@ impl GlobalState {
         command_bootstrap: bool,
     ) -> SchedulerRpcResult<TraceSchedEventResponse> {
         let ev = {
-            let sched = self.lock_rpc_scheduler(false).await;
+            let mut sched = self.lock_rpc_scheduler(false).await;
             if !sched.rpc_incarnation_matches(ev.dettid, request_mm) {
                 return SchedulerRpcResult::ThreadExited;
+            }
+            if sched.callback_history_active {
+                sched
+                    .callback_progress
+                    .entry(ev.dettid)
+                    .or_default()
+                    .observe_event(&ev);
             }
             // TODO(T124316762): debug address randomization in the tracer and get rid of this hack:
             let ev = {
@@ -6765,6 +6813,15 @@ pub enum GlobalRequest {
     /// process), and its argument and environment areas
     /// (`ProcessAuxvTable::current_cmdline`). Appended last.
     ProcessCmdline(DetPid),
+    /// Error-only notice, not a resource or a scheduling turn. Appended last.
+    CallbackCheckpointMismatch {
+        /// The first unconsumed checkpoint, as sent on thread start.
+        checkpoint: crate::preemptions::callback_history::Checkpoint,
+        /// A semantic endpoint/phase mismatch rather than time/RCB drift.
+        hard: bool,
+        /// Independently observed actual callback coordinates.
+        actual: crate::preemptions::callback_history::Origin,
+    },
 }
 
 /// Responses from the global object
@@ -7013,6 +7070,14 @@ pub enum GlobalResponse {
     WithSliceBoundaryStack(Option<PathBuf>, Box<GlobalResponse>),
     /// The process, and its areas if Detcore recorded them. Appended last.
     ProcessCmdline(DetPid, Option<crate::procfs::CmdlineArea>),
+    /// Legacy callback metadata on the original thread-start response. Appended
+    /// without changing existing wire tags or ThreadHistory's positional layout.
+    WithCallbackHistory(
+        crate::preemptions::callback_history::Startup,
+        Box<GlobalResponse>,
+    ),
+    /// A mismatch report acknowledges no scheduler grant and carries no time.
+    CallbackCheckpointMismatch(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -7637,6 +7702,18 @@ where
     if let GlobalResponse::WithSliceBoundaryStack(path, response) = resp.1 {
         resp.1 = *response;
         write_backtrace(guest, path.as_ref());
+    }
+    if let GlobalResponse::WithCallbackHistory(checkpoints, response) = resp.1 {
+        resp.1 = *response;
+        guest
+            .thread_state_mut()
+            .callback_history
+            .install(checkpoints);
+    } else if matches!(resp.1, GlobalResponse::StartNewThread(_)) {
+        assert!(
+            !guest.thread_state().callback_history.is_active(),
+            "preserved callback activation matches coordinator startup"
+        );
     }
     guest.thread_state_mut().last_grant_deadline = deadline;
     cap_timeslice_at_deadline(guest, deadline);
@@ -8838,6 +8915,11 @@ where
 
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let command_bootstrap = guest.is_command_bootstrap();
+    if crate::preemptions::callback_history::recording_enabled(guest.config())
+        || guest.thread_state().callback_history.is_active()
+    {
+        guest.thread_state_mut().callback_history.observe_event(&ev);
+    }
     let resp = send_and_update_time(
         guest,
         GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap),
@@ -19314,6 +19396,7 @@ mod tests {
         );
         assert_eq!(mtime, LogicalTime::from_secs(1));
     }
+    include!("tool_global/callback_history_tests.rs");
 }
 
 #[cfg(test)]

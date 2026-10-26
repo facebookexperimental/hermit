@@ -743,6 +743,12 @@ pub struct Resources {
     /// travels in bincode RPCs, which decode by position.
     #[serde(default)]
     pub(crate) guest_signal_mask: Option<u64>,
+    /// Actual callback origin on the existing priority-change request. Appended
+    /// without skip_serializing_if because Resources crosses positional RPCs.
+    /// Box the rare payload so ordinary resource/RPC futures keep their size.
+    /// Serde preserves the same positional and JSON payload bytes.
+    #[serde(default)]
+    pub(crate) callback_checkpoint: Option<Box<crate::preemptions::callback_history::Origin>>,
 }
 
 impl fmt::Debug for Resources {
@@ -853,6 +859,7 @@ impl Resources {
             private_sigchld_decides: false,
             slice_boundary: None,
             guest_signal_mask: None,
+            callback_checkpoint: None,
         }
     }
 

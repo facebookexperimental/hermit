@@ -9,6 +9,7 @@
 //! A datatype to abstract a record of thread preemptions, as generated during chaos mode execution.
 
 pub mod boundary_recording;
+pub mod callback_history;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -66,6 +67,10 @@ pub struct PreemptionRecord {
     /// in memory, which are replayed under either setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signal_state_copy: Option<bool>,
+    /// Actual callback expirations associated with existing priority-history rows.
+    /// Absent in old/edited recordings; never inferred from time or branch counts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
 }
 
 impl std::fmt::Display for PreemptionRecord {
@@ -84,6 +89,7 @@ impl PreemptionRecord {
             epoch: None,
             pipe_wake_latency: None,
             signal_state_copy: None,
+            callback_checkpoints: BTreeMap::new(),
         }
     }
 
@@ -136,6 +142,7 @@ impl PreemptionRecord {
     }
     /// TODO: provide a better way to create an empty PreemptionRecord but with entries for a given set of tids.
     pub fn strip_contents(mut self) -> Self {
+        self.callback_checkpoints.clear();
         for history in self.per_thread.values_mut() {
             history.prio_changes = Vec::new();
             history.preemption_rcbs = Vec::new();
@@ -153,6 +160,7 @@ impl PreemptionRecord {
         R: IntoIterator<Item = SchedEvent>,
         F: Fn(SchedEvent, &ReplayCursor<SchedEvent>) -> R,
     {
+        self.callback_checkpoints.clear();
         let mut result = Vec::new();
         let global = std::mem::take(&mut self.global);
         let mut cursor = ReplayCursor::from_iter(global);
@@ -167,11 +175,13 @@ impl PreemptionRecord {
 
     /// Iterate over the schedevents.
     pub fn schedevents_iter_mut(&mut self) -> std::slice::IterMut<'_, SchedEvent> {
+        self.callback_checkpoints.clear();
         self.global.iter_mut()
     }
 
     /// Leave only the per-thread preemption records, not the global schedule.
     pub fn preemptions_only(&mut self) {
+        self.callback_checkpoints.clear();
         self.global.clear();
     }
 
@@ -183,6 +193,7 @@ impl PreemptionRecord {
             epoch: self.epoch,
             pipe_wake_latency: self.pipe_wake_latency,
             signal_state_copy: self.signal_state_copy,
+            callback_checkpoints: BTreeMap::new(),
         }
     }
 
@@ -242,6 +253,20 @@ impl PreemptionRecord {
             epoch: None,
             pipe_wake_latency: None,
             signal_state_copy: None,
+            callback_checkpoints: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn callback_checkpoints(
+        &self,
+    ) -> &BTreeMap<DetTid, Vec<callback_history::Checkpoint>> {
+        &self.callback_checkpoints
+    }
+
+    /// Timestamp stripping preserves the event/progress relation, unlike an editor.
+    pub(crate) fn strip_event_times(&mut self) {
+        for event in &mut self.global {
+            event.end_time = None;
         }
     }
 
@@ -272,6 +297,7 @@ impl PreemptionRecord {
     /// Perform internal invariant checks on the PreemptionRecord and return an error if
     /// it is not well formed.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_callback_checkpoints()?;
         for (tid, history) in &self.per_thread {
             if !is_ordinary_priority(history.final_prio) {
                 return Err(format!(
@@ -347,6 +373,56 @@ impl PreemptionRecord {
         Ok(())
     }
 
+    fn validate_callback_checkpoints(&self) -> Result<(), String> {
+        let mut endpoints: BTreeMap<DetTid, BTreeMap<u64, crate::types::Op>> = BTreeMap::new();
+        let mut progress = BTreeMap::<DetTid, u64>::new();
+        for event in self.global.iter().filter(|event| {
+            event.count > 0 && self.callback_checkpoints.contains_key(&event.dettid)
+        }) {
+            let count = progress.entry(event.dettid).or_default();
+            *count = count
+                .checked_add(u64::from(event.count))
+                .ok_or("callback progress overflow")?;
+            endpoints
+                .entry(event.dettid)
+                .or_default()
+                .insert(*count, event.op);
+        }
+        for (tid, checkpoints) in &self.callback_checkpoints {
+            let history = self
+                .per_thread
+                .get(tid)
+                .ok_or("callback history has no thread")?;
+            let mut previous = None;
+            for checkpoint in checkpoints {
+                let row = checkpoint.history_index;
+                if previous.is_some_and(|(last_row, last_progress)| {
+                    row <= last_row || checkpoint.origin.progress < last_progress
+                }) || history.prio_changes.get(row).map(|x| x.0) != Some(checkpoint.origin.time)
+                    || history.preemption_rcbs.get(row).copied() != Some(checkpoint.origin.rcbs)
+                {
+                    return Err(format!("invalid callback history row for {tid}: {row}"));
+                }
+                previous = Some((row, checkpoint.origin.progress));
+                let found = if checkpoint.origin.progress == 0 {
+                    checkpoint.origin.last_op.is_none()
+                } else {
+                    endpoints
+                        .get(tid)
+                        .and_then(|points| points.get(&checkpoint.origin.progress))
+                        == checkpoint.origin.last_op.as_ref()
+                        && checkpoint.origin.last_op.is_some()
+                };
+                if !found {
+                    return Err(format!(
+                        "callback history has no event endpoint for {tid}: {row}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Normalize priorities for readibility.
     pub fn normalize(&self) -> PreemptionRecord {
         let mut clone = self.clone();
@@ -411,6 +487,7 @@ impl PreemptionRecord {
             .next();
 
         let mut clone = self.clone();
+        clone.callback_checkpoints.clear();
         if let Some(tid) = tid_with_preempt_to_drop {
             let thread_history = &mut clone.per_thread.get_mut(&tid).unwrap();
             if !thread_history.prio_changes.is_empty() {
@@ -999,6 +1076,88 @@ mod tests {
     }
 
     #[test]
+    fn callback_checkpoint_metadata_validates_and_only_time_stripping_preserves_it() {
+        use callback_history::Checkpoint;
+        use callback_history::Origin;
+        use callback_history::Site;
+        use reverie::syscalls::Sysno;
+
+        use crate::slice_boundary::callbacks::Callback;
+        let tid = DetTid::from_raw(3);
+        let mut record = PreemptionRecord::from_sched_events(vec![SchedEvent::branches(tid, 10)]);
+        let time = LogicalTime::from_nanos(100);
+        let mut history = ThreadHistory::new();
+        history.prio_changes.push((time, 1000));
+        history.preemption_rcbs.push(10);
+        record.per_thread.insert(tid, history);
+        let point = Checkpoint {
+            history_index: 0,
+            origin: Origin {
+                callback: Callback::Syscall(Sysno::close),
+                site: Site::Posthook,
+                progress: 10,
+                last_op: Some(Op::Branch),
+                time,
+                rcbs: 10,
+            },
+        };
+        record.callback_checkpoints.insert(tid, vec![point.clone()]);
+        record.validate().unwrap();
+        let mut stripped = record.clone();
+        stripped.strip_event_times();
+        assert_eq!(stripped.callback_checkpoints, record.callback_checkpoints);
+        stripped.validate().unwrap();
+        assert_eq!(
+            record.normalize().callback_checkpoints,
+            record.callback_checkpoints
+        );
+        for edited in [
+            record.clone().strip_contents(),
+            record.clone_preemptions_only(),
+            record.with_latest_preempt_removed(),
+        ] {
+            assert!(edited.callback_checkpoints.is_empty());
+        }
+        let mut edited = record.clone();
+        edited.split_map(|event, _| [event]);
+        assert!(edited.callback_checkpoints.is_empty());
+        let mut edited = record.clone();
+        let _ = edited.schedevents_iter_mut();
+        assert!(edited.callback_checkpoints.is_empty());
+        let mut edited = record.clone();
+        edited.preemptions_only();
+        assert!(edited.callback_checkpoints.is_empty());
+        for field in ["history_index", "progress", "time", "rcbs"] {
+            let mut bad = record.clone();
+            let point = &mut bad.callback_checkpoints.get_mut(&tid).unwrap()[0];
+            match field {
+                "history_index" => point.history_index = 1,
+                "progress" => point.origin.progress = 9,
+                "time" => point.origin.time = LogicalTime::from_nanos(101),
+                "rcbs" => point.origin.rcbs = 11,
+                _ => unreachable!(),
+            }
+            assert!(bad.validate().is_err(), "{field}");
+        }
+        let mut bad = record.clone();
+        bad.callback_checkpoints.get_mut(&tid).unwrap().push(point);
+        assert!(bad.validate().is_err());
+        let encoded = serde_json::to_string(&record).unwrap();
+        let decoded: PreemptionRecord = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, record);
+        let empty = PreemptionRecord::from_sched_events(Vec::new());
+        assert_eq!(
+            serde_json::to_string(&empty).unwrap(),
+            r#"{"per_thread":{},"global":[]}"#
+        );
+        let old: PreemptionRecord =
+            serde_json::from_str(r#"{"per_thread":{},"global":[]}"#).unwrap();
+        assert_eq!(old, empty);
+        let bad = encoded.replace("Posthook", "UnknownHook");
+        assert!(serde_json::from_str::<PreemptionRecord>(&bad).is_err());
+    }
+
+    #[test]
     fn test_split_map() {
         let mut pr: PreemptionRecord = serde_json::from_str(
             r#"
@@ -1192,6 +1351,30 @@ impl PreemptionWriter {
         history.prio_changes.push((time, prior_prio));
         history.preemption_rcbs.push(rcbs);
         history.final_prio = next_prio;
+    }
+
+    /// Attach only an observed callback expiry to the row the original helper just wrote.
+    pub(crate) fn insert_callback_checkpoint(
+        &mut self,
+        tid: DetTid,
+        origin: callback_history::Origin,
+    ) {
+        let history = &self.inner.per_thread[&tid];
+        let history_index = history
+            .prio_changes
+            .len()
+            .checked_sub(1)
+            .expect("callback follows priority row");
+        assert_eq!(history.prio_changes[history_index].0, origin.time);
+        assert_eq!(history.preemption_rcbs[history_index], origin.rcbs);
+        self.inner
+            .callback_checkpoints
+            .entry(tid)
+            .or_default()
+            .push(callback_history::Checkpoint {
+                history_index,
+                origin,
+            });
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

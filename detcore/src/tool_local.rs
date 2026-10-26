@@ -3909,7 +3909,7 @@ pub(crate) struct InboundTurn {
     pub(crate) mycount: u64,
     /// Actual callback identity retained through an announcement's await.
     #[serde(default)]
-    pub(crate) boundary_token: Option<crate::slice_boundary::callbacks::Token>,
+    pub(crate) boundary_token: Option<crate::preemptions::callback_history::Token>,
 }
 
 /// One delivery announced to `Tool::announce_signal_event` and not yet
@@ -4438,6 +4438,8 @@ pub struct ThreadState<T> {
     /// it yet; legacy state keeps `None`. Native transfer cannot discard it.
     #[serde(default)]
     pub(crate) slice_boundary: Option<crate::slice_boundary::Observations>,
+    #[serde(default)]
+    pub(crate) callback_history: crate::preemptions::callback_history::State,
 }
 
 /// We cannot assume that the record_or_replay "subtool" is Debug, so it is handy to be able to
@@ -5102,6 +5104,7 @@ impl<T> ThreadState<T> {
             robust_list_head: None,
             robust_list_process: Arc::new(Mutex::new(RobustListProcessState::default())),
             slice_boundary: None,
+            callback_history: Default::default(),
         }
     }
 
@@ -5561,6 +5564,7 @@ impl<T> ThreadState<T> {
             private_sigchld_decides: false,
             slice_boundary: None,
             guest_signal_mask: None,
+            callback_checkpoint: None,
         }
     }
 

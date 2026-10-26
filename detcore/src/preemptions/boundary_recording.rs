@@ -203,9 +203,7 @@ impl Recording {
     pub fn strip_times(&mut self) {
         match self {
             Self::Legacy(record) => {
-                for event in record.schedevents_iter_mut() {
-                    event.end_time = None;
-                }
+                record.strip_event_times();
             }
             Self::Boundaries(record) => record.schedule.strip_times(),
         }
