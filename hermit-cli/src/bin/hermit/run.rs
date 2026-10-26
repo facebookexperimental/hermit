@@ -645,8 +645,9 @@ pub(crate) fn branch_counter_verdict() -> hermit::canonical_verdict::BranchCount
 
 /// Why a run on `backend`, with `--passthru-opt` when `passthru_opt` is set,
 /// can run guest code or syscalls that Hermit does not observe, or `None` when
-/// Hermit sees every syscall of every guest process from its first
-/// instruction after exec. In such a run a host file change found before the
+/// Hermit sees every syscall of every guest process that can change a file,
+/// from its first instruction after exec. `--untrap-passthrough-syscalls`
+/// leaves untrapped only calls that change no file. In such a run a host file change found before the
 /// first divergence is not evidence that the guest did not make the change
 /// itself (see `hermit::host_input_change`).
 fn unobserved_guest_execution(backend: Backend, passthru_opt: bool) -> Option<&'static str> {
@@ -5362,6 +5363,71 @@ fn the_ptrace_runtime_guards_reverie_private_page() {
     );
     ro.set_backend(Some(Backend::Kvm));
     assert_eq!(ro.effective_det_config().untraced_code_range, None);
+}
+
+#[test]
+fn untrap_passthrough_syscalls_is_an_opt_in_refused_where_its_calls_are_counted() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--untrap-passthrough-syscalls", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(opts.det_opts.det_config.untrap_passthrough_syscalls);
+    assert_eq!(
+        format!("{}", opts),
+        " --untrap-passthrough-syscalls --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
+    let mut default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    default.validate_args_with_perf_support(true).unwrap();
+    assert!(!default.det_opts.det_config.untrap_passthrough_syscalls);
+
+    for (argument, backend, refused_with) in [
+        (Some("--strict"), None, "--strict"),
+        // KVM refuses the default preemption timer before this check.
+        (
+            Some("--max-timeslice=disabled"),
+            Some(Backend::Kvm),
+            "backend other than ptrace",
+        ),
+        (None, Some(Backend::E9patch), "backend other than ptrace"),
+        (
+            Some("--record-preemptions-to=/tmp/p"),
+            None,
+            "preemption record",
+        ),
+        (
+            Some("--replay-schedule-from=/tmp/p"),
+            None,
+            "preemption record",
+        ),
+        (Some("--happens-before=/tmp/hb"), None, "--happens-before"),
+        (Some("--verify-run=/tmp/v"), None, "--verify-run"),
+        (Some("--namespace-only"), None, "backend other than ptrace"),
+        (Some("--max-timeslice=disabled"), None, "RCB time"),
+        (Some("--no-rcb-time"), None, "RCB time"),
+    ] {
+        let mut opts = RunOpts::parse_from(
+            ["fakehermit", "--untrap-passthrough-syscalls"]
+                .into_iter()
+                .chain(argument)
+                .chain(["fakeprog"]),
+        );
+        opts.set_backend(backend);
+        let error = opts
+            .validate_args_with_perf_support(true)
+            .expect_err("refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("--untrap-passthrough-syscalls") && message.contains(refused_with),
+            "{argument:?} {backend:?}: {message}"
+        );
+    }
+    // Nor on a host without usable performance counters, where validation
+    // turns the timer off.
+    let mut opts = RunOpts::parse_from(["fakehermit", "--untrap-passthrough-syscalls", "fakeprog"]);
+    let message = format!(
+        "{:#}",
+        opts.validate_args_with_timer_support(Err(TimerUnavailable::NoPerfEvents))
+            .expect_err("refused without a timer")
+    );
+    assert!(message.contains("RCB time"), "{message}");
 }
 
 #[test]
@@ -13156,6 +13222,31 @@ impl RunOpts {
             );
         }
         config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
+        if config.untrap_passthrough_syscalls {
+            // The untrapped calls never reach Detcore, so nothing that counts,
+            // logs or compares Detcore's events sees them.
+            let conflict = if self.strict {
+                Some("--strict, which promises that Detcore observes every syscall")
+            } else if self.namespace_only || backend != Backend::Ptrace {
+                Some(
+                    "a backend other than ptrace, whose syscall interception it has not been \
+                     checked against",
+                )
+            } else if config.record_preemptions_to.is_some()
+                || config.replay_schedule_from.is_some()
+            {
+                Some("a preemption record, whose callback history counts the calls it untraps")
+            } else if self.happens_before.is_some() {
+                Some("--happens-before, whose syscall anchors count the calls it untraps")
+            } else if self.verify_run.is_some() {
+                Some("--verify-run, whose record does not say the calls were untrapped")
+            } else {
+                None
+            };
+            if let Some(conflict) = conflict {
+                anyhow::bail!("--untrap-passthrough-syscalls cannot be combined with {conflict}");
+            }
+        }
 
         // virtualize_metadata implies virtualize_time
         if config.virtualize_metadata && !config.virtualize_time {
@@ -13274,6 +13365,19 @@ impl RunOpts {
             }
             config.max_timeslice = None;
             self.timer_downgrade = Some(unavailable.clone());
+        }
+        // Without RCB time, which needs the preemption timer, syscall charges
+        // are the only progress of virtual time and trapped syscalls the only
+        // points where a thread yields, so a loop on the calls this untraps
+        // would never yield or let virtual time advance. Checked once a host
+        // without usable performance counters has turned the timer off.
+        if config.untrap_passthrough_syscalls && !config.use_rcb_time() {
+            anyhow::bail!(
+                "--untrap-passthrough-syscalls needs the preemption timer and RCB time \
+                 (not --max-timeslice=disabled, --no-rcb-time, or a host without usable \
+                 performance counters): without them a loop on the calls it untraps would \
+                 never yield or let virtual time advance"
+            );
         }
 
         // `--chaos-timeslice-draw=run` draws from the effective scheduler seed,

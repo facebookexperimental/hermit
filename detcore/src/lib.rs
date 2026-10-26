@@ -4621,6 +4621,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             if config.virtualize_cpuid {
                 subscription.cpuid();
             }
+            // Explicit performance opt-in: these calls run without a stop, so
+            // Detcore neither charges them virtual time nor logs or counts
+            // them.
+            if config.untrap_passthrough_syscalls {
+                subscription.disable_syscalls(
+                    crate::syscall_classification::UNTRAPPED_PASSTHROUGH
+                        .iter()
+                        .copied(),
+                );
+            }
             subscription
         } else {
             // Explicit performance opt-in: unlisted syscalls bypass Detcore entirely. Keep this
@@ -8707,6 +8717,87 @@ mod subscription_tests {
                     .iter_syscalls()
                     .any(|subscribed| subscribed == syscall),
                 "passthru_opt allowed {syscall} to bypass Detcore's thread-exit state"
+            );
+        }
+    }
+
+    /// `--untrap-passthrough-syscalls` unsubscribes exactly its list, and a
+    /// run without it still subscribes every syscall it did.
+    #[test]
+    fn untrap_passthrough_syscalls_unsubscribes_exactly_its_list() {
+        use std::collections::BTreeSet;
+
+        let subscribed = |untrap| {
+            let config = Config {
+                untrap_passthrough_syscalls: untrap,
+                ..strict_config(false)
+            };
+            let subscriptions = <Detcore as Tool>::subscriptions(&config);
+            (
+                subscriptions.iter_syscalls().collect::<BTreeSet<_>>(),
+                subscriptions.has_rdtsc(),
+                subscriptions.has_cpuid(),
+            )
+        };
+        let (trapped, rdtsc, cpuid) = subscribed(false);
+        let (untrapped, untrapped_rdtsc, untrapped_cpuid) = subscribed(true);
+        assert_eq!(
+            trapped,
+            <Detcore as Tool>::subscriptions(&strict_config(false))
+                .iter_syscalls()
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(untrapped.is_subset(&trapped));
+        assert_eq!(
+            trapped
+                .difference(&untrapped)
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            syscall_classification::UNTRAPPED_PASSTHROUGH
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!((untrapped_rdtsc, untrapped_cpuid), (rdtsc, cpuid));
+        // Every syscall whose output buffer `--detlog-io-buffers` hashes is
+        // still trapped.
+        for sysno in crate::io_buffers::HASHED_SYSCALLS {
+            assert!(untrapped.contains(sysno), "{sysno}");
+        }
+    }
+
+    /// Each untrapped syscall is one whose Detcore handler passes it through
+    /// unchanged: classified PassThrough, outside the PassThrough calls that
+    /// Detcore handles itself or observes, and none that names a file or a
+    /// descriptor, reads virtual time, maps memory, or has an output buffer
+    /// that `--detlog-io-buffers` hashes.
+    #[test]
+    fn untrapped_passthrough_syscalls_are_plain_passthroughs() {
+        let handled = [
+            Sysno::chroot,
+            Sysno::brk,
+            Sysno::set_tid_address,
+            Sysno::set_robust_list,
+            Sysno::rt_sigreturn,
+            Sysno::mprotect,
+            Sysno::pkey_mprotect,
+        ];
+        for &sysno in syscall_classification::UNTRAPPED_PASSTHROUGH {
+            assert_eq!(
+                syscall_classification::classify_syscall(sysno),
+                syscall_classification::SyscallClassification::PassThrough,
+                "{sysno}"
+            );
+            assert!(!handled.contains(&sysno), "{sysno}");
+            assert!(
+                !crate::syscalls::may_name_file_or_descriptor(sysno),
+                "{sysno}"
+            );
+            assert!(!syscall_time::observes_virtual_time(sysno), "{sysno}");
+            // `--detlog-io-buffers` hashes these calls' output buffers.
+            assert!(
+                !crate::io_buffers::HASHED_SYSCALLS.contains(&sysno),
+                "{sysno}"
             );
         }
     }

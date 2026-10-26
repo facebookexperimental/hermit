@@ -952,6 +952,13 @@ impl RunData {
                 "Error, cannot search through executions with --no-sequentialize-threads.  Determinism required.",
             )
         }
+        if ro.det_opts.det_config.untrap_passthrough_syscalls {
+            bail!(
+                "hermit analyze cannot search executions with --untrap-passthrough-syscalls: its \
+                 trials record and replay preemptions, whose callback history the untrapped \
+                 calls would not reach"
+            )
+        }
 
         // We could add a flag for analyze-without chaos, but it's a rare use case that isn't
         // usefully supported now anyway.  Exploring with RNG alone doesn't make sense, but we may

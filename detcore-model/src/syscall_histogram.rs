@@ -108,6 +108,9 @@ pub enum SyscallObservationGap {
     /// guest's dynamic loader has run, so the loader's syscalls are not
     /// counted (LiteInst, in-guest-trap, SaBRe).
     InProcessRuntimeStart,
+    /// `--untrap-passthrough-syscalls`: the pass-through syscalls it leaves
+    /// untrapped run with no stop and are not counted.
+    UntrappedPassthrough,
 }
 
 /// Whether a histogram counts every syscall the guest made.
@@ -589,6 +592,13 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&partial).unwrap(),
             r#"{"kind":"partial","gaps":["passthru_opt","in_process_runtime_start"]}"#
+        );
+        let untrapped =
+            SyscallObservationScope::from_gaps([SyscallObservationGap::UntrappedPassthrough]);
+        assert!(!untrapped.is_complete());
+        assert_eq!(
+            serde_json::to_string(&untrapped).unwrap(),
+            r#"{"kind":"partial","gaps":["untrapped_passthrough"]}"#
         );
     }
 

@@ -962,6 +962,15 @@ fn sees_syscall(nr: i64) -> bool {
     usize::try_from(nr).is_ok_and(|nr| reverie::syscalls::Sysno::new(nr).is_some())
 }
 
+/// Whether syscall number `nr` runs with no Tool callback because
+/// `--untrap-passthrough-syscalls` (`untrap`) leaves it untrapped.
+fn untrapped(untrap: bool, nr: i64) -> bool {
+    untrap
+        && crate::syscall_classification::UNTRAPPED_PASSTHROUGH
+            .iter()
+            .any(|&sysno| sysno as i64 == nr)
+}
+
 /// `sizeof(struct ucontext)` on x86-64 Linux (`include/uapi/asm-generic/ucontext.h`):
 /// `uc_flags` and `uc_link` (8 bytes each), `stack_t uc_stack` (24),
 /// `struct sigcontext uc_mcontext` (256) and the kernel's 8-byte
@@ -1124,11 +1133,17 @@ where
             //   which needs the thread back in user code
             //   (`synchronous_with_a_kernel_code`);
             // - the thread is in a syscall Detcore cannot see: a number
-            //   outside Reverie's table, or a negative one the kernel refuses,
+            //   outside Reverie's table, a negative one the kernel refuses,
+            //   or one `--untrap-passthrough-syscalls` leaves untrapped,
             //   reaches no Tool callback, so the record still names an earlier
             //   event.
             None | Some(Interruption::AfterFrame) => (from_registers, true),
-            _ if orig == -1 || !sees_syscall(orig) => (from_registers, true),
+            _ if orig == -1
+                || !sees_syscall(orig)
+                || untrapped(guest.config().untrap_passthrough_syscalls, orig) =>
+            {
+                (from_registers, true)
+            }
             // A known syscall that the record does not name: Detcore missed an
             // event it subscribes to. Sent as it stands, so the backend reports
             // the contradiction.
@@ -4818,6 +4833,33 @@ mod tests {
                 guest.thread.delivery_counters.interruption_from_registers,
                 u64::from(from_registers),
                 "record {record:?}, orig_rax {orig}, passthru {passthru}"
+            );
+        }
+        // A syscall `--untrap-passthrough-syscalls` leaves untrapped reaches no
+        // Tool callback, so with the flag the registers decide; without it the
+        // call is trapped, and a record that does not name it is reported.
+        let getppid = libc::SYS_getppid;
+        for (untrap, expected, from_registers) in [
+            (
+                true,
+                reverie::Interruption::KernelRun { syscall: getppid },
+                true,
+            ),
+            (false, read, false),
+        ] {
+            let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+            guest.config.untrap_passthrough_syscalls = untrap;
+            guest.thread.delivery_interruption = Some(read);
+            guest.delivery.orig_rax = Some(getppid);
+            check(&mut guest, libc::SIGUSR1);
+            assert_eq!(
+                guest.delivery.asked[0].interruption, expected,
+                "untrap {untrap}"
+            );
+            assert_eq!(
+                guest.thread.delivery_counters.interruption_from_registers,
+                u64::from(from_registers),
+                "untrap {untrap}"
             );
         }
     }

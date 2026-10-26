@@ -38,6 +38,36 @@ pub(crate) fn all_pinned_syscalls() -> impl Iterator<Item = Sysno> {
     Sysno::iter().chain(std::iter::once(Sysno::last()))
 }
 
+/// The syscalls `--untrap-passthrough-syscalls` leaves to the kernel without a
+/// stop (`Config::untrap_passthrough_syscalls`). Each is `PassThrough`, and
+/// Detcore's handler for it injects the call unchanged and returns the kernel's
+/// result unchanged, so the guest sees the same result whether or not it is
+/// trapped. Each only reads or sets state of the calling process (or, for
+/// `capget` and `get_robust_list`, reads another thread's) that the run's
+/// container fixes, names no file or descriptor, maps or protects no memory,
+/// reads no clock, takes no signal, and never waits for another thread, so
+/// the thread that holds the turn always gets it back. Trapped, each would
+/// still charge virtual time, log DETLOG lines and be a point where the
+/// timeslice can end; those three are what change.
+pub(crate) const UNTRAPPED_PASSTHROUGH: &[Sysno] = &[
+    // The parent's PID in the guest's PID namespace.
+    Sysno::getppid,
+    // Swaps the file-creation mask: process state, read back by later
+    // trapped file creations.
+    Sysno::umask,
+    // The supplementary groups of the container's fixed identity.
+    Sysno::getgroups,
+    // A thread's capability sets, fixed by the container's identity; capset
+    // stays trapped.
+    Sysno::capget,
+    // Constants of each scheduling policy.
+    Sysno::sched_get_priority_max,
+    Sysno::sched_get_priority_min,
+    // A thread's robust-list head; set_robust_list, which Detcore observes,
+    // stays trapped.
+    Sysno::get_robust_list,
+];
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Detcore's execution policy for a named Linux syscall.
 pub(crate) enum SyscallClassification {

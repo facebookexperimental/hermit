@@ -1314,6 +1314,7 @@ fn record_or_replay_config_with_timer_support(
         // of the Determinized classification begins in v0x10a; madvise policy
         // semantics begin in v0x102.
         passthru_opt: true,
+        untrap_passthrough_syscalls: false,
         deterministic_io: false,
         virtualize_time: crate::RECORD_REPLAY_VIRTUALIZES_TIME,
         virtualize_metadata: false,
