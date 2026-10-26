@@ -12946,11 +12946,20 @@ impl RunOpts {
             "--rewrite-exclusives is preprocessing for the ptrace backend; \
              backend `{backend:?}` would run the rewritten image under a different runtime"
         );
+        anyhow::ensure!(
+            hermit::aarch64_lse::host_has_lse_atomics(),
+            "--rewrite-exclusives rewrites exclusive loops into FEAT_LSE atomic instructions, \
+             which this host does not execute (no HWCAP_ATOMICS); the rewritten image would \
+             raise SIGILL"
+        );
         let (guest, host) = self.resolve_guest_and_host_program()?;
         let mut files = vec![(guest, host)];
         for also in &self.rewrite_exclusives_also {
             let path = fs::canonicalize(also).with_context(|| {
-                format!("--rewrite-exclusives-also {} cannot be resolved", also.display())
+                format!(
+                    "--rewrite-exclusives-also {} cannot be resolved",
+                    also.display()
+                )
             })?;
             files.push((path.clone(), path));
         }
@@ -12963,7 +12972,10 @@ impl RunOpts {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "image".to_owned());
-            let output = cache.join(format!("{digest}-{name}"));
+            let output = cache.join(format!(
+                "v{}-{digest}-{name}",
+                hermit::aarch64_lse::REWRITE_FORMAT_VERSION
+            ));
             let report = if output.exists() {
                 hermit::aarch64_lse::elf::rewrite_bytes(&mut input.clone())?
             } else {

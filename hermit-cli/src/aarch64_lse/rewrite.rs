@@ -53,7 +53,6 @@ use super::insn::ZR;
 use super::insn::decode;
 use super::insn::{self};
 
-
 /// The loop shapes this rewriter recognises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Idiom {
@@ -79,8 +78,10 @@ pub enum Refusal {
     Undecoded,
     /// The window is decoded but is not one of the four idioms.
     NotCanonical,
-    /// A branch elsewhere in the scanned range targets the inside of the
-    /// sequence, so the replacement could be entered part-way.
+    /// A direct branch elsewhere in the scanned range targets the inside of
+    /// the sequence, so the replacement could be entered part-way. Only
+    /// direct branches are checked: an indirect branch's target (a jump
+    /// table, a landing pad) is not known here.
     BranchIntoSequence,
     /// The idiom matched but its registers break an assumption the
     /// replacement needs; the string names which one.
@@ -89,6 +90,9 @@ pub enum Refusal {
     UnsupportedOperation,
     /// A branch the replacement must move no longer reaches its target.
     BranchOutOfRange,
+    /// A relocation points into the sequence, so the loader writes those
+    /// bytes itself, for the instruction that used to be there.
+    Relocated,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,7 +251,7 @@ fn match_sequence(
     if load_size != size {
         return Err(Refusal::NotCanonical);
     }
-    if decoded[start + 1..store].iter().any(|i| *i == Insn::Other) {
+    if decoded[start + 1..store].contains(&Insn::Other) {
         return Err(Refusal::Undecoded);
     }
     // The status register must be a register the loop itself destroys and
@@ -271,7 +275,18 @@ fn match_sequence(
         (1, _) => (Idiom::Swap, swap(size, ord, rs, rt, rv, rn, zero_status)?),
         (2, alu @ Insn::Alu { .. }) => (
             Idiom::Rmw,
-            rmw(alu, words[start + 1], size, ord, rs, rt, rv, rn, sf, zero_status)?,
+            rmw(
+                alu,
+                words[start + 1],
+                size,
+                ord,
+                rs,
+                rt,
+                rv,
+                rn,
+                sf,
+                zero_status,
+            )?,
         ),
         (
             2,
@@ -320,6 +335,13 @@ fn swap(
     zero_status: u32,
 ) -> Result<Vec<u32>, Refusal> {
     let _ = rs;
+    // `SWPA`/`SWPAL` acquire only when their destination is not the zero
+    // register, where `LDAXR WZR` acquires regardless (Arm ARM C6.2, the
+    // "Operation" of each; the alias is `STxxx`). A loop that discards its
+    // loaded value is rare, so refuse rather than special-case it.
+    if rt == ZR {
+        return Err(Refusal::Registers("the loaded value is discarded"));
+    }
     if rv == rt {
         return Err(Refusal::Registers(
             "the stored register is the load destination",
@@ -352,8 +374,8 @@ fn cas_zero(
     }
     // The kept branch sits one instruction later than it did, so its
     // displacement shrinks by that instruction to reach the same target.
-    let branch = insn::compare_branch(true, sf, rt, branch_offset - 4)
-        .ok_or(Refusal::BranchOutOfRange)?;
+    let branch =
+        insn::compare_branch(true, sf, rt, branch_offset - 4).ok_or(Refusal::BranchOutOfRange)?;
     Ok(vec![
         insn::mov_reg(sf, rt, ZR),
         insn::cas(size, ord, rt, rv, rn),
@@ -388,6 +410,14 @@ fn rmw(
     // The stored value must be what the operation computed from the loaded one.
     if rd != rv || alu_rn != rt || alu_sf != sf {
         return Err(Refusal::NotCanonical);
+    }
+    // `LD<op>` with the zero register as its destination is the `ST<op>`
+    // alias, which performs no load and, in the A and AL forms, takes no
+    // acquire (Arm ARM C6.2). An immediate add or subtract also encodes
+    // register 31 as SP rather than the zero register, so a loop that loads
+    // into the zero register could match an operation on SP.
+    if rt == ZR {
+        return Err(Refusal::Registers("the loaded value is discarded"));
     }
     // The atomic carries the operand in Rs and the loaded value in Rt, and
     // the architecture leaves one register in both roles unpredictable.
@@ -453,8 +483,7 @@ fn cas_compare(
         return Err(Refusal::NotCanonical);
     };
     // The kept branch sits one instruction later than it did.
-    let branch_word =
-        insn::cond_branch(1, offset - 4).ok_or(Refusal::BranchOutOfRange)?;
+    let branch_word = insn::cond_branch(1, offset - 4).ok_or(Refusal::BranchOutOfRange)?;
     if cmp_rn != rt || cmp_sf != sf {
         return Err(Refusal::NotCanonical);
     }
@@ -472,13 +501,13 @@ fn cas_compare(
         // the low bits, so the two disagree whenever the register's high bits
         // are set. An immediate that fits the access width cannot disagree.
         Operand::Reg(_) if !matches!(size, Size::W | Size::X) => {
-            return Err(Refusal::Registers(
-                "a sub-word compare against a register",
-            ));
+            return Err(Refusal::Registers("a sub-word compare against a register"));
         }
         Operand::Reg(rm) => insn::mov_reg(sf, rt, rm),
         Operand::Imm(k) if k >= width_limit(size) => {
-            return Err(Refusal::Registers("the compared immediate exceeds the access width"));
+            return Err(Refusal::Registers(
+                "the compared immediate exceeds the access width",
+            ));
         }
         Operand::Imm(k) => insn::movz(sf, rt, k),
     };
@@ -646,7 +675,11 @@ mod tests {
             );
             let mut words = original.to_vec();
             apply(&mut words, BASE, &report);
-            assert_eq!(&words[..expected.len()], expected.to_vec(), "{name} applied");
+            assert_eq!(
+                &words[..expected.len()],
+                expected.to_vec(),
+                "{name} applied"
+            );
             // The rewritten code holds no exclusive instruction, so nothing in
             // it can retry.
             let after = plan(&words, BASE);
@@ -696,19 +729,47 @@ mod tests {
         assert_eq!(report.patched.len(), 1, "{report:?}");
         assert_eq!(report.patched[0].addr, BASE + 8);
         apply(&mut words, BASE, &report);
-        assert_eq!(&words[2..2 + expected.len()], expected.to_vec(), "applied at an offset");
+        assert_eq!(
+            &words[2..2 + expected.len()],
+            expected.to_vec(),
+            "applied at an offset"
+        );
         assert_eq!(words[0], insn::NOP);
         assert_eq!(*words.last().unwrap(), insn::NOP);
+    }
+
+    #[test]
+    fn a_loop_that_discards_its_loaded_value_is_refused() {
+        // ldaxr xzr, [x3]; add x4, x31, #1; stlxr w5, x4, [x3]; cbnz w5.
+        // Register 31 is SP in the immediate add and the zero register in the
+        // exclusive, and `LDADD` into the zero register neither loads nor
+        // acquires, so this must not be rewritten.
+        let words = [0xc85f_fc7f, 0x9100_07e4, 0xc805_fc64, 0x35ff_ffa5];
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![]);
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::Registers("the loaded value is discarded"))
+        );
+
+        // ldaxr xzr, [x1]; stlxr w2, x3, [x1]; cbnz w2: the swap form.
+        let words = [0xc85f_fc3f, 0xc802_fc23, 0x35ff_ffc2];
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![]);
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::Registers("the loaded value is discarded"))
+        );
     }
 
     #[test]
     fn every_ordering_combination_maps_to_the_matching_atomic() {
         // ldxr/ldaxr x4,[x3]; add x4,x4,#1; stxr/stlxr w5,x4,[x3]; cbnz w5.
         let orderings = [
-            (0xc85f7c64u32, 0xc8057c64u32, 0xf8250064u32),  // plain
-            (0xc85ffc64, 0xc8057c64, 0xf8a50064),           // acquire only
-            (0xc85f7c64, 0xc805fc64, 0xf8650064),           // release only
-            (0xc85ffc64, 0xc805fc64, 0xf8e50064),           // acquire-release
+            (0xc85f7c64u32, 0xc8057c64u32, 0xf8250064u32), // plain
+            (0xc85ffc64, 0xc8057c64, 0xf8a50064),          // acquire only
+            (0xc85f7c64, 0xc805fc64, 0xf8650064),          // release only
+            (0xc85ffc64, 0xc805fc64, 0xf8e50064),          // acquire-release
         ];
         for (load, store, atomic) in orderings {
             let words = [load, 0x9100_0484, store, 0x35ff_ffa5];

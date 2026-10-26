@@ -45,9 +45,9 @@ impl RewriteExclusivesOpts {
         for file in &self.files {
             let report = match &self.output_dir {
                 Some(dir) => {
-                    let name = file
-                        .file_name()
-                        .ok_or_else(|| Error::msg(format!("{} has no file name", file.display())))?;
+                    let name = file.file_name().ok_or_else(|| {
+                        Error::msg(format!("{} has no file name", file.display()))
+                    })?;
                     elf::rewrite_file(file, dir.join(name))?
                 }
                 None => elf::rewrite_bytes(&mut std::fs::read(file)?)?,

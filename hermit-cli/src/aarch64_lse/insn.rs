@@ -119,11 +119,19 @@ pub enum Insn {
         offset: i64,
     },
     /// B.cond.
-    CondBranch { cond: u32, offset: i64 },
+    CondBranch {
+        cond: u32,
+        offset: i64,
+    },
     /// B and BL.
-    Branch { link: bool, offset: i64 },
+    Branch {
+        link: bool,
+        offset: i64,
+    },
     /// TBZ/TBNZ.
-    TestBranch { offset: i64 },
+    TestBranch {
+        offset: i64,
+    },
     Clrex,
     Nop,
     /// Anything outside the decoded subset, including every indirect branch.
@@ -376,9 +384,8 @@ pub fn cond_branch(cond: u32, offset: i64) -> Option<u32> {
 
 /// `CBZ`/`CBNZ Rt, .+offset`, re-encoded at a new address.
 pub fn compare_branch(nonzero: bool, sf: bool, rt: Reg, offset: i64) -> Option<u32> {
-    imm19(offset).map(|imm| {
-        sf_bit(sf) | 0x3400_0000 | ((nonzero as u32) << 24) | (imm << 5) | rt as u32
-    })
+    imm19(offset)
+        .map(|imm| sf_bit(sf) | 0x3400_0000 | ((nonzero as u32) << 24) | (imm << 5) | rt as u32)
 }
 
 /// A 19-bit, word-aligned PC-relative displacement, or `None` when the
