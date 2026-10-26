@@ -664,6 +664,18 @@ pub struct Config {
     #[clap(skip)]
     pub signal_delivery_check_fatal: bool,
 
+    /// `--strict`'s binder policy. A run that makes a binder call is refused
+    /// unless it replays a preemption record that stores where each
+    /// backgrounded call rejoined; `BINDER_FREEZE` and
+    /// `BINDER_SET_CONTEXT_MGR[_EXT]` are refused even then. `hermit run
+    /// --strict` sets it; nothing else does.
+    ///
+    /// The host sets it. It has no legacy key: [`to_legacy_backend_json`]
+    /// leaves it out and [`from_legacy_backend_json`] reads it back as false.
+    #[serde(default)]
+    #[clap(skip)]
+    pub strict_binder: bool,
+
     /// Schedule threads chaotically.
     ///
     /// The behavior of this flag is subject to change. Current behavior is to randomize thread
@@ -3709,6 +3721,8 @@ mod legacy_backend_json {
     /// coordinated startup's typed configuration carries them.
     /// `signal_delivery_check_fatal` matters only where the copy is kept, so
     /// it is never written and reads as false.
+    /// `strict_binder` is the host's `--strict` policy for binder, which the
+    /// frozen form predates: never written, read as false.
     /// `work_span_report` came after it as well: the report is written by the
     /// scheduler, not the in-guest runtime, so it is never written and reads
     /// as unset.
@@ -3780,6 +3794,7 @@ mod legacy_backend_json {
         "directory_placeholder",
         "container_procfs",
         "signal_delivery_check_fatal",
+        "strict_binder",
         "work_span_report",
         "signal_at",
         "in_guest_signal_delivery",
@@ -3945,7 +3960,8 @@ mod legacy_backend_json {
                     | "notice_host_network_abstract_binds"
                     | "replay_edited_preemptions"
                     | "eager_lone_preemptions"
-                    | "replay_continue_fairly",
+                    | "replay_continue_fairly"
+                    | "strict_binder",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
                 Some("in_guest_reserved_signals" | "access_trace_from") => {
@@ -4283,6 +4299,7 @@ mod legacy_backend_json {
                 | "directory_placeholder"
                 | "container_procfs"
                 | "signal_delivery_check_fatal"
+                | "strict_binder"
                 | "work_span_report"
                 | "signal_at"
                 | "in_guest_signal_delivery"
@@ -5208,6 +5225,7 @@ mod tests {
                 | "directory_placeholder"
                 | "container_procfs"
                 | "signal_delivery_check_fatal"
+                | "strict_binder"
                 | "work_span_report"
                 | "signal_at"
                 | "in_guest_signal_delivery"
@@ -5262,9 +5280,9 @@ mod tests {
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
         // `access_trace_max_bytes`, `replay_continue_fairly`,
-        // `standard_stream_aliases` and `strict_schedule_boundaries` none:
-        // fourteen more keys and forty-six fewer, so thirty-two keys fewer
-        // than fields.
+        // `standard_stream_aliases`, `sleep_registration`, `strict_binder`
+        // and `strict_schedule_boundaries` none: fourteen more keys and
+        // forty-six fewer, so thirty-two keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
         assert_eq!(fields.len(), keys.len() + 32);
     }

@@ -57637,6 +57637,89 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
     }
 }
 
+/// A replay whose record names a readmission it cannot follow leaves the
+/// record with a WARN naming the event and goes on as a fresh run. A
+/// preemption replay always goes on, as it does at any other mismatch. A
+/// schedule replay under `--die-on-desync` ends there as it does at a
+/// schedule desync: the container exits 1, which Hermit reports as an
+/// unexpected container exit. Before, it went on.
+#[test]
+fn a_schedule_replay_that_leaves_its_readmissions_ends_there_under_die_on_desync() {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
+    let run = |extra: &[&str]| {
+        let mut args = vec!["run", "--base-env=minimal", &epoch];
+        args.extend(extra);
+        args.extend(["--", guest.as_str(), "signalfd-inread"]);
+        let output = hermit_test::hermit_output(
+            &format!("hermit {args:?}"),
+            hermit_command(&args)
+                .env_remove("HERMIT_EPOCH")
+                .env("HERMIT_RACE_PROBE", "bg_harvest_skip=0@0.5")
+                .env("HERMIT_RACE_PROBE_SEED", "13")
+                .stdin(Stdio::null()),
+        );
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        (args, output)
+    };
+    let succeeded = |(args, output): &(Vec<String>, Output)| {
+        assert_success(output, &args.iter().map(String::as_str).collect::<Vec<_>>());
+    };
+    let record = directory.path().join("record.json");
+    succeeded(&run(&[&format!(
+        "--record-preemptions-to={}",
+        record.display()
+    )]));
+    // Name another call of the same thread at the first readmission.
+    let mut recording: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let call = &mut recording["rejoins"][0]["calls"][0][1];
+    assert!(call.is_u64(), "no readmission recorded: {recording}");
+    *call = serde_json::json!(999_999);
+    let edited = directory.path().join("edited.json");
+    fs::write(&edited, recording.to_string()).unwrap();
+    let left = "stopped following the replayed record's readmissions";
+
+    let preemptions = run(&[&format!("--replay-preemptions-from={}", edited.display())]);
+    succeeded(&preemptions);
+    assert!(
+        stderr(&preemptions.1).contains(left),
+        "{}",
+        stderr(&preemptions.1)
+    );
+
+    // A schedule replay of the record as it was follows it to the end ...
+    let faithful = run(&[
+        &format!("--replay-schedule-from={}", record.display()),
+        "--die-on-desync",
+    ]);
+    succeeded(&faithful);
+    assert!(
+        !stderr(&faithful.1).contains(left),
+        "{}",
+        stderr(&faithful.1)
+    );
+    // ... and one of the edited record ends where it leaves it.
+    let (_, dies) = run(&[
+        &format!("--replay-schedule-from={}", edited.display()),
+        "--die-on-desync",
+    ]);
+    assert_eq!(
+        dies.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{}",
+        stderr(&dies)
+    );
+    assert!(stderr(&dies).contains(left), "{}", stderr(&dies));
+    assert!(
+        stderr(&dies).contains("class=container-child-exit status=Exited(1)"),
+        "{}",
+        stderr(&dies)
+    );
+}
+
 /// As `a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take`,
 /// with the discarded copy already pending when the waiter files its wait: a
 /// hard `--happens-before` edge holds the waiter (dettid 5) at the entry of
@@ -60544,6 +60627,11 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
 /// or `None` where the kernel has no binder filesystem or will not mount one
 /// here. The run is bounded: the failures these tests pin are hangs.
 fn binder_guest_output(mode: &str) -> Option<Output> {
+    binder_guest_output_with(mode, &[])
+}
+
+/// [`binder_guest_output`] with `hermit_args` added to `hermit run`'s own.
+fn binder_guest_output_with(mode: &str, hermit_args: &[&str]) -> Option<Output> {
     let filesystems = fs::read_to_string("/proc/filesystems").unwrap_or_default();
     if !filesystems
         .lines()
@@ -60562,8 +60650,9 @@ fn binder_guest_output(mode: &str) -> Option<Output> {
     // which neither the guest nor hermit prints.
     let script = format!(
         "mount -t binder binder {mountpoint} || {{ echo NO-BINDERFS; exit 0; }}; \
-         exec timeout --kill-after 5s 120s {hermit} run --base-env=minimal -- \
-         {guest} {mountpoint} {mode}"
+         exec timeout --kill-after 5s 120s {hermit} run --base-env=minimal {} -- \
+         {guest} {mountpoint} {mode}",
+        hermit_args.join(" ")
     );
     let mut command = Command::new("unshare");
     command.args(["--user", "--map-root-user", "--mount", "sh", "-c", &script]);
@@ -63056,6 +63145,21 @@ fn run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
         "init",
     ];
     let output = hermit(&args);
+/// A fresh `--strict` run that uses binder is refused, with the policy
+/// exit, a message naming why, and the replay route: a binder call that waits
+/// for another process finishes when the host's kernel delivers its work, so
+/// no fresh run can promise to repeat. Before, the run went ahead with only a
+/// warning.
+#[test]
+fn a_fresh_strict_run_refuses_binder_and_names_the_replay_route() {
+    let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
+    // Without the preemption timer, a host whose branch counter `--strict`
+    // would refuse still reaches the binder call.
+    let Some(output) =
+        binder_guest_output_with("ping", &["--strict", "--max-timeslice=disabled", &epoch])
+    else {
+        return;
+    };
     let log = stderr(&output);
     assert_eq!(
         output.status.code(),
@@ -63065,6 +63169,58 @@ fn run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
     assert!(
         log.contains("a descriptor's fdinfo of Hermit's own init, cannot be served"),
         "kvm init: the refusal does not name its reason: {log}"
+        "{log}"
+    );
+    assert!(
+        log.contains("--strict refuses binder in a fresh run"),
+        "{log}"
+    );
+    assert!(log.contains("--replay-preemptions-from"), "{log}");
+}
+
+/// A `--strict` replay of a record that stores where each backgrounded binder
+/// call rejoined may use binder: the replay holds each call to its recorded
+/// turn. The record is made without `--strict`, as the refusal above says.
+#[test]
+fn a_strict_replay_of_a_record_with_readmissions_may_use_binder() {
+    let epoch = format!("--epoch={}", detcore_model::config::CANONICAL_TEST_EPOCH);
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("binder.json");
+    let record_flag = format!("--record-preemptions-to={}", record.display());
+    let Some(recorded) = binder_guest_output_with("ping", &[&epoch, &record_flag]) else {
+        return;
+    };
+    assert_success(&recorded, &["binder_fd_passing", "ping"]);
+    let json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    assert!(
+        json["rejoins"]
+            .as_array()
+            .is_some_and(|rejoins| !rejoins.is_empty()),
+        "the recording stored no readmission"
+    );
+    let replay_flag = format!("--replay-preemptions-from={}", record.display());
+    let replayed = binder_guest_output_with("ping", &["--strict", &epoch, &replay_flag])
+        .expect("binderfs mounted for the recording");
+    // A replay follows the record's preemptions with the branch counter,
+    // which `--strict` refuses on a host where it is not exact.
+    if replayed.status.code() == Some(HERMIT_POLICY_REFUSAL_EXIT)
+        && stderr(&replayed).contains("--strict refuses the `ptrace` backend on this host")
+    {
+        eprintln!(
+            "skipping: --strict refuses this host before any binder call: {}",
+            stderr(&replayed)
+        );
+        return;
+    }
+    assert_success(&replayed, &["binder_fd_passing", "ping", "--strict"]);
+    assert!(
+        !stderr(&replayed).contains("--strict refuses binder"),
+        "{}",
+        stderr(&replayed)
+    );
+}
+
 /// A binder read that waits for another process does not hold the guest's
 /// only turn. Both processes open the device blocking, so each read waits
 /// inside `ioctl(BINDER_WRITE_READ)` until the other sends it work: the way

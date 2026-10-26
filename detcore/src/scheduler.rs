@@ -16546,6 +16546,15 @@ impl Scheduler {
             "[step2] stopped following the replayed record's readmissions: {reason}; \
              from here a finished background call is readmitted as in a fresh run"
         );
+        // Leaving the readmissions is a desync like a schedule one, and
+        // `--die-on-desync` ends the run at it the same way.
+        if self
+            .replayer
+            .as_ref()
+            .is_some_and(|replayer| replayer.die_on_desync)
+        {
+            immediate_fatal_exit();
+        }
         self.rejoin_replay = None;
         self.rejoin_stalled_since = None;
     }
@@ -21796,6 +21805,8 @@ impl Scheduler {
                 guest_ids: None,
                 host_id_tasks: 0,
                 virtual_timeout_ns,
+                // GlobalState counts binder calls (`syscalls::binder`).
+                binder_external_calls: None,
             },
             info_reprio_descrip,
         ))

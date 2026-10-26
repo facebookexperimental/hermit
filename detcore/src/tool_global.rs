@@ -2666,6 +2666,8 @@ impl GlobalState {
         summary.guest_ids = (self.cfg.guest_ids != detcore_model::pid::GuestIds::Namespace)
             .then_some(self.cfg.guest_ids);
         summary.host_id_tasks = self.host_id_tasks.load(SeqCst);
+        summary.binder_external_calls =
+            Some(crate::syscalls::binder::external_calls()).filter(|calls| *calls > 0);
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the

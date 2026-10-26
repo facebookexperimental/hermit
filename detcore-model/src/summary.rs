@@ -291,6 +291,14 @@ pub struct RunSummary {
     /// were none, and from summaries written before it existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub desync_notes: Vec<DesyncNote>,
+
+    /// How many binder calls ran as external input: a call that waits for
+    /// another process runs as a blocking external call, so when it finishes
+    /// is this host's. Absent when there were none. Shown in the full report,
+    /// not the INFO guest-behavior view used by `--verify`: which calls go to
+    /// the background is itself decided by host timing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binder_external_calls: Option<u64>,
 }
 
 fn is_zero(count: &u64) -> bool {
@@ -496,6 +504,7 @@ impl RunSummary {
             virtual_timeout_ns,
             replay_departure: _,
             desync_notes: _,
+            binder_external_calls,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
@@ -543,6 +552,12 @@ impl RunSummary {
                     "  {host_id_tasks} host-ID report(s) accepted; chosen process IDs are not guaranteed"
                 )?;
             }
+        }
+        if include_report_metadata && let Some(calls) = binder_external_calls {
+            writeln!(
+                f,
+                "{calls} binder call(s) ran as external input: when they finished was this host's"
+            )?;
         }
 
         if include_report_metadata {
@@ -1110,5 +1125,26 @@ mod tests {
             unavailable.info(None).to_string(),
             pairs.info(None).to_string()
         );
+    }
+
+    /// The binder count is in the full report only: the INFO view that
+    /// `--verify` compares leaves it out.
+    #[test]
+    fn binder_external_calls_show_in_the_report_but_not_the_info_view() {
+        let baseline = RunSummary::default();
+        let summary = RunSummary {
+            binder_external_calls: Some(3),
+            ..baseline.clone()
+        };
+        assert!(
+            summary
+                .to_string()
+                .contains("3 binder call(s) ran as external input")
+        );
+        assert_eq!(
+            summary.info(None).to_string(),
+            baseline.info(None).to_string()
+        );
+        assert!(!baseline.to_string().contains("binder"));
     }
 }

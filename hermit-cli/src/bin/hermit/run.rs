@@ -11198,6 +11198,8 @@ impl RunOpts {
         // A signal delivery the kernel contradicts ends a strict run (A5 step
         // 3.2); elsewhere it is logged as a divergence.
         config.signal_delivery_check_fatal = self.strict;
+        // `--strict`'s binder policy (`Config::strict_binder`).
+        config.strict_binder = self.strict;
         // `--futex-wake-yields` is accepted only where Detcore's precise futex
         // scheduler runs the guest with sequentialized threads, on the ptrace
         // backend (with or without e9patch preprocessing). Every other launch

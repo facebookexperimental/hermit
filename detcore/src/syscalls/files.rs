@@ -13959,8 +13959,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// has work: a read that would not wait keeps its turn, which is what
     /// lets the descriptors it delivers be recorded. A call that would wait
     /// runs on the background path with its write half, which the schedule
-    /// therefore does not order against sibling threads; splitting the two
-    /// halves is left for the change that records the rejoin order.
+    /// therefore does not order against sibling threads. Splitting the two
+    /// halves was measured with the rejoin order recorded and lost most of
+    /// the reproduction (rrnewton/hermit#4751), so the call goes whole.
+    ///
+    /// Under `--strict` (`Config::strict_binder`) a call is first checked
+    /// against `binder::strict_refusal`, and a refused one ends the run with
+    /// the policy-refusal exit.
     // TODO-HUMAN-REVIEW(PR-4742)
     async fn run_binder_call<G: Guest<Self>>(
         &self,
@@ -13971,6 +13976,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         argument: usize,
     ) -> Result<(i64, bool), Error> {
         use crate::syscalls::binder;
+        if guest.config().strict_binder
+            && let Some(reason) =
+                binder::strict_refusal(request, || binder::binder_replay(guest.config()))
+        {
+            error!("[detcore] {reason}");
+            crate::tool_global::report_policy_refusal(guest, reason).await;
+            crate::tool_global::unrecoverable_shutdown(
+                guest,
+                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            )
+            .await
+        }
         let written = binder::write_read(&guest.memory(), argument);
         let nonblocking = guest
             .thread_state()
@@ -13996,7 +14013,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self.binder_has_work(guest, fd).await? {
             return Ok((self.record_or_replay(guest, call).await?, false));
         }
-        binder::note_blocking(waits);
+        let _warned = binder::note_blocking(waits, guest.pid().as_raw());
         Ok((
             self.record_or_replay_blocking(guest, Syscall::Ioctl(call))
                 .await?,
