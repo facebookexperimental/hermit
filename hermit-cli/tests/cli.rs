@@ -57576,8 +57576,23 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     };
 
+    // The schedule as a host whose branch counter fails Reverie's validation
+    // can repeat it: which thread ran which event, in order. Such a counter
+    // (an AMD Zen host with SpecLockMap on, say) can tally a few branches
+    // more or less between two system calls, a branch count no replay can
+    // make repeat.
+    let events = |schedule: &serde_json::Value| -> Vec<(serde_json::Value, serde_json::Value)> {
+        schedule
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| (event["dettid"].clone(), event["op"].clone()))
+            .collect()
+    };
+
     let record = directory.path().join("record.json");
     let recorded = run(13, &record, None);
+    let exact_counter = !stderr(&recorded).contains("performance counters failed");
     let recorded_order = order(&recorded);
     let recording = read(&record);
     let rejoins = &recording["rejoins"];
@@ -57601,10 +57616,22 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
             "probe seed {probe_seed}: the replay readmitted elsewhere than its recording"
         );
         let replay = read(&rerecord);
-        for field in ["global", "per_thread", "rejoins"] {
+        assert_eq!(
+            replay["rejoins"], recording["rejoins"],
+            "probe seed {probe_seed}: the replay re-recorded other readmissions"
+        );
+        if exact_counter {
+            for field in ["global", "per_thread"] {
+                assert_eq!(
+                    replay[field], recording[field],
+                    "probe seed {probe_seed}: the replay re-recorded another {field}"
+                );
+            }
+        } else {
             assert_eq!(
-                replay[field], recording[field],
-                "probe seed {probe_seed}: the replay re-recorded another {field}"
+                events(&replay["global"]),
+                events(&recording["global"]),
+                "probe seed {probe_seed}: the replay re-recorded another schedule"
             );
         }
     }
