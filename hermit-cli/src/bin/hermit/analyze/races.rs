@@ -114,9 +114,14 @@ use detcore_model::futex::FutexID;
 use detcore_model::futex::SharedMemoryObjectId;
 use detcore_model::pid::DetPid;
 use detcore_model::pid::DetTid;
+use regex::Regex;
+use reverie::PrettyBacktrace;
+use reverie::process::ExitStatus;
 use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
+
+use crate::app::analyze::types::ExitStatusConstraint;
 
 /// What the target and baseline continuations are compared over.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +203,10 @@ pub struct RacingAccess {
     /// baseline only (`event` is `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_first_by: Option<DetTid>,
+    /// The thread's stack at the call's entry in the target, from the stack
+    /// replay of the report; `None` until it is taken, or when it was not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<PrettyBacktrace>,
 }
 
 /// Kinds of resource, as the report names them.
@@ -410,6 +419,10 @@ pub struct RacingAccesses {
     /// Sentences that qualify the result (each truncation, for one).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// The two traces the result comes from, target first, as file names
+    /// in the analysis workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace_files: Vec<String>,
 }
 
 /// At most this many other flipped pairs are listed.
@@ -440,7 +453,13 @@ impl RacingAccesses {
             candidates: Vec::new(),
             truncated: false,
             notes: Vec::new(),
+            trace_files: Vec::new(),
         }
+    }
+
+    /// The section when the traces cannot answer, and why.
+    pub fn unavailable(decision: EventIndex, reason: String) -> Self {
+        Self::bare(RaceStatus::Unavailable, decision, reason, None)
     }
 }
 
@@ -605,6 +624,115 @@ pub fn find_racing_accesses(
     result
 }
 
+/// The criteria a run meets the target by, as `hermit analyze` takes them.
+pub struct OutcomeCriteria<'a> {
+    /// `--target-stdout`.
+    pub stdout: Option<&'a Regex>,
+    /// `--target-stderr`.
+    pub stderr: Option<&'a Regex>,
+    /// `--target-exit-code`.
+    pub exit_code: &'a ExitStatusConstraint,
+    /// The root process, whose exit status the exit criterion is about;
+    /// `None` when unknown, which leaves the exit criterion out.
+    pub root: Option<DetPid>,
+}
+
+/// O, where the target trace meets its outcome at or after `decision`: the
+/// first of a fatal signal ending the root process whose exit status the
+/// criteria accept, the write to stdout or stderr after which that stream's
+/// output (the first 256 bytes of each write, as the trace keeps them) first
+/// matches its pattern, and the root process's `exit_group` whose code the
+/// criteria accept. The exit criterion is about the root process's status
+/// only, and `--target-exit-code=any` leaves it out: every run meets it.
+/// `None` when the trace shows none, and the window runs to its end.
+pub fn outcome_point(
+    trace: &AccessTrace,
+    decision: EventIndex,
+    criteria: &OutcomeCriteria<'_>,
+) -> Option<OutcomeRef> {
+    let mut syscalls: Vec<&SyscallRecord> = trace
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            TraceRecord::Syscall(sys) => Some(sys),
+            _ => None,
+        })
+        .collect();
+    syscalls.sort_by_key(|sys| sys.pre);
+    let mut output = [String::new(), String::new()];
+    let mut written = None;
+    let root = criteria
+        .root
+        .filter(|_| !matches!(criteria.exit_code, ExitStatusConstraint::Any));
+    let exited = syscalls
+        .iter()
+        .filter(|sys| sys.pre >= decision && Some(sys.pid) == root)
+        .find(|sys| {
+            sys.sysno == Sysno::exit_group
+                && criteria
+                    .exit_code
+                    .is_match(ExitStatus::Exited(sys.args[0] as i32 & 0xff))
+        })
+        .map(|sys| outcome_of(sys, sys.pre));
+    // A signal record names the thread; its process is the one the trace
+    // shows that thread's calls in.
+    let in_root = |tid: DetTid| {
+        root.is_some_and(|root| syscalls.iter().any(|sys| sys.tid == tid && sys.pid == root))
+    };
+    for sys in &syscalls {
+        let (Some(bytes), Sysno::write | Sysno::writev | Sysno::pwrite64) =
+            (sys.out_bytes.as_deref(), sys.sysno)
+        else {
+            continue;
+        };
+        let (stream, pattern) = match sys.args[0] {
+            1 => (0, criteria.stdout),
+            2 => (1, criteria.stderr),
+            _ => continue,
+        };
+        let Some(pattern) = pattern else {
+            continue;
+        };
+        let matched_before = pattern.is_match(&output[stream]);
+        output[stream].push_str(&String::from_utf8_lossy(bytes));
+        if !matched_before && sys.pre >= decision && pattern.is_match(&output[stream]) {
+            written = Some(outcome_of(sys, sys.pre));
+            break;
+        }
+    }
+    let killed = trace.records.iter().find_map(|r| match r {
+        TraceRecord::Signal(signal)
+            if signal.event >= decision
+                && signal.delivery == SignalDelivery::Fatal
+                && in_root(signal.tid)
+                && nix::sys::signal::Signal::try_from(signal.signo).is_ok_and(|signo| {
+                    criteria
+                        .exit_code
+                        .is_match(ExitStatus::Signaled(signo, false))
+                }) =>
+        {
+            Some(OutcomeRef {
+                event: signal.event,
+                thread: signal.tid,
+                text: format!("{} ends the process", signal_text(signal.signo as u64)),
+            })
+        }
+        _ => None,
+    });
+    [killed, written, exited]
+        .into_iter()
+        .flatten()
+        .min_by_key(|o| o.event)
+}
+
+fn outcome_of(sys: &SyscallRecord, event: EventIndex) -> OutcomeRef {
+    OutcomeRef {
+        event,
+        thread: sys.tid,
+        text: call_text(sys),
+    }
+}
+
 /// The first event of the earliest record that differs between the traces
 /// among records that end before `decision`. Such records hold the same
 /// events in both runs when both followed one schedule prefix.
@@ -672,14 +800,13 @@ fn truncation_notes(
             format!("the outcome at event {}", o.event)
         });
         notes.push(format!(
-            "The target trace ends at event {target_last} without an end line, before {until}: \
-             accesses after it are not seen."
+            "The target trace stops at event {target_last}, before {until}: accesses after it \
+             are not seen."
         ));
     }
     if baseline.end.is_none() {
         notes.push(format!(
-            "The baseline trace ends at event {} without an end line: a call missing from it may \
-             have run later.",
+            "The baseline trace stops at event {}: a call missing from it may have run later.",
             last_event(baseline)
         ));
     }
@@ -1658,6 +1785,7 @@ impl<'a> Finder<'a> {
                 .copied()
                 .filter(|&nth| op.baseline.is_none() && nth <= sys.nth),
             ended_first_by: None,
+            stack: None,
         }
     }
 
@@ -2377,6 +2505,7 @@ impl<'a> Finder<'a> {
             baseline_result: Some(result_text(call)),
             baseline_differs_from: None,
             ended_first_by: Some(kill.target.tid),
+            stack: None,
         };
         [
             self.access_of(Side {
@@ -3598,6 +3727,16 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
         if let Some(hb) = &r.happens_before {
             lines.push(happens_before_sentence(hb, [first, second]));
         }
+        for access in [first, second] {
+            if let Some(stack) = &access.stack {
+                lines.push(format!(
+                    "{} at {}, the stack at its entry:",
+                    access_name(access),
+                    event_text(access.event)
+                ));
+                lines.push(stack.to_string().trim_end().to_string());
+            }
+        }
     }
     if !r.also_reordered.is_empty() {
         lines.push("Also reordered:".to_string());
@@ -3988,6 +4127,7 @@ mod tests {
             baseline_result: results.1.map(str::to_string),
             baseline_differs_from: None,
             ended_first_by: None,
+            stack: None,
         }
     }
 
@@ -6441,7 +6581,10 @@ mod tests {
         assert!(r.truncated);
         assert_eq!(
             r.notes,
-            vec!["The baseline trace ends at event 102 without an end line: a call missing from it may have run later.".to_string()]
+            vec![
+                "The baseline trace stops at event 102: a call missing from it may have run later."
+                    .to_string()
+            ]
         );
 
         // A target cut before the outcome it should reach.
@@ -6457,7 +6600,13 @@ mod tests {
         };
         let r = find_racing_accesses(&cut, &baseline, window.clone(), Some(t(7)));
         assert!(r.truncated);
-        assert!(r.notes[0].starts_with("The target trace ends at event 104 without an end line, before the outcome at event 200"), "{:?}", r.notes);
+        assert!(
+            r.notes[0].starts_with(
+                "The target trace stops at event 104, before the outcome at event 200"
+            ),
+            "{:?}",
+            r.notes
+        );
         // The same cut trace covers an earlier outcome.
         let earlier = Window {
             outcome: Some(OutcomeRef {
@@ -7313,6 +7462,171 @@ mod tests {
         assert_eq!(
             r.notes,
             vec!["The target trace has 1 edge(s) that do not run forward (the first from event 103 to event 101); they are ignored.".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_outcome_point_is_the_first_criterion_met_after_the_decision() {
+        let say = |pre, fd_number, text: &str| {
+            let mut sys = call(
+                pre,
+                7,
+                pre,
+                Sysno::write,
+                &[fd_number, 0x1000, text.len() as u64],
+                Some(text.len() as i64),
+                Vec::new(),
+            );
+            sys.out_bytes = Some(text.as_bytes().to_vec());
+            sys
+        };
+        let exit = |pre, code| call(pre, 9, pre, Sysno::exit_group, &[code], None, Vec::new());
+        let records = |calls: Vec<SyscallRecord>, fatal: Option<EventIndex>| {
+            // Thread 5, which the fatal signal hits, is in the root process.
+            let mut records: Vec<TraceRecord> = vec![TraceRecord::Syscall(call(
+                80,
+                5,
+                1,
+                Sysno::getpid,
+                &[],
+                Some(3),
+                Vec::new(),
+            ))];
+            records.extend(calls.into_iter().map(TraceRecord::Syscall));
+            if let Some(event) = fatal {
+                records.push(TraceRecord::Signal(SignalRecord {
+                    event,
+                    tid: t(5),
+                    signo: libc::SIGABRT,
+                    code: 0,
+                    addr: None,
+                    sender: None,
+                    delivery: SignalDelivery::Fatal,
+                }));
+            }
+            traced(records)
+        };
+        let pattern = Regex::new("double-close of file descriptor").unwrap();
+        let nonzero = ExitStatusConstraint::NonZero;
+        let root = Some(DetPid::from_raw(3));
+        let stderr_and_nonzero = OutcomeCriteria {
+            stdout: None,
+            stderr: Some(&pattern),
+            exit_code: &nonzero,
+            root,
+        };
+        // The pattern spans two writes; the second completes the match.
+        let trace = records(
+            vec![
+                say(90, 2, "starting\n"),
+                say(101, 2, "fdsan: double-close "),
+                say(103, 2, "of file descriptor 6\n"),
+                exit(110, 1),
+            ],
+            Some(108),
+        );
+        assert_eq!(
+            outcome_point(&trace, S, &stderr_and_nonzero),
+            Some(OutcomeRef {
+                event: 103,
+                thread: t(7),
+                text: "write(2, \"of file descriptor 6\", 21)".to_string(),
+            })
+        );
+        // Without a stderr pattern, the fatal signal comes before the exit.
+        let nonzero_only = OutcomeCriteria {
+            stdout: None,
+            stderr: None,
+            exit_code: &nonzero,
+            root,
+        };
+        assert_eq!(
+            outcome_point(&trace, S, &nonzero_only).map(|o| (o.event, o.thread, o.text)),
+            Some((108, t(5), "SIGABRT ends the process".to_string()))
+        );
+        // An exit code the criteria refuse, and output before the decision,
+        // are no outcome.
+        let zero = ExitStatusConstraint::Exact(0);
+        let exit_zero = OutcomeCriteria {
+            stdout: None,
+            stderr: Some(&pattern),
+            exit_code: &zero,
+            root,
+        };
+        let early = records(
+            vec![
+                say(95, 2, "fdsan: double-close of file descriptor 6\n"),
+                exit(110, 1),
+            ],
+            None,
+        );
+        assert_eq!(outcome_point(&early, S, &exit_zero), None);
+        assert_eq!(
+            outcome_point(&records(vec![exit(110, 0)], None), S, &exit_zero).map(|o| o.text),
+            Some("exit_group(0)".to_string())
+        );
+        // A child process's exit_group is not the root's status, and
+        // --target-exit-code=any leaves the exit criterion out: in both cases
+        // the root's matching write is the outcome.
+        let mut child_exit = exit(102, 1);
+        child_exit.tid = t(11);
+        child_exit.pid = DetPid::from_raw(11);
+        let child = records(
+            vec![
+                child_exit,
+                say(105, 2, "fdsan: double-close of file descriptor 6\n"),
+            ],
+            None,
+        );
+        let any = ExitStatusConstraint::Any;
+        for exit_code in [&nonzero, &any] {
+            let criteria = OutcomeCriteria {
+                stdout: None,
+                stderr: Some(&pattern),
+                exit_code,
+                root,
+            };
+            assert_eq!(
+                outcome_point(&child, S, &criteria).map(|o| (o.event, o.thread)),
+                Some((105, t(7))),
+                "{exit_code:?}"
+            );
+        }
+        let any_only = OutcomeCriteria {
+            stdout: None,
+            stderr: None,
+            exit_code: &any,
+            root,
+        };
+        assert_eq!(outcome_point(&trace, S, &any_only), None);
+    }
+
+    #[test]
+    fn the_block_prints_each_access_stack_and_an_unavailable_reason() {
+        let mut r = fdsan();
+        let stack: PrettyBacktrace = serde_json::from_str(
+            r#"{"thread_id":9,"thread_name":null,"frames":[{"frame":{"ip":4096,"is_signal":false},"symbol":{"name":"raw_close","address":4000,"offset":96},"locations":[{"file":"model.cpp","line":285,"column":0}]}]}"#,
+        )
+        .unwrap();
+        r.accesses[0].stack = Some(stack);
+        let text = render_racing_accesses(&r);
+        let tail = text
+            .split_once("thread 9's close at #7587, the stack at its entry:\n")
+            .map(|(_, tail)| tail);
+        assert!(
+            tail.is_some_and(|tail| tail.starts_with("Stack trace for thread 9")
+                && tail.contains("raw_close + 0x60")),
+            "{text}"
+        );
+        assert!(
+            !text.contains("thread 7's lseek at #7589, the stack"),
+            "{text}"
+        );
+
+        let gone = RacingAccesses::unavailable(7586, "the target replay records no access trace: backend `kvm` is refused: use --backend=ptrace".to_string());
+        assert_eq!(
+            render_racing_accesses(&gone),
+            "Racing accesses: unavailable: the target replay records no access trace: backend `kvm` is refused: use --backend=ptrace."
         );
     }
 

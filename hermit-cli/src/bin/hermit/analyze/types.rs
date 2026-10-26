@@ -21,6 +21,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use tracing::metadata::LevelFilter;
 
+use crate::app::analyze::races::RacingAccesses;
+
 /// Repeat a run multiple times in a controlled search to find concurrency bugs.
 ///
 /// Hermit analyze searches over runs of `hermit run`, and its primary input is a set of CLI flags
@@ -219,6 +221,22 @@ pub struct AnalyzeOpts {
     /// Otherwise it is written to stdout.
     #[clap(long)]
     pub report_file: Option<PathBuf>,
+
+    /// Leave out the report's "Racing accesses" section.
+    ///
+    /// By default the final replays on each side of the deciding event also record an access
+    /// trace (`hermit run --record-access-trace-to`) from 20,000 events before it, analyze
+    /// names the first pair of conflicting syscalls on two threads whose order flips between
+    /// them, says whether any edge Hermit observes orders them, and one more replay takes both
+    /// calls' stacks. The trace needs the ptrace backend and sequentialized threads; elsewhere
+    /// the section says it is unavailable and why.
+    #[clap(long)]
+    pub no_racing_accesses: bool,
+
+    /// How many access-trace records after the deciding event the "Racing accesses" section
+    /// reads from each replay; a trace that goes on past it is reported as truncated.
+    #[clap(long, value_name = "RECORDS", default_value = "50000")]
+    pub race_window: usize,
 
     // TODO: run2_schedule
     //
@@ -601,6 +619,11 @@ pub struct Report {
     /// schedule's length and the stack is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deciding_event: Option<ReportCriticalEvent>,
+
+    /// The two conflicting accesses whose order flips after the deciding
+    /// event (`--no-racing-accesses` leaves it out).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub racing_accesses: Option<RacingAccesses>,
 }
 
 /// Runtime context for a critical event included in the analyze report.

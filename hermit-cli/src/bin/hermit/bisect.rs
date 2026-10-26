@@ -126,6 +126,10 @@ impl BisectOpts {
             run2_preemptions: None,
             run2_schedule: None,
             report_file: self.report_file.clone(),
+            // The "Racing accesses" section is analyze's: bisect's report
+            // keeps its two stacks and runs no extra traced replay.
+            no_racing_accesses: true,
+            race_window: 0,
             analyze_seed: None,
             verbose: self.verbose,
             // The replays log at --guest-log's level (warn without it).

@@ -53,6 +53,7 @@ struct AnalyzeWorkloads {
     hello_race: PathBuf,
     racewrite_nostdlib: PathBuf,
     nanosleep_nocrash: PathBuf,
+    fd_reuse_close_race: PathBuf,
     race_then: PathBuf,
     refusal_after_race: PathBuf,
 }
@@ -200,6 +201,12 @@ fn workloads() -> &'static AnalyzeWorkloads {
             &nanosleep_nocrash,
         );
 
+        let fd_reuse_close_race = build_root.join("fd_reuse_close_race");
+        compile_c_pthread(
+            &repository.join("tests/c/fd_reuse_close_race.c"),
+            &fd_reuse_close_race,
+        );
+
         let race_then = build_root.join("analyze_race_then");
         compile_c_pthread(
             &repository.join("hermit-cli/tests/fixtures/analyze_race_then.c"),
@@ -216,6 +223,7 @@ fn workloads() -> &'static AnalyzeWorkloads {
             hello_race,
             racewrite_nostdlib,
             nanosleep_nocrash,
+            fd_reuse_close_race,
             race_then,
             refusal_after_race,
         }
@@ -436,6 +444,38 @@ fn analyze_racewrite_nostdlib_prefix_search() {
     assert_ne!(
         thread("critical_event1"),
         thread("critical_event2"),
+        "{report}"
+    );
+}
+
+/// A deferred second close of a descriptor number another thread reopened
+/// (tests/c/fd_reuse_close_race.c, the fdsan pattern): the report's
+/// "Racing accesses" section names the closer's close and the writer's lseek
+/// that fails with EBADF, on two threads, and no edge Hermit observes orders
+/// them.
+#[test]
+#[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_names_the_close_racing_the_reused_descriptor() {
+    let report = run_analyze(
+        "analyze fd_reuse_close_race --prefix-search",
+        &workloads().fd_reuse_close_race,
+        &[
+            "--prefix-search",
+            "--run-arg=--base-env=empty",
+            "--target-stderr=failed with EBADF",
+        ],
+        "unordered by the edges Hermit observes",
+    );
+    let racing = &report["racing_accesses"];
+    assert_eq!(racing["status"], "found", "{report}");
+    let access = |i: usize, field: &str| racing["accesses"][i][field].clone();
+    let call = |i: usize| access(i, "call").as_str().unwrap_or_default().to_owned();
+    assert!(call(0).starts_with("close("), "{report}");
+    assert!(call(1).starts_with("lseek("), "{report}");
+    assert_eq!(access(1, "result"), "-EBADF", "{report}");
+    assert_ne!(access(0, "thread"), access(1, "thread"), "{report}");
+    assert_eq!(
+        racing["happens_before"]["target"]["ordered"], false,
         "{report}"
     );
 }

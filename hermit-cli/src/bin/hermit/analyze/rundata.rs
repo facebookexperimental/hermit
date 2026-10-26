@@ -851,6 +851,36 @@ impl RunData {
         self
     }
 
+    /// Record an access trace beside the recorded schedule, leaving out
+    /// records that end before event `from` and stopping after
+    /// `max_records` records; with the trace's path, or the reason `hermit
+    /// run` would refuse it here (a backend or mode it does not support), in
+    /// which case the run goes without it.
+    pub fn with_access_trace(
+        mut self,
+        from: u64,
+        max_records: u64,
+    ) -> (Self, Result<PathBuf, String>) {
+        let path = self.root_path().with_extension(ACCESS_TRACE_EXT);
+        let config = &mut self.runopts.det_opts.det_config;
+        config.access_trace = Some(path.clone());
+        config.access_trace_from = from;
+        config.access_trace_max_records = Some(max_records);
+        let refusal = self.runopts.clone().validate_args().err();
+        let mut without = self.runopts.clone();
+        without.det_opts.det_config.access_trace = None;
+        without.det_opts.det_config.access_trace_from = 0;
+        without.det_opts.det_config.access_trace_max_records = None;
+        match refusal {
+            // A run refused without the trace too fails for its own reason.
+            Some(error) if without.clone().validate_args().is_ok() => {
+                self.runopts = without;
+                (self, Err(format!("{error:#}")))
+            }
+            _ => (self, Ok(path)),
+        }
+    }
+
     /// The run's reproducer: a shell line that changes to the directory the
     /// trial ran in, then runs [`Self::repro_command`].
     ///
