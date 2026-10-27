@@ -9324,6 +9324,51 @@ mod subscription_tests {
         }
     }
 
+    /// aarch64: under `--passthru-opt` (record and replay turn it on),
+    /// `mprotect` and `pkey_mprotect` reach Detcore exactly where the
+    /// exclusive-loop scan reads guest tasks, which follows them; under
+    /// `hermit record` and `hermit replay`, or a backend whose tasks are not
+    /// the guest's, the event stream stays as it was. Without it every call
+    /// is delivered anyway.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn protection_changes_reach_detcore_where_the_exclusive_scan_runs() {
+        let protection = [Sysno::mprotect, Sysno::pkey_mprotect];
+        for recordreplay_modes in [false, true] {
+            for host_task_reads_reach_guest_threads in [false, true] {
+                for tool_shares_guest_descriptor_table in [false, true] {
+                    for passthru_opt in [false, true] {
+                        let mut config = Config {
+                            recordreplay_modes,
+                            ..strict_config(passthru_opt)
+                        };
+                        config.backend.host_task_reads_reach_guest_threads =
+                            host_task_reads_reach_guest_threads;
+                        config.backend.tool_shares_guest_descriptor_table =
+                            tool_shares_guest_descriptor_table;
+                        let scans = host_task_reads_reach_guest_threads
+                            && !tool_shares_guest_descriptor_table
+                            && !recordreplay_modes;
+                        assert_eq!(crate::store_exclusive::reads_guest_tasks(&config), scans);
+                        let delivered: Vec<Sysno> = <Detcore as Tool>::subscriptions(&config)
+                            .iter_syscalls()
+                            .collect();
+                        for sysno in protection {
+                            assert_eq!(
+                                delivered.contains(&sysno),
+                                scans || !passthru_opt,
+                                "{sysno}: passthru_opt={passthru_opt} \
+                                 recordreplay_modes={recordreplay_modes} \
+                                 host_task_reads={host_task_reads_reach_guest_threads} \
+                                 shared_table={tool_shares_guest_descriptor_table}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Detcore declares the serialized-execution contract only where it holds:
     /// threads sequentialized, and both seccomp-filter routes intercepted and
     /// refused.

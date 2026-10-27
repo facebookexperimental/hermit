@@ -3038,17 +3038,35 @@ mod runtime {
         if !reads_guest_tasks(guest.config()) {
             return None;
         }
-        let page = page_size();
-        let span = |start: u64, len: usize| page_span(start, len as u64, page);
         let metadata = &guest.thread_state().memory_metadata;
+        let mut metadata = metadata.lock().unwrap();
+        scan_after(
+            call,
+            result,
+            page_size(),
+            guest.config().rewrite_exclusives_in_memory,
+            &mut metadata.exclusive_scan,
+        )
+    }
+
+    /// [`range_to_scan`] for an address space whose ranges are `scan`, on
+    /// pages of `page` bytes: what a successful `call` that returned `result`
+    /// makes scan, and why. `in_memory`: the run rewrites in memory.
+    fn scan_after(
+        call: &Syscall,
+        result: i64,
+        page: u64,
+        in_memory: bool,
+        scan: &mut ScannedRanges,
+    ) -> Option<(Range, Trigger)> {
+        let span = |start: u64, len: usize| page_span(start, len as u64, page);
         // Rewriting in memory, every transition to executable is rescanned,
         // so that the counts follow a range made writable and executable
         // again (it is recounted, never written); otherwise only a range
         // that may hold a mapping not scanned.
-        let in_memory = guest.config().rewrite_exclusives_in_memory;
-        let made_executable = |start: Option<u64>, len: usize| {
+        let made_executable = |scan: &ScannedRanges, start: Option<u64>, len: usize| {
             let range = span(start.unwrap_or(0), len);
-            let needed = in_memory || metadata.lock().unwrap().exclusive_scan.needs_scan(range);
+            let needed = in_memory || scan.needs_scan(range);
             needed.then_some((range, Trigger::Protected))
         };
         // Whether executable file text was in a range at the last scan: a
@@ -3056,14 +3074,10 @@ mod runtime {
         // tally, and the rescan that follows (which never writes) lets it
         // drop what is gone. Every mode, so that a count-only tally follows
         // too; anywhere else, nothing to do.
-        let was_executable = |range: Range| {
-            metadata
-                .lock()
-                .unwrap()
-                .exclusive_scan
-                .was_executable(range)
+        let changed = |scan: &ScannedRanges, range: Range| {
+            scan.was_executable(range)
+                .then_some((range, Trigger::Changed))
         };
-        let changed = |range: Range| was_executable(range).then_some((range, Trigger::Changed));
         match call {
             Syscall::Mmap(mmap) => {
                 let range = span(result as u64, mmap.len());
@@ -3072,10 +3086,10 @@ mod runtime {
                     return Some((range, Trigger::Mapped));
                 }
                 if file {
-                    metadata.lock().unwrap().exclusive_scan.add_unscanned(range);
+                    scan.add_unscanned(range);
                 }
                 // A fixed mapping that replaced executable text.
-                changed(range)
+                changed(scan, range)
             }
             // Executable text moved away, or a fixed destination replaced
             // some. The rescan of the new range also learns the address
@@ -3087,33 +3101,45 @@ mod runtime {
                     mremap.old_len(),
                 );
                 let new = span(result as u64, mremap.new_len());
-                (was_executable(old) || was_executable(new)).then_some((new, Trigger::Changed))
+                (scan.was_executable(old) || scan.was_executable(new))
+                    .then_some((new, Trigger::Changed))
             }
-            Syscall::Munmap(munmap) => changed(span(
-                munmap.addr().map_or(0, |addr| addr.as_raw() as u64),
-                munmap.len(),
-            )),
+            Syscall::Munmap(munmap) => changed(
+                scan,
+                span(
+                    munmap.addr().map_or(0, |addr| addr.as_raw() as u64),
+                    munmap.len(),
+                ),
+            ),
             Syscall::Mprotect(mprotect) if mprotect.protection().contains(ProtFlags::PROT_EXEC) => {
                 made_executable(
+                    scan,
                     mprotect.addr().map(|addr| addr.as_raw() as u64),
                     mprotect.len(),
                 )
             }
             Syscall::PkeyMprotect(mprotect) if mprotect.prot() & libc::PROT_EXEC != 0 => {
                 made_executable(
+                    scan,
                     mprotect.addr().map(|addr| addr.as_raw() as u64),
                     mprotect.len(),
                 )
             }
             // Text no longer executable.
-            Syscall::Mprotect(mprotect) => changed(span(
-                mprotect.addr().map_or(0, |addr| addr.as_raw() as u64),
-                mprotect.len(),
-            )),
-            Syscall::PkeyMprotect(mprotect) => changed(span(
-                mprotect.addr().map_or(0, |addr| addr.as_raw() as u64),
-                mprotect.len(),
-            )),
+            Syscall::Mprotect(mprotect) => changed(
+                scan,
+                span(
+                    mprotect.addr().map_or(0, |addr| addr.as_raw() as u64),
+                    mprotect.len(),
+                ),
+            ),
+            Syscall::PkeyMprotect(mprotect) => changed(
+                scan,
+                span(
+                    mprotect.addr().map_or(0, |addr| addr.as_raw() as u64),
+                    mprotect.len(),
+                ),
+            ),
             // Dropping a private file mapping's pages puts the file's bytes
             // back, undoing an in-memory rewrite there: the scan recounts
             // those loops as left. Only where an executable file mapping
@@ -3121,7 +3147,7 @@ mod runtime {
             // scan. (MADV_REMOVE fails on a private mapping; it is listed so
             // that a shared one is recounted too.)
             Syscall::Madvise(madvise)
-                if guest.config().rewrite_exclusives_in_memory
+                if in_memory
                     && matches!(
                         madvise.advice(),
                         libc::MADV_DONTNEED | libc::MADV_REMOVE | MADV_DONTNEED_LOCKED
@@ -3129,12 +3155,8 @@ mod runtime {
             {
                 let start = madvise.addr().map_or(0, |addr| addr.as_raw() as u64);
                 let range = span(start, madvise.len());
-                let executable = metadata
-                    .lock()
-                    .unwrap()
-                    .exclusive_scan
-                    .was_executable(range);
-                executable.then_some((range, Trigger::Dropped))
+                scan.was_executable(range)
+                    .then_some((range, Trigger::Dropped))
             }
             _ => None,
         }
@@ -3160,6 +3182,553 @@ mod runtime {
         T: RecordOrReplay,
     {
         report_pairs(guest, Some(range), trigger).await;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::path::PathBuf;
+
+        use reverie::syscalls::Addr;
+        use reverie::syscalls::AddrMut;
+        use reverie::syscalls::Madvise;
+        use reverie::syscalls::Mmap;
+        use reverie::syscalls::Mprotect;
+        use reverie::syscalls::Mremap;
+        use reverie::syscalls::Munmap;
+        use reverie::syscalls::PkeyMprotect;
+
+        use super::*;
+        use crate::aarch64_lse::elf::plan_bytes;
+        use crate::aarch64_lse::elf::tests::elf_with_text;
+
+        /// nop; ldaxr w8, [x0]; add w8, w8, #1; stlxr w9, w8, [x0];
+        /// cbnz w9, <ldaxr>; ret: one canonical loop, at file offset 0x104
+        /// of [`elf_with_text`]'s image.
+        const ONE_LOOP: [u32; 6] = [
+            0xd503_201f,
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+
+        /// The same loop adding 2: an image of the same size with other
+        /// bytes.
+        const OTHER_LOOP: [u32; 6] = [
+            0xd503_201f,
+            0x885f_fc08,
+            0x1100_0908,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+
+        /// Where [`ONE_LOOP`]'s sequence starts in the image, and its length.
+        const LOOP_AT: usize = 0x104;
+        const LOOP_LEN: usize = 16;
+
+        fn this_process() -> Pid {
+            Pid::from_raw(std::process::id() as i32)
+        }
+
+        /// Why these tests cannot run on this host, if they cannot. They map
+        /// and run code from `/dev/shm`, which a `noexec` mount refuses, and
+        /// with `writes` they write this process's code through
+        /// `/proc/<pid>/mem`, which Linux 6.12's `proc_mem.force_override`
+        /// (or its build-time default) can refuse: a probe write to a private
+        /// read-only page says. A test that cannot run says why and checks
+        /// nothing.
+        fn cannot_run(writes: bool) -> Option<String> {
+            // SAFETY: an all-zero `statvfs` is a valid buffer.
+            let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path and a `statvfs` buffer.
+            if unsafe { libc::statvfs(c"/dev/shm".as_ptr(), &mut fs) } != 0 {
+                return Some(format!("/dev/shm: {}", std::io::Error::last_os_error()));
+            }
+            if fs.f_flag & libc::ST_NOEXEC != 0 {
+                return Some("/dev/shm is mounted noexec".to_owned());
+            }
+            if !writes {
+                return None;
+            }
+            let len = page_size() as usize;
+            // SAFETY: a new private anonymous page at an address the kernel
+            // chooses, unmapped below.
+            let page = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if page == libc::MAP_FAILED {
+                return Some(format!("mmap: {}", std::io::Error::last_os_error()));
+            }
+            let written = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/proc/self/mem")
+                .and_then(|memory| memory.write_all_at(&[1], page as u64));
+            // SAFETY: the page mapped above, unmapped once.
+            unsafe { libc::munmap(page, len) };
+            written.err().map(|error| {
+                format!(
+                    "a forced write through /proc/self/mem failed ({error}); \
+                     proc_mem.force_override may refuse it"
+                )
+            })
+        }
+
+        /// Whether a test cannot run here, saying why on stderr.
+        fn skipped(writes: bool) -> bool {
+            cannot_run(writes)
+                .map(|reason| eprintln!("skipped: {reason}"))
+                .is_some()
+        }
+
+        /// An image file in a fresh directory on tmpfs: a file opened by name
+        /// is proven to be the mapped one only outside btrfs and overlayfs,
+        /// and an unprivileged test cannot open `/proc/<pid>/map_files`.
+        fn image_file(words: &[u32]) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+            let dir = tempfile::tempdir_in("/dev/shm").expect("a directory on /dev/shm (tmpfs)");
+            let path = dir.path().join("image");
+            let image = elf_with_text(words);
+            std::fs::write(&path, &image).unwrap();
+            (dir, path, image)
+        }
+
+        /// A one-page mapping of a file in this process, unmapped on drop.
+        struct Mapping {
+            address: u64,
+            len: usize,
+        }
+
+        impl Mapping {
+            fn new(path: &Path, flags: libc::c_int) -> Self {
+                let file = File::open(path).unwrap();
+                let len = page_size() as usize;
+                // SAFETY: a new mapping, at an address the kernel chooses, of
+                // a file this test made.
+                let address = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                        flags,
+                        file.as_raw_fd(),
+                        0,
+                    )
+                };
+                assert_ne!(
+                    address,
+                    libc::MAP_FAILED,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                Self {
+                    address: address as u64,
+                    len,
+                }
+            }
+
+            /// The bytes the mapping holds at `offset`, as this process
+            /// reads them.
+            fn bytes(&self, offset: usize, len: usize) -> Vec<u8> {
+                assert!(offset + len <= self.len);
+                // SAFETY: within the mapping, which is readable.
+                unsafe {
+                    std::slice::from_raw_parts((self.address as usize + offset) as *const u8, len)
+                }
+                .to_vec()
+            }
+
+            /// The mapping as this process's maps list it, and its file
+            /// range, as the scan takes them.
+            fn listed(&self) -> (MemoryMap, FileRange) {
+                let map =
+                    crate::procmaps::from_pid(this_process(), |map| map.address.0 == self.address)
+                        .unwrap()
+                        .into_iter()
+                        .next()
+                        .expect("the mapping in /proc/self/maps");
+                let key = FileRange {
+                    dev: map.dev,
+                    inode: map.inode,
+                    offset: map.offset,
+                    len: map.address.1 - map.address.0,
+                };
+                (map, key)
+            }
+
+            /// [`rewrite_mapping`] of this mapping, through
+            /// `/proc/<this process>/mem`, with every sequence new or none.
+            fn rewrite(&self, path: &Path, new: bool) -> (Rewrite, u64) {
+                let (map, key) = self.listed();
+                rewrite_mapping(this_process(), path, key, &map, 1, &|_, _| new)
+            }
+        }
+
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: the mapping `new` made, unmapped once.
+                unsafe { libc::munmap(self.address as *mut libc::c_void, self.len) };
+            }
+        }
+
+        fn rewrite(rewritten: u64, left: u64, failed: u64) -> Rewrite {
+            Rewrite {
+                rewritten,
+                left,
+                failed,
+                ..Rewrite::default()
+            }
+        }
+
+        /// The write goes through `/proc/<pid>/mem` into a private read-only
+        /// executable file mapping, as the guest's are: the mapping then holds
+        /// the replacement, read back, while the file and another mapping of
+        /// it keep the loop. Asking again finds it done; a sequence that is
+        /// not new, or a shared mapping, is left as the file has it.
+        #[test]
+        fn the_rewrite_writes_only_this_private_mapping_through_proc_mem() {
+            if skipped(true) {
+                return;
+            }
+            let (_dir, path, image) = image_file(&ONE_LOOP);
+            let plan = plan_bytes(&image).unwrap().expect("an aarch64 image");
+            let patch = &plan.patches[0];
+            assert_eq!(
+                (patch.offset as usize, patch.original.len()),
+                (LOOP_AT, LOOP_LEN)
+            );
+            assert_eq!(patch.original, image[LOOP_AT..LOOP_AT + LOOP_LEN]);
+
+            let mapping = Mapping::new(&path, libc::MAP_PRIVATE);
+            assert_eq!(mapping.rewrite(&path, true), (rewrite(1, 0, 0), 0));
+            assert_eq!(mapping.bytes(LOOP_AT, LOOP_LEN), patch.rewritten);
+            // Linux copied the page for this mapping alone.
+            assert_eq!(std::fs::read(&path).unwrap(), image);
+            let other = Mapping::new(&path, libc::MAP_PRIVATE);
+            assert_eq!(other.bytes(LOOP_AT, LOOP_LEN), patch.original);
+            // Memory that already holds the replacement counts as rewritten,
+            // whether or not the sequence could have run.
+            assert_eq!(mapping.rewrite(&path, false), (rewrite(1, 0, 0), 0));
+            assert_eq!(mapping.rewrite(&path, true), (rewrite(1, 0, 0), 0));
+
+            // The file's bytes where an instruction may have run: left.
+            assert_eq!(other.rewrite(&path, false), (rewrite(0, 1, 0), 0));
+            assert_eq!(other.bytes(LOOP_AT, LOOP_LEN), patch.original);
+
+            // A shared mapping would write the file: left.
+            let shared = Mapping::new(&path, libc::MAP_SHARED);
+            assert_eq!(shared.rewrite(&path, true), (rewrite(0, 1, 0), 0));
+            assert_eq!(shared.bytes(LOOP_AT, LOOP_LEN), patch.original);
+            assert_eq!(std::fs::read(&path).unwrap(), image);
+        }
+
+        /// A name that leads to another file than the mapped one plans
+        /// nothing: the mapping is counted as failed and keeps its loop.
+        #[test]
+        fn a_mapping_whose_name_now_leads_elsewhere_is_not_written() {
+            if skipped(true) {
+                return;
+            }
+            let (dir, path, image) = image_file(&ONE_LOOP);
+            let mapping = Mapping::new(&path, libc::MAP_PRIVATE);
+            let elsewhere = dir.path().join("elsewhere");
+            std::fs::write(&elsewhere, elf_with_text(&OTHER_LOOP)).unwrap();
+            std::fs::rename(&elsewhere, &path).unwrap();
+
+            let (map, key) = mapping.listed();
+            // A tracer that may open `/proc/<pid>/map_files` (with
+            // `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`) opens the mapped
+            // object itself, whatever the name now leads to.
+            let (start, end) = map.address;
+            if File::open(format!("/proc/self/map_files/{start:x}-{end:x}")).is_ok() {
+                assert_eq!(mapping.rewrite(&path, true), (rewrite(1, 0, 0), 0));
+                return;
+            }
+            let (why, refused) = plan_for(this_process(), &path, &map, key).unwrap_err();
+            assert_eq!(why, NotWritten::Unproven);
+            assert!(refused.contains("another file"), "{refused}");
+            assert_eq!(
+                mapping.rewrite(&path, true),
+                (
+                    Rewrite {
+                        not_written: Some(NotWritten::Unproven),
+                        ..rewrite(0, 0, 1)
+                    },
+                    0
+                )
+            );
+            assert_eq!(
+                mapping.bytes(LOOP_AT, LOOP_LEN),
+                image[LOOP_AT..LOOP_AT + LOOP_LEN]
+            );
+        }
+
+        /// A plan is the mapped file's bytes as they are now: rewritten in
+        /// place (same inode, same size), the file plans its new loop, and
+        /// no cached plan of the old bytes answers for it. (The change falls
+        /// in a page the cache samples, so this does not test the cache's
+        /// comparison of whole bytes; the model's `ByteCache` test does.)
+        #[test]
+        fn the_plan_follows_the_files_bytes_through_the_cache() {
+            if skipped(false) {
+                return;
+            }
+            let (_dir, path, image) = image_file(&ONE_LOOP);
+            let mapping = Mapping::new(&path, libc::MAP_PRIVATE);
+            let (map, key) = mapping.listed();
+            let before = plan_for(this_process(), &path, &map, key).unwrap();
+            let before = before.as_ref().as_ref().expect("an aarch64 image");
+            assert_eq!(before.patches.len(), 1);
+            assert_eq!(
+                before.patches[0].original,
+                image[LOOP_AT..LOOP_AT + LOOP_LEN]
+            );
+            // Asked again, the same bytes give an equal plan (from the cache,
+            // unless another test emptied it meanwhile).
+            let again = plan_for(this_process(), &path, &map, key).unwrap();
+            assert_eq!(again.as_ref().as_ref(), Some(before));
+
+            let other = elf_with_text(&OTHER_LOOP);
+            assert_eq!(other.len(), image.len());
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .write_all_at(&other, 0)
+                .unwrap();
+            let after = plan_for(this_process(), &path, &map, key).unwrap();
+            let after = after.as_ref().as_ref().expect("an aarch64 image");
+            assert_eq!(after.patches.len(), 1);
+            assert_eq!(
+                after.patches[0].original,
+                other[LOOP_AT..LOOP_AT + LOOP_LEN]
+            );
+            assert_ne!(after.patches[0].original, before.patches[0].original);
+            assert_ne!(after.patches[0].rewritten, before.patches[0].rewritten);
+        }
+
+        const PAGE: u64 = 0x1000;
+        /// Executable file text at the last scan.
+        const TEXT: Range = (0x10000, 0x20000);
+        /// A file mapping without execute permission, not scanned.
+        const DATA: Range = (0x40000, 0x50000);
+
+        fn scanned() -> ScannedRanges {
+            ScannedRanges {
+                ranges: Some(vec![(TEXT.0, TEXT.1, true), (DATA.0, DATA.1, false)]),
+                ..ScannedRanges::default()
+            }
+        }
+
+        fn after(call: Syscall, result: i64, in_memory: bool) -> Option<(Range, Trigger)> {
+            scan_after(&call, result, PAGE, in_memory, &mut scanned())
+        }
+
+        fn munmap(start: u64, len: usize) -> Syscall {
+            Syscall::Munmap(
+                Munmap::new()
+                    .with_addr(Addr::from_raw(start as usize))
+                    .with_len(len),
+            )
+        }
+
+        fn mprotect(start: u64, len: usize, prot: ProtFlags) -> Syscall {
+            Syscall::Mprotect(
+                Mprotect::new()
+                    .with_addr(AddrMut::from_raw(start as usize))
+                    .with_len(len)
+                    .with_protection(prot),
+            )
+        }
+
+        fn mmap(len: usize, prot: ProtFlags, flags: MapFlags, fd: i32) -> Syscall {
+            Syscall::Mmap(
+                Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(prot)
+                    .with_flags(flags)
+                    .with_fd(fd)
+                    .with_offset(0),
+            )
+        }
+
+        fn madvise(start: u64, len: usize, advice: i32) -> Syscall {
+            Syscall::Madvise(
+                Madvise::new()
+                    .with_addr(AddrMut::from_raw(start as usize))
+                    .with_len(len)
+                    .with_advice(advice),
+            )
+        }
+
+        /// Every call that changes where executable file text is rescans
+        /// what it changed, in every mode, and never as a write
+        /// (`Trigger::Changed`); the same calls elsewhere scan nothing.
+        #[test]
+        fn calls_that_change_executable_text_rescan_it_and_others_do_not() {
+            let changed = |start: u64, end: u64| Some(((start, end), Trigger::Changed));
+            for in_memory in [false, true] {
+                // munmap, and a length rounded up to whole pages.
+                assert_eq!(
+                    after(munmap(TEXT.0, 0x1000), 0, in_memory),
+                    changed(0x10000, 0x11000)
+                );
+                assert_eq!(
+                    after(munmap(TEXT.1 - 0x1000, 1), 0, in_memory),
+                    changed(0x1f000, 0x20000)
+                );
+                assert_eq!(after(munmap(DATA.0, 0x1000), 0, in_memory), None);
+                assert_eq!(after(munmap(0x90000, 0x1000), 0, in_memory), None);
+                // Execute permission taken away, by either call.
+                assert_eq!(
+                    after(mprotect(TEXT.0, 0x2000, ProtFlags::PROT_READ), 0, in_memory),
+                    changed(0x10000, 0x12000)
+                );
+                let pkey = Syscall::PkeyMprotect(
+                    PkeyMprotect::new()
+                        .with_addr(AddrMut::from_raw(TEXT.0 as usize))
+                        .with_len(0x1000)
+                        .with_prot(libc::PROT_READ)
+                        .with_pkey(-1),
+                );
+                assert_eq!(after(pkey, 0, in_memory), changed(0x10000, 0x11000));
+                assert_eq!(
+                    after(mprotect(DATA.0, 0x1000, ProtFlags::PROT_READ), 0, in_memory),
+                    None
+                );
+                // Text moved away: the new range is rescanned; data moved: nothing.
+                let mremap = |from: u64| {
+                    Syscall::Mremap(
+                        Mremap::new()
+                            .with_addr(AddrMut::from_raw(from as usize))
+                            .with_old_len(0x1000)
+                            .with_new_len(0x1000)
+                            .with_flags(libc::MREMAP_MAYMOVE as usize)
+                            .with_new_addr(None),
+                    )
+                };
+                assert_eq!(
+                    after(mremap(TEXT.0), 0x80000, in_memory),
+                    changed(0x80000, 0x81000)
+                );
+                assert_eq!(after(mremap(DATA.0), 0x80000, in_memory), None);
+                // A fixed mapping without execute permission over text replaced
+                // it; over nothing executable, it is only recorded.
+                let fixed = MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED;
+                assert_eq!(
+                    after(
+                        mmap(0x1000, ProtFlags::PROT_READ, fixed, 3),
+                        TEXT.0 as i64,
+                        in_memory
+                    ),
+                    changed(0x10000, 0x11000)
+                );
+                assert_eq!(
+                    after(
+                        mmap(0x1000, ProtFlags::PROT_READ, fixed, 3),
+                        0x90000,
+                        in_memory
+                    ),
+                    None
+                );
+                // An executable file mapping is made new; anonymous memory is
+                // never scanned.
+                assert_eq!(
+                    after(
+                        mmap(
+                            0x1000,
+                            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                            MapFlags::MAP_PRIVATE,
+                            3
+                        ),
+                        0x60000,
+                        in_memory
+                    ),
+                    Some(((0x60000, 0x61000), Trigger::Mapped))
+                );
+                assert_eq!(
+                    after(
+                        mmap(
+                            0x1000,
+                            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                            -1
+                        ),
+                        0x70000,
+                        in_memory
+                    ),
+                    None
+                );
+            }
+            // Unknown ranges count as executable.
+            let mut unknown = ScannedRanges::default();
+            assert_eq!(
+                scan_after(&munmap(0x90000, 0x1000), 0, PAGE, false, &mut unknown),
+                changed(0x90000, 0x91000)
+            );
+        }
+
+        /// A range made executable is rescanned where it may hold a mapping
+        /// not scanned, and always when rewriting in memory (recounted, never
+        /// written: `Trigger::Protected` is never new). A page drop over text
+        /// is rescanned only when rewriting in memory, since it puts the
+        /// file's bytes back.
+        #[test]
+        fn protection_and_page_drops_rescan_what_they_may_change() {
+            let exec = ProtFlags::PROT_READ | ProtFlags::PROT_EXEC;
+            let protected = |start: u64, end: u64| Some(((start, end), Trigger::Protected));
+            assert_eq!(after(mprotect(TEXT.0, 0x1000, exec), 0, false), None);
+            assert_eq!(
+                after(mprotect(TEXT.0, 0x1000, exec), 0, true),
+                protected(0x10000, 0x11000)
+            );
+            assert_eq!(
+                after(mprotect(DATA.0, 0x1000, exec), 0, false),
+                protected(0x40000, 0x41000)
+            );
+            // A file mapping recorded without execute permission is then
+            // scanned when it gains it.
+            let mut ranges = scanned();
+            let data = mmap(0x1000, ProtFlags::PROT_READ, MapFlags::MAP_PRIVATE, 3);
+            assert_eq!(scan_after(&data, 0x90000, PAGE, false, &mut ranges), None);
+            assert_eq!(
+                scan_after(
+                    &mprotect(0x90000, 0x1000, exec),
+                    0,
+                    PAGE,
+                    false,
+                    &mut ranges
+                ),
+                protected(0x90000, 0x91000)
+            );
+            assert!(!sequence_is_new(
+                Trigger::Protected,
+                Some((0x90000, 0x91000)),
+                (0x90000, 0x90010)
+            ));
+
+            for advice in [libc::MADV_DONTNEED, libc::MADV_REMOVE, MADV_DONTNEED_LOCKED] {
+                assert_eq!(
+                    after(madvise(TEXT.0, 0x1000, advice), 0, true),
+                    Some(((0x10000, 0x11000), Trigger::Dropped))
+                );
+                assert_eq!(after(madvise(TEXT.0, 0x1000, advice), 0, false), None);
+                assert_eq!(after(madvise(DATA.0, 0x1000, advice), 0, true), None);
+            }
+            assert_eq!(
+                after(madvise(TEXT.0, 0x1000, libc::MADV_WILLNEED), 0, true),
+                None
+            );
+        }
     }
 }
 
