@@ -100,9 +100,13 @@ pub struct Replayer {
     /// (`crate::preemptions::PreemptionRecord::notes_background_starts`).
     notes_background_starts: bool,
     /// How many recorded events a fast-forward dropped unconsumed, so that
-    /// `events_popped + skipped` is the replay's position in the schedule,
-    /// which places the background starts.
+    /// `events_popped + skipped` is the replay's position in the schedule
+    /// (`record_position`), which places the background starts and the
+    /// summary's desyncs.
     skipped: u64,
+    /// The first replayed event that differed from the record, for the run
+    /// summary (<https://github.com/rrnewton/hermit/issues/4876>).
+    pub first_desync: Option<FirstDesync>,
 }
 
 /// How many retry turns in a row a polling thread keeps
@@ -125,6 +129,24 @@ pub struct UntakenStart {
     /// Where the replay was when it passed the start, or `None` if it never
     /// reached it.
     pub passed_at: Option<ReplayPosition>,
+}
+
+/// The first replayed event that differed from the record
+/// (`Replayer::first_desync`).
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub struct FirstDesync {
+    /// Its number, as `traced_event_count` and the `[tracereplay]` warnings
+    /// number events.
+    pub event: u64,
+    /// The record's position then ([`Replayer::record_position`]): the index
+    /// of the recorded event it stood for.
+    pub record_event: u64,
+    /// The thread that ran it.
+    pub observed: DetTid,
+    /// The thread of the recorded event.
+    pub expected: DetTid,
+    /// Whether it was a hard desync (`is_hard_desync`).
+    pub hard: bool,
 }
 
 /// The count of desyncs for a particular thread.
@@ -312,6 +334,7 @@ impl Replayer {
             passed_starts: Vec::new(),
             notes_background_starts: false,
             skipped: 0,
+            first_desync: None,
         }
     }
 
@@ -345,7 +368,7 @@ impl Replayer {
     /// fast-forward, where the replay passed them. Returns how many it
     /// retired.
     fn retire_skipped_starts(&mut self, dropped: u64, event: u64) -> usize {
-        let position = self.events_popped + self.skipped;
+        let position = self.record_position();
         let past: Vec<u64> = self
             .background_starts
             .range(position + 1..=position + dropped)
@@ -382,7 +405,7 @@ impl Replayer {
     /// passed due, in order. The position counts events a fast-forward
     /// dropped as passed (`retire_skipped_starts`).
     fn queue_background_starts(&mut self) {
-        let position = self.events_popped + self.skipped;
+        let position = self.record_position();
         while let Some(entry) = self.background_starts.first_entry() {
             if *entry.key() > position {
                 break;
@@ -426,6 +449,15 @@ impl Replayer {
         } else {
             false
         }
+    }
+
+    /// Where the replay is in the record: the index, among the record's
+    /// schedule events, of the next one to match. It equals
+    /// `traced_event_count` until the first desync; after it, an event
+    /// observed in hard desync consumes no recorded event and a fast-forward
+    /// drops recorded events unobserved, so the two can part.
+    pub fn record_position(&self) -> u64 {
+        self.events_popped + self.skipped
     }
 
     /// Whether the replay must stop the thread of `next`, a branch event, at
@@ -601,7 +633,7 @@ impl Replayer {
     pub(super) fn position_now(&self) -> ReplayPosition {
         ReplayPosition {
             event: self.traced_event_count,
-            record_event: self.events_popped + self.skipped,
+            record_event: self.record_position(),
         }
     }
 
@@ -683,7 +715,7 @@ impl Replayer {
         let untaken = std::mem::take(&mut self.pending_starts);
         let passed_at = ReplayPosition {
             event: current_ix,
-            record_event: self.events_popped + self.skipped,
+            record_event: self.record_position(),
         };
         for &(thread, call, after) in &untaken {
             tracing::warn!(
@@ -728,6 +760,15 @@ impl Replayer {
             let is_desync = is_desync(observed, &expected);
             let mut in_hard_desync_mode = false;
             if is_desync {
+                if self.first_desync.is_none() {
+                    self.first_desync = Some(FirstDesync {
+                        event: current_ix,
+                        record_event: self.record_position(),
+                        observed: observed.dettid,
+                        expected: expected.dettid,
+                        hard: is_hard_desync(observed, &expected),
+                    });
+                }
                 let counts = self.desync_counts.entry(mytid).or_default();
                 if is_hard_desync(observed, &expected) {
                     if self.die_on_desync {
@@ -929,6 +970,8 @@ impl Replayer {
             // Drop the corresponding number of of missed/mismatched events so that the observed
             // matches the head of the replay tape (which is to be popped).
             self.cursor.drop(ix);
+            // The caller moves the record position past the dropped events
+            // (`retire_skipped_starts`), which places the background starts.
             Some(ix)
         } else {
             trace!(

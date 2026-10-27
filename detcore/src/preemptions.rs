@@ -1161,6 +1161,41 @@ impl PreemptionRecord {
         self.global
     }
 
+    /// For each recorded callback checkpoint, by thread and number
+    /// (`history_index`): the index in the global schedule of the thread's
+    /// event that ends its slice, the event whose running count of the
+    /// thread's branches and instructions reaches the checkpoint's progress,
+    /// as `validate_callback_checkpoints` finds it. A checkpoint at progress
+    /// 0, before the thread's first event, has none
+    /// (<https://github.com/rrnewton/hermit/issues/4876>).
+    pub(crate) fn callback_checkpoint_events(&self) -> BTreeMap<(DetTid, usize), u64> {
+        let mut endpoints: BTreeMap<DetTid, BTreeMap<u64, u64>> = BTreeMap::new();
+        let mut progress = BTreeMap::<DetTid, u64>::new();
+        for (index, event) in self.global.iter().enumerate() {
+            if event.count == 0 || !self.callback_checkpoints.contains_key(&event.dettid) {
+                continue;
+            }
+            let count = progress.entry(event.dettid).or_default();
+            *count = count.saturating_add(u64::from(event.count));
+            endpoints
+                .entry(event.dettid)
+                .or_default()
+                .insert(*count, index as u64);
+        }
+        let mut events = BTreeMap::new();
+        for (tid, checkpoints) in &self.callback_checkpoints {
+            for checkpoint in checkpoints {
+                if let Some(index) = endpoints
+                    .get(tid)
+                    .and_then(|points| points.get(&checkpoint.origin.progress))
+                {
+                    events.insert((*tid, checkpoint.history_index), *index);
+                }
+            }
+        }
+        events
+    }
+
     /// Save to disk.
     pub fn write_to_disk(&self, path: &Path) -> Result<(), String> {
         let mut str: String = self.to_string();
@@ -3141,6 +3176,46 @@ mod tests {
             Some((continued, prefix.callback_checkpoints.clone()))
         );
         assert!(prefix.with_schedule(Vec::new()).is_none());
+    }
+
+    /// Each recorded callback checkpoint is placed at the thread's event whose
+    /// running count reaches its progress, by its index in the global
+    /// schedule, with other threads' events in between counted; a checkpoint
+    /// before the thread's first event has no place
+    /// (https://github.com/rrnewton/hermit/issues/4876).
+    #[test]
+    fn callback_checkpoints_are_placed_at_the_event_ending_their_slice() {
+        use callback_history::Checkpoint;
+        use callback_history::Origin;
+        use callback_history::Site;
+
+        use crate::slice_boundary::callbacks::Callback;
+        let (a, b) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        let mut record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(a, 4),
+            SchedEvent::branches(b, 2),
+            SchedEvent::branches(a, 6),
+            SchedEvent::branches(b, 1),
+        ]);
+        let point = |history_index: usize, progress: u64| Checkpoint {
+            history_index,
+            origin: Origin {
+                callback: Callback::Cpuid,
+                site: Site::Prehook,
+                progress,
+                last_op: (progress > 0).then_some(Op::Branch),
+                time: LogicalTime::from_nanos(progress * 10),
+                rcbs: progress,
+            },
+        };
+        record
+            .callback_checkpoints
+            .insert(a, vec![point(0, 4), point(1, 10)]);
+        record.callback_checkpoints.insert(b, vec![point(0, 0)]);
+        assert_eq!(
+            record.callback_checkpoint_events(),
+            BTreeMap::from([((a, 0), 0), ((a, 1), 2)])
+        );
     }
 
     #[test]

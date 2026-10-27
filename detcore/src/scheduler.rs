@@ -2530,7 +2530,11 @@ pub struct Scheduler {
         DetTid,
         std::collections::VecDeque<crate::preemptions::callback_history::Checkpoint>,
     >,
-    callback_checkpoint_desyncs: Vec<String>,
+    /// Where the replayed record puts each callback checkpoint: the index in
+    /// its schedule of the event ending the checkpoint's slice, by thread and
+    /// number (`PreemptionRecord::callback_checkpoint_events`).
+    callback_checkpoint_events: BTreeMap<(DetTid, usize), u64>,
+    callback_checkpoint_desyncs: Vec<detcore_model::summary::DesyncNote>,
     pub(crate) callback_progress: BTreeMap<DetTid, crate::preemptions::callback_history::Progress>,
     /// `Config::annotated_priority_replay`: the priority history replayed
     /// carries callback checkpoints, consumed per thread in row order.
@@ -5359,6 +5363,7 @@ impl Scheduler {
             DetTid,
             std::collections::VecDeque<crate::preemptions::callback_history::Checkpoint>,
         > = BTreeMap::new();
+        let mut callback_checkpoint_events = BTreeMap::new();
         let mut boundary_replayer = None;
         let mut boundary_stacktrace_events = BTreeMap::new();
         let mut recorded_host_inputs = None;
@@ -5423,6 +5428,7 @@ impl Scheduler {
                             .iter()
                             .map(|(tid, points)| (*tid, points.clone().into()))
                             .collect();
+                        callback_checkpoint_events = record.callback_checkpoint_events();
                         let background_starts = record.background_starts().to_vec();
                         let notes_background_starts = record.notes_background_starts();
                         let vec = record.into_global();
@@ -5614,6 +5620,7 @@ impl Scheduler {
                     .values()
                     .any(|points| !points.is_empty()),
             callback_checkpoints,
+            callback_checkpoint_events,
             callback_checkpoint_desyncs: Vec::new(),
             callback_progress: BTreeMap::new(),
             annotated_priority_replay: cfg.annotated_priority_replay,
@@ -17780,7 +17787,16 @@ impl Scheduler {
             );
             // Selected now, once: acknowledge the recorded row it ends.
             if let Err(refusal) = self.acknowledge_priority_row(dettid, rs) {
-                self.callback_checkpoint_desyncs.push(refusal.clone());
+                self.callback_checkpoint_desyncs
+                    .push(detcore_model::summary::DesyncNote {
+                        kind: detcore_model::summary::DesyncKind::CallbackRefusal,
+                        thread: Some(dettid),
+                        record_event: None,
+                        checkpoints: Vec::new(),
+                        background_starts: Vec::new(),
+                        reported_at: self.traced_replay_position(),
+                        message: refusal.clone(),
+                    });
                 exit_on_replay_refusal(&refusal);
             }
         }
@@ -21691,6 +21707,54 @@ impl Scheduler {
         })
     }
 
+    /// Where a schedule replay is: the number of the event it traces next, as
+    /// its `[tracereplay] ... at event #N` warnings number events, and the
+    /// record's position (`Replayer::record_position`). `None` without a
+    /// schedule replay.
+    fn traced_replay_position(&self) -> Option<detcore_model::summary::ReplayPosition> {
+        self.replayer
+            .as_ref()
+            .map(|replayer| detcore_model::summary::ReplayPosition {
+                event: replayer.traced_event_count,
+                record_event: replayer.record_position(),
+            })
+    }
+
+    /// A recorded callback checkpoint of `tid`, with the index of the event
+    /// ending its slice in the replayed record.
+    fn checkpoint_ref(&self, tid: DetTid, number: usize) -> detcore_model::summary::CheckpointRef {
+        detcore_model::summary::CheckpointRef {
+            number,
+            record_event: self.callback_checkpoint_events.get(&(tid, number)).copied(),
+        }
+    }
+
+    /// How a summarized desync names where in the record it lies: `at record
+    /// event #N`, or `(no recorded position)`
+    /// (<https://github.com/rrnewton/hermit/issues/4876>).
+    fn record_position_text(record_event: Option<u64>) -> String {
+        match record_event {
+            Some(event) => format!("at record event #{event}"),
+            None => "(no recorded position)".to_owned(),
+        }
+    }
+
+    /// How a summarized desync names where the replay was when it reported
+    /// it, or nothing without a schedule replay.
+    fn reported_at_text(
+        reported_at: Option<detcore_model::summary::ReplayPosition>,
+        verb: &str,
+    ) -> String {
+        reported_at
+            .map(|at| {
+                format!(
+                    " ({verb} at event #{}, record event #{})",
+                    at.event, at.record_event
+                )
+            })
+            .unwrap_or_default()
+    }
+
     /// Report a checkpoint mismatch without inserting an event or moving the
     /// legacy cursor, its resynchronization state, priorities, or virtual time.
     pub(crate) fn callback_checkpoint_mismatch(
@@ -21726,15 +21790,32 @@ impl Scheduler {
             Some(checkpoint),
             "mismatch refers to the current callback checkpoint"
         );
+        // Where the record puts the checkpoint: the event ending its slice.
+        // The thread reports a mismatch only on its next check-in, which can
+        // come after other threads ran, so the replay's position then is
+        // kept apart as when it was reported.
+        let place = self.checkpoint_ref(tid, checkpoint.history_index);
+        let reported_at = self.traced_replay_position();
         let message = format!(
-            "DESYNC callback checkpoint {} for {tid}: expected {:?}, observed {:?} ({})",
+            "DESYNC callback checkpoint {} for {tid} {}{}: expected {:?}, observed {:?} ({})",
             checkpoint.history_index,
+            Self::record_position_text(place.record_event),
+            Self::reported_at_text(reported_at, "reported"),
             checkpoint.origin,
             actual,
             if hard { "hard" } else { "soft" }
         );
         tracing::warn!("{}", message);
-        self.callback_checkpoint_desyncs.push(message);
+        self.callback_checkpoint_desyncs
+            .push(detcore_model::summary::DesyncNote {
+                kind: detcore_model::summary::DesyncKind::CallbackCheckpoint,
+                thread: Some(tid),
+                record_event: place.record_event,
+                checkpoints: vec![place],
+                background_starts: Vec::new(),
+                reported_at,
+                message,
+            });
         if hard
             && self
                 .replayer
@@ -21811,6 +21892,8 @@ impl Scheduler {
             .unwrap_or_default();
 
         let total_desyncs = total_desync_stats.soft + total_desync_stats.hard;
+        let first_desync = self.replayer.as_ref().and_then(|r| r.first_desync);
+        let mut desync_notes = Vec::new();
         let mut desync_descrip = if total_desyncs > 0 {
             let mut buf = String::new();
             write!(
@@ -21823,6 +21906,30 @@ impl Scheduler {
                 total_desync_stats.resync_insertions,
                 total_desync_stats.resync_deletions,
             )?;
+            let first_desync = first_desync.map(|first| {
+                let message = format!(
+                    "DESYNC first schedule event {} (event #{}): thread {} ran, the record has \
+                     thread {} ({})",
+                    Self::record_position_text(Some(first.record_event)),
+                    first.event,
+                    first.observed,
+                    first.expected,
+                    if first.hard { "hard" } else { "soft" }
+                );
+                desync_notes.push(detcore_model::summary::DesyncNote {
+                    kind: detcore_model::summary::DesyncKind::ScheduleEvent,
+                    thread: Some(first.observed),
+                    record_event: Some(first.record_event),
+                    checkpoints: Vec::new(),
+                    background_starts: Vec::new(),
+                    reported_at: Some(detcore_model::summary::ReplayPosition {
+                        event: first.event,
+                        record_event: first.record_event,
+                    }),
+                    message: message.clone(),
+                });
+                message
+            });
             if let Some(ref replayer) = self.replayer {
                 for (tid, desync_stats) in replayer.desync_counts.iter() {
                     write!(
@@ -21837,6 +21944,9 @@ impl Scheduler {
                 }
             }
             writeln!(buf)?;
+            if let Some(message) = first_desync {
+                writeln!(buf, "{message}")?;
+            }
             Some(buf)
         } else {
             None
@@ -21874,7 +21984,6 @@ impl Scheduler {
         // Likewise name the recorded background starts the replay never took,
         // each by its thread, call and place in the record, and where the
         // replay passed it (https://github.com/rrnewton/hermit/issues/4876).
-        let mut desync_notes = Vec::new();
         if let Some(replayer) = self.replayer.as_ref()
             && let untaken = replayer.untaken_background_starts()
             && !untaken.is_empty()
@@ -21935,6 +22044,7 @@ impl Scheduler {
                 kind: detcore_model::summary::DesyncKind::UntakenBackgroundStarts,
                 thread: None,
                 record_event: starts.first().map(|start| start.after),
+                checkpoints: Vec::new(),
                 background_starts: starts,
                 reported_at: Some(ended_at),
                 message,
@@ -21944,23 +22054,51 @@ impl Scheduler {
         // incomplete callback metadata separately; do not invent guest events.
         // A stopped run's replay is unfinished by definition.
         if end == RunEnd::Finished {
+            // The record puts each unconsumed checkpoint at the event ending
+            // its slice; the replay ended without reaching it.
+            let replay_ended_at = self.traced_replay_position();
             for (tid, points) in &self.callback_checkpoints {
                 if !points.is_empty() {
+                    let places: Vec<_> = points
+                        .iter()
+                        .map(|point| self.checkpoint_ref(*tid, point.history_index))
+                        .collect();
                     let message = format!(
-                        "DESYNC incomplete callback history for {tid}: {} unconsumed checkpoints",
-                        points.len()
+                        "DESYNC incomplete callback history for {tid}: {} unconsumed checkpoints \
+                         ({}){}",
+                        places.len(),
+                        places
+                            .iter()
+                            .map(|place| format!(
+                                "{} {}",
+                                place.number,
+                                Self::record_position_text(place.record_event)
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        Self::reported_at_text(replay_ended_at, "the replay ended"),
                     );
                     tracing::warn!("{}", message);
                     desync_descrip
                         .get_or_insert_with(String::new)
                         .push_str(&format!("{message}\n"));
+                    desync_notes.push(detcore_model::summary::DesyncNote {
+                        kind: detcore_model::summary::DesyncKind::IncompleteCallbackHistory,
+                        thread: Some(*tid),
+                        record_event: places.first().and_then(|place| place.record_event),
+                        checkpoints: places,
+                        background_starts: Vec::new(),
+                        reported_at: replay_ended_at,
+                        message,
+                    });
                 }
             }
         }
-        for message in &self.callback_checkpoint_desyncs {
+        for note in &self.callback_checkpoint_desyncs {
             desync_descrip
                 .get_or_insert_with(String::new)
-                .push_str(&format!("{message}\n"));
+                .push_str(&format!("{}\n", note.message));
+            desync_notes.push(note.clone());
         }
         let unmade_time_skips = match &self.time_skip_mode {
             TimeSkipMode::Driven(rest) => rest.len(),

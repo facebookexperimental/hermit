@@ -300,6 +300,8 @@ mod callback_history_scheduler_tests {
                     },
                 ]),
             );
+            // The record would put checkpoint 0 at its schedule's event #0.
+            scheduler.callback_checkpoint_events.insert((t, 0), 0);
             let before = format!("{:?}", scheduler.replayer);
             let turn = scheduler.turn;
             let time = scheduler.committed_time;
@@ -326,6 +328,263 @@ mod callback_history_scheduler_tests {
             assert!(text.contains("DESYNC callback checkpoint"));
             assert!(text.contains(if hard { "(hard)" } else { "(soft)" }));
             assert!(text.contains("DESYNC incomplete callback history"));
+            // Each line names where the record puts it and where the replay
+            // was (https://github.com/rrnewton/hermit/issues/4876): the
+            // mismatched checkpoint at the event ending its slice, the
+            // unconsumed one with no recorded position, as this test's
+            // custody has no record behind it.
+            assert!(
+                text.contains(
+                    "DESYNC callback checkpoint 0 for 3 at record event #0 (reported at event \
+                     #0, record event #0): expected"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "DESYNC incomplete callback history for 3: 1 unconsumed checkpoints (1 (no \
+                     recorded position)) (the replay ended at event #0, record event #0)"
+                ),
+                "{text}"
+            );
+            use detcore_model::summary::CheckpointRef;
+            use detcore_model::summary::DesyncKind;
+            use detcore_model::summary::ReplayPosition;
+            let at_start = Some(ReplayPosition {
+                event: 0,
+                record_event: 0,
+            });
+            let notes: Vec<_> = summary
+                .desync_notes
+                .iter()
+                .map(|note| {
+                    assert!(
+                        text.contains(note.message.as_str()),
+                        "{note:?} not in {text}"
+                    );
+                    (
+                        note.kind,
+                        note.thread,
+                        note.record_event,
+                        note.checkpoints.clone(),
+                        note.reported_at,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                notes,
+                [
+                    (
+                        DesyncKind::IncompleteCallbackHistory,
+                        Some(t),
+                        None,
+                        vec![CheckpointRef {
+                            number: 1,
+                            record_event: None
+                        }],
+                        at_start,
+                    ),
+                    (
+                        DesyncKind::CallbackCheckpoint,
+                        Some(t),
+                        Some(0),
+                        vec![CheckpointRef {
+                            number: 0,
+                            record_event: Some(0)
+                        }],
+                        at_start,
+                    ),
+                ]
+            );
+        }
+    }
+
+    /// A schedule replay's summary names where in the record each departure
+    /// lies, in `desync_descrip` and `desync_notes`
+    /// (https://github.com/rrnewton/hermit/issues/4876): the first replayed
+    /// event that differed, with its thread and the record's; a mismatched
+    /// checkpoint at the event the record ends its slice with, apart from the
+    /// later point where the thread reported it. An event the record lacks
+    /// sets the replay's numbering apart from the record's, and a
+    /// fast-forward moves the record's position on.
+    #[test]
+    fn summarized_desyncs_name_their_recorded_event() {
+        use detcore_model::summary::DesyncKind;
+
+        use crate::preemptions::callback_history::Checkpoint;
+        use crate::preemptions::callback_history::Origin;
+        use crate::preemptions::callback_history::Site;
+        use crate::slice_boundary::callbacks::Callback;
+        let t = tid(3);
+        let point = Checkpoint {
+            history_index: 4,
+            origin: Origin {
+                callback: Callback::Cpuid,
+                site: Site::Prehook,
+                progress: 7,
+                last_op: Some(crate::types::Op::Branch),
+                time: LogicalTime::from_nanos(70),
+                rcbs: 7,
+            },
+        };
+        let actual = Origin {
+            time: LogicalTime::from_nanos(71),
+            ..point.origin.clone()
+        };
+
+        // The replayer needs each observed event's time.
+        let event = |thread: DetTid, count: u32, nanos: u64| SchedEvent {
+            end_time: Some(LogicalTime::from_nanos(nanos)),
+            ..SchedEvent::branches(thread, count)
+        };
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.replayer = Some(crate::scheduler::replayer::Replayer::new([
+            event(t, 7, 70),
+            event(t, 5, 120),
+            event(t, 3, 150),
+            event(t, 2, 170),
+        ]));
+        let replayer = scheduler.replayer.as_mut().unwrap();
+        replayer.observe_event(&event(t, 7, 70));
+        // Event #1 is not in the record: another thread ran. It consumes no
+        // recorded event, so from here the replay's numbering runs one ahead
+        // of the record's.
+        replayer.observe_event(&event(tid(4), 2, 90));
+        replayer.observe_event(&event(t, 5, 120));
+        replayer.observe_event(&event(t, 3, 150));
+        // A later desync (another count, a soft desync that still consumes
+        // the recorded event) leaves the first in place.
+        replayer.observe_event(&event(t, 9, 170));
+        let first = replayer.first_desync.unwrap();
+        assert_eq!(
+            (
+                first.event,
+                first.record_event,
+                first.observed,
+                first.expected,
+                first.hard
+            ),
+            (1, 1, tid(4), t, true)
+        );
+        assert_eq!(
+            (replayer.traced_event_count, replayer.record_position()),
+            (5, 4)
+        );
+        // A fast-forward past a recorded event the replay never ran moves the
+        // record's position on by the events it drops.
+        let mut skipping = crate::scheduler::replayer::Replayer::new([
+            event(t, 7, 70),
+            event(t, 5, 120),
+            event(t, 3, 150),
+        ]);
+        skipping.observe_event(&event(t, 7, 70));
+        skipping.observe_event(&event(t, 3, 150));
+        assert_eq!(
+            skipping
+                .first_desync
+                .map(|first| (first.event, first.record_event, first.hard)),
+            Some((1, 1, false))
+        );
+        assert_eq!(
+            (skipping.traced_event_count, skipping.record_position()),
+            (2, 3)
+        );
+        // The record puts checkpoint 4 at its schedule's event #2; the thread
+        // reports the mismatch later, at the replay's event #5 (record #4).
+        scheduler
+            .callback_checkpoints
+            .insert(t, std::collections::VecDeque::from([point.clone()]));
+        scheduler.callback_checkpoint_events.insert((t, 4), 2);
+        scheduler.callback_checkpoint_mismatch(t, &point, false, &actual);
+        let summary = scheduler.generate_partial_run_summary(None).unwrap();
+        let text = summary.desync_descrip.unwrap();
+        assert!(
+            text.contains(
+                "DESYNC first schedule event at record event #1 (event #1): thread 4 ran, the \
+                 record has thread 3 (hard)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "DESYNC callback checkpoint 4 for 3 at record event #2 (reported at event #5, \
+                 record event #4): expected"
+            ),
+            "{text}"
+        );
+        let placed: Vec<_> = summary
+            .desync_notes
+            .iter()
+            .map(|note| {
+                (
+                    note.kind,
+                    note.thread,
+                    note.record_event,
+                    note.reported_at.map(|at| (at.event, at.record_event)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            placed,
+            [
+                (
+                    DesyncKind::ScheduleEvent,
+                    Some(tid(4)),
+                    Some(1),
+                    Some((1, 1))
+                ),
+                (
+                    DesyncKind::CallbackCheckpoint,
+                    Some(t),
+                    Some(2),
+                    Some((5, 4))
+                ),
+            ]
+        );
+    }
+
+    /// One `desync_notes` collects every producer's note: a replay that
+    /// departs from its schedule at an event and leaves a recorded background
+    /// start untaken reports both, the schedule event's note first, in
+    /// `desync_descrip`'s order (https://github.com/rrnewton/hermit/issues/4876).
+    #[test]
+    fn desync_notes_collect_every_producers_note() {
+        use detcore_model::summary::DesyncKind;
+        let (a, b, c) = (tid(3), tid(5), tid(7));
+        let event = |thread: DetTid, count: u32, nanos: u64| SchedEvent {
+            end_time: Some(LogicalTime::from_nanos(nanos)),
+            ..SchedEvent::branches(thread, count)
+        };
+        let recorded = [event(a, 10, 100), event(a, 20, 200), event(a, 30, 300)];
+        let start = |after, thread, call| crate::preemptions::BackgroundStart {
+            after,
+            thread,
+            call,
+        };
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.replayer = Some(
+            crate::scheduler::replayer::Replayer::new(recorded.clone())
+                .with_background_starts(&[start(1, b, 2)], true),
+        );
+        let replayer = scheduler.replayer.as_mut().unwrap();
+        replayer.observe_event(&recorded[0]);
+        // Another thread runs where the record has `a`: the start due after
+        // event 0 is passed, and the event departs from the schedule.
+        replayer.observe_event(&event(c, 20, 200));
+        let summary = scheduler.generate_partial_run_summary(None).unwrap();
+        let kinds: Vec<_> = summary.desync_notes.iter().map(|note| note.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                DesyncKind::ScheduleEvent,
+                DesyncKind::UntakenBackgroundStarts
+            ],
+            "{:?}",
+            summary.desync_descrip
+        );
+        let text = summary.desync_descrip.unwrap();
+        for note in &summary.desync_notes {
+            assert!(text.contains(&note.message), "{text}");
         }
     }
     /// A thread reported past a checkpoint that this custody no longer holds
