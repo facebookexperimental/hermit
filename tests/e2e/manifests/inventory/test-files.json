@@ -554,6 +554,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/exclusive_loop_counter.c",
+      "runner": "hermit-cli/tests/aarch64_exclusive_rewrite.rs",
+      "why": "tests/c/exclusive_loop_counter.c is owned by hermit-cli/tests/aarch64_exclusive_rewrite.rs: The aarch64 integration test compiles this guest, whose four threads add to one counter through an LDAXR/ADD/STLXR/CBNZ loop, and checks that `--rewrite-exclusives` rewrites the loop in the guest's memory and that the counter is exact."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/exec_clock_continuity.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/exec_clock_continuity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this self-re-execing guest and asserts that guest virtual time is strictly monotonic ACROSS the execve boundary, comparing pre-exec and post-exec CLOCK_REALTIME samples handed through argv; it remains a guest fixture because a generic manifest cannot express the exec-boundary hand-off contract or the cross-image ordering assertion."
