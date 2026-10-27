@@ -5764,6 +5764,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             None => None,
         };
         let copied = object.and_then(|stat| snapshot.live_file(stat.st_dev, stat.st_ino));
+        if copied.is_none()
+            && let Some(file) =
+                object.and_then(|stat| snapshot.known_live_file(stat.st_dev, stat.st_ino))
+        {
+            return Some(PropertyOpen::Live(format!(
+                "the live property file {} stopped being readable while the snapshot was \
+                 taken, so it has no copy",
+                file.name
+            )));
+        }
         match (copied, in_area) {
             (Some(file), _) => Some(if snapshot.copy_dir.is_dir() {
                 PropertyOpen::Copy(snapshot.copy_dir.join(&file.name))
@@ -5819,7 +5829,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             },
         };
-        match snapshot.live_file(dev, ino) {
+        match snapshot.known_live_file(dev, ino) {
             Some(file) => LiveCheck::Live(format!(
                 "an open reached the live property file {}",
                 file.name
@@ -5851,7 +5861,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return self.live_property_area_allowed(guest, &reason).await;
             }
         };
-        if let Some(file) = snapshot.live_file(stat.st_dev, stat.st_ino) {
+        if let Some(file) = snapshot.known_live_file(stat.st_dev, stat.st_ino) {
             let reason = format!(
                 "descriptor {fd}, which Hermit did not open from its snapshot, maps the live \
                  property file {}",

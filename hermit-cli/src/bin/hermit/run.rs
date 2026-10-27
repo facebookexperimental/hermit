@@ -16893,9 +16893,24 @@ impl RunOpts {
             super::property_snapshot::Taken::NoPropertyArea => Ok(()),
             super::property_snapshot::Taken::Snapshot(snapshot) => {
                 tracing::info!(
-                    "the guest reads a copy of the system property area taken now ({} files)",
-                    snapshot.copied()
+                    "the guest reads a copy of the system property area taken now ({} files, {})",
+                    snapshot.copied(),
+                    if snapshot.consistent_cut() {
+                        "one consistent cut"
+                    } else {
+                        "coherent per file"
+                    }
                 );
+                if !snapshot.consistent_cut() {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "WARNING: HERMIT_PROPERTY_SNAPSHOT_PER_FILE: the copy of the system \
+                         property area could not be confirmed as one consistent cut (properties \
+                         changed during each attempt, or properties_serial could not be read), \
+                         so each file is coherent but two files may come from different moments"
+                    );
+                }
                 let inherited = snapshot.inherited_live_descriptors();
                 if !inherited.is_empty() {
                     let reason = format!(

@@ -242,6 +242,19 @@ pub struct PropertySnapshot {
     /// descriptor link) is recognized, and its name in `copy_dir`.
     #[serde(default)]
     pub live_files: Vec<PropertyFile>,
+    /// Each live file the capture saw but could not copy, because it stopped
+    /// being readable mid-capture. It has no copy, so an open that reaches it
+    /// by any spelling reads the live area, which is refused under the
+    /// default fail-closed policy.
+    #[serde(default)]
+    pub uncopied_files: Vec<PropertyFile>,
+    /// Whether the copies are one consistent cut: `properties_serial` read
+    /// the same before and after they were taken. Otherwise (properties kept
+    /// changing, or the serial could not be read) each file is coherent on
+    /// its own, but two files may come from different moments. Shown in the
+    /// run summary; not stored in preemption or schedule recordings.
+    #[serde(default)]
+    pub consistent_cut: bool,
 }
 
 impl PropertySnapshot {
@@ -251,6 +264,22 @@ impl PropertySnapshot {
         self.live_files
             .iter()
             .find(|file| (file.dev, file.ino) == (dev, ino))
+    }
+
+    /// The live property file with host device `dev` and inode `ino` the
+    /// capture saw, copied or not: reading it reads the live area. Matching
+    /// is by identity alone, here and in [`Self::live_file`]: if a captured
+    /// file is deleted during the run and its inode reused by an unrelated
+    /// file, a pure read of that file is falsely redirected to the copy (a
+    /// copied identity) or treated as the live area and refused in a
+    /// fail-closed run (an uncopied one). Either way no live property read
+    /// is let through.
+    pub fn known_live_file(&self, dev: u64, ino: u64) -> Option<&PropertyFile> {
+        self.live_file(dev, ino).or_else(|| {
+            self.uncopied_files
+                .iter()
+                .find(|file| (file.dev, file.ino) == (dev, ino))
+        })
     }
 }
 

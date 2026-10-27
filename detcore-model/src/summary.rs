@@ -207,6 +207,42 @@ impl fmt::Display for PostCrashSummary {
     }
 }
 
+/// The Android system property snapshot a run's guest read
+/// (`Config::property_snapshot`).
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct PropertySnapshotSummary {
+    /// How many files of the area were copied.
+    pub copied_files: u64,
+    /// How many files stopped being readable mid-capture and have no copy.
+    pub uncopied_files: u64,
+    /// Whether the copies are one consistent cut (no property set during
+    /// the capture) rather than coherent per file only.
+    pub consistent_cut: bool,
+}
+
+impl fmt::Display for PropertySnapshotSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = if self.consistent_cut {
+            "one consistent cut"
+        } else {
+            "coherent per file only (properties changed during the capture)"
+        };
+        write!(
+            f,
+            "System property snapshot: {} files copied, {kind}",
+            self.copied_files
+        )?;
+        if self.uncopied_files > 0 {
+            write!(
+                f,
+                "; {} files without a copy (refused if opened)",
+                self.uncopied_files
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Statistics that summarize a hermit run.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct RunSummary {
@@ -268,6 +304,11 @@ pub struct RunSummary {
     /// the INFO guest-behavior view used by `--verify`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_crash: Option<PostCrashSummary>,
+
+    /// The system property snapshot the guest read, when the run took one.
+    /// Launch metadata, so not part of the INFO view `--verify` compares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub property_snapshot: Option<PropertySnapshotSummary>,
 
     /// How the backend dispatched guest syscalls: through signals, patched
     /// direct calls, or ptrace stops. The record carries its own schema
@@ -720,6 +761,7 @@ impl RunSummary {
             per_thread_timeslice,
             preemption,
             post_crash,
+            property_snapshot,
             dispatch_stats: _,
             syscall_histogram: _,
             host_inputs: _,
@@ -873,6 +915,9 @@ impl RunSummary {
                     "  {path}: {rewritten} rewritten, {left} left, {failed} not written"
                 )?;
             }
+        }
+        if include_report_metadata && let Some(snapshot) = property_snapshot {
+            writeln!(f, "{snapshot}")?;
         }
 
         if let Some(txt) = desync_descrip {

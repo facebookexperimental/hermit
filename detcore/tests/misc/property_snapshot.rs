@@ -39,6 +39,8 @@ fn area() -> Area {
             ino: metadata.ino(),
             name: name.to_owned(),
         }],
+        uncopied_files: Vec::new(),
+        consistent_cut: true,
     };
     Area {
         live,
@@ -190,45 +192,50 @@ fn mappings_that_read_no_property_file_are_not_refused() {
     );
 }
 
-/// Marks the run of this test binary that
-/// `a_file_the_area_gained_after_its_snapshot_is_refused` starts for its
+/// Marks a run of this test binary that a refusal test starts for its
 /// guest: the refusal ends the tool's process, which in a test is the test
 /// binary, so the guest runs in a binary of its own.
 const REFUSAL_ENV: &str = "HERMIT_PROPERTY_SNAPSHOT_REFUSAL_INNER";
 
-/// In a fail-closed run, a read of a file the area gained after its snapshot
-/// was taken ends the run with the policy-refusal exit, naming why.
-#[test]
-fn a_file_the_area_gained_after_its_snapshot_is_refused() {
-    if std::env::var_os(REFUSAL_ENV).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("property_snapshot::a_file_the_area_gained_after_its_snapshot_is_refused")
-            .args(["--exact", "--nocapture", "--test-threads=1"])
-            .env(REFUSAL_ENV, "1")
-            .output()
-            .expect("run this test binary again");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            output.status.code(),
-            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
-            "{stderr}"
-        );
-        assert!(
-            stderr.contains("HERMIT_PROPERTY_AREA_LIVE")
-                && stderr.contains("is in the property area but not in its snapshot"),
-            "{stderr}"
-        );
-        return;
+/// Whether this process is the inner run of the refusal test `test`. If it
+/// is not, runs `test` again in a binary of its own and checks that its
+/// guest's run ended with the policy-refusal exit, the live-area warning and
+/// `why`.
+fn is_inner_refusal_run(test: &str, why: &str) -> bool {
+    if std::env::var_os(REFUSAL_ENV).is_some() {
+        return true;
     }
-    let area = area();
-    let later = area.live.path().join("u:object_r:later_prop:s0");
-    std::fs::write(&later, [9]).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg(format!("property_snapshot::{test}"))
+        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .env(REFUSAL_ENV, "1")
+        .output()
+        .expect("run this test binary again");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_PROPERTY_AREA_LIVE") && stderr.contains(why),
+        "{stderr}"
+    );
+    false
+}
+
+/// Runs `guest` in a fail-closed run under `snapshot`; returns only if the
+/// run was not refused.
+fn run_fail_closed(
+    snapshot: detcore_model::config::PropertySnapshot,
+    guest: impl FnOnce() + Send + 'static,
+) {
     let config = detcore::Config {
         max_timeslice: None,
         sequentialize_threads: true,
         panic_on_unsupported_syscalls: true,
         shutdown_on_unsupported_syscall: true,
-        property_snapshot: Some(area.snapshot.clone()),
+        property_snapshot: Some(snapshot),
         ..Default::default()
     };
     // On a thread of its own with a large stack: Detcore's futures outgrow
@@ -238,7 +245,7 @@ fn a_file_the_area_gained_after_its_snapshot_is_refused() {
         .spawn(move || {
             let _ = detcore_testutils::test_fn_with_config::<detcore::Detcore, _>(
                 move || {
-                    let _ = std::fs::read(&later);
+                    guest();
                     std::process::exit(0);
                 },
                 detcore_testutils::prepare_ptrace_timer_config(config),
@@ -248,5 +255,55 @@ fn a_file_the_area_gained_after_its_snapshot_is_refused() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+/// In a fail-closed run, a read of a file the area gained after its snapshot
+/// was taken ends the run with the policy-refusal exit, naming why.
+#[test]
+fn a_file_the_area_gained_after_its_snapshot_is_refused() {
+    if !is_inner_refusal_run(
+        "a_file_the_area_gained_after_its_snapshot_is_refused",
+        "is in the property area but not in its snapshot",
+    ) {
+        return;
+    }
+    let area = area();
+    let later = area.live.path().join("u:object_r:later_prop:s0");
+    std::fs::write(&later, [9]).unwrap();
+    run_fail_closed(area.snapshot.clone(), move || {
+        let _ = std::fs::read(&later);
+    });
+    panic!("the run was not refused");
+}
+
+/// A file the capture saw but could not copy (it stopped being readable
+/// mid-capture) is known by device and inode: in a fail-closed run, a read
+/// of it through a hard link outside the area, a name the snapshot never
+/// saw, is refused rather than read live unnoticed.
+#[test]
+fn a_file_without_a_copy_is_refused_through_an_outside_alias() {
+    if !is_inner_refusal_run(
+        "a_file_without_a_copy_is_refused_through_an_outside_alias",
+        "stopped being readable while the snapshot was taken",
+    ) {
+        return;
+    }
+    let mut area = area();
+    let gone = area.live.path().join("u:object_r:gone_prop:s0");
+    std::fs::write(&gone, [9]).unwrap();
+    let metadata = std::fs::metadata(&gone).unwrap();
+    area.snapshot
+        .uncopied_files
+        .push(detcore_model::config::PropertyFile {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            name: "u:object_r:gone_prop:s0".to_owned(),
+        });
+    let outside = tempfile::tempdir_in(area.live.path().parent().unwrap()).unwrap();
+    let alias = outside.path().join("alias");
+    std::fs::hard_link(&gone, &alias).unwrap();
+    run_fail_closed(area.snapshot.clone(), move || {
+        let _ = std::fs::read(&alias);
+    });
     panic!("the run was not refused");
 }

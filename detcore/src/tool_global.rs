@@ -2798,6 +2798,13 @@ impl GlobalState {
                 post_crash.recorded_not_taken
             );
         }
+        summary.property_snapshot = self.cfg.property_snapshot.as_ref().map(|snapshot| {
+            detcore_model::summary::PropertySnapshotSummary {
+                copied_files: snapshot.live_files.len() as u64,
+                uncopied_files: snapshot.uncopied_files.len() as u64,
+                consistent_cut: snapshot.consistent_cut,
+            }
+        });
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the

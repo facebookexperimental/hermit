@@ -67,6 +67,23 @@ struct AreaFile {
     ino: u64,
 }
 
+/// What one capture of the property area found.
+#[derive(Debug)]
+struct Capture {
+    /// Each file read, coherent on its own.
+    files: Vec<AreaFile>,
+    /// Each file that stopped being readable mid-capture, by the identity of
+    /// its last successful read: it has no copy.
+    uncopied: Vec<detcore_model::config::PropertyFile>,
+    /// Whether no property was set during the capture (`SERIAL_FILE` read
+    /// the same before and after), so the files are one consistent cut.
+    consistent_cut: bool,
+}
+
+/// The area file init rewrites on every property set: its bytes (the area
+/// header's serial among them) change exactly when a property changes.
+const SERIAL_FILE: &str = "properties_serial";
+
 /// A copy of the property area this run holds, released when the last holder
 /// in the process that took it drops it.
 #[derive(Debug)]
@@ -75,6 +92,10 @@ pub(super) struct PropertySnapshotDir {
     copied: usize,
     /// Each live file copied.
     live_files: Vec<detcore_model::config::PropertyFile>,
+    /// Each live file seen but not copied.
+    uncopied_files: Vec<detcore_model::config::PropertyFile>,
+    /// Whether the copies are one consistent cut.
+    consistent_cut: bool,
     /// The shared lock on the directory's `.lock` (close-on-exec, so no guest
     /// inherits it).
     lock: File,
@@ -91,7 +112,15 @@ impl PropertySnapshotDir {
             guest_dir: PathBuf::from(PROPERTY_AREA),
             copy_dir: self.copy_dir.clone(),
             live_files: self.live_files.clone(),
+            uncopied_files: self.uncopied_files.clone(),
+            consistent_cut: self.consistent_cut,
         }
+    }
+
+    /// Whether the copies are one consistent cut, not only coherent per
+    /// file.
+    pub(super) fn consistent_cut(&self) -> bool {
+        self.consistent_cut
     }
 
     /// This process's descriptors that a guest would inherit (not
@@ -113,6 +142,7 @@ impl PropertySnapshotDir {
                 std::fs::metadata(format!("/proc/self/fd/{fd}")).is_ok_and(|metadata| {
                     self.live_files
                         .iter()
+                        .chain(&self.uncopied_files)
                         .any(|file| (file.dev, file.ino) == (metadata.dev(), metadata.ino()))
                 })
             })
@@ -260,7 +290,16 @@ fn take_as_root(
     under: &Path,
     chown_root: bool,
 ) -> Result<PropertySnapshotDir, String> {
-    let files = read_coherent(source)?;
+    let Capture {
+        files,
+        uncopied,
+        consistent_cut,
+    } = read_coherent(source)?;
+    let catalog = |live_files| Catalog {
+        live_files,
+        uncopied_files: uncopied.clone(),
+        consistent_cut,
+    };
     let live_files = files
         .iter()
         .map(|file| detcore_model::config::PropertyFile {
@@ -290,7 +329,12 @@ fn take_as_root(
     for _ in 0..4 {
         if let Some(lock) = join(&copy_dir) {
             if holds(&copy_dir, &files) {
-                return Ok(held(copy_dir, files.len(), live_files, lock));
+                return Ok(held(
+                    copy_dir,
+                    files.len(),
+                    catalog(live_files.clone()),
+                    lock,
+                ));
             }
             // Someone changed the shared copy (only root can): this run
             // makes a private one rather than read it.
@@ -307,7 +351,12 @@ fn take_as_root(
                 let _ = std::fs::remove_dir_all(&filling);
                 format!("its copy could not be made in {}: {error}", under.display())
             })?;
-            return Ok(held(private, files.len(), live_files, lock));
+            return Ok(held(
+                private,
+                files.len(),
+                catalog(live_files.clone()),
+                lock,
+            ));
         }
         let (filling, lock) = fill(under, &files, chown_root).map_err(|error| {
             format!("its copy could not be made in {}: {error}", under.display())
@@ -315,7 +364,12 @@ fn take_as_root(
         // `rename` fails if another run put the directory in place first;
         // this run then joins it.
         if std::fs::rename(&filling, &copy_dir).is_ok() {
-            return Ok(held(copy_dir, files.len(), live_files, lock));
+            return Ok(held(
+                copy_dir,
+                files.len(),
+                catalog(live_files.clone()),
+                lock,
+            ));
         }
         drop(lock);
         let _ = std::fs::remove_dir_all(&filling);
@@ -326,13 +380,20 @@ fn take_as_root(
     ))
 }
 
-/// Record `copy_dir` as held by this process and wrap it.
-fn held(
-    copy_dir: PathBuf,
-    copied: usize,
+/// What a snapshot knows about the live files it was taken from.
+struct Catalog {
     live_files: Vec<detcore_model::config::PropertyFile>,
-    lock: File,
-) -> PropertySnapshotDir {
+    uncopied_files: Vec<detcore_model::config::PropertyFile>,
+    consistent_cut: bool,
+}
+
+/// Record `copy_dir` as held by this process and wrap it.
+fn held(copy_dir: PathBuf, copied: usize, catalog: Catalog, lock: File) -> PropertySnapshotDir {
+    let Catalog {
+        live_files,
+        uncopied_files,
+        consistent_cut,
+    } = catalog;
     let owner = std::process::id();
     if let Ok(duplicate) = lock.try_clone() {
         HELD.lock()
@@ -343,35 +404,176 @@ fn held(
         copy_dir,
         copied,
         live_files,
+        uncopied_files,
+        consistent_cut,
         lock,
         owner,
     }
 }
 
-/// The area's files, as two consecutive reads agree on them. init writes a
-/// property in place (the value, then its serial, then the area's serial),
-/// and a new property extends an area's trie, so one read that overlaps a
-/// write can hold half of it; requiring the next read to find the same bytes
-/// makes keeping such a half-written state very unlikely. Refused when the
-/// area keeps changing.
-fn read_coherent(source: &Path) -> Result<Vec<AreaFile>, String> {
-    const ATTEMPTS: usize = 5;
-    let read = || {
-        read_area(source)
-            .map_err(|error| format!("{} could not be read: {error}", source.display()))
+/// The area's files. Each is read until two consecutive reads of it agree:
+/// init writes a property in place (the value, then its serial, then the
+/// global serial in `SERIAL_FILE`), and a new property extends one context
+/// file's trie, so one read that overlaps a write can hold half of it, and
+/// requiring the next read of the same file to find the same bytes makes
+/// keeping such a half-written state very unlikely.
+///
+/// That makes each file coherent on its own, but two files read at
+/// different moments can disagree: init publishes some properties in an
+/// order readers rely on across files (it loads the persistent properties,
+/// then sets `ro.persistent_properties.ready` in another context), so a set
+/// landing between two files' reads could show the later property with the
+/// earlier values. The whole capture is therefore bracketed by reads of
+/// `SERIAL_FILE`: when they agree the copies are taken as one consistent cut.
+/// Up to `CUT_ATTEMPTS` captures are tried; if properties keep changing, or
+/// `SERIAL_FILE` cannot be read, the last capture is kept as coherent per
+/// file only, and says so ([`Capture::consistent_cut`]).
+///
+/// The bracket is not a seqlock proof. It rests on how Android's property
+/// service works: init is the area's only writer, it bumps the global serial
+/// after each complete update, the serial does not wrap within a capture,
+/// and the area is not re-created (a new counter generation) mid-capture.
+/// Under those assumptions matching brackets allow at most one update still
+/// in flight in one context file, a state the area natively holds for that
+/// moment too.
+///
+/// Refused when a file keeps changing through `ATTEMPTS` reads. Every
+/// identity (device and inode) any read of any attempt returned and that the
+/// kept capture did not copy is kept as uncopied, so the guest cannot read
+/// such a file live unnoticed, whichever attempt saw it.
+fn read_coherent(source: &Path) -> Result<Capture, String> {
+    read_coherent_with(source, read_file)
+}
+
+/// `read_coherent`, reading each file with `read`.
+fn read_coherent_with(
+    source: &Path,
+    mut read: impl FnMut(&Path) -> Option<(Vec<u8>, u64, u64)>,
+) -> Result<Capture, String> {
+    const CUT_ATTEMPTS: usize = 3;
+    let serial = source.join(SERIAL_FILE);
+    // Every read below, the brackets' included, goes through `reads`, so
+    // every identity any of them returned is in `reads.seen`.
+    let mut reads = Observed {
+        read: &mut read,
+        seen: std::collections::BTreeMap::new(),
     };
-    let mut previous = read()?;
-    for _ in 0..ATTEMPTS {
-        let next = read()?;
-        if next == previous {
-            return Ok(next);
+    let mut attempt = 1;
+    loop {
+        // The serial file's contents only: init rewrites it in place, so its
+        // device and inode never change and carry nothing about a set.
+        let before = reads.read(&serial).map(|(contents, _, _)| contents);
+        let files = read_each_file(source, &mut reads)?;
+        let after = reads.read(&serial).map(|(contents, _, _)| contents);
+        let consistent_cut = before.is_some() && before == after;
+        if consistent_cut || attempt == CUT_ATTEMPTS {
+            let copied = files
+                .iter()
+                .map(|file| (file.dev, file.ino))
+                .collect::<std::collections::BTreeSet<_>>();
+            let uncopied = std::mem::take(&mut reads.seen)
+                .into_iter()
+                .filter(|(identity, _)| !copied.contains(identity))
+                .map(|((dev, ino), name)| detcore_model::config::PropertyFile { dev, ino, name })
+                .collect();
+            return Ok(Capture {
+                files,
+                uncopied,
+                consistent_cut,
+            });
         }
-        previous = next;
+        attempt += 1;
     }
-    Err(format!(
-        "its files changed between every two of {} reads, so no consistent copy could be taken",
-        ATTEMPTS + 1
-    ))
+}
+
+/// The capture's reader, recording every identity (device and inode) a read
+/// returns, with the file's name, before handing back its bytes.
+struct Observed<R> {
+    read: R,
+    seen: std::collections::BTreeMap<(u64, u64), String>,
+}
+
+impl<R: FnMut(&Path) -> Option<(Vec<u8>, u64, u64)>> Observed<R> {
+    fn read(&mut self, path: &Path) -> Option<(Vec<u8>, u64, u64)> {
+        let result = (self.read)(path);
+        if let Some((_, dev, ino)) = &result {
+            let name = path.file_name().unwrap_or_default();
+            self.seen
+                .entry((*dev, *ino))
+                .or_insert_with(|| name.to_string_lossy().into_owned());
+        }
+        result
+    }
+}
+
+/// One pass over the area: each readable file once two consecutive reads of
+/// it agree. A file that stops being readable mid-pass is left out of the
+/// pass (its identity stays in `reads.seen`).
+fn read_each_file<R: FnMut(&Path) -> Option<(Vec<u8>, u64, u64)>>(
+    source: &Path,
+    reads: &mut Observed<R>,
+) -> Result<Vec<AreaFile>, String> {
+    // A file changes only while init writes a property into it, so even
+    // under a burst of sets two reads of one 128 KiB file agree within a few
+    // tries.
+    const ATTEMPTS: usize = 50;
+    let unreadable = |error: io::Error| format!("{} could not be read: {error}", source.display());
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(source).map_err(unreadable)? {
+        let entry = entry.map_err(unreadable)?;
+        if !entry.file_type().map_err(unreadable)?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(mut previous) = reads.read(&path) else {
+            continue;
+        };
+        let mut stable = None;
+        let mut vanished = false;
+        for _ in 0..ATTEMPTS {
+            let Some(next) = reads.read(&path) else {
+                vanished = true;
+                break;
+            };
+            if next == previous {
+                stable = Some(next);
+                break;
+            }
+            previous = next;
+        }
+        match stable {
+            Some((contents, dev, ino)) => files.push(AreaFile {
+                name: entry.file_name(),
+                contents,
+                dev,
+                ino,
+            }),
+            // Its identity is in `reads.seen`, so it ends up uncopied unless
+            // a later attempt copies it.
+            None if vanished => {}
+            None => {
+                return Err(format!(
+                    "{} changed between every two of {} reads, so no consistent copy of it \
+                     could be taken",
+                    path.display(),
+                    ATTEMPTS + 1
+                ));
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// One read of the file at `path` through one descriptor: its bytes, device
+/// and inode. `None` if it cannot be opened or read: the guest, which runs
+/// with this process's credentials, cannot open it either.
+fn read_file(path: &Path) -> Option<(Vec<u8>, u64, u64)> {
+    let mut file = File::open(path).ok()?;
+    let mut contents = Vec::new();
+    io::Read::read_to_end(&mut file, &mut contents).ok()?;
+    let metadata = file.metadata().ok()?;
+    Some((contents, metadata.dev(), metadata.ino()))
 }
 
 /// Take a shared hold on the existing copy directory `copy_dir`, if it is in
@@ -438,36 +640,6 @@ fn fill(under: &Path, files: &[AreaFile], chown_root: bool) -> io::Result<(PathB
             Err(error)
         }
     }
-}
-
-/// Every regular file of `source` this process can read, in name order,
-/// each read and identified through one descriptor. A file that cannot be
-/// read is left out: the guest, which runs with this process's credentials,
-/// cannot open it either.
-fn read_area(source: &Path) -> io::Result<Vec<AreaFile>> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let Ok(mut file) = File::open(entry.path()) else {
-            continue;
-        };
-        let mut contents = Vec::new();
-        if io::Read::read_to_end(&mut file, &mut contents).is_err() {
-            continue;
-        }
-        let metadata = file.metadata()?;
-        files.push(AreaFile {
-            name: entry.file_name(),
-            contents,
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        });
-    }
-    files.sort();
-    Ok(files)
 }
 
 /// A hash of every file's name and contents, which names the copy directory.
@@ -594,6 +766,214 @@ mod tests {
         assert_eq!(std::fs::metadata(&property).unwrap().mode() & 0o777, 0o444);
         assert!(!copy.join("subdir").exists());
         assert_eq!(copy.join("u:object_r:secret_prop:s0").exists(), root);
+    }
+
+    /// The read counts a reader saw, by file name.
+    fn counted(reads: &std::collections::HashMap<PathBuf, u32>, name: &str) -> u32 {
+        reads
+            .iter()
+            .find(|(path, _)| path.ends_with(name))
+            .map_or(0, |(_, count)| *count)
+    }
+
+    /// A quiet area is one consistent cut: the serial file reads the same
+    /// before and after, and each file is read exactly twice.
+    #[test]
+    fn a_quiet_area_is_captured_as_one_consistent_cut() {
+        let source = area(&[
+            ("properties_serial", &[0; 4]),
+            ("u:object_r:test_prop:s0", &[1; 4]),
+        ]);
+        let mut reads = std::collections::HashMap::<PathBuf, u32>::new();
+        let capture = read_coherent_with(source.path(), |path| {
+            *reads.entry(path.to_owned()).or_default() += 1;
+            Some((vec![1; 4], 1, 2))
+        })
+        .unwrap();
+        assert!(capture.consistent_cut);
+        assert_eq!(capture.files.len(), 2);
+        assert!(capture.uncopied.is_empty());
+        // Two bracket reads and two capture reads.
+        assert_eq!(counted(&reads, "properties_serial"), 4);
+        assert_eq!(counted(&reads, "u:object_r:test_prop:s0"), 2);
+    }
+
+    /// A file is captured once two consecutive reads of it agree, however
+    /// many reads before differed. When properties keep changing across the
+    /// whole capture (the serial file differs before and after it in each
+    /// of the three attempts), the last capture is kept as coherent per file
+    /// only.
+    #[test]
+    fn a_changing_area_is_captured_per_file_and_says_so() {
+        let source = area(&[
+            ("properties_serial", &[0; 4]),
+            ("u:object_r:test_prop:s0", &[1; 4]),
+        ]);
+        let mut reads = std::collections::HashMap::<PathBuf, u32>::new();
+        // The serial file's bytes advance every second read: two consecutive
+        // reads inside a capture can agree, the bracket reads never do.
+        let capture = read_coherent_with(source.path(), |path| {
+            let count = reads.entry(path.to_owned()).or_default();
+            *count += 1;
+            let contents = if path.ends_with("properties_serial") {
+                vec![(*count / 2) as u8; 4]
+            } else {
+                vec![1; 4]
+            };
+            Some((contents, 1, 2))
+        })
+        .unwrap();
+        assert!(!capture.consistent_cut);
+        assert_eq!(capture.files.len(), 2);
+        // The last attempt's capture is kept: its serial reads were the 10th
+        // and 11th (10 / 2 = 11 / 2 = 5).
+        let serial = capture
+            .files
+            .iter()
+            .find(|file| file.name == "properties_serial")
+            .unwrap();
+        assert_eq!(serial.contents, [5; 4]);
+        assert!(capture.uncopied.is_empty());
+        // Three attempts of: bracket, two capture reads, bracket.
+        assert_eq!(counted(&reads, "properties_serial"), 12);
+        assert_eq!(counted(&reads, "u:object_r:test_prop:s0"), 6);
+    }
+
+    /// A file that differs in every one of its 51 reads refuses the
+    /// snapshot, naming it, after exactly that many reads.
+    #[test]
+    fn a_file_that_never_settles_refuses_after_its_last_read() {
+        let source = area(&[
+            ("properties_serial", &[0; 4]),
+            ("u:object_r:test_prop:s0", &[1; 4]),
+        ]);
+        let mut reads = std::collections::HashMap::<PathBuf, u32>::new();
+        let reason = read_coherent_with(source.path(), |path| {
+            let count = reads.entry(path.to_owned()).or_default();
+            *count += 1;
+            let changing = path.ends_with("u:object_r:test_prop:s0");
+            Some((
+                if changing {
+                    count.to_le_bytes().to_vec()
+                } else {
+                    vec![1]
+                },
+                1,
+                2,
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            reason.contains("u:object_r:test_prop:s0 changed between every two of 51 reads"),
+            "{reason}"
+        );
+        assert_eq!(counted(&reads, "u:object_r:test_prop:s0"), 51);
+    }
+
+    /// A file that stops being readable after its first read is not copied
+    /// but kept by the identity that read gave, so an open that reaches it
+    /// is still recognized as the live area.
+    #[test]
+    fn a_file_that_vanishes_mid_capture_is_kept_by_identity() {
+        let source = area(&[
+            ("properties_serial", &[0; 4]),
+            ("u:object_r:test_prop:s0", &[1; 4]),
+        ]);
+        let mut seen = 0;
+        let capture = read_coherent_with(source.path(), |path| {
+            if path.ends_with("u:object_r:test_prop:s0") {
+                seen += 1;
+                return (seen == 1).then(|| (vec![1; 4], 5, 6));
+            }
+            Some((vec![2; 4], 1, 2))
+        })
+        .unwrap();
+        assert_eq!(capture.files.len(), 1);
+        assert_eq!(capture.files[0].name, "properties_serial");
+        assert_eq!(
+            capture.uncopied,
+            [detcore_model::config::PropertyFile {
+                dev: 5,
+                ino: 6,
+                name: "u:object_r:test_prop:s0".to_owned(),
+            }]
+        );
+        let under = tempfile::tempdir().unwrap();
+        let snapshot = take_as_root(source.path(), under.path(), false)
+            .unwrap()
+            .config();
+        assert!(snapshot.uncopied_files.is_empty());
+        assert!(snapshot.consistent_cut);
+    }
+
+    /// An identity seen only by an attempt that was retried is still kept:
+    /// attempt 1 reads a file once and then loses it, the bracket changes,
+    /// attempt 2 cannot read the file at all and its bracket agrees, yet
+    /// the kept cut carries the file's identity as uncopied, so a later read
+    /// of it by another name is still recognized.
+    #[test]
+    fn an_identity_seen_by_a_retried_attempt_is_kept() {
+        let source = area(&[
+            ("properties_serial", &[0; 4]),
+            ("u:object_r:test_prop:s0", &[1; 4]),
+        ]);
+        let mut serial_reads = 0_u8;
+        let mut file_reads = 0;
+        let capture = read_coherent_with(source.path(), |path| {
+            if path.ends_with("properties_serial") {
+                serial_reads += 1;
+                // Attempt 1's bracket (reads 1 and 4) differs; attempt 2's
+                // (reads 5 and 8) agrees.
+                let contents = if serial_reads <= 1 { 0 } else { 1 };
+                return Some((vec![contents; 4], 1, 2));
+            }
+            file_reads += 1;
+            (file_reads == 1).then(|| (vec![1; 4], 5, 6))
+        })
+        .unwrap();
+        assert!(capture.consistent_cut);
+        assert_eq!(capture.files.len(), 1);
+        assert_eq!(
+            capture.uncopied,
+            [detcore_model::config::PropertyFile {
+                dev: 5,
+                ino: 6,
+                name: "u:object_r:test_prop:s0".to_owned(),
+            }]
+        );
+    }
+
+    /// An identity only a bracket read returned is kept too: the serial
+    /// file reads fine for both brackets but fails its own per-file read, so
+    /// it is not copied, and its identity is uncopied rather than forgotten.
+    #[test]
+    fn an_identity_only_a_bracket_read_saw_is_kept() {
+        let source = area(&[
+            ("properties_serial", &[0; 4]),
+            ("u:object_r:test_prop:s0", &[1; 4]),
+        ]);
+        let mut serial_reads = 0;
+        let capture = read_coherent_with(source.path(), |path| {
+            if path.ends_with("properties_serial") {
+                serial_reads += 1;
+                // Reads 1 and 3 are the brackets; read 2 is its own.
+                return (serial_reads != 2).then(|| (vec![0; 4], 7, 8));
+            }
+            Some((vec![1; 4], 5, 6))
+        })
+        .unwrap();
+        assert!(capture.consistent_cut);
+        assert_eq!(serial_reads, 3);
+        assert_eq!(capture.files.len(), 1);
+        assert_eq!(capture.files[0].name, "u:object_r:test_prop:s0");
+        assert_eq!(
+            capture.uncopied,
+            [detcore_model::config::PropertyFile {
+                dev: 7,
+                ino: 8,
+                name: "properties_serial".to_owned(),
+            }]
+        );
     }
 
     /// Two runs that read the same properties share one directory, under the
