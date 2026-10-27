@@ -234,7 +234,9 @@ mod decode {
 )]
 mod model {
     use std::collections::BTreeMap;
+    use std::collections::VecDeque;
     use std::path::Path;
+    use std::sync::Arc;
 
     /// An Arm CPU PMU, as `/sys/bus/event_source/devices/<name>` describes
     /// it.
@@ -516,6 +518,230 @@ mod model {
             }
         }
         merged
+    }
+
+    /// One [`ByteCache`] entry: the bytes, what was made from them, and what
+    /// it is charged.
+    struct Cached<V> {
+        bytes: Box<[u8]>,
+        value: V,
+        charge: usize,
+    }
+
+    /// A [`ByteCache`] key: the length and a hash of three sampled pages.
+    type CacheKey = (usize, u64);
+
+    /// An upper bound on one B-tree node's allocation, for the
+    /// [`ByteCache`] key map and a plan's report maps. A node holds up to 11
+    /// keys, 11 values and (inside the tree) 12 child pointers: for a 16-byte
+    /// key and a 24-byte value that is under 560 bytes. A B-tree never has
+    /// more nodes than entries (no node is empty), so this bounds each entry's
+    /// share however sparsely the nodes are filled.
+    const MAP_NODE_BOUND: usize = 1024;
+
+    /// What one [`ByteCache`] entry's own allocation costs beyond its bytes
+    /// and its value's heap: the entry with its two reference counts.
+    pub(crate) const fn cached_entry_overhead<V>() -> usize {
+        2 * std::mem::size_of::<usize>() + std::mem::size_of::<Cached<V>>()
+    }
+
+    /// An upper bound on what a [`ByteCache`] of at most `max_entries`
+    /// retains besides its entries, whatever was inserted, evicted or
+    /// cleared: the age queue, whose capacity never exceeds twice the most
+    /// entries it held (it grows by doubling, and entries are evicted before
+    /// one is added), at most one key-map node per entry, and each key's
+    /// candidate list, allocated for the most candidates.
+    pub(crate) const fn spine_bound<V>(max_entries: usize) -> usize {
+        use std::mem::size_of;
+        let slots = if max_entries < 2 { 4 } else { 2 * max_entries };
+        slots
+            .saturating_mul(size_of::<(CacheKey, Arc<Cached<V>>)>())
+            .saturating_add(max_entries.saturating_mul(
+                MAP_NODE_BOUND + MAX_CANDIDATES_PER_KEY * size_of::<Arc<Cached<V>>>(),
+            ))
+    }
+
+    /// The most entries [`ByteCache`] compares bytes with for one key.
+    pub(crate) const MAX_CANDIDATES_PER_KEY: usize = 4;
+
+    /// The heap a cached plan holds, from the capacities of everything it
+    /// allocated, as [`ByteCache`] charges it.
+    pub(crate) fn plan_charge(plan: &Option<crate::aarch64_lse::elf::FilePlan>) -> usize {
+        use std::mem::size_of;
+
+        use crate::aarch64_lse::elf::FilePatch;
+        // The plan in its shared allocation, with the reference counts.
+        let mut charge =
+            2 * size_of::<usize>() + size_of::<Option<crate::aarch64_lse::elf::FilePlan>>();
+        let Some(plan) = plan else {
+            return charge;
+        };
+        let add = |charge: &mut usize, more: usize| *charge = charge.saturating_add(more);
+        add(
+            &mut charge,
+            plan.patches
+                .capacity()
+                .saturating_mul(size_of::<FilePatch>()),
+        );
+        for patch in &plan.patches {
+            add(&mut charge, patch.original.capacity());
+            add(&mut charge, patch.rewritten.capacity());
+        }
+        let report = &plan.report;
+        add(
+            &mut charge,
+            report
+                .refused_examples
+                .capacity()
+                .saturating_mul(size_of::<(u64, String)>()),
+        );
+        for (_, why) in &report.refused_examples {
+            add(&mut charge, why.capacity());
+        }
+        add(
+            &mut charge,
+            report
+                .skipped_segments
+                .capacity()
+                .saturating_mul(size_of::<String>()),
+        );
+        for why in &report.skipped_segments {
+            add(&mut charge, why.capacity());
+        }
+        add(
+            &mut charge,
+            (report.patched.len() + report.refused.len()).saturating_mul(MAP_NODE_BOUND),
+        );
+        charge
+    }
+
+    /// Values made from byte strings, found by those bytes: an entry is used
+    /// only for bytes equal to its own, so a value that is a pure function of
+    /// its bytes comes back exactly as making it again would. The key (the
+    /// length and a hash of three sampled 4 KiB pages) only picks the
+    /// candidates, at most [`MAX_CANDIDATES_PER_KEY`] of them. Everything it
+    /// retains (the entries with their bytes and their values' heap, and the
+    /// spine bounded by [`spine_bound`]) stays within the `max_retained` it
+    /// is made with, and the entries within `max_entries`: the oldest go
+    /// before a new one is added.
+    pub(crate) struct ByteCache<V> {
+        by_key: BTreeMap<CacheKey, Vec<Arc<Cached<V>>>>,
+        order: VecDeque<(CacheKey, Arc<Cached<V>>)>,
+        held: usize,
+        peak: usize,
+        max_charge: usize,
+        max_entries: usize,
+    }
+
+    impl<V: Clone> ByteCache<V> {
+        pub(crate) const fn new(max_retained: usize, max_entries: usize) -> Self {
+            ByteCache {
+                by_key: BTreeMap::new(),
+                order: VecDeque::new(),
+                held: 0,
+                peak: 0,
+                // The entries get what the spine cannot take.
+                max_charge: max_retained.saturating_sub(spine_bound::<V>(max_entries)),
+                max_entries,
+            }
+        }
+
+        fn key(bytes: &[u8]) -> CacheKey {
+            let mut hasher = std::hash::DefaultHasher::new();
+            let sample = 4096.min(bytes.len());
+            let middle = (bytes.len() - sample) / 2;
+            for part in [
+                &bytes[..sample],
+                &bytes[middle..middle + sample],
+                &bytes[bytes.len() - sample..],
+            ] {
+                std::hash::Hasher::write(&mut hasher, part);
+            }
+            (bytes.len(), std::hash::Hasher::finish(&hasher))
+        }
+
+        /// The value made from bytes equal to `bytes`, if held.
+        pub(crate) fn get(&self, bytes: &[u8]) -> Option<V> {
+            self.by_key
+                .get(&Self::key(bytes))?
+                .iter()
+                .find(|cached| *cached.bytes == *bytes)
+                .map(|cached| cached.value.clone())
+        }
+
+        /// Hold `value`, made from `bytes`, charged the bytes, `value_charge`
+        /// (its own heap) and the entry's bookkeeping, after the oldest
+        /// entries make room. Not held when its key already has
+        /// [`MAX_CANDIDATES_PER_KEY`] candidates, or when it alone is over
+        /// the bound.
+        pub(crate) fn insert(&mut self, bytes: Vec<u8>, value: V, value_charge: usize) {
+            let key = Self::key(&bytes);
+            let charge = bytes
+                .len()
+                .saturating_add(value_charge)
+                .saturating_add(cached_entry_overhead::<V>());
+            if charge > self.max_charge
+                || self.max_entries == 0
+                || self
+                    .by_key
+                    .get(&key)
+                    .is_some_and(|candidates| candidates.len() >= MAX_CANDIDATES_PER_KEY)
+            {
+                return;
+            }
+            while self.held.saturating_add(charge) > self.max_charge
+                || self.order.len() >= self.max_entries
+            {
+                let Some((key, oldest)) = self.order.pop_front() else {
+                    break;
+                };
+                self.held -= oldest.charge;
+                if let Some(candidates) = self.by_key.get_mut(&key) {
+                    candidates.retain(|candidate| !Arc::ptr_eq(candidate, &oldest));
+                    if candidates.is_empty() {
+                        self.by_key.remove(&key);
+                    }
+                }
+            }
+            let cached = Arc::new(Cached {
+                bytes: bytes.into_boxed_slice(),
+                value,
+                charge,
+            });
+            self.held += charge;
+            self.by_key
+                .entry(key)
+                .or_insert_with(|| Vec::with_capacity(MAX_CANDIDATES_PER_KEY))
+                .push(cached.clone());
+            self.order.push_back((key, cached));
+            self.peak = self.peak.max(self.held);
+        }
+
+        /// The most its entries have been charged at once since it was made or
+        /// cleared.
+        pub(crate) fn peak(&self) -> usize {
+            self.peak
+        }
+
+        /// Drop every entry, the spine's allocations and the peak.
+        pub(crate) fn clear(&mut self) {
+            self.by_key = BTreeMap::new();
+            self.order = VecDeque::new();
+            self.held = 0;
+            self.peak = 0;
+        }
+
+        /// What the entries are charged now, and how many there are.
+        #[cfg(test)]
+        pub(crate) fn held(&self) -> (usize, usize) {
+            (self.held, self.order.len())
+        }
+
+        /// What the entries may be charged: `max_retained` less the spine.
+        #[cfg(test)]
+        pub(crate) fn max_charge(&self) -> usize {
+            self.max_charge
+        }
     }
 
     /// What a file's executable bytes hold, by file offset: the load of each
@@ -865,6 +1091,7 @@ mod runtime {
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use detcore_model::summary::ExclusiveRewrite;
     use detcore_model::summary::RunSummary;
@@ -884,6 +1111,7 @@ mod runtime {
     use super::decode::CodeScan;
     use super::decode::elf_section_table;
     use super::decode::executable_sections;
+    use super::model::ByteCache;
     use super::model::CpuPmu;
     use super::model::FileLoops;
     use super::model::Found;
@@ -906,6 +1134,7 @@ mod runtime {
     use super::model::merge_overlaps;
     use super::model::page_span;
     use super::model::place;
+    use super::model::plan_charge;
     use super::model::sequence_is_new;
     use super::model::step;
     use super::model::was_executable;
@@ -922,7 +1151,7 @@ mod runtime {
     /// guest thread is the host task of the same ID and Detcore runs outside
     /// it (ptrace), and not under `hermit record` or `hermit replay`, whose
     /// replayed guest maps placeholders.
-    fn reads_guest_tasks(cfg: &Config) -> bool {
+    pub(crate) fn reads_guest_tasks(cfg: &Config) -> bool {
         cfg.backend.host_task_reads_reach_guest_threads
             && !cfg.backend.tool_shares_guest_descriptor_table
             && !cfg.recordreplay_modes
@@ -1022,6 +1251,14 @@ mod runtime {
     }
 
     impl RunTally {
+        /// The tally of a new run. The plan cache starts empty too, so that
+        /// what the run plans and the peak its summary reports are the run's
+        /// own, also when one Hermit process runs several (`analyze` trials).
+        pub(crate) fn new_run() -> Self {
+            PLANS.lock().unwrap().clear();
+            Self::default()
+        }
+
         /// Take one report.
         pub(crate) fn note(&mut self, cfg: &Config, report: &Report) {
             match report {
@@ -1092,6 +1329,7 @@ mod runtime {
         /// and the counts or why there are none (full report only).
         pub(crate) fn fill_summary(&mut self, summary: &mut RunSummary) {
             summary.exclusive_pairs = self.pairs.pairs_per_path();
+            summary.exclusive_rewrite_cache_peak = PLANS.lock().unwrap().peak() as u64;
             summary.counter_reads = self.pairs.counter_reads_per_path();
             summary.exclusive_rewrites = self
                 .pairs
@@ -1735,11 +1973,26 @@ mod runtime {
     /// allocation.
     const MAX_PLANNED_FILE: u64 = 1 << 30;
 
-    /// The rewrite plan of the file a mapping maps, planned afresh from the
-    /// mapped object's bytes each time: nothing is cached, so no identity can
-    /// carry one file's plan to another. The bytes are used only if the file
-    /// kept its size, modification and status-change times (the last cannot
-    /// be set from user space) while they were read.
+    /// The rewrite plans this Hermit process has made, found by the exact
+    /// bytes they were made from ([`ByteCache`]): a plan is a pure function of
+    /// those bytes, so a hit is the plan planning them again would give, and
+    /// no file identity (device, inode, path, time) or digest is trusted. It
+    /// retains at most 128 MiB (a process on a small device maps tens of MB of
+    /// code) and 1024 entries; anything past a bound only costs a re-plan.
+    /// Each run starts it empty ([`RunTally::new_run`]): Hermit runs one
+    /// guest at a time in a process (`--verify` runs each in its own,
+    /// `analyze` its trials one after another). Runs that did overlap in one
+    /// process would share it, and one's start would empty it under the
+    /// other: that costs re-planning and the accuracy of the full report's
+    /// peak, never a plan's bytes or the INFO view.
+    static PLANS: Mutex<ByteCache<Arc<Option<FilePlan>>>> =
+        Mutex::new(ByteCache::new(128 << 20, 1024));
+
+    /// The rewrite plan of the file a mapping maps, from the mapped object's
+    /// bytes, read afresh each time. The bytes are used only if the file kept
+    /// its size, modification and status-change times (the last cannot be
+    /// set from user space) while they were read; planning them is skipped
+    /// when bytes equal to them were planned before ([`PLANS`]).
     fn plan_for(
         tid: Pid,
         path: &Path,
@@ -1781,9 +2034,15 @@ mod runtime {
         {
             return Err("the file changed while it was read".to_owned());
         }
-        Ok(Arc::new(
+        if let Some(plan) = PLANS.lock().unwrap().get(&bytes) {
+            return Ok(plan);
+        }
+        let plan = Arc::new(
             crate::aarch64_lse::elf::plan_bytes(&bytes).map_err(|error| error.to_string())?,
-        ))
+        );
+        let charge = plan_charge(&plan);
+        PLANS.lock().unwrap().insert(bytes, plan.clone(), charge);
+        Ok(plan)
     }
 
     /// The guest's memory through `/proc/<tid>/mem`.
@@ -2458,6 +2717,7 @@ mod tests {
     use super::decode::executable_sections;
     use super::decode::is_counter_read;
     use super::decode::scan_words;
+    use super::model::ByteCache;
     use super::model::CpuPmu;
     use super::model::Found;
     use super::model::GuestCode;
@@ -2471,6 +2731,7 @@ mod tests {
     use super::model::Trigger;
     use super::model::Written;
     use super::model::arm_cpu_pmus;
+    use super::model::cached_entry_overhead;
     use super::model::combine;
     use super::model::covering;
     use super::model::crosses_page;
@@ -2479,7 +2740,9 @@ mod tests {
     use super::model::page_span;
     use super::model::parse_cpu_list;
     use super::model::place;
+    use super::model::plan_charge;
     use super::model::sequence_is_new;
+    use super::model::spine_bound;
     use super::model::step;
     use super::model::was_executable;
     use super::model::write_sequence;
@@ -2861,6 +3124,114 @@ mod tests {
         two.note(&("01".to_owned(), 0), &[left(0, 2)], None);
         two.note(&space, &[], Some(&[]));
         assert_eq!(two.remaining_per_path().get(libc), Some(&2));
+    }
+
+    /// The plan cache returns a value only for bytes equal to those it was
+    /// made from, even when the sampled key matches, and never passes its
+    /// bounds on the bytes, values and bookkeeping charged, on entries, or on
+    /// candidates per key: the oldest entries go before a new one is added.
+    #[test]
+    fn the_plan_cache_answers_only_for_equal_bytes_and_stays_bounded() {
+        // 20,000 bytes: the key samples 0..4096, 7952..12048 and
+        // 15904..20000, so bytes 5000 to 7000 are not sampled.
+        let a = vec![7u8; 20_000];
+        let variant = |at: usize| {
+            let mut bytes = a.clone();
+            bytes[at] ^= 1;
+            bytes
+        };
+        let entry = 20_000 + cached_entry_overhead::<u32>();
+        let max = 6 * entry;
+        let spine = spine_bound::<u32>(16);
+        let mut cache = ByteCache::<u32>::new(max + spine, 16);
+        assert_eq!(cache.max_charge(), max, "the spine is set aside");
+        let within = |cache: &ByteCache<u32>| {
+            let (held, entries) = cache.held();
+            assert!(held <= max && entries <= 16 && cache.peak() <= max);
+            assert!(held + spine <= max + spine);
+        };
+        cache.insert(a.clone(), 1, 0);
+        assert_eq!(cache.get(&a), Some(1));
+        assert_eq!(cache.get(&variant(5000)), None, "same key, other bytes");
+        for (value, at) in [(2, 5000), (3, 6000), (4, 7000)] {
+            cache.insert(variant(at), value, 0);
+            within(&cache);
+        }
+        assert_eq!(cache.get(&variant(6000)), Some(3));
+        // A fifth candidate for the key is not held.
+        cache.insert(variant(5001), 9, 0);
+        assert_eq!(cache.get(&variant(5001)), None);
+        assert_eq!(cache.held(), (4 * entry, 4));
+        // The value's heap counts: room is made first, oldest first, and the
+        // bound is never passed.
+        let big = vec![1u8; 20_001];
+        cache.insert(big.clone(), 10, 2 * entry);
+        within(&cache);
+        assert_eq!((cache.get(&a), cache.get(&variant(5000))), (None, None));
+        assert_eq!(cache.get(&big), Some(10));
+        assert_eq!(cache.held(), (5 * entry + 1, 3));
+        assert_eq!(cache.peak(), 5 * entry + 1);
+        // Exactly at the bound is allowed; one past it by itself is not held.
+        let fill = vec![3u8; 20_002];
+        cache.insert(
+            fill.clone(),
+            11,
+            max - 20_002 - cached_entry_overhead::<u32>(),
+        );
+        assert_eq!((cache.get(&fill), cache.held()), (Some(11), (max, 1)));
+        cache.insert(vec![2u8; 100], 12, max);
+        assert_eq!(cache.get(&[2u8; 100]), None);
+        within(&cache);
+        // The entry bound: many small files.
+        let mut small = ByteCache::<u32>::new(usize::MAX, 3);
+        for n in 0..10u8 {
+            small.insert(vec![n; 10 + usize::from(n)], u32::from(n), 0);
+            assert!(small.held().1 <= 3);
+        }
+        assert_eq!(small.get(&[9u8; 19]), Some(9));
+        assert_eq!(small.get(&[0u8; 10]), None);
+        // A new run starts empty, with no peak.
+        small.clear();
+        assert_eq!((small.held(), small.peak()), ((0, 0), 0));
+        assert_eq!(small.get(&[9u8; 19]), None);
+        // A bound the spine alone would fill holds nothing.
+        let mut tiny = ByteCache::<u32>::new(spine_bound::<u32>(8), 8);
+        tiny.insert(vec![1u8; 1], 1, 0);
+        assert_eq!((tiny.max_charge(), tiny.held()), (0, (0, 0)));
+    }
+
+    /// A plan is charged for what it holds, by capacity, not length: spare
+    /// room in its vectors counts.
+    #[test]
+    fn a_cached_plan_is_charged_its_allocations() {
+        use std::mem::size_of;
+
+        use crate::aarch64_lse::elf::FilePatch;
+        use crate::aarch64_lse::elf::FilePlan;
+        let mut patches = Vec::with_capacity(10);
+        patches.push(FilePatch {
+            offset: 0,
+            original: Vec::with_capacity(64),
+            rewritten: vec![0; 4],
+        });
+        let mut plan = FilePlan {
+            patches,
+            ..FilePlan::default()
+        };
+        plan.report.patched.insert("rmw", 1);
+        plan.report.refused_examples = Vec::with_capacity(3);
+        plan.report
+            .refused_examples
+            .push((0x10, String::with_capacity(40)));
+        let charge = plan_charge(&Some(plan));
+        let floor = 10 * size_of::<FilePatch>()
+            + 64
+            + 4
+            + 3 * size_of::<(u64, String)>()
+            + 40
+            + size_of::<Option<FilePlan>>();
+        assert!(charge >= floor, "{charge} < {floor}");
+        assert!(plan_charge(&None) >= size_of::<Option<FilePlan>>());
     }
 
     #[test]

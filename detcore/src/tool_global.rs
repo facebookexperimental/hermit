@@ -1953,7 +1953,7 @@ impl GlobalState {
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             syscall_observation_gaps: Mutex::new(BTreeSet::new()),
             #[cfg(target_arch = "aarch64")]
-            store_exclusive: Mutex::new(Default::default()),
+            store_exclusive: Mutex::new(crate::store_exclusive::RunTally::new_run()),
             announced_handlers_not_installed: Mutex::new(BTreeSet::new()),
             announced_refused_signal_controls: Mutex::new((0, false)),
             host_diskstats: std::sync::OnceLock::new(),

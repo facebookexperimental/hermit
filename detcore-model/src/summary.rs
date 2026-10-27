@@ -272,6 +272,14 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub exclusive_rewrites: BTreeMap<String, ExclusiveRewrite>,
 
+    /// aarch64, the in-memory rewrite: the most its plan cache held at once
+    /// during the run, in bytes: each plan with the file bytes it was made
+    /// from, and their bookkeeping. The cache starts empty at each run, but
+    /// it belongs to the Hermit process, so this is shown in the full report
+    /// and not in the INFO view `--verify` compares. Zero elsewhere.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub exclusive_rewrite_cache_peak: u64,
+
     /// **Nondeterministic:** aarch64, in runs that record or replay
     /// preemptions: the store-exclusives the guest failed, each of which
     /// retried its loop and added retired branches, and those it executed.
@@ -582,6 +590,7 @@ impl RunSummary {
             exclusive_pairs,
             counter_reads,
             exclusive_rewrites,
+            exclusive_rewrite_cache_peak,
             store_exclusives,
             store_exclusives_unavailable,
             guest_deadlock,
@@ -701,11 +710,18 @@ impl RunSummary {
             }
         }
         if !exclusive_rewrites.is_empty() {
-            writeln!(
+            write!(
                 f,
-                "Exclusive loops rewritten in the guest's memory, in {} file(s):",
+                "Exclusive loops rewritten in the guest's memory, in {} file(s)",
                 exclusive_rewrites.len()
             )?;
+            if include_report_metadata && *exclusive_rewrite_cache_peak != 0 {
+                write!(
+                    f,
+                    " (plan cache peak: {exclusive_rewrite_cache_peak} bytes)"
+                )?;
+            }
+            writeln!(f, ":")?;
             for (path, rewrite) in exclusive_rewrites {
                 let ExclusiveRewrite {
                     rewritten,
@@ -791,6 +807,7 @@ Timeslice stats: min=199999995ns max=200000000ns mean=199999998ns count=4
 mod tests {
     use std::collections::BTreeMap;
 
+    use super::ExclusiveRewrite;
     use super::PathEvidence;
     use super::PreemptionSummary;
     use super::RunSummary;
@@ -1213,6 +1230,43 @@ mod tests {
             assert!(summary.to_string().contains(expected));
             assert_eq!(summary.info(None).to_string(), baseline_info);
         }
+    }
+
+    /// The in-memory rewrite's per-path counts are in both views, its plan
+    /// cache's peak only in the full report; the peak is left out of the
+    /// JSON while zero.
+    #[test]
+    fn the_in_memory_rewrite_is_in_both_views_and_its_cache_peak_in_the_full_report() {
+        let baseline = RunSummary {
+            syscalls: Some(7),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&baseline).unwrap();
+        assert!(value.get("exclusive_rewrite_cache_peak").is_none());
+        let rewritten = RunSummary {
+            exclusive_rewrites: BTreeMap::from([(
+                "/lib64/libc.so.6".to_owned(),
+                ExclusiveRewrite {
+                    rewritten: 19,
+                    left: 0,
+                    failed: 0,
+                },
+            )]),
+            exclusive_rewrite_cache_peak: 2_254_552,
+            ..baseline
+        };
+        let counts = "  /lib64/libc.so.6: 19 rewritten, 0 left, 0 not written\n";
+        let full = format!(
+            "Exclusive loops rewritten in the guest's memory, in 1 file(s) (plan cache peak: \
+             2254552 bytes):\n{counts}"
+        );
+        let info =
+            format!("Exclusive loops rewritten in the guest's memory, in 1 file(s):\n{counts}");
+        assert!(rewritten.to_string().contains(&full));
+        assert!(rewritten.info(None).to_string().contains(&info));
+        assert!(!rewritten.info(None).to_string().contains("peak"));
+        let value = serde_json::to_value(&rewritten).unwrap();
+        assert_eq!(value["exclusive_rewrite_cache_peak"], 2_254_552);
     }
 
     #[test]
