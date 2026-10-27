@@ -334,10 +334,14 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skid_overshoot_reports: Option<u64>,
 
-    /// `false` when this summary shows that the run's seed and configuration
-    /// do not reproduce it: a skid overshoot moved a preemption point by host
-    /// interrupt latency. Absent otherwise, which claims nothing either way;
-    /// see [`RunSummary::record_skid_overshoots`].
+    /// `false` when this execution was not reproducible from its seed and
+    /// configuration: a skid overshoot moved a preemption point in this run by
+    /// host interrupt latency. It describes this execution, never the seed: the
+    /// same seed can run clean once and overshoot the next time, so no seed is
+    /// classified by it. Absent otherwise, which claims nothing either way: an
+    /// absent field with `skid_overshoots: 0` means that no overshoot was
+    /// observed in this run, not that the seed reproduces it; see
+    /// [`RunSummary::record_skid_overshoots`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_reproducible: Option<bool>,
 }
@@ -505,10 +509,12 @@ impl RunSummary {
     /// Records the skid-overshoot `events` of a run whose backend has precise
     /// PMU timers, and the `reports` of them by its detection sites; there
     /// are events exactly when there are reports. Any report means a
-    /// preemption point moved by host interrupt latency, so the seed no
-    /// longer reproduces the run. None proves no more than that: a relaxed
-    /// configuration may still not be reproducible, so `seed_reproducible`
-    /// is then left absent rather than set to `true`.
+    /// preemption point of this execution moved by host interrupt latency, so
+    /// its seed does not reproduce this execution; another run of the same
+    /// seed may not overshoot. None proves no more than that no overshoot was
+    /// observed in this run: it is no reproducibility guarantee, and a relaxed
+    /// configuration may still not be reproducible, so `seed_reproducible` is
+    /// then left absent rather than set to `true`.
     pub fn record_skid_overshoots(&mut self, events: u64, reports: u64) {
         debug_assert!(events <= reports && (events > 0) == (reports > 0));
         self.skid_overshoots = Some(events);
@@ -635,7 +641,9 @@ impl RunSummary {
             writeln!(
                 f,
                 "Skid overshoots: {events} event(s){reports}; a precise timer took effect past \
-                 its programmed branch count, so this run is not reproducible from its seed"
+                 its programmed branch count, so this run is not reproducible from its seed \
+                 (the overshoot moved a preemption point in this execution; another run of the \
+                 same seed may not overshoot)"
             )?;
         }
 
@@ -974,7 +982,9 @@ mod tests {
         assert!(
             overshot.to_string().contains(
                 "Skid overshoots: 3 event(s) (6 reports); a precise timer took effect past its \
-                 programmed branch count, so this run is not reproducible from its seed\n"
+                 programmed branch count, so this run is not reproducible from its seed (the \
+                 overshoot moved a preemption point in this execution; another run of the same \
+                 seed may not overshoot)\n"
             ),
             "{overshot}"
         );

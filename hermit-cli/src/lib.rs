@@ -2663,8 +2663,9 @@ impl SkidOvershoots {
         format!(
             "hermit: WARNING: {} skid-overshoot event(s) ({} skid-overshoot report(s)): a \
              precise timer took effect past its programmed branch count, so this run is not \
-             reproducible from its seed; it ran on from the observed point, and --strict would \
-             refuse it. First: {first}",
+             reproducible from its seed (the overshoot moved a preemption point in this \
+             execution; another run of the same seed may not overshoot); it ran on from the \
+             observed point, and --strict would refuse it. First: {first}",
             self.counts.events, self.counts.reports
         )
     }
@@ -7630,8 +7631,9 @@ mod tests {
             warning,
             "hermit: WARNING: 3 skid-overshoot event(s) (3 skid-overshoot report(s)): a precise \
              timer took effect past its programmed branch count, so this run is not reproducible \
-             from its seed; it ran on from the observed point, and --strict would refuse it. \
-             First: tid=42 kind=delivered_late rcb_actual=41000 rcb_target=33000 \
+             from its seed (the overshoot moved a preemption point in this execution; another \
+             run of the same seed may not overshoot); it ran on from the observed point, and \
+             --strict would refuse it. First: tid=42 kind=delivered_late rcb_actual=41000 rcb_target=33000 \
              past_target=8000 overflow_point=31000 past_overflow=10000 overflow_recorded=true \
              sample_age_ns=3500"
         );

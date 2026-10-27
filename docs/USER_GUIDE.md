@@ -181,7 +181,11 @@ that the seed does not reproduce the run; `--summary` and `--summary-json`
 record the number of events (`skid_overshoots`, with `seed_reproducible:
 false`). Reverie and Detcore can each report one overshoot, so an event is one
 thread's late timer and its target, however many reports name it; the JSON
-also records the reports (`skid_overshoot_reports`).
+also records the reports (`skid_overshoot_reports`). Both describe that
+execution, not its seed: the same seed can run clean once and overshoot the
+next time, so a seed is never classified. An absent `seed_reproducible` with
+`skid_overshoots: 0` means that no overshoot was observed in that run, not that
+the seed reproduces it.
 
 ## Choosing A Mode
 
