@@ -15194,6 +15194,142 @@ fn no_namespace_preemption_records_replay_under_their_base() {
     );
 }
 
+/// `hermit bisect` under `--no-namespace` with chosen IDs: its replays take
+/// the base the two schedules were recorded under, without `--pid-base` in
+/// the run arguments, and every schedule it writes for a replay states those
+/// IDs, so each replay can follow it. The schedules come from seeds of a shell
+/// that races a background `echo a` against its own `echo b`, and the search
+/// localizes that race and finishes. Before, bisect's first replay was refused
+/// (exit 122): the schedules it wrote stated no guest numbering, and read as
+/// numbered by a PID namespace. Run as the init of the test's own user and
+/// PID namespace, as the other chosen-ID tests are. Not a PMU subject: the
+/// schedules switch threads only at syscalls (`--max-timeslice=disabled`).
+#[test]
+fn no_namespace_bisect_replays_the_schedules_it_writes() {
+    const RACE: &str = "echo a & echo b; wait";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = |name: &str| directory.path().join(name).display().to_string();
+    let hermit = env!("CARGO_BIN_EXE_hermit");
+    let run_args = [
+        "--no-namespace",
+        "--base-env=minimal",
+        "--max-timeslice=disabled",
+    ];
+    let mut good = None;
+    let mut bad = None;
+    for seed in 0..40 {
+        let schedule = path(&format!("seed{seed}.json"));
+        let mut command = Command::new("unshare");
+        command
+            .args(OWN_PID_NAMESPACE)
+            .args([hermit, "run"])
+            .args(run_args)
+            .args([
+                "--pid-base=5000",
+                "--chaos",
+                "--sched-heuristic=random",
+                "--epoch=2026-01-01T00:00:00Z",
+            ])
+            .arg(format!("--seed={seed}"))
+            .arg(format!("--record-preemptions-to={schedule}"))
+            .args(["--", "/bin/sh", "-c", RACE]);
+        let label = format!("{command:?}");
+        let recorded = hermit_test::hermit_output(&label, &mut command);
+        assert_success(&recorded, &["record", &label]);
+        match stdout(&recorded).as_str() {
+            "a\nb\n" if good.is_none() => good = Some(schedule),
+            "b\na\n" if bad.is_none() => bad = Some(schedule),
+            _ => {}
+        }
+        if good.is_some() && bad.is_some() {
+            break;
+        }
+    }
+    let good = good.expect("no seed of 40 printed a before b");
+    let bad = bad.expect("no seed of 40 printed b before a");
+    let schedule: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&bad).unwrap()).unwrap();
+    assert_eq!(schedule["guest_ids"]["Chosen"]["base"], 5000, "{schedule}");
+
+    let report = path("report.json");
+    let mut command = Command::new("unshare");
+    command
+        .args(OWN_PID_NAMESPACE)
+        .args([hermit, "bisect"])
+        .arg(format!("--good={good}"))
+        .arg(format!("--bad={bad}"))
+        .args(["--target-exit-code=0", "--target-stdout=^b"])
+        .arg(format!("--report-file={report}"))
+        .arg("--")
+        .args(run_args)
+        .args(["--", "/bin/sh", "-c", RACE]);
+    let label = format!("{command:?}");
+    let bisected = hermit_test::hermit_output(&label, &mut command);
+    assert_success(&bisected, &["bisect", &label]);
+    assert!(
+        stdout(&bisected).contains("Schedule divergence localized at bad event"),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&bisected),
+        stderr(&bisected)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    let first = report["critical_event1"]["event_index"].as_u64();
+    let second = report["critical_event2"]["event_index"].as_u64();
+    assert!(
+        first.is_some() && second == first.map(|first| first + 1),
+        "{report}"
+    );
+}
+
+/// The candidate records `analyze --minimize` writes for its rounds
+/// (`round_NNN.preempts`) state the trials' guest IDs too, so under
+/// `--no-namespace` each round replays its candidate instead of being refused
+/// at the first one (exit 122: "recorded with guest process IDs numbered by
+/// the run's PID namespace"). The race needs a preemption for `a` to print
+/// first (a target the guest reaches with none makes analyze loop after
+/// minimizing: https://github.com/rrnewton/hermit/issues/4871). How many
+/// rounds run depends on the shell's own threads and calls, so the test asks
+/// only that minimization ran a round and finished with no refusal. Run as
+/// the init of a user and PID namespace, with the base Hermit chooses there.
+#[test]
+fn no_namespace_minimize_replays_its_candidate_records() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("report.json").display().to_string();
+    let mut command = Command::new("unshare");
+    command
+        .args(OWN_PID_NAMESPACE)
+        .args([
+            env!("CARGO_BIN_EXE_hermit"),
+            "analyze",
+            "--search",
+            "--minimize",
+        ])
+        .args(["--target-exit-code=0", "--target-stdout=^a"])
+        .arg(format!("--report-file={report}"))
+        .args([
+            "--",
+            "--no-namespace",
+            "--base-env=minimal",
+            "--max-timeslice=disabled",
+            "--epoch=2026-01-01T00:00:00Z",
+        ])
+        .args(["--", "/bin/sh", "-c", "echo a & echo b; wait"]);
+    let label = format!("{command:?}");
+    let analyzed = hermit_test::hermit_output(&label, &mut command);
+    assert_success(&analyzed, &["analyze", &label]);
+    let log = stderr(&analyzed);
+    assert!(
+        log.contains("Minimizing schedule, round 1,")
+            && log.contains("Minimized to")
+            && !log.contains("numbered by the run's PID namespace"),
+        "{log}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+    assert!(report["critical_event1"].is_object(), "{report}");
+}
+
 /// `--no-namespace` runs the guest in Hermit's own namespace, where Hermit
 /// installs no mount. Detcore still renders the guest's mount files there, on
 /// every backend, from the table of that namespace's launch mounts (the ones

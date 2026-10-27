@@ -2597,7 +2597,16 @@ mod tests {
             assert_eq!(back.clone_preemptions_only().guest_ids(), Some(ids));
             std::fs::write(&path, &written).unwrap();
             assert_eq!(read_recorded_guest_ids(&path), Ok(ids));
+            // A record analyze writes for a trial states the trials' numbering
+            // the same way.
+            let stamped = PreemptionRecord::from_sched_events(Vec::new()).with_guest_ids(ids);
+            stamped.write_to_disk(&path).unwrap();
+            assert_eq!(read_recorded_guest_ids(&path), Ok(ids));
         }
+        let unstamped = PreemptionRecord::from_sched_events(Vec::new())
+            .with_guest_ids(chosen(4000, true))
+            .with_guest_ids(GuestIds::Namespace);
+        assert_eq!(unstamped.guest_ids(), None);
         for (recorded, replay, refused) in [
             (GuestIds::Namespace, GuestIds::Namespace, false),
             (chosen(4000, false), chosen(4000, true), false),

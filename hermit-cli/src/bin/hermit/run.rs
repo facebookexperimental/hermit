@@ -3038,6 +3038,24 @@ fn vmm_time_warning_silent_for_non_vmm_programs() {
     }
 }
 
+/// The guest IDs the trials of this process's analysis or bisection take
+/// under `--no-namespace`, once resolved (`RunOpts::prepare_trial_guest_ids`).
+/// The memo has no key: it serves one analysis per process, as `hermit
+/// analyze` and `hermit bisect` are, whose trials share every option that
+/// numbers a guest.
+static TRIAL_GUEST_IDS: std::sync::Mutex<Option<detcore_model::pid::GuestIds>> =
+    std::sync::Mutex::new(None);
+
+/// The guest IDs every trial of this process's analysis or bisection takes,
+/// once resolved: `None` before that, and without `--no-namespace`. Analyze
+/// stamps every record it writes for a trial with them
+/// (`AnalyzeOpts::stamp_trial_record`).
+pub(crate) fn resolved_trial_guest_ids() -> Option<detcore_model::pid::GuestIds> {
+    *TRIAL_GUEST_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The guest IDs every trial of an analysis or bisection under
 /// `--no-namespace` uses, from those its first trial resolved: chosen IDs,
 /// with any task that cannot have its own refused rather than given a host ID
@@ -13762,18 +13780,20 @@ impl RunOpts {
     /// trial that replays a record with other IDs is refused as
     /// `hermit run` refuses it.
     ///
-    /// The memo has no key: it serves one analysis per process, as `hermit
-    /// analyze` and `hermit bisect` are, whose trials share every option that
-    /// numbers a guest. The window is not checked again for host tasks; one
-    /// that takes an ID in it during the analysis gets the trial whose task
-    /// needed that ID refused (`refuse_host_ids`), which ends the analysis.
+    /// The memo (`TRIAL_GUEST_IDS`) is normally filled before the first
+    /// trial, from the analysis's input records
+    /// (`prepare_trial_guest_ids_for_inputs`). The window is not checked
+    /// again for host tasks; one that takes an ID in it during the analysis
+    /// gets the trial whose task needed that ID refused (`refuse_host_ids`),
+    /// which ends the analysis.
+    ///
+    /// The trial's options name the base (`--pid-base`), so that its printed
+    /// reproducer replays its record under the same IDs.
     pub(crate) fn prepare_trial_guest_ids(&mut self) -> Result<(), Error> {
-        use detcore_model::pid::GuestIds;
-        static RESOLVED: std::sync::Mutex<Option<GuestIds>> = std::sync::Mutex::new(None);
         if !self.no_namespace {
             return Ok(());
         }
-        let mut resolved = RESOLVED
+        let mut resolved = TRIAL_GUEST_IDS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(ids) = *resolved {
@@ -13783,14 +13803,65 @@ impl RunOpts {
                 return Err(Error::new(PolicyRefusal).context(refusal));
             }
             self.det_opts.det_config.guest_ids = ids;
+            self.pid_base = ids.base();
             return Ok(());
         }
         self.resolve_guest_ids()?;
         let ids = trial_guest_ids(self.det_opts.det_config.guest_ids)
             .map_err(|refusal| Error::new(PolicyRefusal).context(refusal))?;
         self.det_opts.det_config.guest_ids = ids;
+        self.pid_base = ids.base();
         *resolved = Some(ids);
         Ok(())
+    }
+
+    /// Numbers the trials of an analysis or bisection before its first trial
+    /// (`prepare_trial_guest_ids`), from its input `recordings`, so that every
+    /// record it writes for a trial can state the trials' numbering
+    /// (`AnalyzeOpts::stamp_trial_record`). The inputs number their guests
+    /// alike (`AnalyzeOpts::refuse_recordings_numbered_apart`), so the first
+    /// speaks for all.
+    ///
+    /// Under `--no-namespace` the trials are numbered as a replay of the first
+    /// input would be (`resolve_guest_ids`): from its base
+    /// (`guest_ids::Required::Replay`), and an input whose IDs Hermit did not
+    /// choose is refused, naming it, as `hermit run` refuses its replay. The
+    /// run arguments' own replayed record or `--pid-base` takes precedence,
+    /// and the trials replaying the inputs must then agree with it. Without
+    /// inputs, as for a seeded analysis, a free window is chosen. In a PID
+    /// namespace an input numbered otherwise is refused: every trial numbers
+    /// its guest by its namespace, so none could follow it.
+    pub(crate) fn prepare_trial_guest_ids_for_inputs(
+        &mut self,
+        recordings: &[(&str, &Path)],
+    ) -> Result<(), Error> {
+        if !self.no_namespace {
+            for (option, path) in recordings {
+                let ids =
+                    detcore::preemptions::read_recorded_guest_ids(path).map_err(Error::msg)?;
+                if ids != detcore_model::pid::GuestIds::Namespace {
+                    return Err(Error::new(PolicyRefusal).context(format!(
+                        "{option} {} was recorded with guest process IDs {ids}, and every trial \
+                         numbers its guest by its own PID namespace, so no trial could follow \
+                         it. Analyze it under --no-namespace (with the same --pid-base) instead",
+                        path.display()
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        // As each trial does before it is numbered (`RunData::launch`): this
+        // settles the configuration the numbering reads, such as whether
+        // threads are sequentialized.
+        self.validate_args()?;
+        let config = &mut self.det_opts.det_config;
+        if config.replay_preemptions_from.is_none()
+            && config.replay_schedule_from.is_none()
+            && let Some((_, path)) = recordings.first()
+        {
+            config.replay_preemptions_from = Some(path.to_path_buf());
+        }
+        self.prepare_trial_guest_ids()
     }
 
     /// Under `--no-namespace`, the replayed record (`--replay-preemptions-from`

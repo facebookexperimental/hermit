@@ -775,6 +775,12 @@ impl RunData {
     /// Replay `pr`, a record analyze edited
     /// ([`Self::with_edited_preempts_path_in`]).
     pub fn with_preempts_in(mut self, pr: PreemptionRecord) -> Self {
+        // Derived from a trial's own record, which states the trials' guest
+        // IDs already; stated again, as every record written for a trial is.
+        let pr = match crate::app::run::resolved_trial_guest_ids() {
+            Some(ids) => pr.with_guest_ids(ids),
+            None => pr,
+        };
         let path = self.preempts_path_in().to_path_buf();
         pr.write_to_disk(&path)
             .expect("write of preempts file to succeed");
@@ -1067,11 +1073,18 @@ impl AnalyzeOpts {
             let source = format!("{option} {}", path.display());
             match &first {
                 None => first = Some((source, ids)),
-                Some((first_source, first_ids)) if !first_ids.numbers_like(&ids) => bail!(
-                    "{first_source} was recorded with guest process IDs {first_ids}, and {source} \
-                     with {ids}. Every trial numbers its guest alike, so no trial could follow \
-                     both records. Record both runs under --no-namespace with the same --pid-base"
-                ),
+                Some((first_source, first_ids)) if !first_ids.numbers_like(&ids) => {
+                    // A policy refusal (exit 122), as the epoch's and the
+                    // pipe-wake latency's are, not a CLI error.
+                    return Err(
+                        anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
+                            "{first_source} was recorded with guest process IDs {first_ids}, and \
+                             {source} with {ids}. Every trial numbers its guest alike, so no \
+                             trial could follow both records. Record both runs under \
+                             --no-namespace with the same --pid-base"
+                        )),
+                    );
+                }
                 Some(_) => {}
             }
         }
@@ -1443,7 +1456,7 @@ impl AnalyzeOpts {
     /// value
     /// (<https://github.com/rrnewton/hermit/issues/4380>).
     pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
-        record
+        let record = record
             .with_pipe_wake_latency(self.trial_pipe_wake_latency())
             .with_signal_state_copy(Some(self.trial_signal_state_copy()))
             .with_expired_wait_runs_charged_once(
@@ -1454,7 +1467,14 @@ impl AnalyzeOpts {
                 self.trial_sleep_registration() == SleepRegistration::FirstPass,
             )
             .with_rewrite_exclusives_in_memory(self.trial_rewrite_exclusives_in_memory())
-            .with_post_crash_timeslice(self.trial_post_crash_timeslice())
+            .with_post_crash_timeslice(self.trial_post_crash_timeslice());
+        // Under `--no-namespace`, the guest IDs every trial takes, resolved
+        // before the first (`prepare_trial_guest_ids`): a record without them
+        // reads as numbered by a PID namespace, which no trial can replay.
+        match crate::app::run::resolved_trial_guest_ids() {
+            Some(ids) => record.with_guest_ids(ids),
+            None => record,
+        }
     }
 
     /// Whether the trials cap preemption charges (`--cap-preemption-charge`
@@ -1464,6 +1484,14 @@ impl AnalyzeOpts {
             .det_opts
             .det_config
             .cap_preemption_charge
+    }
+
+    /// Number every trial's guest before the first trial, from the input
+    /// `recordings` (`RunOpts::prepare_trial_guest_ids_for_inputs`), so that
+    /// every record written for a trial states it (`Self::stamp_trial_record`).
+    /// A refusal here comes before any trial.
+    pub fn prepare_trial_guest_ids(&self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
+        RunData::get_raw_runopts(self).prepare_trial_guest_ids_for_inputs(recordings)
     }
 
     /// Write the schedule `events` for a trial to replay, stamped

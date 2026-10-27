@@ -194,6 +194,9 @@ impl BisectOpts {
             sources.trial_format()?;
             sources.validate_reserved_inputs()?;
         }
+        // Every replay's schedule is written anew, stamped with the replays'
+        // guest IDs, so they are resolved before the first.
+        analyzer.prepare_trial_guest_ids(&[("--good", &self.good), ("--bad", &self.bad)])?;
         let mut good = good.into_global();
         let mut bad = bad.into_global();
         // Analyze's trial outputs omit optional event timestamps. Put these
@@ -379,8 +382,10 @@ mod tests {
     }
 
     /// Two `--no-namespace` records whose guest IDs start from different
-    /// bases are refused before any trial: every trial numbers its guest
-    /// alike, so none could follow both. Records numbered alike are admitted.
+    /// bases are refused before any trial, as a policy refusal: every trial
+    /// numbers its guest alike, so none could follow both. Records numbered
+    /// alike are admitted where the trials number their guests that way too:
+    /// here, by a PID namespace.
     #[test]
     fn bisect_refuses_records_whose_guests_were_numbered_apart() {
         use detcore_model::pid::GuestIds;
@@ -416,6 +421,12 @@ mod tests {
         .unwrap_err();
         assert!(
             error
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error
                 .to_string()
                 .contains("Record both runs under --no-namespace with the same --pid-base"),
             "{error:#}"
@@ -423,14 +434,34 @@ mod tests {
         let error = prepare_search_records(&numbered(4, Some(chosen(31744))), &numbered(5, None))
             .unwrap_err();
         assert!(
+            error
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
             error.to_string().contains("no trial could follow both"),
             "{error:#}"
         );
-        prepare_search_records(
+        // Numbered alike, but by chosen IDs, which these trials, each in a
+        // PID namespace of its own, cannot follow.
+        let error = prepare_search_records(
             &numbered(4, Some(chosen(31744))),
             &numbered(5, Some(chosen(31744))),
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("numbers its guest by its own PID namespace"),
+            "{error:#}"
+        );
         prepare_search_records(&numbered(4, None), &numbered(5, None)).unwrap();
     }
 

@@ -2352,7 +2352,8 @@ impl AnalyzeOpts {
         // Every trial runs under the timeslice its recordings drew.
         self.adopt_recorded_timeslice(&recordings)?;
         self.refuse_unsound_continuation_timeslice()?;
-        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
+        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
+        self.prepare_trial_guest_ids(&recordings)
     }
 
     /// Take the settings `analyze` inherits from the global options: every
