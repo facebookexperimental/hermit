@@ -12,7 +12,14 @@
 // after each, so a replay that preempts at a point of its own leaves the
 // recording (--die-on-desync) or prints other times.
 //
-// RUN: d=$(mktemp -d) && %hermit run --chaos --seed=3 --record-preemptions-to="$d/r.json" -- %me > "$d/rec" && %hermit run --chaos --seed=3 --die-on-desync --replay-schedule-from="$d/r.json" -- %me > "$d/rep" && diff "$d/rec" "$d/rep" && rm -r "$d"
+// Both runs are --strict: a replay follows its record exactly only where the
+// retired-branch counter passes Reverie's validation, and where it does not
+// (an AMD Zen host without the SpecLockMap fix) Hermit refuses the run, as for
+// the other strict fixtures, rather than let skid make this fixture pass or
+// fail by chance. The record and the outputs go in the fresh working
+// directory the lit runner makes for the fixture.
+//
+// RUN: %hermit run --strict --chaos --seed=3 --record-preemptions-to=r.json -- %me > rec && %hermit run --strict --chaos --seed=3 --die-on-desync --replay-schedule-from=r.json -- %me > rep && diff rec rep
 
 use std::hint::black_box;
 use std::time::SystemTime;

@@ -28250,6 +28250,19 @@ fn chaos_schedule_replay_divergences(
     divergences
 }
 
+/// Asserts that the recording of tests/c/chaos_replay_new_thread.c (with
+/// `guest_args`) under `--chaos` at `seed` replays to the same outcome
+/// (`chaos_schedule_replay_divergences`). Each seed is a test of its own, so
+/// that each fits nextest's 57-second wall bound on a loaded host, as for the
+/// heavy tests split in https://github.com/rrnewton/hermit/issues/4783.
+fn assert_chaos_schedule_replay_follows(guest_args: &[&str], replay_chaos: bool, seed: u64) {
+    let divergences = chaos_schedule_replay_divergences(guest_args, replay_chaos, &[seed]);
+    assert!(
+        divergences.is_empty(),
+        "(seed, record, replay): {divergences:?}"
+    );
+}
+
 /// A schedule replay under `--chaos` follows its recording. The schedule
 /// decides where a replayed slice ends and which thread runs next; chaos
 /// used to draw slice ends and priorities as well, so the replay ended
@@ -28257,14 +28270,22 @@ fn chaos_schedule_replay_divergences(
 /// virtual clock. Before, 9 of the first 10 seeds' replays printed other
 /// times than their recordings, while the same replays without `--chaos`
 /// followed them; `hermit analyze` makes such replays, so it refused its
-/// endpoints.
+/// endpoints. Seeds 1, 2 and 3, one test each.
 #[test]
-fn a_schedule_replay_under_chaos_follows_its_recording() {
-    let divergences = chaos_schedule_replay_divergences(&[], true, &[1, 2, 3]);
-    assert!(
-        divergences.is_empty(),
-        "(seed, record, replay): {divergences:?}"
-    );
+fn a_schedule_replay_under_chaos_follows_its_recording_at_seed_1() {
+    assert_chaos_schedule_replay_follows(&[], true, 1);
+}
+
+/// Seed 2 of `a_schedule_replay_under_chaos_follows_its_recording_at_seed_1`.
+#[test]
+fn a_schedule_replay_under_chaos_follows_its_recording_at_seed_2() {
+    assert_chaos_schedule_replay_follows(&[], true, 2);
+}
+
+/// Seed 3 of `a_schedule_replay_under_chaos_follows_its_recording_at_seed_1`.
+#[test]
+fn a_schedule_replay_under_chaos_follows_its_recording_at_seed_3() {
+    assert_chaos_schedule_replay_follows(&[], true, 3);
 }
 
 /// The run arguments of tests/c/branch_free_race.c's strict chaos runs at
@@ -28448,14 +28469,23 @@ fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_i
 /// checkpoint that kept the slice it counted the `--max-timeslice` backstop
 /// from the slice's old start, so it ended the next slice early. Either adds
 /// a scheduler turn, and each turn moves the virtual clock. Before, none of
-/// the first 12 seeds' replays printed their recordings' times.
+/// the first 12 seeds' replays printed their recordings' times. Seeds 1, 2
+/// and 3, one test each.
 #[test]
-fn a_schedule_replay_ends_each_recorded_slice_once() {
-    let divergences = chaos_schedule_replay_divergences(&["syscalls"], false, &[1, 2, 3]);
-    assert!(
-        divergences.is_empty(),
-        "(seed, record, replay): {divergences:?}"
-    );
+fn a_schedule_replay_ends_each_recorded_slice_once_at_seed_1() {
+    assert_chaos_schedule_replay_follows(&["syscalls"], false, 1);
+}
+
+/// Seed 2 of `a_schedule_replay_ends_each_recorded_slice_once_at_seed_1`.
+#[test]
+fn a_schedule_replay_ends_each_recorded_slice_once_at_seed_2() {
+    assert_chaos_schedule_replay_follows(&["syscalls"], false, 2);
+}
+
+/// Seed 3 of `a_schedule_replay_ends_each_recorded_slice_once_at_seed_1`.
+#[test]
+fn a_schedule_replay_ends_each_recorded_slice_once_at_seed_3() {
+    assert_chaos_schedule_replay_follows(&["syscalls"], false, 3);
 }
 
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn

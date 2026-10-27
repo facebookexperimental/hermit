@@ -819,6 +819,51 @@ async fn unbound_exec_normal_exit_cannot_consume_pending_or_completed_transfer()
     }
 }
 
+/// An exec continuation whose grant carries the replayed schedule's slice
+/// length (`Scheduler::timeslices`, which a schedule replay fills for the new
+/// leader) installs that slice end as the schedule's, through
+/// `ThreadState::install_schedule_deadline`: it bounds the PMU maximum and
+/// clears the `--max-timeslice` backstop the slice kept, so a later callback
+/// checkpoint's restart (`restart_replay_backstop`) cannot move it, even where
+/// the two fall on the same nanosecond.
+#[tokio::test]
+async fn an_exec_continuation_resumes_the_schedules_slice_end_not_a_backstop() {
+    let fixture = Fixture::prepared().await;
+    let mut guest = fixture.guest(Gate::None);
+    let now = guest.thread.thread_logical_time.as_nanos();
+    let backstop = now + LogicalTime::from_nanos(200_000_000);
+    guest.thread.end_of_timeslice = Some(backstop);
+    guest.thread.max_timeslice_end = Some(backstop);
+    guest.thread.replay_backstop = Some(backstop);
+    let length = LogicalTime::from_nanos(777);
+    {
+        let mut reconnect = Box::pin(super::super::reconnect_exec(&mut guest));
+        assert!(futures::poll!(&mut reconnect).is_pending());
+        assert!(futures::poll!(&mut reconnect).is_pending());
+        fixture
+            .state
+            .sched
+            .lock()
+            .unwrap()
+            .timeslices
+            .insert(LEADER, Some(length));
+        let turn = crate::scheduler::do_a_turn_blocking(
+            fixture.state.sched.clone(),
+            fixture.state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .expect("replacement must receive its continuation grant");
+        assert_eq!(turn.tid, LEADER);
+        assert_eq!(reconnect.await, Ok(()));
+    }
+    let expected = now + length;
+    assert_eq!(guest.thread.end_of_timeslice, Some(expected));
+    assert_eq!(guest.thread.max_timeslice_end, Some(expected));
+    assert_eq!(guest.thread.replay_backstop, None);
+    consume(&fixture.state, &fixture.tool, LEADER, guest.thread).await;
+}
+
 #[tokio::test]
 async fn transferred_exec_waits_for_real_grant_and_preserves_clock_and_deadlines() {
     let mut fixture = Fixture::prepared().await;
