@@ -113,9 +113,6 @@ toml = "0.8.23"
 # Use the qualifier as a dependency without adding its unit tests to fixture binaries.
 reverie-liteinst-artifact = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "831a3a0e79892a7e6bfafc6a86dd73c987feeabb", default-features = false }
 reverie-loader = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "831a3a0e79892a7e6bfafc6a86dd73c987feeabb" }
-# Same exact host source pin as the shared physical launcher and codec consumer.
-# Keep the shared physical-launcher regression in the ordinary unit gate.
-reverie-inguest = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "831a3a0e79892a7e6bfafc6a86dd73c987feeabb", default-features = false, features = ["exec-stop"] }
 # Exact token locations and digests bind the complete source inventory.
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 quote = "1.0.47"
@@ -127,6 +124,13 @@ syn = { version = "2.0.119", features = ["full", "visit"] }
 toml = "0.8.23"
 # version_provenance includes build.rs, whose compatibility stamp hashes with it.
 sha1_smol = "1.0.1"
+
+# The in-guest runtime builds only for x86_64; this lets an aarch64 host build
+# the test targets that do not use it.
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+# Same exact host source pin as the shared physical launcher and codec consumer.
+# Keep the shared physical-launcher regression in the ordinary unit gate.
+reverie-inguest = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "831a3a0e79892a7e6bfafc6a86dd73c987feeabb", default-features = false, features = ["exec-stop"] }
 
 # Always selected with the existing backend feature; fixture exports are a
 # separate producer input, never an exemption from required execution.
