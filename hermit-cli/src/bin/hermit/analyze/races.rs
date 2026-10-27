@@ -3912,6 +3912,7 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
                     .to_string(),
             );
             lines.extend(candidate_lines(r));
+            lines.extend(undecided_lines(r));
             if let Some(o) = &r.outcome {
                 lines.push(format!(
                     "Outcome: {} by thread {} at #{}.",
@@ -3985,6 +3986,128 @@ fn candidate_lines(r: &RacingAccesses) -> Vec<String> {
         }
     }
     lines
+}
+
+/// For `candidates` whose checks ran and none of which decides: what that
+/// means, and what to try next. A reversal that ran as edited and left the
+/// outcome as it was clears its candidate, and only as far as one turn
+/// reversal in one run goes; a reversal that could not be replayed as
+/// edited, one never tried because its control did not reproduce the run,
+/// and a candidate not checked at all leave it untested, so the first
+/// sentence keeps them apart. Empty when no check ran or one decides.
+fn undecided_lines(r: &RacingAccesses) -> Vec<String> {
+    let checks: Vec<Option<&CandidateCheck>> =
+        r.candidates.iter().map(|c| c.check.as_ref()).collect();
+    let verdict = |v: CheckVerdict| {
+        checks
+            .iter()
+            .filter(|c| c.is_some_and(|c| c.verdict == v))
+            .count()
+    };
+    if r.status != RaceStatus::Candidates
+        || checks.iter().all(Option::is_none)
+        || verdict(CheckVerdict::Decides) > 0
+    {
+        return Vec::new();
+    }
+    let n = checks.len();
+    let ran = verdict(CheckVerdict::DoesNotDecide);
+    let not_realized = verdict(CheckVerdict::NotRealized);
+    // A check whose control did not reproduce the run names the control as
+    // its trial: its reversal was never tried.
+    let control_failed = checks
+        .iter()
+        .flatten()
+        .filter(|c| {
+            c.verdict == CheckVerdict::NotChecked
+                && c.trial.as_ref().is_some_and(|t| t.ends_with("_control"))
+        })
+        .count();
+    let not_checked = n - ran - not_realized - control_failed;
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let mut untested = Vec::new();
+    if not_realized > 0 {
+        untested.push(format!(
+            "{not_realized} reversal{} could not be replayed as edited",
+            plural(not_realized)
+        ));
+    }
+    if control_failed > 0 {
+        untested.push(format!(
+            "for {control_failed} the control did not reproduce the run, so {} reversal{} {} not \
+             tried",
+            if control_failed == 1 { "its" } else { "their" },
+            plural(control_failed),
+            if control_failed == 1 { "was" } else { "were" }
+        ));
+    }
+    if not_checked > 0 {
+        untested.push(format!(
+            "{not_checked} {} not checked",
+            if not_checked == 1 { "was" } else { "were" }
+        ));
+    }
+    let untested = untested.join("; ");
+    let head = format!(
+        "None of the {n} candidate{} was shown to decide",
+        if n == 1 { "" } else { "s" }
+    );
+    let summary = if ran == n {
+        format!(
+            "{head}: {} ran as edited and left the outcome as it was, so the outcome probably \
+             does not turn on any one of these candidates' orders alone (each check reverses one \
+             turn order in one run); it may turn on an order not ranked here, an order in memory \
+             that syscalls do not show, one outside the trace, or several together.",
+            if n == 1 {
+                "its reversal".to_string()
+            } else {
+                format!("all {n} reversals")
+            }
+        )
+    } else if ran == 0 {
+        format!(
+            "{head}, and none was tested: {untested}; the deciding interaction may be among them \
+             or elsewhere."
+        )
+    } else {
+        let rest = n - ran;
+        format!(
+            "{head}: {ran} reversal{} ran as edited and left the outcome as it was; of the other \
+             {rest}, {untested}; so {} untested, not cleared, and the deciding interaction may \
+             be among {} or elsewhere.",
+            plural(ran),
+            if rest == 1 {
+                "that one is"
+            } else {
+                "those are"
+            },
+            if rest == 1 { "it" } else { "them" }
+        )
+    };
+    let mut next = vec![
+        "rerun with --minimize if the analysis did not use it, so fewer chaos interventions \
+         surround the deciding event"
+            .to_string(),
+    ];
+    if r.truncated {
+        next.push(
+            "a wider --race-window, since a trace was cut short before the window ended"
+                .to_string(),
+        );
+    }
+    let unrealized: Vec<String> = checks
+        .iter()
+        .flatten()
+        .filter(|c| c.verdict == CheckVerdict::NotRealized)
+        .filter_map(|c| c.trial.as_ref().map(|t| format!("{t}.repro")))
+        .collect();
+    if !unrealized.is_empty() {
+        next.push(format!(
+            "the unrealized checks' replays ({} in the workspace) show where each left its edit",
+            unrealized.join(", ")
+        ));
+    }
+    vec![summary, format!("To look further: {}.", next.join("; "))]
 }
 
 /// Each access's stack at its entry, when the report took it.
@@ -7895,6 +8018,88 @@ mod tests {
         assert_eq!(outcome_point(&trace, S, &any_only), None);
     }
 
+    /// When checks ran and none decides, the candidates block says so after
+    /// the list, keeps reversals that ran apart from checks that could not
+    /// replay theirs, and says what to try next; when one decides, or none
+    /// ran, it says nothing of the kind.
+    #[test]
+    fn candidates_none_of_which_decides_say_what_that_means() {
+        let base = fdsan();
+        let [first, second]: [RacingAccess; 2] = base.accesses.clone().try_into().unwrap();
+        let candidate = |verdict: Option<CheckVerdict>, n: usize, control: bool| RaceCandidate {
+            resource: base.resource.clone(),
+            accesses: [first.clone(), second.clone()],
+            order: base.order.clone().unwrap(),
+            reaches_outcome: true,
+            events_before_outcome: Some(10),
+            evidence: format!("evidence {n}"),
+            check: verdict.map(|verdict| CandidateCheck {
+                verdict,
+                edited: "target".to_string(),
+                edit: "moving 1 event of thread 9 before thread 7's turn at #7587, crossing no \
+                       other thread"
+                    .to_string(),
+                moved: None,
+                trial: Some(if control {
+                    format!("racing_candidate_{n}_control")
+                } else {
+                    format!("racing_candidate_{n}")
+                }),
+                detail: "the detail".to_string(),
+            }),
+        };
+        // Each candidate's verdict, and whether its trial was its control
+        // (a not_checked check whose control did not reproduce the run).
+        let with_trials = |verdicts: &[(Option<CheckVerdict>, bool)]| {
+            let mut r = base.clone();
+            r.status = RaceStatus::Candidates;
+            r.accesses = Vec::new();
+            r.candidates = verdicts
+                .iter()
+                .enumerate()
+                .map(|(i, (v, control))| candidate(*v, i + 1, *control))
+                .collect();
+            r
+        };
+        let with = |verdicts: &[Option<CheckVerdict>]| {
+            with_trials(&verdicts.iter().map(|v| (*v, false)).collect::<Vec<_>>())
+        };
+        use CheckVerdict::*;
+
+        let all_ran = render_racing_accesses(&with(&[Some(DoesNotDecide); 3]));
+        assert!(
+            all_ran.contains("\nNone of the 3 candidates was shown to decide: all 3 reversals ran as edited and left the outcome as it was, so the outcome probably does not turn on any one of these candidates' orders alone (each check reverses one turn order in one run); it may turn on an order not ranked here, an order in memory that syscalls do not show, one outside the trace, or several together.\nTo look further: rerun with --minimize if the analysis did not use it, so fewer chaos interventions surround the deciding event.\n"),
+            "{all_ran}"
+        );
+
+        let none_ran = render_racing_accesses(&with_trials(&[
+            (Some(NotRealized), false),
+            (Some(NotRealized), false),
+            (Some(NotChecked), true),
+        ]));
+        assert!(
+            none_ran.contains("\nNone of the 3 candidates was shown to decide, and none was tested: 2 reversals could not be replayed as edited; for 1 the control did not reproduce the run, so its reversal was not tried; the deciding interaction may be among them or elsewhere.\n")
+                && none_ran.contains("; the unrealized checks' replays (racing_candidate_1.repro, racing_candidate_2.repro in the workspace) show where each left its edit.\n"),
+            "{none_ran}"
+        );
+
+        let mut mixed = with(&[Some(DoesNotDecide), Some(NotRealized), None]);
+        mixed.truncated = true;
+        let mixed = render_racing_accesses(&mixed);
+        assert!(
+            mixed.contains("\nNone of the 3 candidates was shown to decide: 1 reversal ran as edited and left the outcome as it was; of the other 2, 1 reversal could not be replayed as edited; 1 was not checked; so those are untested, not cleared, and the deciding interaction may be among them or elsewhere.\n")
+                && mixed.contains("; a wider --race-window, since a trace was cut short before the window ended; "),
+            "{mixed}"
+        );
+
+        // Two that decide stay candidates, and say nothing of the kind.
+        let two = render_racing_accesses(&with(&[Some(Decides), Some(Decides), Some(NotRealized)]));
+        assert!(
+            !two.contains("was shown to decide") && !two.contains("To look further"),
+            "{two}"
+        );
+    }
+
     #[test]
     fn the_block_prints_each_access_stack_and_an_unavailable_reason() {
         let mut r = fdsan();
@@ -7938,6 +8143,9 @@ mod tests {
                 ),
             "{text}"
         );
+
+        // No check ran: nothing is said about what the checks showed.
+        assert!(!text.contains("was shown to decide"), "{text}");
 
         let gone = RacingAccesses::unavailable(7586, "the target replay records no access trace: backend `kvm` is refused: use --backend=ptrace".to_string());
         assert_eq!(

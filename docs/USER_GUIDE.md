@@ -1159,6 +1159,21 @@ order decides the outcome. In a report file that sentence is not part of a
 candidate's `evidence`: read its `check.verdict`, which is `decides` only for
 a candidate shown to decide.
 
+When the checks ran and none decides, the report says so after the
+candidates, and keeps the cases apart. A reversal that ran as edited and left
+the outcome as it was clears its candidate, but only as far as one turn
+reversal in one run goes: when all of them did, the outcome probably does not
+turn on any one of these candidates' orders alone, and may turn on an order not
+ranked here, an order in memory that syscalls do not show, one outside the
+trace, or several together. A reversal that could not be replayed as edited
+(`not realized`), one never tried because its control did not reproduce the
+run, and a candidate not checked leave it untested, not cleared. Either way,
+nothing says the right pair is among the candidates. The report then lists what to try next: `--minimize`, so fewer
+chaos interventions surround the deciding event; a wider `--race-window` when a
+trace was cut short; and the unrealized checks' replays
+(`racing_candidate_N.repro`), which show where each left its edit. A report
+file carries the same information in the candidates' `check.verdict` values.
+
 For example, an RPC server's shutdown removes a client in memory just before
 the server's default handler looks the client up. No syscall shows that order,
 so the first candidate is the handler thread's change of course against the
