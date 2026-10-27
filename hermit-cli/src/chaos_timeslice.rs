@@ -10,14 +10,15 @@
 //! draws from the scheduler seed.
 //!
 //! Chaos mode ends each timeslice after a random number of retired
-//! conditional branches, exponentially distributed with a mean of the
-//! maximum timeslice and capped at it. Which mean finds a race depends on the
-//! race: one whose window is a few dozen branches long needs slices of about a
-//! hundred branches, while one whose second thread must run far into its own
-//! work before the conflicting access needs slices that let it get there. A
-//! fixed mean suits one of them. Drawing the mean once per scheduler seed
-//! spreads a sweep of seeds across five orders of magnitude, so it covers both
-//! without a guessed value.
+//! conditional branches, drawn from an exponential distribution whose mean
+//! parameter is the maximum timeslice and capped at the maximum, so slices
+//! average about 0.63 of it (1 - 1/e, before rounding to whole branches).
+//! Which maximum finds a race depends on the race: one whose window is a few
+//! dozen branches long needs slices of about a hundred branches, while one
+//! whose second thread must run far into its own work before the conflicting
+//! access needs slices that let it get there. A fixed maximum suits one of
+//! them. Drawing the maximum once per scheduler seed spreads a sweep of seeds
+//! across five orders of magnitude, so it covers both without a guessed value.
 //!
 //! The draw is not uniform over those orders of magnitude. The races measured
 //! needed either the shortest slices or the longest: a 46-branch window in a
@@ -30,14 +31,15 @@
 //! to 200 branches per slice), two in five 1000000 to 200000000 ns, and keeps
 //! one in five for the decades between them.
 //!
-//! The draw is a pure function of the scheduler seed (and of the one-RCB
-//! floor, which only a large clock multiplier or slowdown factor raises above
-//! the range). It seeds a generator of its own and takes nothing from the
-//! streams Detcore already derives from that seed (each thread's chaos
-//! generator, the post-fork generator, the per-thread slowdown factors), so
-//! those are seeded exactly as before. Its result is an ordinary
-//! `--max-timeslice` value: Detcore receives the configuration of a run given
-//! that value explicitly.
+//! The draw is a pure function of the scheduler seed (and of the one-RCB floor,
+//! which only a large clock multiplier or slowdown factor raises above the
+//! range: there every seed draws the floor, and a run that draws nothing keeps
+//! the default raised to its own floor, [`seeded_fallback_max_timeslice`]). It
+//! seeds a generator of its own and takes nothing from the streams Detcore
+//! already derives from that seed (each thread's chaos generator, the post-fork
+//! generator, the per-thread slowdown factors), so those are seeded exactly as
+//! before. Its result is an ordinary `--max-timeslice` value: Detcore receives
+//! the configuration of a run given that value explicitly.
 
 use std::num::NonZeroU64;
 
@@ -50,13 +52,31 @@ use rand_pcg::Pcg64Mcg;
 pub const SEEDED_MAX_TIMESLICE_MIN_NS: u64 = 1_000;
 
 /// The largest drawn maximum, in virtual nanoseconds: the `--max-timeslice`
-/// default. No draw exceeds it, so a replay of a recorded chaos run, which
-/// keeps the default, is never bounded more tightly than the recording was.
+/// default. No draw exceeds it unless one RCB is longer, and then the draw is
+/// one RCB. A replay of a recorded chaos run keeps the larger of the two
+/// ([`seeded_fallback_max_timeslice`]), so it is never bounded more tightly
+/// than the recording was.
 pub const SEEDED_MAX_TIMESLICE_MAX_NS: u64 = 200_000_000;
 
-/// [`SEEDED_MAX_TIMESLICE_MAX_NS`] as a maximum: the default that
-/// `--chaos-seeded-timeslice` stands in for where it draws nothing.
+/// [`SEEDED_MAX_TIMESLICE_MAX_NS`] as a maximum: the `--max-timeslice`
+/// default.
 pub const DEFAULT_MAX_TIMESLICE: NonZeroU64 = NonZeroU64::new(SEEDED_MAX_TIMESLICE_MAX_NS).unwrap();
+
+/// The maximum timeslice `--chaos-seeded-timeslice` stands in for where it
+/// draws nothing (a run that replays preemptions or a schedule, or one
+/// without chaos, such as `hermit analyze`'s baseline): the `--max-timeslice`
+/// default, raised to `minimum_ns` (one RCB at the run's clock multiplier and
+/// slowdown, [`detcore::Config::minimum_max_timeslice_nanos`]) where that is
+/// longer, as every draw is. A replay under the same clock multiplier and
+/// slowdown settings therefore keeps what its recording drew. A run without
+/// chaos raises the default to its own floor, which leaves out the chaos
+/// slowdown factor. Without the raise, a recording whose one RCB is longer
+/// than the default drew one RCB, and its replay or baseline was then refused
+/// for a maximum below one RCB.
+pub fn seeded_fallback_max_timeslice(minimum_ns: u64) -> NonZeroU64 {
+    NonZeroU64::new(SEEDED_MAX_TIMESLICE_MAX_NS.max(minimum_ns))
+        .expect("the --max-timeslice default is positive")
+}
 
 /// The pieces of the drawn maximum's distribution, in order: each is
 /// `(share, low, high)`, the share of seeds whose maximum falls in
@@ -197,6 +217,28 @@ mod tests {
             assert!(
                 (0.8..1.2).contains(&ratio),
                 "a decade of the last piece holds {count} draws, expected about {per_decade:.0}"
+            );
+        }
+    }
+
+    /// Where one RCB is longer than the default maximum (a clock multiplier
+    /// of 30000000 makes it 300000000 virtual ns), every seed draws one RCB,
+    /// and a run that draws nothing keeps the same value rather than the
+    /// default below it. Elsewhere the fallback is the default.
+    #[test]
+    fn the_fallback_is_at_least_one_rcb() {
+        assert_eq!(seeded_fallback_max_timeslice(10), DEFAULT_MAX_TIMESLICE);
+        assert_eq!(
+            seeded_fallback_max_timeslice(SEEDED_MAX_TIMESLICE_MAX_NS),
+            DEFAULT_MAX_TIMESLICE
+        );
+        let one_rcb = 300_000_000;
+        assert_eq!(seeded_fallback_max_timeslice(one_rcb).get(), one_rcb);
+        for seed in 0..64 {
+            assert_eq!(
+                seeded_max_timeslice(seed, one_rcb),
+                seeded_fallback_max_timeslice(one_rcb),
+                "seed {seed}"
             );
         }
     }

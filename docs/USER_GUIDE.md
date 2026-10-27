@@ -439,13 +439,15 @@ CPU-bound code that rarely makes system calls. The old
 `--preemption-timeout` spelling is a deprecated alias for
 `--max-timeslice`.
 
-The value that finds a race depends on the race. Chaos ends each timeslice
-after a random number of retired conditional branches whose mean is the
-maximum timeslice. A race whose window spans a few branches needs a mean of
-about a hundred branches (`--max-timeslice=1000`); a race whose other thread
-must first run far into its own work needs a mean long enough to get there,
-and short slices miss it. No single value finds both. Rather than guessing,
-let each seed draw its own value:
+The value that finds a race depends on the race. Chaos ends each timeslice after
+a random number of retired conditional branches, drawn from an exponential
+distribution whose mean parameter is the maximum timeslice and capped at the
+maximum, so slices average about 0.63 of it before rounding to whole branches. A
+race whose window spans a few branches needs a maximum of about a hundred
+branches (`--max-timeslice=1000`); a race whose other thread must first run far
+into its own work needs slices long enough to get there, and short slices miss
+it. No single value finds both. Rather than guessing, let each seed draw its own
+value:
 
 ```bash
 for seed in $(seq 0 63); do
@@ -453,23 +455,24 @@ for seed in $(seq 0 63); do
 done
 ```
 
-Two in five seeds draw their maximum from 1000 to 2000 virtual nanoseconds
-(slices of about 100 to 200 branches, for windows of a few dozen branches), two
-in five from 1000000 to 200000000 (for races whose other thread must first run
-far), and one in five from the decades between, each log-uniformly within its
-range. The races measured so far needed one end or the other: a 46-branch
-window in a multithreaded C++ test binary failed in 9 of 32 seeds at 1000 and
-in none of 32 at 1e4, 1e5, 1e6 or the default. Hermit prints the value:
-`[hermit] --chaos-seeded-timeslice: scheduler seed 7 drew
---max-timeslice=...`. Rerunning the seed reproduces the run, and so does
-passing the printed value as `--max-timeslice` instead of the flag. The draw is
-part of what a seed selects, so a Hermit release that changed it would change
-every seed's schedule; the printed value pins it. Seeds that draw small values
-run much slower: every timeslice ends with a timer event, and the ptrace
-backend steps the guest through the last skid margin (100 to 10000 branches,
-depending on the processor) of every slice. The option needs the PMU timer of
-the ptrace backend; on other backends, set chaos's cooperative deadline with
-`--target-timeslice`.
+Two in five seeds draw their maximum from 1000 to 2000 virtual nanoseconds (100
+to 200 branches, for windows of a few dozen branches), two in five from 1000000
+to 200000000 (for races whose other thread must first run far), and one in five
+from the decades between, each log-uniformly within its range. Where
+`--clock-multiplier` makes one RCB longer than the value drawn, the maximum is
+one RCB, and a replay of the run under the same clock multiplier and slowdown
+settings keeps it. The races measured so far needed one end or the other: a
+46-branch window in a multithreaded C++ test binary failed in 9 of 32 seeds at
+1000 and in none of 32 at 1e4, 1e5, 1e6 or the default. Hermit prints the value:
+`[hermit] --chaos-seeded-timeslice: scheduler seed 7 drew --max-timeslice=...`.
+Rerunning the seed reproduces the run, and so does passing the printed value as
+`--max-timeslice` instead of the flag. The draw is part of what a seed selects,
+so a Hermit release that changed it would change every seed's schedule; the
+printed value pins it. Seeds that draw small values run much slower: every
+timeslice ends with a timer event, and the ptrace backend steps the guest
+through the last skid margin (100 to 10000 branches, depending on the processor)
+of every slice. The option needs the PMU timer of the ptrace backend; on other
+backends, set chaos's cooperative deadline with `--target-timeslice`.
 
 Every scheduler turn adds a fixed charge to the guest-visible clock
 (`--scheduler-turn-cost`, 500000 virtual nanoseconds by default), including

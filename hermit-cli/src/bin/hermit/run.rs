@@ -1886,27 +1886,31 @@ pub struct RunOpts {
 
     /// With `--chaos`, draw `--max-timeslice` from the scheduler seed instead of using one value
     /// for every seed. Chaos ends each timeslice after a random number of retired conditional
-    /// branches whose mean is the maximum timeslice; a race whose window is a few branches long
-    /// needs a mean of about a hundred branches, and a race whose other thread must first run far
-    /// needs a mean that lets it get there. Two in five seeds draw their maximum from 1000 to 2000
-    /// virtual nanoseconds (slices of about 100 to 200 branches), two in five from 1000000 to
-    /// 200000000 (the `--max-timeslice` default), and one in five from the decades between, each
-    /// log-uniformly within its range (raised to one RCB where `--clock-multiplier` makes that
-    /// longer), so a sweep over seeds tries every scale and most often the two that races have
-    /// needed. A seed
-    /// (`--sched-seed`, else `--seed`) always draws the same value, and the run is the run with
-    /// that value given as `--max-timeslice`, except that the guest can read Hermit's own command
-    /// line as PID 1's. Hermit prints the drawn value on stderr, and `--summary` reports it. The
-    /// draw is part of what a seed selects: a Hermit release that changed it would change every
-    /// seed's schedule, so pass the printed value as `--max-timeslice` to pin a run. Seeds that
-    /// draw small values run much slower: every timeslice ends with a timer event, and the ptrace
-    /// backend steps the guest through the last skid margin of each slice (all of a slice shorter
-    /// than the margin, which is 100 to 10000 branches depending on the processor). Needs a backend with a
-    /// PMU timer (ptrace, with or without e9patch preprocessing); elsewhere use
+    /// branches, drawn from an exponential distribution whose mean parameter is the maximum
+    /// timeslice and capped at the maximum, so slices average about 0.63 of it before rounding to
+    /// whole branches. A race whose window is a few branches long needs a maximum of about a
+    /// hundred branches, and a race whose other thread must first run far needs one that lets it
+    /// get there. Two in five seeds draw their maximum from 1000 to 2000 virtual nanoseconds (100
+    /// to 200 branches), two in five from 1000000 to 200000000 (the `--max-timeslice` default), and
+    /// one in five from the decades between, each log-uniformly within its range, so a sweep over
+    /// seeds tries every scale and most often the two that races have needed. Where
+    /// `--clock-multiplier` makes one RCB longer than the value drawn, the maximum is one RCB. A
+    /// seed (`--sched-seed`, else `--seed`) always draws the same value, and the run is the run
+    /// with that value given as `--max-timeslice`, except that the guest can read Hermit's own
+    /// command line as PID 1's. Hermit prints the drawn value on stderr, and `--summary` reports
+    /// it. The draw is part of what a seed selects: a Hermit release that changed it would change
+    /// every seed's schedule, so pass the printed value as `--max-timeslice` to pin a run. Seeds
+    /// that draw small values run much slower: every timeslice ends with a timer event, and the
+    /// ptrace backend steps the guest through the last skid margin of each slice (all of a slice
+    /// shorter than the margin, which is 100 to 10000 branches depending on the processor). Needs a
+    /// backend with a PMU timer (ptrace, with or without e9patch preprocessing); elsewhere use
     /// `--target-timeslice`. Cannot be combined with a positive `--max-timeslice`, with
     /// `--target-timeslice` or with `--chaos-timeslice-range`. There is nothing to draw with
-    /// `--max-timeslice=disabled` or on a host without usable performance counters, and a run that replays preemptions or a schedule keeps
-    /// the default maximum, since the recording supplies its preemption points.
+    /// `--max-timeslice=disabled` or on a host without usable performance counters. A run that
+    /// replays preemptions or a schedule, or whose chaos `hermit analyze` turns off for a
+    /// baseline, draws nothing: it keeps the default maximum, or one RCB where that is longer (for
+    /// a replay under the same clock multiplier and slowdown settings, what its recording drew),
+    /// and a replay takes its preemption points from the recording.
     #[clap(long, requires = "chaos")]
     chaos_seeded_timeslice: bool,
 
@@ -15017,7 +15021,9 @@ impl RunOpts {
     }
 
     /// Lower `--chaos-seeded-timeslice` to `--max-timeslice`: the value drawn
-    /// from the scheduler seed, or else the default the flag stands in for.
+    /// from the scheduler seed, or else the default the flag stands in for,
+    /// raised to one RCB where that is longer
+    /// ([`hermit::chaos_timeslice::seeded_fallback_max_timeslice`]).
     /// Validation runs again whenever a caller changes the options, as `hermit
     /// analyze` does when it gives a trial a new seed, turns chaos off for its
     /// baseline or replays a trial's preemptions, so this derives the value
@@ -15051,16 +15057,17 @@ impl RunOpts {
         if let Some(target) = config.target_timeslice {
             anyhow::bail!(
                 "--chaos-seeded-timeslice draws --max-timeslice from the scheduler seed, but \
-                 --target-timeslice={target} would set the mean of chaos's timeslices instead: \
-                 drop --target-timeslice to draw the mean from the seed, or drop \
+                 --target-timeslice={target} would set the mean of chaos's per-slice draw \
+                 instead: drop --target-timeslice to draw the maximum from the seed, or drop \
                  --chaos-seeded-timeslice to keep --target-timeslice={target}"
             );
         }
         if self.det_opts.det_config.max_timeslice.is_some() {
-            self.det_opts.det_config.max_timeslice = Some(
-                self.seeded_chaos_timeslice()
-                    .unwrap_or(hermit::chaos_timeslice::DEFAULT_MAX_TIMESLICE),
+            let fallback = hermit::chaos_timeslice::seeded_fallback_max_timeslice(
+                self.det_opts.det_config.minimum_max_timeslice_nanos(),
             );
+            self.det_opts.det_config.max_timeslice =
+                Some(self.seeded_chaos_timeslice().unwrap_or(fallback));
         }
         Ok(())
     }

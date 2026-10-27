@@ -540,6 +540,46 @@ fn every_validation_derives_the_seeded_maximum_afresh() {
     assert_eq!(maximum(&run), seeded(5));
 }
 
+/// A clock multiplier of 30000000 makes one RCB 300000000 virtual ns, longer
+/// than any draw, so every seed draws one RCB. A replay of such a run, of its
+/// preemptions or of its schedule, and `hermit analyze`'s baseline with chaos
+/// turned off draw nothing, and they keep the same one-RCB maximum. Before,
+/// they fell back to the 200000000 ns default and were refused for a maximum
+/// below one RCB.
+#[test]
+fn seeded_replays_and_baseline_keep_a_minimum_above_the_default() {
+    const ONE_RCB: u64 = 300_000_000;
+    let mut run = parse(
+        Backend::Ptrace,
+        &[SEEDED[0], SEEDED[1], "--clock-multiplier=30000000"],
+    );
+    run.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(
+        run.det_opts.det_config.minimum_max_timeslice_nanos(),
+        ONE_RCB
+    );
+    assert_eq!(
+        maximum(&run),
+        Some(ONE_RCB),
+        "the draw is raised to one RCB"
+    );
+
+    let revalidated = |run: &mut RunOpts, what: &str| {
+        run.validate_args_with_perf_support(true)
+            .unwrap_or_else(|error| panic!("{what} was refused: {error:#}"));
+        assert_eq!(run.seeded_chaos_timeslice(), None, "{what} draws nothing");
+        assert_eq!(maximum(run), Some(ONE_RCB), "{what}");
+    };
+    run.det_opts.det_config.replay_preemptions_from = Some("unused-preemptions".into());
+    revalidated(&mut run, "a preemption replay");
+    run.det_opts.det_config.replay_preemptions_from = None;
+    run.det_opts.det_config.replay_schedule_from = Some("unused-schedule".into());
+    revalidated(&mut run, "a schedule replay");
+    run.det_opts.det_config.replay_schedule_from = None;
+    run.det_opts.det_config.chaos = false;
+    revalidated(&mut run, "the baseline without chaos");
+}
+
 #[test]
 fn without_a_timer_a_seeded_run_keeps_the_disabled_maximum() {
     let mut run = parse(Case::PTRACE, &SEEDED);
