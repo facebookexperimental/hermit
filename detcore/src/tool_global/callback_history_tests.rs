@@ -830,7 +830,7 @@ async fn legacy_callback_branch_deadline_trial(annotated: bool, owner_switch: bo
     // Feed the PMU result through the real update/event path, without entering
     // another expiry hook: this proves the next observed branch matches.
     guest.reported_rcbs = 100;
-    let events = tool.update_logical_time_rcbs(&mut guest, true).await.unwrap();
+    let events = tool.update_logical_time_rcbs(&mut guest, true, false).await.unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!((events[0].op, events[0].count), (Op::Branch, 90));
     for event in events { super::trace_schedevent(&mut guest, event, false).await; }
@@ -919,7 +919,7 @@ async fn legacy_callback_expired_deadline_trial_recording(annotated: bool, owner
     let peer_event = SchedEvent::syscall(peer, Sysno::getpid, detcore_model::schedule::SyscallPhase::Posthook);
     if owner_switch { writer.register_thread(peer, DEFAULT_PRIORITY); writer.insert_schedevent(peer_event.clone()); }
     writer.insert_schedevent(SchedEvent::branches(tid, 90));
-    writer.insert_schedevent(SchedEvent { dettid: tid, op: Op::OtherInstructions, count: 1, start_rip: None, end_rip: None, end_time: None, stopless: false });
+    writer.insert_schedevent(SchedEvent { dettid: tid, op: Op::OtherInstructions, count: 1, start_rip: None, end_rip: None, end_time: None, stopless: false, instruction_offset: None });
     writer.insert_schedevent(SchedEvent::syscall(tid, Sysno::close, detcore_model::schedule::SyscallPhase::Prehook));
     writer.insert_reprioritization(tid, at, 11, DEFAULT_PRIORITY, DEFAULT_PRIORITY, None);
     if annotated { writer.insert_callback_checkpoint(tid, Origin { callback: Callback::PmuTimer, site: Site::Prehook, progress: 11, last_op: Some(Op::Branch), time: at, rcbs: 11 }); }
@@ -1141,6 +1141,33 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
     let mut rows = history.clone().into_iter();
     let (_, _, rcbs, offset) = rows.next_with_offset().unwrap();
     assert_eq!((rcbs, offset), (Some(end), Some(armed)), "{record}");
+    // The schedule trace records it too, on the timer's batch of branches,
+    // which the address the steps stopped at follows; the record says format 4.
+    let schedule = serde_json::from_str::<crate::preemptions::PreemptionRecord>(&record).unwrap();
+    assert_eq!(
+        schedule.format_version(),
+        Some(crate::preemptions::INSTRUCTION_OFFSET_FORMAT),
+        "{record}"
+    );
+    let events = schedule.schedevents();
+    let at = events
+        .iter()
+        .position(|event| event.instruction_offset.is_some())
+        .unwrap_or_else(|| panic!("no schedule event carries the offset: {record}"));
+    assert_eq!(
+        (events[at].op, u64::from(events[at].count), events[at].instruction_offset),
+        (Op::Branch, end, Some(armed)),
+        "{record}"
+    );
+    assert_eq!(events[at + 1].op, Op::OtherInstructions, "{record}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.instruction_offset.is_some())
+            .count(),
+        1,
+        "{record}"
+    );
 
     // The replay arms the recorded timer, and its slice ends at the same
     // clock, the recorded end.
@@ -1240,4 +1267,135 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
     drive_callback_hook(&state, tid, tool.handle_timer_event(&mut guest), &mut previous).await;
     assert_eq!(guest.thread.stats.timeslice_count, slices + 1);
     assert!(publishes(&guest.inner.requests).is_empty());
+}
+
+// A schedule replay of a preemption recorded past its branch target, through
+// the actual hooks and the scheduler's replay cursor, with no physical guest
+// or timer: the cursor's timeslice for the recorded batch of branches comes
+// with that batch's offset, the posthook arms the recorded target and steps
+// (not the batch's end, two branches later), the timer's batch carries the
+// same offset and matches the recording with no desync, and the offset is
+// spent with it.
+#[tokio::test]
+async fn a_schedule_replay_arms_a_recorded_instruction_offset() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        use reverie::Tool;
+
+        use crate::resources::InstructionOffset;
+        use crate::slice_boundary::callbacks::Callback;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("offset-schedule.json");
+        let tid = DetTid::from_raw(17);
+        let mut config = Config {
+            sequentialize_threads: true,
+            replay_schedule_from: Some(path.clone()),
+            max_timeslice: std::num::NonZeroU64::new(5_000_000),
+            target_timeslice: std::num::NonZeroU64::new(1_000_000),
+            panic_on_rcb_overshoot: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.delivers_preemption_timer_events = true);
+        config.validate();
+        // The recorded timer was armed 3 steps past branch 98; the steps
+        // crossed 2 more branches, so its batch ends at branch 100.
+        let offset = InstructionOffset {
+            rcb_target: 98,
+            instructions: 3,
+        };
+        let mut writer = crate::preemptions::PreemptionWriter::new(None);
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_schedevent(SchedEvent::branches(tid, 10));
+        writer.insert_schedevent(SchedEvent::branches(tid, 90).with_instruction_offset(Some(offset)));
+        writer.insert_schedevent(SchedEvent {
+            dettid: tid,
+            op: Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: std::num::NonZeroUsize::new(1),
+            end_time: None,
+            stopless: false,
+            instruction_offset: None,
+        });
+        writer.insert_schedevent(SchedEvent::branches(tid, 1));
+        let record = writer.into_string();
+        assert!(record.contains(r#""format_version":4"#), "{record}");
+        std::fs::write(&path, record).unwrap();
+
+        let (config, state, tid, process) = cancellation_test_state_with_config(config);
+        install_test_registration(&state, tid, Ivar::new());
+        state.past_first_execve.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut thread = crate::ThreadState::new(tid, &config, ());
+        thread.detpid = Some(process);
+        thread.past_global_first_execve = true;
+        thread.next_timeslice(&config);
+        let mut guest = LegacyDeadlineGuest {
+            inner: ExternalRegistrationGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                post_exec: false,
+                ppid: None,
+                private_memory: None,
+            },
+            clock_reads: 0,
+            reported_rcbs: 10,
+            timers: Vec::new(),
+            responses: Mutex::new(Vec::new()),
+        };
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let token = tool
+            .pre_handler_hook_observed(&mut guest, true, crate::CheckIn::Event, Some(Callback::PmuTimer))
+            .await;
+        assert_eq!(guest.thread.replay_instruction_offset, Some(offset));
+        assert!(
+            guest.responses.lock().unwrap().iter().any(|response| matches!(
+                response,
+                GlobalResponse::WithReplayInstructionOffset(carried, inner)
+                    if *carried == offset
+                        && matches!(inner.as_ref(), GlobalResponse::TraceSchedEvent(_))
+            )),
+            "the cursor's timeslice came without its offset"
+        );
+        tool.post_handler_hook_observed(&mut guest, crate::CheckIn::Event, token)
+            .await;
+        assert_eq!(guest.timers.len(), 1);
+        assert!(matches!(
+            guest.timers[0],
+            reverie::TimerSchedule::RcbsAndInstructions(88, 3)
+        ));
+        assert_eq!(guest.thread.armed_instruction_offset, Some(offset));
+
+        // The timer lands 3 steps past branch 98, at branch 100: within one
+        // branch a step of its target, so no overshoot (the config panics on
+        // one), and its batch of branches carries the recorded offset.
+        guest.reported_rcbs = 100;
+        let events = tool
+            .update_logical_time_rcbs(&mut guest, false, true)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(
+            (events[0].op, events[0].count, events[0].instruction_offset),
+            (Op::Branch, 90, Some(offset))
+        );
+        assert_eq!(events[1].op, Op::OtherInstructions);
+        for event in events {
+            super::trace_schedevent(&mut guest, event, false).await;
+        }
+        assert_eq!(guest.thread.replay_instruction_offset, None, "spent");
+        let scheduler = state.sched.lock().unwrap();
+        let replayer = scheduler.replayer.as_ref().unwrap();
+        assert!(
+            replayer
+                .desync_counts
+                .values()
+                .all(|stats| stats.soft == 0 && stats.hard == 0),
+            "{:?}",
+            replayer.desync_counts
+        );
+        assert_eq!(replayer.cursor.peek().unwrap().count, 1);
+    })
+    .await
+    .expect("bounded schedule replay of an instruction offset");
 }

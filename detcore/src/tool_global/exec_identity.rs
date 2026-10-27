@@ -231,9 +231,7 @@ where
     }
     if guest.config().sequentialize_threads {
         let (_, response) = send_and_update_time(guest, GlobalRequest::ResumeExec(process)).await;
-        let GlobalResponse::ResumeExec(_, duration) = response else {
-            unreachable!("exec continuation must receive its typed grant");
-        };
+        let (duration, offset) = exec_continuation_slice(response);
         if let Some(duration) = duration {
             let maximum_enabled = guest.config().max_timeslice.is_some();
             let thread = guest.thread_state_mut();
@@ -242,6 +240,10 @@ where
             if maximum_enabled {
                 thread.max_timeslice_end = Some(deadline);
             }
+            // Where a schedule replay's recorded slice had its timer armed
+            // past its branch target, or `None`: the timer `post_handler_hook`
+            // arms for this slice, as after a `TraceSchedEvent` grant.
+            thread.replay_instruction_offset = offset;
         }
         // The continuation's slice end, just installed, takes the grant's
         // deadline cap like any other
@@ -250,6 +252,25 @@ where
         super::cap_timeslice_at_deadline(guest, deadline);
     }
     Ok(())
+}
+
+/// The timeslice an exec continuation's grant carries, and the instruction
+/// offset a schedule replay put beside it (`GlobalResponse::
+/// WithReplayInstructionOffset`), which comes only with a timeslice.
+pub(crate) fn exec_continuation_slice(
+    response: GlobalResponse,
+) -> (
+    Option<LogicalTime>,
+    Option<crate::resources::InstructionOffset>,
+) {
+    let (offset, response) = match response {
+        GlobalResponse::WithReplayInstructionOffset(offset, response) => (Some(offset), *response),
+        response => (None, response),
+    };
+    let GlobalResponse::ResumeExec(_, duration) = response else {
+        unreachable!("exec continuation must receive its typed grant");
+    };
+    (duration, offset.filter(|_| duration.is_some()))
 }
 
 pub(crate) async fn retire_exec<R: GlobalRPC<GlobalState>>(

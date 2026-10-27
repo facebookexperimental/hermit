@@ -346,6 +346,8 @@ static CHAOS_SPINNER_AND_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_DESYNC_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
 static BRANCH_FREE_RACE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(target_arch = "x86_64")]
+static BRANCH_FREE_RACE_FIXED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3627,28 +3629,15 @@ fn parked_read_signal_then_exec_guest() -> &'static Path {
 
 #[cfg(target_arch = "x86_64")]
 fn branch_free_race_guest() -> &'static Path {
-    BRANCH_FREE_RACE_GUEST.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root = process_build_root("branch-free-race");
-        fs::create_dir_all(&build_root)
-            .expect("failed to create the branch-free-race guest directory");
-        let guest = build_root.join("branch_free_race");
-        let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
-            .arg(repository.join("tests/c/branch_free_race.c"))
-            .arg("-o")
-            .arg(&guest)
-            .output()
-            .expect("failed to compile the branch-free-race guest");
-        assert!(
-            output.status.success(),
-            "branch-free-race guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        guest
+    BRANCH_FREE_RACE_GUEST.get_or_init(|| build_branch_free_race("branch_free_race", &[]))
+}
+
+/// tests/c/branch_free_race.c built with its one atomic add instead of the
+/// racing load, add and store: the same loop, which loses no update.
+#[cfg(target_arch = "x86_64")]
+fn branch_free_race_fixed_guest() -> &'static Path {
+    BRANCH_FREE_RACE_FIXED_GUEST.get_or_init(|| {
+        build_branch_free_race("branch_free_race_fixed", &["-DBRANCH_FREE_RACE_FIXED"])
     })
 }
 
@@ -3676,6 +3665,29 @@ fn alarm_receiver_reach_guest() -> &'static Path {
         );
         guest
     })
+#[cfg(target_arch = "x86_64")]
+fn build_branch_free_race(name: &str, defines: &[&str]) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = process_build_root("branch-free-race");
+    fs::create_dir_all(&build_root).expect("failed to create the branch-free-race guest directory");
+    let guest = build_root.join(name);
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .args(defines)
+        .arg(repository.join("tests/c/branch_free_race.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the branch-free-race guest");
+    assert!(
+        output.status.success(),
+        "branch-free-race guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
 }
 
 fn chaos_spinner_and_new_thread_guest() -> &'static Path {
@@ -28145,6 +28157,155 @@ fn a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay() {
         marked(&schedule_record),
         "a schedule replay of a marked record drops the mark"
     );
+/// The run arguments of tests/c/branch_free_race.c's strict chaos runs at
+/// 200 us timeslices, with `--chaos-instruction-offset=8` and `extra`.
+#[cfg(target_arch = "x86_64")]
+fn branch_free_race_offset_args<'a>(seed: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--chaos",
+        seed,
+        "--max-timeslice=200000",
+        "--chaos-instruction-offset=8",
+    ];
+    args.extend(extra);
+    args
+}
+
+/// `--chaos-instruction-offset` through the schedule-trace engine that
+/// `hermit analyze` uses, end to end, on tests/c/branch_free_race.c:
+/// - a seed that loses updates with `--chaos-instruction-offset=8` is
+///   recorded, format 4, and its schedule trace holds the offsets, each on
+///   the timer's batch of branches;
+/// - `--replay-schedule-from` with `--die-on-desync` prints the recording's
+///   line, with no desync;
+/// - `hermit analyze` on the same run accepts the offsets, and its search
+///   starts from endpoints it verified by replaying their schedule traces:
+///   the run without chaos passes and the recorded run, offsets and all,
+///   loses updates again.
+///
+/// The search itself does not conclude on this guest yet: the race turns on
+/// where a preemption lands, not on the order of events, so the chaos run and
+/// the baseline differ in batches of branches the event-level search cannot
+/// reorder, and it aborts (https://github.com/rrnewton/hermit/issues/4831).
+///
+/// Control: the guest's fixed variant (one atomic add, no window) at the same
+/// seed and option loses nothing, its schedule replay prints the same line
+/// with no desync, and analyze decides that no run matches the target.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints() {
+    let _guard = hermit_run_guard();
+    const ITERATIONS: &str = "100000";
+    let seed = (1..=8)
+        .find(|seed| branch_free_race_lost(*seed, &["--chaos-instruction-offset=8"]) > 0)
+        .expect("one of seeds 1-8 should lose an update");
+    let seed_arg = format!("--sched-seed={seed}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for (guest, fixed) in [
+        (branch_free_race_guest(), false),
+        (branch_free_race_fixed_guest(), true),
+    ] {
+        let guest = guest.to_str().expect("guest path should be UTF-8");
+        let label = if fixed { "fixed" } else { "racing" };
+        let record = directory.path().join(format!("{label}.json"));
+        let summary = directory.path().join(format!("{label}.summary.json"));
+        let record_arg = format!("--record-preemptions-to={}", record.display());
+        let replay_arg = format!("--replay-schedule-from={}", record.display());
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let run = |args: Vec<&str>| {
+            let mut argv = vec!["run"];
+            argv.extend(args);
+            argv.extend(["--", guest, ITERATIONS]);
+            let output = hermit(&argv);
+            assert_success(&output, &argv);
+            stdout(&output)
+        };
+
+        let recorded = run(branch_free_race_offset_args(&seed_arg, &[&record_arg]));
+        let lost = parse_branch_free_race(&recorded);
+        assert_eq!(lost == 0, fixed, "{label} seed {seed}: {recorded}");
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record).expect("no preemption record")).unwrap();
+        assert_eq!(json["format_version"], 2, "{label}");
+        let events = json["global"].as_array().expect("schedule trace");
+        let offsets: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| !event["instruction_offset"].is_null())
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            !offsets.is_empty(),
+            "{label}: no schedule event holds an offset"
+        );
+        for index in offsets {
+            let offset = &events[index]["instruction_offset"];
+            assert_eq!(events[index]["op"], "Branch", "{label}: {offset}");
+            assert!(
+                offset["instructions"]
+                    .as_u64()
+                    .is_some_and(|k| (1..=8).contains(&k)),
+                "{label}: {offset}"
+            );
+            assert_eq!(events[index + 1]["op"], "OtherInstructions", "{label}");
+        }
+
+        // The schedule replay reaches the same events, fatally on any desync.
+        let replayed = run(vec![
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--max-timeslice=200000",
+            &replay_arg,
+            "--die-on-desync",
+            &summary_arg,
+        ]);
+        assert_eq!(replayed, recorded, "{label}");
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
+        assert_eq!(summary["schedevent_desynced"], 0, "{label}: {summary}");
+
+        // Analyze the run, with the option in its run arguments.
+        let report = directory.path().join(format!("{label}.report.json"));
+        let report_arg = format!("--report-file={}", report.display());
+        let mut analyze = vec![
+            "analyze",
+            "--target-stdout=lost=[1-9]",
+            "--target-exit-code=0",
+            "--analyze-seed=0",
+            report_arg.as_str(),
+            "--",
+        ];
+        analyze.extend(branch_free_race_offset_args(&seed_arg, &[]));
+        analyze.extend(["--", guest, ITERATIONS]);
+        let output = hermit(&analyze);
+        let text = format!("{}{}", stdout(&output), stderr(&output));
+        if fixed {
+            assert!(!output.status.success(), "{label}: {text}");
+            assert!(
+                text.contains("The run did not match the target criteria"),
+                "{label}: {text}"
+            );
+        } else {
+            // Each endpoint is replayed from its schedule trace before the
+            // search: the baseline first, then the recorded run.
+            let search = text
+                .find("Beginning bisection using endpoints")
+                .unwrap_or_else(|| panic!("analyze never reached its search: {text}"));
+            let endpoints = &text[search..];
+            let baseline = endpoints.find("=> Baseline condition");
+            let target = endpoints.find("=> Target condition");
+            assert!(
+                baseline.is_some() && target > baseline,
+                "the endpoints did not replay to their outcomes: {text}"
+            );
+            assert!(endpoints.contains("Event-Level Search Pass 0"), "{text}");
+            assert!(!text.contains("did not reproduce"), "{text}");
+        }
+    }
 }
 
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn

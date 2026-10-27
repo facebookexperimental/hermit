@@ -21,6 +21,10 @@
 // conditional branch: the loop's own branch, which leaves the thread at its
 // load, before the window. So no seed can lose an update, until
 // `--chaos-instruction-offset` lets a preemption land some instructions later.
+//
+// Built with -DBRANCH_FREE_RACE_FIXED, the add is one atomic `lock addq`
+// instead: the same loop with no window at all, which loses no update at any
+// seed or offset (a fixed control).
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <stdio.h>
@@ -31,7 +35,9 @@ static long iterations = 100000;
 static pthread_barrier_t start;
 
 static void increment(void) {
-#if defined(__x86_64__)
+#if defined(BRANCH_FREE_RACE_FIXED)
+  __atomic_fetch_add(&counter, 1, __ATOMIC_SEQ_CST);
+#elif defined(__x86_64__)
   __asm__ volatile(
       "movq %0, %%rax\n\t"
       "addq $1, %%rax\n\t"

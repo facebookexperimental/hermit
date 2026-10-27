@@ -232,6 +232,11 @@ pub struct InterpolateOpts {
 
 impl InterpolateOpts {
     pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
+        // A record of a format this Hermit does not read is refused, typed
+        // (exit 122 through `main`), before either input's settings are read.
+        for path in [&self.file_a, &self.file_b] {
+            detcore::preemptions::refuse_unread_record_format(path)?;
+        }
         let next_sched = self.interpolated_record()?;
         let dir = tempfile::Builder::new()
             .prefix("hermit_internal")
@@ -678,6 +683,54 @@ mod tests {
             "page_bytes": 4096,
             "abi": "x86_64",
         })
+    }
+
+    /// Interpolation refuses an input of a format this Hermit does not read,
+    /// legacy or slice-boundary, in either position, typed (so `main` exits
+    /// 122), before it reads either input's settings: each newer input also
+    /// holds a pipe-wake latency its settings reader would reject.
+    #[test]
+    fn interpolation_refuses_a_newer_record_before_reading_its_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("valid.json");
+        std::fs::write(
+            &valid,
+            PreemptionRecord::from_sched_events(vec![SchedEvent::branches(DetTid::from_raw(3), 3)])
+                .to_string(),
+        )
+        .unwrap();
+        let newer_preemptions = serde_json::json!({
+            "per_thread": {}, "global": [], "format_version": 99, "pipe_wake_latency": "x",
+        });
+        let legacy = dir.path().join("legacy.json");
+        std::fs::write(&legacy, newer_preemptions.to_string()).unwrap();
+        let boundary = dir.path().join("boundary.json");
+        std::fs::write(
+            &boundary,
+            serde_json::json!({
+                "slice_boundary_recording": {"preemptions": newer_preemptions, "schedule": []},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let common = CommonOpts::parse_from(["hermit-verify"]);
+        for newer in [&legacy, &boundary] {
+            for (file_a, file_b) in [(newer, &valid), (&valid, newer)] {
+                let error = InterpolateOpts {
+                    interpolate: 50,
+                    file_a: file_a.clone(),
+                    file_b: file_b.clone(),
+                }
+                .run(&common)
+                .unwrap_err();
+                assert!(
+                    error
+                        .chain()
+                        .any(|cause| cause.is::<detcore::preemptions::RecordFormatRefusal>()),
+                    "{error:#}"
+                );
+            }
+        }
     }
 
     #[test]

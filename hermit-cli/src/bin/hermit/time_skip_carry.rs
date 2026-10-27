@@ -107,11 +107,11 @@ impl TimeSkipSources {
     /// (`detcore::preemptions::format_without_instruction_offsets`,
     /// `detcore::preemptions::format_without_background_starts`): those
     /// formats and the one below them share their timing rules. A trial
-    /// whose rows hold offsets states the offsets' format again when it is
-    /// written (`PreemptionRecord::with_format`), and the starts differ only
-    /// in a list no spliced trial keeps, so a recording with offsets or noted
-    /// starts, the re-record of its schedule replay and a trial's record
-    /// without either share one format here.
+    /// whose rows or schedule hold offsets states their format again when it
+    /// is written (`PreemptionRecord::with_format`), and the starts differ
+    /// only in a list no spliced trial keeps, so a recording with offsets or
+    /// noted starts, the re-record of its schedule replay and a trial's
+    /// record without either share one format here.
     pub fn remember(&mut self, record: &PreemptionRecord) {
         self.formats
             .insert(detcore::preemptions::format_without_background_starts(

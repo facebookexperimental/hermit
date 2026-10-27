@@ -26,6 +26,19 @@ pub mod boundary;
 // Scheduler events
 //--------------------------------------------------------------------------------
 
+/// Where a chaos timeslice with `--chaos-instruction-offset` ends: `instructions`
+/// single steps after the thread's conditional-branch counter reaches
+/// `rcb_target`. Straight-line code can return to an address without a
+/// conditional branch (a repeated call, a backward jump, a `rep` instruction),
+/// so the step count, not an address, names the point.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
+pub struct InstructionOffset {
+    /// The thread's absolute PMU branch count the timer was armed for.
+    pub rcb_target: u64,
+    /// Single steps past that count, at least one.
+    pub instructions: u64,
+}
+
 /// A scheduled action by one thread in the system.  This can be recorded, or replayed to guide the
 /// schedule.
 #[derive(PartialEq, Eq, Clone, Hash, Deserialize)]
@@ -50,13 +63,24 @@ pub struct SchedEvent {
     /// take such an end without a stop too, where its thread runs alone.
     #[serde(default)]
     pub stopless: bool,
+    /// For a batch of branches that a timer armed with
+    /// `--chaos-instruction-offset` ended past its branch target: where that
+    /// timer was armed. A schedule replay arms the same timer for the event
+    /// (`Some` only on an `Op::Branch` event, whose following
+    /// `Op::OtherInstructions` event names the address it stopped at). `None`
+    /// on every other event, and on every event of a schedule recorded without
+    /// the option or before the field existed; a written schedule then omits
+    /// it (see `Serialize`), so it is byte for byte what it was before.
+    #[serde(default)]
+    pub instruction_offset: Option<InstructionOffset>,
 }
 
 /// Written by hand so that a human-readable record (JSON) leaves `stopless`
-/// out when it is false, as every record made before the field existed did,
-/// while a binary encoding keeps every field: `SchedEvent` crosses Reverie's
-/// RPC, which is bincode, positional and not self-describing, so a field
-/// skipped there would misalign every field after it.
+/// out when it is false and `instruction_offset` out when it is `None`, as
+/// every record made before those fields existed did, while a binary
+/// encoding keeps every field: `SchedEvent` crosses Reverie's RPC, which is
+/// bincode, positional and not self-describing, so a field skipped there
+/// would misalign every field after it.
 impl Serialize for SchedEvent {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
@@ -69,10 +93,15 @@ impl Serialize for SchedEvent {
             end_rip,
             end_time,
             stopless,
+            instruction_offset,
         } = self;
-        let written_stopless = *stopless || !serializer.is_human_readable();
-        let mut state =
-            serializer.serialize_struct("SchedEvent", 6 + usize::from(written_stopless))?;
+        let binary = !serializer.is_human_readable();
+        let written_stopless = *stopless || binary;
+        let written_offset = instruction_offset.is_some() || binary;
+        let mut state = serializer.serialize_struct(
+            "SchedEvent",
+            6 + usize::from(written_stopless) + usize::from(written_offset),
+        )?;
         state.serialize_field("dettid", dettid)?;
         state.serialize_field("op", op)?;
         state.serialize_field("count", count)?;
@@ -84,13 +113,19 @@ impl Serialize for SchedEvent {
         } else {
             state.skip_field("stopless")?;
         }
+        if written_offset {
+            state.serialize_field("instruction_offset", instruction_offset)?;
+        } else {
+            state.skip_field("instruction_offset")?;
+        }
         state.end()
     }
 }
 
-/// As derived, but without `stopless` when it is false, so that the logs of
-/// a run without slice ends taken without a stop read as before the field
-/// existed.
+/// As derived, but without `stopless` when it is false and without
+/// `instruction_offset` when it is `None`, so that the logs of a run with
+/// neither read as before the fields existed: INFO and DEBUG lines that show
+/// an event stay unchanged.
 impl fmt::Debug for SchedEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
@@ -101,6 +136,7 @@ impl fmt::Debug for SchedEvent {
             end_rip,
             end_time,
             stopless,
+            instruction_offset,
         } = self;
         let mut s = f.debug_struct("SchedEvent");
         s.field("dettid", dettid)
@@ -111,6 +147,9 @@ impl fmt::Debug for SchedEvent {
             .field("end_time", end_time);
         if *stopless {
             s.field("stopless", stopless);
+        }
+        if let Some(offset) = instruction_offset {
+            s.field("instruction_offset", offset);
         }
         s.finish()
     }
@@ -135,6 +174,13 @@ impl fmt::Display for SchedEvent {
         if self.stopless {
             write!(f, " stopless")?;
         }
+        if let Some(offset) = self.instruction_offset {
+            write!(
+                f,
+                " offset=+{}@rcb{}",
+                offset.instructions, offset.rcb_target
+            )?;
+        }
         write!(f, " {:?})", self.op)?;
         Ok(())
     }
@@ -152,6 +198,7 @@ impl SchedEvent {
             end_rip: None,
             end_time: None,
             stopless: false,
+            instruction_offset: None,
         }
     }
 
@@ -165,6 +212,7 @@ impl SchedEvent {
             end_rip: None,
             end_time: None,
             stopless: false,
+            instruction_offset: None,
         }
     }
 
@@ -201,10 +249,11 @@ impl SchedEvent {
     /// Why this event's `stopless` mark contradicts the rest of it, if it
     /// does: only the branches up to a timeslice end are marked, and an end
     /// taken without a stop has no `end_rip`, since the guest was not stopped
-    /// there. The builders refuse both (`taken_without_stop`,
-    /// `with_end_rip`), and so do the record writer and reader, so that no
-    /// record says an end was taken without a stop while it holds the RIP a
-    /// stop read.
+    /// there, and no `instruction_offset`, since an offset is stepped from a
+    /// stop at its branch target. The builders refuse each
+    /// (`taken_without_stop`, `with_end_rip`, `with_instruction_offset`), and
+    /// so do the record writer and reader, so that no record says an end was
+    /// taken without a stop while it holds what only a stop provides.
     pub fn stopless_mark_refusal(&self) -> Option<&'static str> {
         if !self.stopless {
             None
@@ -214,21 +263,30 @@ impl SchedEvent {
             Some(
                 "a timeslice end marked `stopless` has no end RIP: the guest was not stopped there",
             )
+        } else if self.instruction_offset.is_some() {
+            Some(
+                "a timeslice end marked `stopless` has no instruction offset: an offset is stepped \
+                 from a stop at its branch target",
+            )
         } else {
             None
         }
     }
 
     /// Whether the two events are the same operation by the same thread at
-    /// the same instruction pointers, whichever way each run took a timeslice
-    /// end there: a stop reads the `end_rip` that an end taken without one
-    /// (`stopless`) does not have. Counts and times are not compared. Not
+    /// the same instruction pointers and, for a batch an instruction-offset
+    /// timer ended, at the same offset, whichever way each run took a
+    /// timeslice end there: a stop reads the `end_rip` that an end taken
+    /// without one (`stopless`) does not have. An offset, like an end RIP,
+    /// names where the batch ended, so two batches that differ only in their
+    /// offsets are not the same kind. Counts and times are not compared. Not
     /// transitive (two stops at different RIPs are each the same kind as the
     /// end without one), so it compares two events and cannot key a hash.
     pub fn same_kind(&self, other: &SchedEvent) -> bool {
         let rips_known = !(self.stopless || other.stopless);
         (self.dettid, self.op, self.start_rip) == (other.dettid, other.op, other.start_rip)
             && (!rips_known || self.end_rip == other.end_rip)
+            && self.instruction_offset == other.instruction_offset
     }
 
     /// [`SchedEvent::same_kind`], with the same count and time too: the same
@@ -245,7 +303,24 @@ impl SchedEvent {
             self.end_rip.is_none(),
             "a slice end without a stop has no RIP"
         );
+        assert!(
+            self.instruction_offset.is_none(),
+            "a slice end without a stop has no instruction offset"
+        );
         self.stopless = true;
+        self
+    }
+
+    /// Set the instruction_offset field: where the timer that ended this
+    /// batch of branches was armed past its branch target.
+    /// An end taken without a stop (`stopless`) has none
+    /// ([`Self::stopless_mark_refusal`]).
+    pub fn with_instruction_offset(mut self, offset: Option<InstructionOffset>) -> Self {
+        assert!(
+            !(self.stopless && offset.is_some()),
+            "a slice end without a stop has no instruction offset: {self:?}"
+        );
+        self.instruction_offset = offset;
         self
     }
 }
@@ -447,6 +522,19 @@ mod sched_event_tests {
             ..event(true)
         };
         assert!(!stopped.same_operations(&later));
+        // An instruction offset names where the batch ended, like an end RIP,
+        // so batches that differ only in their offsets are not the same.
+        let offset = |instructions| {
+            Some(InstructionOffset {
+                rcb_target: 98,
+                instructions,
+            })
+        };
+        let at_offset = stopped.clone().with_instruction_offset(offset(3));
+        assert!(at_offset.same_operations(&at_offset.clone()));
+        assert!(!at_offset.same_operations(&stopped));
+        assert!(!stopped.same_kind(&at_offset));
+        assert!(!at_offset.same_kind(&stopped.clone().with_instruction_offset(offset(4))));
     }
 
     #[test]
@@ -544,6 +632,86 @@ mod sigwrapper_tests {
         assert_eq!(by_name, SigWrapper::from(Signal::SIGUSR1));
         let by_number: SigWrapper = serde_json::from_str("\"SIG40\"").expect("number");
         assert_eq!(by_number, SigWrapper(40));
+    }
+}
+
+#[cfg(test)]
+mod instruction_offset_tests {
+    use super::*;
+
+    /// `SchedEvent` as it was before `instruction_offset` existed, with the
+    /// derived `Serialize` and `Debug` it had then.
+    mod before {
+        use super::*;
+
+        #[derive(Debug, Serialize)]
+        pub struct SchedEvent {
+            pub dettid: DetTid,
+            pub op: Op,
+            pub count: u32,
+            pub start_rip: Option<InstructionPointer>,
+            pub end_rip: Option<InstructionPointer>,
+            pub end_time: Option<LogicalTime>,
+        }
+    }
+
+    fn branch(offset: Option<InstructionOffset>) -> SchedEvent {
+        SchedEvent::branches(DetTid::from_raw(3), 7)
+            .with_end_rip(NonZeroUsize::new(4096).unwrap())
+            .with_time(LogicalTime::from_nanos(70))
+            .with_instruction_offset(offset)
+    }
+
+    /// An event without an instruction offset is written, and printed, exactly
+    /// as it was before the field existed; one with an offset keeps it through
+    /// JSON, and the RPC's encoding carries the field either way. A schedule
+    /// written before the field existed reads as events without offsets.
+    #[test]
+    fn an_absent_offset_leaves_an_event_unchanged_and_a_present_one_round_trips() {
+        let plain = branch(None);
+        let old = before::SchedEvent {
+            dettid: plain.dettid,
+            op: plain.op,
+            count: plain.count,
+            start_rip: plain.start_rip,
+            end_rip: plain.end_rip,
+            end_time: plain.end_time,
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert_eq!(json, serde_json::to_string(&old).unwrap());
+        assert_eq!(
+            serde_json::to_string_pretty(&plain).unwrap(),
+            serde_json::to_string_pretty(&old).unwrap()
+        );
+        assert_eq!(serde_json::from_str::<SchedEvent>(&json).unwrap(), plain);
+        assert_eq!(format!("{plain:?}"), format!("{old:?}"));
+        assert_eq!(format!("{plain:#?}"), format!("{old:#?}"));
+        assert!(!format!("{plain}").contains("offset"));
+
+        let offset = InstructionOffset {
+            rcb_target: 40,
+            instructions: 5,
+        };
+        let with = branch(Some(offset));
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(
+            json.ends_with(r#","instruction_offset":{"rcb_target":40,"instructions":5}}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<SchedEvent>(&json).unwrap(), with);
+        assert_ne!(with, plain);
+        assert!(format!("{with:?}").ends_with(
+            "instruction_offset: InstructionOffset { rcb_target: 40, instructions: 5 } }"
+        ));
+        assert!(format!("{with}").contains(" offset=+5@rcb40 "), "{with}");
+
+        for event in [plain, with] {
+            let config = bincode::config::standard();
+            let encoded = bincode::serde::encode_to_vec(&event, config).unwrap();
+            let (decoded, _): (SchedEvent, usize) =
+                bincode::serde::decode_from_slice(&encoded, config).unwrap();
+            assert_eq!(decoded, event);
+        }
     }
 }
 

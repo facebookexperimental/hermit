@@ -144,7 +144,9 @@ pub struct CriticalSchedule {
 }
 
 /// return 2 if first == second (ignores end_time)
-/// return -1 if only count is different
+/// return -1 if only count is different (an instruction offset, like an end
+/// address, names where an event ended, so a different one is not "only";
+/// `SchedEvent::same_kind` compares both)
 /// return -2 otherwise
 pub fn scoring_function(first: SchedEvent, second: SchedEvent) -> i32 {
     let mut score = -2;
@@ -291,14 +293,7 @@ where
             .green()
             .bold()
     );
-    let critical_event_index = {
-        let (common_prefix, _) = get_common_pre_and_postfix(
-            &passing_schedule,
-            &failing_schedule,
-            SchedEvent::same_operations,
-        );
-        common_prefix.len() + 1
-    };
+    let critical_event_index = critical_event_index(&passing_schedule, &failing_schedule);
     eprintln!("Critical event index {}", critical_event_index);
     Ok(CriticalSchedule {
         failing_schedule,
@@ -428,18 +423,15 @@ fn events_shared_with(schedule: &[SchedEvent], other: &[SchedEvent]) -> Option<V
 }
 
 /// Whether two realized traces of one control schedule are the same interleaving:
-/// the same events of the same threads in the same order, with branch counts that
-/// differ by at most `branch_jitter`. Event times are not compared: they follow
-/// from the counts, so a branch-count difference shifts every later time.
+/// the same events of the same threads in the same order (`SchedEvent::same_kind`,
+/// instruction offsets included), ending at the same RIPs, with branch counts
+/// that differ by at most `branch_jitter`. Event times are not compared: they
+/// follow from the counts, so a branch-count difference shifts every later time.
 fn same_interleaving(first: &[SchedEvent], second: &[SchedEvent], branch_jitter: u32) -> bool {
     first.len() == second.len()
         && first.iter().zip(second).all(|(a, b)| {
             let allowed = if a.op == Op::Branch { branch_jitter } else { 0 };
-            a.dettid == b.dettid
-                && a.op == b.op
-                && a.start_rip == b.start_rip
-                && a.end_rip == b.end_rip
-                && a.count.abs_diff(b.count) <= allowed
+            a.same_kind(b) && a.end_rip == b.end_rip && a.count.abs_diff(b.count) <= allowed
         })
 }
 
@@ -1112,6 +1104,17 @@ where
     }))
 }
 
+/// The index in the failing schedule of the event that, swapped with the
+/// one before it, changes the outcome: one past the events both schedules
+/// share at their start. Events are compared as everywhere in this search,
+/// with `SchedEvent::same_operations`, which compares instruction offsets
+/// too.
+fn critical_event_index(passing: &[SchedEvent], failing: &[SchedEvent]) -> usize {
+    let (common_prefix, _) =
+        get_common_pre_and_postfix(passing, failing, SchedEvent::same_operations);
+    common_prefix.len() + 1
+}
+
 fn same_event_except_count(first: &SchedEvent, second: &SchedEvent) -> bool {
     first.same_operations(&SchedEvent {
         count: first.count,
@@ -1119,8 +1122,15 @@ fn same_event_except_count(first: &SchedEvent, second: &SchedEvent) -> bool {
     })
 }
 
+/// Whether the sub-event search may split `event`. A batch of branches that
+/// an instruction-offset timer ended (`SchedEvent::instruction_offset`) is
+/// not split: its last branches can lie past the timer's branch target (its
+/// steps cross them), so a fragment that started there could not arm the
+/// timer, and its replay would report a skid that no retry removes.
 fn can_split_event(event: &SchedEvent) -> bool {
-    event.count > 0 && (event.op == detcore::types::Op::Branch || event.count == 1)
+    event.count > 0
+        && event.instruction_offset.is_none()
+        && (event.op == detcore::types::Op::Branch || event.count == 1)
 }
 
 fn test_exact_replay<F>(tester: &mut F, requested: &[SchedEvent]) -> anyhow::Result<Option<bool>>
@@ -1195,6 +1205,11 @@ fn sched_event_fragment(
         // Only the fragment that ends where the original did ends at its
         // slice end.
         stopless: keeps_end && original.stopless,
+        // Where a timer armed past its branch target stopped the original is
+        // where it ended: only the fragment that keeps that end keeps it. The
+        // branch target is the thread's absolute count, so it is the same
+        // in that fragment, which starts later.
+        instruction_offset: keeps_end.then_some(original.instruction_offset).flatten(),
         ..*original
     }
 }
@@ -1368,6 +1383,167 @@ mod tests {
         assert_eq!(binary_search(0..10, &mut |_| Ok(None)).unwrap(), None);
     }
 
+    /// A batch of branches that a timer armed past its branch target ended
+    /// keeps its instruction offset, like its end address, only in the
+    /// fragment that keeps its end: the sub-event search's splices put a new
+    /// preemption at a branch inside the batch, and the remainder still ends
+    /// where the recording did. Unsplit, the batch keeps it, and a trial
+    /// schedule written from either carries it, stamped format 4.
+    /// The sub-event search does not split a batch of branches that an
+    /// instruction-offset timer ended: the timer's steps can cross branches,
+    /// so the batch's last branches lie past its target, and a fragment that
+    /// started there could not arm the timer.
+    #[test]
+    fn an_offset_batch_is_not_split() {
+        let tid = DetTid::from_raw(3);
+        let offset = detcore::preemptions::InstructionOffset {
+            rcb_target: 100,
+            instructions: 6,
+        };
+        // 104 branches, the last 4 crossed by the timer's 6 steps.
+        let stepped = SchedEvent::branches(tid, 104).with_instruction_offset(Some(offset));
+        assert!(!can_split_event(&stepped));
+        assert!(can_split_event(&SchedEvent::branches(tid, 104)));
+    }
+
+    #[test]
+    fn a_spliced_branch_batch_keeps_its_instruction_offset_with_its_end() {
+        let offset = detcore::preemptions::InstructionOffset {
+            rcb_target: 100,
+            instructions: 3,
+        };
+        let end = std::num::NonZeroUsize::new(0x4000).unwrap();
+        let a = SchedEvent::branches(DetTid::from_raw(3), 8)
+            .with_end_rip(end)
+            .with_instruction_offset(Some(offset));
+        let b = SchedEvent::branches(DetTid::from_raw(5), 9);
+        let pair = [a.clone(), b.clone()];
+        // A4 B7 A4 B2
+        let spliced = create_schedule_with_critical_pair(&[], &[], &pair, 4, 7);
+        assert_eq!(spliced.len(), 4);
+        assert_eq!(
+            (
+                spliced[0].count,
+                spliced[0].end_rip,
+                spliced[0].instruction_offset
+            ),
+            (4, None, None)
+        );
+        assert_eq!(
+            (
+                spliced[2].count,
+                spliced[2].end_rip,
+                spliced[2].instruction_offset
+            ),
+            (4, Some(end), Some(offset))
+        );
+        assert!(spliced[1].instruction_offset.is_none() && spliced[3].instruction_offset.is_none());
+        // Unsplit: the whole batch first.
+        let whole = create_schedule_with_critical_pair(&[], &[], &pair, 8, 9);
+        assert_eq!(whole, vec![a.clone(), b]);
+        for schedule in [spliced, whole] {
+            let record = PreemptionRecord::from_sched_events(schedule);
+            record.validate().unwrap();
+            assert_eq!(
+                record.format_version(),
+                Some(detcore::preemptions::INSTRUCTION_OFFSET_FORMAT)
+            );
+        }
+        // An offset, like an end address, makes an event more than "the
+        // same except its count".
+        assert_eq!(scoring_function(a.clone(), a.clone()), 2);
+        assert_eq!(
+            scoring_function(a.clone(), a.clone().with_instruction_offset(None)),
+            -2
+        );
+        assert!(!same_event_except_count(
+            &a,
+            &a.clone().with_instruction_offset(None)
+        ));
+    }
+
+    /// Two schedules that differ only in where an instruction-offset timer
+    /// ended one batch are different schedules wherever the search compares
+    /// events: the shared prefix and the critical event stop at that batch,
+    /// the sub-event search does not take the pair beside it for a single
+    /// reversal (it calls no trial), a replay that realized another offset
+    /// did not realize the request, and the score counts the batches as
+    /// different events, as does the jitter check between two replays of one
+    /// control schedule.
+    #[test]
+    fn schedules_that_differ_only_in_an_instruction_offset_differ_everywhere_the_search_compares() {
+        let offset = |instructions| {
+            Some(detcore::preemptions::InstructionOffset {
+                rcb_target: 100,
+                instructions,
+            })
+        };
+        let (a, b) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        let (here, there) = (6, 7);
+        let ended =
+            |instructions| SchedEvent::branches(a, 8).with_instruction_offset(offset(instructions));
+        let passing = vec![
+            ended(here),
+            SchedEvent::branches(a, 4),
+            SchedEvent::branches(b, 6),
+            SchedEvent::branches(b, 2),
+        ];
+        let mut failing = passing.clone();
+        failing[0] = ended(there);
+        failing.swap(1, 2);
+
+        let (prefix, postfix) =
+            get_common_pre_and_postfix(&passing, &failing, SchedEvent::same_operations);
+        assert_eq!((prefix.len(), postfix.len()), (0, 1));
+        assert_eq!(critical_event_index(&passing, &failing), 1);
+        let same_but_the_swap = {
+            let mut events = failing.clone();
+            events[0] = ended(here);
+            events
+        };
+        assert_eq!(critical_event_index(&passing, &same_but_the_swap), 2);
+
+        let mut no_trial = |_: &[SchedEvent]| -> TrialOutcome {
+            panic!("the sub-event search ran a trial for a pair that is not a single reversal")
+        };
+        assert!(
+            sub_event_search(&mut no_trial, passing.clone(), failing.clone())
+                .unwrap()
+                .is_none()
+        );
+
+        let mut realized_elsewhere = |requested: &[SchedEvent]| -> TrialOutcome {
+            let mut actual = requested.to_vec();
+            actual[0] = ended(there);
+            Ok((true, actual))
+        };
+        assert_eq!(
+            test_exact_replay(&mut realized_elsewhere, &passing).unwrap(),
+            None
+        );
+        let mut realized =
+            |requested: &[SchedEvent]| -> TrialOutcome { Ok((true, requested.to_vec())) };
+        assert_eq!(
+            test_exact_replay(&mut realized, &passing).unwrap(),
+            Some(true)
+        );
+
+        assert_eq!(scoring_function(ended(here), ended(there)), -2);
+        assert_eq!(scoring_function(ended(here), ended(here)), 2);
+
+        // Two replays of one control schedule that ended a batch at different
+        // offsets are not the same interleaving, whatever jitter is allowed.
+        assert!(!same_interleaving(
+            &passing,
+            &{
+                let mut events = passing.clone();
+                events[0] = ended(there);
+                events
+            },
+            2
+        ));
+        assert!(same_interleaving(&passing, &passing, 0));
+    }
     #[test]
     fn syscall_pair_stays_at_event_granularity() {
         let first = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
