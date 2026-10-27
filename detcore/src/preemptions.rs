@@ -42,6 +42,33 @@ use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;
 
+/// The first format whose records note every background start
+/// (`BackgroundStart`), so that a call such a record does not start at a point
+/// did not start there.
+pub const BACKGROUND_STARTS_FORMAT: u32 = 2;
+
+/// The turn that began a kernel-run blocking call
+/// (`ResourceID::is_kernel_run_blocking`: a blocking read of an external
+/// descriptor, a binder call that waits for another process, a vfork, an
+/// `rt_sigsuspend`), committed as BACKGROUND: from then on the call runs in
+/// the kernel while other threads' turns commit. The turn runs no guest code
+/// and so leaves no event; it is recorded after the global schedule's first
+/// `after` events. When a call starts can decide what it sees: a binder read
+/// already waiting in the driver is the idle looper a later read on another
+/// thread finds, or not. A schedule replay starts the call at the same point,
+/// before the event that follows it.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundStart {
+    /// How many events of the global schedule came before the turn.
+    pub after: u64,
+    /// The thread whose call the turn began.
+    pub thread: DetTid,
+    /// The call's per-thread sequence number (`ExternalOpId::sequence`), as
+    /// the readmissions name it (`rejoins`).
+    pub call: u64,
+}
+
 /// A record of all the preemptions and other scheduling events that occur during execution.
 #[derive(PartialEq, Default, Debug, Eq, Clone, Hash)]
 pub struct PreemptionRecord {
@@ -182,6 +209,12 @@ pub struct PreemptionRecord {
     /// one synthesized or edited in memory, has `None`. Either kind with no
     /// entry replays as before.
     rejoins: Option<Vec<crate::scheduler::rejoin_log::Rejoin>>,
+    /// The turns that began kernel-run blocking calls, in the order they
+    /// committed (`BackgroundStart`). Empty for records of format 1, which
+    /// replay as before, for runs that began no such call, and for records
+    /// synthesized in memory; dropped, with the readmissions, by any edit of
+    /// the schedule.
+    background_starts: Vec<BackgroundStart>,
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -346,7 +379,8 @@ impl PreemptionRecord {
             format_version: None,
             time_skips: None,
             queued_sleeps_registered_at_first_pass: false,
-rejoins: None,
+            rejoins: None,
+            background_starts: Vec::new(),
         }
     }
 
@@ -784,6 +818,10 @@ rejoins: None,
     fn forget_run_points(&mut self) {
         self.callback_checkpoints.clear();
         self.rejoins = None;
+        // The background starts sit between events an edit moves, so they go
+        // too, and the format with them: the edited record notes no start.
+        self.background_starts.clear();
+        self.format_version = None;
     }
 
     /// TODO: provide a better way to create an empty PreemptionRecord but with entries for a given set of tids.
@@ -854,7 +892,8 @@ rejoins: None,
             format_version: None,
             time_skips: None,
             queued_sleeps_registered_at_first_pass: self.queued_sleeps_registered_at_first_pass,
-rejoins: None,
+            rejoins: None,
+            background_starts: Vec::new(),
         }
     }
 
@@ -927,7 +966,8 @@ rejoins: None,
             format_version: None,
             time_skips: None,
             queued_sleeps_registered_at_first_pass: false,
-rejoins: None,
+            rejoins: None,
+            background_starts: Vec::new(),
         }
     }
 
@@ -935,6 +975,19 @@ rejoins: None,
     /// when the record does not say.
     pub fn time_skips(&self) -> Option<&[TimeSkip]> {
         self.time_skips.as_deref()
+    }
+
+    /// The background starts the record holds, in order (`BackgroundStart`).
+    pub fn background_starts(&self) -> &[BackgroundStart] {
+        &self.background_starts
+    }
+
+    /// Whether the record notes every background start its run took: a
+    /// record of `BACKGROUND_STARTS_FORMAT` or newer. A format-1 record says
+    /// nothing about when its calls began.
+    pub fn notes_background_starts(&self) -> bool {
+        self.format_version
+            .is_some_and(|format| format >= BACKGROUND_STARTS_FORMAT)
     }
 
     pub(crate) fn callback_checkpoints(
@@ -985,6 +1038,41 @@ rejoins: None,
     /// ([`Self::validate_format`]), whose failure is a refusal rather than a
     /// malformed record, and which readers check separately for that reason.
     pub fn validate_contents(&self) -> Result<(), String> {
+        if let Some(format) = self.format_version
+            && format > PREEMPTION_RECORD_FORMAT
+        {
+            return Err(format!(
+                "the preemption record is format {format}, written by a newer Hermit; this \
+                 Hermit reads formats up to {PREEMPTION_RECORD_FORMAT}. Replay it with the \
+                 Hermit that recorded it, or a newer one"
+            ));
+        }
+        let events = self.global.len() as u64;
+        if let Some(start) = self
+            .background_starts
+            .iter()
+            .zip(self.background_starts.iter().skip(1))
+            .find(|(a, b)| a.after > b.after)
+            .map(|(_, b)| b)
+            .or_else(|| {
+                self.background_starts
+                    .iter()
+                    .find(|start| start.after > events)
+            })
+        {
+            return Err(format!(
+                "background start of call {} of thread {} after event {} is out of order or \
+                 past the {} recorded events",
+                start.call, start.thread, start.after, events
+            ));
+        }
+        if !self.background_starts.is_empty() && !self.notes_background_starts() {
+            return Err(format!(
+                "the preemption record holds background starts but is format {}, older than \
+                 the format {BACKGROUND_STARTS_FORMAT} that notes them",
+                self.format_version.unwrap_or(1)
+            ));
+        }
         self.validate_callback_checkpoints()?;
         self.validate_histories()
     }
@@ -1520,6 +1608,76 @@ mod tests {
         assert!(!exact.contains("replay_departed_at"), "{exact}");
         std::fs::write(&path, &exact).unwrap();
         assert_eq!(read_recorded_replay_departure(&path), Ok(None));
+    }
+
+    /// A writer that notes background starts stamps the current format, even
+    /// on a record without any, and notes each start after the events recorded
+    /// so far; one that does not note them keeps format 1 and takes none. A
+    /// record's starts must be in order, within its events and of a format
+    /// that notes them, and an edit of the schedule drops them with the
+    /// format.
+    #[test]
+    fn background_starts_follow_their_events_and_version_the_record() {
+        let event = |tid: i32| SchedEvent {
+            dettid: DetTid::from_raw(tid),
+            op: Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: None,
+            end_time: Some(LogicalTime::from_nanos(5)),
+        };
+        let read = |writer: PreemptionWriter| -> PreemptionRecord {
+            serde_json::from_str(&writer.into_string()).unwrap()
+        };
+        let mut plain = PreemptionWriter::new(None);
+        plain.insert_schedevent(event(3));
+        plain.insert_background_start(DetTid::from_raw(3), 1);
+        let plain_json = plain.into_string();
+        assert!(!plain_json.contains("format_version"), "{plain_json}");
+        assert!(!plain_json.contains("background_starts"), "{plain_json}");
+
+        let mut none = PreemptionWriter::new(None).noting_background_starts();
+        none.insert_schedevent(event(3));
+        let none = read(none);
+        assert_eq!(none.format_version, Some(PREEMPTION_RECORD_FORMAT));
+        assert!(none.notes_background_starts());
+        assert!(none.background_starts().is_empty());
+
+        let mut writer = PreemptionWriter::new(None).noting_background_starts();
+        writer.insert_schedevent(event(3));
+        writer.insert_background_start(DetTid::from_raw(3), 7);
+        writer.insert_schedevent(event(5));
+        writer.insert_background_start(DetTid::from_raw(5), 2);
+        writer.insert_background_start(DetTid::from_raw(3), 8);
+        let record = read(writer);
+        let start = |after, tid, call| BackgroundStart {
+            after,
+            thread: DetTid::from_raw(tid),
+            call,
+        };
+        assert_eq!(
+            record.background_starts(),
+            [start(1, 3, 7), start(2, 5, 2), start(2, 3, 8)]
+        );
+        record.validate().unwrap();
+
+        let mut out_of_order = record.clone();
+        out_of_order.background_starts.swap(0, 1);
+        assert!(out_of_order.validate().is_err());
+        let mut past_the_end = record.clone();
+        past_the_end.background_starts.push(start(3, 5, 3));
+        assert!(past_the_end.validate().is_err());
+        let mut unnoted = record.clone();
+        unnoted.format_version = None;
+        assert!(unnoted.validate().is_err());
+        let mut newer = record.clone();
+        newer.format_version = Some(PREEMPTION_RECORD_FORMAT + 1);
+        assert!(newer.validate().is_err());
+
+        let mut edited = record;
+        edited.preemptions_only();
+        assert!(edited.background_starts().is_empty());
+        assert!(!edited.notes_background_starts());
     }
 
     /// `--pipe-wake-latency` rides in a preemption record as the epoch does:
@@ -2788,6 +2946,31 @@ impl PreemptionWriter {
     /// can readmit it at the same turn (`crate::scheduler::rejoin_log`).
     pub(crate) fn push_rejoin(&mut self, rejoin: crate::scheduler::rejoin_log::Rejoin) {
         self.inner.rejoins.get_or_insert_with(Vec::new).push(rejoin);
+    }
+
+    /// Stamp the record with the current format: the run records its
+    /// schedule without replaying one, so it notes every background start it
+    /// takes (`insert_background_start`), and a record without any says its
+    /// run began none.
+    pub fn noting_background_starts(mut self) -> Self {
+        self.inner.format_version = Some(PREEMPTION_RECORD_FORMAT);
+        self
+    }
+
+    /// Note that the scheduler just began `thread`'s kernel-run call `call`
+    /// (a BACKGROUND commit), after the events recorded so far
+    /// (`BackgroundStart`). Only a writer stamped by
+    /// `noting_background_starts` takes it: another's record would say it
+    /// notes starts it does not.
+    pub(crate) fn insert_background_start(&mut self, thread: DetTid, call: u64) {
+        if self.boundary_records.is_some() || !self.inner.notes_background_starts() {
+            return;
+        }
+        self.inner.background_starts.push(BackgroundStart {
+            after: self.inner.global.len() as u64,
+            thread,
+            call,
+        });
     }
 
     /// Does the record have zero entries?

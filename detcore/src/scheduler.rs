@@ -5215,6 +5215,15 @@ fn describe_rejoin_calls(rejoin: &Rejoin) -> String {
         .join(", ")
 }
 
+/// Whether a run's preemption record notes every background start it takes
+/// (`PreemptionWriter::noting_background_starts`): a legacy recording made
+/// without replaying a schedule. A schedule replay follows the starts its
+/// record notes rather than taking its own, and a slice-boundary recording
+/// keeps no background starts, so neither is stamped as noting them.
+fn notes_background_starts(cfg: &Config) -> bool {
+    cfg.replay_schedule_from.is_none() && !cfg.strict_schedule_boundaries
+}
+
 /// The readmissions a replayed preemption record carries, for a run that
 /// replays one (`--replay-preemptions-from`, `--replay-schedule-from`; the
 /// first when both name a record). `None` when the run replays no record, or
@@ -5315,6 +5324,8 @@ impl Scheduler {
                             .iter()
                             .map(|(tid, points)| (*tid, points.clone().into()))
                             .collect();
+                        let background_starts = record.background_starts().to_vec();
+                        let notes_background_starts = record.notes_background_starts();
                         let vec = record.into_global();
                         trace!("Trace loaded, length {}", vec.len());
                         // Indices are traced (observed) event counts, the same
@@ -5327,7 +5338,8 @@ impl Scheduler {
                             .iter()
                             .map(|(ix, path)| (*ix, None, path.clone()))
                             .collect();
-                        let mut replayer = Replayer::new(vec);
+                        let mut replayer = Replayer::new(vec)
+                            .with_background_starts(&background_starts, notes_background_starts);
                         replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
                         replayer.die_on_desync = cfg.die_on_desync;
                         (Some(replayer), Some(toprint))
@@ -5431,6 +5443,14 @@ impl Scheduler {
             // replay then decides a FIFO open by the newer rules.
             let writer =
                 writer.with_format(replayed_format.unwrap_or(Some(PREEMPTION_RECORD_FORMAT)));
+            // A schedule replay follows the background starts its record
+            // notes rather than taking its own, so only a run that replays no
+            // schedule notes every start it takes.
+            let writer = if notes_background_starts(cfg) {
+                writer.noting_background_starts()
+            } else {
+                writer
+            };
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -17774,6 +17794,7 @@ impl Scheduler {
                 //   (2) Request a BlockedExternalContinue as the first thing after the external IO is complete.
                 self.run_queue.undo_tentative_pop(); // Begun in step3
                 assert!(self.run_queue.remove_tid(dettid)); // Deschedule while in background.
+                self.record_or_replay_background_start(dettid, op_id.sequence);
 
                 // TODO: Register the action that is occuring in the background:
                 // let act = self.new_action(Ivar::new());
@@ -18357,6 +18378,60 @@ impl Scheduler {
         }
     }
 
+    /// The scheduler just began `dettid`'s kernel-run call `call` (a
+    /// BACKGROUND commit, which records no event). A recording notes the start
+    /// after the events recorded so far
+    /// (`PreemptionWriter::insert_background_start`). A schedule replay
+    /// retires it if it is the recorded start due next, and then hands the
+    /// foreground to the thread the schedule runs next, as a context switch at
+    /// an event does (`consume_schedevent`): the recording began the call
+    /// there, and its next event follows it.
+    ///
+    /// In a replay of a record that notes every start, a call begun while the
+    /// schedule lasts that is not the start due next was not begun there in
+    /// the recording: a hard desync of its thread, fatal under
+    /// `--die-on-desync`. A due start not taken stays due until the next event
+    /// shows it was not taken (`Replayer::observe_event`).
+    fn record_or_replay_background_start(&mut self, dettid: DetTid, call: u64) {
+        if !self.has_schedule_replay()
+            && let Some(writer) = &mut self.preemption_writer
+        {
+            writer.insert_background_start(dettid, call);
+        }
+        let Some(replayer) = self.replayer.as_mut() else {
+            return;
+        };
+        if !replayer.take_background_start(dettid, call) {
+            if replayer.notes_background_starts() && replayer.has_events_left() {
+                tracing::warn!(
+                    "[tracereplay] [dtid {}] began its call {}, which the replayed record does not start here (start due: {:?})",
+                    dettid,
+                    call,
+                    replayer.pending_background_start()
+                );
+                if replayer.note_unrecorded_background_start(dettid) {
+                    immediate_fatal_exit();
+                }
+            }
+            return;
+        }
+        debug!(
+            "[dtid {}] took the recorded background start of call {}",
+            dettid, call
+        );
+        if let Some((next_tid, timeslice)) = replayer.next_resume()
+            && next_tid != dettid
+        {
+            self.requeue_with_new_priority(dettid, REPLAY_DEFERRED_PRIORITY);
+            self.requeue_with_new_priority(next_tid, REPLAY_FOREGROUND_PRIORITY);
+            self.note_replay_switch(dettid, next_tid, false);
+            self.timeslices.insert(next_tid, timeslice);
+        }
+        // A start after the schedule's last event may have been its last
+        // decision: then the replay is over, as at its last event.
+        self.release_replay_priorities_if_exhausted();
+    }
+
     /// The turn step 3 hands over first in a schedule replay while the thread
     /// the recorded schedule runs next is not queued: the queued turn of a
     /// thread switched away from at a syscall prehook
@@ -18377,7 +18452,15 @@ impl Scheduler {
     /// is queued, since it goes first, and everything outside a schedule
     /// replay. Of several eligible turns, the one queued first goes first.
     fn replay_prehook_handoff(&self) -> Option<DetTid> {
-        if self.replay_prehook_callers.is_empty() {
+        // A record that notes every background start says when each call
+        // began (`record_or_replay_background_start`), and none began where
+        // it notes none.
+        if self.replay_prehook_callers.is_empty()
+            || self
+                .replayer
+                .as_ref()
+                .is_some_and(Replayer::notes_background_starts)
+        {
             return None;
         }
         let (next, _) = self.replay_next_resume()?;
@@ -21496,6 +21579,19 @@ impl Scheduler {
                 .push_str(&format!("{message}\n"));
         }
 
+        // Likewise name the recorded background starts the replay never took.
+        if let Some(left) = self
+            .replayer
+            .as_ref()
+            .map(Replayer::unconsumed_background_starts)
+            .filter(|left| *left > 0)
+        {
+            let message = format!("DESYNC {left} recorded background starts were not taken");
+            tracing::warn!("{}", message);
+            desync_descrip
+                .get_or_insert_with(String::new)
+                .push_str(&format!("{message}\n"));
+        }
         // Legacy EOF policy does not make an unconsumed suffix fatal. Name
         // incomplete callback metadata separately; do not invent guest events.
         for (tid, points) in &self.callback_checkpoints {
@@ -29242,6 +29338,196 @@ mod test {
             .insert(child, ExternalOpId::new(child, 1));
         assert!(backgrounded.step3_peek().is_none());
         assert_eq!(backgrounded.vfork_gated_background_child(), Some(child));
+    }
+
+    /// Only a legacy recording made without replaying a schedule notes its
+    /// background starts: neither a schedule replay's own re-record nor a
+    /// slice-boundary recording, which keeps no starts, is stamped as noting
+    /// them.
+    #[test]
+    fn only_a_legacy_recording_notes_its_background_starts() {
+        let recording = Config::default();
+        assert!(notes_background_starts(&recording));
+        let boundaries = Config {
+            strict_schedule_boundaries: true,
+            ..Config::default()
+        };
+        assert!(!notes_background_starts(&boundaries));
+        let replay = Config {
+            replay_schedule_from: Some(std::path::PathBuf::from("record.json")),
+            ..Config::default()
+        };
+        assert!(!notes_background_starts(&replay));
+    }
+
+    /// A schedule replay whose record notes background starts begins a
+    /// kernel-run call where the recording did. Here the recording began the
+    /// caller's call right after its prehook, before the next thread's event,
+    /// and that thread is queued: the caller keeps the foreground for its
+    /// call's turn, the turn backgrounds the call and retires the start, and
+    /// the foreground passes to the next thread. A record without starts (the
+    /// call's start unrecorded) runs the queued thread first, as before. A
+    /// record that notes starts but none here hands over no call by the
+    /// prehook heuristic (`replay_prehook_handoff`): a poller queued first
+    /// keeps its place.
+    #[test]
+    fn a_recorded_background_start_begins_its_call_where_the_recording_did() {
+        let poller = DetTid::from_raw(3);
+        let caller = DetTid::from_raw(5);
+        let next = DetTid::from_raw(7);
+        let operation = ExternalOpId::new(caller, 1);
+        let observed = SchedEvent::syscall(caller, Sysno::ioctl, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(10_000));
+        let next_event = SchedEvent::syscall(next, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(20_000));
+        let call = || {
+            let mut request = Resources::new(caller);
+            request.insert(ResourceID::BlockingExternalIO(operation), Permission::RW);
+            request
+        };
+        let replay =
+            |starts: &[crate::preemptions::BackgroundStart], notes: bool, queued: &[DetTid]| {
+                let mut sched = Scheduler::new(&Config::default());
+                for tid in [poller, caller, next] {
+                    register_known_thread(&mut sched, tid);
+                    let request = if tid == caller {
+                        call()
+                    } else if tid == poller {
+                        let mut polling = Resources::new(poller);
+                        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+                        polling
+                    } else {
+                        Resources::new(tid)
+                    };
+                    sched.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(request));
+                    sched.priorities.insert(tid, REPLAY_DEFERRED_PRIORITY);
+                }
+                sched.priorities.insert(caller, REPLAY_FOREGROUND_PRIORITY);
+                for tid in queued {
+                    sched.runqueue_push_back(*tid);
+                }
+                sched.replayer = Some(
+                    Replayer::new(vec![observed.clone(), next_event.clone()])
+                        .with_background_starts(starts, notes),
+                );
+                sched.consume_schedevent(&observed);
+                sched
+            };
+        let selected = |sched: &mut Scheduler| {
+            let (tid, _, _) = sched.step3_peek().expect("a thread is runnable");
+            sched.run_queue.undo_tentative_pop();
+            tid
+        };
+        let start = crate::preemptions::BackgroundStart {
+            after: 1,
+            thread: caller,
+            call: 1,
+        };
+
+        // The recorded start: the caller's call goes first and backgrounds.
+        let mut noted = replay(&[start], true, &[caller, next]);
+        assert_eq!(noted.priorities[&caller], REPLAY_FOREGROUND_PRIORITY);
+        let (tid, _, _) = noted.step3_peek().expect("a thread is runnable");
+        assert_eq!(tid, caller);
+        assert!(
+            noted
+                .block_for_one_resource(
+                    caller,
+                    &ResourceID::BlockingExternalIO(operation),
+                    &Permission::RW,
+                    None,
+                    None,
+                    &Ivar::new(),
+                )
+                .is_err()
+        );
+        assert!(!noted.run_queue.contains_tid(caller));
+        assert_eq!(
+            noted.replayer.as_ref().unwrap().pending_background_start(),
+            None
+        );
+        assert_eq!(noted.priorities[&next], REPLAY_FOREGROUND_PRIORITY);
+        assert_eq!(noted.priorities[&caller], REPLAY_DEFERRED_PRIORITY);
+        assert_eq!(selected(&mut noted), next);
+
+        // A start after the schedule's last event is its last decision:
+        // taking it ends the replay, and every thread takes the default
+        // priority at once.
+        let terminal_start = crate::preemptions::BackgroundStart {
+            after: 2,
+            thread: caller,
+            call: 2,
+        };
+        let mut terminal = replay(&[start, terminal_start], true, &[caller, next]);
+        terminal.record_or_replay_background_start(caller, 1);
+        terminal.consume_schedevent(&next_event);
+        assert_eq!(
+            terminal
+                .replayer
+                .as_ref()
+                .unwrap()
+                .pending_background_start(),
+            Some((caller, 2))
+        );
+        assert!(!terminal.replay_priorities_released);
+        terminal.record_or_replay_background_start(caller, 2);
+        assert!(terminal.replay_priorities_released);
+        assert_eq!(terminal.priorities[&caller], DEFAULT_PRIORITY);
+        assert_eq!(terminal.priorities[&next], DEFAULT_PRIORITY);
+
+        // A noting record with no start due here: the caller's call begun
+        // anyway is a hard desync of the caller.
+        let mut extra = replay(&[], true, &[caller, next]);
+        let before = extra
+            .replayer
+            .as_ref()
+            .unwrap()
+            .desync_counts
+            .get(&caller)
+            .map_or(0, |stats| stats.hard);
+        extra.record_or_replay_background_start(caller, 1);
+        assert_eq!(
+            extra.replayer.as_ref().unwrap().desync_counts[&caller].hard,
+            before + 1
+        );
+
+        // No recorded starts: the queued next thread goes first, as before,
+        // and a call begun there is no desync.
+        let mut unrecorded = replay(&[], false, &[caller, next]);
+        assert_eq!(selected(&mut unrecorded), next);
+        unrecorded.record_or_replay_background_start(caller, 1);
+        assert_eq!(
+            unrecorded
+                .replayer
+                .as_ref()
+                .unwrap()
+                .desync_counts
+                .get(&caller)
+                .map_or(0, |stats| stats.hard),
+            0
+        );
+
+        // A mandatory selection rule still comes first while a start is due:
+        // a thread finishing an interrupted rt_sigreturn
+        // (`first_sigreturn_continuation`) runs before the caller's call.
+        let mut continuation = replay(&[start], true, &[next, caller]);
+        let mut signal = Resources::new(next);
+        signal.insert(
+            ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+            Permission::RW,
+        );
+        signal.continues_sigreturn = true;
+        continuation.next_turns.get_mut(&next).unwrap().req = Ivar::full(Ok(signal));
+        continuation.sigreturn_continuations.insert(next);
+        assert_eq!(selected(&mut continuation), next);
+
+        // Starts noted but none here: no heuristic handoff past the poller.
+        let mut none_here = replay(&[], true, &[poller, caller]);
+        assert_eq!(none_here.replay_prehook_handoff(), None);
+        assert_eq!(selected(&mut none_here), poller);
+        // The same record without noted starts hands the call over.
+        let mut heuristic = replay(&[], false, &[poller, caller]);
+        assert_eq!(selected(&mut heuristic), caller);
     }
 
     /// A schedule replay that switches away from a thread at a syscall prehook

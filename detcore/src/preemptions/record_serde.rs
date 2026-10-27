@@ -25,6 +25,7 @@ use serde::de::value::SeqAccessDeserializer;
 use serde::de::value::StringDeserializer;
 use serde::ser::SerializeMap;
 
+use super::BackgroundStart;
 use super::HostObservedCount;
 use super::PreemptionRecord;
 use super::ReservedInputMetadata;
@@ -79,6 +80,8 @@ struct RawRecord {
     time_skips: Option<Vec<TimeSkip>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rejoins: Option<Vec<crate::scheduler::rejoin_log::Rejoin>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    background_starts: Vec<BackgroundStart>,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);
