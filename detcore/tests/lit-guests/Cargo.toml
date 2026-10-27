@@ -11,6 +11,11 @@ repository = "https://github.com/facebookexperimental/hermit"
 publish = false
 
 [[bin]]
+name = "lit_chaos_schedule_replay"
+path = "../lit/chaos_schedule_replay/main.rs"
+test = false
+
+[[bin]]
 name = "lit_child_should_inherit_fds"
 path = "../lit/child_should_inherit_fds/main.rs"
 test = false
