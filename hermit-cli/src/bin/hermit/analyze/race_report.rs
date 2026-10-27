@@ -35,12 +35,20 @@ use detcore_model::access_trace::SyscallRecord;
 use detcore_model::access_trace::TraceRecord;
 use detcore_model::access_trace::read_access_trace;
 use detcore_model::pid::DetPid;
+use detcore_model::schedule::Op;
+use detcore_model::schedule::SyscallPhase;
 use reverie::PrettyBacktrace;
+use reverie::syscalls::Sysno;
 
 use crate::app::analyze::phases::Departure;
 use crate::app::analyze::phases::departure;
 use crate::app::analyze::phases::stack_thread;
+use crate::app::analyze::races::CandidateCheck;
+use crate::app::analyze::races::CheckVerdict;
+use crate::app::analyze::races::CrossedThread;
+use crate::app::analyze::races::MovedEvents;
 use crate::app::analyze::races::OutcomeCriteria;
+use crate::app::analyze::races::RaceCandidate;
 use crate::app::analyze::races::RaceStatus;
 use crate::app::analyze::races::RacingAccess;
 use crate::app::analyze::races::RacingAccesses;
@@ -48,6 +56,7 @@ use crate::app::analyze::races::Window;
 use crate::app::analyze::races::find_racing_accesses;
 use crate::app::analyze::races::outcome_point;
 use crate::app::analyze::rundata::RunData;
+use crate::app::analyze::rundata::TrialEnd;
 use crate::app::analyze::types::AnalyzeOpts;
 use crate::app::container::RunTimeoutMarker;
 
@@ -179,6 +188,14 @@ impl AnalyzeOpts {
     /// runs that both pass would otherwise yield a confident pair, so
     /// without it a replay that left its schedule leaves the section
     /// unavailable.
+    ///
+    /// Candidates are checked by intervention, a control replay and an
+    /// edited one each for at most [`CHECKED_CANDIDATES`]: `check_run` builds
+    /// a replay that follows the first `replay` events of a schedule of the
+    /// `role` run and then continues as the search's trials did. It gets the
+    /// run's name, `role`, the schedule, how many of its first events are as
+    /// that run realized them (whose callback checkpoints still apply), and
+    /// `replay`.
     pub(super) fn racing_accesses(
         &self,
         decision: usize,
@@ -186,6 +203,7 @@ impl AnalyzeOpts {
         baseline: TracedReplay,
         target_met: bool,
         stack_run: impl FnOnce(&str) -> anyhow::Result<RunData>,
+        mut check_run: impl FnMut(&str, &str, &[SchedEvent], usize, usize) -> anyhow::Result<RunData>,
     ) -> RacingAccesses {
         let mut decision = decision as EventIndex;
         let realized = if target_met {
@@ -261,9 +279,32 @@ impl AnalyzeOpts {
             result.notes.insert(0, note);
         }
         result.trace_files = vec![target_trace.file.clone(), baseline_trace.file.clone()];
+        if result.status == RaceStatus::Candidates {
+            let mut replay =
+                |name: &str, role: &str, schedule: &[SchedEvent], reversal: &Reversal| {
+                    check_replay(name, role, schedule, reversal, &mut check_run)
+                };
+            for (i, candidate) in result
+                .candidates
+                .iter_mut()
+                .take(CHECKED_CANDIDATES)
+                .enumerate()
+            {
+                candidate.check = Some(check_candidate(
+                    i + 1,
+                    candidate,
+                    [&target, &baseline],
+                    &mut replay,
+                ));
+            }
+            promote_the_deciding_candidate(&mut result);
+        }
         if matches!(
             result.status,
-            RaceStatus::Found | RaceStatus::Timing | RaceStatus::Candidates
+            RaceStatus::Found
+                | RaceStatus::Timing
+                | RaceStatus::Candidates
+                | RaceStatus::FoundByIntervention
         ) {
             self.attach_stacks(&mut result, &target_trace.trace, stack_run);
         }
@@ -421,6 +462,449 @@ fn guest_reached_a_refusal(error: &anyhow::Error) -> bool {
             .is_some()
 }
 
+/// How a check's replay ended, and where it left the schedule it followed
+/// (or why its recorded schedule gives none).
+type CheckOutcome = (anyhow::Result<TrialEnd>, Result<Option<Departure>, String>);
+
+/// Check `candidate` (the `index`th) by intervention: replay one of the
+/// two runs ([`edit_for`]) with the candidate's turn order reversed
+/// ([`reverse_turns`], which says what it moved), then continue as the
+/// search's trials did. A control replay of the same run without the
+/// reversal, to the same point and continued the same way, comes first:
+/// unless it ends as the run did, a changed outcome could come from where
+/// the replay stops following the schedule rather than from the
+/// reversal. Where a replay left its schedule is read before its outcome.
+fn check_candidate(
+    index: usize,
+    candidate: &RaceCandidate,
+    [target, baseline]: [&TracedReplay; 2],
+    replay: &mut impl FnMut(&str, &str, &[SchedEvent], &Reversal) -> CheckOutcome,
+) -> CandidateCheck {
+    let unchecked =
+        |edited: &str, edit: String, trial: Option<String>, why: String| CandidateCheck {
+            verdict: CheckVerdict::NotChecked,
+            edited: edited.to_string(),
+            edit,
+            moved: None,
+            trial,
+            detail: format!("was not checked: {why}"),
+        };
+    let Some(edit) = edit_for(candidate) else {
+        return unchecked(
+            "target",
+            "its two calls".to_string(),
+            None,
+            "one of them has no event in the target, and the baseline does not run them the \
+             other way round"
+                .to_string(),
+        );
+    };
+    let schedule = if edit.met_decides {
+        &baseline.realized
+    } else {
+        &target.realized
+    };
+    let reversal = match reverse_turns(schedule, edit.earlier, edit.later) {
+        Ok(reversal) => reversal,
+        Err(why) => {
+            return unchecked(
+                edit.role,
+                format!("events #{} and #{}", edit.later, edit.earlier),
+                None,
+                why,
+            );
+        }
+    };
+    let trial = format!("racing_candidate_{index}");
+    let control = format!("{trial}_control");
+    eprintln!(
+        ":: Checking race candidate {index}: reversing {} in the {} run, after a control \
+         replay without the reversal",
+        reversal.edit, edit.role
+    );
+    let (ended, left) = replay(&control, edit.role, schedule, &reversal);
+    if let Err(why) = control_reproduces(ended, left, edit.met_decides) {
+        return CandidateCheck {
+            moved: Some(reversal.moved),
+            ..unchecked(edit.role, reversal.edit, Some(control), why)
+        };
+    }
+    let (ended, left) = replay(&trial, edit.role, &reversal.schedule, &reversal);
+    let (verdict, detail) = verdict_of(ended, left, edit.met_decides);
+    CandidateCheck {
+        verdict,
+        edited: edit.role.to_string(),
+        edit: reversal.edit,
+        moved: Some(reversal.moved),
+        trial: Some(trial),
+        detail,
+    }
+}
+
+/// At most this many candidates are checked by intervention, each with a
+/// control replay and an edited one.
+pub const CHECKED_CANDIDATES: usize = 3;
+
+/// Which run a candidate's check edits, and the two events it reverses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Edit {
+    role: &'static str,
+    /// The event that runs first in the edited run, and the one after it.
+    earlier: usize,
+    later: usize,
+    /// Whether the reversal decides when the replay meets the target (an
+    /// edited baseline, which misses it) rather than when it misses it (an
+    /// edited target).
+    met_decides: bool,
+}
+
+/// The edit that reverses `candidate`'s order: in the target, where its
+/// first access runs before its second; or, when an access has no event in
+/// the target (a wait still pending at the outcome), in the baseline, where
+/// they run the other way round. `None` when neither run holds both.
+fn edit_for(candidate: &RaceCandidate) -> Option<Edit> {
+    let [first, second] = &candidate.accesses;
+    match (
+        first.event,
+        second.event,
+        first.baseline_event,
+        second.baseline_event,
+    ) {
+        (Some(a), Some(b), ..) if a < b => Some(Edit {
+            role: "target",
+            earlier: usize::try_from(a).ok()?,
+            later: usize::try_from(b).ok()?,
+            met_decides: false,
+        }),
+        (_, _, Some(a), Some(b)) if b < a => Some(Edit {
+            role: "baseline",
+            earlier: usize::try_from(b).ok()?,
+            later: usize::try_from(a).ok()?,
+            met_decides: true,
+        }),
+        _ => None,
+    }
+}
+
+/// A schedule with one candidate's turn order reversed.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Reversal {
+    /// The edited schedule.
+    pub schedule: Vec<SchedEvent>,
+    /// How many of its first events are as the run realized them: the
+    /// edited span starts there.
+    pub unchanged: usize,
+    /// How many of its events a replay follows: through the end of the
+    /// edited span, after which it continues without them.
+    pub replay: usize,
+    /// `moving 7 events of thread 53 before thread 21's turn at #39925,
+    /// crossing thread 3 (2 events)`.
+    pub edit: String,
+    /// The same, for the report's JSON.
+    pub moved: MovedEvents,
+}
+
+/// The run of consecutive events of one thread in `schedule` that holds
+/// `index`: that thread's turn.
+fn turn_at(schedule: &[SchedEvent], index: usize) -> std::ops::Range<usize> {
+    let thread = schedule[index].dettid;
+    let start = schedule[..index]
+        .iter()
+        .rposition(|event| event.dettid != thread)
+        .map_or(0, |i| i + 1);
+    let end = schedule[index..]
+        .iter()
+        .position(|event| event.dettid != thread)
+        .map_or(schedule.len(), |i| index + i);
+    start..end
+}
+
+/// Whether `event` is the return of a timed sleep, which cannot come before
+/// its deadline.
+fn is_timed_return(event: &SchedEvent) -> bool {
+    matches!(
+        event.op,
+        Op::Syscall(
+            Sysno::nanosleep | Sysno::clock_nanosleep,
+            SyscallPhase::Posthook
+        )
+    )
+}
+
+/// `schedule` with the turn holding event `later` (thread Y's) run before
+/// the turn holding event `earlier` (thread X's). Over the span from the
+/// start of X's turn to the end of Y's, Y's events move to its front; when
+/// one of them is a timed sleep's return, which cannot run before its
+/// deadline, X's events move to its back instead. That does not always
+/// help: holding X back pulls the other threads' events earlier, Y's sleep
+/// return among them, which can then still land before its deadline; such
+/// a replay leaves the schedule there, and the check is not_realized,
+/// naming the timed wait ([`not_realized`]). Each thread keeps the order of
+/// its own events, and the moved events cross every event of the other
+/// threads in the span: the result says how many moved and which threads,
+/// besides the pair, they crossed. An error when the two events are on one
+/// thread or not in that order.
+pub(super) fn reverse_turns(
+    schedule: &[SchedEvent],
+    earlier: usize,
+    later: usize,
+) -> Result<Reversal, String> {
+    if earlier >= later || later >= schedule.len() {
+        return Err(format!(
+            "the realized schedule does not hold events #{earlier} and #{later} in that order"
+        ));
+    }
+    let (x, y) = (schedule[earlier].dettid, schedule[later].dettid);
+    if x == y {
+        return Err("the two calls are on one thread".to_string());
+    }
+    let span = turn_at(schedule, earlier).start..turn_at(schedule, later).end;
+    let events = &schedule[span.clone()];
+    let advance = !events.iter().any(|e| e.dettid == y && is_timed_return(e));
+    let (mover, other, past, direction) = if advance {
+        (y, x, earlier, "before")
+    } else {
+        (x, y, later, "after")
+    };
+    let moved: Vec<SchedEvent> = events
+        .iter()
+        .filter(|e| e.dettid == mover)
+        .cloned()
+        .collect();
+    let rest: Vec<SchedEvent> = events
+        .iter()
+        .filter(|e| e.dettid != mover)
+        .cloned()
+        .collect();
+    let mut crossed: Vec<CrossedThread> = Vec::new();
+    for event in rest.iter().filter(|e| e.dettid != other) {
+        match crossed.iter_mut().find(|c| c.thread == event.dettid) {
+            Some(c) => c.events += 1,
+            None => crossed.push(CrossedThread {
+                thread: event.dettid,
+                events: 1,
+            }),
+        }
+    }
+    let mut edited = schedule[..span.start].to_vec();
+    if advance {
+        edited.extend(moved.iter().cloned());
+        edited.extend(rest);
+    } else {
+        edited.extend(rest);
+        edited.extend(moved.iter().cloned());
+    }
+    edited.extend_from_slice(&schedule[span.end..]);
+    let count = |n: usize| format!("{n} event{}", if n == 1 { "" } else { "s" });
+    let crossing = if crossed.is_empty() {
+        "crossing no other thread".to_string()
+    } else {
+        format!(
+            "crossing {}",
+            crossed
+                .iter()
+                .map(|c| format!("thread {} ({})", c.thread, count(c.events)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Ok(Reversal {
+        edit: format!(
+            "moving {} of thread {mover} {direction} thread {other}'s turn at #{past}, {crossing}",
+            count(moved.len())
+        ),
+        moved: MovedEvents {
+            thread: mover,
+            events: moved.len(),
+            direction: direction.to_string(),
+            past_event: past as EventIndex,
+            crossed,
+        },
+        schedule: edited,
+        unchanged: span.start,
+        replay: span.end,
+    })
+}
+
+/// Replay the first `reversal.replay` events of `schedule` (edited, or not
+/// for a control) of the `role` run with `check_run`, then continue as the
+/// search's trials did: how it ended, and where it left `schedule`, read
+/// from the schedule it recorded.
+fn check_replay(
+    runname: &str,
+    role: &str,
+    schedule: &[SchedEvent],
+    reversal: &Reversal,
+    check_run: &mut impl FnMut(&str, &str, &[SchedEvent], usize, usize) -> anyhow::Result<RunData>,
+) -> CheckOutcome {
+    let mut run = match check_run(runname, role, schedule, reversal.unchanged, reversal.replay) {
+        Ok(run) => run.with_schedule_recording(),
+        Err(error) => {
+            return (
+                Err(error.context("its replay could not be set up")),
+                Ok(None),
+            );
+        }
+    };
+    let path = run.sched_path_out().to_path_buf();
+    let ended = run.launch_trial();
+    let left =
+        realized_schedule(&path).map(|realized| departure(schedule, &realized, reversal.replay));
+    (ended, left)
+}
+
+/// The schedule a check's replay recorded at `path`, or why it gives none:
+/// absent, unreadable (a replay cut short leaves a partial one) or empty.
+fn realized_schedule(path: &Path) -> Result<Vec<SchedEvent>, String> {
+    if !path.exists() {
+        return Err("its replay recorded no schedule".to_string());
+    }
+    let realized = Recording::read(path)
+        .and_then(|recording| recording.into_legacy("a race candidate's check"))
+        .map(PreemptionRecord::into_global)
+        .map_err(|error| format!("the schedule its replay recorded cannot be read ({error:#})"))?;
+    if realized.is_empty() {
+        return Err("the schedule its replay recorded is empty".to_string());
+    }
+    Ok(realized)
+}
+
+/// Whether a check's control replay (the run's schedule without the
+/// reversal, replayed to the same point and continued the same way) ended
+/// as the run did: met the target for an edited target, missed it for an
+/// edited baseline (`met_decides`). Otherwise why the check cannot count.
+fn control_reproduces(
+    ended: anyhow::Result<TrialEnd>,
+    left: Result<Option<Departure>, String>,
+    met_decides: bool,
+) -> Result<(), String> {
+    let ended = ended.map_err(|error| format!("its control replay failed ({error:#})"))?;
+    match left {
+        Err(why) => return Err(format!("its control replay: {why}")),
+        Ok(Some(left)) => {
+            return Err(format!(
+                "its control replay, without the reversal, left the schedule: the replay {left}"
+            ));
+        }
+        Ok(None) => {}
+    }
+    match (ended, met_decides) {
+        (TrialEnd::Met, false) | (TrialEnd::Missed, true) => Ok(()),
+        (TrialEnd::Met, true) => Err(
+            "the continuation alone changes the outcome: replayed to the same point without the \
+             reversal and continued, the baseline run meets the target"
+                .to_string(),
+        ),
+        (TrialEnd::Missed, false) => Err(
+            "the continuation alone changes the outcome: replayed to the same point without the \
+             reversal and continued, the target run misses the target"
+                .to_string(),
+        ),
+        (TrialEnd::Unfinished(stop), _) => {
+            Err(format!("its control replay did not finish ({stop:?})"))
+        }
+    }
+}
+
+/// What a check's replay showed: `left`, where it left the edited schedule,
+/// is read before its outcome; then the outcome decides when it differs
+/// from the edited run's (met for an edited baseline, missed for an edited
+/// target, as `met_decides` says).
+fn verdict_of(
+    ended: anyhow::Result<TrialEnd>,
+    left: Result<Option<Departure>, String>,
+    met_decides: bool,
+) -> (CheckVerdict, String) {
+    let ended = match ended {
+        Ok(ended) => ended,
+        Err(error) => {
+            return (
+                CheckVerdict::NotChecked,
+                format!("was not checked: its replay failed ({error:#})"),
+            );
+        }
+    };
+    match left {
+        Err(why) => return (CheckVerdict::NotChecked, format!("was not checked: {why}")),
+        Ok(Some(left)) => {
+            return (CheckVerdict::NotRealized, not_realized(&left));
+        }
+        Ok(None) => {}
+    }
+    match (ended, met_decides) {
+        (TrialEnd::Met, true) => (
+            CheckVerdict::Decides,
+            "meets the target; the unedited control misses it".to_string(),
+        ),
+        (TrialEnd::Missed, false) => (
+            CheckVerdict::Decides,
+            "misses the target; the unedited control meets it".to_string(),
+        ),
+        (TrialEnd::Met, false) => (
+            CheckVerdict::DoesNotDecide,
+            "still meets the target, as the unedited control does".to_string(),
+        ),
+        (TrialEnd::Missed, true) => (
+            CheckVerdict::DoesNotDecide,
+            "still misses the target, as the unedited control does".to_string(),
+        ),
+        (TrialEnd::Unfinished(stop), _) => (
+            CheckVerdict::NotChecked,
+            format!("was not checked: its replay did not finish ({stop:?})"),
+        ),
+    }
+}
+
+/// Why a check's replay shows nothing: where it left the edited schedule.
+/// Reaching a timed sleep's return early is named, since no reversal that
+/// runs the return sooner can be replayed: the sleep has not expired there.
+fn not_realized(left: &Departure) -> String {
+    match left {
+        Departure::OtherEvent { expected, .. } if is_timed_return(expected) => format!(
+            "cannot be replayed as edited: the edit moves thread {}'s timed wait return before \
+             its deadline (the replay {left})",
+            expected.dettid
+        ),
+        _ => format!("cannot be replayed as edited: the replay {left}"),
+    }
+}
+
+/// With exactly one candidate whose check decides, report it as found by
+/// intervention: its accesses become the pair, and the candidates stay
+/// listed with their checks.
+fn promote_the_deciding_candidate(result: &mut RacingAccesses) {
+    let deciding: Vec<usize> = result
+        .candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            c.check
+                .as_ref()
+                .is_some_and(|check| check.verdict == CheckVerdict::Decides)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let [index] = deciding.as_slice() else {
+        return;
+    };
+    let candidate = &result.candidates[*index];
+    let Some(check) = &candidate.check else {
+        return;
+    };
+    result.reason = format!(
+        "reversing this turn order ({}) in the {} run {} ({}.repro in the workspace), and no \
+         other checked candidate's reversal changes the outcome",
+        check.edit,
+        check.edited,
+        check.detail,
+        check.trial.as_deref().unwrap_or("the check")
+    );
+    result.status = RaceStatus::FoundByIntervention;
+    result.resource = candidate.resource.clone();
+    result.accesses = candidate.accesses.to_vec();
+    result.order = Some(candidate.order.clone());
+}
+
 /// Where to compare `target` and `baseline` as they ran, when one of them
 /// left its schedule before `decision`: the first event at which their
 /// realized schedules run different threads (or the shorter one ends), with
@@ -539,6 +1023,7 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use detcore_model::pid::DetTid;
 
     use super::*;
 
@@ -658,6 +1143,10 @@ mod tests {
         };
         let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         let no_stacks = |_: &str| -> anyhow::Result<RunData> { anyhow::bail!("no stacks here") };
+        let no_checks =
+            |_: &str, _: &str, _: &[SchedEvent], _: usize, _: usize| -> anyhow::Result<RunData> {
+                anyhow::bail!("no checks here")
+            };
         let r = options.racing_accesses(
             1,
             replay(
@@ -674,6 +1163,7 @@ mod tests {
             ),
             true,
             no_stacks,
+            no_checks,
         );
         assert_ne!(r.status, RaceStatus::Unavailable, "{}", r.reason);
         assert_eq!(r.decision, 3);
@@ -702,6 +1192,7 @@ mod tests {
             ),
             true,
             no_stacks,
+            no_checks,
         );
         assert_eq!(r.status, RaceStatus::Unavailable);
         assert!(
@@ -729,6 +1220,7 @@ mod tests {
             ),
             false,
             no_stacks,
+            no_checks,
         );
         assert_eq!(r.status, RaceStatus::Unavailable);
         assert!(
@@ -755,6 +1247,7 @@ mod tests {
             ),
             true,
             no_stacks,
+            no_checks,
         );
         assert_eq!(r.status, RaceStatus::Unavailable);
         assert_eq!(
@@ -762,5 +1255,367 @@ mod tests {
             "the target replay left its schedule too early: the two replays first run different \
              threads at event 3, before their traces begin (event 4)"
         );
+    }
+
+    /// The threads of `schedule`, one letter per event.
+    fn threads(schedule: &[SchedEvent]) -> String {
+        schedule
+            .iter()
+            .map(|e| char::from(b'a' + e.dettid.as_raw() as u8))
+            .collect()
+    }
+
+    /// A schedule with one event per letter, thread `a` = 0.
+    fn schedule_of(letters: &str) -> Vec<SchedEvent> {
+        letters
+            .bytes()
+            .map(|b| SchedEvent::branches(DetTid::from_raw(i32::from(b - b'a')), 1))
+            .collect()
+    }
+
+    #[test]
+    fn a_reversal_moves_the_later_turn_and_says_what_it_crossed() {
+        // y's turn moves before x's: from the start of x's turn to the end
+        // of y's; the events before and after stay as they ran.
+        let r = reverse_turns(&schedule_of("axxyyb"), 2, 3).unwrap();
+        assert_eq!(threads(&r.schedule), "ayyxxb");
+        assert_eq!((r.unchanged, r.replay), (1, 5));
+        assert_eq!(
+            r.edit,
+            "moving 2 events of thread 24 before thread 23's turn at #2, crossing no other thread"
+        );
+        // A third thread between them is crossed, and said.
+        let r = reverse_turns(&schedule_of("xzzwyy"), 0, 4).unwrap();
+        assert_eq!(threads(&r.schedule), "yyxzzw");
+        assert_eq!(
+            r.edit,
+            "moving 2 events of thread 24 before thread 23's turn at #0, crossing thread 25 (2 \
+             events), thread 22 (1 event)"
+        );
+        assert_eq!(
+            r.moved,
+            MovedEvents {
+                thread: DetTid::from_raw(24),
+                events: 2,
+                direction: "before".to_string(),
+                past_event: 0,
+                crossed: vec![
+                    CrossedThread {
+                        thread: DetTid::from_raw(25),
+                        events: 2
+                    },
+                    CrossedThread {
+                        thread: DetTid::from_raw(22),
+                        events: 1
+                    },
+                ],
+            }
+        );
+        // When y's turn holds a timed sleep's return, which cannot come
+        // before its deadline, x's events are held back instead.
+        let mut schedule = schedule_of("xzy");
+        schedule[2].op = Op::Syscall(Sysno::nanosleep, SyscallPhase::Posthook);
+        let r = reverse_turns(&schedule, 0, 2).unwrap();
+        assert_eq!(threads(&r.schedule), "zyx");
+        assert_eq!(
+            r.edit,
+            "moving 1 event of thread 23 after thread 24's turn at #2, crossing thread 25 (1 \
+             event)"
+        );
+        // One thread, the wrong order, or past the schedule: refused.
+        assert!(reverse_turns(&schedule_of("xxx"), 0, 2).is_err());
+        assert!(reverse_turns(&schedule_of("xy"), 1, 0).is_err());
+        assert!(reverse_turns(&schedule_of("xy"), 0, 5).is_err());
+    }
+
+    /// A candidate whose two accesses run at `target` and `baseline` events.
+    fn candidate_at(target: [Option<u64>; 2], baseline: [Option<u64>; 2]) -> RaceCandidate {
+        let access = |i: usize| RacingAccess {
+            thread: DetTid::from_raw(3 + i as i32),
+            nth: 1,
+            at: crate::app::analyze::races::AccessPoint::Entry,
+            event: target[i],
+            baseline_event: baseline[i],
+            call: "read(3, 0x1000, 8)".to_string(),
+            result: "8".to_string(),
+            baseline_result: Some("8".to_string()),
+            baseline_differs_from: None,
+            ended_first_by: None,
+            stack: None,
+        };
+        RaceCandidate {
+            resource: None,
+            accesses: [access(0), access(1)],
+            order: crate::app::analyze::races::RaceOrder {
+                target: [0, 1],
+                baseline: [1, 0],
+            },
+            reaches_outcome: true,
+            events_before_outcome: None,
+            evidence: "the evidence".to_string(),
+            check: None,
+        }
+    }
+
+    #[test]
+    fn a_check_edits_the_target_or_else_the_baseline() {
+        assert_eq!(
+            edit_for(&candidate_at([Some(10), Some(20)], [Some(30), Some(25)])),
+            Some(Edit {
+                role: "target",
+                earlier: 10,
+                later: 20,
+                met_decides: false,
+            })
+        );
+        // A wait still pending at the outcome has no target event: the
+        // baseline, where the two run the other way round, is edited.
+        assert_eq!(
+            edit_for(&candidate_at([Some(10), None], [Some(30), Some(25)])),
+            Some(Edit {
+                role: "baseline",
+                earlier: 25,
+                later: 30,
+                met_decides: true,
+            })
+        );
+        assert_eq!(
+            edit_for(&candidate_at([Some(10), None], [Some(25), None])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_replay_that_leaves_the_edit_is_not_realized_whatever_its_outcome() {
+        let left = Departure::OtherEvent {
+            index: 4,
+            expected: SchedEvent::branches(DetTid::from_raw(3), 1),
+            ran: SchedEvent::branches(DetTid::from_raw(5), 1),
+        };
+        for ended in [TrialEnd::Met, TrialEnd::Missed] {
+            let (verdict, detail) = verdict_of(Ok(ended), Ok(Some(left.clone())), false);
+            assert_eq!(verdict, CheckVerdict::NotRealized);
+            assert!(
+                detail.starts_with("cannot be replayed as edited: the replay ran"),
+                "{detail}"
+            );
+        }
+        // Leaving it where a timed sleep was to return says so.
+        let mut nap = SchedEvent::branches(DetTid::from_raw(7), 1);
+        nap.op = Op::Syscall(Sysno::clock_nanosleep, SyscallPhase::Posthook);
+        let early = Departure::OtherEvent {
+            index: 4,
+            expected: nap,
+            ran: SchedEvent::branches(DetTid::from_raw(5), 1),
+        };
+        let (verdict, detail) = verdict_of(Ok(TrialEnd::Met), Ok(Some(early)), false);
+        assert_eq!(verdict, CheckVerdict::NotRealized);
+        assert!(
+            detail.starts_with(
+                "cannot be replayed as edited: the edit moves thread 7's timed wait return \
+                 before its deadline (the replay ran"
+            ),
+            "{detail}"
+        );
+        assert_eq!(
+            verdict_of(Ok(TrialEnd::Missed), Ok(None), false),
+            (
+                CheckVerdict::Decides,
+                "misses the target; the unedited control meets it".to_string()
+            )
+        );
+        assert_eq!(
+            verdict_of(Ok(TrialEnd::Met), Ok(None), false).0,
+            CheckVerdict::DoesNotDecide
+        );
+        assert_eq!(
+            verdict_of(Ok(TrialEnd::Met), Ok(None), true),
+            (
+                CheckVerdict::Decides,
+                "meets the target; the unedited control misses it".to_string()
+            )
+        );
+        assert_eq!(
+            verdict_of(Ok(TrialEnd::Missed), Ok(None), true).0,
+            CheckVerdict::DoesNotDecide
+        );
+        assert_eq!(
+            verdict_of(Err(anyhow::anyhow!("refused")), Ok(None), false).0,
+            CheckVerdict::NotChecked
+        );
+        // A schedule that cannot be read decides nothing.
+        assert_eq!(
+            verdict_of(Ok(TrialEnd::Missed), Err("unreadable".to_string()), false),
+            (
+                CheckVerdict::NotChecked,
+                "was not checked: unreadable".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn exactly_one_deciding_candidate_is_found_by_intervention() {
+        let checked = |verdict| {
+            let mut c = candidate_at([Some(10), Some(20)], [Some(30), Some(25)]);
+            c.check = Some(CandidateCheck {
+                verdict,
+                edited: "target".to_string(),
+                edit: "moving 1 event of thread 4 before thread 3's turn at #10, crossing no \
+                       other thread"
+                    .to_string(),
+                moved: None,
+                trial: Some("racing_candidate_1".to_string()),
+                detail: "misses the target; the unedited control meets it".to_string(),
+            });
+            c
+        };
+        let mut r = RacingAccesses::unavailable(5, "x".to_string());
+        r.status = RaceStatus::Candidates;
+        r.candidates = vec![
+            checked(CheckVerdict::NotRealized),
+            checked(CheckVerdict::Decides),
+            checked(CheckVerdict::DoesNotDecide),
+        ];
+        let mut one = r.clone();
+        promote_the_deciding_candidate(&mut one);
+        assert_eq!(one.status, RaceStatus::FoundByIntervention);
+        assert_eq!(one.accesses, r.candidates[1].accesses.to_vec());
+        assert_eq!(
+            one.reason,
+            "reversing this turn order (moving 1 event of thread 4 before thread 3's turn at #10, \
+             crossing no other thread) in the target run misses the target; the unedited control \
+             meets it (racing_candidate_1.repro in the workspace), and no other checked \
+             candidate's reversal changes the outcome"
+        );
+        let text = crate::app::analyze::races::render_racing_accesses(&one);
+        assert!(
+            text.starts_with("Racing accesses, found by intervention, not as an order the two runs show: reversing")
+                && text.contains("Candidates checked:\n  1. the evidence.")
+                && text.contains("   Check: decides: reversing this turn order (moving 1 event of thread 4 before thread 3's turn at #10, crossing no other thread) in the target run misses the target; the unedited control meets it (racing_candidate_1.repro)."),
+            "{text}"
+        );
+
+        // Two that decide: still candidates.
+        let mut two = r.clone();
+        two.candidates[2] = checked(CheckVerdict::Decides);
+        promote_the_deciding_candidate(&mut two);
+        assert_eq!(two.status, RaceStatus::Candidates);
+        assert!(two.accesses.is_empty());
+    }
+
+    #[test]
+    fn a_check_counts_only_when_its_control_ends_as_the_run_did() {
+        // An edited target must meet the target without the reversal, an
+        // edited baseline miss it.
+        assert_eq!(
+            control_reproduces(Ok(TrialEnd::Met), Ok(None), false),
+            Ok(())
+        );
+        assert_eq!(
+            control_reproduces(Ok(TrialEnd::Missed), Ok(None), true),
+            Ok(())
+        );
+        assert_eq!(
+            control_reproduces(Ok(TrialEnd::Missed), Ok(None), false),
+            Err(
+                "the continuation alone changes the outcome: replayed to the same point without \
+                 the reversal and continued, the target run misses the target"
+                    .to_string()
+            )
+        );
+        assert!(
+            control_reproduces(Ok(TrialEnd::Met), Ok(None), true)
+                .unwrap_err()
+                .starts_with("the continuation alone changes the outcome")
+        );
+        let left = Departure::Ended { events: 3 };
+        assert!(
+            control_reproduces(Ok(TrialEnd::Met), Ok(Some(left)), false)
+                .unwrap_err()
+                .starts_with("its control replay, without the reversal, left the schedule")
+        );
+        assert!(control_reproduces(Ok(TrialEnd::Met), Err("x".to_string()), false).is_err());
+        assert!(control_reproduces(Err(anyhow::anyhow!("refused")), Ok(None), false).is_err());
+    }
+
+    #[test]
+    fn a_missing_empty_or_partial_realized_schedule_gives_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            realized_schedule(&dir.path().join("absent.preempts")),
+            Err("its replay recorded no schedule".to_string())
+        );
+        let empty = dir.path().join("empty.preempts");
+        std::fs::write(&empty, "").unwrap();
+        assert!(realized_schedule(&empty).is_err());
+        let no_events = dir.path().join("no_events.preempts");
+        PreemptionRecord::from_sched_events(Vec::new())
+            .write_to_disk(&no_events)
+            .unwrap();
+        assert_eq!(
+            realized_schedule(&no_events),
+            Err("the schedule its replay recorded is empty".to_string())
+        );
+        let partial = dir.path().join("partial.preempts");
+        std::fs::write(&partial, "{\"version\": 1, \"events\": [").unwrap();
+        assert!(realized_schedule(&partial).is_err());
+    }
+
+    /// A check replays the unedited schedule first, as a control, and the
+    /// edited one only when the control ends as the run did.
+    #[test]
+    fn a_check_replays_its_control_first_and_counts_only_when_it_reproduces() {
+        let dir = tempfile::tempdir().unwrap();
+        let realized: Vec<SchedEvent> = [3, 3, 4, 4]
+            .iter()
+            .map(|&t| SchedEvent::branches(DetTid::from_raw(t), 1))
+            .collect();
+        let run = |role| TracedReplay {
+            role,
+            trace: Err("no trace".to_string()),
+            departure: None,
+            realized: realized.clone(),
+            realized_path: dir.path().join(format!("{role}.preempts")),
+            schedule_error: None,
+        };
+        let (target, baseline) = (run("target"), run("baseline"));
+        let candidate = candidate_at([Some(1), Some(2)], [Some(2), Some(1)]);
+        let tids = |schedule: &[SchedEvent]| -> Vec<i32> {
+            schedule.iter().map(|e| e.dettid.as_raw()).collect()
+        };
+        let check = |control: TrialEnd, edited: TrialEnd| {
+            let mut calls = Vec::new();
+            let mut replay = |name: &str, _: &str, schedule: &[SchedEvent], _: &Reversal| {
+                calls.push((name.to_string(), tids(schedule)));
+                let end = if name.ends_with("_control") {
+                    control
+                } else {
+                    edited
+                };
+                (Ok(end), Ok(None))
+            };
+            let result = check_candidate(1, &candidate, [&target, &baseline], &mut replay);
+            (result, calls)
+        };
+        let (decides, calls) = check(TrialEnd::Met, TrialEnd::Missed);
+        assert_eq!(decides.verdict, CheckVerdict::Decides);
+        assert_eq!(decides.trial.as_deref(), Some("racing_candidate_1"));
+        assert_eq!(
+            calls,
+            vec![
+                ("racing_candidate_1_control".to_string(), vec![3, 3, 4, 4]),
+                ("racing_candidate_1".to_string(), vec![4, 4, 3, 3]),
+            ]
+        );
+        let (unchecked, calls) = check(TrialEnd::Missed, TrialEnd::Missed);
+        assert_eq!(unchecked.verdict, CheckVerdict::NotChecked);
+        assert!(
+            unchecked
+                .detail
+                .starts_with("was not checked: the continuation alone changes the outcome"),
+            "{}",
+            unchecked.detail
+        );
+        assert_eq!(calls.len(), 1);
     }
 }

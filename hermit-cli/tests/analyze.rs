@@ -56,6 +56,7 @@ struct AnalyzeWorkloads {
     fd_reuse_close_race: PathBuf,
     race_then: PathBuf,
     refusal_after_race: PathBuf,
+    rpc_shutdown_removes_client: PathBuf,
 }
 
 fn command_output(mut command: Command, label: &str) -> Output {
@@ -219,6 +220,12 @@ fn workloads() -> &'static AnalyzeWorkloads {
             &refusal_after_race,
         );
 
+        let rpc_shutdown_removes_client = build_root.join("rpc_shutdown_removes_client");
+        compile_c_pthread(
+            &repository.join("tests/c/rpc_shutdown_removes_client.c"),
+            &rpc_shutdown_removes_client,
+        );
+
         AnalyzeWorkloads {
             hello_race,
             racewrite_nostdlib,
@@ -226,6 +233,7 @@ fn workloads() -> &'static AnalyzeWorkloads {
             fd_reuse_close_race,
             race_then,
             refusal_after_race,
+            rpc_shutdown_removes_client,
         }
     })
 }
@@ -446,6 +454,63 @@ fn analyze_racewrite_nostdlib_prefix_search() {
         thread("critical_event2"),
         "{report}"
     );
+}
+
+/// A shutdown that removes a client before the server looks it up
+/// (tests/c/rpc_shutdown_removes_client.c): the race is in memory, so the
+/// finder can only rank candidates, first the server's change of course
+/// against the deciding event. The report checks each candidate by
+/// intervention. Moving the server's turn before the shutdown's crosses the
+/// client and the poller, and the check says how many events of each; the
+/// server then cannot run as edited (it needs the request that now comes
+/// after it), so the check is not realized rather than a verdict. No
+/// poller nap decides.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
+    let report = run_analyze(
+        "analyze rpc_shutdown_removes_client --prefix-search",
+        &workloads().rpc_shutdown_removes_client,
+        &[
+            "--prefix-search",
+            "--run-arg=--base-env=empty",
+            "--target-stdout=call failed",
+        ],
+        "call failed",
+    );
+    let racing = &report["racing_accesses"];
+    assert_eq!(racing["status"], "candidates", "{report}");
+    let candidates = racing["candidates"].as_array().cloned().unwrap_or_default();
+    let calls = |c: &serde_json::Value| -> Vec<String> {
+        (0..2)
+            .map(|i| c["accesses"][i]["call"].as_str().unwrap_or("").to_owned())
+            .collect()
+    };
+    let change = candidates
+        .iter()
+        .find(|c| calls(c).iter().any(|call| call.contains("not found")))
+        .unwrap_or_else(|| panic!("no candidate names the server's change: {report}"));
+    let check = &change["check"];
+    assert_eq!(check["verdict"], "not_realized", "{report}");
+    assert!(
+        check["edit"].as_str().unwrap_or("").starts_with("moving ")
+            && check["moved"]["events"].as_u64().unwrap_or(0) > 0
+            && !check["moved"]["crossed"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .is_empty(),
+        "{report}"
+    );
+    for candidate in &candidates {
+        assert!(candidate["check"].is_object(), "{report}");
+        if calls(candidate)
+            .iter()
+            .any(|call| call.starts_with("nanosleep("))
+        {
+            assert_ne!(candidate["check"]["verdict"], "decides", "{report}");
+        }
+    }
 }
 
 /// A deferred second close of a descriptor number another thread reopened

@@ -2600,6 +2600,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/rpc_shutdown_removes_client.c",
+      "runner": "hermit-cli/tests/analyze.rs",
+      "why": "tests/c/rpc_shutdown_removes_client.c is owned by hermit-cli/tests/analyze.rs: The ignored analyze test compiles this guest, a shutdown thread that removes a client before the server looks it up, with a poller napping throughout, and checks that hermit analyze --prefix-search checks its race candidates by intervention, saying how many events each edit moved and which threads they crossed, and that no poller nap decides."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/sabre_exit_group_parked.c",
       "runner": "hermit-cli/tests/hermit_modes.rs",
       "why": "tests/c/sabre_exit_group_parked.c is owned by hermit-cli/tests/hermit_modes.rs: The Rust integration test compiles this SaBRe-only lifecycle guest, supplies the reviewed loader, enforces strict verification, and owns bounded process-group cleanup; a generic manifest cell cannot express that backend-specific setup and timeout contract."

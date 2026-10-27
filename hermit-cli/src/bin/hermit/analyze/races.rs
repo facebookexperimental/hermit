@@ -156,6 +156,13 @@ pub enum RaceStatus {
     /// Several pairs or timed calls whose order changes, none of which the
     /// evidence singles out; `candidates` ranks them.
     Candidates,
+    /// Candidates, of which exactly one decides by intervention: a replay
+    /// with that one's turn order reversed (its check says which events
+    /// moved, and which threads' events they crossed) changes whether the
+    /// run meets the target, while the unedited control replay does not.
+    /// `accesses` are that candidate's. The two runs did not show it as a
+    /// race of their own.
+    FoundByIntervention,
     /// The traces cover the window and hold neither kind of pair.
     NoneFound,
     /// The traces cannot answer.
@@ -372,6 +379,95 @@ pub struct RaceCandidate {
     /// The evidence, in a sentence: which threads, what flipped, the
     /// distance to the outcome and the happens-before relation.
     pub evidence: String,
+    /// What a replay with this candidate's order reversed showed, when the
+    /// report checked it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<CandidateCheck>,
+}
+
+/// What reversing one candidate's order showed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckVerdict {
+    /// The reversed replay changed whether the run meets the target, and the
+    /// unedited control did not.
+    Decides,
+    /// The reversed replay ended as the run it edits did.
+    DoesNotDecide,
+    /// The replay could not follow the edited schedule (a moved event
+    /// needed one that now comes after it), so it shows nothing.
+    NotRealized,
+    /// No replay answered: there was nothing to move, or it did not finish.
+    NotChecked,
+}
+
+/// A check by intervention of one candidate: the edit, the replay and what
+/// it showed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CandidateCheck {
+    pub verdict: CheckVerdict,
+    /// The run whose realized schedule was edited, `target` or `baseline`.
+    pub edited: String,
+    /// The edit: `moving 7 events of thread 53 before thread 21's turn at
+    /// #39925, crossing thread 3 (2 events)`.
+    pub edit: String,
+    /// What the edit moved, when it made one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved: Option<MovedEvents>,
+    /// The replay's name in the workspace (its reproducer is
+    /// `<trial>.repro`), when one ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial: Option<String>,
+    /// What the replay did, or why none answered.
+    pub detail: String,
+}
+
+/// The events a check's edit moved: one thread's, past the other thread's
+/// turn, and the events of other threads they crossed on the way.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MovedEvents {
+    /// The thread whose events moved.
+    pub thread: DetTid,
+    /// How many of its events moved.
+    pub events: usize,
+    /// `before` the other thread's turn (they now run earlier) or `after`
+    /// it (they are held back).
+    pub direction: String,
+    /// The event of the other access, whose turn they now precede or follow.
+    pub past_event: EventIndex,
+    /// The threads other than the pair whose events they crossed, with how
+    /// many of each; empty when they crossed only the other thread's.
+    pub crossed: Vec<CrossedThread>,
+}
+
+/// One thread's events that a check's edit moved others across.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CrossedThread {
+    pub thread: DetTid,
+    pub events: usize,
+}
+
+impl CandidateCheck {
+    /// `decides: reversing this turn order (moving 7 events of thread 53
+    /// before thread 21's turn at #39925, crossing thread 3 (2 events)) in
+    /// the target run misses the target; the unedited control meets it
+    /// (racing_candidate_1.repro)`.
+    pub fn sentence(&self) -> String {
+        let verdict = match self.verdict {
+            CheckVerdict::Decides => "decides",
+            CheckVerdict::DoesNotDecide => "does not decide",
+            CheckVerdict::NotRealized => "not realized",
+            CheckVerdict::NotChecked => "not checked",
+        };
+        let trial = self
+            .trial
+            .as_ref()
+            .map_or(String::new(), |t| format!(" ({t}.repro)"));
+        format!(
+            "{verdict}: reversing this turn order ({}) in the {} run {}{trial}",
+            self.edit, self.edited, self.detail
+        )
+    }
 }
 
 /// At most this many candidates are listed.
@@ -2790,6 +2886,7 @@ impl<'a> Finder<'a> {
                 reaches_outcome: toward.as_ref().is_some_and(|(v, _)| v.ordered),
                 events_before_outcome: toward.map(|(_, d)| d),
                 evidence,
+                check: None,
             },
         ))
     }
@@ -2858,6 +2955,7 @@ impl<'a> Finder<'a> {
             reaches_outcome: toward.as_ref().is_some_and(|(v, _)| v.ordered),
             events_before_outcome: toward.map(|(_, d)| d),
             evidence,
+            check: None,
         }
     }
 
@@ -2906,6 +3004,7 @@ impl<'a> Finder<'a> {
             reaches_outcome: toward.as_ref().is_some_and(|(v, _)| v.ordered),
             events_before_outcome: toward.map(|(_, d)| d),
             evidence,
+            check: None,
         }
     }
 
@@ -2951,6 +3050,7 @@ impl<'a> Finder<'a> {
             reaches_outcome: toward.as_ref().is_some_and(|(v, _)| v.ordered),
             events_before_outcome: toward.map(|(_, d)| d),
             evidence,
+            check: None,
         }
     }
 
@@ -3689,6 +3789,17 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
              The order that flips is the return order of two timed calls:",
             r.decision
         )),
+        RaceStatus::FoundByIntervention => {
+            let resource = r
+                .resource
+                .as_ref()
+                .map_or(String::new(), |x| format!(" ({})", x.text));
+            lines.push(format!(
+                "Racing accesses{resource}, found by intervention, not as an order the two \
+                 runs show: {}.",
+                r.reason
+            ));
+        }
         RaceStatus::Candidates => {
             lines.push(format!("Racing accesses: {}.", r.reason));
             lines.push(
@@ -3696,12 +3807,7 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
                  tell which decides):"
                     .to_string(),
             );
-            for (i, c) in r.candidates.iter().enumerate() {
-                lines.push(format!("  {}. {}.", i + 1, c.evidence));
-                let [a, b] = &c.accesses;
-                lines.extend(access_lines([a, b]).into_iter().map(|l| format!("   {l}")));
-                lines.extend(stack_lines([a, b]));
-            }
+            lines.extend(candidate_lines(r));
             if let Some(o) = &r.outcome {
                 lines.push(format!(
                     "Outcome: {} by thread {} at #{}.",
@@ -3747,8 +3853,27 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
             lines.push(format!("  and {} more", r.more_reordered));
         }
     }
+    if r.status == RaceStatus::FoundByIntervention {
+        lines.push("Candidates checked:".to_string());
+        lines.extend(candidate_lines(r));
+    }
     lines.extend(r.notes.iter().cloned());
     lines.join("\n")
+}
+
+/// Each candidate: its evidence, its accesses, their stacks and its check.
+fn candidate_lines(r: &RacingAccesses) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (i, c) in r.candidates.iter().enumerate() {
+        lines.push(format!("  {}. {}.", i + 1, c.evidence));
+        let [a, b] = &c.accesses;
+        lines.extend(access_lines([a, b]).into_iter().map(|l| format!("   {l}")));
+        lines.extend(stack_lines([a, b]));
+        if let Some(check) = &c.check {
+            lines.push(format!("   Check: {}.", check.sentence()));
+        }
+    }
+    lines
 }
 
 /// Each access's stack at its entry, when the report took it.
@@ -7642,6 +7767,7 @@ mod tests {
             reaches_outcome: true,
             events_before_outcome: Some(10),
             evidence: "the evidence".to_string(),
+            check: None,
         }];
         let text = render_racing_accesses(&candidates);
         assert!(
