@@ -1128,6 +1128,60 @@ stores `once`, so analyze refuses it beside a chaos target. Re-record it with
 `--expired-wait-charge=each`, or, if it is the target, pass
 `--expired-wait-charge=once` in the run arguments.
 
+#### Racing accesses
+
+The report ends with a "Racing accesses" section (`racing_accesses` in a
+`--report-file`; `--no-racing-accesses` leaves it out). The final replays on
+each side of the deciding event record an access trace, and analyze compares
+the two from that event on. Its `status` says how far the evidence goes:
+
+| Status | Meaning |
+| --- | --- |
+| `found` | The evidence singles out one pair of conflicting syscalls on two threads whose order flips between the runs. |
+| `timing` | No conflicting pair; two timed calls whose return order flips. |
+| `candidates` | Up to three ranked candidates, none singled out; each says what differs between the runs. |
+| `found_by_intervention` | Exactly one candidate whose reversal changes the outcome while an unedited control does not. |
+| `none_found`, `unavailable` | Neither, with the reason. |
+
+A rank is not a verdict. Candidates are listed by kind of evidence: a thread's
+change of course that fed the outcome's input first, then waits in flight
+across the deciding event, then order flips the evidence supports, then the
+rest. Analyze checks each candidate by replaying one run with the candidate's
+turn order reversed, beside a control replay without the reversal, and the
+candidate's `Check:` line (`check` in the report file) says what that showed:
+`decides` (the reversal changed whether the run meets the target, and the
+control did not), `does not decide`, `not realized` (the replay could not
+follow the edited schedule; a timed sleep, for example, cannot return before
+its deadline) or `not checked`, with how many events the edit moved and which
+threads' events they crossed. A candidate whose check does not decide ends
+"not shown to decide", whatever its rank. Only `found_by_intervention` says an
+order decides the outcome. In a report file that sentence is not part of a
+candidate's `evidence`: read its `check.verdict`, which is `decides` only for
+a candidate shown to decide.
+
+For example, an RPC server's shutdown removes a client in memory just before
+the server's default handler looks the client up. No syscall shows that order,
+so the first candidate is the handler thread's change of course against the
+call the deciding event runs. The two run in the same order in both runs (in
+the baseline the order is measured at the handler's call of the same number,
+which there takes another course), and an edge Hermit observes orders them, so
+the candidate is listed for the change rather than for an order flip, and its
+check could not replay the reversal (stacks and part of the Check line left
+out):
+
+```text
+Racing accesses: thread 3's read(5, 0x7fffffffec48, 4) returns 4 in both runs but reaches different data; it takes its data from a thread whose calls change course after the deciding event, and no access Hermit sees changes order around that change.
+Candidates, ranked (each says what differs between the runs; a rank is not a verdict, and a candidate decides only where its check says so):
+  1. thread 3's read(5, 0x7fffffffec48, 4) returns 4 in both runs but reaches different data; it takes its data from thread 9's write (#716), and thread 9's calls change course at its call 5 (#704); the deciding event 668 runs thread 7's read; the two run in the same order in both runs (the changed call's counterpart enters at #703 in the baseline); ordered in the target by futex wake thread 7 #684 -> thread 9 #701; it is listed for that change, ahead of order flips, and no access Hermit sees changes order around it, so what decides may be an order in memory that syscalls do not show; thread 3's read is 24 events before the outcome and reaches it through program order; not shown to decide.
+     thread 7  #668  read(7, 0x7ffff73fde47, 1) = 1 (its return)
+     thread 9  #704  write(2, "server: client 3 not found, no handler", 39) = 39
+   Check: not realized: reversing this turn order (moving 8 events of thread 9 before thread 7's turn at #668, crossing thread 3 (1 event), thread 5 (3 events)) in the target run cannot be replayed as edited: the replay ran (...) at event #659, where the schedule has (...) (racing_candidate_1.repro).
+```
+
+Here thread 7 is the shutdown, thread 9 the default handler and thread 3 the
+client. The candidate names the right roles, but nothing in the two runs shows
+that their order decides the failure.
+
 ## Common Run Options
 
 ### Scheduling And Determinism

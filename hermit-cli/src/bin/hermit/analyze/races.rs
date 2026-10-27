@@ -6,7 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Names the two conflicting operations whose order decides the outcome.
+//! Names the conflicting operations whose order differs, around the deciding
+//! event, between a run that meets the target and one that does not. It
+//! shows what differs, not what decides: only a replay with an order
+//! reversed (the report's check by intervention) shows that one decides.
 //!
 //! Analyze finds the scheduling decision (event S) after which the guest
 //! meets its target, and replays the schedule with it (the target) and
@@ -153,8 +156,11 @@ pub enum RaceStatus {
     /// No conflicting pair; two timed waits or clock reads whose return
     /// order flips.
     Timing,
-    /// Several pairs or timed calls whose order changes, none of which the
-    /// evidence singles out; `candidates` ranks them.
+    /// Several pairs, changes of course or timed calls, none of which the
+    /// evidence singles out; `candidates` ranks them. A rank orders kinds of
+    /// evidence and is not a verdict: a candidate is shown to decide the
+    /// outcome only by its `check` (`decides`), and exactly one such makes
+    /// the status `found_by_intervention`.
     Candidates,
     /// Candidates, of which exactly one decides by intervention: a replay
     /// with that one's turn order reversed (its check says which events
@@ -358,7 +364,9 @@ pub struct ReorderedPair {
     pub accesses: [RacingAccess; 2],
 }
 
-/// One ranked entry of a `candidates` result.
+/// One ranked entry of a `candidates` result: what differs between the runs
+/// at one pair of calls. Its rank is the finder's order of kinds of
+/// evidence, not a finding that it decides; only its `check` can show that.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RaceCandidate {
     /// The resource the two accesses conflict on; `None` for two timed
@@ -367,7 +375,13 @@ pub struct RaceCandidate {
     pub resource: Option<ResourceText>,
     /// The two accesses, in target order.
     pub accesses: [RacingAccess; 2],
-    /// Their order in each run.
+    /// Their order in each run. For a change of course against the deciding
+    /// event, the baseline order is measured against the changed call's
+    /// counterpart there (the same thread's call of the same number), and
+    /// can be the same as the target's: that pair is listed for the change,
+    /// not for a flip. Without a counterpart the changed call sorts last in
+    /// the baseline, as any absent call does, and the evidence says no order
+    /// is measured there.
     pub order: RaceOrder,
     /// Whether the access the order is measured against (the victim, or the
     /// call whose time or course changed) happens before the outcome in the
@@ -376,8 +390,11 @@ pub struct RaceCandidate {
     /// Events from that access to the outcome in the target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events_before_outcome: Option<u64>,
-    /// The evidence, in a sentence: which threads, what flipped, the
-    /// distance to the outcome and the happens-before relation.
+    /// The evidence, in a sentence: which threads, what differs (an order
+    /// that flips, or a change of course whose order with the deciding event
+    /// stays the same), why it is listed, the distance to the outcome and
+    /// the happens-before relation. It says nothing of whether the pair
+    /// decides; `check` does.
     pub evidence: String,
     /// What a replay with this candidate's order reversed showed, when the
     /// report checked it.
@@ -2864,24 +2881,58 @@ impl<'a> Finder<'a> {
         let toward = self.toward_outcome(victim, outcome);
         let unordered = hb_ends(sides.map(|s| Some((s.op.target, s.at))), false)
             .map(|(from, to)| happens_before(&self.target.edges, from, to));
+        // The pair's baseline order, measured against the changed call's
+        // counterpart (the same thread's call of the same number, at its
+        // entry); none is claimed when it or the deciding call has none.
+        let counterpart = change.side.op.baseline;
+        let measured = match (counterpart, deciding.op.baseline) {
+            (Some(b), Some(_)) => {
+                let measured_change = Side {
+                    op: Op {
+                        target: change.side.op.target,
+                        baseline: Some(b),
+                    },
+                    at: AccessPoint::Entry,
+                };
+                let measured_sides = if deciding.target_key() < changed.target_key() {
+                    [deciding, measured_change]
+                } else {
+                    [measured_change, deciding]
+                };
+                Ok((self.order_of(measured_sides), b.pre))
+            }
+            (None, _) => Err("the changed call"),
+            (Some(_), None) => Err("the deciding call"),
+        };
+        let order = match &measured {
+            Ok((order, _)) => order.clone(),
+            Err(_) => self.order_of(sides),
+        };
         let evidence = format!(
-            "{}; it takes its data from {} (#{}), and {}; the deciding event {} runs {}; {}; no \
-             access Hermit sees changes order around that change, so what decides may be an \
-             order in memory that syscalls do not show; {}",
+            "{}; it takes its data from {} (#{}), and {}; the deciding event {} runs {}; {}; it \
+             is listed for that change, ahead of order flips, and no access Hermit sees changes \
+             order around it, so what decides may be an order in memory that syscalls do not \
+             show; {}",
             describe(victim.op.target, victim.op.baseline),
             who(partner.op.target),
             partner.op.target.pre,
             change.text(),
             self.decision,
             who(deciding.op.target),
-            pair_hb_clause(unordered.as_ref()),
+            change_order_clause(
+                measured
+                    .as_ref()
+                    .map(|(order, at)| (order, *at))
+                    .map_err(|who| *who),
+                unordered.as_ref()
+            ),
             outcome_clause(who(victim.op.target), toward.as_ref())
         );
         Some((
             tid,
             RaceCandidate {
                 resource: None,
-                order: self.order_of(sides),
+                order,
                 accesses: sides.map(|side| self.access_of(side)),
                 reaches_outcome: toward.as_ref().is_some_and(|(v, _)| v.ordered),
                 events_before_outcome: toward.map(|(_, d)| d),
@@ -3450,6 +3501,59 @@ fn outcome_clause(name: String, toward: Option<&(HbVerdict, u64)>) -> String {
     }
 }
 
+/// How a change of course and the deciding call stand in the two runs, and
+/// what orders them in the target. `measured` is their order with the
+/// baseline side measured at the changed call's counterpart (and where that
+/// counterpart enters), or which of the two has no baseline counterpart, in
+/// which case no baseline order is claimed: `the two run in the same order
+/// in both runs (the changed call's counterpart enters at #112 in the
+/// baseline), ordered in the target by futex wake thread 21 #100 -> thread
+/// 53 #108`.
+fn change_order_clause(
+    measured: Result<(&RaceOrder, EventIndex), &str>,
+    verdict: Option<&HbVerdict>,
+) -> String {
+    let runs = match measured {
+        Ok((order, at)) if order.target == order.baseline => format!(
+            "the two run in the same order in both runs (the changed call's counterpart enters at \
+             #{at} in the baseline)"
+        ),
+        Ok((_, at)) => format!(
+            "the two run in one order in the target and the other in the baseline (the changed \
+             call's counterpart enters at #{at} there)"
+        ),
+        Err(which) => format!(
+            "{which} has no counterpart in the baseline, so the two have no order there to \
+             compare"
+        ),
+    };
+    match verdict {
+        Some(v) if v.ordered => {
+            format!("{runs}; ordered in the target by {}", edge_chain(&v.edges))
+        }
+        Some(_) => format!("{runs}; unordered by the edges Hermit observes in the target"),
+        None => format!("{runs}; one of the two has no target event"),
+    }
+}
+
+/// `futex wake thread 21 #100 -> thread 53 #108, then ...`.
+fn edge_chain(edges: &[HbEdge]) -> String {
+    edges
+        .iter()
+        .map(|e| {
+            format!(
+                "{} thread {} #{} -> thread {} #{}",
+                edge_kind_text(e.kind),
+                e.from.tid,
+                e.from.event,
+                e.to.tid,
+                e.to.event
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", then ")
+}
+
 /// Whether edges order the two accesses of a candidate pair in the target.
 fn pair_hb_clause(verdict: Option<&HbVerdict>) -> String {
     match verdict {
@@ -3803,8 +3907,8 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
         RaceStatus::Candidates => {
             lines.push(format!("Racing accesses: {}.", r.reason));
             lines.push(
-                "Candidates, ranked (each says what differs between the runs; Hermit cannot \
-                 tell which decides):"
+                "Candidates, ranked (each says what differs between the runs; a rank is not a \
+                 verdict, and a candidate decides only where its check says so):"
                     .to_string(),
             );
             lines.extend(candidate_lines(r));
@@ -3862,10 +3966,17 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
 }
 
 /// Each candidate: its evidence, its accesses, their stacks and its check.
+/// A candidate whose check does not decide says it is not shown to decide,
+/// whatever its rank.
 fn candidate_lines(r: &RacingAccesses) -> Vec<String> {
     let mut lines = Vec::new();
     for (i, c) in r.candidates.iter().enumerate() {
-        lines.push(format!("  {}. {}.", i + 1, c.evidence));
+        let decides = c
+            .check
+            .as_ref()
+            .is_some_and(|check| check.verdict == CheckVerdict::Decides);
+        let verdict = if decides { "" } else { "; not shown to decide" };
+        lines.push(format!("  {}. {}{verdict}.", i + 1, c.evidence));
         let [a, b] = &c.accesses;
         lines.extend(access_lines([a, b]).into_iter().map(|l| format!("   {l}")));
         lines.extend(stack_lines([a, b]));
@@ -4036,23 +4147,7 @@ fn happens_before_sentence(hb: &HappensBefore, accesses: [&RacingAccess; 2]) -> 
     let text = |v: &Option<HbVerdict>| match v {
         None => "not applicable: one of the accesses has no event there".to_string(),
         Some(v) if !v.ordered => unordered.to_string(),
-        Some(v) => {
-            let chain: Vec<String> = v
-                .edges
-                .iter()
-                .map(|e| {
-                    format!(
-                        "{} thread {} #{} -> thread {} #{}",
-                        edge_kind_text(e.kind),
-                        e.from.tid,
-                        e.from.event,
-                        e.to.tid,
-                        e.to.event
-                    )
-                })
-                .collect();
-            format!("ordered by {}", chain.join(", then "))
-        }
+        Some(v) => format!("ordered by {}", edge_chain(&v.edges)),
     };
     let caveat = if is_unordered(&hb.target) || is_unordered(&hb.baseline) {
         format!(" {INVISIBLE_SYNC_CAVEAT}")
@@ -6452,15 +6547,81 @@ mod tests {
             "{}",
             candidate.evidence
         );
+        // Its order does not flip, measured against the changed call's
+        // counterpart in the baseline (#112, after the deciding event), and
+        // it says so, and why it is listed.
+        assert_eq!(candidate.order.baseline, candidate.order.target);
+        assert!(
+            candidate.evidence.contains(
+                "; the two run in the same order in both runs (the changed call's counterpart \
+                 enters at #112 in the baseline); "
+            ) && candidate
+                .evidence
+                .contains("; it is listed for that change, ahead of order flips, "),
+            "{}",
+            candidate.evidence
+        );
         let text = render_racing_accesses(&r);
         assert!(
-            text.contains("Candidates, ranked (each says what differs between the runs; Hermit cannot tell which decides):\n  1. thread 3's read"),
+            text.contains("Candidates, ranked (each says what differs between the runs; a rank is not a verdict, and a candidate decides only where its check says so):\n  1. thread 3's read"),
+            "{text}"
+        );
+        // Ranked first, it is still not shown to decide.
+        assert!(
+            text.contains("reaches it through program order; not shown to decide.\n"),
             "{text}"
         );
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["status"], "candidates");
         assert_eq!(json["candidates"][0]["accesses"][1]["thread"], 53);
         assert_eq!(json["candidates"][0]["reaches_outcome"], true);
+    }
+
+    /// The baseline order of a change of course is measured at the changed
+    /// call's counterpart, not at the absent event that sorts last: a
+    /// counterpart that enters before the deciding call's event in the
+    /// baseline makes the order opposite, and a change with no counterpart
+    /// claims no order there.
+    #[test]
+    fn a_changed_course_is_ordered_by_its_baseline_counterpart() {
+        // In the baseline the deciding call (thread 21's write) returns only
+        // after the changed call's counterpart (#112) enters.
+        let (target, mut baseline) = fed_by_a_changed_course(false);
+        let deciding = baseline
+            .iter_mut()
+            .find(|sys| sys.tid == t(21) && sys.nth == 40)
+            .unwrap();
+        deciding.post = Some(115);
+        let (target, baseline) = (trace(target), trace(baseline));
+        let r = find_at(&target, &baseline, (3, 140));
+        assert_eq!(r.status, RaceStatus::Candidates, "{}", r.reason);
+        let [candidate] = r.candidates.as_slice() else {
+            panic!("{:?}", r.candidates);
+        };
+        assert_eq!(candidate.order.target, [0, 1]);
+        assert_eq!(candidate.order.baseline, [1, 0]);
+        assert!(
+            candidate.evidence.contains(
+                "; the two run in one order in the target and the other in the baseline (the \
+                 changed call's counterpart enters at #112 there); "
+            ),
+            "{}",
+            candidate.evidence
+        );
+
+        let order = RaceOrder {
+            target: [0, 1],
+            baseline: [0, 1],
+        };
+        assert_eq!(
+            change_order_clause(Err("the changed call"), None),
+            "the changed call has no counterpart in the baseline, so the two have no order there \
+             to compare; one of the two has no target event"
+        );
+        assert!(change_order_clause(Ok((&order, 7)), None).starts_with(
+            "the two run in the same order in both runs (the changed call's counterpart enters at \
+             #7 in the baseline)"
+        ));
     }
 
     #[test]
@@ -7771,7 +7932,7 @@ mod tests {
         }];
         let text = render_racing_accesses(&candidates);
         assert!(
-            text.contains("  1. the evidence.\n")
+            text.contains("  1. the evidence; not shown to decide.\n")
                 && text.contains(
                     "thread 9's close at #7587, the stack at its entry:\nStack trace for thread 9"
                 ),

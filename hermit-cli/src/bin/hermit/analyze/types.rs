@@ -228,8 +228,12 @@ pub struct AnalyzeOpts {
     /// trace (`hermit run --record-access-trace-to`) from 20,000 events before it, analyze
     /// names the first pair of conflicting syscalls on two threads whose order flips between
     /// them, says whether any edge Hermit observes orders them, and one more replay takes both
-    /// calls' stacks. The trace needs the ptrace backend and sequentialized threads; elsewhere
-    /// the section says it is unavailable and why.
+    /// calls' stacks. When the evidence singles out no pair, it ranks up to three candidates,
+    /// each saying what differs between the runs, and checks each by replaying one run with
+    /// its order reversed beside an unedited control. A rank is not a verdict: a candidate is
+    /// shown to decide the outcome only when its reversal changes the outcome and the control
+    /// does not. The trace needs the ptrace backend and sequentialized threads; elsewhere the
+    /// section says it is unavailable and why.
     #[clap(long)]
     pub no_racing_accesses: bool,
 

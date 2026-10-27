@@ -1490,7 +1490,8 @@ mod tests {
         let text = crate::app::analyze::races::render_racing_accesses(&one);
         assert!(
             text.starts_with("Racing accesses, found by intervention, not as an order the two runs show: reversing")
-                && text.contains("Candidates checked:\n  1. the evidence.")
+                && text.contains("Candidates checked:\n  1. the evidence; not shown to decide.")
+                && text.contains("  2. the evidence.\n")
                 && text.contains("   Check: decides: reversing this turn order (moving 1 event of thread 4 before thread 3's turn at #10, crossing no other thread) in the target run misses the target; the unedited control meets it (racing_candidate_1.repro)."),
             "{text}"
         );
