@@ -903,7 +903,11 @@ pub struct Config {
     /// nondeterminism points it uses `--fuzz-seed` to (a) deliver a
     /// process-directed signal to a randomly chosen thread in the group (signal
     /// timing races) and (b) randomize the requeue position of a force-unblocked
-    /// thread (lock-ordering / wakeup races). Only takes effect with `--chaos`;
+    /// thread (lock-ordering / wakeup races). With `--chaos`, outside a replay,
+    /// it also (c) starts a new thread other than a vfork child at the first or
+    /// last priority instead of a random one (fork and exec races); a vfork
+    /// child keeps its random priority. It is meant for `--chaos` runs,
+    /// but (a) and (b) apply whenever it is set, with or without `--chaos`;
     /// like the rest of chaos mode it remains reproducible under a fixed seed.
     #[clap(long)]
     pub chaos_target_races: bool,
@@ -2282,6 +2286,15 @@ impl Config {
     /// factors from its own scheduler seed and slowdown options, so it
     /// reproduces the recorded run's virtual time only when it is given the
     /// same ones.
+    ///
+    /// Nor does this predicate cover what `--fuzz-seed` draws: targeted chaos
+    /// (`--chaos-target-races`: the thread a process-directed signal goes to,
+    /// and whether a force-unblocked thread is requeued at the front) and
+    /// `--fuzz-futexes`. The scheduler reads those flags, not `--chaos`, so
+    /// adding `--chaos` to a schedule replay changes none of their draws. The
+    /// record does not carry them; a replay draws them again from its own
+    /// `--fuzz-seed`, so it reproduces them only when it is given the
+    /// recorded run's.
     pub fn chaos_draws_schedule(&self) -> bool {
         self.chaos && self.replay_schedule_from.is_none()
     }

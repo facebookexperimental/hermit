@@ -2866,8 +2866,9 @@ pub struct Scheduler {
     poll_upgrade_period: Duration,
     /// A cached copy of the same (immutable) field in Config.
     fuzz_futexes: bool,
-    /// A cached copy of the same (immutable) field in Config. When set (and only
-    /// meaningful in chaos mode) the scheduler biases its nondeterminism points
+    /// A cached copy of the same (immutable) field in Config. When set, with or
+    /// without `--chaos`, the scheduler biases its nondeterminism points (a
+    /// process-directed signal's target, a force-unblocked thread's requeue)
     /// toward known race patterns rather than exploring uniformly.
     chaos_target_races: bool,
     /// A cached copy of `Config::chaos_draws_schedule`: whether chaos, rather
