@@ -200,8 +200,12 @@ jobs:
         printf '%s\n' "$history" > "$RUNNER_TEMP/website-validation-history.txt"
     - name: Dependencies
       # A self-hosted runner's host already builds Hermit and is not Debian.
+      # Refresh the index first: the runner image's index can name package
+      # versions the mirror no longer serves, and install then fails with 404.
       if: runner.environment == 'github-hosted'
-      run: sudo apt-get install -y libunwind-dev liblzma-dev
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libunwind-dev liblzma-dev
     # The published ledger as an earlier run left it, so this run's fetch of the
     # published commit (fetch_ledger) downloads only what changed since then:
     # the restored repository holds the commit an earlier run built from
