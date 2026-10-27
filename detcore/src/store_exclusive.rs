@@ -552,13 +552,25 @@ mod model {
     /// one is added), at most one key-map node per entry, and each key's
     /// candidate list, allocated for the most candidates.
     pub(crate) const fn spine_bound<V>(max_entries: usize) -> usize {
+        let slots = if max_entries < 2 {
+            4
+        } else {
+            max_entries.saturating_mul(2)
+        };
+        spine_of::<V>(slots, max_entries)
+    }
+
+    /// The spine of a [`ByteCache`] whose age queue has room for `slots`
+    /// and whose key map has `keys` keys: the queue's slots, a node per key
+    /// (a bound: there are never more nodes than keys) and each key's
+    /// candidate list. Saturating, so an absurd size cannot wrap.
+    const fn spine_of<V>(slots: usize, keys: usize) -> usize {
         use std::mem::size_of;
-        let slots = if max_entries < 2 { 4 } else { 2 * max_entries };
+        let per_key = MAP_NODE_BOUND
+            .saturating_add(MAX_CANDIDATES_PER_KEY.saturating_mul(size_of::<Arc<Cached<V>>>()));
         slots
             .saturating_mul(size_of::<(CacheKey, Arc<Cached<V>>)>())
-            .saturating_add(max_entries.saturating_mul(
-                MAP_NODE_BOUND + MAX_CANDIDATES_PER_KEY * size_of::<Arc<Cached<V>>>(),
-            ))
+            .saturating_add(keys.saturating_mul(per_key))
     }
 
     /// The most entries [`ByteCache`] compares bytes with for one key.
@@ -714,11 +726,20 @@ mod model {
                 .or_insert_with(|| Vec::with_capacity(MAX_CANDIDATES_PER_KEY))
                 .push(cached.clone());
             self.order.push_back((key, cached));
-            self.peak = self.peak.max(self.held);
+            self.peak = self.peak.max(self.retained());
         }
 
-        /// The most its entries have been charged at once since it was made or
-        /// cleared.
+        /// What the cache retains now, by the bounds it is charged with: its
+        /// entries and its spine as allocated (the queue's capacity and a
+        /// node and a candidate list per key). Never more than the
+        /// `max_retained` it was made with.
+        pub(crate) fn retained(&self) -> usize {
+            self.held
+                .saturating_add(spine_of::<V>(self.order.capacity(), self.by_key.len()))
+        }
+
+        /// The most it has retained at once ([`ByteCache::retained`]), its
+        /// spine included, since it was made or cleared.
         pub(crate) fn peak(&self) -> usize {
             self.peak
         }
@@ -3147,8 +3168,9 @@ mod tests {
         assert_eq!(cache.max_charge(), max, "the spine is set aside");
         let within = |cache: &ByteCache<u32>| {
             let (held, entries) = cache.held();
-            assert!(held <= max && entries <= 16 && cache.peak() <= max);
-            assert!(held + spine <= max + spine);
+            assert!(held <= max && entries <= 16);
+            assert!(cache.retained() <= max + spine && cache.peak() <= max + spine);
+            assert!(cache.peak() >= cache.retained());
         };
         cache.insert(a.clone(), 1, 0);
         assert_eq!(cache.get(&a), Some(1));
@@ -3170,7 +3192,9 @@ mod tests {
         assert_eq!((cache.get(&a), cache.get(&variant(5000))), (None, None));
         assert_eq!(cache.get(&big), Some(10));
         assert_eq!(cache.held(), (5 * entry + 1, 3));
-        assert_eq!(cache.peak(), 5 * entry + 1);
+        // The peak counts the spine too: the most retained so far is now.
+        assert!(cache.retained() > 5 * entry + 1);
+        assert_eq!(cache.peak(), cache.retained());
         // Exactly at the bound is allowed; one past it by itself is not held.
         let fill = vec![3u8; 20_002];
         cache.insert(
@@ -3190,10 +3214,19 @@ mod tests {
         }
         assert_eq!(small.get(&[9u8; 19]), Some(9));
         assert_eq!(small.get(&[0u8; 10]), None);
-        // A new run starts empty, with no peak.
+        // A new run starts empty, with no peak, its spine released.
         small.clear();
-        assert_eq!((small.held(), small.peak()), ((0, 0), 0));
+        assert_eq!(
+            (small.held(), small.peak(), small.retained()),
+            ((0, 0), 0, 0)
+        );
         assert_eq!(small.get(&[9u8; 19]), None);
+        // And starts counting afresh.
+        small.insert(vec![5u8; 7], 5, 0);
+        let fresh = 7 + cached_entry_overhead::<u32>();
+        assert_eq!(small.held(), (fresh, 1));
+        assert_eq!(small.peak(), small.retained());
+        assert!(small.retained() > fresh);
         // A bound the spine alone would fill holds nothing.
         let mut tiny = ByteCache::<u32>::new(spine_bound::<u32>(8), 8);
         tiny.insert(vec![1u8; 1], 1, 0);
@@ -3223,15 +3256,31 @@ mod tests {
         plan.report
             .refused_examples
             .push((0x10, String::with_capacity(40)));
-        let charge = plan_charge(&Some(plan));
-        let floor = 10 * size_of::<FilePatch>()
+        let shared = 2 * size_of::<usize>() + size_of::<Option<FilePlan>>();
+        let expected = shared
+            + 10 * size_of::<FilePatch>()
             + 64
             + 4
             + 3 * size_of::<(u64, String)>()
             + 40
-            + size_of::<Option<FilePlan>>();
-        assert!(charge >= floor, "{charge} < {floor}");
-        assert!(plan_charge(&None) >= size_of::<Option<FilePlan>>());
+            + 1024;
+        assert_eq!(plan_charge(&Some(plan)), expected);
+        assert_eq!(plan_charge(&None), shared);
+    }
+
+    /// The spine's bound is the queue at twice the entries (at least 4
+    /// slots), a node and a 4-candidate list per entry, and saturates.
+    #[test]
+    fn the_plan_cache_spine_bound_is_exact_and_saturates() {
+        use std::mem::size_of;
+        let arc = size_of::<usize>();
+        let slot = size_of::<(usize, u64)>() + arc;
+        let per_key = 1024 + 4 * arc;
+        assert_eq!(spine_bound::<u32>(16), 32 * slot + 16 * per_key);
+        assert_eq!(spine_bound::<u32>(1), 4 * slot + per_key);
+        assert_eq!(spine_bound::<u32>(0), 4 * slot);
+        assert_eq!(spine_bound::<u32>(usize::MAX), usize::MAX);
+        assert_eq!(ByteCache::<u32>::new(usize::MAX, usize::MAX).held(), (0, 0));
     }
 
     #[test]

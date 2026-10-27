@@ -274,7 +274,7 @@ pub struct RunSummary {
 
     /// aarch64, the in-memory rewrite: the most its plan cache held at once
     /// during the run, in bytes: each plan with the file bytes it was made
-    /// from, and their bookkeeping. The cache starts empty at each run, but
+    /// from, and the cache's own containers. The cache starts empty at each run, but
     /// it belongs to the Hermit process, so this is shown in the full report
     /// and not in the INFO view `--verify` compares. Zero elsewhere.
     #[serde(default, skip_serializing_if = "is_zero")]
