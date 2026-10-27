@@ -1495,3 +1495,172 @@ async fn legacy_chaos_replay_ends_an_expired_deadline_as_without_chaos() {
     .await
     .expect("bounded expired Continue(None) callback under --chaos");
 }
+
+// The record ended a slice at a system call's pre-hook, with no branch between
+// the slice's last branch and the call. The replayer arms the PMU at that slice
+// end, so the replay's timer stops the thread at the last branch, at the
+// checkpoint's branch count and time. That stop must leave the slice to the
+// call's pre-hook: before, the timer's post-hook ended it with a yield, one
+// scheduler turn (and its charge of virtual time) more than recorded, and the
+// pre-hook then ended the next slice as well.
+#[tokio::test]
+async fn a_timer_stop_before_a_recorded_syscall_slice_end_leaves_it_to_the_call() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        use reverie::Tool;
+        use crate::preemptions::callback_history::{Origin, Site, Startup};
+        use crate::slice_boundary::callbacks::Callback;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("syscall-slice-end.json");
+        let tid = DetTid::from_raw(17);
+        let mut config = Config {
+            sequentialize_threads: true,
+            replay_schedule_from: Some(path.clone()),
+            max_timeslice: std::num::NonZeroU64::new(5_000_000),
+            target_timeslice: std::num::NonZeroU64::new(1_000_000),
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.delivers_preemption_timer_events = true);
+        config.validate();
+        let start = crate::ThreadState::new(tid, &config, ()).thread_logical_time.as_nanos();
+        let at = start + Duration::from_nanos(110);
+        let mut writer = crate::preemptions::PreemptionWriter::new(None);
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_schedevent(SchedEvent::branches(tid, 1));
+        writer.insert_schedevent(SchedEvent::branches(tid, 10));
+        writer.insert_schedevent(SchedEvent {
+            dettid: tid,
+            op: Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: None,
+            end_time: None,
+        });
+        writer.insert_schedevent(SchedEvent::syscall(
+            tid,
+            Sysno::close,
+            detcore_model::schedule::SyscallPhase::Prehook,
+        ));
+        writer.insert_schedevent(SchedEvent::branches(tid, 90));
+        writer.insert_reprioritization(tid, at, 11, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
+        writer.insert_callback_checkpoint(
+            tid,
+            Origin {
+                callback: Callback::Syscall(Sysno::close),
+                site: Site::Prehook,
+                progress: 12,
+                last_op: Some(Op::OtherInstructions),
+                time: at,
+                rcbs: 11,
+            },
+        );
+        std::fs::write(&path, writer.into_string()).unwrap();
+        let (config, state, tid, process) = cancellation_test_state_with_config(config);
+        install_test_registration(&state, tid, Ivar::new());
+        state
+            .past_first_execve
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut thread = crate::ThreadState::new(tid, &config, ());
+        thread.detpid = Some(process);
+        thread.past_global_first_execve = true;
+        thread.next_timeslice(&config);
+        thread.callback_history.install(Startup {
+            checkpoints: state
+                .sched
+                .lock()
+                .unwrap()
+                .callback_checkpoints
+                .get(&tid)
+                .map(|points| points.iter().cloned().collect())
+                .unwrap_or_default(),
+            ..Startup::default()
+        });
+        let mut guest = LegacyDeadlineGuest {
+            inner: ExternalRegistrationGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                post_exec: false,
+                ppid: None,
+                private_memory: None,
+            },
+            clock_reads: 0,
+            reported_rcbs: 1,
+            timers: Vec::new(),
+            responses: Mutex::new(Vec::new()),
+        };
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let first = tool
+            .pre_handler_hook_observed(&mut guest, true, crate::CheckIn::Event, Some(Callback::PmuTimer))
+            .await;
+        // The replayer's deadline for the thread is the recorded slice end, as
+        // the length a replayed context switch hands the thread installs it;
+        // the run up to the call needs no branch-count stop of its own.
+        guest.thread.install_schedule_deadline(at, true);
+        tool.post_handler_hook_observed(&mut guest, crate::CheckIn::Event, first)
+            .await;
+        assert!(matches!(guest.timers.last(), Some(reverie::TimerSchedule::Rcbs(10))));
+
+        // The timer stops the thread at the last branch before the call.
+        guest.reported_rcbs = 11;
+        let mut previous = Err(crate::scheduler::SkipTurn);
+        let pre = tool.pre_handler_hook_observed(
+            &mut guest,
+            true,
+            crate::CheckIn::Event,
+            Some(Callback::PmuTimer),
+        );
+        let (token, pre_commits, pre_skips) = drive_callback_hook(&state, tid, pre, &mut previous).await;
+        let (_, post_commits, post_skips) = drive_callback_hook(
+            &state,
+            tid,
+            tool.post_handler_hook_observed(&mut guest, crate::CheckIn::Event, token),
+            &mut previous,
+        )
+        .await;
+        assert_eq!(guest.thread.thread_logical_time.as_nanos(), at);
+        assert_eq!(
+            (pre_commits, pre_skips, post_commits, post_skips),
+            (0, 0, 0, 0),
+            "the timer stop files no request"
+        );
+        // The logical end stays due; only the PMU maximum moved on.
+        assert_eq!(guest.thread.end_of_timeslice, Some(at));
+        assert_eq!(
+            guest.thread.max_timeslice_end,
+            Some(at + Duration::from_nanos(5_000_000))
+        );
+        assert!(
+            !state.sched.lock().unwrap().callback_checkpoints[&tid].is_empty(),
+            "the checkpoint is still to come"
+        );
+
+        // The call's pre-hook reaches the checkpoint and ends the slice there,
+        // as the record did.
+        let call = tool.pre_handler_hook_observed(
+            &mut guest,
+            false,
+            crate::CheckIn::Event,
+            Some(Callback::Syscall(Sysno::close)),
+        );
+        let (_, call_commits, call_skips) = drive_callback_hook(&state, tid, call, &mut previous).await;
+        // The checkpoint's turn: one skipped and one committed request, as
+        // for any replayed callback checkpoint.
+        assert_eq!((call_commits, call_skips), (1, 1));
+        assert_eq!(
+            guest.thread.end_of_timeslice,
+            Some(at + Duration::from_nanos(5_000_000))
+        );
+        let scheduler = state.sched.lock().unwrap();
+        let replayer = scheduler.replayer.as_ref().unwrap();
+        assert!(
+            replayer
+                .desync_counts
+                .values()
+                .all(|stats| stats.soft == 0 && stats.hard == 0)
+        );
+        assert!(scheduler.callback_checkpoints.values().all(|points| points.is_empty()));
+    })
+    .await
+    .expect("bounded timer stop before a recorded system call slice end");
+}

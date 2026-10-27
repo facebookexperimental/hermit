@@ -355,6 +355,28 @@ impl State {
         })
     }
 
+    /// Whether the next checkpoint ends the running slice at a later
+    /// callback that the thread reaches from this PMU timer stop without
+    /// retiring a branch: the same branch count and thread time, at or past
+    /// this progress. The replayer arms the PMU at the recorded slice end, so
+    /// where the record ended the slice at, say, a system call's pre-hook, the
+    /// timer already stops the replay at the last branch before that call.
+    /// The record took no callback expiry there (one would be the next
+    /// checkpoint, with the timer's callback), and ending the slice at both
+    /// would give the replay a scheduler turn, and a turn's charge of virtual
+    /// time, that the record does not have. A no-RCB timer stop is not one:
+    /// its handler can still advance the thread to the PMU maximum after this
+    /// check, so the thread would not reach the checkpoint at its time.
+    pub(crate) fn ends_at_a_later_callback_without_branches(&self, actual: &Origin) -> bool {
+        actual.callback == Callback::PmuTimer
+            && self.checkpoints.front().is_some_and(|expected| {
+                expected.origin.callback != actual.callback
+                    && expected.origin.progress >= actual.progress
+                    && expected.origin.rcbs == actual.rcbs
+                    && expected.origin.time == actual.time
+            })
+    }
+
     /// Only an independently reached callback endpoint may actuate a checkpoint.
     /// Earlier/nested callbacks wait. Passing the endpoint reports desync; it
     /// never authorizes a late administrative operation.
@@ -555,6 +577,59 @@ mod tests {
             assert!(!state.ends_later_in_callback(&actual), "{actual:?}");
         }
         assert!(!State::default().ends_later_in_callback(&expected));
+    }
+
+    /// A PMU timer stop at the branch count and time where the next
+    /// checkpoint ends the slice in a later callback, such as the pre-hook of
+    /// the system call that follows the stop, leaves the slice to that
+    /// callback. Any other stop (a no-RCB timer stop included), or a checkpoint
+    /// at another count or time, does not.
+    #[test]
+    fn a_timer_stop_before_the_recorded_callback_leaves_the_slice_to_it() {
+        let expected = Origin {
+            callback: Callback::Syscall(Sysno::write),
+            site: Site::Prehook,
+            last_op: Some(Op::OtherInstructions),
+            ..origin()
+        };
+        let state = replay(expected.clone());
+        let stop = Origin {
+            callback: Callback::PmuTimer,
+            site: Site::Prehook,
+            progress: expected.progress - 1,
+            last_op: Some(Op::Branch),
+            ..expected.clone()
+        };
+        assert!(state.ends_at_a_later_callback_without_branches(&stop));
+        for actual in [
+            Origin {
+                callback: Callback::NoRcbTimer,
+                ..stop.clone()
+            },
+            Origin {
+                rcbs: expected.rcbs - 1,
+                ..stop.clone()
+            },
+            Origin {
+                time: LogicalTime::from_nanos(99),
+                ..stop.clone()
+            },
+            Origin {
+                progress: expected.progress + 1,
+                ..stop.clone()
+            },
+            Origin {
+                callback: Callback::Rdtsc,
+                ..stop.clone()
+            },
+            expected.clone(),
+        ] {
+            assert!(
+                !state.ends_at_a_later_callback_without_branches(&actual),
+                "{actual:?}"
+            );
+        }
+        assert!(!State::default().ends_at_a_later_callback_without_branches(&stop));
     }
 
     #[test]
