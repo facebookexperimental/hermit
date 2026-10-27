@@ -81,6 +81,7 @@ mod pidfd_self;
 #[cfg(test)]
 mod pidfd_self_tests;
 mod pipe_wake;
+pub mod post_crash;
 #[cfg(test)]
 mod predicted_death_tests;
 mod procfs;
@@ -1656,6 +1657,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn take_timer_event<G: Guest<Self>>(&self, guest: &mut G) {
         // A preemption stops the guest in user code (A5 step 3.2).
         guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+        // An armed crash handler that has returned disarms at the end of its
+        // thread's slice, before another thread can run (`post_crash`).
+        post_crash::note_stop(guest).await;
 
         info!(
             "[detcore, dtid {}] inbound timer preemption event",
@@ -1732,11 +1736,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 && guest.thread_state().slice_boundary.is_none()
             {
                 let fallback_deadline = max_timeslice_end
-                    + Duration::from_nanos(u64::from(
-                        self.cfg
-                            .max_timeslice
-                            .expect("PMU maximum must be configured"),
-                    ));
+                    + Duration::from_nanos(
+                        guest
+                            .thread_state()
+                            .after_post_crash(
+                                self.cfg
+                                    .max_timeslice
+                                    .expect("PMU maximum must be configured"),
+                            )
+                            .get(),
+                    );
                 let thread_state = guest.thread_state_mut();
                 let replay_deadline = thread_state
                     .end_of_timeslice
@@ -2747,6 +2756,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         boundary: CheckIn,
         entry: Option<slice_boundary::callbacks::Callback>,
     ) -> Option<preemptions::callback_history::Token> {
+        // Before the call or trap: an armed crash handler that has returned
+        // disarms before this hook can end the slice or hand the turn over
+        // (`post_crash`).
+        post_crash::note_stop(guest).await;
         let mut token = preemptions::callback_history::begin(guest.thread_state_mut(), entry)
             .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
         // A handler that left early (an error return) may not have cleared
@@ -3115,6 +3128,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) {
         preemptions::callback_history::post(guest.thread_state_mut(), &token)
             .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+        // After the call or trap: an armed crash handler that has returned
+        // (the call itself may have unblocked its signal) disarms before
+        // this hook can end the slice or hand the turn to another thread
+        // (`post_crash`).
+        post_crash::note_stop(guest).await;
         // Only `kill` and `rt_sigqueueinfo` set the hold, and they wake no
         // futex waiter (https://github.com/rrnewton/hermit/issues/4034).
         assert!(
@@ -4756,6 +4774,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             tool_global::discarded_signal(guest, control).await;
         }
         if delivered.is_some() {
+            // Before the copy of the dispositions applies the delivery, so a
+            // one-shot (`SA_RESETHAND`) handler still counts as caught.
+            post_crash::note_delivery(guest, signal as i32).await;
             crate::syscalls::signal_shadow::check_and_record_delivery(guest, signal as i32).await;
         }
         Ok(delivered.map(|_| signal))
@@ -4774,6 +4795,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .handle_inbound_signal(guest, SigWrapper(signal))
             .await?;
         if delivered.is_some() {
+            // As for the standard signals: before the copy of the
+            // dispositions applies the delivery (`handle_signal_event`).
+            post_crash::note_delivery(guest, signal).await;
             crate::syscalls::signal_shadow::check_and_record_delivery(guest, signal).await;
         }
         Ok(delivered.map(|signal| signal.raw()))
@@ -5490,6 +5514,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     claimed_sigchld: false,
                     pending_chaos_epochs: Vec::new(),
                     max_timeslice_end: None,
+                    post_crash_bound: None,
+                    crash_armed: None,
                     last_grant_deadline: None,
                     published_runtime_private_memory: None,
                     last_rcb_timer: None,
@@ -5691,6 +5717,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             result => result?,
         }
+        // A successful exec while a caught crash signal's handler runs takes
+        // the post-crash switch (`crate::post_crash`).
+        post_crash::note_exec(guest).await;
         // Every non-default profile requires Detcore's CPUID answers. Ptrace
         // verifies faulting before each new image; this backend-independent
         // guard also refuses a missing interception capability before the
@@ -6087,6 +6116,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             Self::unmap_orphaned_staging_pages(guest).await;
         }
         crate::syscalls::signal_shadow::at_syscall_entry(guest);
+        // An armed crash handler that has returned disarms before this call
+        // runs (`post_crash`).
+        post_crash::note_stop(guest).await;
         // Until Detcore finishes it, the kernel may run it (A5 step 3.2).
         guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::KernelRun {
             syscall: call.number() as i64,

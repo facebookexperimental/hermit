@@ -1362,6 +1362,38 @@ pub struct Config {
     #[serde(default)]
     pub signal_at: Option<SignalAt>,
 
+    /// The slice bound, in virtual nanoseconds, once the guest has crashed:
+    /// `off` (the default) keeps `--max-timeslice` to the end; `default` is
+    /// the default `--max-timeslice` (200000000); a number is that bound.
+    ///
+    /// A crash is a fatal signal on its way to ending a process: SIGABRT
+    /// however it was sent, or SIGSEGV, SIGBUS, SIGILL, SIGFPE or SIGSYS
+    /// raised by the kernel for a fault. One whose delivery takes the default
+    /// action switches at once. One the guest catches arms the switch, which
+    /// is taken when a process the crashed one created meanwhile (or the
+    /// crashed process itself) execs while the handler still runs (Android's
+    /// crash handler runs `crash_dump` that way), and dropped when the handler
+    /// returns (a runtime that turns a fault into an exception, as ART and
+    /// JVMs do for null checks). A handler left with a plain `longjmp`, which
+    /// keeps the signal blocked, counts as still running. From the switch on,
+    /// the slices of the crashed process and of the processes it creates are
+    /// bounded by this value instead of the run's, so a run whose race needs
+    /// fine slices does not spend its time slicing the crash dumper; other
+    /// processes (a harness running trials as children) keep the run's bound.
+    /// The switch happens at the same point of every run and replay that
+    /// reaches it, and a preemption record stores both the setting and where
+    /// it switched; a replay takes the record's setting, and refuses another
+    /// (it cannot turn a recorded switch off). A no-op unless the run's own
+    /// bound is below this one. `--summary` reports it.
+    #[clap(
+        long,
+        value_name = "uint64|'default'|'off'",
+        default_value = "off",
+        value_parser = parse_post_crash_timeslice
+    )]
+    #[serde(default)]
+    pub post_crash_timeslice: MaybeTimeslice,
+
     /// **Internal:** Debugging option to treat all sockets as mysterious external, nondeterministic
     /// entities, rather than container-internal and determinstically scheduled.
     #[clap(long)]
@@ -2077,6 +2109,37 @@ impl Config {
         Ok(charge as u64)
     }
 
+    /// Why `post_crash_timeslice`, which is set, would not be in effect under
+    /// this configuration ([`Self::post_crash_timeslice_in_effect`]), or
+    /// `None` when it is, or is not set.
+    pub fn post_crash_timeslice_refusal(&self) -> Option<String> {
+        let bound = self.post_crash_timeslice?;
+        if self.post_crash_timeslice_in_effect().is_some() {
+            return None;
+        }
+        Some(if !self.sequentialize_threads {
+            "the switch needs sequentialized threads".to_owned()
+        } else {
+            match self.max_timeslice {
+                None => "the switch needs a --max-timeslice".to_owned(),
+                Some(max) => format!(
+                    "a bound of {bound} is not above --max-timeslice={max}; replay with the \
+                     recording's --max-timeslice"
+                ),
+            }
+        })
+    }
+
+    /// The post-crash bound this run switches to (`post_crash_timeslice`), or
+    /// `None` when the switch is off: unset, without sequentialized threads
+    /// (there is no scheduler turn to switch at), without a `max_timeslice`,
+    /// or not above it.
+    pub fn post_crash_timeslice_in_effect(&self) -> Option<NonZeroU64> {
+        let bound = self.post_crash_timeslice?;
+        let run = self.max_timeslice?;
+        (self.sequentialize_threads && bound > run).then_some(bound)
+    }
+
     /// The `--pipe-wake-latency` in effect (<https://github.com/rrnewton/hermit/issues/4380>): the
     /// option's value in run mode, with sequentialized threads and a heuristic that selects by
     /// priority; `None` everywhere else, so nothing of the hand-off runs.
@@ -2419,6 +2482,9 @@ impl fmt::Display for Config {
         }
         if let Some(at) = self.signal_at {
             write!(f, " --signal-at={}", at)?;
+        }
+        if let Some(bound) = self.post_crash_timeslice {
+            write!(f, " --post-crash-timeslice={}", bound)?;
         }
         if self.debug_externalize_sockets {
             write!(f, " --debug-externalize-sockets")?;
@@ -2945,6 +3011,24 @@ fn parse_timeslice(src: &str) -> Result<MaybeTimeslice, ParseTimesliceError> {
                 "Unable to parse timeslice, expected disabled or a non-negative integer",
             )),
         }
+    }
+}
+
+/// The default `--max-timeslice`, in virtual nanoseconds, which
+/// `--post-crash-timeslice=default` names.
+pub const DEFAULT_MAX_TIMESLICE: u64 = 200_000_000;
+
+fn parse_post_crash_timeslice(src: &str) -> Result<MaybeTimeslice, ParseTimesliceError> {
+    match src {
+        "off" => Ok(None),
+        "default" => Ok(NonZeroU64::new(DEFAULT_MAX_TIMESLICE)),
+        _ => match parse_timeslice(src) {
+            Ok(Some(bound)) => Ok(Some(bound)),
+            _ => Err(ParseTimesliceError::new(
+                "expected off, default, or a timeslice of at least one RCB (10 virtual \
+                 nanoseconds)",
+            )),
+        },
     }
 }
 
@@ -3837,7 +3921,9 @@ mod legacy_backend_json {
     /// rewrite of aarch64 exclusive loops is done by the ptrace backend's
     /// global state, and no backend that reads the legacy form does it, so it
     /// is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 50] = [
+    /// `post_crash_timeslice` came after it too, and the scheduler acts on it
+    /// as well, so it is never written and reads as off.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 51] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3869,6 +3955,7 @@ mod legacy_backend_json {
         "strict_binder",
         "work_span_report",
         "signal_at",
+        "post_crash_timeslice",
         "in_guest_signal_delivery",
         "annotated_priority_replay",
         "virtual_cpus",
@@ -4068,7 +4155,8 @@ mod legacy_backend_json {
                     | "access_trace"
                     | "access_trace_max_records"
                     | "access_trace_max_bytes"
-                    | "standard_stream_aliases",
+                    | "standard_stream_aliases"
+                    | "post_crash_timeslice",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -4378,6 +4466,7 @@ mod legacy_backend_json {
                 | "strict_binder"
                 | "work_span_report"
                 | "signal_at"
+                | "post_crash_timeslice"
                 | "in_guest_signal_delivery"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
@@ -4418,6 +4507,59 @@ mod legacy_backend_json {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_post_crash_timeslice;
+
+    /// A set bound is refused, with the reason, wherever it would not be in
+    /// effect: not above the run's bound, no bound, unsequentialized threads.
+    #[test]
+    fn a_post_crash_bound_is_refused_where_it_would_not_take_effect() {
+        let nz = std::num::NonZeroU64::new;
+        let config = |bound: u64, max: Option<u64>, sequentialize: bool| super::Config {
+            post_crash_timeslice: nz(bound),
+            max_timeslice: max.and_then(nz),
+            sequentialize_threads: sequentialize,
+            ..Default::default()
+        };
+        assert_eq!(
+            config(200, Some(100), true).post_crash_timeslice_refusal(),
+            None
+        );
+        assert_eq!(
+            super::Config::default().post_crash_timeslice_refusal(),
+            None,
+            "not set"
+        );
+        for (max, sequentialize, why) in [
+            (Some(200), true, "not above --max-timeslice=200"),
+            (Some(300), true, "not above --max-timeslice=300"),
+            (None, true, "needs a --max-timeslice"),
+            (Some(100), false, "needs sequentialized threads"),
+        ] {
+            let refusal = config(200, max, sequentialize)
+                .post_crash_timeslice_refusal()
+                .unwrap();
+            assert!(refusal.contains(why), "{refusal}");
+        }
+    }
+
+    /// `--post-crash-timeslice` takes off, default (the default
+    /// `--max-timeslice`) or a bound of at least one RCB.
+    #[test]
+    fn post_crash_timeslice_parses_off_default_and_bounds() {
+        assert_eq!(parse_post_crash_timeslice("off").unwrap(), None);
+        assert_eq!(
+            parse_post_crash_timeslice("default").unwrap(),
+            std::num::NonZeroU64::new(super::DEFAULT_MAX_TIMESLICE)
+        );
+        assert_eq!(
+            parse_post_crash_timeslice("5000000").unwrap(),
+            std::num::NonZeroU64::new(5_000_000)
+        );
+        for bad in ["0", "5", "disabled", "fast"] {
+            assert!(parse_post_crash_timeslice(bad).is_err(), "{bad}");
+        }
+    }
+
     use super::*;
 
     /// `--chaos-timeslice-range` takes MIN..MAX virtual nanoseconds, both at
@@ -5306,6 +5448,7 @@ mod tests {
                 | "strict_binder"
                 | "work_span_report"
                 | "signal_at"
+                | "post_crash_timeslice"
                 | "in_guest_signal_delivery"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
@@ -5360,11 +5503,12 @@ mod tests {
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
         // `access_trace_max_bytes`, `replay_continue_fairly`,
-        // `standard_stream_aliases`, `sleep_registration`, `strict_binder`
+        // `standard_stream_aliases`, `sleep_registration`, `strict_binder`,
+        // `post_crash_timeslice`, `rewrite_exclusives_in_memory`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-nine fewer, so thirty-five keys fewer than fields.
+        // fifty fewer, so thirty-six keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 35);
+        assert_eq!(fields.len(), keys.len() + 36);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

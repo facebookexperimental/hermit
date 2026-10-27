@@ -9651,6 +9651,57 @@ impl RunOpts {
     /// (https://github.com/rrnewton/hermit/issues/4380). A record without the
     /// field was made with the option off. As for the epoch, the record is
     /// read before anything is launched.
+    /// A replay of a recorded schedule runs under the record's post-crash
+    /// bound (`--post-crash-timeslice`): taken when the replay sets none,
+    /// refused when it sets another, or sets one for a record made with the
+    /// switch off (`post_crash_timeslice_for_replay`). The switch changes
+    /// every slice after a crash, so a replay under another bound would leave
+    /// the record there.
+    fn adopt_replayed_post_crash_timeslice(&mut self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        let mut adopted = None;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded = detcore::preemptions::read_recorded_post_crash_timeslice(path)
+                .map_err(Error::msg)?;
+            // An explicit bound the run would not use (not above
+            // --max-timeslice) is the switch off, not unset: a record made
+            // with the switch on refuses it.
+            let replay = config.post_crash_timeslice.map(|_| {
+                config
+                    .post_crash_timeslice_in_effect()
+                    .map(std::num::NonZeroU64::get)
+            });
+            let bound = detcore::preemptions::post_crash_timeslice_for_replay(
+                &format!("{option} {}", path.display()),
+                recorded,
+                adopted.map(Some).or(replay),
+            )
+            .map_err(|refusal| Error::new(PolicyRefusal).context(refusal))?;
+            adopted = adopted.or(bound);
+        }
+        if let Some(bound) = adopted {
+            self.det_opts.det_config.post_crash_timeslice = std::num::NonZeroU64::new(bound);
+            // The recorded switch must stay on under this replay's own
+            // settings (a bound above its --max-timeslice, with threads
+            // sequentialized), or the replay cannot take it.
+            if let Some(refusal) = self.det_opts.det_config.post_crash_timeslice_refusal() {
+                return Err(Error::new(PolicyRefusal).context(format!(
+                    "the replayed record was made with --post-crash-timeslice={bound}: {refusal}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn refuse_replay_under_another_pipe_wake_latency(&self) -> Result<(), Error> {
         if self.namespace_only {
             return Ok(());
@@ -11129,6 +11180,7 @@ impl RunOpts {
         self.refuse_strict_with_host_drawn_inputs()?;
         self.refuse_replay_under_another_pipe_wake_latency()?;
         self.refuse_replay_under_another_signal_state_copy()?;
+        self.adopt_replayed_post_crash_timeslice()?;
         // Refused here too, before stdin is read; each run's preparation
         // below sets the configuration from the same record.
         self.annotated_priority_replay_admission()?;

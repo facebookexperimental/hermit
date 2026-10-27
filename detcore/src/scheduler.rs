@@ -2603,6 +2603,8 @@ pub struct Scheduler {
     /// `Config::signal_at`: the turn after whose commit the run's root
     /// process is sent the signal, until it is sent.
     signal_at: Option<detcore_model::config::SignalAt>,
+    /// The post-crash timeslice switch (`crate::post_crash`).
+    post_crash: crate::post_crash::PostCrashState,
     /// The number of the last `COMMIT turn`, set where `unblock_guest`
     /// commits it. `turn` itself names the next turn and also advances on
     /// the turns the scheduler skips.
@@ -5281,6 +5283,67 @@ fn replayed_rejoins(cfg: &Config) -> Option<std::collections::VecDeque<Rejoin>> 
 }
 
 impl Scheduler {
+    /// The process (thread-group leader) of `dtid`, itself when unknown.
+    fn post_crash_process(&self, dtid: DetTid) -> DetPid {
+        self.thread_tree
+            .thread_to_leader
+            .get(&dtid)
+            .copied()
+            .unwrap_or(dtid)
+    }
+
+    /// `child`, a new process, was created by `creator`'s thread: it belongs
+    /// to that process's crash, armed or switched (`crate::post_crash`).
+    pub(crate) fn post_crash_process_created(&mut self, creator: DetTid, child: DetPid) {
+        let creator = self.post_crash_process(creator);
+        self.post_crash.process_created(creator, child);
+    }
+
+    /// Apply a post-crash step from `dtid` in the current turn
+    /// (`GlobalRequest::PostCrash`), storing the switch in the preemption
+    /// record when this step takes it. Returns the bound once `dtid`'s
+    /// process takes it.
+    pub(crate) fn post_crash_step(
+        &mut self,
+        dtid: DetTid,
+        event: crate::post_crash::PostCrashEvent,
+    ) -> Option<std::num::NonZeroU64> {
+        let turn = self.last_committed_turn.unwrap_or(0);
+        let process = self.post_crash_process(dtid);
+        let (bound, taken) = self
+            .post_crash
+            .step(dtid, process, event, turn)
+            .unwrap_or_else(|refusal| exit_on_scheduler_refusal(&refusal));
+        if let Some(switch) = taken {
+            tracing::info!(
+                "[scheduler] post-crash switch: signal {} to dtid {} ({:?}) at turn {}, every slice \
+                 bounded by {} virtual ns from now on",
+                switch.signal,
+                switch.dtid,
+                switch.cause(),
+                switch.turn,
+                switch.bound
+            );
+            if let Some(writer) = &mut self.preemption_writer {
+                writer.push_post_crash(switch);
+            }
+        }
+        bound
+    }
+
+    /// The post-crash bound `dtid` takes, once the switch has made its
+    /// process a crashed one.
+    pub(crate) fn post_crash_bound_for(&self, dtid: DetTid) -> Option<std::num::NonZeroU64> {
+        self.post_crash.bound_for(self.post_crash_process(dtid))
+    }
+
+    /// The run summary's account of the switch.
+    pub(crate) fn post_crash_summary(&self) -> Option<detcore_model::summary::PostCrashSummary> {
+        self.post_crash.summary()
+    }
+}
+
+impl Scheduler {
     /// Create a new scheduler based on the configuration.
     pub fn new(cfg: &Config) -> Self {
         crate::record_or_replay::admit_chosen_input_stream(cfg, reverie::ToolStreamRole::Plain);
@@ -5468,7 +5531,18 @@ impl Scheduler {
                 .with_chaos_timeslice(cfg.chaos_timeslice)
                 .with_guest_ids(cfg.guest_ids)
                 .with_queued_sleeps_registered_at_first_pass(queued_sleeps_registered_at_first_pass)
-                .with_rewrite_exclusives_in_memory(cfg.rewrite_exclusives_in_memory);
+                .with_rewrite_exclusives_in_memory(cfg.rewrite_exclusives_in_memory)
+                .with_post_crash_timeslice(
+                    cfg.post_crash_timeslice_in_effect()
+                        .map(std::num::NonZeroU64::get),
+                );
+            // This run's own record lists every switch it takes, possibly
+            // none, so its replay can refuse an unrecorded one.
+            let writer = if cfg.post_crash_timeslice_in_effect().is_some() {
+                writer.noting_post_crash_switches()
+            } else {
+                writer
+            };
             // A run that follows no record writes the newest format. A replay
             // writes the format of the record it follows, whose rules it ran
             // by. A replay of a format-1 record (`TimeSkipMode::Legacy`) takes
@@ -5564,6 +5638,29 @@ impl Scheduler {
             stacktrace_events_counted: cfg.record_preemptions || cfg.replay_schedule_from.is_some(),
             stop_after_turn: cfg.stop_after_turn,
             signal_at: cfg.signal_at,
+            post_crash: crate::post_crash::PostCrashState::new(
+                cfg.post_crash_timeslice_in_effect(),
+                // A preemption replay of a record its own run wrote with the
+                // switch on takes exactly the switches it lists (possibly
+                // none) and is refused at a different or extra one. Records
+                // derived from another (`clone_preemptions_only`: minimize,
+                // analyze trials) list none, so their runs compute the switch
+                // afresh. A schedule replay is not checked: analyze replays
+                // spliced and edited schedules that leave their record on
+                // purpose.
+                cfg.replay_preemptions_from.as_deref().and_then(|path| {
+                    crate::preemptions::read_recorded_post_crash_switches(path)
+                        .map_err(|error| {
+                            tracing::warn!(
+                                "the post-crash switches of {} could not be read, so this \
+                                     replay does not check them: {error}",
+                                path.display()
+                            )
+                        })
+                        .ok()
+                        .flatten()
+                }),
+            ),
             last_committed_turn: None,
             stop_after_iter: cfg.stop_after_iter,
             recordreplay_modes: cfg.recordreplay_modes,
@@ -8859,6 +8956,7 @@ impl Scheduler {
         detpid: DetPid,
         mm: MmId,
     ) -> bool {
+        self.post_crash.forget(dettid);
         if self.take_retired_exited_leader(dettid) {
             return false;
         }
@@ -21972,6 +22070,7 @@ impl Scheduler {
                 replay_departure: self.replay_departure.clone(),
                 // GlobalState records the effective run configuration.
                 preemption: None,
+                post_crash: None,
                 // GlobalState knows what the accounting point could not see
                 // and replaces this scope (`run_summary_for_log`).
                 syscall_histogram: Some(

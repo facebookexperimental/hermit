@@ -62,6 +62,10 @@ struct RawRecord {
     reserved_input: ReservedInputMetadata,
     #[serde(skip)]
     replay_departed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_crash_timeslice: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

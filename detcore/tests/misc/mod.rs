@@ -17,6 +17,7 @@ mod cpuinfo_sessions;
 mod ignored_signal_waits;
 mod inode_reuse;
 mod notification_fds;
+mod post_crash;
 mod proc_stat_lifecycle;
 mod procfs_caller_buffer;
 mod procfs_inode;

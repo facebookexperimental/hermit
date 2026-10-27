@@ -163,6 +163,21 @@ pub struct PreemptionRecord {
     /// standalone JSON member is deliberately absent from ThreadHistory/RPC.
     /// Unknown values are retained for editing and non-Chosen replay.
     reserved_input: ReservedInputMetadata,
+    /// The post-crash bound in effect in the run that produced this record
+    /// (`Config::post_crash_timeslice_in_effect`), in virtual nanoseconds. The
+    /// switch changes every slice after it, so a replay takes this value
+    /// (`post_crash_timeslice_for_replay`) and refuses another. `None` when
+    /// the switch was off, which writes the record exactly as before the
+    /// field existed, and for records written before it.
+    post_crash_timeslice: Option<u64>,
+    /// Where the run that produced this record took the post-crash switch,
+    /// each time it did, in order (`crate::post_crash`). A replay that
+    /// follows the record takes the same switches at the same points, and is
+    /// refused at a different one.
+    /// Present (possibly empty) only in a record its own run wrote with the
+    /// switch on, so a replay can tell "no switch was taken" from a record
+    /// derived from another, which holds none (`None`).
+    post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
@@ -408,6 +423,8 @@ impl PreemptionRecord {
             guest_ids: None,
             replay_departed_at: None,
             reserved_input: ReservedInputMetadata::default(),
+            post_crash_timeslice: None,
+            post_crash: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -889,6 +906,32 @@ impl PreemptionRecord {
         self
     }
 
+    /// The post-crash bound in effect in the run this record came from
+    /// (`None` for off).
+    pub fn post_crash_timeslice(&self) -> Option<u64> {
+        self.post_crash_timeslice
+    }
+
+    /// Where the run this record came from took the post-crash switch, each
+    /// time it did.
+    pub fn post_crash(&self) -> &[crate::post_crash::PostCrashSwitch] {
+        self.post_crash.as_deref().unwrap_or(&[])
+    }
+
+    /// The switches, if this record is one its own run wrote with the switch
+    /// on (and so lists every switch it took, possibly none).
+    pub fn post_crash_complete(&self) -> Option<&[crate::post_crash::PostCrashSwitch]> {
+        self.post_crash.as_deref()
+    }
+
+    /// The same record, stating the post-crash bound of the trials it came
+    /// from (`None` for off). Every record analyze, minimize or bisect writes
+    /// from trials carries it, as it carries the pipe-wake latency.
+    pub fn with_post_crash_timeslice(mut self, bound: Option<u64>) -> Self {
+        self.post_crash_timeslice = bound;
+        self
+    }
+
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
     pub fn extract_all(&self) -> BTreeMap<DetTid, ThreadHistory> {
         self.per_thread.clone()
@@ -977,6 +1020,10 @@ impl PreemptionRecord {
             // A record derived from an inexact one is inexact too.
             replay_departed_at: self.replay_departed_at,
             reserved_input: self.reserved_input.clone(),
+            post_crash_timeslice: self.post_crash_timeslice,
+            // A derived record (minimize, analyze trials) runs a different
+            // schedule, whose switches the run computes afresh.
+            post_crash: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
             expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
@@ -1053,6 +1100,8 @@ impl PreemptionRecord {
             guest_ids: None,
             replay_departed_at: None,
             reserved_input: ReservedInputMetadata::default(),
+            post_crash_timeslice: None,
+            post_crash: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -2100,6 +2149,97 @@ mod tests {
             read_recorded_queued_sleeps_registered_at_first_pass(&path),
             Ok(false)
         );
+    }
+
+    /// The post-crash bound and switch ride in a preemption record (absent,
+    /// and not written, when the switch is off); a replay takes a recorded
+    /// bound when it sets none, and refuses another bound or a bound for a
+    /// record made with the switch off.
+    #[test]
+    fn the_post_crash_switch_round_trips_and_a_replay_takes_the_recorded_bound() {
+        let switch = crate::post_crash::PostCrashSwitch {
+            dtid: DetTid::from_raw(5),
+            signal: libc::SIGABRT,
+            exec_by: Some(DetTid::from_raw(9)),
+            turn: 42,
+            bound: 200_000_000,
+        };
+        let mut writer = PreemptionWriter::new(None)
+            .with_post_crash_timeslice(Some(200_000_000))
+            .noting_post_crash_switches();
+        writer.push_post_crash(switch);
+        let written = writer.into_string();
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.post_crash_timeslice(), Some(200_000_000));
+        assert_eq!(back.post_crash(), &[switch]);
+        assert!(
+            back.clone_preemptions_only()
+                .post_crash_complete()
+                .is_none()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, &written).unwrap();
+        assert_eq!(
+            read_recorded_post_crash_timeslice(&path),
+            Ok(Some(200_000_000))
+        );
+        assert_eq!(
+            read_recorded_post_crash_switches(&path),
+            Ok(Some(vec![switch]))
+        );
+        // A run with the switch on that took none lists none; a record
+        // stamped with the bound alone lists nothing at all.
+        let none_taken = PreemptionWriter::new(None)
+            .with_post_crash_timeslice(Some(200_000_000))
+            .noting_post_crash_switches()
+            .into_string();
+        std::fs::write(&path, &none_taken).unwrap();
+        assert_eq!(
+            read_recorded_post_crash_switches(&path),
+            Ok(Some(Vec::new()))
+        );
+        let stamped = PreemptionWriter::new(None)
+            .with_post_crash_timeslice(Some(200_000_000))
+            .into_string();
+        std::fs::write(&path, &stamped).unwrap();
+        assert_eq!(read_recorded_post_crash_switches(&path), Ok(None));
+        let off = PreemptionWriter::new(None).into_string();
+        assert!(!off.contains("post_crash"), "{off}");
+        std::fs::write(&path, &off).unwrap();
+        assert_eq!(read_recorded_post_crash_timeslice(&path), Ok(None));
+        assert_eq!(read_recorded_post_crash_switches(&path), Ok(None));
+
+        let source = "--replay-preemptions-from=x";
+        // Unset: the record decides.
+        assert_eq!(
+            post_crash_timeslice_for_replay(source, None, None),
+            Ok(None)
+        );
+        assert_eq!(
+            post_crash_timeslice_for_replay(source, Some(7), None),
+            Ok(Some(7))
+        );
+        // Given and in effect: it must be the record's.
+        assert_eq!(
+            post_crash_timeslice_for_replay(source, Some(7), Some(Some(7))),
+            Ok(Some(7))
+        );
+        for (recorded, replay) in [(Some(7), Some(8)), (None, Some(8))] {
+            let refusal =
+                post_crash_timeslice_for_replay(source, recorded, Some(replay)).unwrap_err();
+            assert!(refusal.starts_with(source), "{refusal}");
+            assert!(refusal.contains("--post-crash-timeslice=8"), "{refusal}");
+        }
+        // Given but not in effect (not above --max-timeslice): the switch is
+        // off, which a record made with it on refuses and one made without it
+        // accepts.
+        assert_eq!(
+            post_crash_timeslice_for_replay(source, None, Some(None)),
+            Ok(None)
+        );
+        let refusal = post_crash_timeslice_for_replay(source, Some(7), Some(None)).unwrap_err();
+        assert!(refusal.contains("the post-crash switch off"), "{refusal}");
     }
 
     /// The signal-state copy setting rides in a preemption record as the
@@ -3372,6 +3512,30 @@ impl PreemptionWriter {
         });
     }
 
+    /// Store the run's post-crash bound in effect
+    /// (`Config::post_crash_timeslice_in_effect`; `None` for off).
+    pub fn with_post_crash_timeslice(mut self, bound: Option<u64>) -> Self {
+        self.inner.post_crash_timeslice = bound;
+        self
+    }
+
+    /// Mark the record as listing every post-crash switch its run takes
+    /// (possibly none): the scheduler's own writer, for a run with the switch
+    /// on. A record stamped with the bound alone (analyze's derived records)
+    /// lists none.
+    pub fn noting_post_crash_switches(mut self) -> Self {
+        self.inner.post_crash = Some(Vec::new());
+        self
+    }
+
+    /// Store where the run took a post-crash switch.
+    pub fn push_post_crash(&mut self, switch: crate::post_crash::PostCrashSwitch) {
+        self.inner
+            .post_crash
+            .get_or_insert_with(Vec::new)
+            .push(switch);
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -3781,6 +3945,60 @@ pub fn cap_preemption_charge_mismatch(
             show(recorded),
         )
     })
+}
+
+/// Read only the post-crash switches a preemption record holds, so a replay
+/// can refuse to take a different one: `Some` (possibly empty) for a record
+/// its own run wrote with the switch on, `None` for one made with it off,
+/// derived from another, or made before the field existed.
+pub fn read_recorded_post_crash_switches(
+    path: &Path,
+) -> Result<Option<Vec<crate::post_crash::PostCrashSwitch>>, String> {
+    #[derive(Deserialize)]
+    struct SwitchesOnly {
+        #[serde(default)]
+        post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
+    }
+    Ok(boundary_recording::read_settings::<SwitchesOnly>(path)?.post_crash)
+}
+
+/// Read only the post-crash bound stored in a preemption record file, as
+/// [`read_recorded_epoch`] reads the epoch. `Ok(None)` means the record was
+/// made with the switch off, or before the field existed.
+pub fn read_recorded_post_crash_timeslice(path: &Path) -> Result<Option<u64>, String> {
+    #[derive(Deserialize)]
+    struct BoundOnly {
+        #[serde(default)]
+        post_crash_timeslice: Option<u64>,
+    }
+    Ok(boundary_recording::read_settings::<BoundOnly>(path)?.post_crash_timeslice)
+}
+
+/// The post-crash bound a replay of a record runs under, naming the record
+/// by `source` (an option and a path) in a refusal. A record that stores a
+/// bound gives it to a replay that sets none; a replay that sets another
+/// bound, or sets one for a record made with the switch off, is refused: the
+/// switch changes every slice after it, so the replay would leave the record.
+pub fn post_crash_timeslice_for_replay(
+    source: &str,
+    recorded: Option<u64>,
+    replay: Option<Option<u64>>,
+) -> Result<Option<u64>, String> {
+    let show = |bound: Option<u64>| match bound {
+        Some(ns) => format!("--post-crash-timeslice={ns}"),
+        None => "the post-crash switch off".to_owned(),
+    };
+    match (recorded, replay) {
+        (recorded, None) => Ok(recorded),
+        (recorded, Some(replay)) if recorded == replay => Ok(recorded),
+        (recorded, Some(replay)) => Err(format!(
+            "{source} was recorded with {} and would be replayed with {}. The switch changes \
+             every slice after a crash, so the replay cannot reproduce the run. Replay with {}.",
+            show(recorded),
+            show(replay),
+            show(recorded),
+        )),
+    }
 }
 
 /// Read only whether the signal-state copy was on in the run that wrote a

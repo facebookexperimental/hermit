@@ -6565,6 +6565,20 @@ pub struct ThreadState<T> {
     /// `end_of_timeslice` so syscall-heavy workloads can use a shorter, cheap target deadline.
     pub max_timeslice_end: Option<LogicalTime>,
 
+    /// The post-crash bound, once the run has switched to it
+    /// (`crate::post_crash`): this thread's slices are bounded by it from
+    /// its next slice on, instead of by `max_timeslice`. Learned from the
+    /// scheduler's answer to a post-crash step or from a reply that resumes
+    /// the thread from a grant.
+    #[serde(default)]
+    pub post_crash_bound: Option<std::num::NonZeroU64>,
+
+    /// The crash signal whose caught delivery armed the post-crash switch for
+    /// this thread, until a stop of the thread finds the handler returned
+    /// (`crate::post_crash::note_stop`).
+    #[serde(default)]
+    pub crash_armed: Option<i32>,
+
     /// The deadline hint carried by the last scheduler reply this thread
     /// received (`ThreadState::cap_timeslice_at_deadline`). Applied when the
     /// reply arrives, and again by the two paths that then install a fresh
@@ -6676,6 +6690,8 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("chaos_slowdown_factor", &self.chaos_slowdown_factor)
             .field("chaos_slowdown_active", &self.chaos_slowdown_active)
             .field("max_timeslice_end", &self.max_timeslice_end)
+            .field("post_crash_bound", &self.post_crash_bound)
+            .field("crash_armed", &self.crash_armed)
             .field("last_rcb_timer", &self.last_rcb_timer)
             .field("last_rcb_timer_is_max", &self.last_rcb_timer_is_max)
             .finish()
@@ -7428,6 +7444,8 @@ impl<T> ThreadState<T> {
             claimed_sigchld: false,
             pending_chaos_epochs: Vec::new(),
             max_timeslice_end: None,
+            post_crash_bound: None,
+            crash_armed: None,
             last_grant_deadline: None,
             published_runtime_private_memory: None,
             last_rcb_timer: None,
@@ -9160,6 +9178,14 @@ impl<T> ThreadState<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    /// `bound`, a configured slice bound, raised to the post-crash bound once
+    /// the run has switched to it (`crate::post_crash`). A bound already
+    /// above it is kept.
+    pub(crate) fn after_post_crash(&self, bound: std::num::NonZeroU64) -> std::num::NonZeroU64 {
+        self.post_crash_bound
+            .map_or(bound, |post_crash| post_crash.max(bound))
+    }
+
     /// Choose the logical target and PMU maximum deadlines for the next timeslice.
     ///
     /// Effects:
@@ -9169,7 +9195,10 @@ impl<T> ThreadState<T> {
     ///
     /// Returns: an optional new priority.
     pub fn next_timeslice(&mut self, cfg: &Config) -> Option<Priority> {
-        let logical_timeslice = cfg.target_timeslice.or(cfg.max_timeslice);
+        let logical_timeslice = cfg
+            .target_timeslice
+            .or(cfg.max_timeslice)
+            .map(|bound| self.after_post_crash(bound));
         if let Some(timeout_ns) = logical_timeslice {
             let current_ns = self.thread_logical_time.as_nanos();
 
@@ -9337,9 +9366,10 @@ impl<T> ThreadState<T> {
             } else if !cfg.chaos {
                 if self.follows_replayed_schedule(cfg) {
                     if cfg.no_rcb_time {
-                        let max_timeslice = cfg
-                            .max_timeslice
-                            .expect("schedule replay with PMU requires a maximum");
+                        let max_timeslice = self.after_post_crash(
+                            cfg.max_timeslice
+                                .expect("schedule replay with PMU requires a maximum"),
+                        );
                         self.end_of_timeslice =
                             Some(current_ns + Duration::from_nanos(u64::from(max_timeslice)));
                     } else {
@@ -9435,7 +9465,7 @@ impl<T> ThreadState<T> {
                 && self.preemption_points.is_some()
                 && self.end_of_timeslice == Some(LogicalTime::MAX);
             let configured_max_end = cfg.max_timeslice.map(|max_timeslice| {
-                let length = Duration::from_nanos(u64::from(max_timeslice));
+                let length = Duration::from_nanos(self.after_post_crash(max_timeslice).get());
                 current_ns
                     + if past_an_edited_record {
                         length.max(margin)
