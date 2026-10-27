@@ -401,20 +401,25 @@ static void run_control_fds(void) {
     fail_errno("epoll_ctl(DEL timerfd)");
   }
 
+#ifdef SYS_epoll_ctl_old
   errno = 0;
   const long legacy_result =
       syscall(SYS_epoll_ctl_old, epoll_fd, EPOLL_CTL_ADD, event_fd, NULL);
   if (legacy_result != -1 || errno != ENOSYS) {
     fail("epoll_ctl_old did not return ENOSYS");
   }
+#endif
 
   close(epoll_fd);
   close(timer_fd);
   close(blocking_event_fd);
   close(event_fd);
   printf(
-      "control-fds counter=%llu blocking-counter=%llu flags-ok "
-      "legacy-enosys\n",
+      "control-fds counter=%llu blocking-counter=%llu flags-ok"
+#ifdef SYS_epoll_ctl_old
+      " legacy-enosys"
+#endif
+      "\n",
       (unsigned long long)counter,
       (unsigned long long)blocking_counter);
 }
