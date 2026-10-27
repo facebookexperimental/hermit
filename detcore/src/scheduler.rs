@@ -1778,6 +1778,12 @@ pub struct Scheduler {
     /// has been granted or replaced is dropped there, so the set holds at
     /// most a few threads, and a turn with none costs the rule nothing.
     sigreturn_continuations: BTreeSet<DetTid>,
+    /// Threads a schedule replay switched away from at a syscall prehook
+    /// (`ReplayAction::ContextSwitch(false, ..)` on a prehook event) whose
+    /// next turn has not been selected yet. Step 3 may select that turn ahead
+    /// of the other threads the replayer does not want to run
+    /// (`replay_prehook_handoff`); selecting it in any way drops the entry.
+    replay_prehook_callers: BTreeSet<DetTid>,
     /// Counts `first_sigreturn_continuation`'s reads of a filed request.
     #[cfg(test)]
     test_continuation_request_reads: std::sync::atomic::AtomicUsize,
@@ -4291,6 +4297,16 @@ impl std::fmt::Display for ParentDeathFiringRefusal {
 
 impl std::error::Error for ParentDeathFiringRefusal {}
 
+/// Whether a replayed record is a syscall prehook: the point where a
+/// schedule replay that switches away lets the thread carry out the call it
+/// entered (`Scheduler::replay_prehook_handoff`).
+pub(crate) fn observed_is_syscall_prehook(observed: &SchedEvent) -> bool {
+    matches!(
+        observed.op,
+        detcore_model::schedule::Op::Syscall(_, SyscallPhase::Prehook)
+    )
+}
+
 /// End the run on a scheduler refusal: write it to stderr and exit with
 /// `HERMIT_POLICY_REFUSAL_EXIT`, the status for "hermit examined the run and
 /// refused it", as the network replay refusal does. Only the ptrace backend
@@ -5593,6 +5609,7 @@ impl Scheduler {
             #[cfg(test)]
             test_internal_io_signal_state_reads: Default::default(),
             sigreturn_continuations: Default::default(),
+            replay_prehook_callers: Default::default(),
             #[cfg(test)]
             test_continuation_request_reads: Default::default(),
             cleared_child_tids: Default::default(),
@@ -6732,6 +6749,7 @@ impl Scheduler {
                     self.requeue_with_new_priority(mytid, REPLAY_DEFERRED_PRIORITY);
                     self.requeue_with_new_priority(new_tid, REPLAY_FOREGROUND_PRIORITY);
                     self.wake_due_replay_target(new_tid);
+                    self.note_replay_switch(mytid, new_tid, observed_is_syscall_prehook(observed));
                     if !self.run_queue.contains_tid(new_tid) {
                         // If it is not yet in next_turns, that is because it was JUST spawned and
                         // hasn't showed up yet, but it will by the next scheduler turn.
@@ -7066,6 +7084,7 @@ impl Scheduler {
         // Before removing blocking ownership, pending-vfork state, a turn or
         // its receiver: callback cancellation is not native access retirement.
         self.freeze_reserved_input_thread(*dtid);
+        self.replay_prehook_callers.remove(dtid);
         if let Some(owners) = &mut self.boundary_owners {
             owners.retire(*dtid, mm);
         }
@@ -17374,7 +17393,10 @@ impl Scheduler {
                 // the wait for a backgrounded vfork child: that wait is what
                 // keeps the child's host-timed completion from deciding which
                 // turn commits next.
-                None => match self.first_sigreturn_continuation() {
+                None => match self
+                    .first_sigreturn_continuation()
+                    .or_else(|| self.replay_prehook_handoff())
+                {
                     Some(thread) => self
                         .run_queue
                         .tentative_pop_tid(thread)
@@ -17382,6 +17404,7 @@ impl Scheduler {
                     None => self.run_queue.tentative_pop_next().expect("impossible"),
                 },
             };
+            self.replay_prehook_callers.remove(&next_dtid);
             let nextturn = self.next_turns.get(&next_dtid).unwrap_or_else(|| {
                 panic!(
                 "[sched-step3] internal error: dettid {} queued but missing entry in next_turns",
@@ -18319,6 +18342,63 @@ impl Scheduler {
             && self.rpc_incarnation_matches(parent, parent_mm)
             && self.vfork_barriers.get(&parent) == Some(&None)
             && MmId::for_clone(parent_mm, child, shares_vm) == child_mm
+    }
+
+    /// Record a schedule replay's context switch from `from` to `to`. A
+    /// switch at a syscall prehook leaves `from` still to carry out the call
+    /// it entered (`replay_prehook_callers`); the thread switched to is the
+    /// one the replayer wants, so it needs no handoff of its own.
+    fn note_replay_switch(&mut self, from: DetTid, to: DetTid, at_syscall_prehook: bool) {
+        self.replay_prehook_callers.remove(&to);
+        if at_syscall_prehook {
+            self.replay_prehook_callers.insert(from);
+        } else {
+            self.replay_prehook_callers.remove(&from);
+        }
+    }
+
+    /// The turn step 3 hands over first in a schedule replay while the thread
+    /// the recorded schedule runs next is not queued: the queued turn of a
+    /// thread switched away from at a syscall prehook
+    /// (`replay_prehook_callers`) whose request begins a kernel-run blocking
+    /// call (`ResourceID::is_kernel_run_blocking`). Committing that turn
+    /// backgrounds the call and records no event; the call's continuation and
+    /// its posthook come later, at turns of their own. The recording carried
+    /// the call out at once, before any other thread's event: the call that
+    /// creates the thread the recorded schedule runs next is the case that
+    /// needs it: posix_spawn's clone3 with CLONE_VFORK, a vfork the scheduler
+    /// backgrounds. Without the handoff the
+    /// call waited behind every other deferred thread in arrival order, and a
+    /// poller there took the turn and recorded its polling attempt out of
+    /// order.
+    ///
+    /// Any other request is left in arrival order: a polling grant, for one,
+    /// can record a polling attempt. So is everything while the wanted thread
+    /// is queued, since it goes first, and everything outside a schedule
+    /// replay. Of several eligible turns, the one queued first goes first.
+    fn replay_prehook_handoff(&self) -> Option<DetTid> {
+        if self.replay_prehook_callers.is_empty() {
+            return None;
+        }
+        let (next, _) = self.replay_next_resume()?;
+        if self.run_queue.contains_tid(next) {
+            return None;
+        }
+        self.run_queue.tids().copied().find(|tid| {
+            self.replay_prehook_callers.contains(tid)
+                && self
+                    .next_turns
+                    .get(tid)
+                    .and_then(|next_turn| next_turn.req.try_read())
+                    .and_then(Result::ok)
+                    .is_some_and(|request| {
+                        !request.resources.is_empty()
+                            && request
+                                .resources
+                                .keys()
+                                .all(ResourceID::is_kernel_run_blocking)
+                    })
+        })
     }
 
     /// Inner helper for just the core priority changing.
@@ -29162,6 +29242,119 @@ mod test {
             .insert(child, ExternalOpId::new(child, 1));
         assert!(backgrounded.step3_peek().is_none());
         assert_eq!(backgrounded.vfork_gated_background_child(), Some(child));
+    }
+
+    /// A schedule replay that switches away from a thread at a syscall prehook
+    /// lets that thread's next turn go ahead of the other threads it does not
+    /// want to run while the thread it wants is not queued, if the turn begins
+    /// a kernel-run blocking call (`replay_prehook_handoff`). In the case this
+    /// pins, the call is a backgrounded clone3 that creates the thread the
+    /// replay wants, and a poller queued earlier took the turn instead: its
+    /// recorded polling attempt came out of order and the replay left the
+    /// recording. The handed-over turn backgrounds the call and records no
+    /// event. A request that can record one, a polling grant, is not handed
+    /// over; the wanted thread, once queued, goes first; a switch after the
+    /// thread's event hands over nothing.
+    #[test]
+    fn a_prehook_switch_hands_a_backgrounded_call_its_turn_before_deferred_threads() {
+        let poller = DetTid::from_raw(3);
+        let caller = DetTid::from_raw(5);
+        let wanted = DetTid::from_raw(7);
+        let operation = ExternalOpId::new(caller, 1);
+        let polling = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request
+        };
+        let replay = |phase: SyscallPhase, caller_request: Resources| {
+            let mut sched = Scheduler::new(&Config::default());
+            for (tid, request) in [
+                (poller, polling(poller)),
+                (caller, caller_request),
+                (wanted, Resources::new(wanted)),
+            ] {
+                register_known_thread(&mut sched, tid);
+                sched.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(request));
+                sched.priorities.insert(tid, REPLAY_DEFERRED_PRIORITY);
+            }
+            sched.runqueue_push_back(poller);
+            sched.runqueue_push_back(caller);
+            let observed = SchedEvent::syscall(caller, Sysno::clone3, phase)
+                .with_time(LogicalTime::from_nanos(10_000));
+            sched.replayer = Some(Replayer::new(vec![
+                observed.clone(),
+                SchedEvent::syscall(wanted, Sysno::getpid, SyscallPhase::Prehook),
+            ]));
+            let keep_running = sched.consume_schedevent(&observed).keep_running;
+            assert_eq!(sched.priorities[&caller], REPLAY_DEFERRED_PRIORITY);
+            assert_eq!(sched.priorities[&wanted], REPLAY_FOREGROUND_PRIORITY);
+            (sched, keep_running)
+        };
+        // posix_spawn's clone3 with CLONE_VFORK files a vfork, which the
+        // scheduler backgrounds.
+        let backgrounded = || {
+            let mut request = Resources::new(caller);
+            request.insert(ResourceID::BlockingVfork(operation), Permission::RW);
+            request
+        };
+        let selected = |sched: &mut Scheduler| {
+            let (tid, _, _) = sched.step3_peek().expect("a thread is runnable");
+            sched.run_queue.undo_tentative_pop();
+            tid
+        };
+
+        // The backgrounded call goes first, and its turn records no event: it
+        // takes the thread out of the run queue with its call in the kernel.
+        let (mut at_prehook, keep_running) = replay(SyscallPhase::Prehook, backgrounded());
+        assert!(keep_running);
+        let (tid, _, _) = at_prehook.step3_peek().expect("a thread is runnable");
+        assert_eq!(tid, caller);
+        assert!(!at_prehook.replay_prehook_callers.contains(&caller));
+        assert!(
+            at_prehook
+                .block_for_one_resource(
+                    caller,
+                    &ResourceID::BlockingVfork(operation),
+                    &Permission::RW,
+                    None,
+                    None,
+                    &Ivar::new(),
+                )
+                .is_err()
+        );
+        assert!(at_prehook.vfork_barriers.contains_key(&caller));
+        assert!(!at_prehook.run_queue.contains_tid(caller));
+        // Its call is in the kernel; nothing else has run.
+        assert_eq!(
+            at_prehook.run_queue.tids().copied().collect::<Vec<_>>(),
+            [poller]
+        );
+
+        // A polling grant could record a polling attempt: arrival order.
+        let (mut polls, _) = replay(SyscallPhase::Prehook, polling(caller));
+        assert_eq!(selected(&mut polls), poller);
+
+        // Once the thread the replay wants is queued, it goes first.
+        let (mut with_wanted, _) = replay(SyscallPhase::Prehook, backgrounded());
+        with_wanted.runqueue_push_back(wanted);
+        assert_eq!(selected(&mut with_wanted), wanted);
+        assert!(with_wanted.replay_prehook_callers.contains(&caller));
+
+        // Switched away from after its event, it waits behind the poller.
+        let (mut after_event, keep_running) = replay(SyscallPhase::Posthook, backgrounded());
+        assert!(!keep_running);
+        assert!(after_event.replay_prehook_callers.is_empty());
+        assert_eq!(selected(&mut after_event), poller);
+
+        // The entry goes with a later switch after the thread's event and with
+        // a switch to the thread.
+        let mut cleanup = Scheduler::new(&Config::default());
+        cleanup.note_replay_switch(caller, wanted, true);
+        cleanup.note_replay_switch(caller, wanted, false);
+        assert!(cleanup.replay_prehook_callers.is_empty());
+        cleanup.note_replay_switch(caller, wanted, true);
+        cleanup.note_replay_switch(wanted, caller, false);
+        assert!(cleanup.replay_prehook_callers.is_empty());
     }
 
     /// A vfork parent killed while its registered child's barrier is up takes
