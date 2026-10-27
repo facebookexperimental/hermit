@@ -722,6 +722,31 @@ fn choose_rcb_timer(
     (max_rcbs_remaining, true)
 }
 
+/// What a schedule replay's recorded callback checkpoints decided at one
+/// check-in site (`Detcore::replay_callback_checkpoint`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayCheckpoint {
+    /// No checkpoint decides here; the slice's own end does.
+    Undecided,
+    /// The next checkpoint ended the slice here.
+    Ended,
+    /// The next checkpoint ends the slice later: at a later site of the
+    /// running callback, or, `at_a_later_callback`, at a later callback the
+    /// thread reaches without retiring a branch, such as the system call a
+    /// timer stop precedes. At the post-hook's `PosthookPmuEpsilon`, the last
+    /// site of a callback, nothing of the running callback comes later, so
+    /// there it is always the second; the post-hook still matches on
+    /// `at_a_later_callback` to ask exactly what it decides on.
+    EndsLater { at_a_later_callback: bool },
+}
+
+impl ReplayCheckpoint {
+    /// Whether the checkpoints, not the slice's own end, decide here.
+    fn decides(self) -> bool {
+        self != Self::Undecided
+    }
+}
+
 /// The actual callback check-in at which a slice ends, carried into
 /// `end_timeslice_with_checkpoint` so that priority-history replay of a
 /// callback-annotated record (`Config::annotated_priority_replay`) decides
@@ -3137,6 +3162,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self
             .replay_callback_checkpoint(guest, boundary, token, site)
             .await
+            .decides()
         {
             return;
         }
@@ -3190,47 +3216,54 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Under a schedule replay, let the recorded callback checkpoints decide
-    /// whether the slice ends at `site`. Returns whether one does: the next
-    /// checkpoint ended the slice here, or it ends it at a later site of the
-    /// running callback (`callback_history::State::ends_later_in_callback`),
-    /// or at a later callback this PMU timer stop reaches without retiring a
-    /// branch (`ends_at_a_later_callback_without_branches`).
-    /// In the second case the caller must not end the slice here either: a
-    /// timer preemption the record ended in its post-hook, within one RCB of
-    /// the PMU maximum, already reaches its replayed branch count in the
-    /// pre-hook, and ending it at both would give the replay a scheduler turn,
-    /// and a turn's charge of virtual time, that the record does not have.
+    /// whether the slice ends at `site`, and say how they did
+    /// (`ReplayCheckpoint`): the next checkpoint ended the slice here, or it
+    /// ends it later, at a later site of the running callback
+    /// (`callback_history::State::ends_later_in_callback`) or at a later
+    /// callback this PMU timer stop reaches without retiring a branch
+    /// (`ends_at_a_later_callback_without_branches`). When it ends it later,
+    /// the caller must not end the slice here either: a timer preemption the
+    /// record ended in its post-hook, within one RCB of the PMU maximum,
+    /// already reaches its replayed branch count in the pre-hook, and ending
+    /// it at both would give the replay a scheduler turn, and a turn's charge
+    /// of virtual time, that the record does not have.
     async fn replay_callback_checkpoint<G: Guest<Self>>(
         &self,
         guest: &mut G,
         boundary: CheckIn,
         token: &mut Option<preemptions::callback_history::Token>,
         site: preemptions::callback_history::Site,
-    ) -> bool {
+    ) -> ReplayCheckpoint {
         if self.cfg.replay_schedule_from.is_none()
             || self.cfg.strict_schedule_boundaries
             || guest.thread_state().own_signal_turn_hold.is_some()
         {
-            return false;
+            return ReplayCheckpoint::Undecided;
         }
         let thread = guest.thread_state();
         if let Some(token) = token {
             token.note_cut(thread.callback_history.progress(), site);
         }
         let Some(actual) = thread.callback_history.origin(thread, token, site) else {
-            return false;
+            return ReplayCheckpoint::Undecided;
         };
         let Some(origin) = self
             .take_callback_checkpoint(guest, actual.clone(), token.as_ref())
             .await
         else {
             let history = &guest.thread_state().callback_history;
-            return history.ends_later_in_callback(&actual)
-                || history.ends_at_a_later_callback_without_branches(&actual);
+            let at_a_later_callback = history.ends_at_a_later_callback_without_branches(&actual);
+            return if at_a_later_callback || history.ends_later_in_callback(&actual) {
+                ReplayCheckpoint::EndsLater {
+                    at_a_later_callback,
+                }
+            } else {
+                ReplayCheckpoint::Undecided
+            };
         };
         self.end_timeslice_with_checkpoint(guest, false, Some(origin), boundary, None)
             .await;
-        true
+        ReplayCheckpoint::Ended
     }
 
     /// Priority-history replay of a callback-annotated record
@@ -3470,7 +3503,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             preemptions::callback_history::Site::Posthook,
         )
         .await;
-        let checkpoint_decides = self
+        let checkpoint = self
             .replay_callback_checkpoint(
                 guest,
                 boundary,
@@ -3514,22 +3547,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     );
                     return;
                 }
-                let defers_to_a_later_callback = checkpoint_decides && {
-                    let thread = guest.thread_state();
-                    thread
-                        .callback_history
-                        .origin(
-                            thread,
-                            &token,
-                            preemptions::callback_history::Site::PosthookPmuEpsilon,
-                        )
-                        .is_some_and(|actual| {
-                            thread
-                                .callback_history
-                                .ends_at_a_later_callback_without_branches(&actual)
-                        })
-                };
-                if defers_to_a_later_callback {
+                if checkpoint
+                    == (ReplayCheckpoint::EndsLater {
+                        at_a_later_callback: true,
+                    })
+                {
                     // A schedule replay's next callback checkpoint ends this
                     // slice at a later callback the thread reaches without
                     // retiring a branch, such as the system call this timer
