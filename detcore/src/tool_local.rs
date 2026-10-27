@@ -8531,7 +8531,6 @@ impl<T> ThreadState<T> {
             priority_row: None,
             slice_expired: false,
             zero_length_sleep: false,
-            instruction_offset: None,
         }
     }
 
@@ -9667,6 +9666,19 @@ impl<T> ThreadState<T> {
         let current_time = self.thread_logical_time.as_nanos();
         self.end_of_timeslice
             .is_some_and(|end_of_timeslice| current_time >= end_of_timeslice)
+    }
+
+    /// Take the instruction offset the ending slice's timer was armed with
+    /// (`--chaos-instruction-offset`), for the change point that records it:
+    /// only if the thread reached the branch target, so that the timer, or a
+    /// check-in among its steps, ended the slice. A slice that ended at a
+    /// check-in before the target records no offset; its replay ends it at
+    /// that check-in, as any such slice.
+    pub(crate) fn take_ended_slice_offset(&mut self) -> Option<InstructionOffset> {
+        let committed = self.committed_clock_value;
+        self.armed_instruction_offset
+            .take()
+            .filter(|offset| committed >= offset.rcb_target)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -11933,6 +11945,15 @@ mod timeslice_tests {
         // the timer, so no later change point can file it.
         state.next_timeslice(&chaos);
         assert_eq!(state.armed_instruction_offset, None);
+        // The end of a slice takes the offset only once its branch target
+        // is reached.
+        state.armed_instruction_offset = Some(armed);
+        state.committed_clock_value = 39;
+        assert_eq!(state.take_ended_slice_offset(), None);
+        assert_eq!(state.armed_instruction_offset, None);
+        state.armed_instruction_offset = Some(armed);
+        state.committed_clock_value = 40;
+        assert_eq!(state.take_ended_slice_offset(), Some(armed));
 
         let replay = Config {
             target_timeslice: nz(10_000),

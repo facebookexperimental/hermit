@@ -3750,8 +3750,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             // Where the timer of the timeslice this ends was armed, for one
             // armed with `--chaos-instruction-offset`: taken only where the
-            // slice really ends, and filed with the change point that ends
-            // it. A later pass of this loop ends no armed slice.
+            // slice really ends, and published for the change point that
+            // ends it, which records it. A later pass of this loop ends no
+            // armed slice.
             let mut ended_offset = None;
             let (maybe_prio, boundary) = {
                 let thread = guest.thread_state_mut();
@@ -3762,7 +3763,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // update that authority normally; do not snapshot it here.
                     (None, None)
                 } else if let Some(mut observed) = thread.slice_boundary.take() {
-                    ended_offset = thread.armed_instruction_offset.take();
+                    ended_offset = thread.take_ended_slice_offset();
                     let result =
                         observed.close_slice(thread, &self.cfg, explicit_sched_yield, None);
                     thread.slice_boundary = Some(observed);
@@ -3771,7 +3772,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     });
                     (closed.next_priority, Some(Box::new(closed.boundary)))
                 } else {
-                    ended_offset = thread.armed_instruction_offset.take();
+                    ended_offset = thread.take_ended_slice_offset();
                     (thread.next_timeslice(&self.cfg), None)
                 }
             };
@@ -3800,6 +3801,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
 
+            // Only a change point records an offset; nothing is sent for a
+            // timeslice armed without one.
+            if let Some(offset) = ended_offset
+                && !replay_checkpoint
+                && (maybe_prio.is_some() || chaos)
+            {
+                tool_global::publish_instruction_offset(guest, offset).await;
+            }
+
             // Depending on chaos mode, a received timer event is either a preemption or a changepoint
             let mut req = if replay_checkpoint {
                 // The selected scheduler operation reads its current replay
@@ -3808,12 +3818,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     guest,
                     end_time,
                     scheduler::runqueue::DEFAULT_PRIORITY,
-                    None,
                 )
             } else if let Some(prio) = maybe_prio {
-                Self::priority_changepoint_request(guest, end_time, prio, ended_offset)
+                Self::priority_changepoint_request(guest, end_time, prio)
             } else if chaos {
-                Self::random_priority_changepoint_request(guest, end_time, ended_offset)
+                Self::random_priority_changepoint_request(guest, end_time)
             } else if explicit_sched_yield && self.cfg.replay_schedule_from.is_none() {
                 Self::sched_yield_request(guest)
             } else {

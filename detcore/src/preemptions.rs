@@ -1511,6 +1511,21 @@ impl PreemptionRecord {
                     tid
                 ));
             }
+            // A row records an offset only once its slice reached the target
+            // (`ThreadState::take_ended_slice_offset`). There is no upper
+            // bound: an `rt_sigreturn` among the steps cancels the event, and
+            // the slice then ends at its next callback.
+            if history
+                .preemption_instruction_offsets
+                .iter()
+                .zip(&history.preemption_rcbs)
+                .any(|(offset, rcbs)| offset.is_some_and(|offset| *rcbs < offset.rcb_target))
+            {
+                return Err(format!(
+                    "thread {} has an instruction offset whose branch target its row's end precedes",
+                    tid
+                ));
+            }
             if history
                 .preemption_rcbs
                 .windows(2)
@@ -3411,6 +3426,17 @@ mod tests {
             instructions: 0,
         });
         assert!(zero.validate().unwrap_err().contains("zero steps"));
+        // The row ends at branch 20: an offset aimed past it cannot be its.
+        let mut early = record.clone();
+        early
+            .per_thread
+            .get_mut(&tid)
+            .unwrap()
+            .preemption_instruction_offsets[1] = Some(InstructionOffset {
+            rcb_target: 21,
+            instructions: 4,
+        });
+        assert!(early.validate().unwrap_err().contains("precedes"));
         let mut without_rcbs = record.clone();
         without_rcbs
             .per_thread

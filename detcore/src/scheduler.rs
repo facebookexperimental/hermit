@@ -2615,6 +2615,16 @@ pub struct Scheduler {
     /// recording priorities. The writer owns the latter through retirement.
     record_logical_replay_priorities: bool,
 
+    /// Where the timer of each thread's ending timeslice was armed, for a
+    /// timeslice armed with `--chaos-instruction-offset`, as the thread
+    /// published it just before the change point that ends that timeslice
+    /// (`publish_instruction_offset`). Taken by that change point, which
+    /// records it in the preemption record beside its row
+    /// (`perform_priority_changepoint`). Kept out of `Resources`, which every
+    /// syscall's futures copy at each level. A thread's entry dies with it
+    /// (`logically_kill_thread`).
+    pub(crate) instruction_offsets: HashMap<DetTid, crate::resources::InstructionOffset>,
+
     /// An instance of replayer that is responsible for replaying events in case --replay-preemptions-from is specified
     pub replayer: Option<Replayer>,
     /// Whether the run replays a preemption record (`--replay-preemptions-from`),
@@ -5872,6 +5882,7 @@ impl Scheduler {
             preemption_writer,
             access_trace,
             record_logical_replay_priorities: Self::records_logical_replay_priorities(cfg),
+            instruction_offsets: HashMap::new(),
             callback_history_active: crate::preemptions::callback_history::recording_enabled(cfg)
                 || cfg.annotated_priority_replay
                 || callback_checkpoints
@@ -7684,6 +7695,7 @@ impl Scheduler {
         }
         self.kernel_run_requests.remove(dtid);
         self.published_masks.remove(dtid);
+        self.instruction_offsets.remove(dtid);
         let retired = self
             .discarded_at_send
             .retire(discarded_at_send::QueueId::Thread(*dtid));
@@ -9676,6 +9688,29 @@ impl Scheduler {
             held: entry.generation,
             taken,
         })
+    }
+
+    /// Note where the timer of `thread`'s ending timeslice was armed
+    /// (`instruction_offsets`), for the change point the thread files next.
+    /// Answered before any clock or scheduler accounting, like a published
+    /// mask, and refused, taking nothing, on the same grounds: a thread the
+    /// scheduler does not know, one logically killed, or a retired exec
+    /// incarnation of its tid (`rpc_incarnation_matches` with the request's
+    /// `mm`). Such a thread files no change point that could record it.
+    pub(crate) fn publish_instruction_offset(
+        &mut self,
+        thread: DetTid,
+        mm: MmId,
+        offset: crate::resources::InstructionOffset,
+    ) -> bool {
+        if !self.next_turns.contains_key(&thread)
+            || self.thread_is_logically_killed(thread)
+            || !self.rpc_incarnation_matches(thread, mm)
+        {
+            return false;
+        }
+        self.instruction_offsets.insert(thread, offset);
+        true
     }
 
     /// Record (`Some`) or withdraw (`None`) `thread`'s mask as Detcore's copy
@@ -18478,14 +18513,7 @@ impl Scheduler {
                 .preemption_writer
                 .as_ref()
                 .map(|writer| writer.reprioritization_count(dettid));
-            let answer = self.perform_priority_changepoint(
-                dettid,
-                priority,
-                *time,
-                *rcbs,
-                epochs,
-                rs.instruction_offset.as_deref().copied(),
-            );
+            let answer = self.perform_priority_changepoint(dettid, priority, *time, *rcbs, epochs);
             // (The expiry's row omission is marked centrally in
             // `perform_priority_changepoint`, for every priority decision
             // a raw schedule replay takes without recording it.)
@@ -18560,31 +18588,14 @@ impl Scheduler {
                 0 => Ok(()),
                 1 => {
                     let (rid, perm) = rs.resources.iter().next().unwrap();
-                    let blocked = match rid {
-                        // The end of a timeslice armed with an instruction
-                        // offset carries it beside the change point
-                        // (`Resources::instruction_offset`).
-                        ResourceID::PriorityChangePoint(prio, change_time, rcbs, epochs)
-                            if rs.instruction_offset.is_some() =>
-                        {
-                            self.perform_priority_changepoint(
-                                dettid,
-                                *prio,
-                                *change_time,
-                                *rcbs,
-                                epochs,
-                                rs.instruction_offset.as_deref().copied(),
-                            )
-                        }
-                        _ => self.block_for_one_resource(
-                            dettid,
-                            rid,
-                            perm,
-                            rs.signal_interrupt_errno(),
-                            rs.blocked_signal_mask,
-                            resp,
-                        ),
-                    };
+                    let blocked = self.block_for_one_resource(
+                        dettid,
+                        rid,
+                        perm,
+                        rs.signal_interrupt_errno(),
+                        rs.blocked_signal_mask,
+                        resp,
+                    );
                     if blocked.is_err() {
                         self.work_span_note_wait(dettid, rs);
                     }
@@ -18917,10 +18928,8 @@ impl Scheduler {
             }
 
             // Thread requests change in priority
-            // A request that carries an instruction offset is taken in
-            // `step4_resource_block`, which sees the whole request.
             ResourceID::PriorityChangePoint(prio, change_time, rcbs, epochs) => {
-                self.perform_priority_changepoint(dettid, *prio, *change_time, *rcbs, epochs, None)
+                self.perform_priority_changepoint(dettid, *prio, *change_time, *rcbs, epochs)
             }
 
             // For now, all other resource types are immediately granted.
@@ -19609,10 +19618,17 @@ impl Scheduler {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1151)
         chaos_epochs: &[crate::resources::ChaosEpochTransition],
-        instruction_offset: Option<crate::resources::InstructionOffset>,
     ) -> Result<(), SkipTurn> {
         assert!(runqueue::is_ordinary_priority(new_priority));
         self.chaos_turns_in_slice.remove(&dettid);
+        // Taken whether or not this change point is recorded, so that it
+        // never reaches a later one. The thread published it from the same
+        // committed clock this change point carries, at or past the target.
+        let instruction_offset = self.instruction_offsets.remove(&dettid);
+        debug_assert!(
+            instruction_offset.is_none_or(|offset| offset.rcb_target <= guest_rcbs),
+            "[dtid {dettid}] offset {instruction_offset:?} ends before its change point's {guest_rcbs} branches"
+        );
         let new_priority = self.bound_chaos_starvation(dettid, new_priority);
         // Alter the threads priority and requeue.
         let old_priority = self.priorities.insert(dettid, new_priority);
@@ -40118,8 +40134,7 @@ mod test {
                     DEFAULT_PRIORITY,
                     LogicalTime::from_nanos(1),
                     1,
-                    &[],
-                    None
+                    &[]
                 )
                 .is_err()
         );
@@ -40388,14 +40403,7 @@ mod test {
         );
         assert!(
             scheduler
-                .perform_priority_changepoint(
-                    spinner,
-                    drawn,
-                    LogicalTime::from_nanos(at),
-                    at,
-                    &[],
-                    None
-                )
+                .perform_priority_changepoint(spinner, drawn, LogicalTime::from_nanos(at), at, &[])
                 .is_err()
         );
     }

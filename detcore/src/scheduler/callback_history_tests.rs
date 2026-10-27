@@ -1119,10 +1119,11 @@ mod callback_history_scheduler_tests {
         );
     }
 
-    /// The end of a timeslice armed with `--chaos-instruction-offset` carries
-    /// where its timer was armed beside its change point
-    /// (`Resources::instruction_offset`), and the scheduler records it on that
-    /// row; the same change point without one records none.
+    /// The end of a timeslice armed with `--chaos-instruction-offset`
+    /// publishes where its timer was armed just before its change point
+    /// (`Scheduler::publish_instruction_offset`), and the change point records
+    /// it on its row and takes it; the same change point without one records
+    /// none.
     #[test]
     fn a_change_point_records_the_instruction_offset_it_carries() {
         use crate::resources::InstructionOffset;
@@ -1131,7 +1132,7 @@ mod callback_history_scheduler_tests {
             rcb_target: 40,
             instructions: 3,
         };
-        for carried in [Some(offset), None] {
+        for published in [Some(offset), None] {
             let mut s = Scheduler::new(&Config {
                 record_preemptions: true,
                 ..Config::default()
@@ -1140,9 +1141,17 @@ mod callback_history_scheduler_tests {
                 .as_mut()
                 .unwrap()
                 .register_thread(thread, 200);
-            let mut request = priority(thread, false);
-            request.instruction_offset = carried.map(Box::new);
+            // The change point ends the slice at branch 43, three steps
+            // past the target.
+            let mut request = Resources::new(thread);
+            request.insert(
+                ResourceID::PriorityChangePoint(200, LogicalTime::ZERO, 43, Vec::new()),
+                Permission::W,
+            );
             install(&mut s, thread, 200, request);
+            if let Some(offset) = published {
+                assert!(s.publish_instruction_offset(thread, MmId::initial(thread), offset));
+            }
             let (selected, filed, response) = s.step3_peek().unwrap();
             assert_eq!(selected, thread);
             let filed = filed.try_read().unwrap().unwrap();
@@ -1152,11 +1161,47 @@ mod callback_history_scheduler_tests {
                 serde_json::from_str(&s.preemption_writer.take().unwrap().into_string()).unwrap();
             let offsets =
                 record["per_thread"][thread.to_string()]["preemption_instruction_offsets"].clone();
-            let expected = match carried {
+            assert!(s.instruction_offsets.is_empty());
+            let expected = match published {
                 Some(_) => serde_json::json!([{"rcb_target": 40, "instructions": 3}]),
                 None => serde_json::Value::Null,
             };
             assert_eq!(offsets, expected, "{record}");
         }
+    }
+
+    /// A published offset dies with its thread
+    /// (`Scheduler::logically_kill_thread`), and nothing publishes one for a
+    /// thread the scheduler does not know, one logically killed, or a retired
+    /// exec incarnation of its tid: a later thread under that tid must not
+    /// record it on its own row.
+    #[test]
+    fn a_published_instruction_offset_dies_with_its_thread() {
+        use crate::resources::InstructionOffset;
+        let thread = tid(3);
+        let mm = MmId::initial(thread);
+        let offset = InstructionOffset {
+            rcb_target: 40,
+            instructions: 3,
+        };
+        let mut s = Scheduler::new(&Config {
+            record_preemptions: true,
+            ..Config::default()
+        });
+        assert!(!s.publish_instruction_offset(thread, mm, offset), "unknown");
+        install(&mut s, thread, 200, priority(thread, false));
+        assert!(s.publish_instruction_offset(thread, mm, offset));
+        assert_eq!(s.instruction_offsets.get(&thread), Some(&offset));
+        s.logically_kill_thread(&thread, &DetPid::from_raw(3), mm);
+        assert!(s.instruction_offsets.is_empty());
+        assert!(!s.publish_instruction_offset(thread, mm, offset), "killed");
+
+        let mut s = Scheduler::new(&Config::default());
+        install(&mut s, thread, 200, priority(thread, false));
+        let successor = MmId::initial(tid(4));
+        s.exec_incarnations.insert(thread, successor);
+        assert!(!s.publish_instruction_offset(thread, mm, offset), "retired");
+        assert!(s.instruction_offsets.is_empty());
+        assert!(s.publish_instruction_offset(thread, successor, offset));
     }
 }

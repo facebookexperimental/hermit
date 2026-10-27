@@ -823,14 +823,6 @@ pub struct Resources {
     /// the configuration fingerprint (revision 8 appended this field).
     #[serde(default)]
     pub(crate) zero_length_sleep: bool,
-    /// On the priority change that ends a timeslice armed with
-    /// `--chaos-instruction-offset`, where that timeslice's timer was armed,
-    /// for the preemption record. Beside the request rather than in
-    /// `ResourceID::PriorityChangePoint`, whose debug form the scheduler logs
-    /// with every commit. Appended last without skip_serializing_if, and
-    /// boxed, as above.
-    #[serde(default)]
-    pub(crate) instruction_offset: Option<Box<InstructionOffset>>,
 }
 
 impl fmt::Debug for Resources {
@@ -910,9 +902,6 @@ impl fmt::Debug for Resources {
         if self.slice_expired {
             debug.field("slice_expired", &true);
         }
-        if let Some(offset) = &self.instruction_offset {
-            debug.field("instruction_offset", offset);
-        }
         debug.finish()
     }
 }
@@ -966,7 +955,6 @@ impl Resources {
             priority_row: None,
             slice_expired: false,
             zero_length_sleep: false,
-            instruction_offset: None,
         }
     }
 

@@ -1094,6 +1094,17 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
         responses: Mutex::new(Vec::new()),
     };
     let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+    let publishes = |requests: &Mutex<Vec<GlobalRequest>>| {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                GlobalRequest::PublishInstructionOffset(offset) => Some(*offset),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
     tool.pre_handler_hook(&mut guest, true, crate::CheckIn::Event)
         .await;
     tool.post_handler_hook(&mut guest, crate::CheckIn::Event)
@@ -1111,6 +1122,9 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
     drive_callback_hook(&state, tid, tool.handle_timer_event(&mut guest), &mut previous).await;
     assert_eq!(guest.thread.committed_clock_value, end);
     assert_eq!(guest.thread.stats.timeslice_count, slices + 1);
+    // One publication, just before the change point that took it.
+    assert_eq!(publishes(&guest.inner.requests), vec![armed]);
+    assert!(state.sched.lock().unwrap().instruction_offsets.is_empty());
     let record = state
         .sched
         .lock()
@@ -1169,4 +1183,61 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
     drive_callback_hook(&state, tid, tool.handle_timer_event(&mut guest), &mut previous).await;
     assert_eq!(guest.thread.committed_clock_value, end);
     assert_eq!(guest.thread.stats.timeslice_count, slices + 1);
+    // The replay publishes the recorded offset too, and its change point
+    // takes it although nothing records it.
+    assert_eq!(publishes(&guest.inner.requests), vec![armed]);
+    assert!(state.sched.lock().unwrap().instruction_offsets.is_empty());
+
+    // Without the option, the same chaos slice publishes nothing.
+    let mut off = Config {
+        chaos: true,
+        record_preemptions: true,
+        sched_seed: Some(seed),
+        ..replay
+    };
+    off.validate();
+    let (off, state, tid, process) = cancellation_test_state_with_config(off);
+    install_test_registration(&state, tid, Ivar::new());
+    state
+        .sched
+        .lock()
+        .unwrap()
+        .preemption_writer
+        .as_mut()
+        .unwrap()
+        .register_thread(tid, DEFAULT_PRIORITY);
+    let mut thread = crate::ThreadState::new(tid, &off, ());
+    thread.detpid = Some(process);
+    thread.next_timeslice(&off);
+    assert_eq!(thread.slice_instruction_offset, 0);
+    let mut guest = LegacyDeadlineGuest {
+        inner: ExternalRegistrationGuest {
+            global: &state,
+            config: &off,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+            ppid: None,
+            private_memory: None,
+        },
+        clock_reads: 0,
+        reported_rcbs: 0,
+        timers: Vec::new(),
+        responses: Mutex::new(Vec::new()),
+    };
+    let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &off);
+    tool.pre_handler_hook(&mut guest, true, crate::CheckIn::Event)
+        .await;
+    tool.post_handler_hook(&mut guest, crate::CheckIn::Event)
+        .await;
+    assert!(matches!(
+        guest.timers.last(),
+        Some(reverie::TimerSchedule::Rcbs(rcbs)) if *rcbs == due
+    ));
+    guest.reported_rcbs = due;
+    let slices = guest.thread.stats.timeslice_count;
+    let mut previous = Err(crate::scheduler::SkipTurn);
+    drive_callback_hook(&state, tid, tool.handle_timer_event(&mut guest), &mut previous).await;
+    assert_eq!(guest.thread.stats.timeslice_count, slices + 1);
+    assert!(publishes(&guest.inner.requests).is_empty());
 }
