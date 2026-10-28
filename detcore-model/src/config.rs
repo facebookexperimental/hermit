@@ -3773,7 +3773,11 @@ mod legacy_backend_json {
     /// it is never written and reads as unset.
     /// `sleep_registration` too: the scheduler registers sleeps, not the
     /// runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 48] = [
+    /// `rewrite_exclusives_in_memory` came after it as well: the in-memory
+    /// rewrite of aarch64 exclusive loops is done by the ptrace backend's
+    /// global state, and no backend that reads the legacy form does it, so it
+    /// is never written and reads as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 49] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3822,6 +3826,7 @@ mod legacy_backend_json {
         "access_trace_max_bytes",
         "replay_continue_fairly",
         "standard_stream_aliases",
+        "rewrite_exclusives_in_memory",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3970,6 +3975,7 @@ mod legacy_backend_json {
                     | "eager_lone_preemptions"
                     | "replay_continue_fairly"
                     | "strict_binder",
+                    | "rewrite_exclusives_in_memory",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
                 Some("in_guest_reserved_signals" | "access_trace_from") => {
@@ -4325,7 +4331,8 @@ mod legacy_backend_json {
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
-                | "access_trace_max_bytes" => Ok(()),
+                | "access_trace_max_bytes"
+                | "rewrite_exclusives_in_memory" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -5251,7 +5258,8 @@ mod tests {
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
-                | "access_trace_max_bytes" => {}
+                | "access_trace_max_bytes"
+                | "rewrite_exclusives_in_memory" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
@@ -5290,9 +5298,9 @@ mod tests {
         // `access_trace_max_bytes`, `replay_continue_fairly`,
         // `standard_stream_aliases`, `sleep_registration`, `strict_binder`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-seven fewer, so thirty-three keys fewer than fields.
+        // forty-eight fewer, so thirty-four keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 33);
+        assert_eq!(fields.len(), keys.len() + 34);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5825,6 +5833,39 @@ mod tests {
             .unwrap_err();
         assert!(message.contains("at least 1"), "{message}");
         assert!(message.contains("at most 1000000000"), "{message}");
+    }
+
+    /// `rewrite_exclusives_in_memory` never enters the legacy form, whatever its value: the
+    /// legacy string keeps its bytes, and it reads back as false from both
+    /// the object and the array form.
+    #[test]
+    fn rewrite_exclusives_in_memory_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            rewrite_exclusives_in_memory: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("rewrite_exclusives_in_memory"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .rewrite_exclusives_in_memory
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .rewrite_exclusives_in_memory
+        );
     }
 
     /// `futex_wake_yields` never enters the legacy form, whatever its
