@@ -13993,7 +13993,7 @@ impl RunOpts {
     /// The guest paths at which the caller's mounts can cover `/dev/shm`:
     /// every `--mount` target, and a `--bind` at `/dev/shm` itself.
     fn dev_shm_covering_targets(&self) -> impl Iterator<Item = &Path> {
-        self.mount.iter().map(Mount::get_target).chain(
+        self.mount.iter().map(|arg| arg.mount.get_target()).chain(
             self.bind
                 .iter()
                 .map(|bind| bind_paths(bind).1)
