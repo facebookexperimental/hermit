@@ -389,8 +389,13 @@ pub struct BackgroundStartRef {
     /// before the record's event of this index.
     pub after: u64,
     /// Where the replay was when it passed the start without taking it (the
-    /// next event came, or a fast-forward skipped past it). `None` for a
-    /// start the replay never reached.
+    /// next event came, or a fast-forward skipped past it): the observed event
+    /// and the record's position before that event or the skip was consumed.
+    /// For a start the replay passed at the next event, `record_event` is at
+    /// least `after`; for one a fast-forward skipped, it is less, as the
+    /// replay jumped over the start. `None` for a start still due when the
+    /// replay ended (`after` at most the note's `reported_at.record_event`)
+    /// and for one it never reached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passed_at: Option<ReplayPosition>,
 }

@@ -1498,20 +1498,17 @@ mod tests {
     /// the replay never reached (https://github.com/rrnewton/hermit/issues/4876).
     #[test]
     fn untaken_background_starts_name_their_place_in_the_record() {
+        // Ten recorded events, of which the replay runs five, with the third
+        // skipped: every start lies within the record, as a valid record's
+        // must (`PreemptionRecord::validate`).
         let mut b = builder::SchedTestBuilder::new();
-        let five = strip_times(vec![
-            b.branch(10, tid(3)),
-            b.branch(20, tid(3)),
-            b.branch(30, tid(3)),
-            b.branch(40, tid(3)),
-            b.branch(50, tid(3)),
-        ]);
+        let ten = strip_times((1..=10).map(|n| b.branch(10 * n, tid(3))).collect());
         let start = |after, raw, call| crate::preemptions::BackgroundStart {
             after,
             thread: tid(raw),
             call,
         };
-        let mut replayer = Replayer::new(five.clone()).with_background_starts(
+        let mut replayer = Replayer::new(ten.clone()).with_background_starts(
             &[
                 start(1, 5, 1),
                 start(3, 7, 1),
@@ -1521,13 +1518,14 @@ mod tests {
             true,
         );
         // The start after event 0 is due, and event #1 comes without it.
-        replayer.observe_event(&five[0]);
-        replayer.observe_event(&five[1]);
+        replayer.observe_event(&ten[0]);
+        replayer.observe_event(&ten[1]);
         // Event #2 is the record's fourth: the third is fast-forwarded past,
-        // and the start after it with it.
-        replayer.observe_event(&five[3]);
-        // The last event makes the start after it due; the replay ends.
-        replayer.observe_event(&five[4]);
+        // and the start before the fourth with it.
+        replayer.observe_event(&ten[3]);
+        // The record's fifth event makes the start after it due; the replay
+        // ends there, short of the start before the record's event #9.
+        replayer.observe_event(&ten[4]);
         let at = |event, record_event| {
             Some(ReplayPosition {
                 event,

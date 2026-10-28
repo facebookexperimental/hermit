@@ -21597,14 +21597,18 @@ impl Scheduler {
                     passed_at: start.passed_at,
                 })
                 .collect();
+            // The line lists the first starts; the note lists them all.
+            const LISTED: usize = 10;
+            let more = starts.len().saturating_sub(LISTED);
             let message = format!(
-                "DESYNC {} recorded background starts were not taken: {} (the replay ended at \
+                "DESYNC {} recorded background starts were not taken: {}{} (the replay ended at \
                  event #{}, record event #{})",
                 starts.len(),
                 starts
                     .iter()
+                    .take(LISTED)
                     .map(|start| format!(
-                        "thread {}'s call {} after record event #{} ({})",
+                        "thread {}'s call {} before record event #{} ({})",
                         start.thread,
                         start.call,
                         start.after,
@@ -21613,11 +21617,21 @@ impl Scheduler {
                                 "passed at event #{}, record event #{}",
                                 at.event, at.record_event
                             ),
+                            // Due when the replay ended (its events passed),
+                            // or still ahead of it.
+                            None if start.after <= ended_at.record_event => {
+                                "due when the replay ended".to_owned()
+                            }
                             None => "not reached".to_owned(),
                         }
                     ))
                     .collect::<Vec<_>>()
                     .join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                },
                 ended_at.event,
                 ended_at.record_event,
             );
@@ -29416,6 +29430,7 @@ mod test {
         let events = [
             SchedEvent::branches(a, 10).with_time(LogicalTime::from_nanos(100)),
             SchedEvent::branches(a, 20).with_time(LogicalTime::from_nanos(200)),
+            SchedEvent::branches(a, 30).with_time(LogicalTime::from_nanos(300)),
         ];
         let start = |after, thread, call| crate::preemptions::BackgroundStart {
             after,
@@ -29425,17 +29440,19 @@ mod test {
         let mut scheduler = Scheduler::new(&Config::default());
         scheduler.replayer = Some(
             crate::scheduler::replayer::Replayer::new(events.clone())
-                .with_background_starts(&[start(1, b, 2), start(4, a, 7)], true),
+                .with_background_starts(&[start(1, b, 2), start(2, a, 5), start(3, a, 7)], true),
         );
         let replayer = scheduler.replayer.as_mut().unwrap();
         replayer.observe_event(&events[0]);
         replayer.observe_event(&events[1]);
         let summary = scheduler.generate_partial_run_summary(None).unwrap();
         let text = summary.desync_descrip.unwrap();
-        let line = "DESYNC 2 recorded background starts were not taken: thread 5's call 2 after \
-                    record event #1 (passed at event #1, record event #1), thread 3's call 7 \
-                    after record event #4 (not reached) (the replay ended at event #2, record \
-                    event #2)";
+        // The replay passes the first start, ends with the second due and
+        // never reaches the third.
+        let line = "DESYNC 3 recorded background starts were not taken: thread 5's call 2 before \
+                    record event #1 (passed at event #1, record event #1), thread 3's call 5 \
+                    before record event #2 (due when the replay ended), thread 3's call 7 before \
+                    record event #3 (not reached) (the replay ended at event #2, record event #2)";
         assert!(text.contains(line), "{text}");
         assert_eq!(summary.desync_notes.len(), 1);
         let note = &summary.desync_notes[0];
@@ -29462,8 +29479,14 @@ mod test {
                 },
                 BackgroundStartRef {
                     thread: a,
+                    call: 5,
+                    after: 2,
+                    passed_at: None,
+                },
+                BackgroundStartRef {
+                    thread: a,
                     call: 7,
-                    after: 4,
+                    after: 3,
                     passed_at: None,
                 },
             ]
@@ -29475,6 +29498,25 @@ mod test {
                 record_event: 2
             })
         );
+        // The line lists the first ten starts and counts the rest; the note
+        // lists them all.
+        let many: Vec<_> = (0..12).map(|call| start(3, a, call)).collect();
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.replayer = Some(
+            crate::scheduler::replayer::Replayer::new(events.clone())
+                .with_background_starts(&many, true),
+        );
+        let summary = scheduler.generate_partial_run_summary(None).unwrap();
+        let text = summary.desync_descrip.unwrap();
+        assert!(
+            text.contains(
+                "thread 3's call 9 before record event #3 (not reached) and 2 more (the replay \
+                 ended at event #0, record event #0)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("call 10 "), "{text}");
+        assert_eq!(summary.desync_notes[0].background_starts.len(), 12);
     }
 
     /// A schedule replay whose record notes background starts begins a
