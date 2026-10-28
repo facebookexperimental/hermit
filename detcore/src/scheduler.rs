@@ -23064,6 +23064,7 @@ impl Scheduler {
                 seed_reproducible: None,
                 // GlobalState takes it from the access trace.
                 watch: None,
+                stdio_changed: Vec::new(),
             },
             info_reprio_descrip,
         ))

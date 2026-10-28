@@ -3242,6 +3242,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/stderr_fsync.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/stderr_fsync.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test records this guest with stderr a regular file and replays its schedule with stderr a pipe and a file again, asserting what fsync on stderr returned in each, that the pipe replay names the changed stderr kind on stderr and in its summary, and that the file replay names nothing; it remains a guest fixture because a generic manifest cannot set a run's stderr kind or compare a recording with its replay."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/stdio_lseek_identity.c",
       "runner": "hermit-cli/tests/cli.rs and hermit-cli/tests/run_evidence.rs",
       "why": "tests/c/stdio_lseek_identity.c is owned by hermit-cli/tests/cli.rs and hermit-cli/tests/run_evidence.rs: The dedicated suites compile the guest and control inherited output descriptors to assert unseekable standard-stream identity and its recorded execution evidence."

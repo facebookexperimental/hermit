@@ -239,6 +239,11 @@ pub fn host_input_changed(recorded: &HostInput, now: &HostInput) -> bool {
 pub struct HostInputSet {
     pub digest: String,
     pub files: Vec<HostInput>,
+    /// The kinds of file behind the guest's standard descriptors when the
+    /// run began ([`StdioKinds`]). Not part of [`Self::digest`], which follows
+    /// the files alone. Absent where the run did not look.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdio: Option<StdioKinds>,
 }
 
 impl HostInputSet {
@@ -280,6 +285,117 @@ impl std::fmt::Display for HostInputChange {
             f,
             "host input {} changed since the recording ({} then, {} now); the run may diverge where the guest reads it",
             self.path, self.recorded, self.now
+        )
+    }
+}
+
+/// The kind of file behind one of the guest's standard descriptors. A guest
+/// can tell them apart (`fstat`, `isatty`, and calls whose result depends on
+/// the kind: `fsync` fails with `EINVAL` on a pipe and succeeds on a file, and
+/// `lseek` fails with `ESPIPE` on a pipe), so a replay whose stdio kinds
+/// differ from its recording's may run differently where the guest checks.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StdioKind {
+    /// A regular file.
+    File,
+    /// A pipe or FIFO.
+    Pipe,
+    /// A socket.
+    Socket,
+    /// A terminal.
+    Tty,
+    /// A character device that is not a terminal, such as `/dev/null`.
+    CharDevice,
+    /// A block device.
+    BlockDevice,
+    /// A directory.
+    Directory,
+    /// No open descriptor.
+    Closed,
+}
+
+impl StdioKind {
+    /// The kind of an open descriptor whose `st_mode` is `mode`, with
+    /// `terminal` whether it is a terminal (`isatty`).
+    pub fn from_mode(mode: libc::mode_t, terminal: bool) -> Self {
+        match mode & libc::S_IFMT {
+            libc::S_IFREG => Self::File,
+            libc::S_IFIFO => Self::Pipe,
+            libc::S_IFSOCK => Self::Socket,
+            libc::S_IFCHR if terminal => Self::Tty,
+            libc::S_IFCHR => Self::CharDevice,
+            libc::S_IFBLK => Self::BlockDevice,
+            libc::S_IFDIR => Self::Directory,
+            // `S_IFLNK` cannot be an open descriptor's kind.
+            _ => Self::File,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::File => "a regular file",
+            Self::Pipe => "a pipe",
+            Self::Socket => "a socket",
+            Self::Tty => "a terminal",
+            Self::CharDevice => "a character device",
+            Self::BlockDevice => "a block device",
+            Self::Directory => "a directory",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// The kinds of file behind the guest's stdin, stdout and stderr when a run
+/// began.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StdioKinds {
+    pub stdin: StdioKind,
+    pub stdout: StdioKind,
+    pub stderr: StdioKind,
+}
+
+impl StdioKinds {
+    /// The descriptors whose kind differs between `recorded` and `now`, in
+    /// descriptor order.
+    pub fn changes(recorded: &Self, now: &Self) -> Vec<StdioChange> {
+        [
+            (0, recorded.stdin, now.stdin),
+            (1, recorded.stdout, now.stdout),
+            (2, recorded.stderr, now.stderr),
+        ]
+        .into_iter()
+        .filter(|(_, recorded, now)| recorded != now)
+        .map(|(fd, recorded, now)| StdioChange { fd, recorded, now })
+        .collect()
+    }
+}
+
+/// A standard descriptor whose kind differs between a recorded run and the
+/// run that reproduces it ([`StdioKinds::changes`]).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StdioChange {
+    /// 0, 1 or 2.
+    pub fd: u8,
+    pub recorded: StdioKind,
+    pub now: StdioKind,
+}
+
+impl std::fmt::Display for StdioChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self.fd {
+            0 => "stdin",
+            1 => "stdout",
+            _ => "stderr",
+        };
+        write!(
+            f,
+            "{name} (fd {}) was {} in the recording and is {} now; the run may diverge where the guest checks it (fstat, isatty, fsync, lseek)",
+            self.fd,
+            self.recorded.describe(),
+            self.now.describe()
         )
     }
 }
@@ -333,6 +449,7 @@ mod tests {
 
     fn set(files: &[(&str, HostFileIdentity)]) -> HostInputSet {
         HostInputSet {
+            stdio: None,
             digest: String::new(),
             files: files
                 .iter()
@@ -343,6 +460,65 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// A descriptor's kind follows its mode, and a character device is a
+    /// terminal only when it says so. A replay names each descriptor whose
+    /// kind changed, in descriptor order. A set without stdio kinds is
+    /// written as before, and one with them round-trips.
+    #[test]
+    fn stdio_kinds_name_each_changed_descriptor() {
+        assert_eq!(
+            StdioKind::from_mode(libc::S_IFREG | 0o644, false),
+            StdioKind::File
+        );
+        assert_eq!(StdioKind::from_mode(libc::S_IFIFO, false), StdioKind::Pipe);
+        assert_eq!(StdioKind::from_mode(libc::S_IFCHR, true), StdioKind::Tty);
+        assert_eq!(
+            StdioKind::from_mode(libc::S_IFCHR, false),
+            StdioKind::CharDevice
+        );
+        let recorded = StdioKinds {
+            stdin: StdioKind::CharDevice,
+            stdout: StdioKind::Pipe,
+            stderr: StdioKind::File,
+        };
+        let now = StdioKinds {
+            stdin: StdioKind::Closed,
+            stderr: StdioKind::Pipe,
+            ..recorded
+        };
+        assert!(StdioKinds::changes(&recorded, &recorded).is_empty());
+        let changes = StdioKinds::changes(&recorded, &now);
+        assert_eq!(
+            changes,
+            vec![
+                StdioChange {
+                    fd: 0,
+                    recorded: StdioKind::CharDevice,
+                    now: StdioKind::Closed,
+                },
+                StdioChange {
+                    fd: 2,
+                    recorded: StdioKind::File,
+                    now: StdioKind::Pipe,
+                },
+            ]
+        );
+        assert_eq!(
+            changes[1].to_string(),
+            "stderr (fd 2) was a regular file in the recording and is a pipe now; the run may \
+             diverge where the guest checks it (fstat, isatty, fsync, lseek)"
+        );
+        let without = set(&[]);
+        assert!(!serde_json::to_string(&without).unwrap().contains("stdio"));
+        let with = HostInputSet {
+            stdio: Some(now),
+            ..set(&[])
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""stderr":"pipe""#), "{json}");
+        assert_eq!(serde_json::from_str::<HostInputSet>(&json).unwrap(), with);
     }
 
     #[test]

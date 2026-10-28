@@ -1290,6 +1290,13 @@ pub struct GlobalState {
     // Whether `settle_host_inputs` has run.
     host_inputs_settled: AtomicBool,
 
+    // The kinds of file behind the guest's standard descriptors when the run
+    // began, when `Config::record_host_inputs` is set, and those that differ
+    // from the replayed recording's (`detcore_model::host_input::StdioKinds`).
+    // Information only, as `recorded_host_inputs` is.
+    stdio: Option<detcore_model::host_input::StdioKinds>,
+    stdio_changed: Vec<detcore_model::host_input::StdioChange>,
+
     // The canonical models of open file descriptions that several guest
     // processes share (see `crate::shared_open_files`). Locked after `sched`,
     // never before it.
@@ -1906,7 +1913,7 @@ impl GlobalState {
 
         // A replayed recording that names the host files its run opened:
         // this run's opens are compared against them.
-        let replay_host_inputs = cfg
+        let recorded_host_inputs = cfg
             .record_host_inputs
             .then(|| {
                 preemptions_to_replay
@@ -1915,7 +1922,24 @@ impl GlobalState {
                     .cloned()
                     .or_else(|| sched.lock().unwrap().recorded_host_inputs.clone())
             })
-            .flatten()
+            .flatten();
+        // The guest inherits this process's standard descriptors. A replay
+        // names each whose kind differs from its recording's, before the
+        // guest runs.
+        let stdio = cfg.record_host_inputs.then(crate::host_inputs::stdio_kinds);
+        let stdio_changed = match (
+            recorded_host_inputs.as_ref().and_then(|set| set.stdio),
+            stdio,
+        ) {
+            (Some(recorded), Some(now)) => {
+                detcore_model::host_input::StdioKinds::changes(&recorded, &now)
+            }
+            _ => Vec::new(),
+        };
+        for change in &stdio_changed {
+            report_host_input_change(change);
+        }
+        let replay_host_inputs = recorded_host_inputs
             .map(|recorded| Mutex::new(crate::host_inputs::ReplayHostInputs::new(recorded)));
         let range = Self::read_port_range();
         let network = Self::network_engine(cfg).map(Mutex::new);
@@ -1973,6 +1997,8 @@ impl GlobalState {
             replay_host_inputs,
             host_input_sources: Mutex::new(Vec::new()),
             host_inputs_settled: AtomicBool::new(false),
+            stdio,
+            stdio_changed,
             shared_open_files: process_exit_cleanup.shared_open_files,
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
@@ -2648,13 +2674,15 @@ impl GlobalState {
         if mutated.contains("/") {
             return None;
         }
-        Some(crate::host_inputs::input_set(
+        let mut set = crate::host_inputs::input_set(
             &self
                 .host_inputs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
             &mutated,
-        ))
+        );
+        set.stdio = self.stdio;
+        Some(set)
     }
 
     /// Read what the run's host-input records need from the files
@@ -2831,6 +2859,7 @@ impl GlobalState {
                 consistent_cut: snapshot.consistent_cut,
             }
         });
+        summary.stdio_changed = self.stdio_changed.clone();
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -9800,11 +9829,11 @@ pub(crate) async fn record_host_input<G, T>(
     );
 }
 
-/// Print `change` on Hermit's own stderr, never the guest's output or the
-/// log `--verify` compares, without panicking where the guest made the shared
-/// stderr nonblocking (`crate::util::RetryingStderr`). The caller holds no
-/// lock.
-fn report_host_input_change(change: &detcore_model::host_input::HostInputChange) {
+/// Print `change`, a host input that changed since its recording, on Hermit's
+/// own stderr, never the guest's output or the log `--verify` compares,
+/// without panicking where the guest made the shared stderr nonblocking
+/// (`crate::util::RetryingStderr`). The caller holds no lock.
+fn report_host_input_change(change: &dyn std::fmt::Display) {
     let line = format!(
         "{} {change}\n",
         detcore_model::host_input::HOST_INPUT_CHANGED_SINCE_RECORDING_MARKER

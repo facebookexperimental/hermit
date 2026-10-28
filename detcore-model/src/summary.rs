@@ -20,6 +20,7 @@ use serde::Serialize;
 
 use crate::host_input::HostInputChange;
 use crate::host_input::HostInputSet;
+use crate::host_input::StdioChange;
 use crate::pid::DetTid;
 use crate::syscall_histogram::SyscallHistogramSummary;
 use crate::time::LogicalTime;
@@ -444,6 +445,15 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_timeout_secs: Option<u64>,
 
+    /// The guest's standard descriptors whose kind (file, pipe, terminal, ...)
+    /// a schedule replay found different from the recording it replays, in
+    /// descriptor order (see [`crate::host_input::StdioChange`]); this run's
+    /// own kinds are in `host_inputs`. Empty when they match, when either run
+    /// did not look, or the run replayed nothing. Not part of the
+    /// human-readable summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stdio_changed: Vec<StdioChange>,
+
     /// Skid-overshoot events of the run's precise PMU timers: preemption
     /// points that took effect past the branch count they were programmed
     /// for, because the overflow interrupt was handled late. One event is
@@ -821,6 +831,7 @@ impl RunSummary {
             skid_overshoot_reports,
             seed_reproducible: _,
             watch,
+            stdio_changed: _,
         } = self;
         if let Some(bound) = run_timeout_secs {
             writeln!(
