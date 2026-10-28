@@ -4707,9 +4707,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (proved to fault included) goes to the kernel. One Detcore cannot
         // read although the kernel may (a page mapped writable, not readable,
         // or a mapped page 0) cannot be checked, so it is refused below.
+        let witness = super::chosen_ids::FaultWitness::for_backend(
+            &guest.config().backend,
+            guest.tid().as_raw(),
+        );
         let memory = guest.memory();
-        let mut raw = match super::chosen_ids::read_clone_args(&memory, guest.tid().as_raw(), clone)
-        {
+        let mut raw = match super::chosen_ids::read_clone_args(&memory, witness, clone) {
             super::chosen_ids::Clone3Read::Bytes(bytes) => bytes,
             super::chosen_ids::Clone3Read::Refused => return None,
             super::chosen_ids::Clone3Read::Unreadable { .. } => {
@@ -4758,7 +4761,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             super::chosen_ids::read_pid_array(&memory, set_tid as usize, &mut tids).is_some();
         if !read
             && super::chosen_ids::range_faults(
-                guest.tid().as_raw(),
+                witness,
                 set_tid as usize,
                 tids.len() * std::mem::size_of::<libc::pid_t>(),
             )
@@ -4783,12 +4786,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             thread.detpid.expect("detpid unset"),
             thread.dettid
         );
-        let capabilities = std::fs::read_to_string(status).ok().and_then(|status| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix("CapEff:"))
-                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
-        });
+        // Only where host tasks describe guest threads: elsewhere (KVM) that
+        // file is an unrelated host task's, so the set counts as unread.
+        let host_readable = matches!(witness, super::chosen_ids::FaultWitness::HostMaps(_));
+        let capabilities = host_readable
+            .then(|| std::fs::read_to_string(status).ok())
+            .flatten()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("CapEff:"))
+                    .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            });
         let pid_capabilities = (1u64 << CAP_SYS_ADMIN) | (1u64 << CAP_CHECKPOINT_RESTORE);
         if capabilities.is_some_and(|mask| mask & pid_capabilities == 0) {
             return None;

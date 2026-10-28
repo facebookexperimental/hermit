@@ -671,8 +671,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The calling thread's own maps: the leader's are empty once it has
         // exited, while the others still run on the same memory.
         let tid = guest.tid().as_raw();
+        let witness = FaultWitness::for_backend(&guest.config().backend, tid);
         let clone3_read = match call {
-            Syscall::Clone3(clone) => Some(read_clone_args(&guest.memory(), tid, clone)),
+            Syscall::Clone3(clone) => Some(read_clone_args(&guest.memory(), witness, clone)),
             _ => None,
         };
         if clone3_read == Some(Clone3Read::Refused) {
@@ -743,7 +744,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // though it is mapped could still be read by the kernel, so
                 // it may create a task whose ID in Hermit's namespace the
                 // kernel picks.
-                let tids = match read_guest_set_tid(&guest.memory(), tid, &args) {
+                let tids = match read_guest_set_tid(&guest.memory(), witness, &args) {
                     Ok(tids) => tids,
                     Err(SetTidUnread::Refused) => return Ok(ClonePlan::GuestChosen),
                     Err(SetTidUnread::Unreadable) => {
@@ -1458,13 +1459,13 @@ const MAX_SET_TID: usize = 32;
 /// kernel.
 fn read_guest_set_tid<M: MemoryAccess>(
     memory: &M,
-    tid: i32,
+    witness: FaultWitness,
     args: &[u8; CLONE_ARGS_SIZE_VER2],
 ) -> Result<Vec<libc::pid_t>, SetTidUnread> {
     let (address, size) = guest_set_tid_shape(args).ok_or(SetTidUnread::Refused)?;
     let mut bytes = vec![0u8; size * std::mem::size_of::<libc::pid_t>()];
     if !within_user_memory(address as usize, bytes.len()) {
-        return Err(if range_faults(tid, address as usize, bytes.len()) {
+        return Err(if range_faults(witness, address as usize, bytes.len()) {
             SetTidUnread::Refused
         } else {
             SetTidUnread::Unreadable
@@ -1477,7 +1478,7 @@ fn read_guest_set_tid<M: MemoryAccess>(
         &mut bytes,
     );
     if read.is_err() {
-        return Err(if range_faults(tid, address as usize, bytes.len()) {
+        return Err(if range_faults(witness, address as usize, bytes.len()) {
             SetTidUnread::Refused
         } else {
             SetTidUnread::Unreadable
@@ -1594,7 +1595,7 @@ fn is_restart(errno: Errno) -> bool {
 /// can be read and number at most a page, the kernel's limit (E2BIG).
 pub(crate) fn read_clone_args<M: MemoryAccess>(
     memory: &M,
-    tid: i32,
+    witness: FaultWitness,
     clone: &syscalls::Clone3,
 ) -> Clone3Read {
     let Ok(page) = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) else {
@@ -1618,7 +1619,7 @@ pub(crate) fn read_clone_args<M: MemoryAccess>(
                 .ok()
                 .map(|()| bytes)
         },
-        || range_faults(tid, raw, size),
+        || range_faults(witness, raw, size),
         || {
             // Its flags, read past the protection, still say whether the
             // call is untraced.
@@ -1685,14 +1686,55 @@ fn user_memory_end() -> Option<usize> {
     Some(word_end & !(page - 1))
 }
 
-/// Whether some byte of the guest's `address..address + len` is one the
-/// kernel's `copy_from_user` faults on in every case (`EFAULT`), from the
-/// calling thread `tid`'s mappings (`/proc/<tid>/smaps`; the leader's are
-/// empty once it has exited): see [`range_faults_in`]. False when nothing is
-/// proved, as when the mappings cannot be read. Reading smaps walks the page
+/// What tells Detcore whether a guest range that it could not read with the
+/// guest's own access must fault in the kernel too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FaultWitness {
+    /// The calling thread's host mappings (`/proc/<tid>/smaps`; the leader's
+    /// are empty once it has exited), on a backend through whose host tasks
+    /// a tool may read guest threads (`host_task_reads_reach_guest_threads`,
+    /// today ptrace): see [`range_faults`].
+    HostMaps(i32),
+    /// Nothing: on any other backend no host `/proc` entry is known to
+    /// describe the guest thread (KVM's and DBT's tids are their own, and no
+    /// tool read through LiteInst's or SaBRe's host tasks is validated), and
+    /// the backend's own failed read may not be the kernel's (an in-guest
+    /// runtime reads its own memory with `process_vm_readv`, which a page
+    /// mapped writable but not readable refuses while the guest's `clone3`
+    /// reads it). A failed read proves no fault, so the call is refused by
+    /// name rather than handed to the kernel unchecked.
+    Unproven,
+}
+
+impl FaultWitness {
+    /// The witness for the calling thread `tid` under `backend`.
+    pub(crate) fn for_backend(backend: &reverie::BackendCapabilities, tid: i32) -> Self {
+        if backend.host_task_reads_reach_guest_threads {
+            FaultWitness::HostMaps(tid)
+        } else {
+            FaultWitness::Unproven
+        }
+    }
+}
+
+/// Whether some byte of the guest's `address..address + len`, which Detcore
+/// could not read with the guest's own access, is one the kernel's
+/// `copy_from_user` faults on too (`EFAULT`), by `witness`: from the calling
+/// thread's mappings (`/proc/<tid>/smaps`, see [`range_faults_in`]) where
+/// those are known to be the guest's; false when nothing is proved, as when
+/// the mappings cannot be read or are not known to be the guest's. Reading smaps walks the page
 /// tables of every mapping, which is why it is read only after a read with
 /// the guest's own access has failed, a rare event.
-pub(crate) fn range_faults(tid: i32, address: usize, len: usize) -> bool {
+pub(crate) fn range_faults(witness: FaultWitness, address: usize, len: usize) -> bool {
+    // An address in the kernel half faults on every kernel, whatever the
+    // backend.
+    if in_kernel_half(address) {
+        return true;
+    }
+    let tid = match witness {
+        FaultWitness::HostMaps(tid) => tid,
+        FaultWitness::Unproven => return false,
+    };
     let Some(limit) = user_memory_end() else {
         return false;
     };
@@ -1723,8 +1765,15 @@ pub(crate) fn within_user_memory(address: usize, len: usize) -> bool {
 /// guest enable tagging today, so the tagged case is a guard, not a path a
 /// guest takes.
 fn past_end_faults(address: usize) -> bool {
+    in_kernel_half(address) || (cfg!(target_arch = "aarch64") && address >> 56 == 0)
+}
+
+/// Whether `address` lies in the kernel half of the address space, which no
+/// user access reaches on any kernel, tagged or not: bit 63 on x86-64, bit 55
+/// on arm64 (where untagging sign-extends it).
+fn in_kernel_half(address: usize) -> bool {
     if cfg!(target_arch = "aarch64") {
-        address & (1 << 55) != 0 || address >> 56 == 0
+        address & (1 << 55) != 0
     } else {
         address & (1 << 63) != 0
     }
@@ -2423,6 +2472,32 @@ VmFlags: rd wr mr mw me gd ac
         assert_eq!(faults(limit, 8), cfg!(target_arch = "aarch64"));
         // No mappings listed: nothing is proved.
         assert!(!super::range_faults_in("", limit, 0x4000, 8));
+        // Only ptrace's guest threads are read through their host tasks; on
+        // every other backend a failed read proves nothing.
+        use reverie::BackendCapabilities as B;
+        for backend in [B::PTRACE, B::E9PATCH] {
+            assert_eq!(
+                super::FaultWitness::for_backend(&backend, 7),
+                super::FaultWitness::HostMaps(7)
+            );
+        }
+        for backend in [B::LITEINST_IN_GUEST, B::SABRE, B::DBT, B::KVM] {
+            assert_eq!(
+                super::FaultWitness::for_backend(&backend, 7),
+                super::FaultWitness::Unproven
+            );
+        }
+        // Except in the kernel half, which faults on every backend.
+        assert!(!super::range_faults(
+            super::FaultWitness::Unproven,
+            0x4000,
+            8
+        ));
+        assert!(super::range_faults(
+            super::FaultWitness::Unproven,
+            usize::MAX - 4095,
+            88
+        ));
         // A mapping whose VmFlags are missing might grow down: a hole below
         // it proves nothing. Below no mapping at all, it does.
         let unflagged = "5000-6000 rw-p 00000000 00:00 0\n";
