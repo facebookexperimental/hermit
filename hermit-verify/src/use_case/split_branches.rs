@@ -14,6 +14,15 @@ use detcore_model::schedule::Op;
 use detcore_model::schedule::SchedEvent;
 use detcore_model::time::LogicalTime;
 
+/// `event`, a branch event, as two: its first half of the branches, ending
+/// with no RIP, then the rest, ending where `event` ended, with its RIP. A
+/// schedule replay stops a thread at a branch event's count when the event
+/// has a RIP (a timer stop), or when another branch event or another thread's
+/// event follows it (`Replayer::resolve_time_to_run`). The first half is
+/// always followed by the second, so it stays a stop. The second keeps
+/// `event`'s RIP, so it is a stop exactly where `event` was, even when the
+/// thread's own OtherInstructions follows it, as `hermit analyze`'s fragments
+/// keep theirs.
 fn split_one(event: SchedEvent) -> Vec<SchedEvent> {
     let first_count = event.count / 2;
     let second_count = event.count - first_count;
@@ -35,7 +44,7 @@ fn split_one(event: SchedEvent) -> Vec<SchedEvent> {
             count: second_count,
             op: Op::Branch,
             start_rip: None,
-            end_rip: None,
+            end_rip: event.end_rip,
             ..event
         },
     ]
@@ -114,5 +123,27 @@ mod tests {
             .collect();
 
         assert_eq!(counts, vec![(Op::Branch, 1, 9980), (Op::Branch, 2, 10000)]);
+    }
+
+    /// The second half of a split timer stop keeps its RIP, so a schedule
+    /// replay still stops the thread there when the thread's own
+    /// OtherInstructions follows; the first half, which the second follows,
+    /// needs none.
+    #[test]
+    fn a_split_timer_stop_keeps_its_rip_on_the_second_half() {
+        let rip = std::num::NonZeroUsize::new(0x0040_110b).unwrap();
+        let event = SchedEvent {
+            count: 7,
+            dettid: DetPid::from_raw(3),
+            end_time: Some(LogicalTime::from_nanos(10000)),
+            op: Op::Branch,
+            start_rip: None,
+            end_rip: Some(rip),
+        };
+        let rips: Vec<_> = split_one(event)
+            .into_iter()
+            .map(|x| (x.count, x.end_rip))
+            .collect();
+        assert_eq!(rips, vec![(3, None), (4, Some(rip))]);
     }
 }

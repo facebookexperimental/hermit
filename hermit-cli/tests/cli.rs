@@ -28165,12 +28165,15 @@ fn run_schedule_replay_ends_check_in_slices_where_the_record_did() {
 
     // The schedule decides every turn, so the replay takes no `--seed`; only
     // the guest's randomness, which `--seed` set when recording, is given.
+    let summary = directory.path().join("replay-summary.json");
+    let summary_arg = format!("--summary-json={}", summary.display());
     let replay_args = [
         "run",
         "--base-env=minimal",
         "--rng-seed=2",
         "--epoch=2026-01-01T00:00:00Z",
         &replay_arg,
+        &summary_arg,
         "--",
         guest,
     ];
@@ -28186,6 +28189,15 @@ fn run_schedule_replay_ends_check_in_slices_where_the_record_did() {
         stdout(&recorded),
         "the replay's virtual clock left the recording's"
     );
+    // And it followed the schedule: a replay that left it could still land
+    // on the same final clock reading.
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+    assert!(
+        summary["schedevent_replayed"].as_u64().unwrap_or(0) > 0,
+        "{summary}"
+    );
+    assert_eq!(summary["schedevent_desynced"], 0, "{summary}");
 }
 
 /// A `--replay-schedule-from` run that has left its recorded schedule (a hard

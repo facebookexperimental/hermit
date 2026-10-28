@@ -437,10 +437,12 @@ impl Replayer {
     /// it no OtherInstructions event (since 832ca40b7; before it, the stop had
     /// one). Only then does the replay need the timer, to stop the thread
     /// where the recording did, even when the thread is picked again and its
-    /// next check-in follows after no further branch. The fragments
-    /// split-branches and `hermit analyze` cut a branch event into carry no
-    /// RIP, but are followed directly by more branches or by another thread's
-    /// event, which marks them as stops too.
+    /// next check-in follows after no further branch. When split-branches or
+    /// `hermit analyze` cuts a branch event into fragments, the leading ones
+    /// carry no RIP but are followed directly by more branches or by another
+    /// thread's event, which marks them as stops too, and the trailing one
+    /// keeps the original's RIP, so it is a stop exactly where the original
+    /// was.
     ///
     /// Branches without a RIP followed by the thread's OtherInstructions
     /// reached a check-in after them: a syscall, a trapped instruction, a
