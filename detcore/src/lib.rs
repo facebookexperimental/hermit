@@ -730,14 +730,9 @@ enum ReplayCheckpoint {
     Undecided,
     /// The next checkpoint ended the slice here.
     Ended,
-    /// The next checkpoint ends the slice later: at a later site of the
-    /// running callback, or, `at_a_later_callback`, at a later callback the
-    /// thread reaches without retiring a branch, such as the system call a
-    /// timer stop precedes. At the post-hook's `PosthookPmuEpsilon`, the last
-    /// site of a callback, nothing of the running callback comes later, so
-    /// there it is always the second; the post-hook still matches on
-    /// `at_a_later_callback` to ask exactly what it decides on.
-    EndsLater { at_a_later_callback: bool },
+    /// The next checkpoint ends the slice later, at a later site of the
+    /// running callback.
+    EndsLater,
 }
 
 impl ReplayCheckpoint {
@@ -3219,14 +3214,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// whether the slice ends at `site`, and say how they did
     /// (`ReplayCheckpoint`): the next checkpoint ended the slice here, or it
     /// ends it later, at a later site of the running callback
-    /// (`callback_history::State::ends_later_in_callback`) or at a later
-    /// callback this PMU timer stop reaches without retiring a branch
-    /// (`ends_at_a_later_callback_without_branches`). When it ends it later,
-    /// the caller must not end the slice here either: a timer preemption the
-    /// record ended in its post-hook, within one RCB of the PMU maximum,
-    /// already reaches its replayed branch count in the pre-hook, and ending
-    /// it at both would give the replay a scheduler turn, and a turn's charge
-    /// of virtual time, that the record does not have.
+    /// (`callback_history::State::ends_later_in_callback`). When it ends it
+    /// later, the caller must not end the slice here either: a timer
+    /// preemption the record ended in its post-hook, within one RCB of the PMU
+    /// maximum, already reaches its replayed branch count in the pre-hook, and
+    /// ending it at both would give the replay a scheduler turn, and a turn's
+    /// charge of virtual time, that the record does not have.
     async fn replay_callback_checkpoint<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3252,11 +3245,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
         else {
             let history = &guest.thread_state().callback_history;
-            let at_a_later_callback = history.ends_at_a_later_callback_without_branches(&actual);
-            return if at_a_later_callback || history.ends_later_in_callback(&actual) {
-                ReplayCheckpoint::EndsLater {
-                    at_a_later_callback,
-                }
+            return if history.ends_later_in_callback(&actual) {
+                ReplayCheckpoint::EndsLater
             } else {
                 ReplayCheckpoint::Undecided
             };
@@ -3503,14 +3493,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             preemptions::callback_history::Site::Posthook,
         )
         .await;
-        let checkpoint = self
-            .replay_callback_checkpoint(
-                guest,
-                boundary,
-                &mut token,
-                preemptions::callback_history::Site::PosthookPmuEpsilon,
-            )
-            .await;
+        self.replay_callback_checkpoint(
+            guest,
+            boundary,
+            &mut token,
+            preemptions::callback_history::Site::PosthookPmuEpsilon,
+        )
+        .await;
         // A row recorded as ending within one RCB of the PMU maximum ends at
         // the same posthook site here; the recorded site is the authority,
         // not a re-derived epsilon test. The signal hold stays authoritative.
@@ -3547,57 +3536,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                     );
                     return;
                 }
-                if checkpoint
-                    == (ReplayCheckpoint::EndsLater {
-                        at_a_later_callback: true,
-                    })
-                {
-                    // A schedule replay's next callback checkpoint ends this
-                    // slice at a later callback the thread reaches without
-                    // retiring a branch, such as the system call this timer
-                    // stop precedes (`callback_history::State::
-                    // ends_at_a_later_callback_without_branches`). Keep the
-                    // slice's logical end, which that callback's pre-hook
-                    // finds due, and move only the PMU maximum past it, so
-                    // the timer does not stop the thread again first.
-                    let backstop = current_time
-                        + Duration::from_nanos(u64::from(
-                            guest
-                                .config()
-                                .max_timeslice
-                                .expect("a PMU maximum implies --max-timeslice"),
-                        ));
-                    guest.thread_state_mut().max_timeslice_end = Some(backstop);
-                    max_timeslice_end = backstop;
-                } else {
-                    trace!(
-                        "posthook [dtid {}] less than one RCB remains before PMU maximum {}; ending slice",
-                        dettid, max_timeslice_end
-                    );
-                    let origin = self.record_callback_origin(
-                        guest,
-                        &token,
-                        preemptions::callback_history::Site::PosthookPmuEpsilon,
-                    );
-                    let checkin = PriorityCheckin {
-                        token: token.as_ref(),
-                        site: preemptions::callback_history::Site::PosthookPmuEpsilon,
-                    };
-                    self.end_timeslice_with_checkpoint(
-                        guest,
-                        false,
-                        origin,
-                        boundary,
-                        Some(checkin),
-                    )
+                trace!(
+                    "posthook [dtid {}] less than one RCB remains before PMU maximum {}; ending slice",
+                    dettid, max_timeslice_end
+                );
+                let origin = self.record_callback_origin(
+                    guest,
+                    &token,
+                    preemptions::callback_history::Site::PosthookPmuEpsilon,
+                );
+                let checkin = PriorityCheckin {
+                    token: token.as_ref(),
+                    site: preemptions::callback_history::Site::PosthookPmuEpsilon,
+                };
+                self.end_timeslice_with_checkpoint(guest, false, origin, boundary, Some(checkin))
                     .await;
-                    max_timeslice_end = guest
-                        .thread_state()
-                        .max_timeslice_end
-                        .expect("ending a PMU-backed timeslice must install a new maximum");
-                    current_time = guest.thread_state().thread_logical_time.as_nanos();
-                    replay_rcb_end = guest.thread_state().replay_rcb_end;
-                }
+                max_timeslice_end = guest
+                    .thread_state()
+                    .max_timeslice_end
+                    .expect("ending a PMU-backed timeslice must install a new maximum");
+                current_time = guest.thread_state().thread_logical_time.as_nanos();
+                replay_rcb_end = guest.thread_state().replay_rcb_end;
                 if guest.config().replay_edited_preemptions {
                     // The slice ending path chose the new slice with the
                     // margin at the chaos slowdown it installed, which can
