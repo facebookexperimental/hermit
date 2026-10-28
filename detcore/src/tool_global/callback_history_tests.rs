@@ -1739,45 +1739,78 @@ fn other_instructions(tid: DetTid) -> SchedEvent {
 // A recorded slice end can fall on the backstop's nanosecond, and a callback
 // checkpoint's restart (`restart_replay_backstop`) took it for the backstop
 // and moved it a whole --max-timeslice later.
+//
+// The replayer gives such a deadline only for a timer preemption, which a
+// recording writes as branches carrying the RIP the PMU stopped at
+// (`Replayer::resolve_time_to_run`). Branches without it that the thread's
+// OtherInstructions follows reached a check-in, which the thread reaches on
+// its own: no deadline is installed, and the slice keeps its end and its
+// backstop.
 #[tokio::test]
 async fn a_replayed_event_deadline_is_the_schedules_and_no_backstop() {
     tokio::time::timeout(Duration::from_secs(3), async {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("event-deadline.json");
         let tid = DetTid::from_raw(17);
-        let mut config = Config {
-            sequentialize_threads: true,
-            replay_schedule_from: Some(path.clone()),
-            max_timeslice: std::num::NonZeroU64::new(5_000_000),
-            ..Config::default()
-        };
-        config.validate();
         let call = SchedEvent::syscall(
             tid,
             Sysno::close,
             detcore_model::schedule::SyscallPhase::Prehook,
         );
-        let (config, state, thread) = schedule_replay_thread(
-            &path,
-            config,
-            &[
-                call.clone(),
+        let timer_stop = SchedEvent {
+            end_rip: detcore_model::schedule::InstructionPointer::new(0x4000),
+            ..SchedEvent::branches(tid, 90)
+        };
+        for (name, branches, stops) in [
+            ("a timer preemption", timer_stop, true),
+            (
+                "branches before a check-in",
                 SchedEvent::branches(tid, 90),
-                other_instructions(tid),
-                SchedEvent::branches(tid, 5),
-            ],
-            |_| {},
-        );
-        let mut guest = schedule_replay_guest(&state, &config, thread, 0);
-        let now = guest.thread.thread_logical_time.as_nanos();
-        let mut event = call;
-        event.end_time = Some(now);
-        super::trace_schedevent(&mut guest, event, false).await;
-        // The next recorded event is a run of 90 branches.
-        let deadline = now + LogicalTime::from_rcbs(90);
-        assert_eq!(guest.thread.end_of_timeslice, Some(deadline));
-        assert_eq!(guest.thread.max_timeslice_end, Some(deadline));
-        assert_eq!(guest.thread.replay_backstop, None);
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("event-deadline.json");
+            let mut config = Config {
+                sequentialize_threads: true,
+                replay_schedule_from: Some(path.clone()),
+                max_timeslice: std::num::NonZeroU64::new(5_000_000),
+                ..Config::default()
+            };
+            config.validate();
+            let (config, state, thread) = schedule_replay_thread(
+                &path,
+                config,
+                &[
+                    call.clone(),
+                    branches,
+                    other_instructions(tid),
+                    SchedEvent::branches(tid, 5),
+                ],
+                |_| {},
+            );
+            let mut guest = schedule_replay_guest(&state, &config, thread, 0);
+            let now = guest.thread.thread_logical_time.as_nanos();
+            let kept = (
+                guest.thread.end_of_timeslice,
+                guest.thread.max_timeslice_end,
+                guest.thread.replay_backstop,
+            );
+            let mut event = call.clone();
+            event.end_time = Some(now);
+            super::trace_schedevent(&mut guest, event, false).await;
+            let after = (
+                guest.thread.end_of_timeslice,
+                guest.thread.max_timeslice_end,
+                guest.thread.replay_backstop,
+            );
+            if stops {
+                // The next recorded event is a timer stop after 90 branches.
+                let deadline = Some(now + LogicalTime::from_rcbs(90));
+                assert_eq!(after, (deadline, deadline, None), "{name}");
+            } else {
+                assert!(kept.2.is_some(), "{name}: the slice's backstop");
+                assert_eq!(after, kept, "{name}");
+            }
+        }
     })
     .await
     .expect("bounded replayed event deadline");
