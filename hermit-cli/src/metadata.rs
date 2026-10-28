@@ -1337,6 +1337,7 @@ fn record_or_replay_config_with_timer_support(
         // `hermit record` keeps the files it replays; nothing is rewritten.
         rewrite_exclusives_in_memory: false,
         count_store_exclusives: false,
+        rewrite_exclusives_overlay: Vec::new(),
         cpu_profile_source: None,
         // Record and replay run under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),

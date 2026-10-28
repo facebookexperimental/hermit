@@ -23057,6 +23057,7 @@ impl Scheduler {
                 exclusive_rewrites: Default::default(),
                 exclusive_rewrite_cache_peak: 0,
                 store_exclusives: None,
+                exclusive_pairs_not_rewritten: Default::default(),
                 store_exclusives_unavailable: None,
                 guest_deadlock,
                 guest_ids: None,

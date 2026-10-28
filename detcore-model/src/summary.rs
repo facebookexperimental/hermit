@@ -401,6 +401,15 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_exclusives: Option<StoreExclusiveCounts>,
 
+    /// aarch64, `--rewrite-exclusives` with its overlay: the load/store
+    /// exclusive pairs of each mapped file the overlay was not given (it
+    /// rewrites the executable and each `--rewrite-exclusives-also` file),
+    /// by guest path, for the files that have any. A function of the files'
+    /// bytes and the run's options, so it is in the INFO view. Empty
+    /// elsewhere.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exclusive_pairs_not_rewritten: BTreeMap<String, u64>,
+
     /// aarch64: why `store_exclusives` could not be counted in a run that
     /// counts them. Full report only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -521,6 +530,39 @@ pub struct StoreExclusiveCounts {
     /// when the PMU multiplexed them, or the guest ran on CPUs whose PMU
     /// does not count these events. Then the counts cover only part of it.
     pub fully_counted: bool,
+    /// For how much of the run the less covered counter was on a PMU
+    /// counter, in thousandths of the time it was enabled: 1000 when
+    /// `fully_counted`. A count of 0 over most of the run observed none,
+    /// over a sliver of it little; only a whole run rules a rare one out.
+    /// Absent from summaries written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counted_per_mille: Option<u32>,
+}
+
+impl StoreExclusiveCounts {
+    /// What part of the run the counts cover, for a run not `fully_counted`:
+    /// the share when it is known.
+    pub fn coverage(&self) -> String {
+        let why = "the PMU multiplexed the counters, or the task ran on CPUs whose PMU does \
+                   not carry these events";
+        match self.counted_per_mille {
+            Some(per_mille) => format!(
+                "counted for {} of the run ({why})",
+                counted_share(per_mille)
+            ),
+            None => format!("not counted for the whole run ({why})"),
+        }
+    }
+}
+
+/// A coverage share in thousandths as a percentage with one decimal: "less
+/// than 0.1%" for 0, which a counter that ran at all rounds down to.
+pub fn counted_share(per_mille: u32) -> String {
+    if per_mille == 0 {
+        "less than 0.1%".to_owned()
+    } else {
+        format!("{}.{}%", per_mille / 10, per_mille % 10)
+    }
 }
 
 impl fmt::Display for StoreExclusiveCounts {
@@ -529,6 +571,7 @@ impl fmt::Display for StoreExclusiveCounts {
             failed,
             executed,
             fully_counted,
+            counted_per_mille: _,
         } = self;
         let executed = executed.map(|executed| counted(executed, "store-exclusive"));
         match (*failed, executed) {
@@ -543,11 +586,7 @@ impl fmt::Display for StoreExclusiveCounts {
             }
         }
         if !fully_counted {
-            write!(
-                f,
-                "; not counted for the whole run (multiplexed, or the task ran on CPUs whose \
-                 PMU does not carry these events)"
-            )?;
+            write!(f, "; {}", self.coverage())?;
         }
         Ok(())
     }
@@ -818,6 +857,7 @@ impl RunSummary {
             exclusive_rewrites,
             exclusive_rewrite_cache_peak,
             store_exclusives,
+            exclusive_pairs_not_rewritten,
             store_exclusives_unavailable,
             guest_deadlock,
             guest_ids,
@@ -929,6 +969,18 @@ impl RunSummary {
                 exclusive_pairs.len()
             )?;
             for (path, pairs) in exclusive_pairs {
+                writeln!(f, "  {path}: {pairs}")?;
+            }
+        }
+        if !exclusive_pairs_not_rewritten.is_empty() {
+            writeln!(
+                f,
+                "Not tried by --rewrite-exclusives, whose overlay rewrites only the executable and \
+                 each --rewrite-exclusives-also file (name a file with --rewrite-exclusives-also \
+                 to have it try its loops), in {} file(s):",
+                exclusive_pairs_not_rewritten.len()
+            )?;
+            for (path, pairs) in exclusive_pairs_not_rewritten {
                 writeln!(f, "  {path}: {pairs}")?;
             }
         }
@@ -1672,6 +1724,7 @@ mod tests {
         let value = serde_json::to_value(&baseline).unwrap();
         for key in [
             "exclusive_pairs",
+            "exclusive_pairs_not_rewritten",
             "store_exclusives",
             "store_exclusives_unavailable",
         ] {
@@ -1691,12 +1744,38 @@ mod tests {
         assert!(pairs.info(None).to_string().contains(listing));
         assert!(pairs.to_string().contains(listing));
 
+        // Under the overlay rewrite, the files it was not given are named in
+        // both views, as a function of the files and the options.
+        let overlay = RunSummary {
+            exclusive_pairs_not_rewritten: BTreeMap::from([("/lib64/libc.so.6".to_owned(), 38)]),
+            ..pairs.clone()
+        };
+        let not_rewritten = "Not tried by --rewrite-exclusives, whose overlay rewrites only the \
+                             executable and each --rewrite-exclusives-also file (name a file with \
+                             --rewrite-exclusives-also to have it try its loops), in 1 file(s):\n  \
+                             /lib64/libc.so.6: 38\n";
+        assert!(overlay.info(None).to_string().contains(not_rewritten));
+        assert!(overlay.to_string().contains(not_rewritten));
+        assert!(!pairs.to_string().contains("Not tried"));
+        let value = serde_json::to_value(&overlay).unwrap();
+        assert_eq!(
+            value["exclusive_pairs_not_rewritten"],
+            serde_json::json!({"/lib64/libc.so.6": 38})
+        );
+        assert!(
+            serde_json::to_value(&pairs)
+                .unwrap()
+                .get("exclusive_pairs_not_rewritten")
+                .is_none()
+        );
+
         for (counts, line, json) in [
             (
                 StoreExclusiveCounts {
                     failed: 20,
                     executed: Some(10_000_020),
                     fully_counted: true,
+                    counted_per_mille: None,
                 },
                 "20 store-exclusive failures; replay may diverge (10000020 store-exclusives \
                  executed)\n",
@@ -1707,6 +1786,7 @@ mod tests {
                     failed: 0,
                     executed: Some(2),
                     fully_counted: true,
+                    counted_per_mille: None,
                 },
                 "2 store-exclusives executed, none failed\n",
                 serde_json::json!({"failed": 0, "executed": 2, "fully_counted": true}),
@@ -1716,6 +1796,7 @@ mod tests {
                     failed: 0,
                     executed: Some(1),
                     fully_counted: true,
+                    counted_per_mille: None,
                 },
                 "1 store-exclusive executed, none failed\n",
                 serde_json::json!({"failed": 0, "executed": 1, "fully_counted": true}),
@@ -1725,6 +1806,7 @@ mod tests {
                     failed: 3,
                     executed: None,
                     fully_counted: true,
+                    counted_per_mille: None,
                 },
                 "3 store-exclusive failures; replay may diverge\n",
                 serde_json::json!({"failed": 3, "fully_counted": true}),
@@ -1734,6 +1816,7 @@ mod tests {
                     failed: 0,
                     executed: None,
                     fully_counted: true,
+                    counted_per_mille: None,
                 },
                 "No store-exclusive failed\n",
                 serde_json::json!({"failed": 0, "fully_counted": true}),
@@ -1743,11 +1826,63 @@ mod tests {
                     failed: 1,
                     executed: Some(9),
                     fully_counted: false,
+                    counted_per_mille: None,
                 },
                 "1 store-exclusive failure; replay may diverge (9 store-exclusives executed); \
-                 not counted for the whole run (multiplexed, or the task ran on CPUs whose PMU \
-                 does not carry these events)\n",
+                 not counted for the whole run (the PMU multiplexed the counters, or the task ran \
+                 on CPUs whose PMU does not carry these events)\n",
                 serde_json::json!({"failed": 1, "executed": 9, "fully_counted": false}),
+            ),
+            // A count of 0 over most of the run: none observed, not none run.
+            (
+                StoreExclusiveCounts {
+                    failed: 0,
+                    executed: Some(0),
+                    fully_counted: false,
+                    counted_per_mille: Some(997),
+                },
+                "0 store-exclusives executed, none failed; counted for 99.7% of the run (the PMU \
+                 multiplexed the counters, or the task ran on CPUs whose PMU does not carry \
+                 these events)\n",
+                serde_json::json!({
+                    "failed": 0,
+                    "executed": 0,
+                    "fully_counted": false,
+                    "counted_per_mille": 997
+                }),
+            ),
+            // A counter that ran for less than a thousandth of the run.
+            (
+                StoreExclusiveCounts {
+                    failed: 0,
+                    executed: Some(0),
+                    fully_counted: false,
+                    counted_per_mille: Some(0),
+                },
+                "0 store-exclusives executed, none failed; counted for less than 0.1% of the run \
+                 (the PMU multiplexed the counters, or the task ran on CPUs whose PMU does not \
+                 carry these events)\n",
+                serde_json::json!({
+                    "failed": 0,
+                    "executed": 0,
+                    "fully_counted": false,
+                    "counted_per_mille": 0
+                }),
+            ),
+            (
+                StoreExclusiveCounts {
+                    failed: 2,
+                    executed: Some(40),
+                    fully_counted: true,
+                    counted_per_mille: Some(1000),
+                },
+                "2 store-exclusive failures; replay may diverge (40 store-exclusives executed)\n",
+                serde_json::json!({
+                    "failed": 2,
+                    "executed": 40,
+                    "fully_counted": true,
+                    "counted_per_mille": 1000
+                }),
             ),
         ] {
             let counted = RunSummary {

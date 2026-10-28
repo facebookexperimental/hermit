@@ -506,6 +506,10 @@ pub struct StoreExclusiveRunCounts {
     pub executed: Option<u64>,
     /// Whether the counters covered the whole run.
     pub fully_counted: bool,
+    /// For how much of the run the counters were on a PMU counter, in
+    /// thousandths; absent where the run did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counted_per_mille: Option<u32>,
 }
 
 /// How the warning Hermit prints on a host whose retired-branch counter
@@ -993,6 +997,7 @@ mod tests {
                 failed: 2,
                 executed: Some(16_641),
                 fully_counted: true,
+                counted_per_mille: None,
             }),
             run2: None,
             loops_left: std::collections::BTreeMap::from([("/bin/guest".to_owned(), 4)]),

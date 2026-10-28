@@ -302,20 +302,29 @@ mod model {
     }
 
     /// One event's reads on each PMU, as (value, time enabled, time running),
-    /// combined: the sum of the values and whether the event was on a counter
-    /// for the whole run, or `None` when it was enabled but never on a
-    /// counter (a core that accepts the event and does not count it). A
-    /// task-bound event on one PMU of several is enabled whenever the task
-    /// runs, but runs only while the task is on that PMU's CPUs, so the PMUs'
-    /// times running add up to the time enabled when nothing was multiplexed.
-    pub(crate) fn combine(reads: &[(u64, u64, u64)]) -> Option<(u64, bool)> {
+    /// combined: the sum of the values, whether the event was on a counter
+    /// for the whole run, and for how much of it, in thousandths of the time
+    /// enabled (1000 for the whole run); or `None` when it was enabled but
+    /// never on a counter (a core that accepts the event and does not count
+    /// it). A task-bound event on one PMU of several is enabled whenever the
+    /// task runs, but runs only while the task is on that PMU's CPUs, so the
+    /// PMUs' times running add up to the time enabled when nothing was
+    /// multiplexed.
+    pub(crate) fn combine(reads: &[(u64, u64, u64)]) -> Option<(u64, bool, u32)> {
         let value = reads.iter().map(|read| read.0).sum();
         let enabled = reads.iter().map(|read| read.1).max().unwrap_or(0);
         let running: u64 = reads.iter().map(|read| read.2).sum();
         if enabled > 0 && running == 0 {
             return None;
         }
-        Some((value, running >= enabled))
+        let whole = running >= enabled;
+        // Rounded down, so a run that missed any time reads below 1000.
+        let per_mille = if whole {
+            1000
+        } else {
+            u32::try_from(u128::from(running) * 1000 / u128::from(enabled)).unwrap_or(999)
+        };
+        Some((value, whole, per_mille))
     }
 
     /// What a scan of one mapping found.
@@ -1270,6 +1279,20 @@ mod runtime {
         /// Whether this run has said what rewriting in memory means for the
         /// guest.
         noted_rewrite: bool,
+        /// The guest paths with exclusive pairs that this run's overlay
+        /// rewrite was not given, each warned about once.
+        not_rewritten: BTreeSet<String>,
+    }
+
+    /// Whether `path` is a file the run's overlay rewrite was not given: the
+    /// run rewrites with the overlay (`Config::rewrite_exclusives_overlay`
+    /// names at least the executable), and `path` is none of its files.
+    fn left_by_overlay(cfg: &Config, path: &str) -> bool {
+        !cfg.rewrite_exclusives_overlay.is_empty()
+            && !cfg
+                .rewrite_exclusives_overlay
+                .iter()
+                .any(|covered| covered.as_path() == Path::new(path))
     }
 
     impl RunTally {
@@ -1308,6 +1331,21 @@ mod runtime {
                                  checksum or verify it) sees single LSE atomics where its files \
                                  hold load/store-exclusive loops, and each rewritten page is a \
                                  private copy. The summary lists every rewritten image."
+                            );
+                        }
+                        if mapping.found.pairs != 0
+                            && left_by_overlay(cfg, &mapping.path)
+                            && self.not_rewritten.insert(mapping.path.clone())
+                        {
+                            warn!(
+                                "[store-exclusive] --rewrite-exclusives did not try the {} of {}: \
+                                 its overlay rewrites only the executable and each \
+                                 --rewrite-exclusives-also file. Pass \
+                                 --rewrite-exclusives-also={} to have it try them (its report \
+                                 names any it refuses)",
+                                counted(mapping.found.pairs, "load/store-exclusive loop"),
+                                mapping.path,
+                                mapping.path
                             );
                         }
                         if mapping.rewrite.failed != 0
@@ -1351,6 +1389,12 @@ mod runtime {
         /// and the counts or why there are none (full report only).
         pub(crate) fn fill_summary(&mut self, summary: &mut RunSummary) {
             summary.exclusive_pairs = self.pairs.pairs_per_path();
+            summary.exclusive_pairs_not_rewritten = summary
+                .exclusive_pairs
+                .iter()
+                .filter(|(path, _)| self.not_rewritten.contains(*path))
+                .map(|(path, pairs)| (path.clone(), *pairs))
+                .collect();
             summary.exclusive_rewrite_cache_peak = PLANS.lock().unwrap().peak() as u64;
             summary.counter_reads = self.pairs.counter_reads_per_path();
             summary.exclusive_rewrites = self
@@ -1413,10 +1457,9 @@ mod runtime {
                 ),
             };
             let partial = if counts.fully_counted {
-                ""
+                String::new()
             } else {
-                "; not counted for the whole run (multiplexed, or the task ran on CPUs whose PMU \
-                 does not carry these events)"
+                format!("; {}", counts.coverage())
             };
             // After an in-memory rewrite, only what it left or could not
             // write can still retry, in the process where the most can.
@@ -1797,7 +1840,7 @@ mod runtime {
                 self.0.iter().map(|pmu| &pmu.failed).collect(),
                 "STREX_FAIL_SPEC",
             )?;
-            let Some((failed, failed_whole)) = combine(&failed) else {
+            let Some((failed, failed_whole, failed_per_mille)) = combine(&failed) else {
                 let reason = never("STREX_FAIL_SPEC (raw 0x6e)");
                 uncounted.push(format!("store-exclusives were not counted: {reason}"));
                 return Err(reason);
@@ -1819,8 +1862,13 @@ mod runtime {
             };
             Ok(StoreExclusiveCounts {
                 failed,
-                executed: executed.map(|(executed, _)| executed),
-                fully_counted: failed_whole && executed.is_none_or(|(_, whole)| whole),
+                executed: executed.map(|(executed, _, _)| executed),
+                fully_counted: failed_whole && executed.is_none_or(|(_, whole, _)| whole),
+                // The less covered of the two events bounds what the counts
+                // say.
+                counted_per_mille: Some(executed.map_or(failed_per_mille, |(_, _, executed)| {
+                    executed.min(failed_per_mille)
+                })),
             })
         }
     }
@@ -3035,20 +3083,28 @@ mod tests {
     #[test]
     fn combines_reads_across_pmus() {
         // One PMU, always on a counter.
-        assert_eq!(combine(&[(20, 1000, 1000)]), Some((20, true)));
+        assert_eq!(combine(&[(20, 1000, 1000)]), Some((20, true, 1000)));
         // Two kinds of core: the task's time splits between the PMUs.
-        assert_eq!(combine(&[(5, 1000, 300), (7, 1000, 700)]), Some((12, true)));
-        // Multiplexed: on a counter for part of the run only.
-        assert_eq!(combine(&[(5, 1000, 400)]), Some((5, false)));
+        assert_eq!(
+            combine(&[(5, 1000, 300), (7, 1000, 700)]),
+            Some((12, true, 1000))
+        );
+        // Multiplexed: on a counter for part of the run only, rounded down.
+        assert_eq!(combine(&[(5, 1000, 400)]), Some((5, false, 400)));
         assert_eq!(
             combine(&[(5, 1000, 300), (7, 1000, 400)]),
-            Some((12, false))
+            Some((12, false, 700))
+        );
+        assert_eq!(combine(&[(0, 100_000, 99_999)]), Some((0, false, 999)));
+        assert_eq!(
+            combine(&[(0, u64::MAX, u64::MAX - 1)]),
+            Some((0, false, 999))
         );
         // Enabled but never on a counter: the core does not count the event.
         assert_eq!(combine(&[(0, 1000, 0)]), None);
         assert_eq!(combine(&[(0, 1000, 0), (0, 1000, 0)]), None);
         // Never enabled: nothing ran.
-        assert_eq!(combine(&[(0, 0, 0)]), Some((0, true)));
+        assert_eq!(combine(&[(0, 0, 0)]), Some((0, true, 1000)));
     }
 
     /// A mapping as the scan reports it, for the tally tests.
