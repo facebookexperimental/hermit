@@ -21579,18 +21579,60 @@ impl Scheduler {
                 .push_str(&format!("{message}\n"));
         }
 
-        // Likewise name the recorded background starts the replay never took.
-        if let Some(left) = self
-            .replayer
-            .as_ref()
-            .map(Replayer::unconsumed_background_starts)
-            .filter(|left| *left > 0)
+        // Likewise name the recorded background starts the replay never took,
+        // each by its thread, call and place in the record, and where the
+        // replay passed it (https://github.com/rrnewton/hermit/issues/4876).
+        let mut desync_notes = Vec::new();
+        if let Some(replayer) = self.replayer.as_ref()
+            && let untaken = replayer.untaken_background_starts()
+            && !untaken.is_empty()
         {
-            let message = format!("DESYNC {left} recorded background starts were not taken");
+            let ended_at = replayer.position_now();
+            let starts: Vec<_> = untaken
+                .iter()
+                .map(|start| detcore_model::summary::BackgroundStartRef {
+                    thread: start.thread,
+                    call: start.call,
+                    after: start.after,
+                    passed_at: start.passed_at,
+                })
+                .collect();
+            let message = format!(
+                "DESYNC {} recorded background starts were not taken: {} (the replay ended at \
+                 event #{}, record event #{})",
+                starts.len(),
+                starts
+                    .iter()
+                    .map(|start| format!(
+                        "thread {}'s call {} after record event #{} ({})",
+                        start.thread,
+                        start.call,
+                        start.after,
+                        match start.passed_at {
+                            Some(at) => format!(
+                                "passed at event #{}, record event #{}",
+                                at.event, at.record_event
+                            ),
+                            None => "not reached".to_owned(),
+                        }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                ended_at.event,
+                ended_at.record_event,
+            );
             tracing::warn!("{}", message);
             desync_descrip
                 .get_or_insert_with(String::new)
                 .push_str(&format!("{message}\n"));
+            desync_notes.push(detcore_model::summary::DesyncNote {
+                kind: detcore_model::summary::DesyncKind::UntakenBackgroundStarts,
+                thread: None,
+                record_event: starts.first().map(|start| start.after),
+                background_starts: starts,
+                reported_at: Some(ended_at),
+                message,
+            });
         }
         // Legacy EOF policy does not make an unconsumed suffix fatal. Name
         // incomplete callback metadata separately; do not invent guest events.
@@ -21700,6 +21742,7 @@ impl Scheduler {
                 schedevent_desynced: total_desyncs,
                 // schedevent_desynced_at_context_switch: total_desyncs.at_context_switch,
                 desync_descrip,
+                desync_notes,
                 reprio_descrip,
                 threads_descrip,
                 num_processes,
@@ -29358,6 +29401,80 @@ mod test {
             ..Config::default()
         };
         assert!(!notes_background_starts(&replay));
+    }
+
+    /// A schedule replay's summary lists the recorded background starts it
+    /// did not take, each by thread, call and place in the record, and where
+    /// the replay passed it, in `desync_descrip` and as a note in
+    /// `desync_notes` (https://github.com/rrnewton/hermit/issues/4876).
+    #[test]
+    fn the_summary_names_each_untaken_background_start() {
+        use detcore_model::summary::BackgroundStartRef;
+        use detcore_model::summary::DesyncKind;
+        use detcore_model::summary::ReplayPosition;
+        let (a, b) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        let events = [
+            SchedEvent::branches(a, 10).with_time(LogicalTime::from_nanos(100)),
+            SchedEvent::branches(a, 20).with_time(LogicalTime::from_nanos(200)),
+        ];
+        let start = |after, thread, call| crate::preemptions::BackgroundStart {
+            after,
+            thread,
+            call,
+        };
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.replayer = Some(
+            crate::scheduler::replayer::Replayer::new(events.clone())
+                .with_background_starts(&[start(1, b, 2), start(4, a, 7)], true),
+        );
+        let replayer = scheduler.replayer.as_mut().unwrap();
+        replayer.observe_event(&events[0]);
+        replayer.observe_event(&events[1]);
+        let summary = scheduler.generate_partial_run_summary(None).unwrap();
+        let text = summary.desync_descrip.unwrap();
+        let line = "DESYNC 2 recorded background starts were not taken: thread 5's call 2 after \
+                    record event #1 (passed at event #1, record event #1), thread 3's call 7 \
+                    after record event #4 (not reached) (the replay ended at event #2, record \
+                    event #2)";
+        assert!(text.contains(line), "{text}");
+        assert_eq!(summary.desync_notes.len(), 1);
+        let note = &summary.desync_notes[0];
+        assert_eq!(
+            (
+                note.kind,
+                note.thread,
+                note.record_event,
+                note.message.as_str()
+            ),
+            (DesyncKind::UntakenBackgroundStarts, None, Some(1), line)
+        );
+        assert_eq!(
+            note.background_starts,
+            [
+                BackgroundStartRef {
+                    thread: b,
+                    call: 2,
+                    after: 1,
+                    passed_at: Some(ReplayPosition {
+                        event: 1,
+                        record_event: 1
+                    }),
+                },
+                BackgroundStartRef {
+                    thread: a,
+                    call: 7,
+                    after: 4,
+                    passed_at: None,
+                },
+            ]
+        );
+        assert_eq!(
+            note.reported_at,
+            Some(ReplayPosition {
+                event: 2,
+                record_event: 2
+            })
+        );
     }
 
     /// A schedule replay whose record notes background starts begins a

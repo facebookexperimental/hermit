@@ -15,6 +15,7 @@ use detcore_model::pid::DetTid;
 use detcore_model::schedule::Op;
 use detcore_model::schedule::SchedEvent;
 use detcore_model::schedule::SyscallPhase;
+use detcore_model::summary::ReplayPosition;
 use detcore_model::time::LogicalTime;
 use reverie::syscalls::Sysno;
 use tracing::debug;
@@ -89,8 +90,12 @@ pub struct Replayer {
     /// follow (`crate::preemptions::BackgroundStart`): thread and call.
     background_starts: BTreeMap<u64, VecDeque<(DetTid, u64)>>,
     /// The recorded background starts due now, in order, until the scheduler
-    /// takes them (`take_background_start`).
-    pending_starts: VecDeque<(DetTid, u64)>,
+    /// takes them (`take_background_start`): thread, call, and the `after`
+    /// that placed them.
+    pending_starts: VecDeque<(DetTid, u64, u64)>,
+    /// The recorded background starts the replay passed without taking them,
+    /// with where it was then (`untaken_background_starts`).
+    passed_starts: Vec<UntakenStart>,
     /// Whether the replayed record notes every background start
     /// (`crate::preemptions::PreemptionRecord::notes_background_starts`).
     notes_background_starts: bool,
@@ -106,6 +111,21 @@ pub struct Replayer {
 /// so a replay that has drifted from its record cannot spin forever on a poll
 /// that nothing in the run will satisfy.
 pub(super) const REPLAY_KEPT_RETRY_LIMIT: u32 = 1000;
+
+/// A recorded background start the replay did not take
+/// (`Replayer::untaken_background_starts`).
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub struct UntakenStart {
+    /// The thread whose call it began.
+    pub thread: DetTid,
+    /// The call's per-thread sequence number.
+    pub call: u64,
+    /// How many recorded events came before it.
+    pub after: u64,
+    /// Where the replay was when it passed the start, or `None` if it never
+    /// reached it.
+    pub passed_at: Option<ReplayPosition>,
+}
 
 /// The count of desyncs for a particular thread.
 #[derive(Debug, PartialEq, Eq, Default, Copy, Clone)]
@@ -289,6 +309,7 @@ impl Replayer {
             release: None,
             background_starts: BTreeMap::new(),
             pending_starts: VecDeque::new(),
+            passed_starts: Vec::new(),
             notes_background_starts: false,
             skipped: 0,
         }
@@ -320,8 +341,10 @@ impl Replayer {
     /// counts a hard desync of its thread and is dropped, rather than coming
     /// due ahead of the start recorded after the matched event. The position
     /// moves past the dropped events, so later starts keep their places.
-    /// Returns how many it retired.
-    fn retire_skipped_starts(&mut self, dropped: u64) -> usize {
+    /// `event` is the number of the observed event that caused the
+    /// fast-forward, where the replay passed them. Returns how many it
+    /// retired.
+    fn retire_skipped_starts(&mut self, dropped: u64, event: u64) -> usize {
         let position = self.events_popped + self.skipped;
         let past: Vec<u64> = self
             .background_starts
@@ -329,6 +352,10 @@ impl Replayer {
             .map(|(after, _)| *after)
             .collect();
         let mut retired = 0;
+        let passed_at = ReplayPosition {
+            event,
+            record_event: position,
+        };
         for after in past {
             for (thread, call) in self.background_starts.remove(&after).unwrap_or_default() {
                 tracing::warn!(
@@ -338,6 +365,12 @@ impl Replayer {
                     after
                 );
                 self.desync_counts.entry(thread).or_default().hard += 1;
+                self.passed_starts.push(UntakenStart {
+                    thread,
+                    call,
+                    after,
+                    passed_at: Some(passed_at),
+                });
                 retired += 1;
             }
         }
@@ -354,14 +387,22 @@ impl Replayer {
             if *entry.key() > position {
                 break;
             }
-            self.pending_starts.extend(entry.remove());
+            let after = *entry.key();
+            self.pending_starts.extend(
+                entry
+                    .remove()
+                    .into_iter()
+                    .map(|(thread, call)| (thread, call, after)),
+            );
         }
     }
 
     /// The thread and call of the background start the recording took next,
     /// if one is due: the schedule's next decision, before its next event.
     pub(super) fn pending_background_start(&self) -> Option<(DetTid, u64)> {
-        self.pending_starts.front().copied()
+        self.pending_starts
+            .front()
+            .map(|&(thread, call, _)| (thread, call))
     }
 
     /// Whether the replayed record notes every background start, so that a
@@ -373,7 +414,7 @@ impl Replayer {
     /// The scheduler began `thread`'s kernel-run call `call`. Whether that was
     /// the recorded background start due next, which it then retires.
     pub(super) fn take_background_start(&mut self, thread: DetTid, call: u64) -> bool {
-        if self.pending_starts.front() == Some(&(thread, call)) {
+        if self.pending_background_start() == Some((thread, call)) {
             self.pending_starts.pop_front();
             true
         } else {
@@ -534,8 +575,51 @@ impl Replayer {
             || !self.background_starts.is_empty()
     }
 
+    /// Where the replay is: the number of the event it traces next, and the
+    /// record's position, the index of the next recorded event to match
+    /// (`events_popped + skipped`, the position that places the background
+    /// starts) (<https://github.com/rrnewton/hermit/issues/4876>).
+    pub(super) fn position_now(&self) -> ReplayPosition {
+        ReplayPosition {
+            event: self.traced_event_count,
+            record_event: self.events_popped + self.skipped,
+        }
+    }
+
+    /// Every recorded background start the replay did not take, in record
+    /// order (<https://github.com/rrnewton/hermit/issues/4876>): those it
+    /// passed (the next event came, or a fast-forward skipped them), with
+    /// where it was then, and those still due or not yet due, which it never
+    /// reached.
+    pub(super) fn untaken_background_starts(&self) -> Vec<UntakenStart> {
+        let mut untaken = self.passed_starts.clone();
+        untaken.extend(
+            self.pending_starts
+                .iter()
+                .map(|&(thread, call, after)| UntakenStart {
+                    thread,
+                    call,
+                    after,
+                    passed_at: None,
+                }),
+        );
+        untaken.extend(self.background_starts.iter().flat_map(|(after, starts)| {
+            starts.iter().map(|&(thread, call)| UntakenStart {
+                thread,
+                call,
+                after: *after,
+                passed_at: None,
+            })
+        }));
+        // Passed starts were due before those still waiting, but sort to
+        // keep record order whatever the mix.
+        untaken.sort_by_key(|start| start.after);
+        untaken
+    }
+
     /// How many recorded background starts the replay has not taken, due or
     /// not yet due: at the end of a run, starts it left out.
+    #[cfg(test)]
     pub(super) fn unconsumed_background_starts(&self) -> usize {
         self.pending_starts.len()
             + self
@@ -577,7 +661,11 @@ impl Replayer {
         // not waiting to begin, so the replay has left its recording. It
         // counts as a hard desync of the start's thread, and will not be taken.
         let untaken = std::mem::take(&mut self.pending_starts);
-        for &(thread, call) in &untaken {
+        let passed_at = ReplayPosition {
+            event: current_ix,
+            record_event: self.events_popped + self.skipped,
+        };
+        for &(thread, call, after) in &untaken {
             tracing::warn!(
                 "[tracereplay] the recorded background start of thread {}'s call {} before event #{} was not taken",
                 thread,
@@ -585,6 +673,12 @@ impl Replayer {
                 current_ix
             );
             self.desync_counts.entry(thread).or_default().hard += 1;
+            self.passed_starts.push(UntakenStart {
+                thread,
+                call,
+                after,
+                passed_at: Some(passed_at),
+            });
         }
         if !untaken.is_empty() && self.die_on_desync {
             return ReplayAction::Stop(StopReason::FatalDesync);
@@ -645,7 +739,7 @@ impl Replayer {
                 // The background starts recorded among the dropped events were
                 // missed, as an untaken due start is, before the matched event
                 // is accepted.
-                if self.retire_skipped_starts(ix as u64) > 0 && self.die_on_desync {
+                if self.retire_skipped_starts(ix as u64, current_ix) > 0 && self.die_on_desync {
                     return ReplayAction::Stop(StopReason::FatalDesync);
                 }
                 in_hard_desync_mode = false;
@@ -1397,6 +1491,73 @@ mod tests {
         assert_eq!(unrecorded.desync_counts[&tid(7)].hard, 1);
     }
 
+    /// Every recorded background start the replay does not take is listed, in
+    /// record order, with its thread, call and place in the record, and where
+    /// the replay passed it: when the next event comes, when a fast-forward
+    /// skips it, or never, for a start still due when the replay ends and one
+    /// the replay never reached (https://github.com/rrnewton/hermit/issues/4876).
+    #[test]
+    fn untaken_background_starts_name_their_place_in_the_record() {
+        let mut b = builder::SchedTestBuilder::new();
+        let five = strip_times(vec![
+            b.branch(10, tid(3)),
+            b.branch(20, tid(3)),
+            b.branch(30, tid(3)),
+            b.branch(40, tid(3)),
+            b.branch(50, tid(3)),
+        ]);
+        let start = |after, raw, call| crate::preemptions::BackgroundStart {
+            after,
+            thread: tid(raw),
+            call,
+        };
+        let mut replayer = Replayer::new(five.clone()).with_background_starts(
+            &[
+                start(1, 5, 1),
+                start(3, 7, 1),
+                start(5, 9, 1),
+                start(9, 11, 1),
+            ],
+            true,
+        );
+        // The start after event 0 is due, and event #1 comes without it.
+        replayer.observe_event(&five[0]);
+        replayer.observe_event(&five[1]);
+        // Event #2 is the record's fourth: the third is fast-forwarded past,
+        // and the start after it with it.
+        replayer.observe_event(&five[3]);
+        // The last event makes the start after it due; the replay ends.
+        replayer.observe_event(&five[4]);
+        let at = |event, record_event| {
+            Some(ReplayPosition {
+                event,
+                record_event,
+            })
+        };
+        let untaken = |thread, after, passed_at| UntakenStart {
+            thread: tid(thread),
+            call: 1,
+            after,
+            passed_at,
+        };
+        assert_eq!(
+            replayer.untaken_background_starts(),
+            [
+                untaken(5, 1, at(1, 1)),
+                untaken(7, 3, at(2, 2)),
+                untaken(9, 5, None),
+                untaken(11, 9, None),
+            ]
+        );
+        assert_eq!(
+            replayer.position_now(),
+            ReplayPosition {
+                event: 4,
+                record_event: 5
+            }
+        );
+    }
+
     /// A fast-forward past recorded events retires the starts recorded among
     /// them or before the matched event as hard desyncs of their threads, and
     /// leaves the start recorded after the matched event to come due in its
@@ -1417,7 +1578,7 @@ mod tests {
         let mut replayer = Replayer::new(schedule)
             .with_background_starts(&[start(1, 5, 1), start(2, 7, 1), start(3, 9, 1)], true);
         // Drop the first two events: the starts after events 1 and 2 are past.
-        replayer.retire_skipped_starts(2);
+        replayer.retire_skipped_starts(2, 0);
         assert_eq!(replayer.desync_counts[&tid(5)].hard, 1);
         assert_eq!(replayer.desync_counts[&tid(7)].hard, 1);
         assert_eq!(replayer.unconsumed_background_starts(), 1);

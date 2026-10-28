@@ -283,6 +283,14 @@ pub struct RunSummary {
     /// counted too; this is not a count of distinct created tasks.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub host_id_tasks: u64,
+
+    /// **Trace replay:** each departure from the record that
+    /// `desync_descrip` summarizes, with where in the record it lies, so that
+    /// a tool can place it without parsing text
+    /// (<https://github.com/rrnewton/hermit/issues/4876>). Absent when there
+    /// were none, and from summaries written before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub desync_notes: Vec<DesyncNote>,
 }
 
 fn is_zero(count: &u64) -> bool {
@@ -341,6 +349,74 @@ fn counted(count: u64, noun: &str) -> String {
     } else {
         format!("{count} {noun}s")
     }
+}
+
+/// What kind of departure a [`DesyncNote`] reports.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DesyncKind {
+    /// Recorded background starts the replay did not take.
+    UntakenBackgroundStarts,
+    /// A kind this build does not know, written by a later Hermit.
+    #[serde(other)]
+    Other,
+}
+
+/// Where a schedule replay was, in its own numbering and in the record's.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayPosition {
+    /// The number of the event the replay traces next, as the `[tracereplay]
+    /// ... at event #N` and `... before event #N` warnings number events
+    /// (from 0).
+    pub event: u64,
+    /// The index, in the record's schedule (`global`, from 0), of the next
+    /// recorded event the replay was to match. It equals `event` until the
+    /// first desync; after one, an event observed in hard desync consumes no
+    /// recorded event and a fast-forward skips recorded events, so the two
+    /// can part.
+    pub record_event: u64,
+}
+
+/// A recorded background start a [`DesyncNote`] concerns
+/// (`background_starts` in the record).
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct BackgroundStartRef {
+    /// The thread whose call it began.
+    pub thread: DetTid,
+    /// The call's per-thread sequence number.
+    pub call: u64,
+    /// How many events of the record's schedule came before it: it lies
+    /// before the record's event of this index.
+    pub after: u64,
+    /// Where the replay was when it passed the start without taking it (the
+    /// next event came, or a fast-forward skipped past it). `None` for a
+    /// start the replay never reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passed_at: Option<ReplayPosition>,
+}
+
+/// One departure of a replay from its record, as `desync_descrip` lists it
+/// (<https://github.com/rrnewton/hermit/issues/4876>).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DesyncNote {
+    pub kind: DesyncKind,
+    /// The thread it concerns, when it concerns one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<DetTid>,
+    /// Where in the record the departure lies, as an index into the record's
+    /// schedule (`global`, from 0): for `untaken_background_starts`, the
+    /// first untaken start's `after`. `None` when the record gives none.
+    pub record_event: Option<u64>,
+    /// The recorded background starts it concerns
+    /// (`untaken_background_starts`), in record order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_starts: Vec<BackgroundStartRef>,
+    /// Where the replay was when it reported this: where it ended, for
+    /// `untaken_background_starts`. `None` without a schedule replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_at: Option<ReplayPosition>,
+    /// The line `desync_descrip` carries for it.
+    pub message: String,
 }
 
 /// The full human-readable report, including recorded launch configuration.
@@ -414,6 +490,7 @@ impl RunSummary {
             host_id_tasks,
             virtual_timeout_ns,
             replay_departure: _,
+            desync_notes: _,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
@@ -762,6 +839,81 @@ mod tests {
             let parsed: RunSummary = serde_json::from_value(value).unwrap();
             assert_eq!(parsed.preemption, summary.preemption);
         }
+    }
+
+    /// `desync_notes` reaches `--summary-json` with each note's kind,
+    /// recorded position, background starts and replay position, and reads
+    /// back; a summary without notes, or written before the field existed,
+    /// omits it; a kind from a later Hermit still parses
+    /// (https://github.com/rrnewton/hermit/issues/4876).
+    #[test]
+    fn desync_notes_round_trip_through_summary_json() {
+        use super::BackgroundStartRef;
+        use super::DesyncKind;
+        use super::DesyncNote;
+        use super::ReplayPosition;
+        use crate::pid::DetTid;
+        let summary = RunSummary {
+            desync_notes: vec![DesyncNote {
+                kind: DesyncKind::UntakenBackgroundStarts,
+                thread: None,
+                record_event: Some(51206),
+                background_starts: vec![
+                    BackgroundStartRef {
+                        thread: DetTid::from_raw(5121),
+                        call: 35,
+                        after: 51206,
+                        passed_at: Some(ReplayPosition {
+                            event: 51207,
+                            record_event: 51206,
+                        }),
+                    },
+                    BackgroundStartRef {
+                        thread: DetTid::from_raw(5123),
+                        call: 24,
+                        after: 51217,
+                        passed_at: None,
+                    },
+                ],
+                reported_at: Some(ReplayPosition {
+                    event: 51271,
+                    record_event: 51217,
+                }),
+                message: "DESYNC 2 recorded background starts were not taken: ...".into(),
+            }],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            value["desync_notes"],
+            serde_json::json!([{
+                "kind": "untaken_background_starts",
+                "record_event": 51206,
+                "background_starts": [
+                    {
+                        "thread": 5121,
+                        "call": 35,
+                        "after": 51206,
+                        "passed_at": { "event": 51207, "record_event": 51206 }
+                    },
+                    { "thread": 5123, "call": 24, "after": 51217 }
+                ],
+                "reported_at": { "event": 51271, "record_event": 51217 },
+                "message": "DESYNC 2 recorded background starts were not taken: ..."
+            }])
+        );
+        let parsed: RunSummary = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.desync_notes, summary.desync_notes);
+
+        let mut later = value;
+        later["desync_notes"][0]["kind"] = serde_json::json!("callback_checkpoint");
+        let parsed: RunSummary = serde_json::from_value(later).unwrap();
+        assert_eq!(parsed.desync_notes[0].kind, DesyncKind::Other);
+
+        let none = serde_json::to_value(RunSummary::default()).unwrap();
+        assert!(none.get("desync_notes").is_none(), "{none}");
+        let old: RunSummary = serde_json::from_value(none).unwrap();
+        assert!(old.desync_notes.is_empty());
     }
 
     #[test]
