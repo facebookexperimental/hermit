@@ -2930,6 +2930,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/sleep_ignored_sigchld.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/sleep_ignored_sigchld.c is owned by hermit-cli/tests/cli.rs: the CLI test an_ignored_or_blocked_sigchld_does_not_end_a_sleep runs it under hermit run --strict on every backend this build has (ptrace, DBT, SaBRe) with SIGCHLD at its default, set to SIG_IGN and blocked, and requires the parent's nanosleep to return 0 in each mode, as Linux does for a signal it does not deliver (https://github.com/rrnewton/hermit/pull/4682). It stays a fixture because a generic manifest cannot run one guest across modes and backends with one expected line."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/sleep_restart.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/sleep_restart.c is owned by hermit-cli/tests/cli.rs: kernel_run_sleeps_and_futex_waits_restart_as_on_linux runs its nanosleep, clock_nanosleep, abs, futex and alrm modes natively, under ptrace with --strict, plain and with --no-sequentialize-threads, and (but for abs) under record start --verify --verify-strict, and requires native's lines: a 100 ms nanosleep, relative or absolute clock_nanosleep or FUTEX_WAIT that 40 ignored SIGWINCH end over and over outlasts the third and still ends before they stop, and a SIGALRM handler gets EINTR and the time left. It stays a fixture because the test compares native and Hermit output."
@@ -2939,6 +2945,12 @@
       "path": "tests/c/sleep_sigchld_taker.c",
       "runner": "hermit-cli/tests/external_signal_interrupt.rs",
       "why": "tests/c/sleep_sigchld_taker.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The integration suite compiles this guest and checks that a pause or nanosleep of the thread that forked a child, beside a sibling spinning without system calls, takes the child's SIGCHLD and returns EINTR with the handler on the sleeping thread, as on Linux."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/sleep_signal_after_deadline.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/sleep_signal_after_deadline.c is owned by hermit-cli/tests/cli.rs: the CLI test a_signal_after_a_sleeps_deadline_does_not_interrupt_it runs it under hermit run --strict --signal-at turn=N:SIGUSR1, binary-searches N for the first turn whose signal no longer ends the sleep with time left, and requires that turn's sleep to return 0 with the handler run, as Linux's do_nanosleep returns 0 once its timer has fired (https://github.com/rrnewton/hermit/pull/4682). It stays a fixture because a generic manifest cannot search over runs with different options."
     },
     {
       "disposition": "guest-fixture",

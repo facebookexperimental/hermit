@@ -4603,6 +4603,8 @@ pub async fn do_a_turn_blocking(
                             // ordinary loop's step 2 does.
                             state.step2_register_queued_sleeps();
                             state.step2_drain_prefix()?;
+                            // And for a sleep the drain admitted.
+                            state.step2_register_queued_sleeps();
                             maintenance = 1;
                             continue;
                         }
@@ -10503,6 +10505,10 @@ impl Scheduler {
         self.step2_sigalrm_ledger();
         self.step2_release_signaled_background()?;
         self.step2_drain_prefix()?;
+        // Again for a sleep the drain admitted (a new thread whose first call
+        // is a sleep), so that it too is a timed waiter before step 3 can
+        // choose by priority.
+        self.step2_register_queued_sleeps();
         // A signal the drain placed that armed a background thread ends the
         // pass before any timer pops: the release barrier requeues that thread
         // at the top of the next one. A `ChildExit` target is then chosen with
@@ -14031,7 +14037,26 @@ impl Scheduler {
                 // sibling took the process-directed copy, and a `pause` that
                 // found no signal for itself never returned
                 // (https://github.com/rrnewton/hermit/issues/4333).
-                let parked_sleep = self.signal_sleep(dettid).is_some();
+                let sleep = self.signal_sleep(dettid);
+                // A `nanosleep` whose deadline has passed is already over:
+                // its wake is due and pops at the next pass, and the sleep
+                // returns 0 there. Linux's `do_nanosleep` returns 0 once the
+                // timer has fired (`if (!t->task) return 0`), and the signal
+                // is delivered as the call returns. Woken here, it answered
+                // EINTR with nothing left to sleep. A queued one is left
+                // alone the same way (`is_queued_sleep` above)
+                // (https://github.com/rrnewton/hermit/pull/4682).
+                if let Some(sleep_signal::SignalSleep::Nanosleep { deadline }) = sleep
+                    && deadline <= self.committed_time
+                {
+                    debug!(
+                        "[dtid {}] signal {} arrived after its parked sleep's deadline {}; \
+                         the sleep completes at its wake.",
+                        dettid, signal, deadline
+                    );
+                    return;
+                }
+                let parked_sleep = sleep.is_some();
                 if parked_sleep && !gated_wakes {
                     // Under the gate, as a queued sleep above.
                     debug!(
@@ -30807,6 +30832,48 @@ mod test {
         LogicalTime::from_nanos(NOW_NS + offset_ns)
     }
 
+    /// A sleep the step-2 drain admits (a new thread whose first call is a
+    /// sleep) is a timed waiter in the same pass, before step 3 can choose by
+    /// priority: registration runs again after the drain
+    /// (https://github.com/rrnewton/hermit/pull/4682).
+    #[test]
+    fn a_sleep_the_drain_admits_registers_in_the_same_pass() {
+        let config = first_pass_config();
+        let mut scheduler = Scheduler::new(&config);
+        assert!(scheduler.queued_sleeps_registered_at_first_pass);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        scheduler.committed_time = at(0);
+        let worker = DetTid::from_raw(3);
+        queue_request(&mut scheduler, worker, Resources::new(worker));
+        let newborn = DetTid::from_raw(5);
+        queue_request(&mut scheduler, newborn, sleep_request(newborn, at(7_000)));
+        // Admitted by the drain rather than already queued.
+        assert!(scheduler.run_queue.remove_tid(newborn));
+        scheduler.admit_to_run_queue(newborn, AdmitIntent::Fixed(AdmitSide::Front));
+        for tid in [worker, newborn] {
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+        }
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(newborn),
+            Some(at(7_000))
+        );
+        assert!(!scheduler.run_queue.contains_tid(newborn));
+        assert!(scheduler.run_queue.contains_tid(worker));
+    }
+
+    /// A configuration under which queued sleeps register at the first pass
+    /// by default: serialized threads on a backend whose kernel signal targets
+    /// the scheduler predicts, as a prepared ptrace run has
+    /// (`Config::queued_sleeps_registered_at_first_pass`).
+    fn first_pass_config() -> Config {
+        Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| detcore_model::config::set_kernel_signal_facts(backend, true))
+    }
+
     /// A queued plain sleep is a timed waiter from the first quiescent pass
     /// that finds it queued, whatever the priorities, and its thread leaves
     /// the run queue until the wake pops. A due sleep (a yield), a sleep with
@@ -30817,7 +30884,7 @@ mod test {
     /// `--chaos` the sleep stays queued, as before.
     #[test]
     fn a_queued_sleep_is_a_timed_waiter_from_the_first_pass() {
-        let config = Config::default();
+        let config = first_pass_config();
         let mut scheduler = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         scheduler.committed_time = at(0);
@@ -30972,10 +31039,12 @@ mod test {
         };
         assert!(!Scheduler::new(&random).queued_sleeps_registered_at_first_pass);
         for chaos in [false, true] {
+            // On a prepared ptrace run (`first_pass_config`): elsewhere the
+            // default registers when chosen.
             let config = Config {
                 chaos,
                 record_preemptions: true,
-                ..Default::default()
+                ..first_pass_config()
             };
             let scheduler = Scheduler::new(&config);
             assert_eq!(scheduler.queued_sleeps_registered_at_first_pass, !chaos);
@@ -30994,7 +31063,7 @@ mod test {
     /// thread is pending removal is left alone.
     #[test]
     fn a_queued_sleep_registers_whatever_the_priorities() {
-        let config = Config::default();
+        let config = first_pass_config();
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let worker = DetTid::from_raw(3);
         let sleeper = DetTid::from_raw(5);
@@ -48228,6 +48297,44 @@ mod test {
                 &format!("committed {committed}"),
             );
         }
+    }
+
+    /// A signal the scheduler sends at a commit point (`--signal-at`, a
+    /// parent-death signal) to a parked `nanosleep` whose deadline has passed
+    /// but whose wake has not popped yet leaves the sleep to complete at its
+    /// wake, with 0, as Linux's `do_nanosleep` returns 0 once its timer has
+    /// fired; the signal is delivered as the call returns. Before the deadline
+    /// the same signal wakes the sleep to answer it
+    /// (https://github.com/rrnewton/hermit/pull/4682).
+    #[test]
+    fn a_scheduler_signal_after_a_parked_nanosleep_deadline_leaves_it_to_complete() {
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        for committed in [deadline, deadline + LogicalTime::from_nanos(1)] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+            scheduler.committed_time = committed;
+            set_sleeper_state(&mut scheduler, target, sleeper_state(usr1, 0, 0, 0));
+            scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+            let case = format!("committed {committed}");
+            assert_sleep_parked(&scheduler, target, deadline, &case);
+            assert!(scheduler.inbound_signals(target).is_empty(), "{case}");
+            assert!(!scheduler.blocked.woken_sleeps.contains(&target), "{case}");
+        }
+        let mut scheduler = gated_scheduler();
+        let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+        scheduler.committed_time = LogicalTime::from_nanos(4_999_999_999);
+        set_sleeper_state(&mut scheduler, target, sleeper_state(usr1, 0, 0, 0));
+        scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper::from(Signal::SIGUSR1)],
+            "before the deadline"
+        );
+        assert!(
+            scheduler.blocked.timed_waiters.is_empty(),
+            "before the deadline"
+        );
     }
 
     /// What is not recorded at all: a `SIGKILL`, which the kernel acts on for

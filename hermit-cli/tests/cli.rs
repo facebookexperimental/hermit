@@ -263,6 +263,8 @@ static PROC_FD_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_AT_TURN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FAIR_CONTINUATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SLEEP_SIGNAL_AFTER_DEADLINE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SLEEP_IGNORED_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_UNIQUE_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_HANDLER_TURN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -14291,6 +14293,125 @@ fn signal_at_sends_the_root_process_its_signal_after_the_named_turn() {
         "{}",
         stderr(&output)
     );
+}
+
+/// A signal the scheduler sends once a sleep's deadline has passed, before the
+/// sleep's wake pops, does not end the sleep with EINTR: Linux's
+/// `do_nanosleep` returns 0 once its timer has fired, and the handler runs as
+/// the call returns (kernel/time/hrtimer.c). The guest's main thread sleeps
+/// 2 ms with a SIGUSR1 handler while a helper that blocks SIGUSR1 keeps the
+/// scheduler turning, and `--signal-at turn=N:SIGUSR1` sends the root process
+/// the signal after turn N. A binary search over N finds the first turn whose
+/// signal no longer ends the sleep with time left: the turn before it ends the
+/// sleep with EINTR and some time left, and its own signal arrives after the
+/// deadline, where the sleep returns 0 and the handler runs. Before, the
+/// parked sleep (every plain sleep, under first-pass registration) took EINTR
+/// there with nothing left (https://github.com/rrnewton/hermit/pull/4682).
+#[test]
+fn a_signal_after_a_sleeps_deadline_does_not_interrupt_it() {
+    let guest = compiled_c_guest(
+        &SLEEP_SIGNAL_AFTER_DEADLINE_GUEST,
+        "sleep_signal_after_deadline",
+    );
+    let guest = guest.to_str().unwrap();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let summary = directory.path().join("summary.json");
+    let summary_arg = format!("--summary-json={}", summary.display());
+    let args = ["run", "--strict", &summary_arg, "--", guest];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "rc=0 before=0 handled=0\n");
+    // A turn past the run's last never sends the signal: the search's top.
+    let turns = serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&summary).unwrap())
+        .unwrap()["sched_turns"]
+        .as_u64()
+        .expect("summary has no sched_turns");
+    let mut outcomes = std::collections::BTreeMap::new();
+    let mut outcome = |turn: u64| -> String {
+        outcomes
+            .entry(turn)
+            .or_insert_with(|| {
+                let signal_at = format!("--signal-at=turn={turn}:SIGUSR1");
+                let args = ["run", "--strict", &signal_at, "--", guest];
+                let output = hermit(&args);
+                // A signal before the handler is installed kills the guest.
+                if output.status.success() {
+                    stdout(&output)
+                } else {
+                    "killed\n".to_owned()
+                }
+            })
+            .clone()
+    };
+    let rem = |line: &str| -> Option<u64> {
+        line.strip_prefix("rc=EINTR rem=")?
+            .split(' ')
+            .next()?
+            .parse()
+            .ok()
+    };
+    // Whether turn N's signal no longer ends the sleep with time left: false
+    // for a signal that kills the guest before its handler is installed, one
+    // that arrives before the sleep, and one during it; true from the
+    // deadline on, and for a turn the run never reaches.
+    let past_deadline = |line: &str| {
+        !(line == "killed\n" || line.contains("before=1") || rem(line).is_some_and(|rem| rem > 0))
+    };
+    let (mut low, mut high) = (1, turns + 1);
+    assert!(
+        !past_deadline(&outcome(low)),
+        "turn {low}: {}",
+        outcome(low)
+    );
+    assert!(
+        past_deadline(&outcome(high)),
+        "turn {high}: {}",
+        outcome(high)
+    );
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        if past_deadline(&outcome(middle)) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    let (before, after) = (outcome(low), outcome(high));
+    assert!(
+        rem(&before).is_some_and(|rem| rem > 0) && before.ends_with(" before=0 handled=1\n"),
+        "turn {low}, the last whose signal ends the sleep: {before}"
+    );
+    assert_eq!(
+        after, "rc=0 before=0 handled=1\n",
+        "turn {high}, the first whose signal arrives after the deadline"
+    );
+}
+
+/// A child's SIGCHLD that the parent leaves at its default action (ignore),
+/// sets to SIG_IGN or blocks never ends the parent's sleep, on any backend:
+/// Linux ends a sleep only for a signal it delivers to a handler or that kills
+/// or stops the process. Where the scheduler cannot read a sleeper's signal
+/// state, a parked sleep took EINTR for such a signal, so first-pass
+/// registration is not the default there
+/// (https://github.com/rrnewton/hermit/pull/4682).
+#[test]
+fn an_ignored_or_blocked_sigchld_does_not_end_a_sleep() {
+    let test = "an_ignored_or_blocked_sigchld_does_not_end_a_sleep";
+    let guest = compiled_c_guest(&SLEEP_IGNORED_SIGCHLD_GUEST, "sleep_ignored_sigchld");
+    let guest = guest.to_str().unwrap();
+    for backend in procfs_backends_among(test, &["ptrace", "dbt", "sabre"]) {
+        for mode in ["default", "ignore", "block"] {
+            let args = ["--backend", backend, "run", "--strict", "--", guest, mode];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(
+                stdout(&output),
+                "rc=0\n",
+                "{backend}, {mode}:\n{}",
+                stderr(&output)
+            );
+        }
+    }
 }
 
 /// `--signal-at` stops QEMU at the same point of two runs: the controller
