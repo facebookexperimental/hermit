@@ -2011,7 +2011,9 @@ impl Config {
     /// only where the scheduler reads a sleeper's signal state (`models_signal_targets`, or the
     /// in-guest delivery gate). Never under `hermit record` and `hermit replay`, whose schedule
     /// must not change. A replay that leaves the option unset takes its record's value instead
-    /// (`Scheduler::new`).
+    /// (`Scheduler::new`), whatever its own backend's default: a record made on ptrace and
+    /// replayed on a backend that reads no signal state registers at the first pass there, with
+    /// the limitation below, so that the replay keeps the record's schedule.
     ///
     /// A registered sleep is parked, and a signal the scheduler sends a parked sleep wakes it
     /// whatever the signal is unless the scheduler can read the sleeper's mask and dispositions

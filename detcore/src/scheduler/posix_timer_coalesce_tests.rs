@@ -1566,3 +1566,23 @@ fn a_mismatched_blocked_finish_after_an_early_pop_retires() {
         "the timer re-armed"
     );
 }
+
+/// A timer's send is made at the time the timer was due, whenever the pass
+/// that pops it runs: `dispatch_timed_signal` sets `signal_sent_at` for the
+/// length of the dispatch, so a sleep the signal reaches is judged by when
+/// the signal was due, and restores it after. A send outside a dispatch is
+/// made at the commit point (https://github.com/rrnewton/hermit/pull/4682).
+#[test]
+fn a_timer_send_is_made_at_its_due_time() {
+    let mut f = family();
+    let leader = f.leader;
+    f.arm(0, SignalTarget::Thread(leader), 1_000, 0);
+    f.pop(5_000);
+    assert_eq!(f.sent().len(), 1);
+    assert_eq!(
+        f.sched.test_send_times,
+        vec![LogicalTime::from_nanos(1_000)]
+    );
+    assert_eq!(f.sched.signal_sent_at, None);
+    assert_eq!(f.sched.signal_sent_at(), LogicalTime::from_nanos(5_000));
+}

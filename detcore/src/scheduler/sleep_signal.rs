@@ -101,6 +101,28 @@ pub(super) enum SleeperStateUnreadable {
 }
 
 impl Scheduler {
+    /// The deadline of the `nanosleep` `dettid`'s filed request is, on any
+    /// backend: unlike `signal_sleep`, it needs none of the guest's signal
+    /// state, only the request.
+    pub(super) fn filed_nanosleep_deadline(&self, dettid: DetTid) -> Option<LogicalTime> {
+        let resources = self.next_turns.get(&dettid)?.req.try_read()?.ok()?;
+        match resources.resources.iter().next() {
+            Some((ResourceID::SleepUntil(deadline), _))
+                if resources.resources.len() == 1 && resources.fyi.as_str() == NANOSLEEP_FYI =>
+            {
+                Some(*deadline)
+            }
+            _ => None,
+        }
+    }
+
+    /// When the signal being sent now was sent: a timed signal's own due time
+    /// while it is dispatched (`dispatch_timed_signal`), else the commit
+    /// point's `committed_time`.
+    pub(super) fn signal_sent_at(&self) -> LogicalTime {
+        self.signal_sent_at.unwrap_or(self.committed_time)
+    }
+
     /// The sleep `dettid`'s filed request is, if it is one a cross-task signal
     /// can end on this backend.
     pub(super) fn signal_sleep(&self, dettid: DetTid) -> Option<SignalSleep> {

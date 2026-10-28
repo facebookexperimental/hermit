@@ -727,7 +727,25 @@ impl Scheduler {
     }
 
     /// Both timed pop sites dispatch before any host-capable signal operation.
+    /// While it runs, `signal_sent_at` is the event's own time: a pass pops
+    /// one due event, so committed time may already be past later deadlines,
+    /// and a sleep the signal reaches is judged by when the signal was due
+    /// (`wake_signaled_guest_as`).
     pub(super) fn dispatch_timed_signal(
+        &mut self,
+        deadline: LogicalTime,
+        id: SignalTimerId,
+        target: timed_waiters::SignalTarget,
+        signal: timed_waiters::TimerSignal,
+        normal_due: bool,
+        observed_now: LogicalTime,
+    ) {
+        let previous = self.signal_sent_at.replace(deadline);
+        self.dispatch_timed_signal_at(deadline, id, target, signal, normal_due, observed_now);
+        self.signal_sent_at = previous;
+    }
+
+    fn dispatch_timed_signal_at(
         &mut self,
         deadline: LogicalTime,
         id: SignalTimerId,

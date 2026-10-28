@@ -1720,6 +1720,10 @@ pub struct Scheduler {
     /// under `models_signal_targets`. False on every run today: no host sets
     /// the gate before step 3c.1f.
     in_guest_signal_delivery: bool,
+    /// While a timed signal is dispatched (`dispatch_timed_signal`), the
+    /// time it was due; `None` for a send at the commit point itself, whose
+    /// time is `committed_time`. See `signal_sent_at`.
+    signal_sent_at: Option<LogicalTime>,
 
     /// The in-guest runtime's reserved signals
     /// (`Config::in_guest_reserved_signals`), which never end a parked wait
@@ -2280,6 +2284,11 @@ pub struct Scheduler {
     /// (`send_wakes`).
     #[cfg(test)]
     pub(crate) test_send_wakes: Vec<DetTid>,
+
+    /// When each captured send (`test_sent_signals`) was sent
+    /// (`signal_sent_at`).
+    #[cfg(test)]
+    pub(crate) test_send_times: Vec<LogicalTime>,
 
     /// The set each thread polling `rt_sigtimedwait` waits for: a signal in
     /// it is taken at the thread's next poll whatever its mask, so the
@@ -5495,6 +5504,7 @@ impl Scheduler {
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.models_signal_targets(),
             in_guest_signal_delivery: cfg.in_guest_signal_delivery,
+            signal_sent_at: None,
             in_guest_reserved_signals: cfg.in_guest_reserved_signals,
             host_timed_signals: Default::default(),
             host_timed_signals_everywhere: startup_host_timed_signals(cfg),
@@ -5627,6 +5637,8 @@ impl Scheduler {
             test_sent_signals: None,
             #[cfg(test)]
             test_send_wakes: Vec::new(),
+            #[cfg(test)]
+            test_send_times: Vec::new(),
             sigtimedwait_sets: Default::default(),
             undelivered_scheduler_signals: Default::default(),
             thread_timer_copies: Default::default(),
@@ -13424,6 +13436,7 @@ impl Scheduler {
             if self.send_wakes(dettid) {
                 self.test_send_wakes.push(dettid);
             }
+            self.test_send_times.push(self.signal_sent_at());
             return;
         }
         // Whether a SIGCHLD is already pending in the shared queue, read before
@@ -14037,26 +14050,32 @@ impl Scheduler {
                 // sibling took the process-directed copy, and a `pause` that
                 // found no signal for itself never returned
                 // (https://github.com/rrnewton/hermit/issues/4333).
-                let sleep = self.signal_sleep(dettid);
-                // A `nanosleep` whose deadline has passed is already over:
-                // its wake is due and pops at the next pass, and the sleep
-                // returns 0 there. Linux's `do_nanosleep` returns 0 once the
-                // timer has fired (`if (!t->task) return 0`), and the signal
-                // is delivered as the call returns. Woken here, it answered
-                // EINTR with nothing left to sleep. A queued one is left
-                // alone the same way (`is_queued_sleep` above)
-                // (https://github.com/rrnewton/hermit/pull/4682).
-                if let Some(sleep_signal::SignalSleep::Nanosleep { deadline }) = sleep
-                    && deadline <= self.committed_time
+                // A `nanosleep` whose deadline had passed when the signal
+                // was sent is already over: its wake is due and pops at the
+                // next pass, and the sleep returns 0 there. Linux's
+                // `do_nanosleep` returns 0 once the timer has fired (`if
+                // (!t->task) return 0`), and the signal is delivered as the
+                // call returns. Woken here, it answered EINTR with nothing
+                // left to sleep (https://github.com/rrnewton/hermit/pull/4682).
+                // The time is the signal's own (`signal_sent_at`): a timed
+                // signal due before the deadline, popped in a pass whose
+                // committed time is already past it, still ends the sleep.
+                // The deadline is read from the filed request on every
+                // backend, as it needs no signal state.
+                if let Some(deadline) = self.filed_nanosleep_deadline(dettid)
+                    && deadline <= self.signal_sent_at()
                 {
                     debug!(
-                        "[dtid {}] signal {} arrived after its parked sleep's deadline {}; \
+                        "[dtid {}] signal {} sent at {} after its parked sleep's deadline {}; \
                          the sleep completes at its wake.",
-                        dettid, signal, deadline
+                        dettid,
+                        signal,
+                        self.signal_sent_at(),
+                        deadline
                     );
                     return;
                 }
-                let parked_sleep = sleep.is_some();
+                let parked_sleep = self.signal_sleep(dettid).is_some();
                 if parked_sleep && !gated_wakes {
                     // Under the gate, as a queued sleep above.
                     debug!(
@@ -14153,7 +14172,7 @@ impl Scheduler {
         let live = match self.signal_sleep(dettid) {
             Some(sleep_signal::SignalSleep::Pause) => true,
             Some(sleep_signal::SignalSleep::Nanosleep { deadline }) => {
-                deadline > self.committed_time
+                deadline > self.signal_sent_at()
             }
             None => false,
         };
@@ -48335,6 +48354,91 @@ mod test {
             scheduler.blocked.timed_waiters.is_empty(),
             "before the deadline"
         );
+    }
+
+    /// A timed signal is judged by when it was due, not by the committed time
+    /// of the pass that pops it: a pass pops one due event, so an alarm due
+    /// before a parked `nanosleep`'s deadline can pop when committed time is
+    /// already past the deadline, and it still ends the sleep, as Linux ends
+    /// a sleep for a signal that arrives before its timer fires. One due at or
+    /// after the deadline leaves the sleep to its wake. `dispatch_timed_signal`
+    /// sets the due time for the length of the dispatch and restores it
+    /// (https://github.com/rrnewton/hermit/pull/4682).
+    #[test]
+    fn a_timed_signal_due_before_a_parked_nanosleep_deadline_ends_it_whenever_it_pops() {
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        for (due, woken) in [
+            (LogicalTime::from_nanos(4_999_000_000), true),
+            (deadline, false),
+        ] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+            scheduler.committed_time = LogicalTime::from_nanos(5_001_000_000);
+            set_sleeper_state(&mut scheduler, target, sleeper_state(usr1, 0, 0, 0));
+            scheduler.signal_sent_at = Some(due);
+            assert_eq!(scheduler.signal_sent_at(), due);
+            scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+            let case = format!("due {due}");
+            if woken {
+                assert_eq!(
+                    scheduler.inbound_signals(target),
+                    vec![SigWrapper::from(Signal::SIGUSR1)],
+                    "{case}"
+                );
+                assert!(scheduler.blocked.timed_waiters.is_empty(), "{case}");
+            } else {
+                assert_sleep_parked(&scheduler, target, deadline, &case);
+                assert!(scheduler.inbound_signals(target).is_empty(), "{case}");
+            }
+        }
+        // Outside a timed dispatch, the send time is the commit point's.
+        let mut scheduler = gated_scheduler();
+        scheduler.committed_time = deadline;
+        assert_eq!(scheduler.signal_sent_at, None);
+        assert_eq!(scheduler.signal_sent_at(), deadline);
+    }
+
+    /// On a backend that reads no sleeper's signal state, a signal sent at or
+    /// after a parked `nanosleep`'s deadline still leaves it to its wake: the
+    /// deadline is read from the filed request, which needs no signal state.
+    /// This holds for the default and for an explicit `first-pass`, which
+    /// registers there too (https://github.com/rrnewton/hermit/pull/4682).
+    #[test]
+    fn a_signal_after_a_parked_nanosleep_deadline_leaves_it_to_complete_on_any_backend() {
+        use crate::config::SleepRegistration;
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        for registration in [None, Some(SleepRegistration::FirstPass)] {
+            for committed in [deadline, deadline + LogicalTime::from_nanos(1)] {
+                let cfg = Config {
+                    sequentialize_threads: true,
+                    backend: BackendCapabilities::DBT,
+                    sleep_registration: registration,
+                    ..Config::default()
+                };
+                let mut scheduler = Scheduler::new(&cfg);
+                let case = format!("{registration:?}, committed {committed}");
+                assert!(
+                    !scheduler.models_signal_targets && !scheduler.in_guest_signal_delivery,
+                    "{case}"
+                );
+                assert_eq!(
+                    cfg.queued_sleeps_registered_at_first_pass(),
+                    registration.is_some(),
+                    "{case}"
+                );
+                let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+                assert_eq!(scheduler.signal_sleep(target), None, "{case}");
+                scheduler.committed_time = committed;
+                scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+                assert_eq!(
+                    scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+                    vec![(deadline, TimedEvent::ThreadEvt(target))],
+                    "{case}"
+                );
+                assert!(scheduler.inbound_signals(target).is_empty(), "{case}");
+            }
+        }
     }
 
     /// What is not recorded at all: a `SIGKILL`, which the kernel acts on for
