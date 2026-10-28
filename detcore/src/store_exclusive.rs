@@ -1186,10 +1186,11 @@ mod runtime {
     }
 
     /// Whether this run counts store-exclusives: one that records or replays
-    /// preemptions, whose divergence a count can explain. Other runs keep
-    /// their PMU counters to themselves.
+    /// preemptions, or a run of `--verify` (`Config::count_store_exclusives`),
+    /// whose divergence a count can explain. Other runs keep their PMU
+    /// counters to themselves.
     fn counts_store_exclusives(cfg: &Config) -> bool {
-        reads_guest_tasks(cfg) && records_or_replays(cfg)
+        reads_guest_tasks(cfg) && (records_or_replays(cfg) || cfg.count_store_exclusives)
     }
 
     /// `count` and `noun`, plural unless the count is 1.
@@ -1285,7 +1286,7 @@ mod runtime {
             match report {
                 Report::Attach { root } => {
                     if counts_store_exclusives(cfg) && self.counters.is_none() {
-                        self.counters = Some(Counters::open(*root));
+                        self.counters = Some(Counters::open(*root, records_or_replays(cfg)));
                     }
                 }
                 Report::Pairs {
@@ -1501,6 +1502,16 @@ mod runtime {
     /// `inherit` is set. Naming the PMU's own type binds the event to that
     /// PMU, where `PERF_TYPE_RAW` would bind it to the first one that accepts
     /// it.
+    ///
+    /// The event is flexible, never pinned. Reverie pins the branch counter
+    /// that drives virtual time and the preemption timer (`attr.pinned`, in
+    /// its `perf::Builder`), and Linux schedules every pinned group onto the
+    /// PMU before any flexible one (`ctx_sched_in`, kernel/events/core.c), so
+    /// these events take only counters the pinned ones leave and cannot
+    /// displace them; when the PMU is short, they are the ones time-shared,
+    /// which `TOTAL_TIME_RUNNING` shows and the counts report as not counted
+    /// for the whole run. A pinned branch counter that could not be scheduled
+    /// would put its event in error, which Reverie refuses rather than read.
     fn open_event(pmu: &CpuPmu, config: u64, pid: i32, inherit: bool) -> std::io::Result<OwnedFd> {
         let mut attr = PerfEventAttr {
             type_: pmu.kind,
@@ -1695,7 +1706,12 @@ mod runtime {
     struct Counters(Vec<PmuEvents>);
 
     impl Counters {
-        fn open(root: i32) -> Result<Self, String> {
+        /// Open the run's counters on `root`. `log_probe` says whether the
+        /// probe's host-observed counts go to the debug log: only in a run
+        /// that records or replays preemptions, as before `--verify` counted.
+        /// A `--verify` run keeps them out, because `--verify-verbose`
+        /// compares every log level and these counts differ from run to run.
+        fn open(root: i32, log_probe: bool) -> Result<Self, String> {
             let cpus = affinity(root)
                 .map_err(|error| format!("cannot read the guest's CPU affinity: {error}"))?;
             let mut names = Vec::new();
@@ -1719,12 +1735,14 @@ mod runtime {
                     .map_or("does not open".to_owned(), |executed| {
                         format!("counted {executed} of {}", 2 * PROBE_LOOPS)
                     });
-                debug!(
-                    "[store-exclusive] probe of PMU {} on CPU {cpu}: STREX_FAIL_SPEC counted {} of \
-                     {PROBE_LOOPS} failing store-exclusives (the CPU reported {} failed); \
-                     STREX_SPEC {executed}",
-                    pmu.name, probe.failed, probe.observed_failed
-                );
+                if log_probe {
+                    debug!(
+                        "[store-exclusive] probe of PMU {} on CPU {cpu}: STREX_FAIL_SPEC counted \
+                         {} of {PROBE_LOOPS} failing store-exclusives (the CPU reported {} \
+                         failed); STREX_SPEC {executed}",
+                        pmu.name, probe.failed, probe.observed_failed
+                    );
+                }
                 if probe.failed == 0 {
                     return Err(format!(
                         "store-exclusive counting unavailable on this core: STREX_FAIL_SPEC (raw \

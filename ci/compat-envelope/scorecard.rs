@@ -21843,6 +21843,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                     first_divergent_left_message: None,
                     first_divergent_right_message: None,
                     exact_branch_counter: None,
+                    store_exclusive_retries: None,
                 })
                 .unwrap();
                 serde_json::json!({
@@ -22776,6 +22777,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 first_divergent_left_message: None,
                 first_divergent_right_message: None,
                 exact_branch_counter: None,
+                store_exclusive_retries: None,
                 runtime: None,
                 dbt_counted_branches: None,
                 guest_exit_code: Some(0),

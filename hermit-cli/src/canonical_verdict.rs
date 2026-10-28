@@ -464,6 +464,48 @@ pub struct VerificationReport {
     /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_branch_counter: Option<BranchCounterVerdict>,
+    /// aarch64: the store-exclusives that failed in a diverged comparison,
+    /// with the load/store-exclusive loops either run could still retry. A
+    /// failed store-exclusive runs its loop again, or sends a weak
+    /// compare-and-swap down its failure path; either retires more branches,
+    /// which moves virtual time, so these are a candidate cause the producer
+    /// can name. Present only beside a `diverged` comparison in which either
+    /// run counted a failure (the parse refuses it beside any other verdict);
+    /// it names a cause and decides nothing. Absent elsewhere, and in a
+    /// report written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_exclusive_retries: Option<StoreExclusiveRetries>,
+}
+
+/// [`VerificationReport::store_exclusive_retries`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreExclusiveRetries {
+    /// The first run's counts; `None` where it did not count them.
+    pub run1: Option<StoreExclusiveRunCounts>,
+    /// The second run's counts; `None` where it did not count them.
+    pub run2: Option<StoreExclusiveRunCounts>,
+    /// The load/store-exclusive loops either run could still retry, by guest
+    /// path: those an executable file mapping had and no rewrite turned into
+    /// single LSE atomics. The larger of the two runs' counts for each path.
+    pub loops_left: std::collections::BTreeMap<String, u64>,
+    /// Whether the runs had `--rewrite-exclusives`; `None` when the producer
+    /// does not know (a comparison of two `--verify-run` directories).
+    pub rewrite_exclusives: Option<bool>,
+}
+
+/// One run's store-exclusive counts (aarch64 `STREX_FAIL_SPEC` and
+/// `STREX_SPEC`). Both are speculative events, and whether a squashed
+/// store-exclusive counts is IMPLEMENTATION DEFINED, so the counts are
+/// indicative rather than exact.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreExclusiveRunCounts {
+    pub failed: u64,
+    /// `None` where the core does not count executed store-exclusives.
+    pub executed: Option<u64>,
+    /// Whether the counters covered the whole run.
+    pub fully_counted: bool,
 }
 
 /// [`VerificationReport::exact_branch_counter`]: present, and the producer's
@@ -511,6 +553,7 @@ impl VerificationReport {
             first_divergent_left_message: None,
             first_divergent_right_message: None,
             exact_branch_counter: None,
+            store_exclusive_retries: None,
         }
     }
 
@@ -635,6 +678,15 @@ impl VerificationReport {
                 ));
             }
             (_, None) => {}
+        }
+        // A named store-exclusive cause explains a divergence; beside any
+        // other verdict it would contradict the report.
+        if self.store_exclusive_retries.is_some() && self.verdict != Verdict::Diverged {
+            return Err(format!(
+                "inconsistent verification report: verdict={} carries store_exclusive_retries, \
+                 which only a diverged comparison names",
+                self.verdict
+            ));
         }
         Ok(self)
     }
@@ -910,6 +962,62 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         value["exact_branch_counter"]["measured_counts"] = serde_json::json!(91);
         assert!(VerificationReport::from_json_slice(value.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn store_exclusive_retries_are_optional_strictly_typed_and_only_beside_a_divergence() {
+        // Absent: not written, so a report without the cause has the bytes it
+        // had before the field existed, and such a report still reads.
+        let absent = VerificationReport::no_result();
+        let bytes = serde_json::to_vec(&absent).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("store_exclusive_retries").is_none(), "{value}");
+        assert_eq!(
+            VerificationReport::from_current_json_slice(&bytes)
+                .unwrap()
+                .store_exclusive_retries,
+            None
+        );
+        // Present beside a divergence: it round-trips.
+        let retries = StoreExclusiveRetries {
+            run1: Some(StoreExclusiveRunCounts {
+                failed: 2,
+                executed: Some(16_641),
+                fully_counted: true,
+            }),
+            run2: None,
+            loops_left: std::collections::BTreeMap::from([("/bin/guest".to_owned(), 4)]),
+            rewrite_exclusives: Some(true),
+        };
+        let mut diverged = report(LogCompareStrictness::Canonical, true, 9, 9);
+        diverged.verified = false;
+        diverged.bitwise_parity = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged.store_exclusive_retries = Some(retries.clone());
+        let bytes = serde_json::to_vec(&diverged).unwrap();
+        assert_eq!(
+            VerificationReport::from_json_slice(&bytes)
+                .unwrap()
+                .store_exclusive_retries,
+            Some(retries.clone())
+        );
+        // An unknown key in either level is refused, not dropped.
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["store_exclusive_retries"]["cause"] = serde_json::json!("retries");
+        assert!(VerificationReport::from_json_slice(value.to_string().as_bytes()).is_err());
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["store_exclusive_retries"]["run1"]["passed"] = serde_json::json!(1);
+        assert!(VerificationReport::from_json_slice(value.to_string().as_bytes()).is_err());
+        // Beside any other verdict it is refused at parse.
+        let mut matched = report(LogCompareStrictness::Canonical, true, 9, 9);
+        matched.store_exclusive_retries = Some(retries.clone());
+        let mut no_result = VerificationReport::no_result();
+        no_result.store_exclusive_retries = Some(retries);
+        for refused in [matched, no_result] {
+            let error = VerificationReport::from_json_slice(&serde_json::to_vec(&refused).unwrap())
+                .unwrap_err();
+            assert!(error.contains("store_exclusive_retries"), "{error}");
+        }
     }
 
     fn failed_container_report(
@@ -1257,6 +1365,7 @@ mod tests {
             first_divergent_left_message: None,
             first_divergent_right_message: None,
             exact_branch_counter: None,
+            store_exclusive_retries: None,
         }
     }
 

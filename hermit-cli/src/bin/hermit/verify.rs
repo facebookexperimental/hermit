@@ -40,6 +40,8 @@ pub(crate) use hermit::canonical_verdict::NoResultReason;
 use hermit::canonical_verdict::RecordEnvelopeReport;
 use hermit::canonical_verdict::RunFailure;
 use hermit::canonical_verdict::RuntimeStats;
+use hermit::canonical_verdict::StoreExclusiveRetries;
+use hermit::canonical_verdict::StoreExclusiveRunCounts;
 pub(crate) use hermit::canonical_verdict::Verdict;
 pub(crate) use hermit::canonical_verdict::VerificationReport;
 pub(crate) use hermit::canonical_verdict::VerificationRun;
@@ -694,6 +696,129 @@ pub(crate) fn verification_runtime_from_summaries(
     })
 }
 
+/// aarch64: the store-exclusive failures that name a possible cause of a
+/// divergence, from the two runs' summaries. A store-exclusive fails when an
+/// exception clears the exclusive monitor between its load and its store,
+/// which a host interrupt can do at any point; the loop then runs again (or a
+/// weak compare-and-swap takes its failure path) and retires more branches,
+/// which moves the thread's virtual time and can move everything after it.
+/// The counts are not tied to the first divergence, so this is a candidate
+/// cause, not a proof. `Some` only for a [`Verdict::Diverged`] comparison in
+/// which either run counted a failure: the counters are speculative events
+/// whose counts are indicative rather than exact, so a run that counted none
+/// may still have retried, and is not named. It changes no verdict. `rewrite_exclusives` is whether the runs had
+/// `--rewrite-exclusives`, when known.
+pub(crate) fn store_exclusive_retries(
+    verdict: Verdict,
+    run1: Option<&RunSummary>,
+    run2: Option<&RunSummary>,
+    rewrite_exclusives: Option<bool>,
+) -> Option<StoreExclusiveRetries> {
+    if verdict != Verdict::Diverged {
+        return None;
+    }
+    let counts = |run: Option<&RunSummary>| {
+        run.and_then(|summary| summary.store_exclusives)
+            .map(|counts| StoreExclusiveRunCounts {
+                failed: counts.failed,
+                executed: counts.executed,
+                fully_counted: counts.fully_counted,
+            })
+    };
+    let (counts1, counts2) = (counts(run1), counts(run2));
+    if [counts1, counts2]
+        .iter()
+        .all(|counts| counts.is_none_or(|counts| counts.failed == 0))
+    {
+        return None;
+    }
+    let mut loops_left = std::collections::BTreeMap::new();
+    for summary in [run1, run2].into_iter().flatten() {
+        for (path, left) in summary.exclusive_pairs_left() {
+            let most = loops_left.entry(path).or_insert(0);
+            *most = left.max(*most);
+        }
+    }
+    Some(StoreExclusiveRetries {
+        run1: counts1,
+        run2: counts2,
+        loops_left,
+        rewrite_exclusives,
+    })
+}
+
+/// The line that names [`store_exclusive_retries`] on the console, after
+/// `HERMIT_STORE_EXCLUSIVE_RETRIES`.
+pub(crate) fn store_exclusive_retries_line(retries: &StoreExclusiveRetries) -> String {
+    fn plural(count: u64, noun: &str) -> String {
+        if count == 1 {
+            format!("1 {noun}")
+        } else {
+            format!("{count} {noun}s")
+        }
+    }
+    let run = |label: &str, counts: Option<StoreExclusiveRunCounts>| match counts {
+        None => format!("{label} did not count them"),
+        Some(counts) => {
+            let failed = match counts.executed {
+                Some(executed) => format!(
+                    "{label} failed {} of {}",
+                    counts.failed,
+                    plural(executed, "store-exclusive")
+                ),
+                None => format!(
+                    "{label} failed {}",
+                    plural(counts.failed, "store-exclusive")
+                ),
+            };
+            if counts.fully_counted {
+                failed
+            } else {
+                format!("{failed} (counted for part of the run)")
+            }
+        }
+    };
+    let loops = if retries.loops_left.is_empty() {
+        "No executable file mapping has a load/store-exclusive loop left, so the failures \
+         were in other code"
+            .to_owned()
+    } else {
+        let paths: Vec<String> = retries
+            .loops_left
+            .iter()
+            .map(|(path, loops)| format!("{path} ({loops})"))
+            .collect();
+        format!(
+            "Load/store-exclusive loops either run could retry: {}",
+            paths.join(", ")
+        )
+    };
+    // What removes the loops, said only where some are left in executable
+    // file mappings: the rewrite reaches nothing else.
+    let setting = match (retries.loops_left.is_empty(), retries.rewrite_exclusives) {
+        (true, _) => "",
+        (false, Some(false)) => {
+            "; suggested setting: --rewrite-exclusives, which rewrites the loops it \
+             recognizes to single LSE atomics"
+        }
+        (false, Some(true)) => {
+            "; --rewrite-exclusives left these: its report names why it refused each, and a \
+             loop it cannot rewrite needs a new idiom or a build with LSE atomics \
+             (-march=armv8.1-a or later)"
+        }
+        (false, None) => {
+            "; --rewrite-exclusives rewrites the loops it recognizes to single LSE atomics"
+        }
+    };
+    format!(
+        "possible cause: {}, {}. A failed store-exclusive runs its loop again, or sends a \
+         weak compare-and-swap down its failure path, and either retires more branches, which \
+         moves virtual time. {loops}{setting}",
+        run("run 1", retries.run1),
+        run("run 2", retries.run2),
+    )
+}
+
 /// The full outcome of comparing two runs: the verification [`Verdict`] plus the
 /// guest exit status, so a caller never has to infer either one from the other.
 #[derive(Debug, Clone)]
@@ -728,6 +853,9 @@ pub struct VerificationOutcome {
     pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
     /// Runtime totals for the two compared executions when their summaries were readable.
     pub runtime: Option<VerificationRuntime>,
+    /// aarch64: the store-exclusive failures that name a cause of a
+    /// divergence ([`store_exclusive_retries`]); `None` elsewhere.
+    pub store_exclusive_retries: Option<StoreExclusiveRetries>,
     /// Scheduler turn at the first log divergence, when a preceding COMMIT
     /// identified the turn.
     pub first_divergent_scheduler_turn: Option<u64>,
@@ -896,6 +1024,11 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
         first_divergent_left_message: outcome.first_divergent_left_message.clone(),
         first_divergent_right_message: outcome.first_divergent_right_message.clone(),
         exact_branch_counter: None,
+        // Only a divergence names a cause (`store_exclusive_retries`).
+        store_exclusive_retries: outcome
+            .store_exclusive_retries
+            .clone()
+            .filter(|_| outcome.verdict == Verdict::Diverged),
     }
 }
 
@@ -985,6 +1118,8 @@ pub fn write_skid_overshoot_verification_json(
     report.no_result_reason = None;
     report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
     report.dbt_counted_branches = None;
+    // The verdict is no longer a divergence, so no cause of one is named.
+    report.store_exclusive_retries = None;
     write_report_json(path, &report)
 }
 
@@ -1014,6 +1149,8 @@ pub fn write_host_input_change_verification_json(
     report.no_result_reason = None;
     report.infrastructure_error = Some(change);
     report.dbt_counted_branches = None;
+    // The verdict is no longer a divergence, so no cause of one is named.
+    report.store_exclusive_retries = None;
     write_report_json(path, &report)
 }
 
@@ -2305,6 +2442,7 @@ fn compare_two_runs_with_unsupported_scan(
             compared_outputs,
             dbt_counted_branches: None,
             runtime: None,
+            store_exclusive_retries: None,
             first_divergent_scheduler_turn,
             first_divergent_record_positions,
             first_divergent_virtual_nanoseconds,
@@ -2324,6 +2462,7 @@ fn compare_two_runs_with_unsupported_scan(
             compared_outputs,
             dbt_counted_branches: None,
             runtime: None,
+            store_exclusive_retries: None,
             first_divergent_scheduler_turn,
             first_divergent_record_positions,
             first_divergent_virtual_nanoseconds,
@@ -2591,6 +2730,7 @@ fn display_diff(left: &str, right: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
     use super::*;
@@ -5771,6 +5911,7 @@ mod tests {
             },
             dbt_counted_branches: None,
             runtime: None,
+            store_exclusive_retries: None,
             first_divergent_scheduler_turn: None,
             first_divergent_record_positions: None,
             first_divergent_virtual_nanoseconds: None,
@@ -5780,6 +5921,202 @@ mod tests {
             first_divergent_right_message: None,
         };
         assert!(!verification_report(&diverged).bitwise_parity);
+
+        // A named store-exclusive cause travels with the report and changes
+        // neither the verdict nor parity.
+        let retries = StoreExclusiveRetries {
+            run1: Some(StoreExclusiveRunCounts {
+                failed: 1,
+                executed: Some(9),
+                fully_counted: true,
+            }),
+            run2: None,
+            loops_left: BTreeMap::from([("/bin/guest".to_owned(), 1)]),
+            rewrite_exclusives: Some(false),
+        };
+        let named = VerificationOutcome {
+            store_exclusive_retries: Some(retries.clone()),
+            ..diverged
+        };
+        let report = verification_report(&named);
+        assert_eq!(report.verdict, Verdict::Diverged);
+        assert!(!report.bitwise_parity);
+        assert_eq!(report.store_exclusive_retries, Some(retries.clone()));
+        // An outcome that is not a divergence publishes no cause, and the
+        // writers that turn a divergence into another verdict drop it.
+        let not_diverged = VerificationOutcome {
+            verdict: Verdict::NoResult,
+            ..named.clone()
+        };
+        assert_eq!(
+            verification_report(&not_diverged).store_exclusive_retries,
+            None
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let skid = directory.path().join("skid.json");
+        write_skid_overshoot_verification_json(&skid, &named, 1).unwrap();
+        let skid = VerificationReport::from_json_slice(&fs::read(&skid).unwrap()).unwrap();
+        assert_eq!(skid.verdict, Verdict::InfrastructureError);
+        assert_eq!(skid.store_exclusive_retries, None);
+    }
+
+    fn store_exclusive_summary(
+        failed: u64,
+        executed: Option<u64>,
+        pairs: &[(&str, u64)],
+    ) -> RunSummary {
+        RunSummary {
+            store_exclusives: Some(detcore_model::summary::StoreExclusiveCounts {
+                failed,
+                executed,
+                fully_counted: true,
+            }),
+            exclusive_pairs: pairs
+                .iter()
+                .map(|(path, pairs)| ((*path).to_owned(), *pairs))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_divergence_with_failed_store_exclusives_names_them_and_the_loops_left() {
+        let first = store_exclusive_summary(2, Some(16_641), &[("/bin/guest", 4)]);
+        let second = store_exclusive_summary(
+            0,
+            Some(16_645),
+            &[("/bin/guest", 4), ("/lib/libc.so.6", 19)],
+        );
+        let retries =
+            store_exclusive_retries(Verdict::Diverged, Some(&first), Some(&second), Some(false))
+                .expect("a failure in either run names the cause");
+        assert_eq!(
+            retries,
+            StoreExclusiveRetries {
+                run1: Some(StoreExclusiveRunCounts {
+                    failed: 2,
+                    executed: Some(16_641),
+                    fully_counted: true,
+                }),
+                run2: Some(StoreExclusiveRunCounts {
+                    failed: 0,
+                    executed: Some(16_645),
+                    fully_counted: true,
+                }),
+                loops_left: BTreeMap::from([
+                    ("/bin/guest".to_owned(), 4),
+                    ("/lib/libc.so.6".to_owned(), 19),
+                ]),
+                rewrite_exclusives: Some(false),
+            }
+        );
+        assert_eq!(
+            store_exclusive_retries_line(&retries),
+            "possible cause: run 1 failed 2 of 16641 store-exclusives, run 2 failed 0 of 16645 \
+             store-exclusives. A failed store-exclusive runs its loop again, or sends a weak \
+             compare-and-swap down its failure path, and either retires more branches, which \
+             moves virtual time. Load/store-exclusive loops either run could retry: /bin/guest \
+             (4), /lib/libc.so.6 (19); suggested setting: --rewrite-exclusives, which rewrites \
+             the loops it recognizes to single LSE atomics"
+        );
+    }
+
+    #[test]
+    fn the_store_exclusive_line_says_what_a_rewrite_left_and_where_none_was_left() {
+        let left = StoreExclusiveRetries {
+            run1: Some(StoreExclusiveRunCounts {
+                failed: 1,
+                executed: None,
+                fully_counted: false,
+            }),
+            run2: None,
+            loops_left: BTreeMap::from([("/bin/guest".to_owned(), 1)]),
+            rewrite_exclusives: Some(true),
+        };
+        let line = store_exclusive_retries_line(&left);
+        assert!(
+            line.starts_with(
+                "possible cause: run 1 failed 1 store-exclusive (counted for part of the run), \
+                 run 2 did not count them."
+            ),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(
+                "/bin/guest (1); --rewrite-exclusives left these: its report names why it \
+                 refused each, and a loop it cannot rewrite needs a new idiom or a build with \
+                 LSE atomics (-march=armv8.1-a or later)"
+            ),
+            "{line}"
+        );
+        let elsewhere = StoreExclusiveRetries {
+            loops_left: BTreeMap::new(),
+            rewrite_exclusives: None,
+            ..left
+        };
+        let line = store_exclusive_retries_line(&elsewhere);
+        // With no loop left in an executable file mapping, no setting is
+        // suggested: the rewrite reaches nothing else.
+        assert!(
+            line.ends_with(
+                "No executable file mapping has a load/store-exclusive loop left, so the \
+                 failures were in other code"
+            ),
+            "{line}"
+        );
+        let none_left_without_rewrite = StoreExclusiveRetries {
+            rewrite_exclusives: Some(false),
+            ..elsewhere
+        };
+        assert!(
+            !store_exclusive_retries_line(&none_left_without_rewrite).contains("setting"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn no_store_exclusive_cause_is_named_without_a_divergence_and_a_failure() {
+        let failed = store_exclusive_summary(3, Some(100), &[("/bin/guest", 2)]);
+        let clean = store_exclusive_summary(0, Some(100), &[("/bin/guest", 2)]);
+        let uncounted = RunSummary {
+            exclusive_pairs: BTreeMap::from([("/bin/guest".to_owned(), 2)]),
+            ..Default::default()
+        };
+        // A match names nothing, even with failures counted.
+        for verdict in [
+            Verdict::Matched,
+            Verdict::NoResult,
+            Verdict::InfrastructureError,
+        ] {
+            assert_eq!(
+                store_exclusive_retries(verdict, Some(&failed), Some(&failed), Some(false)),
+                None
+            );
+        }
+        // A divergence names nothing when neither run counted a failure, or
+        // neither counted at all.
+        assert_eq!(
+            store_exclusive_retries(Verdict::Diverged, Some(&clean), Some(&clean), Some(false)),
+            None
+        );
+        assert_eq!(
+            store_exclusive_retries(
+                Verdict::Diverged,
+                Some(&uncounted),
+                Some(&uncounted),
+                Some(false)
+            ),
+            None
+        );
+        assert_eq!(
+            store_exclusive_retries(Verdict::Diverged, None, None, None),
+            None
+        );
+        // One run's failure is enough.
+        assert!(
+            store_exclusive_retries(Verdict::Diverged, Some(&uncounted), Some(&failed), None)
+                .is_some()
+        );
     }
 
     #[test]

@@ -119,6 +119,8 @@ use super::verify::retain_logs_after_verification_error;
 use super::verify::retain_verification_error;
 use super::verify::retain_verification_logs;
 use super::verify::run_verification_execution;
+use super::verify::store_exclusive_retries;
+use super::verify::store_exclusive_retries_line;
 use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
 use super::verify::verification_log_level;
@@ -15011,6 +15013,7 @@ impl RunOpts {
                 backend: self.selected_backend(),
                 application_backend: self.application_backend,
                 passthru_opt: self.det_opts.det_config.passthru_opt,
+                rewrite_exclusives: Some(self.rewrite_exclusives),
             },
             CompletedVerificationRun {
                 output: &out1,
@@ -15610,6 +15613,10 @@ impl RunOpts {
         let mut options = self.clone();
         options.det_opts.det_config.annotated_priority_replay =
             options.annotated_priority_replay_admission()?;
+        // Each run counts its store-exclusives (aarch64), so that a
+        // divergence a retried load/store-exclusive loop explains is named
+        // (`conclude_verification`).
+        options.det_opts.det_config.count_store_exclusives = true;
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
         let resources = format!(
@@ -17260,6 +17267,10 @@ pub(super) struct VerificationConclusion<'a> {
     pub(super) application_backend: Option<&'a str>,
     /// Whether both runs used `--passthru-opt`.
     pub(super) passthru_opt: bool,
+    /// Whether both runs had `--rewrite-exclusives`, when known: what a
+    /// divergence that store-exclusive failures explain suggests
+    /// ([`store_exclusive_retries`]).
+    pub(super) rewrite_exclusives: Option<bool>,
 }
 
 /// Compare two completed verification runs, publish the report to the
@@ -17281,6 +17292,7 @@ pub(super) fn conclude_verification(
         backend,
         application_backend,
         passthru_opt,
+        rewrite_exclusives,
     } = conclusion;
     let out1 = run1.output;
     let out2 = run2.output;
@@ -17366,6 +17378,14 @@ pub(super) fn conclude_verification(
     )?;
     let native_messages = evidence.map(|comparison| comparison.apply(&mut outcome));
     outcome.runtime = verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref());
+    // A divergence that failed store-exclusives explain is named as such
+    // (aarch64): reporting only, the verdict stays what the comparison found.
+    outcome.store_exclusive_retries = store_exclusive_retries(
+        outcome.verdict,
+        summary1.as_ref(),
+        summary2.as_ref(),
+        rewrite_exclusives,
+    );
 
     // A divergence that a host file changing during one run explains is
     // named as such: only a divergence is examined, and only a change
@@ -17423,6 +17443,18 @@ pub(super) fn conclude_verification(
     if let Some(change) = &host_input_change {
         // The divergence stays a failure; this names its cause.
         eprintln!("HERMIT_HOST_INPUT_CHANGED {change}");
+    }
+    if host_input_change.is_some() {
+        // The published verdict is that infrastructure error, not a
+        // divergence, so no cause of a divergence is named.
+        outcome.store_exclusive_retries = None;
+    }
+    if let Some(retries) = &outcome.store_exclusive_retries {
+        // Likewise: a possible cause named, the verdict unchanged.
+        eprintln!(
+            "HERMIT_STORE_EXCLUSIVE_RETRIES {}",
+            store_exclusive_retries_line(retries)
+        );
     }
     Ok(outcome)
 }

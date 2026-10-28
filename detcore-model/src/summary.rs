@@ -281,15 +281,16 @@ pub struct RunSummary {
     pub exclusive_rewrite_cache_peak: u64,
 
     /// **Nondeterministic:** aarch64, in runs that record or replay
-    /// preemptions: the store-exclusives the guest failed, each of which
-    /// retried its loop and added retired branches, and those it executed.
+    /// preemptions and in each run of `--verify`: the store-exclusives the
+    /// guest failed, each of which retried its loop and added retired
+    /// branches, and those it executed.
     /// Host interrupts decide them, so they are shown in the full report but
     /// not in the INFO view `--verify` compares. Absent where not counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_exclusives: Option<StoreExclusiveCounts>,
 
     /// aarch64: why `store_exclusives` could not be counted in a run that
-    /// records or replays preemptions. Full report only.
+    /// counts them. Full report only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_exclusives_unavailable: Option<String>,
 
@@ -530,6 +531,30 @@ impl fmt::Display for RunSummaryInfo<'_> {
 }
 
 impl RunSummary {
+    /// aarch64: the exclusive loops of each guest path that could still
+    /// retry in this run, for the paths that have any: every pair the scan
+    /// found ([`Self::exclusive_pairs`]), less what an in-memory rewrite made
+    /// single LSE atomics ([`Self::exclusive_rewrites`]). Under an overlay
+    /// rewrite the scan reads the rewritten copy, so its pairs are already
+    /// only the loops the rewrite left.
+    pub fn exclusive_pairs_left(&self) -> BTreeMap<String, u64> {
+        // Every path either map names: an in-memory rewrite also records
+        // paths whose scan found no pair it could attribute (a loop crossing
+        // a mapping's end, a mapping that could not be read).
+        self.exclusive_pairs
+            .keys()
+            .chain(self.exclusive_rewrites.keys())
+            .map(|path| {
+                let left = match self.exclusive_rewrites.get(path) {
+                    Some(rewrite) => rewrite.left + rewrite.failed,
+                    None => self.exclusive_pairs[path],
+                };
+                (path.clone(), left)
+            })
+            .filter(|(_, left)| *left != 0)
+            .collect()
+    }
+
     /// Whether the histogram, when present, counts exactly the `syscalls`
     /// total. `None` when either is absent.
     pub fn syscall_histogram_is_consistent(&self) -> Option<bool> {
@@ -852,6 +877,57 @@ mod tests {
             marked_json, json,
             "every existing JSON field stays identical"
         );
+    }
+
+    #[test]
+    fn the_loops_left_are_the_pairs_less_what_the_in_memory_rewrite_made_atomic() {
+        let summary = RunSummary {
+            // Scanned without an in-memory rewrite (or an overlay copy whose
+            // pairs are what the rewrite left): every pair is left.
+            exclusive_pairs: BTreeMap::from([
+                ("/bin/guest".to_owned(), 4),
+                ("/lib/libc.so.6".to_owned(), 19),
+                ("/lib/ld.so".to_owned(), 3),
+            ]),
+            exclusive_rewrites: BTreeMap::from([
+                (
+                    "/lib/libc.so.6".to_owned(),
+                    ExclusiveRewrite {
+                        rewritten: 16,
+                        left: 2,
+                        failed: 1,
+                    },
+                ),
+                (
+                    "/lib/ld.so".to_owned(),
+                    ExclusiveRewrite {
+                        rewritten: 3,
+                        left: 0,
+                        failed: 0,
+                    },
+                ),
+                // A mapping that could not be read: no pair scanned, one
+                // loop that could not be written.
+                (
+                    "/lib/unreadable.so".to_owned(),
+                    ExclusiveRewrite {
+                        rewritten: 0,
+                        left: 0,
+                        failed: 1,
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary.exclusive_pairs_left(),
+            BTreeMap::from([
+                ("/bin/guest".to_owned(), 4),
+                ("/lib/libc.so.6".to_owned(), 3),
+                ("/lib/unreadable.so".to_owned(), 1),
+            ])
+        );
+        assert!(RunSummary::default().exclusive_pairs_left().is_empty());
     }
 
     #[test]

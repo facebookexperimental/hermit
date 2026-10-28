@@ -106,6 +106,7 @@ fn canonical_report(verdict: Verdict) -> VerificationReport {
         first_divergent_left_message: None,
         first_divergent_right_message: None,
         exact_branch_counter: None,
+        store_exclusive_retries: None,
     }
 }
 
