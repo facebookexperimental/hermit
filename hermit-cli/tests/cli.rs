@@ -15197,8 +15197,10 @@ fn no_namespace_preemption_records_replay_under_their_base() {
 /// `hermit bisect` under `--no-namespace` with chosen IDs: its replays take
 /// the base the two schedules were recorded under, without `--pid-base` in
 /// the run arguments, and every schedule it writes for a replay states those
-/// IDs, so each replay can follow it. The schedules come from seeds of a shell
-/// that races a background `echo a` against its own `echo b`, and the search
+/// IDs, so each replay can follow it. The schedules come from scheduler seeds
+/// (`--seed`) of a shell that races a background `echo a` against its own
+/// `echo b`, all under one guest random seed (`--rng-seed=0`), since bisect
+/// compares only records that gave the guest the same random input. The search
 /// localizes that race and finishes. Before, bisect's first replay was refused
 /// (exit 122): the schedules it wrote stated no guest numbering, and read as
 /// numbered by a PID namespace. Run as the init of the test's own user and
@@ -15229,6 +15231,7 @@ fn no_namespace_bisect_replays_the_schedules_it_writes() {
                 "--chaos",
                 "--sched-heuristic=random",
                 "--epoch=2026-01-01T00:00:00Z",
+                "--rng-seed=0",
             ])
             .arg(format!("--seed={seed}"))
             .arg(format!("--record-preemptions-to={schedule}"))
