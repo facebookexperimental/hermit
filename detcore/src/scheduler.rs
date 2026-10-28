@@ -13747,6 +13747,19 @@ impl Scheduler {
         current
     }
 
+    /// The process a CPU clock id naming `named` belongs to
+    /// (`crate::cpu_clock`): the process of a live thread, or the process a
+    /// leader's id names while it exists, a zombie included
+    /// (`Self::process_exists`). Linux's `pid_for_clock` finds the task by
+    /// its pid, which a reaped process no longer has
+    /// (kernel/time/posix-cpu-timers.c:73-75 at v6.16), while a signal still
+    /// takes a leader's id as naming its process
+    /// (`Self::signal_target_process`).
+    pub fn cpu_clock_process(&self, named: DetPid) -> Option<DetPid> {
+        let process = self.signal_target_process(named)?;
+        self.process_exists(process).then_some(process)
+    }
+
     /// What the `sigev_notify_thread_id` `named` of a `timer_create` in
     /// `process` names. Linux's `good_sigevent` accepts only a task of the
     /// caller's thread group, found by its pid in the caller's namespace, so
@@ -25987,6 +26000,41 @@ mod test {
             Err(Errno::EACCES)
         );
         assert_eq!(scheduler.setpgid_decision(late, 0, 0), Ok((late, late)));
+    }
+
+    /// A CPU clock id names a live thread, or a process while it exists, a
+    /// zombie included; a reaped process's id names nothing, though a signal
+    /// still takes it as naming the process (`cpu_clock_process`,
+    /// `pid_for_clock`).
+    #[test]
+    fn a_cpu_clock_names_only_tasks_linux_still_has() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let root = DetPid::from_raw(3);
+        let reaped = DetPid::from_raw(5);
+        let zombie = DetPid::from_raw(7);
+        for pid in [root, reaped, zombie] {
+            scheduler.thread_tree.add_child(root, pid, true);
+        }
+        assert_eq!(scheduler.cpu_clock_process(reaped), Some(reaped));
+        // A zombie keeps its pid until its parent reaps it.
+        exit_process(&mut scheduler, zombie);
+        assert!(scheduler.process_exists(zombie));
+        assert_eq!(scheduler.cpu_clock_process(zombie), Some(zombie));
+        // The root ignores SIGCHLD, so a child that exits now is gone.
+        scheduler
+            .thread_tree
+            .set_sigchld_disposition(root, true, false);
+        exit_process(&mut scheduler, reaped);
+        assert_eq!(scheduler.signal_target_process(reaped), Some(reaped));
+        assert_eq!(scheduler.cpu_clock_process(reaped), None);
+        // A live thread's id names its process; an exited one's nothing.
+        let thread = DetTid::from_raw(9);
+        scheduler.thread_tree.add_child(root, thread, false);
+        register_known_thread(&mut scheduler, thread);
+        assert_eq!(scheduler.cpu_clock_process(thread), Some(root));
+        scheduler.logically_kill_thread(&thread, &root, MmId::initial(root));
+        assert_eq!(scheduler.cpu_clock_process(thread), None);
+        assert_eq!(scheduler.cpu_clock_process(DetPid::from_raw(42)), None);
     }
 
     /// A process Linux no longer has, although its wait record remains (a

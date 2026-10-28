@@ -8232,11 +8232,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
         // Only once the thread has left the scheduler, which then no longer
         // finds it in its process, does its id stop naming a CPU clock; until
-        // then its clock reads its final time. A leader stays as long as its
-        // process does (`ProcessCpuTime::threads`).
-        if current != detpid {
-            thread_state.forget_thread_cpu_time();
-        }
+        // then its clock reads its final time.
+        thread_state.release_thread_cpu_time_at_exit(current, detpid);
 
         self.record_or_replay
             .on_exit_thread(
@@ -9500,12 +9497,41 @@ mod thread_cpu_time_tests {
         assert_eq!(parent.sibling_cpu_time(DetPid::from_raw(1)), own);
 
         thread.account_process_cpu_time();
-        thread.forget_thread_cpu_time();
+        thread.release_thread_cpu_time_at_exit(thread_id, DetPid::from_raw(1));
         let exited = thread.thread_cpu_time();
         assert_eq!(parent.sibling_cpu_time(thread_id), zero);
         let total = parent.process_cpu_time();
         assert_eq!(total.user, own.0 + exited.0);
         assert_eq!(total.system, own.1 + exited.1);
+    }
+
+    /// A leader that exits before its threads stays a zombie whose thread
+    /// clock reads its final time, not zero, as Linux's does
+    /// (`pid_for_clock` still finds it, and `posix_cpu_clock_get` samples the
+    /// exited task): its entry outlives its exit, while a non-leader's goes.
+    #[test]
+    fn an_exited_leaders_clock_keeps_its_final_time() {
+        let config = Config::default();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let mut leader = ThreadState::new(DetPid::from_raw(1), &config, ());
+        leader.detpid = Some(DetPid::from_raw(1));
+        leader.clone_flags = Some(CloneFlags::CLONE_THREAD);
+        let sibling = <Detcore as Tool>::init_thread_state(
+            &tool,
+            Tid::from_raw(2),
+            Some((Tid::from_raw(1), &leader)),
+        );
+        leader.clone_flags = None;
+        leader.thread_logical_time.add_rcbs(40);
+        leader.thread_logical_time.add_syscall_with_cost(600);
+        leader.account_process_cpu_time();
+        let last = leader.thread_cpu_time();
+        assert!(last.0 > LogicalTime::ZERO && last.1 > LogicalTime::ZERO);
+        let leader_id = DetPid::from_raw(1);
+
+        leader.release_thread_cpu_time_at_exit(leader_id, leader_id);
+        assert_eq!(sibling.sibling_cpu_time(leader_id), last);
+        assert_eq!(sibling.sibling_cpu_time(leader_id), last);
     }
 }
 

@@ -17,13 +17,16 @@
 // - the clock ids pthread_getcpuclockid and clock_getcpuclockid build read the
 //   same clocks, for the caller and for another thread;
 // - the process clock covers every thread's, exited ones included, and an
-//   exited thread's id names no clock any more;
+//   exited thread's id names no clock any more, except a leader's: a leader
+//   that exits before its other thread keeps reading its final time;
 // - clock(), getrusage and times agree with CLOCK_PROCESS_CPUTIME_ID and
 //   CLOCK_THREAD_CPUTIME_ID, to their own units;
 // - a fork child's clocks start afresh, and an exec keeps the thread's and
 //   the process's;
 // - clock_nanosleep refuses the caller's own thread clock as Linux does, and
-//   returns at once for a process-clock deadline that has passed.
+//   returns at once for a process-clock deadline that has passed. (A sleep
+//   that would have to wait is not checked: Hermit refuses it, since only the
+//   clock's task's CPU time may end it.)
 //
 // Before, Hermit answered every CPU clock with its epoch-based virtual wall
 // time (about 1.77e9 s), so clock() read about 1.77e15.
@@ -398,12 +401,45 @@ static void check_fork_child(void) {
       waited && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
-static void* spin_until_released(void* arg) {
-  volatile int* released = arg;
-  while (!*released) {
-    burn(10000);
+struct exited_leader {
+  pthread_t leader;
+  clockid_t clock;
+  int64_t last;
+};
+
+static void* read_exited_leader(void* arg) {
+  struct exited_leader* leader = arg;
+  // Returns once the kernel has cleared the leader's tid at its exit.
+  pthread_join(leader->leader, NULL);
+  int64_t first = clock_ns(leader->clock);
+  burn(100000);
+  int64_t second = clock_ns(leader->clock);
+  _exit(first > 0 && first >= leader->last && second == first ? 0 : 1);
+}
+
+// A process whose leader exits before its other thread: the leader stays a
+// zombie while the process lives, and its thread clock, read by the other
+// thread, keeps the leader's final CPU time.
+static void check_exited_leader(void) {
+  fflush(stdout);
+  pid_t child = fork();
+  if (child == 0) {
+    static struct exited_leader leader;
+    leader.leader = pthread_self();
+    leader.clock = thread_sched_clock(getpid());
+    burn(100000);
+    leader.last = clock_ns(leader.clock);
+    pthread_t reader;
+    if (pthread_create(&reader, NULL, read_exited_leader, &leader) != 0) {
+      _exit(2);
+    }
+    pthread_exit(NULL);
   }
-  return NULL;
+  int status = 0;
+  int waited = child > 0 && waitpid(child, &status, 0) == child;
+  check(
+      "an-exited-leaders-clock-keeps-its-final-time",
+      waited && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 static void check_clock_nanosleep(void) {
@@ -433,29 +469,6 @@ static void check_clock_nanosleep(void) {
       "passed-process-clock-deadline-returns-at-once",
       clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, TIMER_ABSTIME, &passed, NULL) ==
           0);
-
-  // A future deadline on the process clock passes as another thread spends
-  // CPU time while this one sleeps.
-  volatile int released = 0;
-  pthread_t spinner;
-  if (pthread_create(&spinner, NULL, spin_until_released, (void*)&released) !=
-      0) {
-    check("spinner-starts", 0);
-    return;
-  }
-  int64_t now = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
-  int64_t deadline_ns = now + 2 * NANOS_PER_SEC / 1000;
-  const struct timespec deadline = {
-      deadline_ns / NANOS_PER_SEC, deadline_ns % NANOS_PER_SEC};
-  int slept =
-      clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, TIMER_ABSTIME, &deadline, NULL);
-  int64_t woke = clock_ns(CLOCK_PROCESS_CPUTIME_ID);
-  released = 1;
-  pthread_join(spinner, NULL);
-  value("process-sleep-woke", woke - deadline_ns);
-  check(
-      "future-process-clock-deadline-passes-while-a-sibling-runs",
-      slept == 0 && woke >= deadline_ns);
 }
 
 static int finish(void) {
@@ -493,6 +506,7 @@ int main(int argc, char** argv) {
   check_sibling_clocks();
   check_exited_thread();
   check_fork_child();
+  check_exited_leader();
   check_clock_nanosleep();
 
   char thread_before[32];

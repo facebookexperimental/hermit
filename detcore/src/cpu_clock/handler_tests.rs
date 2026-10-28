@@ -57,6 +57,9 @@ const SIBLING: i32 = 8;
 const OTHER_PROCESS: i32 = 40;
 /// An id that names no task.
 const NOBODY: i32 = 99;
+/// A process that has exited and been reaped: a signal still takes its
+/// leader's id as naming it, a CPU clock not.
+const REAPED: i32 = 41;
 /// The caller's and the sibling's pids in a nested PID namespace, and one the
 /// scheduler could not record.
 const NESTED_CALLER: i32 = 2;
@@ -77,6 +80,8 @@ struct CpuClockGuest {
     config: Config,
     thread: ThreadState<()>,
     requests: Mutex<Vec<&'static str>>,
+    /// Whether the sibling has exited since the test began.
+    sibling_exited: std::sync::atomic::AtomicBool,
 }
 
 struct UnusedStack;
@@ -134,13 +139,17 @@ impl GlobalRPC<GlobalState> for CpuClockGuest {
                 };
                 ("guest-pid", GlobalResponse::GuestPid(answer))
             }
-            GlobalRequest::SignalTargetProcess(named) => {
+            GlobalRequest::CpuClockProcess(named) => {
+                let sibling_exited = self
+                    .sibling_exited
+                    .load(std::sync::atomic::Ordering::SeqCst);
                 let answer = match named.as_raw() {
+                    SIBLING if sibling_exited => None,
                     PROCESS | CALLER | SIBLING => Some(DetPid::from_raw(PROCESS)),
                     OTHER_PROCESS => Some(named),
                     _ => None,
                 };
-                ("process-of", GlobalResponse::SignalTargetProcess(answer))
+                ("process-of", GlobalResponse::CpuClockProcess(answer))
             }
             request => panic!("unexpected request: {request:?}"),
         };
@@ -234,6 +243,7 @@ fn setup() -> (Detcore, CpuClockGuest, (LogicalTime, LogicalTime)) {
         config,
         thread: caller,
         requests: Mutex::new(Vec::new()),
+        sibling_exited: std::sync::atomic::AtomicBool::new(false),
     };
     (tool, guest, sibling_time)
 }
@@ -400,39 +410,60 @@ async fn a_nested_namespace_pid_is_translated_first() {
     assert_eq!(take_requests(&guest), ["global-time"]);
 }
 
+/// `clock_getres` on a CPU clock checks the task it names and reports the
+/// clock kind's resolution: 1 ns for SCHED, one tick of a 250 Hz kernel for
+/// PROF and VIRT (`posix_cpu_clock_getres`). Every other clock keeps 10 us.
 #[tokio::test]
 async fn clock_getres_validates_the_task_a_cpu_clock_names() {
     let (tool, mut guest, _) = setup();
-    let getres = |id: i32| {
+    let getres = |id: i32, res: Option<&mut Timespec>| {
         ClockGetres::new()
             .with_clockid(ClockId::from_raw(id as _))
-            .with_res(None)
+            .with_res(res.map(|res| AddrMut::from_ptr(res as *mut Timespec).unwrap()))
     };
-    for id in [
-        libc::CLOCK_THREAD_CPUTIME_ID,
-        thread_clock(CALLER, 2),
-        thread_clock(SIBLING, 0),
-        process_clock(PROCESS, 2),
+    for (id, nanos) in [
+        (libc::CLOCK_THREAD_CPUTIME_ID, 1),
+        (libc::CLOCK_PROCESS_CPUTIME_ID, 1),
+        (thread_clock(CALLER, 2), 1),
+        (thread_clock(SIBLING, 0), 4_000_000),
+        (thread_clock(0, 1), 4_000_000),
+        (process_clock(PROCESS, 2), 1),
+        (process_clock(0, 0), 4_000_000),
         // A clock of another process is valid; only reading it is refused.
-        process_clock(OTHER_PROCESS, 2),
+        (process_clock(OTHER_PROCESS, 1), 4_000_000),
+        (libc::CLOCK_MONOTONIC, 10_000),
     ] {
         assert_eq!(
-            tool.handle_clock_getres(&mut guest, getres(id))
+            tool.handle_clock_getres(&mut guest, getres(id, None))
                 .await
                 .unwrap(),
             0,
             "{id}"
         );
+        let mut res = Timespec {
+            tv_sec: -1,
+            tv_nsec: -1,
+        };
+        assert_eq!(
+            tool.handle_clock_getres(&mut guest, getres(id, Some(&mut res)))
+                .await
+                .unwrap(),
+            0,
+            "{id}"
+        );
+        assert_eq!((res.tv_sec, res.tv_nsec), (0, nanos), "{id}");
     }
     for id in [
         thread_clock(NOBODY, 2),
         process_clock(NOBODY, 2),
+        // A reaped process names no clock, though a signal still names it.
+        process_clock(REAPED, 2),
         // Only clock_gettime takes the caller's thread id for its process.
         process_clock(CALLER, 2),
         thread_clock(0, 3),
     ] {
         assert_eq!(
-            errno(tool.handle_clock_getres(&mut guest, getres(id)).await),
+            errno(tool.handle_clock_getres(&mut guest, getres(id, None)).await),
             Errno::EINVAL,
             "{id}"
         );
@@ -486,6 +517,148 @@ async fn clock_nanosleep_refuses_the_callers_own_thread_clock() {
     );
 }
 
+fn cpu_sleep(id: i32, flags: i32, req: &Timespec) -> ClockNanosleep {
+    ClockNanosleep::new()
+        .with_clockid(ClockId::from_raw(id as _))
+        .with_flags(flags)
+        .with_req(Some(Addr::from_ptr(req as *const Timespec).unwrap()))
+        .with_rem(None)
+}
+
+/// A CPU-clock sleep returns at once where its deadline has been reached and
+/// is refused where it would have to wait: Linux ends it only when the
+/// clock's task has used the CPU time, and Detcore's sleeps count down on the
+/// virtual clock, which any process advances, so an unrelated process
+/// burning CPU would end it. None of these calls waits on the virtual clock
+/// (no sleep request reaches the scheduler).
+#[tokio::test]
+async fn a_cpu_clock_sleep_that_would_wait_is_refused() {
+    let (tool, mut guest, (sibling_user, sibling_system)) = setup();
+    let (caller_user, caller_system) = guest.thread.thread_cpu_time();
+    let process = caller_user + caller_system + sibling_user + sibling_system;
+    let at = |time: LogicalTime| Timespec {
+        tv_sec: (time.as_nanos() / 1_000_000_000) as i64,
+        tv_nsec: (time.as_nanos() % 1_000_000_000) as i64,
+    };
+    let zero = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let micro = Timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000,
+    };
+    let passed = at(process);
+    let future = at(process + LogicalTime::from_nanos(1_000));
+    for (id, flags, req) in [
+        (libc::CLOCK_PROCESS_CPUTIME_ID, 0, &zero),
+        (libc::CLOCK_PROCESS_CPUTIME_ID, libc::TIMER_ABSTIME, &passed),
+        (process_clock(PROCESS, 2), libc::TIMER_ABSTIME, &zero),
+        (thread_clock(SIBLING, 2), 0, &zero),
+        // A zero request arms nothing, so it returns at once even on a clock
+        // Detcore cannot read.
+        (process_clock(OTHER_PROCESS, 2), libc::TIMER_ABSTIME, &zero),
+        (process_clock(OTHER_PROCESS, 2), 0, &zero),
+    ] {
+        assert_eq!(
+            tool.handle_nanosleep_family(&mut guest, cpu_sleep(id, flags, req).into())
+                .await
+                .unwrap(),
+            0,
+            "{id} {flags}"
+        );
+    }
+    for (id, flags, req) in [
+        (libc::CLOCK_PROCESS_CPUTIME_ID, 0, &micro),
+        (libc::CLOCK_PROCESS_CPUTIME_ID, libc::TIMER_ABSTIME, &future),
+        (process_clock(0, 0), 0, &micro),
+        (thread_clock(SIBLING, 2), 0, &micro),
+        (
+            thread_clock(SIBLING, 2),
+            libc::TIMER_ABSTIME,
+            &at(sibling_user + sibling_system + LogicalTime::from_nanos(1)),
+        ),
+        (process_clock(OTHER_PROCESS, 2), 0, &micro),
+        (process_clock(OTHER_PROCESS, 2), libc::TIMER_ABSTIME, &micro),
+    ] {
+        assert_eq!(
+            errno(
+                tool.handle_nanosleep_family(&mut guest, cpu_sleep(id, flags, req).into())
+                    .await
+            ),
+            Errno::ENOSYS,
+            "{id} {flags}"
+        );
+    }
+    // A reaped process names no clock.
+    assert_eq!(
+        errno(
+            tool.handle_nanosleep_family(
+                &mut guest,
+                cpu_sleep(process_clock(REAPED, 2), 0, &micro).into()
+            )
+            .await
+        ),
+        Errno::EINVAL
+    );
+    assert!(
+        take_requests(&guest)
+            .iter()
+            .all(|name| *name == "process-of"),
+        "only membership questions, never a sleep"
+    );
+}
+
+async fn try_create_timer(
+    tool: &Detcore,
+    guest: &mut CpuClockGuest,
+    clock: i32,
+) -> Result<i32, Error> {
+    // SAFETY: `sigevent` is plain data, valid when zeroed.
+    let mut event: libc::sigevent = unsafe { std::mem::zeroed() };
+    event.sigev_notify = libc::SIGEV_NONE;
+    let mut id: libc::c_int = -1;
+    let call = TimerCreate::new()
+        .with_clockid(ClockId::from_raw(clock as _))
+        .with_sevp(Some(
+            AddrMut::from_ptr(&mut event as *mut libc::sigevent).unwrap(),
+        ))
+        .with_timerid(Some(
+            AddrMut::from_ptr(&mut id as *mut libc::c_int).unwrap(),
+        ));
+    tool.handle_timer_create(guest, call).await?;
+    Ok(id)
+}
+
+/// `timer_create` on a CPU clock checks the task the clock names, as
+/// `posix_cpu_timer_create` does: EINVAL for no such task, a reaped process,
+/// a thread of another process, or clock bits 3, and no timer is made.
+#[tokio::test]
+async fn timer_create_checks_the_task_a_cpu_clock_names() {
+    let (tool, mut guest, _) = setup();
+    for clock in [
+        thread_clock(NOBODY, 2),
+        process_clock(NOBODY, 2),
+        process_clock(REAPED, 0),
+        thread_clock(OTHER_PROCESS, 2),
+        process_clock(SIBLING, 2),
+    ] {
+        assert_eq!(
+            errno(try_create_timer(&tool, &mut guest, clock).await),
+            Errno::EINVAL,
+            "{clock}"
+        );
+    }
+    assert!(!guest.thread.posix_timers.lock().unwrap().contains(0));
+    // The caller's own thread clock is a valid timer clock, unlike a sleep's.
+    assert_eq!(
+        try_create_timer(&tool, &mut guest, thread_clock(CALLER, 2))
+            .await
+            .unwrap(),
+        0
+    );
+}
+
 async fn create_timer(tool: &Detcore, guest: &mut CpuClockGuest, clock: i32) -> i32 {
     // SAFETY: `sigevent` is plain data, valid when zeroed.
     let mut event: libc::sigevent = unsafe { std::mem::zeroed() };
@@ -503,50 +676,160 @@ async fn create_timer(tool: &Detcore, guest: &mut CpuClockGuest, clock: i32) -> 
     id
 }
 
-/// A timer created on a CPU clock keeps counting down on the virtual clock
-/// for a relative expiration; an absolute one, a CPU time of the task the
-/// timer was created for, is refused.
+/// An absolute expiration on a CPU-clock timer is a CPU time of the task the
+/// timer was created for. One that clock has already passed, with no reload,
+/// fires at once, as `posix_cpu_timer_set` fires it. One that would wait for
+/// CPU time still to come, or reload for more, is refused and arms nothing:
+/// Detcore's timers count down on the virtual clock, which an unrelated
+/// process would advance. The reading of another process's clock is refused
+/// too.
 #[tokio::test]
-async fn an_absolute_expiration_on_a_cpu_clock_timer_is_refused() {
-    let (tool, mut guest, _) = setup();
-    let mut cpu_timers = Vec::new();
-    for clock in [
-        libc::CLOCK_PROCESS_CPUTIME_ID,
-        libc::CLOCK_THREAD_CPUTIME_ID,
-        thread_clock(SIBLING, 2),
-        process_clock(PROCESS, 0),
+async fn an_absolute_cpu_timer_expiration_is_served_only_once_passed() {
+    let (tool, mut guest, (sibling_user, sibling_system)) = setup();
+    let (caller_user, caller_system) = guest.thread.thread_cpu_time();
+    let sibling = sibling_user + sibling_system;
+    let mut timers = Vec::new();
+    for (clock, reading) in [
+        (
+            libc::CLOCK_PROCESS_CPUTIME_ID,
+            caller_user + caller_system + sibling,
+        ),
+        (libc::CLOCK_THREAD_CPUTIME_ID, caller_user + caller_system),
+        (thread_clock(SIBLING, 2), sibling),
+        (process_clock(PROCESS, 1), caller_user + sibling_user),
     ] {
-        cpu_timers.push(create_timer(&tool, &mut guest, clock).await);
+        timers.push((create_timer(&tool, &mut guest, clock).await, reading));
     }
     let wall_timer = create_timer(&tool, &mut guest, libc::CLOCK_MONOTONIC).await;
+    let other = create_timer(&tool, &mut guest, process_clock(OTHER_PROCESS, 2)).await;
     {
-        let timers = guest.thread.posix_timers.lock().unwrap();
-        assert!(cpu_timers.iter().all(|id| timers.on_cpu_clock(*id)));
-        assert!(!timers.on_cpu_clock(wall_timer));
+        let posix = guest.thread.posix_timers.lock().unwrap();
+        assert!(timers.iter().all(|(id, _)| posix.cpu_clock(*id).is_some()));
+        assert!(posix.cpu_clock(wall_timer).is_none());
     }
-    let value = libc::itimerspec {
-        it_interval: libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        },
-        it_value: libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 5_000_000,
-        },
+    take_requests(&guest);
+    let now = LogicalTime::from_nanos(GUEST_CLOCK_NANOS);
+    let spec = |nanos: u64| libc::timespec {
+        tv_sec: (nanos / 1_000_000_000) as i64,
+        tv_nsec: (nanos % 1_000_000_000) as i64,
     };
-    for id in cpu_timers {
-        let call = TimerSettime::new()
+    let arm = |id: i32, value: &libc::itimerspec| {
+        TimerSettime::new()
             .with_timerid(id)
             .with_flags(libc::TIMER_ABSTIME)
+            .with_new_value(Some(
+                Addr::from_ptr(value as *const libc::itimerspec).unwrap(),
+            ))
+            .with_old_value(None)
+    };
+    for (id, reading) in timers {
+        // Passed, or reached exactly, with no reload: fires at once.
+        for expiration in [reading, LogicalTime::from_nanos(1)] {
+            let value = libc::itimerspec {
+                it_interval: spec(0),
+                it_value: spec(expiration.as_nanos()),
+            };
+            assert_eq!(
+                tool.handle_timer_settime(&mut guest, arm(id, &value))
+                    .await
+                    .unwrap(),
+                0,
+                "{id} {expiration:?}"
+            );
+            assert_eq!(
+                guest.thread.posix_timers.lock().unwrap().gettime(id, now),
+                Some((0, 0)),
+                "{id} {expiration:?}"
+            );
+        }
+        // Disarm, then try what would need CPU time still to come: nothing
+        // is armed.
+        let disarm = libc::itimerspec {
+            it_interval: spec(0),
+            it_value: spec(0),
+        };
+        tool.handle_timer_settime(&mut guest, arm(id, &disarm))
+            .await
+            .unwrap();
+        for (value, interval) in [
+            ((reading + LogicalTime::from_nanos(5_000_000)).as_nanos(), 0),
+            (reading.as_nanos(), 1_000_000),
+        ] {
+            let value = libc::itimerspec {
+                it_interval: spec(interval),
+                it_value: spec(value),
+            };
+            assert_eq!(
+                errno(tool.handle_timer_settime(&mut guest, arm(id, &value)).await),
+                Errno::ENOSYS,
+                "{id}"
+            );
+            assert_eq!(
+                guest.thread.posix_timers.lock().unwrap().gettime(id, now),
+                Some((0, 0)),
+                "{id}: a refused arming arms nothing"
+            );
+        }
+    }
+    let value = libc::itimerspec {
+        it_interval: spec(0),
+        it_value: spec(5_000_000),
+    };
+    assert_eq!(
+        errno(
+            tool.handle_timer_settime(&mut guest, arm(other, &value))
+                .await
+        ),
+        Errno::ENOSYS
+    );
+    // The clock reads the armings make, and, for a timer on another task's
+    // clock, whether that task is still there; never a timer registration.
+    assert!(
+        take_requests(&guest)
+            .iter()
+            .all(|name| *name == "global-time" || *name == "process-of")
+    );
+}
+
+/// `timer_settime` on a CPU-clock timer whose task is gone answers ESRCH,
+/// arming or disarming nothing, as `posix_cpu_timer_set` does once the task
+/// has been reaped: here a sibling thread that has exited since the timer was
+/// made, for an absolute, a relative and a disarming value alike.
+#[tokio::test]
+async fn timer_settime_on_a_timer_whose_thread_exited_is_esrch() {
+    let (tool, mut guest, _) = setup();
+    let id = create_timer(&tool, &mut guest, thread_clock(SIBLING, 2)).await;
+    guest
+        .sibling_exited
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for (flags, nanos) in [(libc::TIMER_ABSTIME, 5_000_000), (0, 5_000_000), (0, 0)] {
+        let value = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: nanos,
+            },
+        };
+        let call = TimerSettime::new()
+            .with_timerid(id)
+            .with_flags(flags)
             .with_new_value(Some(
                 Addr::from_ptr(&value as *const libc::itimerspec).unwrap(),
             ))
             .with_old_value(None);
         assert_eq!(
             errno(tool.handle_timer_settime(&mut guest, call).await),
-            Errno::ENOSYS,
-            "{id}"
+            Errno::ESRCH,
+            "{flags} {nanos}"
         );
     }
-    assert!(take_requests(&guest).is_empty());
+    let now = LogicalTime::from_nanos(GUEST_CLOCK_NANOS);
+    assert_eq!(
+        guest.thread.posix_timers.lock().unwrap().gettime(id, now),
+        Some((0, 0)),
+        "nothing was armed"
+    );
 }

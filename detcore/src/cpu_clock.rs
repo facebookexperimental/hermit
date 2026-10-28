@@ -27,20 +27,31 @@
 //! [`DetTime::user_cpu_time`]: crate::types::DetTime::user_cpu_time
 //! [`DetTime::system_cpu_time`]: crate::types::DetTime::system_cpu_time
 
+use std::time::Duration;
+
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls::Errno;
 use reverie::syscalls::Sysno;
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::record_or_replay::RecordOrReplay;
 use crate::scheduler::pid_namespaces::GuestPidAnswer;
 use crate::tool_local::Detcore;
+use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
+/// The tick of the kernel Detcore presents, `HZ`: the kernel's default
+/// (`default HZ_250`, kernel/Kconfig.hz:8 at v6.16). Detcore has no other use
+/// for a tick; it sets the resolution `clock_getres` reports for the PROF and
+/// VIRT clocks.
+const GUEST_KERNEL_HZ: u64 = 250;
+
 /// What a CPU clock measures: `CPUCLOCK_WHICH` (`cpu_clock_sample`,
 /// kernel/time/posix-cpu-timers.c:194-212 at v6.16).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum CpuClockKind {
     /// `CPUCLOCK_PROF`: user plus system time.
     Prof,
@@ -60,6 +71,18 @@ impl CpuClockKind {
         match self {
             Self::Virt => user,
             Self::Prof | Self::Sched => user + system,
+        }
+    }
+
+    /// The resolution `clock_getres` reports (`posix_cpu_clock_getres`,
+    /// kernel/time/posix-cpu-timers.c:160-176 at v6.16): 1 ns for SCHED, one
+    /// tick for PROF and VIRT, rounded up to whole nanoseconds.
+    pub(crate) fn resolution(self) -> Duration {
+        match self {
+            Self::Sched => Duration::from_nanos(1),
+            Self::Prof | Self::Virt => {
+                Duration::from_nanos(1_000_000_000_u64.div_ceil(GUEST_KERNEL_HZ))
+            }
         }
     }
 }
@@ -139,7 +162,7 @@ pub(crate) enum ClockTask {
     OwnProcess,
     /// Another live process, whose CPU accounting Detcore keeps in that
     /// process's own threads, out of the caller's reach.
-    OtherProcess,
+    OtherProcess(DetPid),
 }
 
 /// Which call looks the clock's task up. Only `clock_gettime` also takes the
@@ -151,6 +174,23 @@ pub(crate) enum ClockTask {
 pub(crate) enum ClockLookup {
     Read,
     Other,
+}
+
+/// Whose CPU time a POSIX timer on a CPU clock counts, by id, as
+/// `timer_create` found it: a thread of the timer's process (the creator
+/// itself or another), the process, or another process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum CpuTimerTask {
+    Thread(DetTid),
+    OwnProcess,
+    OtherProcess(DetPid),
+}
+
+/// The CPU clock a POSIX timer was created on ([`Detcore::cpu_timer_clock`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CpuTimerClock {
+    pub(crate) task: CpuTimerTask,
+    pub(crate) kind: CpuClockKind,
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -190,10 +230,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A thread's clock needs a thread of the caller's process
         // (`same_thread_group`, :77-80), and a process's clock a process's
         // id: a thread's id names its process for a signal, but not for a
-        // clock (`pid_has_task(pid, PIDTYPE_TGID)`, :91-94).
-        match crate::tool_global::signal_target_process(guest, named).await {
+        // clock (`pid_has_task(pid, PIDTYPE_TGID)`, :91-94). A process that
+        // has been reaped names nothing, though its leader's id still names
+        // it for a signal (`find_vpid`, :73-75): one scheduler query answers
+        // both (`Scheduler::cpu_clock_process`).
+        match crate::tool_global::cpu_clock_process(guest, named).await {
             Some(process) if thread && process == detpid => Ok(ClockTask::Sibling(named)),
-            Some(process) if !thread && process == named => Ok(ClockTask::OtherProcess),
+            Some(process) if !thread && process == named => Ok(ClockTask::OtherProcess(named)),
             _ => Err(Errno::EINVAL.into()),
         }
     }
@@ -243,6 +286,64 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.cpu_clock_reading(guest, sysno, task, clock.kind).await
     }
 
+    /// The task a timer `timer_create` makes on `clock` counts the CPU time
+    /// of, found as `posix_cpu_timer_create` finds it
+    /// (kernel/time/posix-cpu-timers.c:386-397 at v6.16): EINVAL for a clock
+    /// of no live task. It is kept with the timer, by its own id, since
+    /// another thread of the process may arm the timer later.
+    pub(crate) async fn cpu_timer_clock<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        clock: CpuClock,
+    ) -> Result<CpuTimerClock, Error> {
+        let task = match self
+            .cpu_clock_task(guest, Sysno::timer_create, clock.owner, ClockLookup::Other)
+            .await?
+        {
+            ClockTask::OwnThread => CpuTimerTask::Thread(guest.thread_state().dettid),
+            ClockTask::Sibling(thread) => CpuTimerTask::Thread(thread),
+            ClockTask::OwnProcess => CpuTimerTask::OwnProcess,
+            ClockTask::OtherProcess(process) => CpuTimerTask::OtherProcess(process),
+        };
+        Ok(CpuTimerClock {
+            task,
+            kind: clock.kind,
+        })
+    }
+
+    /// The task a timer on `clock` counts the CPU time of, for the calling
+    /// thread of the timer's process, when `timer_settime` arms or disarms it:
+    /// ESRCH once that task is gone, a thread that has exited or a process
+    /// that has been reaped (`posix_cpu_timer_set`,
+    /// kernel/time/posix-cpu-timers.c:634-643 at v6.16). The caller's own
+    /// thread and process are there; another task is asked about with one
+    /// scheduler query (`Scheduler::cpu_clock_process`).
+    pub(crate) async fn cpu_timer_task<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        clock: CpuTimerClock,
+    ) -> Result<ClockTask, Error> {
+        let detpid = guest.thread_state().detpid.expect("detpid unset");
+        match clock.task {
+            CpuTimerTask::Thread(thread) if thread == guest.thread_state().dettid => {
+                Ok(ClockTask::OwnThread)
+            }
+            CpuTimerTask::OwnProcess => Ok(ClockTask::OwnProcess),
+            CpuTimerTask::Thread(thread) => {
+                match crate::tool_global::cpu_clock_process(guest, thread).await {
+                    Some(process) if process == detpid => Ok(ClockTask::Sibling(thread)),
+                    _ => Err(Errno::ESRCH.into()),
+                }
+            }
+            CpuTimerTask::OtherProcess(process) => {
+                match crate::tool_global::cpu_clock_process(guest, process).await {
+                    Some(found) if found == process => Ok(ClockTask::OtherProcess(process)),
+                    _ => Err(Errno::ESRCH.into()),
+                }
+            }
+        }
+    }
+
     /// What a `kind` clock of `task` reads now: the calling thread's own CPU
     /// time or its process's, or a sibling thread's as of that thread's last
     /// accounting, which with threads sequentialized is where it last stopped
@@ -263,7 +364,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let process = guest.thread_state_mut().process_cpu_time();
                 (process.user, process.system)
             }
-            ClockTask::OtherProcess => {
+            ClockTask::OtherProcess(_) => {
                 return Err(self
                     .refuse_cpu_clock(
                         guest,
@@ -384,6 +485,15 @@ mod tests {
                 "{fd}"
             );
         }
+    }
+
+    /// `posix_cpu_clock_getres`: 1 ns for SCHED, one tick of a 250 Hz kernel
+    /// for PROF and VIRT.
+    #[test]
+    fn the_resolution_is_the_kernels_for_each_kind() {
+        assert_eq!(CpuClockKind::Sched.resolution(), Duration::from_nanos(1));
+        assert_eq!(CpuClockKind::Prof.resolution(), Duration::from_millis(4));
+        assert_eq!(CpuClockKind::Virt.resolution(), Duration::from_millis(4));
     }
 
     #[test]
