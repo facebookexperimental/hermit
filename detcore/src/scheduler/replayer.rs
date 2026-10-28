@@ -1990,7 +1990,7 @@ mod tests {
         let mut replayer = Replayer::new(schedule.clone());
         assert_eq!(
             replayer.observe_event(&schedule[0]),
-            ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
+            ReplayAction::Continue(Some(stop_after(123)))
         );
     }
 
