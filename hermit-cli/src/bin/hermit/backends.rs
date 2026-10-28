@@ -15,8 +15,7 @@
 //! production [`detcore::Detcore`] Tool over [`reverie_dbt::DbtGuest`].
 //!
 //! Generic SaBRe runs are coordinated by `libhermit` with the real Detcore
-//! plugin. This module retains the separate
-//! `hermit --backend sabre strace` diagnostic path.
+//! plugin.
 
 #[cfg(feature = "dbt")]
 use std::collections::BTreeMap;
@@ -26,9 +25,9 @@ use std::collections::BTreeSet;
 use std::env;
 #[cfg(feature = "dbt")]
 use std::ffi::OsStr;
-#[cfg(any(feature = "sabre", feature = "dbt"))]
+#[cfg(feature = "dbt")]
 use std::ffi::OsString;
-#[cfg(any(feature = "sabre", feature = "dbt"))]
+#[cfg(feature = "dbt")]
 use std::fs;
 #[cfg(feature = "dbt")]
 use std::io::IsTerminal as _;
@@ -46,14 +45,15 @@ use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 #[cfg(feature = "dbt")]
 use std::os::fd::FromRawFd;
-#[cfg(any(feature = "sabre", feature = "dbt"))]
+#[cfg(feature = "dbt")]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(any(feature = "dbt", test))]
 use std::os::unix::process::ExitStatusExt as _;
+#[cfg(feature = "dbt")]
 use std::path::Path;
 #[cfg(feature = "dbt")]
 use std::path::PathBuf;
-#[cfg(any(feature = "sabre", feature = "dbt"))]
+#[cfg(feature = "dbt")]
 use std::process::Command as StdCommand;
 #[cfg(any(feature = "dbt", test))]
 use std::process::Output;
@@ -66,7 +66,9 @@ use detcore::Config;
 use detcore_model::backend_engagement::BackendEngagement;
 #[cfg(feature = "dbt")]
 use detcore_model::backend_engagement::BackendEngagementReport;
+#[cfg(feature = "dbt")]
 use hermit::Error;
+#[cfg(any(feature = "dbt", test))]
 use hermit::ExitStatus;
 #[cfg(feature = "dbt")]
 use reverie::process::Bind;
@@ -82,7 +84,7 @@ use reverie_dbt::DbtStatsSink;
 use reverie_dbt::backend_stats::DbtBackendStatsSnapshot;
 #[cfg(feature = "dbt")]
 use reverie_dbt::backend_stats::DbtStatsCapture;
-#[cfg(any(feature = "sabre", feature = "dbt"))]
+#[cfg(feature = "dbt")]
 use tracing::metadata::LevelFilter;
 
 #[cfg(feature = "dbt")]
@@ -2167,128 +2169,6 @@ fn output_status(output: &Output) -> ExitStatus {
     ExitStatus::from_raw(output.status.into_raw())
 }
 
-#[cfg(feature = "sabre")]
-fn sabre_artifact(variable: &str, description: &str, executable: bool) -> Result<OsString, Error> {
-    let value = std::env::var_os(variable).ok_or_else(|| {
-        Error::msg(format!(
-            "the sabre backend needs {variable}=<path-to-{description}>"
-        ))
-    })?;
-    validate_sabre_artifact(Path::new(&value), variable, executable)
-}
-
-#[cfg(feature = "sabre")]
-fn validate_sabre_artifact(
-    requested_path: &Path,
-    variable: &str,
-    executable: bool,
-) -> Result<OsString, Error> {
-    let path = fs::canonicalize(requested_path).map_err(|error| {
-        Error::msg(format!(
-            "the sabre backend cannot access {variable}={}: {error}",
-            requested_path.display()
-        ))
-    })?;
-    let metadata = fs::metadata(&path).map_err(|error| {
-        Error::msg(format!(
-            "the sabre backend cannot inspect {variable}={}: {error}",
-            path.display()
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(Error::msg(format!(
-            "the sabre backend needs {variable}={} to be a regular file",
-            path.display()
-        )));
-    }
-    if executable && metadata.permissions().mode() & 0o111 == 0 {
-        return Err(Error::msg(format!(
-            "the sabre backend needs {variable}={} to be executable",
-            path.display()
-        )));
-    }
-    Ok(path.into_os_string())
-}
-
-#[cfg(feature = "sabre")]
-const SABRE_QUIET_ENV: &str = "REVERIE_SABRE_STRACE_QUIET";
-
-#[cfg(feature = "sabre")]
-fn sabre_command(
-    runner: &OsString,
-    sabre: &OsString,
-    plugin: &OsString,
-    program: &Path,
-    args: &[String],
-    quiet: bool,
-    log: Option<LevelFilter>,
-) -> StdCommand {
-    let mut command = StdCommand::new(runner);
-    command
-        .arg("--sabre")
-        .arg(sabre)
-        .arg("--plugin")
-        .arg(plugin)
-        .arg("--")
-        .arg(program)
-        .args(args);
-    if quiet {
-        command.env(SABRE_QUIET_ENV, "1");
-    }
-    if let Some(level) = log {
-        command.env("HERMIT_LOG", level.to_string());
-    }
-    command
-}
-
-#[cfg(feature = "sabre")]
-fn sabre_artifacts() -> Result<(OsString, OsString, OsString), Error> {
-    Ok((
-        sabre_artifact("HERMIT_SABRE_RUNNER", "reverie-sabre-strace", true)?,
-        sabre_artifact("HERMIT_SABRE_BINARY", "sabre", true)?,
-        sabre_artifact(
-            "HERMIT_SABRE_PLUGIN",
-            "libreverie_sabre_strace_plugin.so",
-            false,
-        )?,
-    ))
-}
-
-/// Runs program through the shared Reverie strace tool over SaBRe.
-///
-/// The SaBRe host and plugin live in the coordinated Reverie checkout, so
-/// Hermit uses explicit artifact paths rather than taking an unreleased Cargo
-/// dependency:
-///
-/// * HERMIT_SABRE_RUNNER: reverie-sabre-strace executable.
-/// * HERMIT_SABRE_BINARY: pinned SaBRe executable.
-/// * HERMIT_SABRE_PLUGIN: libreverie_sabre_strace_plugin.so.
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#589): Review SaBRe CLI backend dispatch.
-#[cfg(feature = "sabre")]
-pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, Error> {
-    let (runner, sabre, plugin) = sabre_artifacts()?;
-
-    eprintln!("hermit: [sabre backend] tracing {program:?} with the shared Reverie tool");
-
-    let status = sabre_command(&runner, &sabre, &plugin, program, args, false, None)
-        .status()
-        .map_err(|error| {
-            Error::msg(format!(
-                "failed to launch the SaBRe runner {}: {error}",
-                Path::new(&runner).display()
-            ))
-        })?;
-
-    Ok(status.into())
-}
-
-#[cfg(not(feature = "sabre"))]
-pub fn run_sabre_strace(_program: &Path, _args: &[String]) -> Result<ExitStatus, Error> {
-    hermit::Backend::Sabre.ensure_available()?;
-    unreachable!("SaBRe availability must fail when the feature is disabled");
-}
-
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "dbt")]
@@ -2325,21 +2205,6 @@ mod tests {
         std::fs::write(path.join(".dynamorio/true.2.1config64"), b"-client").unwrap();
         drop(dir);
         assert!(!path.exists());
-    }
-
-    #[cfg(not(feature = "sabre"))]
-    #[test]
-    fn disabled_sabre_strace_refuses_before_resolving_artifacts() {
-        let error = super::run_sabre_strace(
-            std::path::Path::new("/hermit-missing-disabled-sabre-program"),
-            &[],
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("the `sabre` feature is not enabled")
-        );
     }
 
     #[cfg(feature = "dbt")]
@@ -3897,20 +3762,6 @@ mod tests {
             prepared.get_args().collect::<Vec<_>>(),
             [interpreter.as_os_str(), script.as_os_str()]
         );
-    }
-
-    #[test]
-    #[cfg(feature = "sabre")]
-    fn sabre_artifact_returns_the_validated_absolute_path() {
-        let file = tempfile::NamedTempFile::new_in(".").unwrap();
-        let relative_path = file.path().file_name().unwrap();
-
-        let resolved = validate_sabre_artifact(Path::new(relative_path), "test-artifact", false)
-            .map(std::path::PathBuf::from)
-            .unwrap();
-
-        assert!(resolved.is_absolute());
-        assert_eq!(resolved, fs::canonicalize(file.path()).unwrap());
     }
 
     /// A guest killed by a signal must report as SIGNALLED, not as a normal exit.

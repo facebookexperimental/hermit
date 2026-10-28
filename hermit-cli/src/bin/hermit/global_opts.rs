@@ -104,8 +104,7 @@ pub struct GlobalOpts {
     /// Refused with exit 122, before any guest starts, where the guest could
     /// outlive hermit: --backend=dbt; --no-namespace with every backend,
     /// --gdbserver runs included, and so the trials of `analyze` and `bisect`
-    /// when their run arguments include --no-namespace; and `hermit
-    /// --backend=sabre strace`.
+    /// when their run arguments include --no-namespace.
     ///
     /// SIZE is a byte count with an optional K/M/G/T suffix in powers of 1024,
     /// e.g. 8G. Omit the flag for no cap.

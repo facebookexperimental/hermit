@@ -74,7 +74,6 @@ mod run;
 mod run_config;
 mod run_timeout;
 mod schedule_search;
-mod strace;
 mod tracing;
 mod verify;
 mod verify_inputs;
@@ -194,7 +193,6 @@ use self::record::RecordOpts;
 use self::replay::ReplayOpts;
 use self::run::GuestProgramFault;
 use self::run::RunOpts;
-use self::strace::StraceOpts;
 use self::verify::write_pending_verification_json;
 use self::version::Version;
 use self::version::VersionOpts;
@@ -428,10 +426,6 @@ enum Subcommand {
     #[clap(name = "run", trailing_var_arg = true)]
     Run(Box<RunOpts>),
 
-    /// Trace a program's syscalls through the selected backend.
-    #[clap(name = "strace")]
-    Strace(StraceOpts),
-
     /// Record the execution of a program (EXPERIMENTAL).
     #[clap(name = "record", trailing_var_arg = true)]
     Record(Box<RecordOpts>),
@@ -518,18 +512,14 @@ impl Subcommand {
         // analyze` ran its target trial on KVM). Before `run` lost its own `--backend`, this was spelled
         // `analyze --run-arg=--backend=kvm`.
         let runs_trials = matches!(self, Subcommand::Analyze(_) | Subcommand::Bisect(_));
-        if backend == Some(hermit::Backend::Sabre)
-            && !matches!(self, Subcommand::Strace(_) | Subcommand::Run(_))
-        {
-            // The predicate admits Strace AND Run, and `run` genuinely works --
+        if backend == Some(hermit::Backend::Sabre) && !matches!(self, Subcommand::Run(_)) {
+            // The predicate admits only Run, and `run` genuinely works --
             // measured 2026-08-06 on a 4-thread guest: `hermit --backend sabre run`
-            // exited 0 with the correct deterministic result. The message used to
-            // name only `strace`, so it told users a working path was unsupported
-            // and hid real backend maturity. Message and predicate are now derived
-            // from the same list; if the predicate changes, this text must too.
+            // exited 0 with the correct deterministic result. Message and
+            // predicate are derived from the same list; if the predicate
+            // changes, this text must too.
             anyhow::bail!(
-                "the SaBRe backend is available only through `hermit --backend sabre run` \
-                 and `hermit --backend sabre strace`"
+                "the SaBRe backend is available only through `hermit --backend sabre run`"
             );
         }
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -577,7 +567,6 @@ impl Subcommand {
     fn starts_guest(&self) -> bool {
         match self {
             Subcommand::Run(_)
-            | Subcommand::Strace(_)
             | Subcommand::Replay(_)
             | Subcommand::Analyze(_)
             | Subcommand::Bisect(_) => true,
@@ -658,7 +647,6 @@ impl Subcommand {
             Subcommand::HostCapabilities(x) => x.main(),
             Subcommand::Version(x) => x.main(),
             Subcommand::Run(x) => x.main(global),
-            Subcommand::Strace(x) => x.main(global),
             Subcommand::Record(x) => x.main(global),
             Subcommand::Replay(x) => x.main(global),
             Subcommand::List(x) => x.main(),
@@ -2855,36 +2843,65 @@ mod tests {
 
     /// The scope PREDICATE and the scope MESSAGE must name the same set.
     ///
-    /// They drifted apart: the predicate admitted `Strace | Run` while the text
-    /// said "only ... strace", so a working path was documented as unsupported.
-    /// Both directions are asserted, because either half alone is satisfiable by
-    /// a wrong fix -- narrowing the predicate to strace would pass a
-    /// message-only test, and leaving the message alone would pass a
-    /// predicate-only test.
+    /// They drifted apart once: the predicate admitted more than the text
+    /// said, so a working path was documented as unsupported. Both directions
+    /// are asserted, because either half alone is satisfiable by a wrong fix.
+    /// The separate `strace` subcommand was removed, so `run` is the only
+    /// SaBRe form and a top-level `strace` no longer parses.
     #[test]
-    fn sabre_scope_admits_exactly_run_and_strace() {
+    fn sabre_scope_admits_exactly_run() {
         use hermit::Backend;
 
-        // POSITIVE: both admitted subcommands must pass the scope guard.
-        for sub in ["run", "strace"] {
-            let args = Args::try_parse_from([
+        // POSITIVE: the admitted subcommand must pass the scope guard.
+        let args = Args::try_parse_from([
+            "hermit",
+            "--backend",
+            "sabre",
+            "run",
+            "--",
+            "/bin/echo",
+            "hi",
+        ])
+        .unwrap_or_else(|e| panic!("`--backend sabre run` should parse: {e}"));
+        assert_eq!(args.global.backend, Some(Backend::Sabre));
+        args.command
+            .validate_backend_scope(args.global.backend)
+            .unwrap_or_else(|e| panic!("`--backend sabre run` must be in scope: {e}"));
+
+        // The removed `strace` subcommand is not a subcommand any more, with or
+        // without a SaBRe backend.
+        assert!(
+            Args::command().find_subcommand("strace").is_none(),
+            "the command tree must not contain the removed `strace` subcommand"
+        );
+        for args in [
+            &["hermit", "strace", "--", "/bin/echo", "hi"][..],
+            &[
                 "hermit",
                 "--backend",
                 "sabre",
-                sub,
+                "strace",
                 "--",
                 "/bin/echo",
                 "hi",
-            ])
-            .unwrap_or_else(|e| panic!("`--backend sabre {sub}` should parse: {e}"));
-            assert_eq!(args.global.backend, Some(Backend::Sabre));
-            args.command
-                .validate_backend_scope(args.global.backend)
-                .unwrap_or_else(|e| panic!("`--backend sabre {sub}` must be in scope: {e}"));
+            ][..],
+        ] {
+            let error = Args::try_parse_from(args)
+                .expect_err("the removed `strace` subcommand must not parse");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::InvalidSubcommand,
+                "{args:?}: {error}"
+            );
+            assert_eq!(
+                error.get(clap::error::ContextKind::InvalidSubcommand),
+                Some(&clap::error::ContextValue::String("strace".to_owned())),
+                "{args:?}: {error}"
+            );
         }
 
         // NEGATIVE: something outside the set is still refused. Without this the
-        // guard could admit everything and still pass the positives above.
+        // guard could admit everything and still pass the positive above.
         let args = Args::try_parse_from([
             "hermit",
             "--backend",
@@ -2899,58 +2916,15 @@ mod tests {
             .validate_backend_scope(args.global.backend)
             .expect_err("`--backend sabre log-diff` must be rejected");
 
-        // And the refusal must NAME both supported forms. A message that omits
+        // And the refusal must NAME the supported form. A message that omits
         // `run` is the original defect: it sends a user away from a path that
-        // works.
+        // works. It must not name the removed `strace` subcommand.
         let text = err.to_string();
         assert!(text.contains("sabre run"), "message must name run: {text}");
         assert!(
-            text.contains("sabre strace"),
-            "message must name strace: {text}"
+            !text.contains("strace"),
+            "message must not name the removed strace subcommand: {text}"
         );
-    }
-
-    #[test]
-    fn sabre_strace_command_parses_in_requested_form() {
-        use hermit::Backend;
-
-        let args = Args::try_parse_from([
-            "hermit",
-            "--backend",
-            "sabre",
-            "strace",
-            "--",
-            "/bin/echo",
-            "hello",
-        ])
-        .expect("requested SaBRe strace form should parse");
-        assert_eq!(args.global.backend, Some(Backend::Sabre));
-        assert!(matches!(args.command, Subcommand::Strace(_)));
-    }
-
-    #[test]
-    fn sabre_strace_rejects_run_options_it_does_not_honor() {
-        for option in [
-            "--namespace-only",
-            "--verify",
-            "--strict",
-            "--env=SHOULD_NOT_BE_IGNORED=1",
-            "--workdir=/tmp",
-        ] {
-            let result = Args::try_parse_from([
-                "hermit",
-                "--backend",
-                "sabre",
-                "strace",
-                option,
-                "--",
-                "/bin/true",
-            ]);
-            assert!(
-                result.is_err(),
-                "SaBRe strace unexpectedly accepted unsupported option {option}"
-            );
-        }
     }
 
     #[test]

@@ -182,8 +182,8 @@ per-backend results is paused until that is consolidated. The target layout:
 - **One container.** Every guest launch should go through
   `launch_in_container` and `complete_container_config` in
   `hermit-cli/src/bin/hermit/`. All seven backends use it for `hermit run`
-  today. Record, replay, `--namespace-only`
-  and `sabre strace` still build their own containers and are to move onto it
+  today. Record, replay and `--namespace-only`
+  still build their own containers and are to move onto it
   (https://github.com/rrnewton/hermit/issues/4009).
 - **One in-guest runtime.** `reverie-inguest` owns the seccomp filter, the
   single `SIGSYS` handler, the dispatcher, the handler driver, the RPC client,

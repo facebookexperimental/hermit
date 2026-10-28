@@ -3759,23 +3759,6 @@ fn kvm_pinned_root_arguments_are_exact_and_fail_closed() {
         parser_args.map(OsStr::new)
     );
 
-    let strace_args = [
-        "--backend",
-        "sabre",
-        "--log",
-        "info",
-        "strace",
-        "--",
-        "/bin/true",
-    ];
-    let mut strace = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    append_hermit_args_with_execution_root(&mut strace, &strace_args, Some(OsStr::new("/test")))
-        .expect("strace does not accept the run execution-root options");
-    assert_eq!(
-        strace.get_args().collect::<Vec<_>>(),
-        strace_args.map(OsStr::new)
-    );
-
     for args in [
         ["record", "--verify", "--", "/bin/true"],
         ["record", "start", "--", "/bin/true"],
@@ -13969,22 +13952,7 @@ fn sabre_backend_validation_honors_command_scope() {
     assert_hermit_refusal_contains(
         &non_run,
         Refusal::Hermit,
-        &["SaBRe backend", "only through", "strace"],
-    );
-
-    let log = hermit(&[
-        "--backend",
-        "sabre",
-        "--log",
-        "info",
-        "strace",
-        "--",
-        "/bin/true",
-    ]);
-    assert_hermit_refusal_contains(
-        &log,
-        Refusal::Hermit,
-        &["does not support --log or --log-file"],
+        &["SaBRe backend", "only through", "--backend sabre run"],
     );
 }
 
@@ -20821,88 +20789,6 @@ fn max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime() {
                 assert!(out.contains(MARKER), "{without_flag:?}: {out} {err}");
             }
         }
-    }
-}
-
-/// `hermit --backend=sabre strace` does not go through `run`. It launches the
-/// SaBRe runner as a plain child of hermit, which no PID namespace,
-/// parent-death signal or ptrace attachment binds to hermit, and the trace
-/// reaches the inherited stderr without passing through hermit's charged
-/// writers. The cap could neither count that trace nor stop the guest, so
-/// hermit refuses the flag there with 122 (round-3 review of
-/// https://github.com/rrnewton/hermit/pull/3686, finding 6). The refusal comes
-/// before any SaBRe artifact is resolved: the HERMIT_SABRE_* variables are
-/// removed below, and resolving them first would fail with "the sabre backend
-/// needs HERMIT_SABRE_RUNNER" instead, in builds with and without SaBRe.
-///
-/// strace on any other backend is not refused. The M1 strace command runs only
-/// on SaBRe, so there it fails exactly as it does without the flag, by asking
-/// for `--backend sabre`, with the same status and the same stderr.
-#[test]
-fn max_log_bytes_is_refused_for_sabre_strace_and_leaves_other_strace_alone() {
-    let strace = |args: &[&str]| {
-        hermit_test::hermit_output(
-            "hermit run",
-            hermit_command(args)
-                .env_remove("HERMIT_LOG")
-                .env_remove("HERMIT_LOG_FILE")
-                .env_remove("HERMIT_SABRE_RUNNER")
-                .env_remove("HERMIT_SABRE_BINARY")
-                .env_remove("HERMIT_SABRE_PLUGIN")
-                .stdin(Stdio::null()),
-        )
-    };
-    let args = [
-        "--max-log-bytes=1M",
-        "--backend=sabre",
-        "strace",
-        "/bin/true",
-    ];
-    let refused = strace(&args);
-    let text = stderr(&refused);
-    assert_eq!(
-        refused.status.code(),
-        Some(HERMIT_POLICY_REFUSAL_EXIT),
-        "{args:?}: {refused:?}"
-    );
-    assert!(
-        text.contains(
-            "--max-log-bytes cannot be enforced with strace --backend=sabre: the SaBRe \
-             runner's trace output does not pass through hermit's charged writers, and the \
-             runner is a plain child of hermit with no PID namespace, parent-death signal or \
-             ptrace attachment binding it, so the cap could neither count the trace nor stop \
-             the guest; drop --max-log-bytes"
-        ),
-        "{args:?}: {text}"
-    );
-    assert!(
-        text.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
-        "{args:?}: {text}"
-    );
-
-    for backend in [None, Some("--backend=ptrace")] {
-        let plain: Vec<&str> = backend.into_iter().chain(["strace", "/bin/true"]).collect();
-        let capped: Vec<&str> = ["--max-log-bytes=1M"]
-            .into_iter()
-            .chain(plain.iter().copied())
-            .collect();
-        let without = strace(&plain);
-        let with = strace(&capped);
-        assert_ne!(
-            with.status.code(),
-            Some(HERMIT_POLICY_REFUSAL_EXIT),
-            "{capped:?}: {with:?}"
-        );
-        assert_eq!(
-            (with.status.code(), stderr(&with)),
-            (without.status.code(), stderr(&without)),
-            "{capped:?} must fail exactly as {plain:?} does"
-        );
-        assert!(
-            stderr(&with).contains("the M1 strace command requires `--backend sabre`"),
-            "{capped:?}: {}",
-            stderr(&with)
-        );
     }
 }
 

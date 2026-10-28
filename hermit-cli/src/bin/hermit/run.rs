@@ -6593,9 +6593,6 @@ impl RunOpts {
     ///   `--no-namespace` mode: every one of those containers asks for a
     ///   private PID namespace, and their GDB servers (`replay` and `record
     ///   start --verify-with-gdbex`) run inside it.
-    /// - `hermit --backend=sabre strace` starts no container: `StraceOpts::main`
-    ///   refuses the flag itself, and `strace` with any other backend fails
-    ///   before it starts anything.
     /// - `instruction-map` and `record list`, `remove` and `clean` charge their
     ///   tracing but run no guest. `version`, `host-capabilities`, `log-diff`
     ///   and `oci ls`, `inspect` and `pull` initialize no tracing at all.
