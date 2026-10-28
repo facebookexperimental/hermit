@@ -131,7 +131,51 @@ mod real_random {
         }
     }
 
+    /// Whether `test` must skip for want of a usable PMU timer: Reverie's own
+    /// validation, which the first preemption timer also runs. An error names
+    /// why retired-branch preemptions cannot fire here, so the required timer
+    /// event never could; that is not a product failure. A set requirement
+    /// hatch fails instead, for lanes that must cover the preemption.
+    fn skip_without_pmu(test: &str, verdict: Result<(), String>, required: bool) -> bool {
+        let Err(reason) = verdict else {
+            return false;
+        };
+        assert!(
+            !required,
+            "HERMIT_REQUIRE_PMU is set, but this host cannot deliver the PMU timer {test} needs: {reason}."
+        );
+        eprintln!(
+            "skipping {test}: this host cannot deliver the PMU timer it needs ({reason}); without retired-branch preemptions the required timer event can never fire, which is not a product failure."
+        );
+        true
+    }
+
+    fn pmu_unavailable(test: &str) -> bool {
+        skip_without_pmu(
+            test,
+            reverie_ptrace::pmu_validation().map_err(|error| format!("{error}")),
+            std::env::var_os("HERMIT_REQUIRE_PMU").is_some(),
+        )
+    }
+
+    #[test]
+    fn pmu_skip_runs_where_usable_and_honors_the_require_hatch() {
+        assert!(!skip_without_pmu("t", Ok(()), false));
+        assert!(!skip_without_pmu("t", Ok(()), true));
+        assert!(skip_without_pmu("t", Err("no counters".to_string()), false));
+        let failed =
+            std::panic::catch_unwind(|| skip_without_pmu("t", Err("no counters".to_string()), true))
+                .is_err();
+        assert!(
+            failed,
+            "HERMIT_REQUIRE_PMU must fail a test its host cannot run"
+        );
+    }
+
     pub(super) fn case(name: &str, fatal: bool, trace_diagnostics: bool, operation: Operation) {
+        if pmu_unavailable(name) {
+            return;
+        }
         if std::env::var("HERMIT_OWNER_TEST_ROLE").as_deref() == Ok(name) {
             isolated(name, || exercise(fatal, trace_diagnostics, operation));
             return;
