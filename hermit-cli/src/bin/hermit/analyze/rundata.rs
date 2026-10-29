@@ -3513,7 +3513,9 @@ mod tests {
                 trial.runopts.det_opts.det_config.replay_schedule_from,
                 Some(schedule.clone())
             );
-            options.write_trial_schedule(Vec::new(), &schedule).unwrap();
+            options
+                .write_trial_schedule_from(Vec::new(), &[], &schedule)
+                .unwrap();
             // As the check of the critical preemption builds its run.
             let check = RunData::new_baseline(&options, "verify".to_owned())
                 .unwrap()
