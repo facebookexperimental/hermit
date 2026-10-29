@@ -183,23 +183,21 @@ enum Continuation {
     MeetsTargetAlone,
     /// Replaying the whole schedule finished and missed the target.
     ReplayMisses,
-    /// Replaying the whole schedule did not finish (a bound or a refusal
-    /// stopped it).
-    ReplayUnfinished,
 }
 
-/// Check the two endpoint trials of a prefix search over `len` events.
+/// Check the two endpoint trials of a prefix search over `len` events, each
+/// a completed outcome: whether the trial met the target.
 fn check_continuation(
     len: usize,
-    mut trial: impl FnMut(usize) -> anyhow::Result<TrialEnd>,
+    mut trial: impl FnMut(usize) -> anyhow::Result<bool>,
 ) -> anyhow::Result<Continuation> {
-    if trial(0)? == TrialEnd::Met {
+    if trial(0)? {
         return Ok(Continuation::MeetsTargetAlone);
     }
-    Ok(match trial(len)? {
-        TrialEnd::Met => Continuation::Usable,
-        TrialEnd::Missed => Continuation::ReplayMisses,
-        TrialEnd::Unfinished(_) => Continuation::ReplayUnfinished,
+    Ok(if trial(len)? {
+        Continuation::Usable
+    } else {
+        Continuation::ReplayMisses
     })
 }
 
@@ -210,7 +208,7 @@ fn check_continuation(
 fn choose_continuation(
     candidates: &[MaybeTimeslice],
     len: usize,
-    mut trial: impl FnMut(usize, MaybeTimeslice) -> anyhow::Result<TrialEnd>,
+    mut trial: impl FnMut(usize, MaybeTimeslice) -> anyhow::Result<bool>,
 ) -> anyhow::Result<MaybeTimeslice> {
     let mut outcomes = Vec::new();
     for &timeslice in candidates {
@@ -243,16 +241,8 @@ fn choose_continuation(
             alone.join(" and ")
         );
     }
-    let remedy = if outcomes
-        .iter()
-        .any(|(_, outcome)| *outcome == Continuation::ReplayUnfinished)
-    {
-        "A replay that did not finish was ended by a bound (raise --trial-timeout) or refused \
-         by Hermit (its reason is in its log)."
-    } else {
-        "Schedule replay does not reproduce this run where replaying the whole target schedule \
-         misses the target; check that the target run replays (--selfcheck)."
-    };
+    let remedy = "Schedule replay does not reproduce this run where replaying the whole target \
+                  schedule misses the target; check that the target run replays (--selfcheck).";
     bail!(
         "no continuation allows a prefix search: {}. {remedy} The default search with a \
          passing --run2-seed needs no continuation.",
@@ -283,9 +273,6 @@ fn describe_outcome(outcome: Continuation) -> &'static str {
             "the scheduler alone, replaying none of the target schedule, meets the target"
         }
         Continuation::ReplayMisses => "replaying the whole target schedule misses the target",
-        Continuation::ReplayUnfinished => {
-            "replaying the whole target schedule did not finish (a bound or a refusal stopped it)"
-        }
     }
 }
 
@@ -526,25 +513,20 @@ impl AnalyzeOpts {
     ) -> anyhow::Result<PrefixDecision> {
         let target = target_record.schedevents();
         let mut trial = 0;
-        let mut meets_target =
-            |len: usize, continuation: MaybeTimeslice| -> anyhow::Result<TrialEnd> {
-                trial += 1;
-                let is_match = launch(trial, len, continuation)?;
-                eprintln!(
-                    ":: Prefix of {len} of {} events => {}",
-                    target.len(),
-                    if is_match {
-                        format!("target condition ({})", self.display_criteria())
-                    } else {
-                        "baseline condition".to_string()
-                    }
-                );
-                Ok(if is_match {
-                    TrialEnd::Met
+        let mut meets_target = |len: usize, continuation: MaybeTimeslice| -> anyhow::Result<bool> {
+            trial += 1;
+            let is_match = launch(trial, len, continuation)?;
+            eprintln!(
+                ":: Prefix of {len} of {} events => {}",
+                target.len(),
+                if is_match {
+                    format!("target condition ({})", self.display_criteria())
                 } else {
-                    TrialEnd::Missed
-                })
-            };
+                    "baseline condition".to_string()
+                }
+            );
+            Ok(is_match)
+        };
 
         let candidates = match self.continuation_timeslice {
             ContinuationTimeslice::Auto => continuation_candidates(self.trial_max_timeslice()),
@@ -555,7 +537,7 @@ impl AnalyzeOpts {
             ":: Searching the prefixes continued without chaos {}",
             describe_continuation(continuation)
         );
-        let mut meets_target = |len| Ok(meets_target(len, continuation)? == TrialEnd::Met);
+        let mut meets_target = |len| meets_target(len, continuation);
         let passing = search_prefix_boundary(target.len(), &mut meets_target)?;
         let failing = passing + 1;
         // On a host whose branch counter is not exact, two replays of one
@@ -2602,20 +2584,18 @@ mod tests {
 
     /// The search continues at the first timeslice whose endpoint trials
     /// differ: one at which the scheduler alone meets the target, or the
-    /// whole schedule's replay misses it or does not finish, is skipped. When
-    /// every timeslice fails, the error names each, says what it showed, and
-    /// what to do.
+    /// whole schedule's replay misses it, is skipped. When every timeslice
+    /// fails, the error names each, says what it showed, and what to do.
     #[test]
     fn the_prefix_search_continues_at_the_first_usable_timeslice() {
         let ns = |nanos: u64| NonZeroU64::new(nanos);
         let candidates = [ns(1_000), ns(200_000_000)];
-        let end = |met: bool| if met { TrialEnd::Met } else { TrialEnd::Missed };
         // At 1000 ns the scheduler alone already meets the target (a race
         // found only at a short timeslice); at 200 ms it does not.
         let mut trials = Vec::new();
         let chosen = choose_continuation(&candidates, 50, |prefix, timeslice| {
             trials.push((prefix, timeslice));
-            Ok(end(prefix > 0 || timeslice == ns(1_000)))
+            Ok(prefix > 0 || timeslice == ns(1_000))
         })
         .unwrap();
         assert_eq!(chosen, ns(200_000_000));
@@ -2624,12 +2604,12 @@ mod tests {
             [(0, ns(1_000)), (0, ns(200_000_000)), (50, ns(200_000_000))]
         );
         assert_eq!(
-            choose_continuation(&candidates, 50, |prefix, _| Ok(end(prefix > 0))).unwrap(),
+            choose_continuation(&candidates, 50, |prefix, _| Ok(prefix > 0)).unwrap(),
             ns(1_000),
             "the first usable one wins"
         );
 
-        let alone = choose_continuation(&candidates, 50, |_, _| Ok(TrialEnd::Met)).unwrap_err();
+        let alone = choose_continuation(&candidates, 50, |_, _| Ok(true)).unwrap_err();
         let message = alone.to_string();
         assert!(
             message.contains("the scheduler alone already meets the target criteria at a 1000 ns timeslice and at a 200000000 ns timeslice"),
@@ -2639,7 +2619,7 @@ mod tests {
             message.contains("prefix_round_001.repro") && message.contains("--run2-seed"),
             "{message}"
         );
-        let replay = choose_continuation(&candidates, 50, |_, _| Ok(TrialEnd::Missed)).unwrap_err();
+        let replay = choose_continuation(&candidates, 50, |_, _| Ok(false)).unwrap_err();
         assert!(
             replay.to_string().contains(
                 "at a 1000 ns timeslice replaying the whole target schedule misses the target"
@@ -2647,21 +2627,6 @@ mod tests {
             "{replay}"
         );
         assert!(replay.to_string().contains("--selfcheck"), "{replay}");
-        let unfinished = choose_continuation(&candidates, 50, |prefix, _| {
-            Ok(if prefix == 0 {
-                TrialEnd::Missed
-            } else {
-                TrialEnd::Unfinished(Stop::Bound)
-            })
-        })
-        .unwrap_err();
-        assert!(
-            unfinished
-                .to_string()
-                .contains("did not finish (a bound or a refusal stopped it)")
-                && unfinished.to_string().contains("raise --trial-timeout"),
-            "{unfinished}"
-        );
     }
 
     #[test]
