@@ -5296,24 +5296,19 @@ impl Scheduler {
         // A replay that leaves `--sleep-registration` unset registers queued
         // sleeps as its record says (a record that does not say, older or
         // written by a `when-chosen` run, by default race search, registered
-        // them when chosen); any
-        // other run as `Config::queued_sleeps_registered_at_first_pass` says.
-        // `hermit run` has refused an explicit value that disagrees with the
-        // record.
-        let replayed_record = cfg
-            .replay_schedule_from
-            .as_ref()
-            .or(cfg.replay_preemptions_from.as_ref());
-        let queued_sleeps_registered_at_first_pass = match replayed_record {
-            Some(path) if cfg.sleep_registration.is_none() && !cfg.recordreplay_modes => {
-                crate::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(path)
-                    // A file that cannot be read fails the replay's own
-                    // loader: the schedule's just above, the preemptions'
-                    // in `tool_global` right after this.
-                    .unwrap_or(false)
-            }
-            _ => cfg.queued_sleeps_registered_at_first_pass(),
-        };
+        // them when chosen); any other run as
+        // `Config::queued_sleeps_registered_at_first_pass` says. `hermit run`
+        // has refused an explicit value that disagrees with the record
+        // (`preemptions::requests_first_pass_sleep_registration`). And only
+        // where the scheduler reads a sleeper's signal state: elsewhere a
+        // parked sleep would be ended by any signal the scheduler sends it,
+        // including one Linux ignores or the sleeper blocks, so a sleep is
+        // registered when chosen there whatever the rule. Hermit refuses such
+        // a launch before the guest starts; for any other caller the record
+        // still states what this scheduler does.
+        let queued_sleeps_registered_at_first_pass =
+            crate::preemptions::requests_first_pass_sleep_registration(cfg)
+                && cfg.reads_sleeper_signal_state();
         // The strict verifier explicitly selects the complete protocol. Ordinary
         // producers and the recovery/editor path keep the legacy representation.
         let boundaries = cfg.strict_schedule_boundaries;
@@ -30881,6 +30876,112 @@ mod test {
         assert!(scheduler.run_queue.contains_tid(worker));
     }
 
+    /// First-pass registration applies only where the guest's signal state can
+    /// be read: with neither modeled signal targets nor the in-guest gate, a
+    /// queued plain sleep stays queued at the first pass instead of parking
+    /// where a signal could only wake it unclassified, also when the rule asks
+    /// for the first pass (hermit refuses that launch; a library caller gets
+    /// registration when chosen). With either, it registers.
+    #[test]
+    fn first_pass_registration_needs_a_readable_signal_state() {
+        use crate::config::SleepRegistration;
+        let unreadable = |sleep_registration| Config {
+            sequentialize_threads: true,
+            sleep_registration,
+            ..Config::default()
+        };
+        let gated = Config {
+            in_guest_signal_delivery: true,
+            ..unreadable(None)
+        };
+        for (case, config, registers) in [
+            ("default", unreadable(None), false),
+            (
+                "first-pass asked for",
+                unreadable(Some(SleepRegistration::FirstPass)),
+                false,
+            ),
+            ("modeled targets", first_pass_config(), true),
+            ("in-guest gate", gated, true),
+        ] {
+            let mut scheduler = Scheduler::new(&config);
+            assert_eq!(
+                scheduler.queued_sleeps_registered_at_first_pass, registers,
+                "{case}"
+            );
+            let sleeper = DetTid::from_raw(5);
+            queue_request(
+                &mut scheduler,
+                sleeper,
+                sleep_request(sleeper, LogicalTime::from_nanos(7_000)),
+            );
+            scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+            scheduler.step2_register_queued_sleeps();
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+                registers.then_some(LogicalTime::from_nanos(7_000)),
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.run_queue.contains_tid(sleeper),
+                !registers,
+                "{case}"
+            );
+        }
+    }
+
+    /// A run's record states how its queued sleeps were registered, which is
+    /// what the scheduler does: on a backend that reads no sleeper's signal
+    /// state, by default or when the first pass is asked for, a sleep is
+    /// registered when chosen and the record says so; where the state is read,
+    /// at the first pass, and the record says that.
+    #[test]
+    fn a_record_says_how_its_queued_sleeps_were_registered() {
+        use crate::config::SleepRegistration;
+        let dbt = |sleep_registration| Config {
+            sequentialize_threads: true,
+            backend: BackendCapabilities::DBT,
+            record_preemptions: true,
+            sleep_registration,
+            ..Config::default()
+        };
+        let readable = Config {
+            record_preemptions: true,
+            ..first_pass_config()
+        };
+        for (case, config, registers) in [
+            ("DBT, default", dbt(None), false),
+            (
+                "DBT, first-pass asked for",
+                dbt(Some(SleepRegistration::FirstPass)),
+                false,
+            ),
+            ("ptrace-like, default", readable, true),
+        ] {
+            let mut scheduler = Scheduler::new(&config);
+            let sleeper = DetTid::from_raw(5);
+            queue_request(
+                &mut scheduler,
+                sleeper,
+                sleep_request(sleeper, LogicalTime::from_nanos(7_000)),
+            );
+            scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+            scheduler.step2_register_queued_sleeps();
+            let registered = scheduler
+                .blocked
+                .timed_waiters
+                .thread_deadline(sleeper)
+                .is_some();
+            assert_eq!(registered, registers, "{case}");
+            let written = scheduler.preemption_writer.take().unwrap().into_string();
+            assert_eq!(
+                written.contains("\"queued_sleeps_registered_at_first_pass\":true"),
+                registers,
+                "{case}: {written}"
+            );
+        }
+    }
+
     /// A configuration under which queued sleeps register at the first pass
     /// by default: serialized threads on a backend whose kernel signal targets
     /// the scheduler predicts, as a prepared ptrace run has
@@ -31004,7 +31105,7 @@ mod test {
                     chaos,
                     replay_schedule_from: schedule.then(|| path.clone()),
                     replay_preemptions_from: (!schedule).then(|| path.clone()),
-                    ..Default::default()
+                    ..first_pass_config()
                 };
                 assert_eq!(
                     Scheduler::new(&config).queued_sleeps_registered_at_first_pass,
@@ -31026,7 +31127,7 @@ mod test {
                     chaos: true,
                     sleep_registration: Some(registration),
                     replay_schedule_from: replay.clone(),
-                    ..Default::default()
+                    ..first_pass_config()
                 };
                 assert_eq!(
                     Scheduler::new(&config).queued_sleeps_registered_at_first_pass,
@@ -31040,7 +31141,7 @@ mod test {
             chaos: true,
             replay_schedule_from: Some(path.clone()),
             record_preemptions: true,
-            ..Default::default()
+            ..first_pass_config()
         };
         let scheduler = Scheduler::new(&replaying_recorder);
         assert!(scheduler.queued_sleeps_registered_at_first_pass);
@@ -31054,7 +31155,7 @@ mod test {
         // A heuristic that does not select by priority is race search too.
         let random = Config {
             sched_heuristic: crate::config::SchedHeuristic::Random,
-            ..Default::default()
+            ..first_pass_config()
         };
         assert!(!Scheduler::new(&random).queued_sleeps_registered_at_first_pass);
         for chaos in [false, true] {

@@ -6147,6 +6147,15 @@ fn child_wait_cross_signal_rejects_conflicting_ownership_before_rewrite() {
 }
 
 /// A scheduler for `backend` with sequentialized threads set as given.
+/// KVM's capabilities with a synthetic report of the guest's signal state
+/// (production KVM reports none), under which the scheduler registers queued
+/// sleeps at the first pass (`Config::reads_sleeper_signal_state`).
+fn kvm_reading_signal_state() -> BackendCapabilities {
+    let mut backend = BackendCapabilities::KVM;
+    backend.kernel_signal_targets_are_predictable = true;
+    backend
+}
+
 fn scheduler_for(backend: BackendCapabilities, sequentialize_threads: bool) -> Scheduler {
     Scheduler::new(&Config {
         sequentialize_threads,
@@ -6329,14 +6338,10 @@ fn backends_without_signal_control_never_enter_the_controlled_loop() {
 fn the_controlled_loop_registers_a_queued_sleep() {
     use futures::FutureExt;
 
-    // Asked for: on KVM the scheduler reads no sleeper's signal state, so
-    // first-pass registration is not the default there.
-    let mut s = Scheduler::new(&Config {
-        sequentialize_threads: true,
-        backend: BackendCapabilities::KVM,
-        sleep_registration: Some(detcore_model::config::SleepRegistration::FirstPass),
-        ..Config::default()
-    });
+    // Synthetic: model a backend that reports the guest's signal state
+    // (production KVM does not set this field), so first-pass registration
+    // applies in the controlled loop (`Config::reads_sleeper_signal_state`).
+    let mut s = scheduler_for(kvm_reading_signal_state(), true);
     s.install_signal_control(
         Some(BackendSignalControl {
             process: Arc::new(Backend::default()),
@@ -6380,12 +6385,10 @@ fn the_controlled_loop_registers_a_queued_sleep() {
 /// (https://github.com/rrnewton/hermit/pull/4682).
 #[test]
 fn the_controlled_loop_refresh_registers_a_sleep_filed_during_maintenance() {
-    let mut s = Scheduler::new(&Config {
-        sequentialize_threads: true,
-        backend: BackendCapabilities::KVM,
-        sleep_registration: Some(detcore_model::config::SleepRegistration::FirstPass),
-        ..Config::default()
-    });
+    // Synthetic: model a backend that reports the guest's signal state
+    // (production KVM does not set this field), so first-pass registration
+    // applies in the controlled loop (`Config::reads_sleeper_signal_state`).
+    let mut s = scheduler_for(kvm_reading_signal_state(), true);
     s.install_signal_control(
         Some(BackendSignalControl {
             process: Arc::new(Backend::default()),
@@ -6436,12 +6439,10 @@ fn the_controlled_loop_refresh_registers_a_sleep_filed_during_maintenance() {
 fn the_controlled_loop_registers_a_sleep_its_drain_admits() {
     use futures::FutureExt;
 
-    let mut s = Scheduler::new(&Config {
-        sequentialize_threads: true,
-        backend: BackendCapabilities::KVM,
-        sleep_registration: Some(detcore_model::config::SleepRegistration::FirstPass),
-        ..Config::default()
-    });
+    // Synthetic: model a backend that reports the guest's signal state
+    // (production KVM does not set this field), so first-pass registration
+    // applies in the controlled loop (`Config::reads_sleeper_signal_state`).
+    let mut s = scheduler_for(kvm_reading_signal_state(), true);
     s.install_signal_control(
         Some(BackendSignalControl {
             process: Arc::new(Backend::default()),

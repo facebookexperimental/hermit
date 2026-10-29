@@ -3233,6 +3233,28 @@ pub fn read_recorded_queued_sleeps_registered_at_first_pass(path: &Path) -> Resu
         .queued_sleeps_registered_at_first_pass)
 }
 
+/// Whether `config` asks for queued sleeps to be registered at the first
+/// pass, before the backend's limit: a replay that leaves
+/// `--sleep-registration` unset takes its record's rule (a record that cannot
+/// be read counts as `when-chosen`; the replay's own loader fails on it), and
+/// any other run `Config::queued_sleeps_registered_at_first_pass`.
+/// `Scheduler::new` registers at the first pass only when this holds and the
+/// scheduler reads a sleeper's signal state
+/// (`Config::reads_sleeper_signal_state`), and hermit refuses a launch where
+/// this holds and that does not, before the guest starts.
+pub fn requests_first_pass_sleep_registration(config: &crate::config::Config) -> bool {
+    let replayed = config
+        .replay_schedule_from
+        .as_ref()
+        .or(config.replay_preemptions_from.as_ref());
+    match replayed {
+        Some(path) if config.sleep_registration.is_none() && !config.recordreplay_modes => {
+            read_recorded_queued_sleeps_registered_at_first_pass(path).unwrap_or(false)
+        }
+        _ => config.queued_sleeps_registered_at_first_pass(),
+    }
+}
+
 /// The refusal of a replay whose explicit `--sleep-registration` differs from
 /// the rule a record states (`recorded_first_pass`, as
 /// [`read_recorded_queued_sleeps_registered_at_first_pass`] reads it), naming

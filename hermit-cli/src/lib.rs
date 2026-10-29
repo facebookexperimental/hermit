@@ -69,6 +69,7 @@ mod chosen_input_tests;
 pub mod physical_exit_watch;
 pub mod preemption_admission;
 pub mod proc_mount;
+pub mod sleep_registration_admission;
 
 /// Re-runs the named test alone in a fresh process of this test binary and
 /// requires it to pass; returns false in that fresh process so the caller
@@ -3588,10 +3589,19 @@ pub fn prepare_backend_config_with_capabilities(
 /// the route's own comparison gates any change), so the in-guest runtime's
 /// reserved-signal set stays empty here whatever `config` carried; only the
 /// default route sets it (`in_guest_reserved_signals`).
-pub fn prepare_in_guest_loader_route_config(config: DetConfig) -> DetConfig {
+///
+/// The route launches this configuration directly, not through the
+/// dispatchers, and never takes the in-guest delivery gate, so the scheduler
+/// reads no sleeper's signal state on it: first-pass sleep registration, asked
+/// for or taken from a replayed record, is refused here by name
+/// (`sleep_registration_admission`), before anything is launched.
+pub fn prepare_in_guest_loader_route_config(
+    config: DetConfig,
+) -> Result<DetConfig, sleep_registration_admission::UnreadableSleeperSignalState> {
     let mut config = prepare_backend_config(config, Backend::InGuestTrap);
     config.in_guest_site_patching_off = true;
-    config
+    sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
+    Ok(config)
 }
 
 /// Whether the guest may start with a terminal, which can make Linux send the
@@ -3973,6 +3983,12 @@ async fn dispatch_backend(
     // Do this while the actual Tool type is available, before a DBT/SaBRe
     // launcher erases it to GlobalTool or constructs an RPC server.
     <detcore::Detcore as reverie::Tool>::facility_admission(&config)?;
+    // An in-guest LiteInst backend decides its delivery gate below, from the
+    // final configuration; every other backend's prepared configuration is
+    // already final.
+    if !backend.is_in_guest_liteinst() {
+        crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
+    }
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return Ok(run_kvm(
@@ -4020,6 +4036,7 @@ async fn dispatch_backend(
                         scheduler_owns_guest_pid_namespace(),
                     ),
             );
+            crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (exit_status, mut global_state, dispatch_stats, process_reports) =
@@ -4346,6 +4363,12 @@ async fn dispatch_output_backend(
     crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
     detcore::preemptions::validate_config_replay_inputs(&config)?;
     <detcore::Detcore as reverie::Tool>::facility_admission(&config)?;
+    // An in-guest LiteInst backend decides its delivery gate below, from the
+    // final configuration; every other backend's prepared configuration is
+    // already final.
+    if !backend.is_in_guest_liteinst() {
+        crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
+    }
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return run_kvm(
@@ -4392,6 +4415,7 @@ async fn dispatch_output_backend(
                         scheduler_owns_guest_pid_namespace(),
                     ),
             );
+            crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (output, mut global_state, dispatch_stats, process_reports) =
@@ -6505,7 +6529,8 @@ mod tests {
                 "{backend:?}"
             );
         }
-        let loader = prepare_in_guest_loader_route_config(poisoned);
+        let loader = prepare_in_guest_loader_route_config(poisoned)
+            .expect("the loader route admits this configuration");
         assert_eq!(loader.in_guest_reserved_signals, 0);
         assert!(loader.in_guest_site_patching_off);
         assert_eq!(loader.backend, backend_capabilities(Backend::InGuestTrap));
@@ -6536,7 +6561,8 @@ mod tests {
                 "{backend:?}"
             );
         }
-        let loader = prepare_in_guest_loader_route_config(poisoned);
+        let loader = prepare_in_guest_loader_route_config(poisoned)
+            .expect("the loader route admits this configuration");
         assert!(!loader.in_guest_refuses_host_timed_producers);
         assert!(loader.in_guest_site_patching_off);
     }
@@ -6578,10 +6604,68 @@ mod tests {
             let prepared = prepare_backend_config(poisoned.clone(), backend);
             assert!(!prepared.in_guest_signal_delivery, "{backend:?}");
         }
-        let loader = prepare_in_guest_loader_route_config(poisoned);
+        let loader = prepare_in_guest_loader_route_config(poisoned)
+            .expect("the loader route admits this configuration");
         assert!(!loader.in_guest_signal_delivery);
         assert!(loader.in_guest_site_patching_off);
         assert_eq!(loader.backend, backend_capabilities(Backend::InGuestTrap));
+    }
+
+    /// The loader route launches its configuration directly and never takes
+    /// the in-guest delivery gate, so the scheduler reads no sleeper's signal
+    /// state on it. Its preparation refuses first-pass sleep registration by
+    /// name, asked for or taken from a replayed record, before anything is
+    /// launched; the default and `when-chosen` are admitted and register
+    /// sleeps when chosen.
+    #[test]
+    fn the_loader_route_refuses_first_pass_sleep_registration_before_launch() {
+        use detcore_model::config::SleepRegistration;
+        let base = DetConfig {
+            sequentialize_threads: true,
+            ..DetConfig::default()
+        };
+        for registration in [None, Some(SleepRegistration::WhenChosen)] {
+            let prepared = prepare_in_guest_loader_route_config(DetConfig {
+                sleep_registration: registration,
+                ..base.clone()
+            })
+            .expect("the loader route admits registration when chosen");
+            assert!(!prepared.reads_sleeper_signal_state(), "{registration:?}");
+            assert!(
+                !prepared.queued_sleeps_registered_at_first_pass(),
+                "{registration:?}"
+            );
+        }
+        let refusal = prepare_in_guest_loader_route_config(DetConfig {
+            sleep_registration: Some(SleepRegistration::FirstPass),
+            ..base.clone()
+        })
+        .expect_err("an explicit first-pass on the loader route")
+        .to_string();
+        assert!(
+            refusal.starts_with(
+                "unreadable_sleeper_signal_state: --sleep-registration=first-pass registers"
+            ),
+            "{refusal}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("first-pass-record.json");
+        let record = detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .with_queued_sleeps_registered_at_first_pass(true);
+        std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+        let refusal = prepare_in_guest_loader_route_config(DetConfig {
+            replay_schedule_from: Some(path.clone()),
+            ..base.clone()
+        })
+        .expect_err("an unset replay of a first-pass record on the loader route")
+        .to_string();
+        assert!(
+            refusal.contains(&format!(
+                "unreadable_sleeper_signal_state: the record of --replay-schedule-from {}",
+                path.display()
+            )),
+            "{refusal}"
+        );
     }
 
     /// D35's gate holds only for an in-guest backend with site patching off,

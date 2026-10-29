@@ -1147,7 +1147,12 @@ pub struct Config {
     /// when its thread is chosen before its deadline, so a sleeper behind threads of better
     /// priority wakes later. Unset, `when-chosen` under `--chaos` or a `--sched-heuristic` that
     /// does not select by priority, where those late wakes are what real sleep-ordered races
-    /// depend on, and `first-pass` otherwise. A replay of a schedule or of preemptions that
+    /// depend on, and on a backend whose sleepers' signal mask and dispositions the scheduler
+    /// does not read (DBT, SaBRe and LiteInst without the in-guest delivery gate, KVM), and
+    /// `first-pass` otherwise. On such a backend a sleep parked at the first pass would be ended
+    /// by any signal the scheduler sends it, including one Linux ignores or the sleeper blocks,
+    /// so `first-pass` there, asked for or taken from a record, is refused by name before the
+    /// guest starts. A replay of a schedule or of preemptions that
     /// leaves this unset takes the value its record stores (a record that stores none, written
     /// before the option existed or by a `when-chosen` run, registered sleeps when chosen), and an
     /// explicit value that disagrees with the record is refused. `hermit analyze` and `hermit
@@ -1703,6 +1708,17 @@ impl Config {
         self.sequentialize_threads && self.backend.kernel_signal_targets_are_predictable
     }
 
+    /// Whether the scheduler reads a sleeper's signal mask and dispositions
+    /// (`Scheduler::signal_sleep`): where it models the kernel's signal targets
+    /// (`models_signal_targets`), or under the in-guest delivery gate. Elsewhere
+    /// (DBT, SaBRe and LiteInst without the gate, KVM) a sleep parked as a
+    /// timed waiter is woken by any signal the scheduler sends it, including a
+    /// default-ignored `SIGCHLD` or a signal the sleeper blocks, which Linux
+    /// never lets end a sleep.
+    pub fn reads_sleeper_signal_state(&self) -> bool {
+        self.models_signal_targets() || self.in_guest_signal_delivery
+    }
+
     /// Whether `signal` is one of [`Config::in_guest_reserved_signals`]. Never
     /// signal 0 (an existence check sends nothing), nor a number outside 1 to
     /// 64, which Linux refuses with EINVAL before any target is named. Always
@@ -2007,22 +2023,19 @@ impl Config {
 
     /// Whether a queued plain sleep is registered as a timed waiter at the first quiescent pass
     /// that finds it queued (`--sleep-registration`): the explicit value, or by default outside
-    /// race search (`--chaos`, or a `--sched-heuristic` that does not select by priority), and
-    /// only where the scheduler reads a sleeper's signal state (`models_signal_targets`, or the
-    /// in-guest delivery gate). Never under `hermit record` and `hermit replay`, whose schedule
-    /// must not change. A replay that leaves the option unset takes its record's value instead
-    /// (`Scheduler::new`), whatever its own backend's default: a record made on ptrace and
-    /// replayed on a backend that reads no signal state registers at the first pass there, with
-    /// the limitation below, so that the replay keeps the record's schedule.
+    /// race search (`--chaos`, or a `--sched-heuristic` that does not select by priority) where
+    /// the scheduler reads a sleeper's signal state (`reads_sleeper_signal_state`). Never under
+    /// `hermit record` and `hermit replay`, whose schedule must not change. A replay that leaves
+    /// the option unset takes its record's value instead (`Scheduler::new`).
     ///
     /// A registered sleep is parked, and a signal the scheduler sends a parked sleep wakes it
     /// whatever the signal is unless the scheduler can read the sleeper's mask and dispositions
     /// (`Scheduler::signal_sleep`). Without them (DBT, SaBRe and LiteInst without the in-guest
     /// gate, KVM), a default-ignored `SIGCHLD` or a blocked timer signal would end every plain
-    /// sleep with `EINTR`, where Linux never wakes it; a queued sleep there is left alone. So the
-    /// default registers when chosen on those backends, as before
-    /// (<https://github.com/rrnewton/hermit/pull/4682>). An explicit `first-pass` still
-    /// registers there, with that limitation.
+    /// sleep with `EINTR`, where Linux never wakes it. So the default registers when chosen on
+    /// those backends, as before (<https://github.com/rrnewton/hermit/pull/4682>); an explicit
+    /// `first-pass` there, or one taken from a record, is refused before the guest starts, and
+    /// the scheduler does not register there whatever this says, so a record states what it did.
     pub fn queued_sleeps_registered_at_first_pass(&self) -> bool {
         !self.recordreplay_modes
             && match self.sleep_registration {
@@ -2030,7 +2043,7 @@ impl Config {
                 None => {
                     !self.chaos
                         && self.sched_heuristic.is_priority_ordered()
-                        && (self.models_signal_targets() || self.in_guest_signal_delivery)
+                        && self.reads_sleeper_signal_state()
                 }
             }
     }
@@ -7450,11 +7463,10 @@ mod tests {
     }
 
     /// By default a queued sleep registers at the first pass only where the scheduler reads a
-    /// sleeper's signal state: a backend whose kernel signal targets it can predict (ptrace), or
-    /// any backend under the in-guest delivery gate. DBT, SaBRe, LiteInst and KVM register when
-    /// chosen, where a parked sleep would take `EINTR` from a signal Linux ignores, unless the
-    /// option asks for the first pass. Race search and `hermit record`/`replay` keep their rule
-    /// (<https://github.com/rrnewton/hermit/pull/4682>).
+    /// sleeper's signal state: a backend whose kernel signal targets it predicts (ptrace), or any
+    /// backend under the in-guest delivery gate. DBT, SaBRe, LiteInst and KVM register when
+    /// chosen by default. An explicit value decides here; a `first-pass` the backend cannot honour
+    /// is refused at launch. Race search and `hermit record`/`replay` keep their rule.
     #[test]
     fn first_pass_sleep_registration_is_the_default_only_where_signal_state_is_read() {
         let config = |backend: BackendCapabilities,
@@ -7466,46 +7478,47 @@ mod tests {
             sequentialize_threads: true,
             ..Config::default()
         };
-        assert!(
-            config(BackendCapabilities::PTRACE, false, None)
-                .queued_sleeps_registered_at_first_pass()
-        );
-        assert!(
-            config(BackendCapabilities::E9PATCH, false, None)
-                .queued_sleeps_registered_at_first_pass()
-        );
+        for (name, backend) in [
+            ("PTRACE", BackendCapabilities::PTRACE),
+            ("E9PATCH", BackendCapabilities::E9PATCH),
+        ] {
+            let default = config(backend, false, None);
+            assert!(default.reads_sleeper_signal_state(), "{name}");
+            assert!(default.queued_sleeps_registered_at_first_pass(), "{name}");
+        }
         for (name, backend) in [
             ("DBT", BackendCapabilities::DBT),
             ("SABRE", BackendCapabilities::SABRE),
             ("LITEINST_IN_GUEST", BackendCapabilities::LITEINST_IN_GUEST),
             ("KVM", BackendCapabilities::KVM),
         ] {
+            let default = config(backend, false, None);
+            assert!(!default.reads_sleeper_signal_state(), "{name}");
+            assert!(!default.queued_sleeps_registered_at_first_pass(), "{name}");
+            let gated = config(backend, true, None);
+            assert!(gated.reads_sleeper_signal_state(), "{name} under the gate");
             assert!(
-                !config(backend, false, None).queued_sleeps_registered_at_first_pass(),
-                "{name}"
-            );
-            assert!(
-                config(backend, true, None).queued_sleeps_registered_at_first_pass(),
+                gated.queued_sleeps_registered_at_first_pass(),
                 "{name} under the gate"
             );
             assert!(
                 config(backend, false, Some(SleepRegistration::FirstPass))
                     .queued_sleeps_registered_at_first_pass(),
-                "{name}, asked"
+                "{name}, asked for"
             );
         }
-        // Without serialized threads the scheduler models no signal targets either.
         let unserialized = Config {
             sequentialize_threads: false,
             ..config(BackendCapabilities::PTRACE, false, None)
         };
+        assert!(!unserialized.reads_sleeper_signal_state());
         assert!(!unserialized.queued_sleeps_registered_at_first_pass());
         let chaos = Config {
             chaos: true,
             ..config(BackendCapabilities::PTRACE, false, None)
         };
         assert!(!chaos.queued_sleeps_registered_at_first_pass());
-        let recording = Config {
+        let recorded = Config {
             recordreplay_modes: true,
             ..config(
                 BackendCapabilities::PTRACE,
@@ -7513,7 +7526,7 @@ mod tests {
                 Some(SleepRegistration::FirstPass),
             )
         };
-        assert!(!recording.queued_sleeps_registered_at_first_pass());
+        assert!(!recorded.queued_sleeps_registered_at_first_pass());
     }
 
     #[test]

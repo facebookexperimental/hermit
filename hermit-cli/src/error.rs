@@ -328,6 +328,9 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         || error
             .chain()
             .any(|cause| cause.is::<crate::kvm_address_space::KvmAddressSpaceRefusal>())
+        || error.chain().any(|cause| {
+            cause.is::<crate::sleep_registration_admission::UnreadableSleeperSignalState>()
+        })
     {
         FailureKind::PolicyRefusal
     } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {
@@ -556,6 +559,25 @@ mod tests {
         let serialized = SerializableError::from(paired);
         assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
         assert!(serialized.error.contains("secondary write failure"));
+    }
+
+    #[test]
+    fn an_unreadable_first_pass_refusal_keeps_its_policy_class_across_the_container_boundary() {
+        let config = detcore::Config {
+            sequentialize_threads: true,
+            backend: crate::backend_capabilities(crate::Backend::Dbt),
+            sleep_registration: Some(detcore_model::config::SleepRegistration::FirstPass),
+            ..detcore::Config::default()
+        };
+        let refusal =
+            crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)
+                .unwrap_err();
+        let serialized = SerializableError::from(Error::new(refusal).context("launch refused"));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(serialized.context.iter().any(|message| {
+            message.contains("unreadable_sleeper_signal_state")
+                && message.contains("--sleep-registration=first-pass")
+        }));
     }
 
     #[test]
