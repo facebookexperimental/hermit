@@ -2208,7 +2208,7 @@ mod tests {
         // Trials 1..=4 search the boundary; trials 5 and 6 recheck its two sides.
         for changed_trial in [None, Some(5), Some(6)] {
             let mut trials = 0;
-            let result = options.phase5_prefix_search_with(&schedule, |trial, len| {
+            let result = options.phase5_prefix_search_with(&schedule, |trial, len, _| {
                 trials = trial;
                 let target_met = len > 1;
                 Ok(if Some(trial) == changed_trial {
@@ -2242,7 +2242,7 @@ mod tests {
         options.tmp_dir = Some(dir.path().to_path_buf());
         let schedule = PreemptionRecord::from_sched_events(Vec::new());
         let error = options
-            .prefix_continuation(&schedule, 0, |_| Ok(false))
+            .prefix_continuation(&schedule, 0, None, |_| Ok(false))
             .err()
             .expect("a missing record must not stand in for an observed empty trace");
         assert!(
@@ -2250,7 +2250,7 @@ mod tests {
             "{error:#}"
         );
         let completed = options
-            .prefix_continuation(&schedule, 0, |run| {
+            .prefix_continuation(&schedule, 0, None, |run| {
                 schedule
                     .write_to_disk(run.sched_path_out())
                     .map_err(anyhow::Error::msg)?;
@@ -2313,6 +2313,7 @@ mod tests {
                 PrefixDecision {
                     schedule: PreemptionRecord::from_sched_events(events.clone()),
                     decision: 1,
+                    continuation: None,
                 },
                 |runname, _, prefix, position| {
                     stacks += 1;
