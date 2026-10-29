@@ -91,16 +91,30 @@ pub(crate) enum AlarmPhase {
     Inactive { copy: bool },
 }
 
-/// The first point after `t` on the grid `last + k * interval` (k >= 1).
+/// The first point after `t` on the grid `last + k * interval`, for the least
+/// `k >= 1` that passes `t` (`k = 1` when `t` is before `last`), or `None`
+/// when that point does not fit in 64 bits. Linux's `hrtimer_forward` puts a
+/// restarted periodic timer at that point of its grid, dropping the missed
+/// periods. Both models of a periodic `ITIMER_REAL` restart there: the traced
+/// one (`grid_after`) and the controlled one (`real_timer.rs`).
+pub(crate) fn checked_grid_after(
+    last: LogicalTime,
+    interval: std::num::NonZeroU64,
+    t: LogicalTime,
+) -> Option<LogicalTime> {
+    let k = (t.as_nanos().saturating_sub(last.as_nanos()) / interval).checked_add(1)?;
+    k.checked_mul(interval.get())
+        .and_then(|step| last.as_nanos().checked_add(step))
+        .map(LogicalTime::from_nanos)
+}
+
+/// The first point after `t` on the grid `last + k * interval` (k >= 1), as
+/// `checked_grid_after` computes it, saturating at the end of time. An
+/// interval of zero counts as one nanosecond.
 pub(crate) fn grid_after(last: LogicalTime, interval: LogicalTime, t: LogicalTime) -> LogicalTime {
-    let interval_ns = interval.as_nanos().max(1);
-    let last_ns = last.as_nanos();
-    let k = if t.as_nanos() >= last_ns {
-        (t.as_nanos() - last_ns) / interval_ns + 1
-    } else {
-        1
-    };
-    LogicalTime::from_nanos(last_ns.saturating_add(k.saturating_mul(interval_ns)))
+    let interval =
+        std::num::NonZeroU64::new(interval.as_nanos()).unwrap_or(std::num::NonZeroU64::MIN);
+    checked_grid_after(last, interval, t).unwrap_or(LogicalTime::from_nanos(u64::MAX))
 }
 
 /// What a signal timer does when it expires.

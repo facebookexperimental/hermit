@@ -482,6 +482,939 @@ fn real_expiry_publishes_without_any_borrowed_callback() {
     assert!(s.blocked.timed_waiters.is_empty());
 }
 
+/// A dequeue of process 100's `ITIMER_REAL` copy, number `sequence` of that
+/// process, by `consumer`.
+fn alarm_dequeue(sequence: u64, consumer: reverie::SignalConsumer) -> reverie::SignalDequeue {
+    alarm_dequeue_of(100, sequence, consumer)
+}
+
+/// A dequeue of process `pid`'s `ITIMER_REAL` copy, number `sequence` of that
+/// process, by `consumer`.
+fn alarm_dequeue_of(
+    pid: i32,
+    sequence: u64,
+    consumer: reverie::SignalConsumer,
+) -> reverie::SignalDequeue {
+    let process = task(pid, pid).process;
+    reverie::SignalDequeue {
+        process,
+        sequence,
+        consumer,
+        domain: reverie::PendingDomain::Process,
+        event: reverie::SignalEvent::new(
+            libc::SIGALRM,
+            super::discarded_at_send::itimer_real_siginfo(),
+            reverie::SignalTarget::Process { pid: process.tgid },
+        )
+        .unwrap(),
+    }
+}
+
+/// Process 100, single-threaded, with a controlled periodic `ITIMER_REAL`
+/// of `period` armed at 0, whose first expiry has been popped and published
+/// at committed time `period`.
+fn published_periodic_alarm(period: u64) -> (Scheduler, Arc<Backend>, DetTid) {
+    let (mut s, b) = fixture();
+    let (leader, _, _) = add(&mut s, 100, 100);
+    s.replace_real_timer(
+        leader,
+        leader,
+        at(0),
+        at(period),
+        at(period),
+        Signal::SIGALRM,
+    )
+    .unwrap();
+    s.committed_time = at(period);
+    assert!(s.step2b_process_timed(&committed_clock(&s)));
+    assert_eq!(b.publications.lock().unwrap().len(), 1);
+    assert!(s.blocked.timed_waiters.is_empty());
+    (s, b, leader)
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929: a copy taken at a return
+/// to user mode restarts the controlled timer at the next quiesced boundary
+/// (O3), on its grid after that boundary's committed time, as the traced
+/// path restarts its own. The turn that took the copy has been charged by
+/// then, so a period shorter than that charge does not expire again inside
+/// it: here the copy of a 100 us timer is taken at 100 us and the boundary
+/// comes after a 500 us charge, so the timer restarts at 700 us and that
+/// boundary pops nothing. A restart at the dequeue instant would have queued
+/// 200 us, due at once. Without a dequeue the boundary restarts nothing.
+#[test]
+fn a_dequeued_controlled_alarm_restarts_at_the_next_quiesced_boundary() {
+    for dequeued in [false, true] {
+        let (mut s, b, leader) = published_periodic_alarm(100_000);
+        if dequeued {
+            assert_eq!(
+                s.apply_signal_dequeue(
+                    leader,
+                    alarm_dequeue(1, reverie::SignalConsumer::ReturnToUser)
+                ),
+                Ok(super::real_timer::DequeueAck::Applied { sequence: 1 })
+            );
+            assert!(
+                s.blocked.timed_waiters.is_empty(),
+                "the dequeue itself restarts nothing"
+            );
+        }
+        s.committed_time = at(600_005);
+        s.reconcile_inactive_alarms(s.committed_time);
+        if dequeued {
+            assert_eq!(s.blocked.timed_waiters.next_deadline(), Some(at(700_000)));
+            assert!(!s.step2b_process_timed(&committed_clock(&s)));
+            assert_eq!(b.publications.lock().unwrap().len(), 1);
+            assert_eq!(
+                s.real_timers
+                    .snapshot(leader, at(600_005))
+                    .unwrap()
+                    .remaining,
+                at(99_995)
+            );
+        } else {
+            assert!(s.blocked.timed_waiters.is_empty());
+            assert_eq!(
+                s.real_timers
+                    .snapshot(leader, at(600_005))
+                    .unwrap()
+                    .remaining,
+                at(0)
+            );
+        }
+        assert!(s.real_timers.dequeued_processes().is_empty());
+        assert!(!s.backend_failed());
+    }
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929: a copy a signalfd read
+/// or `rt_sigtimedwait` takes in the reader's own turn restarts the
+/// controlled timer at that call's reconcile point (`ReconcileAlarm`, O2), at
+/// the reader's current time, and the RPC hints the new deadline as the
+/// reader's slice end (`note_arming_hint`), as the traced path does. Before
+/// the dequeue, and again after the restart, a reconcile point restarts
+/// nothing. A `setitimer` reconciles first (O1), so its old value reports
+/// the restart.
+#[test]
+fn an_in_turn_dequeue_restarts_the_controlled_alarm_at_its_reconcile_point() {
+    let (mut s, _, leader) = published_periodic_alarm(5_000_000);
+    assert_eq!(s.reconcile_alarm(leader, at(5_100_000)), None);
+    s.apply_signal_dequeue(leader, alarm_dequeue(1, reverie::SignalConsumer::SignalFd))
+        .unwrap();
+    assert!(s.blocked.timed_waiters.is_empty());
+    let now = at(7_300_000);
+    assert_eq!(s.reconcile_alarm(leader, now), Some(at(10_000_000)));
+    assert_eq!(
+        s.blocked.timed_waiters.next_deadline(),
+        Some(at(10_000_000))
+    );
+    assert_eq!(
+        s.itimer_snapshot(leader, now).unwrap(),
+        super::real_timer::ItimerSnapshot {
+            remaining: at(2_700_000),
+            interval: at(5_000_000),
+        }
+    );
+    s.note_arming_hint(leader, now);
+    assert_eq!(
+        s.take_deadline_hint(leader),
+        Some(Duration::from_nanos(2_700_000))
+    );
+    assert_eq!(s.reconcile_alarm(leader, at(7_400_000)), None);
+    assert_eq!(
+        s.blocked.timed_waiters.next_deadline(),
+        Some(at(10_000_000))
+    );
+
+    // O1 then the replacement, as `GlobalRequest::RegisterAlarm` runs them.
+    let (mut s, _, leader) = published_periodic_alarm(5_000_000);
+    s.apply_signal_dequeue(
+        leader,
+        alarm_dequeue(1, reverie::SignalConsumer::ReturnToUser),
+    )
+    .unwrap();
+    assert_eq!(s.reconcile_alarm(leader, now), Some(at(10_000_000)));
+    assert_eq!(
+        s.replace_real_timer(leader, leader, now, at(0), at(0), Signal::SIGALRM),
+        Ok((at(2_700_000), at(5_000_000)))
+    );
+    assert!(s.blocked.timed_waiters.is_empty());
+    assert!(!s.backend_failed());
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929: as on Linux, only a
+/// SIGALRM taken from the process's shared queue restarts the controlled
+/// timer. `dequeue_signal` re-arms `ITIMER_REAL` only on that path (v6.17
+/// kernel/signal.c:632-636). A copy taken from a thread's private queue (a
+/// `tgkill` SIGALRM, line 629) and another signal taken from the shared
+/// queue are acknowledged and leave the timer inactive, so no reconcile point
+/// restarts it; the shared SIGALRM after them does.
+#[test]
+fn only_a_shared_queue_sigalrm_dequeue_restarts_the_controlled_alarm() {
+    let (mut s, b, leader) = published_periodic_alarm(100_000);
+    let process = task(100, 100).process;
+    let siginfo = |signal: i32, code: i32| {
+        let mut info = [0; reverie::SIGNAL_INFO_SIZE];
+        info[..4].copy_from_slice(&signal.to_ne_bytes());
+        info[8..12].copy_from_slice(&code.to_ne_bytes());
+        info
+    };
+    let private = reverie::SignalDequeue {
+        domain: reverie::PendingDomain::Thread,
+        event: reverie::SignalEvent::new(
+            libc::SIGALRM,
+            siginfo(libc::SIGALRM, libc::SI_TKILL),
+            reverie::SignalTarget::Thread {
+                pid: process.tgid,
+                tid: reverie::Tid::from_raw(100),
+            },
+        )
+        .unwrap(),
+        ..alarm_dequeue(1, reverie::SignalConsumer::ReturnToUser)
+    };
+    let other = reverie::SignalDequeue {
+        event: reverie::SignalEvent::new(
+            libc::SIGUSR1,
+            siginfo(libc::SIGUSR1, libc::SI_USER),
+            reverie::SignalTarget::Process { pid: process.tgid },
+        )
+        .unwrap(),
+        ..alarm_dequeue(2, reverie::SignalConsumer::ReturnToUser)
+    };
+    for (dequeue, sequence) in [(private, 1), (other, 2)] {
+        assert_eq!(
+            s.apply_signal_dequeue(leader, dequeue),
+            Ok(super::real_timer::DequeueAck::Applied { sequence })
+        );
+        assert!(s.real_timers.dequeued_processes().is_empty());
+    }
+    s.committed_time = at(600_005);
+    s.reconcile_inactive_alarms(s.committed_time);
+    assert_eq!(s.reconcile_alarm(leader, s.committed_time), None);
+    assert!(s.blocked.timed_waiters.is_empty());
+    assert_eq!(
+        s.real_timers
+            .snapshot(leader, at(600_005))
+            .unwrap()
+            .remaining,
+        at(0)
+    );
+    assert_eq!(
+        s.apply_signal_dequeue(
+            leader,
+            alarm_dequeue(3, reverie::SignalConsumer::ReturnToUser)
+        ),
+        Ok(super::real_timer::DequeueAck::Applied { sequence: 3 })
+    );
+    s.reconcile_inactive_alarms(s.committed_time);
+    assert_eq!(s.blocked.timed_waiters.next_deadline(), Some(at(700_000)));
+    assert_eq!(b.publications.lock().unwrap().len(), 1);
+    assert!(!s.backend_failed());
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929: a controlled periodic
+/// `ITIMER_REAL` of at most two turn charges hints no slice end, as a traced
+/// one does (`fast_timer_period`); a period one nanosecond longer does, and
+/// so does a one-shot timer of the same length.
+#[test]
+fn a_fast_controlled_periodic_alarm_hints_no_slice_end() {
+    let fast = fixture().0.fast_timer_period.as_nanos();
+    assert!(fast > 0);
+    for (value, interval, hinted) in [
+        (fast, fast, false),
+        (fast + 1, fast + 1, true),
+        (fast, 0, true),
+    ] {
+        let (mut s, _) = fixture();
+        let (leader, _, _) = add(&mut s, 100, 100);
+        s.replace_real_timer(
+            leader,
+            leader,
+            at(0),
+            at(value),
+            at(interval),
+            Signal::SIGALRM,
+        )
+        .unwrap();
+        assert_eq!(
+            s.deadline_remaining_from(leader, at(0)),
+            hinted.then_some(Duration::from_nanos(value)),
+            "value {value}, interval {interval}"
+        );
+    }
+}
+
+/// Files `tid`'s parked wait at a controlled site, as `parked_wait_request`
+/// files a `pause` (`SleepUntil(INDEFINITE)`, `handle_pause`) or a
+/// `nanosleep` (`SleepUntil(deadline)`), without registering it: the
+/// scheduler registers a queued sleep itself.
+fn file_parked_wait(
+    s: &mut Scheduler,
+    tid: DetTid,
+    mm: MmId,
+    site: reverie::CallbackSignalSite,
+    policy: ParkedWaitPolicy,
+) -> Ivar<SchedResponse> {
+    let mut r = Resources::new(tid);
+    match policy {
+        ParkedWaitPolicy::PauseNoHandlerRestart => {
+            r.insert(
+                ResourceID::SleepUntil(LogicalTime::INDEFINITE),
+                Permission::W,
+            );
+            r.fyi(crate::resources::PAUSE_FYI);
+        }
+        ParkedWaitPolicy::NanosleepNoHandlerRestart { absolute_deadline } => {
+            r.insert(ResourceID::SleepUntil(absolute_deadline), Permission::RW);
+        }
+    }
+    s.install_resource_origin(
+        tid,
+        ResourceOrigin {
+            rpc: RpcOrigin::DirectRequestResources,
+            mm,
+            control: ControlCapability::ParkedWait { policy, site },
+        },
+    )
+    .unwrap();
+    let turn = &s.next_turns[&tid];
+    turn.req.put(Ok(r));
+    turn.resp.clone()
+}
+
+/// Files `tid`'s parked `nanosleep` until `deadline` (`file_parked_wait`).
+fn file_parked_sleep(
+    s: &mut Scheduler,
+    tid: DetTid,
+    mm: MmId,
+    site: reverie::CallbackSignalSite,
+    deadline: LogicalTime,
+) -> Ivar<SchedResponse> {
+    file_parked_wait(
+        s,
+        tid,
+        mm,
+        site,
+        ParkedWaitPolicy::NanosleepNoHandlerRestart {
+            absolute_deadline: deadline,
+        },
+    )
+}
+
+/// Parks `tid` in `pause` at a controlled site (`file_parked_wait`),
+/// registered with no deadline, as its admission registers it.
+fn parked_pause(
+    s: &mut Scheduler,
+    tid: DetTid,
+    mm: MmId,
+    site: reverie::CallbackSignalSite,
+) -> Ivar<SchedResponse> {
+    let response = file_parked_wait(s, tid, mm, site, ParkedWaitPolicy::PauseNoHandlerRestart);
+    s.blocked.timed_waiters.insert(LogicalTime::INDEFINITE, tid);
+    response
+}
+
+/// Finishes the observation `control` of `tid` as `FinishParkedObservation`
+/// does: posts the finish, whose acknowledgement only the daemon's control
+/// drain puts.
+fn post_finish(
+    s: &mut Scheduler,
+    tid: DetTid,
+    mm: MmId,
+    control: &AlarmControl,
+    finish: ObservationFinish,
+) -> Ivar<Result<FinishAck, ProtocolFailure>> {
+    let ack = Ivar::new();
+    s.post_control(
+        tid,
+        mm,
+        ControlIntent::Finish {
+            wait: control.continuation,
+            lease: control.lease,
+            site: control.site,
+            finish,
+            ack: ack.clone(),
+        },
+    )
+    .unwrap();
+    ack
+}
+
+/// The finish of an observation that took a signal for a caught handler.
+fn caught(control: &AlarmControl) -> ObservationFinish {
+    ObservationFinish::InterruptForCaught {
+        selection: reverie::PreparedSignalToken {
+            site: control.site,
+            selection_nonce: 1,
+        },
+    }
+}
+
+/// The handler's frame is committed (`consume_signal_boundary`), the backend
+/// releases its reservation, and no signal is pending any more.
+fn handler_entered(s: &mut Scheduler, backend: &Backend, control: &AlarmControl) {
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit: control.permit,
+        outcome: SignalBoundaryOutcome::Caught,
+    })
+    .unwrap();
+    backend.release_delivery(control.permit).unwrap();
+    backend.recipients.lock().unwrap().clear();
+}
+
+/// Polls `ready` every millisecond, for at most 10 s.
+fn wait_until(mut ready: impl FnMut() -> bool) {
+    for _ in 0..10_000 {
+        if ready() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("not reached in 10 s");
+}
+
+/// What a controlled turn leaves for the turns after it, with times relative
+/// to the run's start: the grant, the queue, every timed event (a restarted
+/// `ITIMER_REAL` among them), the granted thread's slice cap, the timer as
+/// getitimer reads it, the clocks, and how many SIGALRMs were published.
+#[derive(Debug, PartialEq, Eq)]
+struct RestartTurn {
+    selected: DetTid,
+    queued: Vec<DetTid>,
+    timed: Vec<(LogicalTime, timed_waiters::TimedEvent)>,
+    slice_cap: Option<Duration>,
+    timer: super::real_timer::ItimerSnapshot,
+    turn: u64,
+    committed: LogicalTime,
+    global: LogicalTime,
+    publications: usize,
+}
+
+impl RestartTurn {
+    fn record(
+        s: &Scheduler,
+        backend: &Backend,
+        global: &Mutex<GlobalTime>,
+        start: LogicalTime,
+        selected: DetTid,
+        timer: DetPid,
+    ) -> Self {
+        let since = |t: LogicalTime| {
+            if t.is_indefinite() {
+                t
+            } else {
+                LogicalTime::from_nanos(t.as_nanos() - start.as_nanos())
+            }
+        };
+        RestartTurn {
+            selected,
+            queued: s.run_queue.tids().copied().collect(),
+            timed: s
+                .blocked
+                .timed_waiters
+                .iter()
+                .map(|(deadline, event)| (since(deadline), event))
+                .collect(),
+            slice_cap: s.deadline_hints.get(&selected).copied(),
+            timer: s.itimer_snapshot(timer, s.committed_time).unwrap(),
+            turn: s.turn,
+            committed: since(s.committed_time),
+            global: since(global.lock().unwrap().as_nanos()),
+            publications: backend.publications.lock().unwrap().len(),
+        }
+    }
+}
+
+/// Files `tid`'s request for its delivery of SIGALRM, as the Tool's inbound
+/// signal stop does (`resource_request`, ordinary origin). Inside an
+/// observation, this delivery hook refills the observation's gate.
+fn file_inbound_signal(s: &mut Scheduler, tid: DetTid, mm: MmId) {
+    s.install_resource_origin(
+        tid,
+        ResourceOrigin {
+            rpc: RpcOrigin::DirectRequestResources,
+            mm,
+            control: ControlCapability::None,
+        },
+    )
+    .unwrap();
+    let mut r = Resources::new(tid);
+    r.insert(
+        ResourceID::InboundSignal(SigWrapper::from(Signal::SIGALRM)),
+        Permission::RW,
+    );
+    s.next_turns[&tid].req.put(Ok(r));
+}
+
+/// The witness of https://github.com/rrnewton/hermit/issues/4929's review
+/// round 1 (Codex P1), run through the real controlled turn loop on its own
+/// thread, with the observed worker on another, as reverie-kvm runs a guest
+/// thread. Parent R (process 100) is queued with an ordinary request; its
+/// child W (process 200) armed a 100 us `ITIMER_REAL` with a 2 ms interval
+/// and parked in `pause`. Turn 1 charges R's turn, pops W's expiry,
+/// publishes it and observes W.
+///
+/// The worker does what reverie-kvm's observation does
+/// (`observe_parked_signal`): it takes the copy, as `recv_signal_dequeued`
+/// records it, and its delivery's hook at once files the `InboundSignal`
+/// request, which refills the observation's gate. The observation finishes
+/// only after that delivery's turn. `worker_first` decides which side
+/// reaches the open gate first. With it, the daemon pauses there
+/// (`observation_gate_pause`) until the worker has taken the copy and filed
+/// the request, so its next look finds every request filled. Without it, the
+/// worker waits until the daemon has looked and is waiting on the gate.
+///
+/// Turn 1 grants R. Then turn 2 grants W's delivery, in which W finishes its
+/// observation (`InterruptForCaught`); turn 3 drains that finish, waits for
+/// the handler's frame and W's next request, and grants; three more turns
+/// follow. Returns the records of all six turns, and how many times turn 1's
+/// loop waited.
+fn controlled_restart_witness(worker_first: bool) -> (Vec<RestartTurn>, u64) {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use futures::FutureExt;
+
+    let (mut s, backend) = fixture();
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let start = global.lock().unwrap().as_nanos();
+    let (r, _, _) = add(&mut s, 100, 100);
+    s.next_turns[&r].req.put(Ok(Resources::new(r)));
+    s.runqueue_push_back(r);
+    let (w, mm, site) = add_process_child(&mut s, 100, 200);
+    let response = parked_pause(&mut s, w, mm, site);
+    s.replace_real_timer(w, w, start, at(100_000), at(2_000_000), Signal::SIGALRM)
+        .unwrap();
+    backend.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(200, 200),
+    });
+    let release = Arc::new(AtomicBool::new(false));
+    if worker_first {
+        s.observation_gate_pause = Some(release.clone());
+    }
+    let scheduler = Arc::new(Mutex::new(s));
+    let last = Ok(Resources::new(r));
+    let (granted, control) = std::thread::scope(|scope| {
+        let daemon = scope.spawn(|| {
+            futures::executor::block_on(do_a_turn_blocking(
+                scheduler.clone(),
+                global.clone(),
+                &last,
+            ))
+        });
+        let control = match futures::executor::block_on(response.clone()) {
+            SchedResponse::ObserveSignal(control) => *control,
+            other => panic!("{other:?}"),
+        };
+        if !worker_first {
+            wait_until(|| scheduler.lock().unwrap().controlled_turn_waits > 0);
+        }
+        // `recv_signal_dequeued`: the copy left the shared queue, at W's time.
+        {
+            let mut s = scheduler.lock().unwrap();
+            assert_eq!(
+                s.real_timers
+                    .validate_effect(w, w, mm, task(200, 200), task(200, 200).process),
+                Ok(true)
+            );
+            global
+                .lock()
+                .unwrap()
+                .update_global_time(w, start + at(5_000), LogicalTime::ZERO);
+            assert_eq!(
+                s.apply_signal_dequeue(
+                    w,
+                    alarm_dequeue_of(200, 1, reverie::SignalConsumer::ReturnToUser)
+                ),
+                Ok(super::real_timer::DequeueAck::Applied { sequence: 1 })
+            );
+        }
+        // The delivery's hook refills the gate before the finish.
+        file_inbound_signal(&mut scheduler.lock().unwrap(), w, mm);
+        release.store(true, Ordering::Release);
+        let granted = daemon.join().unwrap().expect("the turn grants a thread");
+        (granted, control)
+    });
+    let record = |granted: DetTid| {
+        let s = scheduler.lock().unwrap();
+        assert!(!s.backend_failed());
+        RestartTurn::record(&s, &backend, &global, start, granted, w)
+    };
+    let waits = scheduler.lock().unwrap().controlled_turn_waits;
+    let mut turns = vec![record(granted.tid)];
+    // Turn 2: R files its next request; W's delivery is granted.
+    scheduler.lock().unwrap().next_turns[&r]
+        .req
+        .put(Ok(Resources::new(r)));
+    let last = Ok(granted);
+    let delivery = do_a_turn_blocking(scheduler.clone(), global.clone(), &last)
+        .now_or_never()
+        .expect("every request is filled")
+        .expect("the turn grants a thread");
+    turns.push(record(delivery.tid));
+    // In its delivery's turn, W's observation finishes into its handler.
+    let ack = post_finish(
+        &mut scheduler.lock().unwrap(),
+        w,
+        mm,
+        &control,
+        caught(&control),
+    );
+    let last = Ok(delivery);
+    let mut turn = Box::pin(do_a_turn_blocking(scheduler.clone(), global.clone(), &last));
+    assert!(turn.as_mut().now_or_never().is_none(), "W's handler");
+    assert_eq!(ack.try_read(), Some(Ok(FinishAck::Interrupted)));
+    {
+        let mut s = scheduler.lock().unwrap();
+        handler_entered(&mut s, &backend, &control);
+        s.next_turns[&w].req.put(Ok(Resources::new(w)));
+    }
+    let mut last = Ok(turn
+        .as_mut()
+        .now_or_never()
+        .expect("every request is filled")
+        .expect("the turn grants a thread"));
+    drop(turn);
+    turns.push(record(last.as_ref().unwrap().tid));
+    for _ in 0..3 {
+        let tid = last.as_ref().unwrap().tid;
+        scheduler.lock().unwrap().next_turns[&tid]
+            .req
+            .put(Ok(Resources::new(tid)));
+        let granted = do_a_turn_blocking(scheduler.clone(), global.clone(), &last)
+            .now_or_never()
+            .expect("every request is filled")
+            .expect("the turn grants a thread");
+        turns.push(record(granted.tid));
+        last = Ok(granted);
+    }
+    (turns, waits)
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929, review round 1 (Codex
+/// P1): a parked SIGALRM's timer restart does not depend on whether the
+/// observed worker or the daemon reaches the open observation gate first.
+///
+/// Reverie-kvm refills the gate from the observed thread's own host thread:
+/// its observation takes the copy and its delivery's hook files the
+/// `InboundSignal` request, before the observation finishes, so the gate can
+/// be full before the daemon looks again. The loop therefore refreshes after
+/// every pass that opens a gate, not only after a wait: the refresh (and its
+/// reconcile, O3) runs at the first quiesced pass after the hook either way,
+/// after the dequeue that precedes the hook on the worker's thread.
+///
+/// Both orders restart W's timer at 2.1 ms, the first point of its grid after
+/// that pass's committed time of 505 us (R's 500 us turn charge and W's
+/// 5 us), give R a 1.595 ms slice cap, and schedule the five turns after it
+/// alike. Without the refresh after an opened gate, the worker-first order
+/// grants R at 500 us with no slice cap and restarts the timer only at the
+/// next turn's charge.
+#[test]
+fn a_parked_alarm_restart_does_not_depend_on_which_side_reaches_the_gate_first() {
+    let (worker_first, worker_first_waits) = controlled_restart_witness(true);
+    let (daemon_first, daemon_first_waits) = controlled_restart_witness(false);
+    assert_eq!(worker_first, daemon_first);
+    // Each order was forced. Worker first: the daemon's first look after the
+    // gate found it refilled, so it did not wait. Daemon first: it waited on
+    // the gate before the worker took the copy.
+    assert_eq!(worker_first_waits, 0);
+    assert_eq!(daemon_first_waits, 1);
+    let first = &worker_first[0];
+    assert_eq!(first.selected, DetTid::from_raw(100));
+    assert_eq!(first.committed, at(505_000));
+    assert_eq!(
+        first.timed,
+        [(
+            at(2_100_000),
+            timed_waiters::TimedEvent::SignalEvt(
+                timed_waiters::SignalTimerId::Alarm(DetPid::from_raw(200)),
+                timed_waiters::SignalTarget::Process(DetTid::from_raw(200)),
+                timed_waiters::TimerSignal::Send(Signal::SIGALRM),
+            )
+        )]
+    );
+    assert_eq!(first.slice_cap, Some(Duration::from_nanos(1_595_000)));
+    assert_eq!(
+        first.timer,
+        super::real_timer::ItimerSnapshot {
+            remaining: at(1_595_000),
+            interval: at(2_000_000),
+        }
+    );
+    // R and W alternate; the first charged pass past 2.1 ms pops the expiry.
+    assert_eq!(
+        worker_first
+            .iter()
+            .map(|turn| (turn.selected.as_raw(), turn.committed, turn.publications))
+            .collect::<Vec<_>>(),
+        [
+            (100, at(505_000), 1),
+            (200, at(1_005_000), 1),
+            (100, at(1_505_000), 1),
+            (200, at(2_005_000), 1),
+            (100, at(2_505_000), 2),
+            (200, at(3_005_000), 2),
+        ]
+    );
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (review round 1): the
+/// restart of a parked thread's timer is queued before the empty-queue jump
+/// that could pass it. W, alone in process 100, parked in `pause` with a
+/// 100 us, 2 ms `ITIMER_REAL`, takes the copy for a handler. Its delivery's
+/// hook refills the observation's gate, and the refresh pass after it, at
+/// 500 us, restarts the timer at 2.1 ms, the first point of its grid after
+/// 500 us. W's delivery is granted, its observation finishes, and its
+/// handler then sleeps for 10 ms (a parked `nanosleep`, until 10.55 ms). A
+/// queued sleep is registered when step 3 chooses it, so that turn ends
+/// without a grant, having registered W's sleep. The next turn finds nothing
+/// runnable, and its jump goes to the restarted deadline, not to W's, and
+/// pops it.
+#[test]
+fn a_parked_alarm_restart_is_queued_before_the_empty_queue_jump() {
+    use futures::FutureExt;
+
+    let (mut s, backend) = fixture();
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let start = global.lock().unwrap().as_nanos();
+    let (w, mm, site) = add(&mut s, 100, 100);
+    let response = parked_pause(&mut s, w, mm, site);
+    s.replace_real_timer(w, w, start, at(100_000), at(2_000_000), Signal::SIGALRM)
+        .unwrap();
+    backend.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    let scheduler = Arc::new(Mutex::new(s));
+    let timed = |s: &Scheduler| {
+        s.blocked
+            .timed_waiters
+            .iter()
+            .map(|(t, _)| t)
+            .collect::<Vec<_>>()
+    };
+    let last = Ok(Resources::new(w));
+    let mut turn = Box::pin(do_a_turn_blocking(scheduler.clone(), global.clone(), &last));
+    assert!(
+        turn.as_mut().now_or_never().is_none(),
+        "W's observation gate"
+    );
+    let control = selected(&response);
+    {
+        let mut s = scheduler.lock().unwrap();
+        assert_eq!(s.committed_time, start + at(500_000));
+        assert_eq!(backend.publications.lock().unwrap().len(), 1);
+        s.apply_signal_dequeue(w, alarm_dequeue(1, reverie::SignalConsumer::ReturnToUser))
+            .unwrap();
+        file_inbound_signal(&mut s, w, mm);
+    }
+    let delivery = turn
+        .as_mut()
+        .now_or_never()
+        .expect("the hook refilled the gate")
+        .expect("W's delivery is granted");
+    drop(turn);
+    assert_eq!(delivery.tid, w);
+    assert_eq!(timed(&scheduler.lock().unwrap()), [start + at(2_100_000)]);
+    // In its delivery's turn, W's observation finishes into its handler,
+    // which then sleeps.
+    let ack = post_finish(
+        &mut scheduler.lock().unwrap(),
+        w,
+        mm,
+        &control,
+        caught(&control),
+    );
+    let last = Ok(delivery);
+    let mut turn = Box::pin(do_a_turn_blocking(scheduler.clone(), global.clone(), &last));
+    assert!(turn.as_mut().now_or_never().is_none(), "W's handler");
+    assert_eq!(ack.try_read(), Some(Ok(FinishAck::Interrupted)));
+    let wake = start + at(10_550_000);
+    {
+        let mut s = scheduler.lock().unwrap();
+        handler_entered(&mut s, &backend, &control);
+        global
+            .lock()
+            .unwrap()
+            .update_global_time(w, start + at(50_000), LogicalTime::ZERO);
+        file_parked_sleep(&mut s, w, mm, site, wake);
+    }
+    let result = turn.as_mut().now_or_never().expect("W's sleep is chosen");
+    assert!(result.is_err(), "a blocking sleep is no grant");
+    drop(turn);
+    {
+        let s = scheduler.lock().unwrap();
+        assert!(!s.backend_failed());
+        assert_eq!(timed(&s), [start + at(2_100_000), wake]);
+        assert!(s.run_queue.is_empty());
+        assert_eq!(backend.publications.lock().unwrap().len(), 1);
+    }
+    let result = do_a_turn_blocking(scheduler.clone(), global.clone(), &Err(SkipTurn))
+        .now_or_never()
+        .expect("nothing is runnable");
+    assert!(
+        result.is_err(),
+        "the empty queue ends the turn without a grant"
+    );
+    let s = scheduler.lock().unwrap();
+    assert!(!s.backend_failed());
+    let now = global.lock().unwrap().as_nanos();
+    assert_eq!(now, start + at(2_100_000), "the empty-queue jump");
+    assert_eq!(backend.publications.lock().unwrap().len(), 2);
+    assert_eq!(timed(&s), [wake]);
+    assert_eq!(
+        s.itimer_snapshot(w, now).unwrap(),
+        super::real_timer::ItimerSnapshot {
+            remaining: at(0),
+            interval: at(2_000_000),
+        }
+    );
+}
+
+/// https://github.com/rrnewton/hermit/issues/4929 (review round 1): a later
+/// refresh pass does not move a parked thread's timer restart. As in
+/// `a_parked_alarm_restart_does_not_depend_on_which_side_reaches_the_gate_first`,
+/// parent R is queued and its child W takes its timer's copy, whose delivery
+/// hook refills the gate: the refresh pass at 500 us restarts W's timer at
+/// 2.1 ms. That pass also observes X, a third process asleep until 50 ms,
+/// which takes no signal and resumes its sleep after 1.8 ms of its own work,
+/// so a second refresh pass runs at 2.3 ms. The restart stays at 2.1 ms (a
+/// restart there would be 4.1 ms), and the turn's one timed pop is spent, so
+/// R is granted with X's deadline as its slice cap. The next charged pass
+/// pops the timer.
+#[test]
+fn a_later_refresh_pass_does_not_move_a_parked_alarm_restart() {
+    use futures::FutureExt;
+
+    let (mut s, backend) = fixture();
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let start = global.lock().unwrap().as_nanos();
+    let (r, _, _) = add(&mut s, 100, 100);
+    s.next_turns[&r].req.put(Ok(Resources::new(r)));
+    s.runqueue_push_back(r);
+    let (w, wmm, wsite) = add_process_child(&mut s, 100, 200);
+    let w_response = parked_pause(&mut s, w, wmm, wsite);
+    s.replace_real_timer(w, w, start, at(100_000), at(2_000_000), Signal::SIGALRM)
+        .unwrap();
+    let (x, xmm, xsite) = add_process_child(&mut s, 100, 300);
+    let x_response = sleep(&mut s, x, xmm, xsite, (start + at(50_000_000)).as_nanos());
+    backend.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(200, 200),
+    });
+    let scheduler = Arc::new(Mutex::new(s));
+    let alarm = |s: &Scheduler| {
+        s.blocked
+            .timed_waiters
+            .iter()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    timed_waiters::TimedEvent::SignalEvt(
+                        timed_waiters::SignalTimerId::Alarm(_),
+                        ..
+                    )
+                )
+            })
+            .map(|(deadline, _)| deadline)
+            .collect::<Vec<_>>()
+    };
+    let last = Ok(Resources::new(r));
+    let mut turn = Box::pin(do_a_turn_blocking(scheduler.clone(), global.clone(), &last));
+    assert!(
+        turn.as_mut().now_or_never().is_none(),
+        "W's observation gate"
+    );
+    selected(&w_response);
+    {
+        let mut s = scheduler.lock().unwrap();
+        s.apply_signal_dequeue(
+            w,
+            alarm_dequeue_of(200, 1, reverie::SignalConsumer::ReturnToUser),
+        )
+        .unwrap();
+        // The backend now reports a signal pending for process 300.
+        backend.recipients.lock().unwrap().clear();
+        backend.recipients.lock().unwrap().push(SignalRecipient {
+            task: task(300, 300),
+        });
+        file_inbound_signal(&mut s, w, wmm);
+    }
+    assert!(
+        turn.as_mut().now_or_never().is_none(),
+        "X's observation gate"
+    );
+    let x_control = selected(&x_response);
+    let ack = {
+        let mut s = scheduler.lock().unwrap();
+        assert_eq!(s.committed_time, start + at(500_000));
+        assert_eq!(alarm(&s), [start + at(2_100_000)]);
+        backend.recipients.lock().unwrap().clear();
+        global
+            .lock()
+            .unwrap()
+            .update_global_time(x, start + at(1_800_000), LogicalTime::ZERO);
+        post_finish(
+            &mut s,
+            x,
+            xmm,
+            &x_control,
+            ObservationFinish::ResumeSameWait,
+        )
+    };
+    assert!(turn.as_mut().now_or_never().is_none(), "X's resume barrier");
+    let ticket = match ack.try_read().unwrap().unwrap() {
+        FinishAck::AwaitResume(ticket) => ticket,
+        other => panic!("{other:?}"),
+    };
+    scheduler
+        .lock()
+        .unwrap()
+        .post_control(
+            x,
+            xmm,
+            ControlIntent::Resume {
+                ticket,
+                site: xsite,
+                response: Ivar::new(),
+            },
+        )
+        .unwrap();
+    let granted = turn
+        .as_mut()
+        .now_or_never()
+        .expect("every request is filled")
+        .expect("R is granted");
+    drop(turn);
+    assert_eq!(granted.tid, r);
+    {
+        let s = scheduler.lock().unwrap();
+        assert!(!s.backend_failed());
+        assert_eq!(s.committed_time, start + at(2_300_000));
+        assert_eq!(alarm(&s), [start + at(2_100_000)]);
+        assert_eq!(backend.publications.lock().unwrap().len(), 1);
+        assert_eq!(
+            s.blocked.timed_waiters.thread_deadline(x),
+            Some(start + at(50_000_000))
+        );
+        assert_eq!(
+            s.deadline_hints.get(&r).copied(),
+            Some(Duration::from_nanos(50_000_000 - 2_300_000))
+        );
+    }
+    scheduler.lock().unwrap().next_turns[&r]
+        .req
+        .put(Ok(Resources::new(r)));
+    let last = Ok(granted);
+    let next = do_a_turn_blocking(scheduler.clone(), global.clone(), &last)
+        .now_or_never()
+        .expect("every request is filled")
+        .expect("a grant");
+    assert_eq!(next.tid, w, "W's delivery");
+    let s = scheduler.lock().unwrap();
+    assert_eq!(s.committed_time, start + at(2_800_000));
+    assert_eq!(backend.publications.lock().unwrap().len(), 2);
+    assert!(alarm(&s).is_empty());
+    assert!(!s.backend_failed());
+}
+
 #[test]
 fn masked_leader_and_unrelated_process_do_not_prevent_worker_sleep_selection() {
     let (mut s, b) = fixture();

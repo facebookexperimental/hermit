@@ -7,6 +7,17 @@
 
 //! Process-owned ITIMER_REAL state. Expiration publishes a pending signal;
 //! only an actual shared SIGALRM dequeue can restart an inactive interval.
+//!
+//! The dequeue the backend acknowledges ([`RealTimers::dequeue`]) only
+//! records that the copy left the shared queue. The restart itself waits for
+//! the next reconcile point ([`RealTimers::reconcile`]): the `getitimer` or
+//! `setitimer` of the process (O1), the end of the signalfd read or
+//! `rt_sigtimedwait` that consumed the copy (O2), or the next quiesced
+//! boundary (O3). Those are the points at which the traced path's coalescing
+//! model (`itimer_coalesce.rs`) restarts its timer, so both models restart a
+//! timer at the same committed instant, after the scheduler turn in which the
+//! copy was taken has been charged
+//! (<https://github.com/rrnewton/hermit/issues/4929>).
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -67,6 +78,12 @@ pub enum RealTimerPhase {
         expiry: ExpiryId,
     },
     Inactive {
+        last_deadline: LogicalTime,
+    },
+    /// The copy published for the expiry at `last_deadline` has left the
+    /// process's shared queue at an acknowledged dequeue. The timer restarts
+    /// on its grid at the next reconcile point ([`RealTimers::reconcile`]).
+    Dequeued {
         last_deadline: LogicalTime,
     },
     TerminalFailure {
@@ -134,7 +151,12 @@ fn finite_add(a: LogicalTime, b: LogicalTime) -> Result<LogicalTime, TimerFailur
 impl RealTimer {
     fn snapshot(&self, now: LogicalTime) -> Result<ItimerSnapshot, TimerFailure> {
         let remaining = match self.phase {
-            RealTimerPhase::Disarmed | RealTimerPhase::Inactive { .. } => LogicalTime::ZERO,
+            // A `Dequeued` timer is reconciled before every query
+            // (`Scheduler::reconcile_alarm`), so this arm only answers for it
+            // as for the inactive timer it still is until then.
+            RealTimerPhase::Disarmed
+            | RealTimerPhase::Inactive { .. }
+            | RealTimerPhase::Dequeued { .. } => LogicalTime::ZERO,
             RealTimerPhase::Active { deadline } | RealTimerPhase::Publishing { deadline, .. } => {
                 active_remaining(deadline, now)
             }
@@ -259,6 +281,29 @@ impl RealTimers {
             .iter()
             .filter_map(|(pid, p)| (!p.retired).then_some(*pid))
             .collect()
+    }
+
+    /// The live processes whose timer waits for its next reconcile point
+    /// to restart (`Dequeued`), in pid order.
+    pub fn dequeued_processes(&self) -> Vec<DetPid> {
+        self.processes
+            .iter()
+            .filter_map(|(pid, p)| {
+                (!p.retired && matches!(p.timer.phase, RealTimerPhase::Dequeued { .. }))
+                    .then_some(*pid)
+            })
+            .collect()
+    }
+
+    /// The interval of the live process's current arm, when it is periodic:
+    /// the `it_interval` its last `setitimer` installed, which expiries and
+    /// restarts keep. `None` for a one-shot or disarmed timer.
+    pub fn interval(&self, detpid: DetPid) -> Option<LogicalTime> {
+        self.processes
+            .get(&detpid)
+            .filter(|p| !p.retired)
+            .map(|p| p.timer.interval)
+            .filter(|interval| *interval != LogicalTime::ZERO)
     }
 
     /// A successful in-process exec keeps its timer and accepted sequence but
@@ -502,12 +547,17 @@ impl RealTimers {
 
     /// Acknowledgment and the current-arm transition are one atomic scheduler
     /// operation. Event provenance is deliberately irrelevant to rearming.
+    ///
+    /// The transition only records the dequeue: an `Inactive` periodic timer
+    /// of a live process becomes `Dequeued`, and [`Self::reconcile`] restarts
+    /// it. Any other phase is left as it is: an armed or disarmed timer is not
+    /// restarted by a dequeue, a one-shot timer has nothing to restart, and a
+    /// timer already `Dequeued` restarts once.
     pub fn dequeue(
         &mut self,
         detpid: DetPid,
         event: SignalDequeue,
-        now: LogicalTime,
-    ) -> Result<(DequeueAck, Option<LogicalTime>), TimerFailure> {
+    ) -> Result<DequeueAck, TimerFailure> {
         let p = if self
             .processes
             .get(&detpid)
@@ -523,33 +573,18 @@ impl RealTimers {
         if let Some((previous, ack)) = p.last_dequeue
             && previous == event
         {
-            return Ok((ack, None));
+            return Ok(ack);
         }
         if next_nonce(p.sequence)? != event.sequence {
             return Err(TimerFailure::Sequence);
         }
-        let mut next = None;
         if !p.retired
             && event.domain == PendingDomain::Process
             && event.event.signal() == libc::SIGALRM
+            && p.timer.interval != LogicalTime::ZERO
             && let RealTimerPhase::Inactive { last_deadline } = p.timer.phase
-            && let Some(period) = NonZeroU64::new(p.timer.interval.as_nanos())
         {
-            let elapsed = now
-                .as_nanos()
-                .checked_sub(last_deadline.as_nanos())
-                .ok_or(TimerFailure::InvalidPhase)?;
-            let periods = (elapsed / period)
-                .checked_add(1)
-                .ok_or(TimerFailure::Overflow)?;
-            let increment = periods
-                .checked_mul(period.get())
-                .ok_or(TimerFailure::Overflow)?;
-            let deadline = finite_add(last_deadline, LogicalTime::from_nanos(increment))?;
-            if deadline <= now {
-                return Err(TimerFailure::Overflow);
-            }
-            next = Some(deadline);
+            p.timer.phase = RealTimerPhase::Dequeued { last_deadline };
         }
         let ack = if p.retired {
             DequeueAck::Retired {
@@ -560,12 +595,46 @@ impl RealTimers {
                 sequence: event.sequence,
             }
         };
-        if let Some(deadline) = next {
-            p.timer.phase = RealTimerPhase::Active { deadline };
-        }
         p.sequence = event.sequence;
         p.last_dequeue = Some((event, ack));
-        Ok((ack, next))
+        Ok(ack)
+    }
+
+    /// Restart `detpid`'s timer at reconcile point `t` if its last copy was
+    /// dequeued (`Dequeued`): at the first point of its grid
+    /// (`last_deadline + k * interval`, `k >= 1`) after `t`, as Linux's
+    /// `hrtimer_forward` places it, so missed periods are dropped. The traced
+    /// model restarts on the same grid (`timed_waiters::checked_grid_after`).
+    /// Returns the new deadline; `None` in every other phase, and for a
+    /// retired process. A deadline that would not fit, or a `t` before the
+    /// expiry whose copy was dequeued, leaves the timer as it was and fails.
+    pub fn reconcile(
+        &mut self,
+        detpid: DetPid,
+        t: LogicalTime,
+    ) -> Result<Option<LogicalTime>, TimerFailure> {
+        let Some(p) = self.processes.get_mut(&detpid).filter(|p| !p.retired) else {
+            return Ok(None);
+        };
+        let RealTimerPhase::Dequeued { last_deadline } = p.timer.phase else {
+            return Ok(None);
+        };
+        // Only a periodic arm becomes `Dequeued`, and replacing the arm
+        // leaves that phase.
+        let period =
+            NonZeroU64::new(p.timer.interval.as_nanos()).ok_or(TimerFailure::InvalidPhase)?;
+        // The copy was made by a pop at or after `last_deadline`, and every
+        // reconcile point comes later, at a committed time or a caller's
+        // global time, neither of which moves back. An earlier `t` is a
+        // broken invariant, not a time to round up.
+        if t < last_deadline {
+            return Err(TimerFailure::InvalidPhase);
+        }
+        let deadline = super::timed_waiters::checked_grid_after(last_deadline, period, t)
+            .filter(|deadline| !deadline.is_indefinite())
+            .ok_or(TimerFailure::Overflow)?;
+        p.timer.phase = RealTimerPhase::Active { deadline };
+        Ok(Some(deadline))
     }
 }
 
@@ -649,7 +718,8 @@ mod tests {
             if replacement_expired {
                 publish(&mut timers, pid, deadline);
             }
-            let (_, next) = timers.dequeue(pid, effect(1, 1), time(35)).unwrap();
+            timers.dequeue(pid, effect(1, 1)).unwrap();
+            let next = timers.reconcile(pid, time(35)).unwrap();
             assert_eq!(next, replacement_expired.then_some(time(40)));
             assert_eq!(
                 timers.snapshot(pid, time(35)).unwrap().remaining,
@@ -672,25 +742,23 @@ mod tests {
             timers.snapshot(pid, time(35)).unwrap(),
             ItimerSnapshot::default()
         );
-        assert_eq!(timers.dequeue(pid, effect(1, 1), time(35)).unwrap().1, None);
+        timers.dequeue(pid, effect(1, 1)).unwrap();
+        assert_eq!(timers.reconcile(pid, time(35)).unwrap(), None);
     }
 
     #[test]
     fn startup_sequence_rejects_gaps_conflicts_and_reused_processes() {
         let (mut timers, pid, mm) = bound();
         assert_eq!(
-            timers.dequeue(pid, effect(1, 2), time(0)),
+            timers.dequeue(pid, effect(1, 2)),
             Err(TimerFailure::Sequence)
         );
         let original = effect(1, 1);
-        let ack = timers.dequeue(pid, original, time(0)).unwrap();
-        assert_eq!(timers.dequeue(pid, original, time(1)).unwrap(), ack);
+        let ack = timers.dequeue(pid, original).unwrap();
+        assert_eq!(timers.dequeue(pid, original).unwrap(), ack);
         let mut conflict = original;
         conflict.consumer = SignalConsumer::SignalTimedWait;
-        assert_eq!(
-            timers.dequeue(pid, conflict, time(1)),
-            Err(TimerFailure::Sequence)
-        );
+        assert_eq!(timers.dequeue(pid, conflict), Err(TimerFailure::Sequence));
         assert_eq!(
             timers.bind(pid, pid, mm, identity(2)),
             Err(TimerFailure::Identity)
@@ -704,16 +772,16 @@ mod tests {
             Ok(false)
         );
         assert_eq!(
-            timers.dequeue(pid, effect(1, 2), time(35)).unwrap(),
-            (DequeueAck::Retired { sequence: 2 }, None)
+            timers.dequeue(pid, effect(1, 2)).unwrap(),
+            DequeueAck::Retired { sequence: 2 }
         );
         assert_eq!(
             timers.snapshot(pid, time(35)).unwrap(),
             ItimerSnapshot::default()
         );
         assert_eq!(
-            timers.dequeue(pid, effect(2, 1), time(35)).unwrap(),
-            (DequeueAck::Applied { sequence: 1 }, None)
+            timers.dequeue(pid, effect(2, 1)).unwrap(),
+            DequeueAck::Applied { sequence: 1 }
         );
     }
 
@@ -763,10 +831,157 @@ mod tests {
             }
         );
         publish(&mut timers, pid, 10);
+        timers.dequeue(pid, effect(1, 1)).unwrap();
         assert_eq!(
-            timers.dequeue(pid, effect(1, 1), time(u64::MAX - 1)),
+            timers.reconcile(pid, time(u64::MAX - 1)),
             Err(TimerFailure::Overflow)
         );
         assert_eq!(timers.snapshot(pid, time(0)).unwrap().remaining, time(0));
+        // The refused restart left the dequeued arm as it was.
+        assert_eq!(timers.dequeued_processes(), vec![pid]);
+        assert_eq!(timers.reconcile(pid, time(35)).unwrap(), Some(time(40)));
+    }
+
+    /// An acknowledged dequeue only records that the copy left the shared
+    /// queue. The timer restarts at the next reconcile point, at the first
+    /// point of its grid strictly after that point, so the periods missed
+    /// before it are dropped (a reconcile point on the grid restarts at the
+    /// next one). Before the dequeue a reconcile point restarts nothing; a
+    /// second dequeue before the reconcile point restarts it once; and once
+    /// restarted it does not restart again without a new expiry and dequeue.
+    #[test]
+    fn a_dequeue_restarts_the_timer_at_the_next_reconcile_point() {
+        for (reconcile_at, restart) in [(12, 20), (20, 30), (25, 30), (39, 40)] {
+            let (mut timers, pid, _) = bound();
+            timers
+                .replace(pid, pid, time(0), time(10), time(10))
+                .unwrap();
+            publish(&mut timers, pid, 10);
+            assert_eq!(timers.reconcile(pid, time(reconcile_at)).unwrap(), None);
+            assert_eq!(
+                timers.snapshot(pid, time(reconcile_at)).unwrap().remaining,
+                time(0)
+            );
+            assert!(timers.dequeued_processes().is_empty());
+            timers.dequeue(pid, effect(1, 1)).unwrap();
+            assert_eq!(timers.dequeued_processes(), vec![pid]);
+            timers.dequeue(pid, effect(1, 2)).unwrap();
+            assert_eq!(
+                timers.reconcile(pid, time(reconcile_at)).unwrap(),
+                Some(time(restart))
+            );
+            assert!(timers.dequeued_processes().is_empty());
+            assert_eq!(
+                timers.snapshot(pid, time(reconcile_at)).unwrap(),
+                ItimerSnapshot {
+                    remaining: time(restart - reconcile_at),
+                    interval: time(10)
+                }
+            );
+            assert_eq!(timers.reconcile(pid, time(reconcile_at)).unwrap(), None);
+        }
+    }
+
+    /// The controlled timer restarts on the traced model's grid
+    /// (`timed_waiters::checked_grid_after`, which `grid_after` saturates),
+    /// so both models restart a dequeued copy at the same instant for the
+    /// same reconcile point. A reconcile point before the dequeued expiry is
+    /// a broken invariant: it fails and leaves the timer dequeued.
+    #[test]
+    fn a_restart_uses_the_traced_grid_and_refuses_an_earlier_reconcile_point() {
+        let dequeued = || {
+            let (mut timers, pid, _) = bound();
+            timers
+                .replace(pid, pid, time(0), time(10), time(10))
+                .unwrap();
+            publish(&mut timers, pid, 10);
+            timers.dequeue(pid, effect(1, 1)).unwrap();
+            (timers, pid)
+        };
+        for t in [10, 11, 19, 20, 21, 99, 100] {
+            let (mut timers, pid) = dequeued();
+            assert_eq!(
+                timers.reconcile(pid, time(t)).unwrap(),
+                Some(crate::scheduler::timed_waiters::grid_after(
+                    time(10),
+                    time(10),
+                    time(t)
+                ))
+            );
+        }
+        let (mut timers, pid) = dequeued();
+        assert_eq!(
+            timers.reconcile(pid, time(9)),
+            Err(TimerFailure::InvalidPhase)
+        );
+        assert_eq!(timers.dequeued_processes(), vec![pid]);
+        assert_eq!(timers.reconcile(pid, time(10)).unwrap(), Some(time(20)));
+    }
+
+    /// A dequeue restarts only an inactive periodic timer: a one-shot
+    /// timer's dequeued expiry leaves it inactive, an armed timer stays as it
+    /// is, a replacement while dequeued wins over the restart, and a retired
+    /// process restarts nothing.
+    #[test]
+    fn a_dequeue_restarts_no_one_shot_armed_replaced_or_retired_timer() {
+        let (mut timers, pid, _) = bound();
+        timers
+            .replace(pid, pid, time(0), time(10), time(0))
+            .unwrap();
+        publish(&mut timers, pid, 10);
+        timers.dequeue(pid, effect(1, 1)).unwrap();
+        assert!(timers.dequeued_processes().is_empty());
+        assert_eq!(timers.reconcile(pid, time(15)).unwrap(), None);
+        assert_eq!(
+            timers.snapshot(pid, time(15)).unwrap(),
+            ItimerSnapshot::default()
+        );
+
+        timers
+            .replace(pid, pid, time(20), time(10), time(10))
+            .unwrap();
+        timers.dequeue(pid, effect(1, 2)).unwrap();
+        assert_eq!(timers.reconcile(pid, time(25)).unwrap(), None);
+        assert_eq!(timers.snapshot(pid, time(25)).unwrap().remaining, time(5));
+
+        publish(&mut timers, pid, 30);
+        timers.dequeue(pid, effect(1, 3)).unwrap();
+        timers
+            .replace(pid, pid, time(35), time(100), time(100))
+            .unwrap();
+        assert_eq!(timers.reconcile(pid, time(36)).unwrap(), None);
+        assert_eq!(timers.snapshot(pid, time(36)).unwrap().remaining, time(99));
+
+        publish(&mut timers, pid, 135);
+        timers.dequeue(pid, effect(1, 4)).unwrap();
+        assert_eq!(timers.dequeued_processes(), vec![pid]);
+        timers.retire_task(pid, pid);
+        timers.retire_process(pid);
+        assert!(timers.dequeued_processes().is_empty());
+        assert_eq!(timers.reconcile(pid, time(140)).unwrap(), None);
+    }
+
+    /// The interval names a live periodic arm, expiries included, and
+    /// nothing else.
+    #[test]
+    fn interval_names_only_a_live_periodic_arm() {
+        let (mut timers, pid, _) = bound();
+        assert_eq!(timers.interval(pid), None);
+        timers
+            .replace(pid, pid, time(0), time(10), time(7))
+            .unwrap();
+        assert_eq!(timers.interval(pid), Some(time(7)));
+        publish(&mut timers, pid, 10);
+        assert_eq!(timers.interval(pid), Some(time(7)));
+        timers
+            .replace(pid, pid, time(20), time(10), time(0))
+            .unwrap();
+        assert_eq!(timers.interval(pid), None);
+        timers
+            .replace(pid, pid, time(20), time(10), time(7))
+            .unwrap();
+        timers.retire_task(pid, pid);
+        timers.retire_process(pid);
+        assert_eq!(timers.interval(pid), None);
     }
 }

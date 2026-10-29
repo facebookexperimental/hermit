@@ -368,6 +368,20 @@ pub(super) struct SelectionFailure {
     pub failure: ProtocolFailure,
 }
 
+/// Test only: the controlled turn loop's pause at an open observation gate
+/// (`Scheduler::observation_gate_pause_due`). It sleeps in 1 ms steps until
+/// `release` is set, for at most 10 s. A plain `std::thread::sleep` keeps it
+/// free of thread-local state; the caller holds no scheduler lock.
+#[cfg(test)]
+pub(super) fn pause_until_released(release: &std::sync::atomic::AtomicBool) {
+    for _ in 0..10_000 {
+        if release.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 impl Scheduler {
     pub(crate) fn fail_parked(&mut self, tid: DetTid, failure: ProtocolFailure) {
         let pid = self
@@ -552,22 +566,74 @@ impl Scheduler {
         ))
     }
 
+    /// Acknowledges the backend's dequeue of a pending signal of `pid`. A
+    /// dequeue of the process's `ITIMER_REAL` copy does not restart the timer
+    /// here: the restart waits for the next reconcile point
+    /// (`reconcile_controlled_real_timer`), where the traced path restarts its
+    /// own (<https://github.com/rrnewton/hermit/issues/4929>).
     pub(crate) fn apply_signal_dequeue(
         &mut self,
         pid: DetPid,
         dequeue: reverie::SignalDequeue,
-        now: LogicalTime,
     ) -> Result<super::real_timer::DequeueAck, TimerFailure> {
         if self.backend_failed() {
             self.real_timers.fail(pid, TimerFailure::Unsupported);
         }
-        let (ack, next) = self.real_timers.dequeue(pid, dequeue, now)?;
-        if let Some(deadline) = next {
-            self.blocked
-                .timed_waiters
-                .insert_controlled_real_timer_deadline(deadline, pid);
+        self.real_timers.dequeue(pid, dequeue)
+    }
+
+    /// Restarts `pid`'s controlled real timer at reconcile point `t` if its
+    /// last copy was dequeued, on its grid after `t`, and queues the new
+    /// deadline. The reconcile points are the traced path's
+    /// (`reconcile_alarm`, `reconcile_inactive_alarms`): the process's
+    /// `getitimer` or `setitimer` (O1), the end of a signalfd read or
+    /// `rt_sigtimedwait` that may have consumed the copy (O2), each at the
+    /// caller's current time, and every quiesced boundary (O3), at the
+    /// committed time. So a copy taken at a return to user mode restarts
+    /// the timer after the turn that took it has been charged, as on the
+    /// traced path, rather than at the backend's earlier dequeue instant.
+    /// Returns the new deadline. A restart that does not fit fails the run.
+    pub(super) fn reconcile_controlled_real_timer(
+        &mut self,
+        pid: DetPid,
+        t: LogicalTime,
+    ) -> Option<LogicalTime> {
+        match self.real_timers.reconcile(pid, t) {
+            Ok(Some(deadline)) => {
+                self.blocked
+                    .timed_waiters
+                    .insert_controlled_real_timer_deadline(deadline, pid);
+                tracing::debug!(
+                    "[dpid {}] SIGALRM left the shared queue; ITIMER_REAL restarted at {:?}.",
+                    pid,
+                    deadline
+                );
+                Some(deadline)
+            }
+            Ok(None) => None,
+            Err(failure) => {
+                self.fail_parked_location(
+                    pid,
+                    None,
+                    ProtocolFailure::Timer(failure),
+                    "KVM controlled ITIMER_REAL restart",
+                );
+                None
+            }
         }
-        Ok(ack)
+    }
+
+    /// O3 for the controlled real timers: restart, at committed time `t`,
+    /// every one whose copy was dequeued since the last reconcile point.
+    pub(super) fn reconcile_dequeued_real_timers(&mut self, t: LogicalTime) {
+        for pid in self.real_timers.dequeued_processes() {
+            self.reconcile_controlled_real_timer(pid, t);
+        }
+    }
+
+    /// The period of `pid`'s controlled real timer, when it is periodic.
+    pub(super) fn controlled_real_timer_period(&self, pid: DetPid) -> Option<LogicalTime> {
+        self.real_timers.interval(pid)
     }
 
     /// Replaces the process's `ITIMER_REAL`.
@@ -643,6 +709,21 @@ impl Scheduler {
                 .requests
                 .values()
                 .any(|r| matches!(r.phase, ContinuationPhase::AwaitingResumeRegistration(_)))
+    }
+
+    /// The release flag of the test-only `observation_gate_pause`, while it is
+    /// not yet released and a parked observation is open: some thread's turn
+    /// is still owned by its observation, whose finish is not yet drained.
+    #[cfg(test)]
+    pub(super) fn observation_gate_pause_due(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        let release = self.observation_gate_pause.as_ref()?;
+        let open = self
+            .next_turns
+            .values()
+            .any(|turn| matches!(turn.protocol.owner, NextTurnOwner::Observation { .. }));
+        (open && !release.load(std::sync::atomic::Ordering::Acquire)).then(|| release.clone())
     }
 
     /// Both timed pop sites dispatch before any host-capable signal operation.

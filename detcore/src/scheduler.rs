@@ -1913,6 +1913,17 @@ pub struct Scheduler {
     /// Turns that `do_a_turn_blocking` ran through the controlled loop.
     #[cfg(test)]
     controlled_turn_entries: u64,
+    /// Passes of the controlled loop that waited (`Action::Wait`).
+    #[cfg(test)]
+    controlled_turn_waits: u64,
+    /// While set and not yet released, each pass of the controlled loop that
+    /// finds a parked observation open first pauses with the scheduler
+    /// unlocked, before it drains control intents and checks quiescence
+    /// (`parked::pause_until_released`). A test uses it to let a concurrent
+    /// observed worker take its signal and refill its gate first
+    /// (<https://github.com/rrnewton/hermit/issues/4929>).
+    #[cfg(test)]
+    observation_gate_pause: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) real_timers: real_timer::RealTimers,
     parked: parked::ParkedRequests,
 
@@ -4429,6 +4440,15 @@ pub async fn do_a_turn_blocking(
             Select(DetTid, Ivar<SchedRequest>, Ivar<SchedResponse>),
         }
         let mut charged = false;
+        // Whether the next quiesced pass refreshes: after every wait, and
+        // after every pass that leaves a parked observation's gate open,
+        // whether or not the loop then waits for it. The observed thread
+        // files its delivery's request (its hook) as soon as its observation
+        // has taken the signal, and that request can refill the gate before
+        // this loop next looks, so a wait alone would make the refresh, and
+        // its reconcile (O3) of the dequeue the observation made, depend on
+        // which host thread ran first
+        // (https://github.com/rrnewton/hermit/issues/4929).
         let mut refresh = false;
         let mut maintenance = 0;
         // The reference admits one due event before a selection. Control
@@ -4440,6 +4460,12 @@ pub async fn do_a_turn_blocking(
             signal_control::flush_signal_failures(&sched);
             let action = {
                 let mut state = sched.lock().unwrap();
+                #[cfg(test)]
+                if let Some(release) = state.observation_gate_pause_due() {
+                    drop(state);
+                    parked::pause_until_released(&release);
+                    state = sched.lock().unwrap();
+                }
                 state.drain_control_intents();
                 if state.backend_failed() {
                     return Err(SkipTurn);
@@ -4484,6 +4510,8 @@ pub async fn do_a_turn_blocking(
                     }
                     refresh = false;
                     if state.are_all_quiesced().is_some() {
+                        // The refresh pass's selection opened a gate.
+                        refresh = true;
                         continue;
                     }
                     match maintenance {
@@ -4504,6 +4532,7 @@ pub async fn do_a_turn_blocking(
                             if let Err(error) = state.select_parked_alarm() {
                                 state.fail_parked_selection(error);
                             }
+                            refresh |= state.are_all_quiesced().is_some();
                             maintenance = 2;
                             continue;
                         }
@@ -4525,6 +4554,7 @@ pub async fn do_a_turn_blocking(
                             if let Err(error) = state.select_parked_alarm() {
                                 state.fail_parked_selection(error);
                             }
+                            refresh |= state.are_all_quiesced().is_some();
                             maintenance = 5;
                             continue;
                         }
@@ -4536,6 +4566,7 @@ pub async fn do_a_turn_blocking(
                             // Installing an observation creates an empty callback
                             // gate. Await its hook/finish before any tentative pop.
                             if state.are_all_quiesced().is_some() {
+                                refresh = true;
                                 continue;
                             }
                             let (tid, req, resp) = state.step3_peek().ok_or(SkipTurn)?;
@@ -4543,6 +4574,10 @@ pub async fn do_a_turn_blocking(
                         }
                     }
                 } else {
+                    #[cfg(test)]
+                    {
+                        state.controlled_turn_waits += 1;
+                    }
                     Action::Wait {
                         request,
                         control: state.control_waiter(),
@@ -5412,6 +5447,10 @@ impl Scheduler {
             host_signal_attempts: 0,
             #[cfg(test)]
             controlled_turn_entries: 0,
+            #[cfg(test)]
+            controlled_turn_waits: 0,
+            #[cfg(test)]
+            observation_gate_pause: None,
             real_timers: Default::default(),
             parked: Default::default(),
             sigalrm: Default::default(),
@@ -19227,8 +19266,6 @@ impl Scheduler {
         // turns than on the guest. It hints nothing, as before this cap.
         let fast_periodic = |event: &TimedEvent| match event {
             TimedEvent::SignalEvt(id, _, _) => self
-                .blocked
-                .timed_waiters
                 .signal_timer_period(*id)
                 .is_some_and(|period| period <= self.fast_timer_period),
             TimedEvent::ThreadEvt(_) => false,
@@ -19268,6 +19305,21 @@ impl Scheduler {
         Some(Duration::from_nanos(
             earliest.as_nanos().saturating_sub(now.as_nanos()),
         ))
+    }
+
+    /// The period of the periodic signal timer `id`, from the model that keeps
+    /// it: with an installed signal control, a process's `ITIMER_REAL` is its
+    /// controlled real timer (`real_timer.rs`), whose deadlines are queued
+    /// here without a legacy entry
+    /// (<https://github.com/rrnewton/hermit/issues/4929>); every other timer
+    /// is read from the timed waiters. `None` for a one-shot timer.
+    fn signal_timer_period(&self, id: timed_waiters::SignalTimerId) -> Option<LogicalTime> {
+        match id {
+            timed_waiters::SignalTimerId::Alarm(process) if self.signal_control_installed() => {
+                self.controlled_real_timer_period(process)
+            }
+            _ => self.blocked.timed_waiters.signal_timer_period(id),
+        }
     }
 
     /// Record the deadline hint for a thread that has just armed or re-armed

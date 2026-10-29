@@ -126,8 +126,7 @@ impl GlobalState {
                     guest_time.inherited_nanos(),
                 );
             }
-            let now = self.global_time.lock().unwrap().as_nanos();
-            sched.apply_signal_dequeue(pid, dequeue, now)
+            sched.apply_signal_dequeue(pid, dequeue)
         });
         if let Err(error) = result {
             sched.fail_parked(tid, ProtocolFailure::Timer(error));
