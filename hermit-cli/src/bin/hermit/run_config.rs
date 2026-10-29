@@ -1382,6 +1382,14 @@ mod tests {
             "stacktrace-event",
             &["--stacktrace-event=3", "-s", "5,/tmp/st.txt"],
         ),
+        (
+            "stacktrace-at-schedule-positions",
+            &[
+                "--replay-schedule-from=/tmp/s.json",
+                "--stacktrace-event=3",
+                "--stacktrace-at-schedule-positions",
+            ],
+        ),
         ("stacktrace-signal", &["--stacktrace-signal=SIGINT"]),
         ("preemption-stacktrace", &["--preemption-stacktrace"]),
         (

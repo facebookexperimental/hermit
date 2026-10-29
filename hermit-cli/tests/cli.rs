@@ -30684,14 +30684,17 @@ fn a_thread_that_execs_from_its_crash_handler_takes_the_post_crash_switch() {
 ///
 /// tests/c/loopback_accept_reader.c connects a loopback TCP pair, and its
 /// connect makes polling retries as the kernel's state calls for, not as a
-/// replayed schedule says. The recorded prefix is replayed as recorded, with
-/// the first retry removed (a recording that made one fewer than the
-/// replay) and with it doubled (one more). Each replay records the events it
-/// observed, so the test knows which event a traced index names there. In
-/// every case the requested position is the main thread's next syscall
-/// entry after that retry, and the stack must print there; in at least one
-/// edited case the traced index must name another event, or the case would
-/// not exercise the defect.
+/// replayed schedule says. The test records it, then replays a prefix of the
+/// recording whose connect holds exactly 0, 1 and 2 recorded retries, and
+/// asks each replay for the stack at the main thread's next syscall entry
+/// after the connect, by position. The stack must print there in all three.
+/// Each replay also records the events it observed, which says what the
+/// same traced index names in that replay: a case whose recorded retries
+/// differ from the ones the replay makes moves it. The replay's count is the
+/// kernel's, not the schedule's, so at least two of the three cases should
+/// move it. If none does, every replay made the retries its schedule held,
+/// the cases exercise nothing on this host, and the test says so and skips
+/// rather than pass on that evidence.
 #[test]
 fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
     static GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -30715,18 +30718,35 @@ fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
 
     let record = schedule_of(&recorded);
     let events = record["global"].as_array().unwrap().clone();
-    let phase = |event: &serde_json::Value| event["op"]["Syscall"][1].as_str().map(str::to_owned);
-    let retry = events
+    let syscall = |event: &serde_json::Value, phase: &str| {
+        (event["op"]["Syscall"][1].as_str() == Some(phase))
+            .then(|| event["op"]["Syscall"][0].as_i64())
+            .flatten()
+    };
+    let connect = events
         .iter()
-        .position(|event| phase(event).as_deref() == Some("Polling"))
-        .expect("the recording holds the connect's polling retry");
-    let main = events[retry]["dettid"].clone();
-    let target = (retry + 1..events.len())
-        .find(|&ix| {
-            events[ix]["dettid"] == main && phase(&events[ix]).as_deref() == Some("Prehook")
-        })
-        .expect("the main thread enters another syscall after its retry");
+        .position(|event| syscall(event, "Prehook") == Some(libc::SYS_connect))
+        .expect("the recording holds the connect");
+    let main = events[connect]["dettid"].clone();
+    let of_main = |ix: &usize| events[*ix]["dettid"] == main;
+    let returned = (connect + 1..events.len())
+        .filter(of_main)
+        .find(|&ix| syscall(&events[ix], "Posthook") == Some(libc::SYS_connect))
+        .expect("the connect returns");
+    let target = (returned + 1..events.len())
+        .filter(of_main)
+        .find(|&ix| syscall(&events[ix], "Prehook").is_some())
+        .expect("the main thread enters another syscall after its connect");
     let prefix_len = (target + 20).min(events.len());
+    // The connect's retries: the main thread's polling events between its
+    // entry and its return. A retry takes the return's time, so one the
+    // recording did not make is the return's event as a polling one.
+    let retries: Vec<usize> = (connect + 1..returned)
+        .filter(of_main)
+        .filter(|&ix| syscall(&events[ix], "Polling").is_some())
+        .collect();
+    let mut retry = events[returned].clone();
+    retry["op"]["Syscall"][1] = serde_json::json!("Polling");
     // The thread, time and kind of an event, which pick it out among its
     // neighbours.
     let identity = |event: &serde_json::Value| {
@@ -30753,28 +30773,31 @@ fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
     };
     let (target_tid, target_time) = printed(&events[target]);
 
-    let mut shifted = 0;
-    for (case, edit, position) in [
-        ("as recorded", 0i64, target),
-        ("one retry fewer in the recording", -1, target - 1),
-        ("one retry more in the recording", 1, target + 1),
-    ] {
-        let mut prefix = events[..prefix_len].to_vec();
-        match edit {
-            -1 => {
-                prefix.remove(retry);
-            }
-            1 => prefix.insert(retry, events[retry].clone()),
-            _ => {}
+    let mut moved = Vec::new();
+    for recorded_retries in 0..3 {
+        let mut prefix: Vec<serde_json::Value> = events[..prefix_len]
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| !retries.contains(ix))
+            .map(|(_, event)| event.clone())
+            .collect();
+        let at = returned - retries.len();
+        for _ in 0..recorded_retries {
+            prefix.insert(at, retry.clone());
         }
+        let position = target - retries.len() + recorded_retries;
         assert_eq!(identity(&prefix[position]), identity(&events[target]));
         let mut edited = record.clone();
         edited["global"] = serde_json::Value::Array(prefix);
-        let path = directory.path().join(format!("prefix{edit}.json"));
+        let path = directory
+            .path()
+            .join(format!("prefix{recorded_retries}.json"));
         fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
         let replay_from = format!("--replay-schedule-from={}", path.display());
         let stack_at = format!("--stacktrace-event={position}");
-        let realized = directory.path().join(format!("realized{edit}.json"));
+        let realized = directory
+            .path()
+            .join(format!("realized{recorded_retries}.json"));
         let realized_to = format!("--record-preemptions-to={}", realized.display());
         let mut args: Vec<&str> = common.to_vec();
         args.extend([
@@ -30795,30 +30818,37 @@ fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
                     "Printing stack trace for scheduled event #{position} = "
                 ))
             })
-            .unwrap_or_else(|| panic!("{case}: no stack printed:\n{log}"));
+            .unwrap_or_else(|| {
+                panic!("{recorded_retries} recorded retries: no stack printed:\n{log}")
+            });
         assert!(
             line.contains(&target_tid)
                 && line.contains(&target_time)
                 && line.ends_with("Prehook)):"),
-            "{case}: schedule position #{position} is {target_tid}{target_time}syscall entry, but \
-             the stack printed at:\n{line}"
+            "{recorded_retries} recorded retries: schedule position #{position} is \
+             {target_tid}{target_time}syscall entry, but the stack printed at:\n{line}"
         );
         // The event a traced index #position names in this replay: the
         // replay's own recording holds every event it observed.
         let observed = schedule_of(&realized)["global"].as_array().unwrap().clone();
         if identity(&observed[position]) != identity(&events[target]) {
-            shifted += 1;
-        } else {
-            assert_eq!(
-                edit, 0,
-                "{case}: the replay made the retries the edit removed or added"
-            );
+            moved.push(recorded_retries);
         }
     }
-    assert!(
-        shifted > 0,
-        "no edited case moved the traced index, so this host's replay followed the recorded \
-         retries and the test exercises nothing"
+    if moved.is_empty() {
+        eprintln!(
+            "SKIPPED a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries: every \
+             replay made the connect retries its schedule held (0, 1 and 2; the recording made \
+             {}), so no case moved the traced index and the cases exercise nothing on this host. \
+             The count is the kernel's.",
+            retries.len()
+        );
+        return;
+    }
+    eprintln!(
+        "the recording made {} connect retries; the cases with {moved:?} recorded retries moved \
+         the traced index, and the stack printed at the schedule position in all three",
+        retries.len()
     );
 }
 

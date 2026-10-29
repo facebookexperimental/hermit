@@ -5494,11 +5494,12 @@ impl Scheduler {
                         let notes_background_starts = record.notes_background_starts();
                         let vec = record.into_global();
                         trace!("Trace loaded, length {}", vec.len());
-                        // Indices are traced (observed) event counts, the same
-                        // counting `hermit analyze` uses for the events it names,
-                        // so no recorded event is kept to match against, and one at
-                        // or past the end names the events the run makes after the
-                        // schedule runs out.
+                        // Indices are traced (observed) event counts or, under
+                        // `--stacktrace-at-schedule-positions` (how `hermit analyze`
+                        // asks for its stacks), positions of the replayed schedule.
+                        // Either way no recorded event is kept to match against, and
+                        // one at or past the end names the events the run makes after
+                        // the schedule runs out.
                         let toprint = cfg
                             .stacktrace_event
                             .iter()
