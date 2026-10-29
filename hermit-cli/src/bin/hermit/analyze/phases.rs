@@ -4576,8 +4576,9 @@ mod tests {
             } else {
                 let report = result.unwrap();
                 assert!(report.header.contains("decides the outcome"));
-                assert!(report.critical_event1.stack.is_none());
-                assert!(report.critical_event2.stack.is_none());
+                for event in [&report.critical_event1, &report.critical_event2] {
+                    assert!(event.as_ref().is_some_and(|event| event.stack.is_none()));
+                }
             }
             assert_eq!(stacks, expected_stacks);
             assert_eq!(continuations, usize::from(target == Some(true)));
