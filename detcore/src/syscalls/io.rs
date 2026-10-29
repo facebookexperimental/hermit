@@ -99,14 +99,13 @@ mod temporary_mask_forms;
 fn print_poll(call: &syscalls::Poll) {
     let len = call.nfds();
     debug!("POLL: on {} fds, timeout {}", len, call.timeout());
+    let Some(fds) = call.fds() else {
+        return;
+    };
     // TODO: nicer API for reading arrays from the guest:
     unsafe {
         for i in 0..len {
-            debug!(
-                "POLL: fd {} = {}",
-                i,
-                call.fds().unwrap().offset(i as isize)
-            );
+            debug!("POLL: fd {} = {}", i, fds.offset(i as isize));
         }
     }
 }
@@ -6251,6 +6250,26 @@ mod tests {
                 Err(Error::Errno(Errno::EINTR))
             ));
         }
+    }
+
+    #[test]
+    fn print_poll_accepts_null_fds_without_touching_syscall_arguments() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for nfds in [0, 1, libc::nfds_t::MAX] {
+                let call = syscalls::Poll::new()
+                    .with_fds(None)
+                    .with_nfds(nfds)
+                    .with_timeout(1);
+                assert!(std::panic::catch_unwind(|| print_poll(&call)).is_ok());
+                assert_eq!(call.fds(), None);
+                assert_eq!(call.nfds(), nfds);
+                assert_eq!(call.timeout(), 1);
+            }
+        });
     }
 
     #[test]
