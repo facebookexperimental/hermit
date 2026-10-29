@@ -12352,8 +12352,6 @@ where
     }
 }
 
-/// The CPU affinity of task `tid` under `--virtual-cpus`
-/// (`Scheduler::cpu_affinity`).
 /// When the timed signal that woke the calling thread's `nanosleep` was due,
 /// if one did (`Scheduler::take_sleep_interruption`). Sent directly, not
 /// through `send_and_update_time`: it is answered before any clock
@@ -12377,6 +12375,8 @@ where
     }
 }
 
+/// The CPU affinity of task `tid` under `--virtual-cpus`
+/// (`Scheduler::cpu_affinity`).
 pub(crate) async fn cpu_affinity<G, T>(guest: &mut G, tid: DetTid) -> crate::cpu_set::TaskAffinity
 where
     G: Guest<Detcore<T>>,

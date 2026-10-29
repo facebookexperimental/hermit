@@ -2124,6 +2124,7 @@ fn an_empty_boundary_round_trip_beside_sibling_permits_changes_only_the_nonce_an
                         site,
                         selection_nonce: 1,
                     },
+                    dequeue: None,
                 },
                 ack: ack.clone(),
             },
@@ -2236,6 +2237,7 @@ fn a_parked_wait_leaves_nothing_for_an_empty_boundary_to_clean() {
                     site,
                     selection_nonce: 1,
                 },
+                dequeue: None,
             },
             ack: ack.clone(),
         },
@@ -2755,6 +2757,7 @@ fn a_sibling_boundary_is_authorized_beside_an_observed_parked_wait() {
                     site,
                     selection_nonce: 1,
                 },
+                dequeue: None,
             },
             ack: ack.clone(),
         },
@@ -2973,6 +2976,7 @@ fn a_group_exit_retires_permit_holding_siblings_whose_receipts_settle_them() {
                             site,
                             selection_nonce: 1,
                         },
+                        dequeue: None,
                     },
                     ack: ack.clone(),
                 },
@@ -5839,6 +5843,7 @@ fn child_wait_caught_selection_wins_later_exit_and_keeps_return_gate() {
                     site,
                     selection_nonce: 1,
                 },
+                dequeue: None,
             },
             ack: ack.clone(),
         },
@@ -7806,3 +7811,118 @@ fn a_controlled_group_exit_retires_only_its_own_threads_beside_a_reused_member_i
         }
     ));
 }
+/// The KVM controlled alarm path: a timer's published signal that an observed
+/// `nanosleep`'s own observation removes and catches interrupts the sleep at
+/// the timer's due time, however late the observation's finish. The finish
+/// notes that due time, taken once, so the sleep reports its remaining time
+/// from it: deadline N = 100, due D = 10, with committed time already past N
+/// at the finish, the remaining time is N - D = 90. An outcome that does not
+/// interrupt the sleep with exactly that removal leaves no note: no eligible
+/// signal (the removal was ignored), a caught signal the selection removed
+/// another way, a removal some other thread made, and a fatal one. A
+/// process-directed POSIX timer's publication is noted the same way
+/// (https://github.com/rrnewton/hermit/issues/4931).
+#[test]
+fn a_caught_timer_interruption_of_an_observed_nanosleep_notes_the_timers_due_time() {
+    for case in [
+        "caught",
+        "caught POSIX timer",
+        "no eligible signal",
+        "caught another removal",
+        "removed by another thread",
+        "fatal",
+    ] {
+        let (mut s, b) = fixture();
+        let (tid, mm, site) = add(&mut s, 100, 100);
+        let (other, _, _) = add(&mut s, 100, 101);
+        let response = sleep(&mut s, tid, mm, site, 100);
+        s.committed_time = at(10);
+        let (process, event) = if case == "caught POSIX timer" {
+            s.dispatch_timed_signal(
+                at(10),
+                timed_waiters::SignalTimerId::Posix(DetPid::from_raw(100), 3),
+                timed_waiters::SignalTarget::Process(tid),
+                timed_waiters::TimerSignal::Send(Signal::SIGUSR1),
+                true,
+                at(10),
+            );
+            b.timer_publications.lock().unwrap()[0]
+        } else {
+            s.replace_real_timer(tid, tid, at(0), at(10), at(0), Signal::SIGALRM)
+                .unwrap();
+            s.step2b_process_timed(&committed_clock(&s));
+            b.publications.lock().unwrap()[0]
+        };
+        assert!(!s.backend_failed(), "{case}");
+        b.recipients.lock().unwrap().push(SignalRecipient {
+            task: task(100, 100),
+        });
+        s.select_parked_alarm().unwrap();
+        let observed = selected(&response);
+        // Other work carries committed time past the sleep's deadline before
+        // the observation finishes.
+        s.committed_time = at(150);
+        let remover = if case == "removed by another thread" {
+            other
+        } else {
+            tid
+        };
+        let removal = reverie::SignalDequeue {
+            process,
+            sequence: 1,
+            consumer: reverie::SignalConsumer::ReturnToUser,
+            domain: reverie::PendingDomain::Process,
+            event,
+        };
+        s.apply_signal_dequeue(DetPid::from_raw(100), remover, removal)
+            .unwrap();
+        let selection = reverie::PreparedSignalToken {
+            site,
+            selection_nonce: 1,
+        };
+        let finish = match case {
+            "no eligible signal" => ObservationFinish::ResumeSameWait,
+            "caught another removal" => ObservationFinish::InterruptForCaught {
+                selection,
+                dequeue: Some(reverie::DequeueId {
+                    process,
+                    sequence: 2,
+                }),
+            },
+            "fatal" => ObservationFinish::Terminate { selection },
+            _ => ObservationFinish::InterruptForCaught {
+                selection,
+                dequeue: Some(removal.id()),
+            },
+        };
+        let ack = Ivar::new();
+        s.post_control(
+            tid,
+            mm,
+            ControlIntent::Finish {
+                wait: observed.continuation,
+                lease: observed.lease,
+                site,
+                finish,
+                ack: ack.clone(),
+            },
+        )
+        .unwrap();
+        s.drain_control_intents();
+        assert!(matches!(ack.try_read(), Some(Ok(_))), "{case}");
+        assert!(s.parked.observed_timer_dequeues.is_empty(), "{case}");
+        if case.starts_with("caught") && case != "caught another removal" {
+            let due = s.take_sleep_interruption(tid);
+            assert_eq!(due, Some(at(10)), "{case}");
+            assert_eq!(
+                at(100).as_nanos() - due.unwrap().as_nanos(),
+                90,
+                "the remaining time"
+            );
+            assert_eq!(s.take_sleep_interruption(tid), None, "taken once");
+        } else {
+            assert_eq!(s.take_sleep_interruption(tid), None, "{case}");
+        }
+    }
+}
+

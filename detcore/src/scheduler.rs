@@ -6380,6 +6380,12 @@ impl Scheduler {
         }
         let continuation =
             (rs.continues_sigreturn && Self::is_inbound_signal_turn(&rs)).then_some(rs.tid);
+        // A `nanosleep` filing its request starts with no interruption noted
+        // (`BlockedPool::sleep_interruptions`): one an earlier sleep's wake
+        // left behind can never reach it.
+        if rs.fyi.as_str() == crate::resources::NANOSLEEP_FYI {
+            self.blocked.sleep_interruptions.remove(&rs.tid);
+        }
         if let Some(dropped) = req.try_put(Ok(rs)) {
             let tolerated = matches!(
                 req.try_read(),
@@ -7057,6 +7063,8 @@ impl Scheduler {
         }
         self.real_timers.retire_task(*detpid, *dtid);
         self.retire_parked_requests(*dtid);
+        self.parked.observed_timer_dequeues.remove(dtid);
+        self.blocked.sleep_interruptions.remove(dtid);
 
         let _ = self.priorities.remove(dtid);
         self.turn_clocks.remove(dtid);
@@ -7153,6 +7161,7 @@ impl Scheduler {
             }
             self.blocked.timed_waiters.remove_process_timers(*detpid);
             self.real_timers.retire_process(*detpid);
+            self.parked.forget_timer_publications(*detpid);
             // A dying process discards its pending signals.
             self.pending_real_time_expirations.remove(detpid);
             self.child_exit_sigchld.forget_process(*detpid);
@@ -13972,7 +13981,11 @@ impl Scheduler {
                     // EINTR.
                     let interruption = self.timed_sleep_interruption(dettid);
                     let woken = self.force_unblock_thread_at(dettid, rsrcs, true);
-                    self.note_sleep_interruption(dettid, interruption);
+                    // Only an interruption delivered to the sleep: a thread
+                    // held at a gate keeps its request and takes none.
+                    if woken {
+                        self.note_sleep_interruption(dettid, interruption);
+                    }
                     if delivery_placed {
                         self.blocked.sigchld_ready.insert(dettid);
                     }
@@ -14097,7 +14110,9 @@ impl Scheduler {
                 if parked_sleep {
                     let interruption = self.timed_sleep_interruption(dettid);
                     let woken = self.force_unblock_thread_at(dettid, rsrcs, true);
-                    self.note_sleep_interruption(dettid, interruption);
+                    if woken {
+                        self.note_sleep_interruption(dettid, interruption);
+                    }
                     self.mark_woken_sleep_taker(dettid, signal, woken && ends);
                     self.blocked.woken_sleeps.insert(dettid);
                 } else if self.in_guest_signal_delivery
@@ -33301,6 +33316,68 @@ mod test {
                 assert!(!scheduler.blocked.woken_sleeps.contains(&target), "{case}");
                 assert_eq!(scheduler.take_sleep_interruption(target), None, "{case}");
             }
+        }
+    }
+
+    /// A timed signal sent to a `nanosleep` held at a happens-before gate is
+    /// not delivered to it (`force_unblock_thread_at` leaves the thread held,
+    /// its request in place), so no interruption is noted: the note is only
+    /// for an interruption delivered to the sleep, and one left here would
+    /// outlive it.
+    #[test]
+    fn a_timed_signal_to_a_sleep_held_at_a_gate_notes_no_interruption() {
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        for queued in [false, true] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, queued);
+            scheduler.committed_time = LogicalTime::from_nanos(5_001_000_000);
+            set_sleeper_state(&mut scheduler, target, sleeper_state(usr1, 0, 0, 0));
+            let mut hb = hb_runtime(HB_GATE_SPEC);
+            hb.parked.insert(target);
+            scheduler.happens_before = Some(hb);
+            scheduler.signal_sent_at = Some(LogicalTime::from_nanos(4_950_000_000));
+            scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+            assert!(
+                scheduler.inbound_signals(target).is_empty(),
+                "queued {queued}"
+            );
+            assert_eq!(
+                scheduler.take_sleep_interruption(target),
+                None,
+                "queued {queued}"
+            );
+        }
+    }
+
+    /// A `nanosleep` filing its request starts with no interruption noted: a
+    /// note an earlier sleep's wake left behind is dropped. Another request
+    /// leaves the note alone.
+    #[test]
+    fn a_nanosleep_filing_its_request_drops_an_earlier_note() {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let earlier = LogicalTime::from_nanos(1_000);
+        for (fyi, kept) in [(NANOSLEEP_FYI, false), (PAUSE_FYI, true)] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let sleeper = DetTid::from_raw(100);
+            register_known_thread(&mut scheduler, sleeper);
+            scheduler
+                .blocked
+                .sleep_interruptions
+                .insert(sleeper, earlier);
+            let mut sleep = Resources::new(sleeper);
+            sleep.insert(
+                ResourceID::SleepUntil(LogicalTime::from_nanos(5_000)),
+                Permission::W,
+            );
+            sleep.fyi(fyi);
+            let req = scheduler.next_turns[&sleeper].req.clone();
+            scheduler.request_put(&req, sleep, &global_time);
+            assert_eq!(
+                scheduler.take_sleep_interruption(sleeper),
+                kept.then_some(earlier),
+                "{fyi}"
+            );
         }
     }
 
