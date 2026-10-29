@@ -35,7 +35,7 @@ fn test_fn_with_config<T, F>(
 where
     T: reverie::Tool + 'static,
     T::GlobalState: reverie::GlobalTool<Config = detcore::Config> + Send,
-    F: FnOnce() + Send,
+    F: FnOnce() + Send + 'static,
 {
     on_session_stack(move || {
         // In-process sessions from different tests wedge each other's tracers;
@@ -53,7 +53,7 @@ fn check_fn_with_config<T, F>(f: F, config: detcore::Config, capture_output: boo
 where
     T: reverie::Tool + 'static,
     T::GlobalState: reverie::GlobalTool<Config = detcore::Config> + Send,
-    F: FnOnce() + Send,
+    F: FnOnce() + Send + 'static,
 {
     on_session_stack(move || {
         let _session = detcore_testutils::serialized_session();
@@ -71,6 +71,11 @@ where
 /// 2 MiB stack under plain `cargo test`; the allowance belongs to these
 /// test sessions, so it is set here in the test harness, not exported to
 /// every Cargo process.
+///
+/// The guest is forked from this thread, so in the guest glibc treats the
+/// test thread's stack as free and reuses it for the guest's threads: a guest
+/// closure owns what it uses (`'static`) rather than borrow the test thread's
+/// locals (detcore-testutils' `test_fn_with_logs`).
 fn on_session_stack<T>(run: impl FnOnce() -> T + Send) -> T
 where
     T: Send,
@@ -116,7 +121,7 @@ fn tod_from_epoch() {
     };
     let epoch = config.epoch;
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let now = Utc::now();
             let delta_ms = diff_millis(epoch, now);
             // However exactly we compute logical time, this should be within a small
@@ -256,7 +261,7 @@ fn tod_gettimeofday() {
     };
     let epoch = config.epoch;
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             assert_eq!(
                 unsafe { libc::gettimeofday(tp.as_mut_ptr(), ptr::null_mut()) },
                 0
@@ -339,7 +344,7 @@ fn tod_gettimeofday_faulting_tz_writes_virtual_tv() {
     };
     let epoch_micros = config.epoch.timestamp_micros();
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let (readonly, page_size) = map_pages(1);
             assert_eq!(
                 unsafe { libc::mprotect(readonly.cast(), page_size, libc::PROT_READ) },
@@ -498,7 +503,7 @@ fn tod_gettimeofday_misaligned_tv_stores_whole_words_only() {
     };
     let epoch_micros = config.epoch.timestamp_micros();
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             // Address 1 is below mmap_min_addr, so it can never be mapped.
             let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
             let read_write = libc::PROT_READ | libc::PROT_WRITE;
@@ -592,7 +597,7 @@ fn tod_gettimeofday_faulting_tz_write_only_tv_receives_virtual_time() {
     };
     let epoch_micros = config.epoch.timestamp_micros();
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
             let read_write = libc::PROT_READ | libc::PROT_WRITE;
             let write_only = libc::PROT_WRITE;
@@ -662,7 +667,7 @@ fn tod_gettimeofday_faulting_tz_crossing_word_needs_both_pages_writable() {
     };
     let epoch_micros = config.epoch.timestamp_micros();
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
             let read_write = libc::PROT_READ | libc::PROT_WRITE;
             // The first page's protection, the second page's, and how many
@@ -1116,7 +1121,7 @@ fn tod_time() {
     };
     let epoch = config.epoch;
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let t = unsafe { libc::time(&mut tloc as *mut i64) };
             assert_eq!(t, tloc);
             let dt = DateTime::from_timestamp(t, 0).unwrap();
@@ -1139,7 +1144,7 @@ fn tod_clock_gettime() {
     };
     let epoch = config.epoch;
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             assert_eq!(
                 unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, tp.as_mut_ptr()) },
                 0
@@ -1827,7 +1832,7 @@ fn tod_clock_getres() {
         ..Default::default()
     };
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             assert_eq!(
                 unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC, tp.as_mut_ptr()) },
                 0
@@ -1878,7 +1883,7 @@ fn tod_clock_getres_2() {
     let sequentialize = config.sequentialize_threads;
     let timeout_disabled = config.max_timeslice.is_none();
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let now = time::Instant::now();
             // Spot check a single syscall clock delta (clock_gettime).
             let nanos = now.elapsed().as_nanos();

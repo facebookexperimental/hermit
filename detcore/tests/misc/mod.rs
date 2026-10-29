@@ -120,7 +120,7 @@ fn cpuid_faulting_supported() -> bool {
 
 fn det_test_fn_without_pmu<F>(f: F)
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
 {
     let config = detcore::Config {
         max_timeslice: None,
@@ -131,7 +131,7 @@ where
 
 fn det_test_fn_sequential_without_pmu<F>(f: F)
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
 {
     det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Child, f);
 }
@@ -140,7 +140,7 @@ where
 /// for a guest that reads a name only that level has.
 fn det_test_fn_sequential_without_pmu_at_standard<F>(f: F)
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
 {
     let config = detcore::Config {
         max_timeslice: None,
@@ -153,7 +153,7 @@ where
 
 fn det_test_fn_sequential_without_pmu_with_post_fork<F>(runs_post_fork: detcore::RunsPostFork, f: F)
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
 {
     let config = detcore::Config {
         max_timeslice: None,
@@ -305,6 +305,40 @@ fn run_madvise_policy_test(passthru_opt: bool) {
         config,
         detcore_testutils::expect_success,
     );
+}
+
+/// A guest's first thread gets the calling test thread's stack, and the guest
+/// closure must not be on it. The guest is forked from detcore-testutils'
+/// session thread, so in the guest glibc counts the test thread as gone and
+/// marks its stack free in its stack cache (glibc 2.34 `reclaim_stacks`). A
+/// thread the guest starts with the same stack size, Rust's default, as this
+/// one is, takes that stack, and writing over it here overwrites what the
+/// test thread had near its top. On exit the thread hands it back, and glibc
+/// unmaps it when the cache passes its 40 MiB limit, as one 64 MiB
+/// `RUST_MIN_STACK` stack does. A closure kept on the test thread's stack, or
+/// data it borrowed from there, was then overwritten or unmapped: the marker
+/// below read as the fill byte, or faulted. That needs the test thread's stack
+/// to be the one glibc hands out, as when the test runs alone in its process
+/// (nextest); with this fix the marker is on the heap either way.
+#[test]
+fn a_guest_thread_on_the_callers_stack_leaves_the_guest_closure_intact() {
+    const MARKER: u64 = 0x5a5a_1234_5678_5a5a;
+    let marker = [MARKER; 64];
+    det_test_fn_without_pmu(move || {
+        std::thread::spawn(|| {
+            // A quarter of a default 2 MiB stack, from near its top: far
+            // deeper than the test thread's frames down to the closure.
+            let mut fill = [0xa5_u8; 512 << 10];
+            std::hint::black_box(&mut fill);
+        })
+        .join()
+        .unwrap();
+        assert!(
+            marker.iter().all(|word| *word == MARKER),
+            "the guest closure's capture changed under its thread: {:#x}",
+            marker[0]
+        );
+    });
 }
 
 #[test]

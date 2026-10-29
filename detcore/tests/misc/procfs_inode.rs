@@ -46,13 +46,13 @@ fn config() -> Config {
 }
 
 /// Run `guest` under Detcore and require that it exits 0.
-fn under_detcore(guest: impl FnOnce() + Send) {
+fn under_detcore(guest: impl FnOnce() + Send + 'static) {
     under_detcore_with(config(), guest)
 }
 
 /// Run `guest` under Detcore configured by `config` and require that it
 /// exits 0.
-fn under_detcore_with(config: Config, guest: impl FnOnce() + Send) {
+fn under_detcore_with(config: Config, guest: impl FnOnce() + Send + 'static) {
     let (output, _) = detcore_testutils::test_fn_with_config::<Detcore, _>(
         guest,
         detcore_testutils::prepare_ptrace_timer_config(config),
@@ -376,12 +376,15 @@ fn an_overwritten_path_does_not_name_the_entry_it_now_leads_to() {
     in_its_own_process(
         "an_overwritten_path_does_not_name_the_entry_it_now_leads_to",
         || {
-            let links = tempfile::tempdir().unwrap();
+            // The guest closure owns what it uses (detcore-testutils'
+            // `test_fn_with_logs`); this process drops the directory.
+            let links = std::sync::Arc::new(tempfile::tempdir().unwrap());
             std::os::unix::fs::symlink("/proc/self/task", links.path().join("orig")).unwrap();
             std::os::unix::fs::symlink("/proc/self/fd", links.path().join("mA")).unwrap();
-            under_detcore(|| {
+            let guest_links = std::sync::Arc::clone(&links);
+            under_detcore(move || {
                 let fds = std::fs::metadata("/proc/self/fd").unwrap().ino();
-                let directory = File::open(links.path()).unwrap();
+                let directory = File::open(guest_links.path()).unwrap();
                 let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
                 let buffer = stat.as_mut_ptr().cast::<u8>();
                 let path = b"orig\0";
@@ -467,7 +470,7 @@ fn the_proc_root_link_count_through_the_cwd_does_not_count_host_processes() {
     let native = cwd_link_count(None)
         .map(drop)
         .map_err(|error| error.raw_os_error());
-    under_detcore(|| {
+    under_detcore(move || {
         std::env::set_current_dir("/proc").unwrap();
         let empty = CString::new("").unwrap();
         assert_eq!(cwd_link_count(Some(&empty)).unwrap(), 1, "an empty path");

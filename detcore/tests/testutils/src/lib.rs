@@ -598,20 +598,24 @@ macro_rules! basic_det_test {
 pub fn det_test_all_configs<C, T, O>(check: C, test: T, oracle: O)
 where
     C: Fn(&Config) -> bool,
-    T: Fn(&Config) + Sync,
+    T: Fn(&Config) + Send + Sync + 'static,
     O: Fn(&Output, <Detcore as Tool>::GlobalState) + Clone,
 {
+    // The guest closure owns what it uses, on the heap (`test_fn_with_logs`).
+    let test = Arc::new(test);
     let do_cfg = |cfg: Config| {
         let cfg2 = cfg.clone();
-        let test2 = || test(&cfg);
+        let isdet = check(&cfg);
         println!("Full config: {:?}", cfg);
         println!(
             "================================================================================"
         );
+        let test = Arc::clone(&test);
+        let test2 = move || test(&cfg);
         let oracle2 = |output: &Output, state: <Detcore as Tool>::GlobalState| {
             (oracle.clone())(output, state);
         };
-        det_test_fn_with_config(check(&cfg), test2, cfg2, oracle2);
+        det_test_fn_with_config(isdet, test2, cfg2, oracle2);
     };
     println!("\nDEFAULT mode");
     do_cfg(DEFAULT_CFG.clone());
@@ -824,6 +828,19 @@ impl Drop for SessionGuard {
 
 /// Similar to Reverie's `test_fn_with_config` that captures and returns the tracer's
 /// logs as well.
+///
+/// `f` owns what it uses (`'static`) and reaches the guest on the heap: the
+/// guest is forked from the session thread below, not from the caller's
+/// thread. In the forked guest glibc counts every other thread as gone and
+/// marks its stack free in its stack cache (glibc 2.34 `reclaim_stacks`,
+/// sysdeps/nptl/fork.h), so the first thread the guest starts with the
+/// caller's stack size, Rust's default for both, takes the caller's stack
+/// (`get_cached_stack` takes any cached stack up to four times the size
+/// asked for) and writes over it. On that thread's exit glibc unmaps cached
+/// stacks while the cache is over its 40 MiB limit (`__nptl_free_stacks`,
+/// nptl/nptl-stack.c), as one 64 MiB `RUST_MIN_STACK` stack makes it. Data
+/// the guest borrowed from the caller's stack was then silently overwritten,
+/// or unmapped.
 fn test_fn_with_logs<T, F>(
     f: F,
     config: <T::GlobalState as GlobalTool>::Config,
@@ -831,7 +848,7 @@ fn test_fn_with_logs<T, F>(
 ) -> Result<(Output, T::GlobalState, TracerLogs), Error>
 where
     T: Tool + 'static,
-    F: FnOnce() + Send,
+    F: FnOnce() + Send + 'static,
 {
     let marker = std::env::var_os(ISOLATED_WORKDIR_ENV);
     let workdir = requested_test_workdir(marker.as_deref())
@@ -920,7 +937,7 @@ pub fn test_fn_with_config<T, F>(
 ) -> Result<(Output, T::GlobalState), Error>
 where
     T: Tool + 'static,
-    F: FnOnce() + Send,
+    F: FnOnce() + Send + 'static,
 {
     test_fn_with_logs::<T, F>(f, config, capture_output)
         .map(|(output, state, _logs)| (output, state))
@@ -935,7 +952,7 @@ pub fn check_fn_with_config<T, F>(
 ) -> T::GlobalState
 where
     T: Tool + 'static,
-    F: FnOnce() + Send,
+    F: FnOnce() + Send + 'static,
 {
     let (output, state) = test_fn_with_config::<T, F>(f, config, capture_output).unwrap();
     if output.status != ExitStatus::Exited(0) {
@@ -949,7 +966,7 @@ where
 /// deterministic between runs. Expect successful exit code.
 pub fn det_test_fn<F>(f: F)
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
 {
     det_test_fn_with_config(true, f, Default::default(), expect_success)
 }
@@ -960,7 +977,7 @@ where
 /// process described by [`det_test_fn_with_config_repetitions`].
 pub fn det_test_fn_with_config<F, O>(isdet: bool, f: F, config: Config, oracle: O)
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
     det_test_fn_with_config_repetitions(TEST_REPS - 1, isdet, f, config, oracle)
@@ -989,7 +1006,7 @@ pub fn det_test_fn_with_config_repetitions<F, O>(
     config: Config,
     oracle: O,
 ) where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
     assert!(repetitions > 0, "at least one test repetition is required");
@@ -1000,6 +1017,9 @@ pub fn det_test_fn_with_config_repetitions<F, O>(
     // under its new pid.
     let _session = serialized_session();
     let config = prepare_ptrace_timer_config(config);
+    // The guest calls `f` from a heap allocation, not from this thread's
+    // stack, which is not the guest's (`test_fn_with_logs`).
+    let f = Arc::new(f);
     // Borrow the caller's values: only child-created configs/runtime/state are
     // consumed in children, and the caller drops its originals after the wait.
     run_function_test_driver(|| {
@@ -1010,11 +1030,11 @@ pub fn det_test_fn_with_config_repetitions<F, O>(
 fn compare_function_repetitions<F, O>(
     repetitions: u64,
     isdet: bool,
-    f: &F,
+    f: &Arc<F>,
     config: &Config,
     oracle: &O,
 ) where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
     if isdet {
@@ -1121,12 +1141,12 @@ where
 }
 
 fn isolated_function_repetition<F, O>(
-    f: &F,
+    f: &Arc<F>,
     config: &Config,
     oracle: &O,
 ) -> Result<(Output, TracerLogs), RunError>
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
     in_function_pid_namespace(|| {
@@ -1134,8 +1154,9 @@ where
         // panic's diagnostics, then exit unsuccessfully instead of unwinding
         // through that boundary or publishing a substitute successful value.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let f = Arc::clone(f);
             let (output, state, logs) =
-                test_fn_with_logs::<Detcore, _>(f, config.clone(), true).unwrap();
+                test_fn_with_logs::<Detcore, _>(move || f(), config.clone(), true).unwrap();
             println!("({} log lines captured.)", logs.len());
             oracle(&output, state);
             (output, logs)

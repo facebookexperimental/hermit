@@ -24,6 +24,7 @@ use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use detcore::Config;
 use detcore::Detcore;
@@ -40,14 +41,14 @@ fn run_five_times(guest: fn()) {
 }
 
 fn run_five_times_with(guest: fn(), sequentialize_threads: bool) {
-    run_five_times_on(|| (), |()| guest(), sequentialize_threads)
+    run_five_times_on(|| (), move |()| guest(), sequentialize_threads)
 }
 
 /// Runs `guest` five times, each on a new value from `setup`. The value is made
 /// outside the guest and dropped after its run.
-fn run_five_times_on<S: Sync>(
+fn run_five_times_on<S: Send + Sync + 'static>(
     setup: impl Fn() -> S,
-    guest: impl Fn(&S) + Sync,
+    guest: impl Fn(&S) + Send + Sync + 'static,
     sequentialize_threads: bool,
 ) {
     let config = Config {
@@ -79,7 +80,7 @@ fn run_five_times_hashing_buffers(guest: fn()) {
         detlog_io_buffers: true,
         ..Default::default()
     };
-    run_five_times_under(|| (), |()| guest(), config)
+    run_five_times_under(|| (), move |()| guest(), config)
 }
 
 /// Like [`run_five_times`], without hashing the bytes each syscall returns
@@ -92,10 +93,14 @@ fn run_five_times_without_hashing_buffers(guest: fn()) {
         detlog_io_buffers: false,
         ..Default::default()
     };
-    run_five_times_under(|| (), |()| guest(), config)
+    run_five_times_under(|| (), move |()| guest(), config)
 }
 
-fn run_five_times_under<S: Sync>(setup: impl Fn() -> S, guest: impl Fn(&S) + Sync, config: Config) {
+fn run_five_times_under<S: Send + Sync + 'static>(
+    setup: impl Fn() -> S,
+    guest: impl Fn(&S) + Send + Sync + 'static,
+    config: Config,
+) {
     // Every run below drives Detcore in this process, whose directory-stream
     // state, detlog forwarder, and soft RLIMIT_NOFILE are process-global: a
     // sibling test's stream state can leave this test's listing empty, its
@@ -122,11 +127,16 @@ fn run_five_times_under<S: Sync>(setup: impl Fn() -> S, guest: impl Fn(&S) + Syn
         return;
     }
     let mut expected = None;
+    // The guest closure owns what it uses (detcore-testutils'
+    // `test_fn_with_logs`): the value stays this thread's to drop after the
+    // run.
+    let guest = Arc::new(guest);
 
     for run in 1..=RUNS {
-        let value = setup();
+        let value = Arc::new(setup());
+        let (guest_fn, guest_value) = (Arc::clone(&guest), Arc::clone(&value));
         let (output, _state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
-            || guest(&value),
+            move || guest_fn(&guest_value),
             detcore_testutils::prepare_ptrace_timer_config(config.clone()),
             true,
         )

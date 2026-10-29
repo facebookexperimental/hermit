@@ -36,7 +36,7 @@ fn config() -> Config {
 }
 
 /// Run `guest` under Detcore and require that it exits 0.
-fn under_detcore(guest: impl FnOnce() + Send) {
+fn under_detcore(guest: impl FnOnce() + Send + 'static) {
     let (output, _) = detcore_testutils::test_fn_with_config::<Detcore, _>(
         guest,
         detcore_testutils::prepare_ptrace_timer_config(config()),
@@ -235,7 +235,7 @@ fn natively_answering(answer: impl FnOnce() -> String) -> String {
 }
 
 /// Run `test` natively and under Detcore: the same checks hold for both.
-fn natively_and_under_detcore(test: impl Fn() + Send + Sync + Copy) {
+fn natively_and_under_detcore(test: impl Fn() + Send + Sync + Copy + 'static) {
     natively(test);
     under_detcore(test);
 }
