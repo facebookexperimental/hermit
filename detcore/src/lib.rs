@@ -1991,7 +1991,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// run that replays nothing. A record with per-thread chaos rates
     /// (`--chaos-per-thread-slowdown`) installs a recorded rate at slice ends
     /// whatever this run's flags say; those ends keep their stops, as the
-    /// flag keeps them in a run that records it.
+    /// flag keeps them in a run that records it. So do the ends of a thread
+    /// whose recorded ends hold an instruction offset
+    /// (`--chaos-instruction-offset`): the offset is stepped from a stop at
+    /// its branch target, which a record of the option always has
+    /// (`Config::slice_ends_need_a_stop`), whatever this run's flags say.
     fn replay_allows_stopless_end<U>(&self, thread_state: &ThreadState<U>, end: u64) -> bool {
         stopless_end_allowed(self.cfg.replay_schedule_from.is_some(), thread_state, end)
     }
@@ -9351,7 +9355,7 @@ fn stopless_end_allowed<U>(schedule_replay: bool, thread_state: &ThreadState<U>,
     if thread_state
         .preemption_points
         .as_ref()
-        .is_some_and(preemptions::ThreadHistoryIterator::has_chaos_epochs)
+        .is_some_and(|points| points.has_chaos_epochs() || points.has_instruction_offsets())
     {
         return false;
     }
@@ -9406,6 +9410,35 @@ mod stopless_end_permission_tests {
         );
         assert!(!stopless_end_allowed(false, &thread, 100), "chaos rates");
         assert!(!stopless_end_allowed(true, &thread, 100), "chaos rates");
+    }
+
+    /// A preemption replay of a thread whose recorded ends hold an
+    /// instruction offset takes none of them without a stop, even at its
+    /// recorded end: the offset is stepped from a stop at the branch target.
+    /// The same record without the offset allows that end, as the control.
+    #[test]
+    fn a_replay_of_instruction_offset_rows_takes_no_stopless_end() {
+        use crate::preemptions::InstructionOffset;
+        let config = Config::default();
+        let mut thread = ThreadState::new(DetPid::from_raw(5), &config, ());
+        thread.replay_rcb_end = Some(100);
+        let rows = |offset: Option<InstructionOffset>| {
+            Some(
+                ThreadHistory::new()
+                    .with_preemption_instruction_offsets(vec![offset])
+                    .into_iter(),
+            )
+        };
+        thread.preemption_points = rows(None);
+        assert!(stopless_end_allowed(false, &thread, 100), "no offset");
+        thread.preemption_points = rows(Some(InstructionOffset {
+            rcb_target: 100,
+            instructions: 4,
+        }));
+        assert!(!stopless_end_allowed(false, &thread, 100), "an offset row");
+        assert!(!stopless_end_allowed(false, &thread, 101), "an offset row");
+        thread.replayed_stopless_end = Some(100);
+        assert!(!stopless_end_allowed(true, &thread, 100), "an offset row");
     }
 }
 

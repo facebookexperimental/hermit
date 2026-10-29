@@ -1931,6 +1931,13 @@ impl ThreadHistoryIterator {
         !self.full_history.chaos_epochs.is_empty()
     }
 
+    /// Whether any recorded timeslice of this thread ends past its branch
+    /// target (`--chaos-instruction-offset`), which only a stop at that
+    /// target can step to.
+    pub fn has_instruction_offsets(&self) -> bool {
+        self.full_history.has_instruction_offsets()
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     /// Return the next recorded logical boundary and its exact RCB target when

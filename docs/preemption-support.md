@@ -228,8 +228,8 @@ Each step is one ptrace stop of the preempted thread, about 35 us on x86_64,
 so a preemption costs up to `N` more; `N` is at most 256. The option is
 validated on x86_64 only: on aarch64 it is a policy refusal (exit status
 122). Every chaos timeslice end needs a real stop at its target while the
-option is on (`Config::slice_ends_need_a_stop`), so a slice end taken without
-stopping the guest must not be used then.
+option is on (`Config::slice_ends_need_a_stop`), so a lone thread's slice ends
+are not taken without a stop then (`Config::replays_lone_preemptions`).
 
 DBT's translation quantum is separate backend work. It does not implement
 Detcore's maximum-timeslice contract and is not changed by this inventory.
