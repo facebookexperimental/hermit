@@ -18849,7 +18849,7 @@ impl Scheduler {
     /// input turn selection reads. The priority it returns is the one recorded
     /// for `dettid`, so a preemption replay restores it as a fixed priority.
     fn bound_chaos_starvation(&mut self, dettid: DetTid, drawn: Priority) -> Priority {
-        if !self.chaos_bounds_starvation || self.has_schedule_replay() {
+        if !self.chaos_bounds_starvation || self.schedule_replay_dictates_turns() {
             return drawn;
         }
         let queued: Vec<(DetTid, Priority)> = self
@@ -19873,7 +19873,7 @@ impl Scheduler {
             self.previous_turn_tid = Some(resources.tid);
             self.previous_turn_expired_wait = expired_wait;
             if self.chaos_bounds_starvation
-                && !self.has_schedule_replay()
+                && !self.schedule_replay_dictates_turns()
                 && due_sleep_grant != Some(resources.tid)
             {
                 *self.chaos_turns_in_slice.entry(resources.tid).or_insert(0) += 1;
@@ -20286,7 +20286,10 @@ impl Scheduler {
     /// `chaos_turns_in_slice`: how many host-timed polling retries ran does
     /// not move the count.
     fn note_chaos_first_turn_waits(&mut self, granted: DetTid) {
-        if !self.chaos_bounds_starvation || self.recordreplay_modes || self.has_schedule_replay() {
+        if !self.chaos_bounds_starvation
+            || self.recordreplay_modes
+            || self.schedule_replay_dictates_turns()
+        {
             return;
         }
         let Some(granted_priority) = self.priorities.get(&granted).copied() else {
@@ -20342,7 +20345,7 @@ impl Scheduler {
     fn chaos_first_turn_overdue(&self) -> bool {
         self.chaos_bounds_starvation
             && !self.recordreplay_modes
-            && !self.has_schedule_replay()
+            && !self.schedule_replay_dictates_turns()
             && self.chaos_turns_per_slice.is_some_and(|turns| {
                 self.chaos_first_turn_waits
                     .values()
@@ -20406,39 +20409,19 @@ impl Scheduler {
     ///
     /// Only where change points are bounded (`chaos_bounds_starvation`: chaos
     /// with timer preemption and the default heuristic, not replaying
-    /// preemptions), and not under `hermit record`/`hermit replay`
-    /// (`recordreplay_modes`), as for every deadline hint. Not under a schedule
-    /// replay either, in both of its phases (`has_schedule_replay`):
-    /// - While it follows recorded schedule events, the recorded slice ends
-    ///   apply and no live deadline hint does (`cap_timeslice_at_deadline`).
-    /// - Once the schedule is over, its last event consumed or the rest
-    ///   released (`schedule_replay_over`), each thread ends slices as in a
-    ///   run without a schedule (`ThreadState::follows_replayed_schedule`),
-    ///   so ordinary deadline hints apply. The scheduler still counts the run
-    ///   as a schedule replay, though, so this count, the first-turn bound and
-    ///   the starvation bound (`bound_chaos_starvation`) stay off.
-    ///
-    /// In each phase these rules are functions of scheduler state. Where the
-    /// tail begins need not be. A tail that begins at the consumption of the
-    /// last recorded event begins at the same event in every run. A release,
-    /// though, also depends on how many recorded polling retries the replay
-    /// matched, since a matched retry ends the run of unmatched events
-    /// (`Replayer::release_schedule`). That count can be host-timed even
-    /// inside Hermit's stable-filesystem and no-network boundary: a guest call
-    /// on the background path finishes at a host-timed moment, and an actor
-    /// outside the container can make a descriptor ready
-    /// (`Scheduler::is_polling_turn`). So a released tail can begin at another
-    /// event, or not at all. The starvation these rules end can come back in
-    /// the tail.
-    ///
-    /// The count is of committed turns, host-timed polling retries aside, as for
-    /// `previous_turn_tid`: background calls and skipped turns do not commit, and
-    /// host-timed admissions and signals change only which pass a turn falls in,
-    /// not how many turns a thread has taken. Both runs of --verify therefore end
-    /// the same slices. A preemption recording records the slice end it causes
-    /// like any other change point, and a preemption or schedule replay, while
-    /// it follows its recorded slice ends, applies no hint
-    /// (`cap_timeslice_at_deadline`), so it needs none there.
+    /// preemptions), not while a schedule replay still dictates the turns
+    /// (`schedule_replay_dictates_turns`: past the end of its schedule it
+    /// counts, as a run without a schedule does), and not under `hermit
+    /// record`/`hermit replay` (`recordreplay_modes`), as for every deadline
+    /// hint. The count is of committed turns, host-timed polling retries
+    /// aside, as for `previous_turn_tid`: background calls and skipped turns
+    /// do not commit, and host-timed admissions and signals change only which
+    /// pass a turn falls in, not how many turns a thread has taken. Both runs
+    /// of --verify therefore end the same slices. A preemption recording
+    /// records the slice end it causes like any other change point, and a
+    /// preemption replay, or a schedule replay until its schedule is over,
+    /// follows its recorded slice ends and applies no hint
+    /// (`cap_timeslice_at_deadline`), so a replay needs none there.
     /// Such a slice ends at a syscall check-in, and a preemption replay ends
     /// a slice recorded there at the same branch count, which can fall just
     /// before the syscall rather than after it; until
@@ -20448,7 +20431,7 @@ impl Scheduler {
     fn chaos_slice_spent_in_turns(&self, granted: DetTid) -> bool {
         self.chaos_bounds_starvation
             && !self.recordreplay_modes
-            && !self.has_schedule_replay()
+            && !self.schedule_replay_dictates_turns()
             && self.chaos_turns_per_slice.is_some_and(|turns| {
                 self.chaos_turns_in_slice
                     .get(&granted)
@@ -20895,6 +20878,31 @@ impl Scheduler {
     /// (`ThreadState::follows_replayed_schedule`).
     pub(crate) fn schedule_replay_over(&self) -> bool {
         self.replay_priorities_released
+    }
+
+    /// Whether a schedule replay still dictates the turns: the run replays a
+    /// schedule (`has_schedule_replay`) that is not over yet
+    /// (`schedule_replay_over`). The chaos bounds a run without a schedule
+    /// applies are off only then: the turn count that ends a chaos slice
+    /// (`chaos_slice_spent_in_turns`), the bound on a new thread's first turn
+    /// (`chaos_first_turn_overdue`) and the starvation bound at change points
+    /// (`bound_chaos_starvation`). Past the end of the schedule the run
+    /// schedules, and draws chaos priorities at its slice ends, as a run
+    /// without a schedule does, so it is bounded as that run is. Before,
+    /// a new thread could wait seconds there for its first turn behind a
+    /// short sleep loop.
+    ///
+    /// The bounds start where every thread takes the default priority and
+    /// the threads switch to the slice rules of a run without a schedule
+    /// (`release_replay_priorities_if_exhausted`), and read nothing else
+    /// that run does not read. A schedule that runs out ends at the
+    /// consumption of its last recorded event, the same in every run. A
+    /// release can come at another event, or not at all, since how many
+    /// recorded polling retries the replay matched can be host-timed
+    /// (`Replayer::release_schedule`); the bounds then start where that
+    /// release resets the priorities, and add no input of their own.
+    fn schedule_replay_dictates_turns(&self) -> bool {
+        self.has_schedule_replay() && !self.schedule_replay_over()
     }
 
     /// What the reply to a traced event of `dettid` tells the thread about
@@ -38842,6 +38850,74 @@ mod test {
         spinner_changepoint(&mut scheduler, spinner, 7043, 2);
         assert_eq!(scheduler.priorities[&spinner], runqueue::LAST_PRIORITY);
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(waiter));
+    }
+
+    /// While a schedule replay dictates the turns, the chaos bounds are off;
+    /// past the end of its schedule (`schedule_replay_dictates_turns`), where
+    /// the run draws chaos priorities at its slice ends as a run without a
+    /// schedule does, they apply as in that run: the bound on a new thread's
+    /// first turn (`chaos_first_turn_overdue`), the turn count that ends a
+    /// chaos slice (`chaos_slice_spent_in_turns`) and the starvation bound at
+    /// change points (`bound_chaos_starvation`). Before, all three stayed off
+    /// for the whole of a schedule replay, its unguided rest included.
+    #[test]
+    fn the_chaos_bounds_apply_past_the_end_of_a_replayed_schedule() {
+        let chaos = Config {
+            chaos: true,
+            ..Config::default()
+        };
+        let schedule = vec![SchedEvent::syscall(
+            DetTid::from_raw(100),
+            Sysno::getpid,
+            SyscallPhase::Prehook,
+        )];
+        for over in [false, true] {
+            let replaying = |scheduler: &mut Scheduler| {
+                scheduler.replayer = Some(Replayer::new(schedule.clone()));
+                scheduler.replay_priorities_released = over;
+                assert_eq!(scheduler.schedule_replay_dictates_turns(), !over);
+            };
+
+            // A new thread (the waiter, which has not run) loses 400 grants
+            // to the spinner on priority.
+            let (mut scheduler, spinner, waiter) =
+                chaos_spinner_and_waiter(chaos.clone(), 500, 9820);
+            replaying(&mut scheduler);
+            scheduler.chaos_had_turn.insert(spinner);
+            for _ in 0..400 {
+                scheduler.note_chaos_first_turn_waits(spinner);
+            }
+            assert_eq!(
+                scheduler.chaos_first_turn_overdue(),
+                over,
+                "schedule over: {over}; first-turn waits {:?}",
+                scheduler.chaos_first_turn_waits
+            );
+            assert!(!scheduler.chaos_had_turn.contains(&waiter));
+
+            // The spinner has taken a chaos slice's worth of turns.
+            let turns = scheduler.chaos_turns_per_slice.unwrap();
+            scheduler.chaos_turns_in_slice.insert(spinner, turns);
+            assert_eq!(scheduler.chaos_slice_spent_in_turns(spinner), over);
+            assert_eq!(
+                scheduler.grant_deadline_hint(spinner) == Some(Duration::ZERO),
+                over,
+                "schedule over: {over}"
+            );
+
+            // Two change points pass the waiter over: past the end, the
+            // second puts the spinner one band behind it.
+            let (mut scheduler, spinner, _waiter) =
+                chaos_spinner_and_waiter(chaos.clone(), 500, 9820);
+            replaying(&mut scheduler);
+            spinner_changepoint(&mut scheduler, spinner, 136, 1);
+            spinner_changepoint(&mut scheduler, spinner, 7043, 2);
+            assert_eq!(
+                scheduler.priorities[&spinner],
+                if over { 9821 } else { 7043 },
+                "schedule over: {over}"
+            );
+        }
     }
 
     /// A poller whose normal priority is the last band is counted by the

@@ -56666,6 +56666,172 @@ fn a_thread_that_has_run_does_not_wait_behind_a_zero_length_sleep_loop() {
     }
 }
 
+/// Past the end of a replayed schedule the run draws chaos priorities at its
+/// slice ends as a run without a schedule does, so #4658's bounds apply there
+/// too: the turn count that ends a chaos slice, the bound on a new thread's
+/// first turn and the starvation bound. In tests/c/sleeper_creates_newcomer.c
+/// thread S spins through several slice ends, then creates thread C and
+/// loops on 100 us sleeps, shorter than a turn charge. Replaying an empty
+/// schedule makes the whole run that unguided rest. On main 16a66895f, which
+/// kept the bounds off for all of a schedule replay, C then waited 3.2 s,
+/// 7.0 s and 15.9 s for its first turn at `--chaos` seeds 1, 4 and 6, behind
+/// S's loop, while plain chaos runs of the same seeds gave it its first turn
+/// in under a millisecond (and no seed of 1-20 more than 0.31 s).
+///
+/// While the schedule still dictates the turns, the bounds stay off: a
+/// recording of seed 2, where the first-turn bound holds C to 0.30 s, cut
+/// just after C's first events, replays without a desync and prints what
+/// the recording printed.
+#[test]
+fn a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second() {
+    static GUEST: OnceLock<PathBuf> = OnceLock::new();
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(&GUEST, "sleeper_creates_newcomer")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let waited_us = |output: &Output, what: &str| -> u64 {
+        let out = stdout(output);
+        assert!(output.status.success(), "{what}: {}", stderr(output));
+        out.split_whitespace()
+            .nth(3)
+            .and_then(|word| word.parse().ok())
+            .unwrap_or_else(|| panic!("{what}: unexpected output {out:?}"))
+    };
+
+    let empty = directory.path().join("empty.json");
+    fs::write(&empty, r#"{"per_thread":{},"global":[]}"#).unwrap();
+    let replay_empty = format!("--replay-schedule-from={}", empty.display());
+    for seed in ["1", "4", "6"] {
+        let output = hermit(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "120",
+            "--chaos",
+            "--seed",
+            seed,
+            &replay_empty,
+            "--",
+            &guest,
+        ]);
+        let waited = waited_us(&output, &format!("seed {seed}"));
+        assert!(
+            waited < 1_000_000,
+            "seed {seed}: past the end of the replayed schedule the new thread waited {waited} us \
+             for its first turn"
+        );
+    }
+
+    // Seed 2's recording, cut just after the new thread's first events, as
+    // `hermit analyze` cuts a prefix (`PreemptionRecord::schedule_prefix`).
+    let recording = directory.path().join("recording.json");
+    let record_to = format!("--record-preemptions-to={}", recording.display());
+    let recorded = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "2",
+        &record_to,
+        "--",
+        &guest,
+    ]);
+    assert!(
+        waited_us(&recorded, "the recording") > 100_000,
+        "seed 2 no longer holds the new thread behind the sleep loop, so the cut replay no \
+         longer covers the first-turn bound: {}",
+        stdout(&recorded)
+    );
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&recording).unwrap()).unwrap();
+    let events = record["global"].as_array().unwrap().clone();
+    let mut threads: Vec<i64> = Vec::new();
+    for event in &events {
+        let tid = event["dettid"].as_i64().unwrap();
+        if !threads.contains(&tid) {
+            threads.push(tid);
+        }
+    }
+    let newcomer = *threads.get(2).expect("main, S and C");
+    let first = events
+        .iter()
+        .position(|event| event["dettid"].as_i64() == Some(newcomer))
+        .unwrap();
+    let cut = (first + 10).min(events.len() - 1);
+    let prefix = &events[..cut];
+    let mut reached: std::collections::BTreeMap<String, u64> = Default::default();
+    for event in prefix {
+        *reached.entry(event["dettid"].to_string()).or_insert(0) +=
+            event["count"].as_u64().unwrap();
+    }
+    let running = prefix
+        .last()
+        .filter(|last| last["count"].as_u64() > Some(0))
+        .map(|last| last["dettid"].to_string());
+    let mut checkpoints = serde_json::Map::new();
+    if let Some(all) = record["callback_checkpoints"].as_object() {
+        for (tid, points) in all {
+            let Some(reached) = reached.get(tid).copied() else {
+                continue;
+            };
+            let kept: Vec<serde_json::Value> = points
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|point| {
+                    let progress = point["origin"]["progress"].as_u64().unwrap();
+                    if running.as_deref() == Some(tid.as_str()) {
+                        progress < reached
+                    } else {
+                        progress <= reached
+                    }
+                })
+                .cloned()
+                .collect();
+            if !kept.is_empty() {
+                checkpoints.insert(tid.clone(), serde_json::Value::Array(kept));
+            }
+        }
+    }
+    record["global"] = serde_json::Value::Array(prefix.to_vec());
+    record["callback_checkpoints"] = serde_json::Value::Object(checkpoints);
+    let cut_path = directory.path().join("cut.json");
+    fs::write(&cut_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let replay_cut = format!("--replay-schedule-from={}", cut_path.display());
+    let replayed = hermit(&[
+        "--log=info",
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "2",
+        &replay_cut,
+        "--",
+        &guest,
+    ]);
+    let log = stderr(&replayed);
+    assert!(
+        replayed.status.success() && log.contains("(0 desynced)"),
+        "the replay of the cut recording must not desync before its end:\n{}",
+        log.lines()
+            .filter(|line| line.contains("desync") || line.contains("expected to be running"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        stdout(&replayed),
+        stdout(&recorded),
+        "the new thread's first turn falls inside the cut, so the replay must print what the \
+         recording printed"
+    );
+}
+
 /// Four threads loop on a 10 us `pthread_cond_timedwait` that nobody signals,
 /// beside a compute-bound worker (tests/c/pollers_beside_worker.c). Each
 /// timed-out wait is a turn charged half a millisecond of virtual time for a
