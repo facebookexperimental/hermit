@@ -178,6 +178,10 @@ mod tests {
         // renumbered to 21 at landing after main's 20; digests measured at
         // this head).
         (21, "9d583ef0f9243c61", "f013e36743d8d9e6"),
+=======
+        // Adds `GlobalRequest::TakeSleepInterruption` and its response.
+        (21, "a26a19716aa915db", "f013e36743d8d9e6"),
+>>>>>>> 929db35999 (Interrupt a nanosleep at a timer's due time and report the time left)
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

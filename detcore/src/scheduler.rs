@@ -741,6 +741,14 @@ pub struct BlockedPool {
     /// (<https://github.com/rrnewton/hermit/issues/4126>).
     pub woken_sleeps: BTreeSet<DetTid>,
 
+    /// For a `nanosleep` a timed signal woke, when that signal was due
+    /// (`Scheduler::signal_sent_at`): the instant Linux would have interrupted
+    /// the sleep, from which the sleep's remaining time is reported
+    /// (`Scheduler::take_sleep_interruption`). A pass pops a timer only after
+    /// the slice that carried time past it, so the wake itself can come later
+    /// than that (<https://github.com/rrnewton/hermit/issues/4931>).
+    pub sleep_interruptions: BTreeMap<DetTid, LogicalTime>,
+
     /// Threads the scheduler woke, at a commit point, to take a `SIGCHLD` it
     /// sent (`mark_placed_delivery`): a parked precise futex waiter whose wait
     /// it interrupts, or a thread polling internal IO. The copy is
@@ -2284,7 +2292,6 @@ pub struct Scheduler {
     /// (`send_wakes`).
     #[cfg(test)]
     pub(crate) test_send_wakes: Vec<DetTid>,
-
     /// When each captured send (`test_sent_signals`) was sent
     /// (`signal_sent_at`).
     #[cfg(test)]
@@ -9325,6 +9332,7 @@ impl Scheduler {
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
         self.blocked.woken_sleeps.remove(dtid);
+        self.blocked.sleep_interruptions.remove(dtid);
         self.blocked.drain_woken_waiters.remove(dtid);
         self.child_exit_sigchld.attributed.remove(dtid);
         self.blocked.signaled_background.remove(dtid);
@@ -13913,12 +13921,14 @@ impl Scheduler {
                 // unblocked, and caught or fatal. Only where the
                 // backend reports the guest's signal state (`signal_sleep`):
                 // elsewhere a woken sleep cannot tell, and every wake ends it.
-                // A `nanosleep` whose deadline has passed completes at its
-                // admission instead, as a parked one does at its timed pop.
+                // A `nanosleep` whose deadline had passed when the signal was
+                // sent completes at its admission instead, as a parked one does
+                // at its timed pop. A timed signal is judged at its due time
+                // (`signal_sent_at`), not at the later pass that pops it.
                 let is_queued_sleep = match self.signal_sleep(dettid) {
                     Some(sleep_signal::SignalSleep::Pause) => true,
                     Some(sleep_signal::SignalSleep::Nanosleep { deadline }) => {
-                        deadline > self.committed_time
+                        deadline > self.signal_sent_at()
                     }
                     None => false,
                 };
@@ -13960,7 +13970,9 @@ impl Scheduler {
                     // ptrace-stopped thread. Behind a running sibling, the
                     // sibling took the handler while the sleep still answered
                     // EINTR.
+                    let interruption = self.timed_sleep_interruption(dettid);
                     let woken = self.force_unblock_thread_at(dettid, rsrcs, true);
+                    self.note_sleep_interruption(dettid, interruption);
                     if delivery_placed {
                         self.blocked.sigchld_ready.insert(dettid);
                     }
@@ -14083,7 +14095,9 @@ impl Scheduler {
                 let mut rsrcs = Resources::new(dettid);
                 rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
                 if parked_sleep {
+                    let interruption = self.timed_sleep_interruption(dettid);
                     let woken = self.force_unblock_thread_at(dettid, rsrcs, true);
+                    self.note_sleep_interruption(dettid, interruption);
                     self.mark_woken_sleep_taker(dettid, signal, woken && ends);
                     self.blocked.woken_sleeps.insert(dettid);
                 } else if self.in_guest_signal_delivery
@@ -33252,6 +33266,44 @@ mod test {
         }
     }
 
+    /// The same for a sleep still queued, as under `when-chosen` registration
+    /// or race search: a timed signal due before its deadline wakes it to
+    /// answer the signal, and notes the due time, though committed time has
+    /// passed the deadline; one due at the deadline leaves it to complete when
+    /// admitted (https://github.com/rrnewton/hermit/issues/4931).
+    #[test]
+    fn a_timed_signal_due_before_a_queued_nanosleep_deadline_ends_it_whenever_it_pops() {
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let early = LogicalTime::from_nanos(4_950_000_000);
+        for (due, woken) in [(early, true), (deadline, false)] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, true);
+            scheduler.committed_time = LogicalTime::from_nanos(5_001_000_000);
+            set_sleeper_state(&mut scheduler, target, sleeper_state(usr1, 0, 0, 0));
+            scheduler.signal_sent_at = Some(due);
+            scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+            let case = format!("due {due}");
+            if woken {
+                assert_eq!(
+                    scheduler.inbound_signals(target),
+                    vec![SigWrapper::from(Signal::SIGUSR1)],
+                    "{case}"
+                );
+                assert!(scheduler.blocked.woken_sleeps.contains(&target), "{case}");
+                assert_eq!(
+                    scheduler.take_sleep_interruption(target),
+                    Some(due),
+                    "{case}"
+                );
+            } else {
+                assert!(scheduler.inbound_signals(target).is_empty(), "{case}");
+                assert!(!scheduler.blocked.woken_sleeps.contains(&target), "{case}");
+                assert_eq!(scheduler.take_sleep_interruption(target), None, "{case}");
+            }
+        }
+    }
+
     /// The mask that decides a discard is the first source present: the
     /// guest's own mask while Detcore holds a private one, a parked futex
     /// waiter's watch, the mask recorded for a thread asleep outside the
@@ -48458,21 +48510,19 @@ mod test {
     }
 
     /// A timed signal is judged by when it was due, not by the committed time
-    /// of the pass that pops it: a pass pops one due event, so an alarm due
-    /// before a parked `nanosleep`'s deadline can pop when committed time is
-    /// already past the deadline, and it still ends the sleep, as Linux ends
-    /// a sleep for a signal that arrives before its timer fires. One due at or
-    /// after the deadline leaves the sleep to its wake. `dispatch_timed_signal`
-    /// sets the due time for the length of the dispatch and restores it
-    /// (https://github.com/rrnewton/hermit/pull/4682).
+    /// of the pass that pops it: a pass pops one due event after the slice
+    /// that carried time past it, so an alarm due before a parked
+    /// `nanosleep`'s deadline can pop when committed time is already past the
+    /// deadline, and it still ends the sleep, as Linux ends a sleep for a
+    /// signal that arrives before its timer fires. The wake notes the due time
+    /// for the sleep's remaining time. One due at the deadline leaves the sleep
+    /// to its wake (https://github.com/rrnewton/hermit/issues/4931).
     #[test]
     fn a_timed_signal_due_before_a_parked_nanosleep_deadline_ends_it_whenever_it_pops() {
         let deadline = LogicalTime::from_nanos(5_000_000_000);
         let usr1 = kernel_signal_bit(libc::SIGUSR1);
-        for (due, woken) in [
-            (LogicalTime::from_nanos(4_999_000_000), true),
-            (deadline, false),
-        ] {
+        let early = LogicalTime::from_nanos(4_950_000_000);
+        for (due, woken) in [(early, true), (deadline, false)] {
             let mut scheduler = gated_scheduler();
             let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
             scheduler.committed_time = LogicalTime::from_nanos(5_001_000_000);
@@ -48488,16 +48538,32 @@ mod test {
                     "{case}"
                 );
                 assert!(scheduler.blocked.timed_waiters.is_empty(), "{case}");
+                assert_eq!(
+                    scheduler.take_sleep_interruption(target),
+                    Some(due),
+                    "{case}"
+                );
+                assert_eq!(scheduler.take_sleep_interruption(target), None, "{case}");
             } else {
                 assert_sleep_parked(&scheduler, target, deadline, &case);
                 assert!(scheduler.inbound_signals(target).is_empty(), "{case}");
+                assert_eq!(scheduler.take_sleep_interruption(target), None, "{case}");
             }
         }
-        // Outside a timed dispatch, the send time is the commit point's.
+        // Outside a timed dispatch the send time is the commit point's, and a
+        // wake notes no interruption: the sleep reads its own clock.
         let mut scheduler = gated_scheduler();
-        scheduler.committed_time = deadline;
+        let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+        scheduler.committed_time = early;
         assert_eq!(scheduler.signal_sent_at, None);
-        assert_eq!(scheduler.signal_sent_at(), deadline);
+        assert_eq!(scheduler.signal_sent_at(), early);
+        set_sleeper_state(&mut scheduler, target, sleeper_state(usr1, 0, 0, 0));
+        scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper::from(Signal::SIGUSR1)]
+        );
+        assert_eq!(scheduler.take_sleep_interruption(target), None);
     }
 
     /// On a backend that reads no sleeper's signal state, a signal sent at or

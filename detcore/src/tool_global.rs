@@ -3573,6 +3573,16 @@ impl GlobalState {
                 .unwrap()
                 .insert(*id, sequence.clone());
             return (None, GlobalResponse::StoreProcfsSequence(()));
+        // When the timed signal that woke the sender's `nanosleep` was due
+        // (`Scheduler::take_sleep_interruption`): the sender's own entry,
+        // answered before the forwarded-record drain and any clock
+        // accounting, so asking for it moves no time and orders nothing.
+        if let GlobalRequest::TakeSleepInterruption = &gr.2 {
+            let due = self
+                .lock_rpc_scheduler(false)
+                .await
+                .take_sleep_interruption(DetTid::from_raw(from.into()));
+            return (None, GlobalResponse::TakeSleepInterruption(due));
         }
         // Records an in-guest Tool forwarded before sending this request are queued,
         // and the sender's are written now if it runs alone (the order rule at
@@ -5641,6 +5651,9 @@ impl GlobalState {
             }
             GlobalRequest::CpuAffinity(tid) => {
                 R::CpuAffinity(self.lock_rpc_scheduler(false).await.cpu_affinity(tid))
+            }
+            GlobalRequest::TakeSleepInterruption => {
+                unreachable!("a sleep's interruption is answered before clock accounting")
             }
             GlobalRequest::SetCpuAffinity(tid, cpus) => R::CpuAffinity(
                 self.lock_rpc_scheduler(false)
@@ -8508,6 +8521,10 @@ pub enum GlobalRequest {
     /// after a read, positioned read or seek of it
     /// (`Detcore::store_procfs_sequence`). Appended last.
     StoreProcfsSequence(OpenFileId, crate::procfs::ProcfsSequence),
+    /// When the timed signal that woke the calling thread's `nanosleep` was
+    /// due, if one did (`Scheduler::take_sleep_interruption`), for the sleep's
+    /// remaining time. Appended last.
+    TakeSleepInterruption,
 }
 
 /// Responses from the global object
@@ -8873,6 +8890,8 @@ pub enum GlobalResponse {
     ProcfsSequence(Option<crate::procfs::ProcfsSequence>),
     /// The answer to `GlobalRequest::StoreProcfsSequence`. Appended last.
     StoreProcfsSequence(()),
+    /// The answer to `GlobalRequest::TakeSleepInterruption`. Appended last.
+    TakeSleepInterruption(Option<LogicalTime>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -12335,6 +12354,29 @@ where
 
 /// The CPU affinity of task `tid` under `--virtual-cpus`
 /// (`Scheduler::cpu_affinity`).
+/// When the timed signal that woke the calling thread's `nanosleep` was due,
+/// if one did (`Scheduler::take_sleep_interruption`). Sent directly, not
+/// through `send_and_update_time`: it is answered before any clock
+/// accounting, so it moves no time and its clock and address-space fields are
+/// placeholders, as `announce_refused_signal_controls`'s are.
+pub(crate) async fn take_sleep_interruption<G, T>(guest: &mut G) -> Option<LogicalTime>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = guest
+        .send_rpc((
+            DetTime::default(),
+            MmId::initial(DetTid::from_raw(0)),
+            GlobalRequest::TakeSleepInterruption,
+        ))
+        .await;
+    match response {
+        GlobalResponse::TakeSleepInterruption(due) => due,
+        response => unreachable!("unexpected response to TakeSleepInterruption: {response:?}"),
+    }
+}
+
 pub(crate) async fn cpu_affinity<G, T>(guest: &mut G, tid: DetTid) -> crate::cpu_set::TaskAffinity
 where
     G: Guest<Detcore<T>>,

@@ -869,6 +869,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // interrupts it (`scheduler::sleep_signal`).
         request.fyi(crate::resources::NANOSLEEP_FYI);
         let mut claimed = false;
+        // When the timed signal that ended the sleep was due, if one did
+        // (`Scheduler::take_sleep_interruption`): Linux interrupts the sleep
+        // then, and reports the time left from there, even when Detcore's
+        // pass pops the timer later (https://github.com/rrnewton/hermit/issues/4931).
+        let mut interrupted_at = None;
         loop {
             // A signal already pending ends the sleep before it parks, and one
             // still pending after a wake ends it; a wake whose signal was taken
@@ -898,6 +903,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // A sleep never asks for `NothingElseCanRun`.
                 ResumeStatus::Normal | ResumeStatus::NothingElseCanRun => return Ok(0),
                 ResumeStatus::Signaled(signals) => {
+                    // Taken at every wake, so a wake that does not end the
+                    // sleep leaves nothing for a later one.
+                    interrupted_at = crate::tool_global::take_sleep_interruption(guest).await;
                     match super::signal::sleep_signal(guest, SleepCheck::AfterWake(signals), false)
                         .await?
                     {
@@ -915,7 +923,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
         let now = thread_observe_time(guest).await;
-        let delta = remaining_sleep_duration(target_time, now);
+        let interrupted = interrupted_at.map_or(now, |due| due.min(now));
+        let delta = remaining_sleep_duration(target_time, interrupted);
         // Linux never touches remain for TIMER_ABSTIME, even when
         // a caught signal interrupts the absolute sleep.
         let addr2 = if call.flags() & libc::TIMER_ABSTIME == 0 {

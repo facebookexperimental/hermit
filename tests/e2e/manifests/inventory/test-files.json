@@ -2954,6 +2954,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/sleep_timer_before_deadline.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/sleep_timer_before_deadline.c is owned by hermit-cli/tests/cli.rs: a_timer_due_before_a_sleeps_deadline_interrupts_it_with_the_time_left runs it natively and under ptrace with --strict, with --sleep-registration=first-pass and when-chosen, and requires native's line: a 50 ms ITIMER_REAL that interrupts a 100 ms nanosleep while a sibling that blocks SIGALRM computes ends the sleep with EINTR, about 50 ms left in rem and the handler run. It stays a fixture because the test compares native and Hermit output."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/sleeper_beside_newcomer.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/sleeper_beside_newcomer.c is owned by hermit-cli/tests/cli.rs: The integration tests a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second, a_thread_that_has_run_still_waits_behind_a_short_sleep_loop and a_thread_that_has_run_does_not_wait_behind_a_zero_length_sleep_loop run this guest under run --strict --chaos: a newly created thread must get its first turn within 1 s of virtual time beside a loop of 100 us sleeps (seeds 9, 23 and 24, with a bitwise-parity verify and a schedule replay), a thread that has run must still wake at least 1 s late behind it (seed 4), and with the zero argument, behind a loop of zero-length sleeps, it must wake within 1 s (seeds 4 and 8); a generic manifest cannot express the measured bounds or the parity and replay checks, and the cases need the PMU timer, so they run in privileged-test.pmu_cli_cases."

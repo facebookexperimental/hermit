@@ -196,6 +196,7 @@ static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_ZERO_TIMEOUT_RESTART_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_RESTART_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RESTART_STOP_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SLEEP_TIMER_BEFORE_DEADLINE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_EXEC_RESUME_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -42027,6 +42028,68 @@ fn a_kernel_run_polls_restart_runs_in_place() {
         let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{args:?} (probe seed {seed})");
+    }
+}
+
+/// A timer due before a `nanosleep`'s deadline ends the sleep with `EINTR` and
+/// the time left from when it was due, as on Linux, also when Hermit's pass
+/// pops the timer after the deadline
+/// (https://github.com/rrnewton/hermit/issues/4931). In the guest
+/// (`tests/c/sleep_timer_before_deadline.c`) a 50 ms `ITIMER_REAL` interrupts
+/// a 100 ms sleep while a sibling that blocks SIGALRM computes without
+/// syscalls, so its slice carries virtual time past both before the timer
+/// pops. Hermit's run must print native's line under the default first-pass
+/// registration (the sleep is parked) and under `when-chosen` (it is still
+/// queued). Before this, both answered 0 with nothing left, the handler run
+/// after the return.
+///
+/// PMU SUBJECT: only the branches the PMU counts carry virtual time over the
+/// sibling's syscall-free slice. Without a PMU timer the alarm pops on time
+/// and the case passes whatever Detcore does (with `--max-timeslice=disabled`
+/// it passed before this fix), so it proves nothing. test.cli and
+/// test.cli_on_host skip it by exact name; privileged-test.pmu_cli_cases runs
+/// it. A run Hermit refuses for skid overshoot is run again, as for
+/// `poll_timeout_returns_on_time_while_another_thread_spins`
+/// ([`run_pmu_spinner_retrying_skid`]).
+#[test]
+fn a_timer_due_before_a_sleeps_deadline_interrupts_it_with_the_time_left() {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(
+        &SLEEP_TIMER_BEFORE_DEADLINE_GUEST,
+        "sleep_timer_before_deadline",
+    );
+    let guest = guest.to_str().unwrap();
+    let line = "nanosleep: rc=-1 EINTR; rem between 40 and 60 ms: yes; handled=1\n";
+    let native = Command::new(guest)
+        .output()
+        .expect("failed to run the guest natively");
+    assert_eq!(String::from_utf8_lossy(&native.stdout), line, "native");
+    for registration in ["first-pass", "when-chosen"] {
+        let registration = format!("--sleep-registration={registration}");
+        let check = |stdout: &str| assert_eq!(stdout, line, "{registration}");
+        let SpinnerRun {
+            status,
+            stdout,
+            stderr: log,
+        } = run_pmu_spinner_retrying_skid(
+            "a_timer_due_before_a_sleeps_deadline_interrupts_it_with_the_time_left",
+            &[
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                registration.as_str(),
+                "--",
+                guest,
+            ],
+            Duration::from_secs(120),
+            check,
+        );
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{registration}: the run must exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, line, "{registration}: stderr:\n{log}");
     }
 }
 
