@@ -54,6 +54,29 @@ use crate::app::container::RunTimeoutMarker;
 use crate::app::global_opts::GlobalOpts;
 use crate::app::run::RunOpts;
 
+/// The outcome of a trial that completed: whether it met the target
+/// criteria. A run that did not complete has none; its launch's error ends
+/// the analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialEnd {
+    /// It finished and met the target criteria.
+    Met,
+    /// It finished and did not meet them.
+    Missed,
+}
+
+/// Whether Hermit refused a run after its guest started, at an operation it
+/// does not support: the container's exit-122 arm returns a bare
+/// `PolicyRefusal`, whose reason Detcore logged before exiting. A refusal
+/// decided before the guest starts (an option or a backend Hermit does not
+/// admit) carries its reason as context instead.
+pub fn guest_reached_a_refusal(error: &anyhow::Error) -> bool {
+    error.chain().count() == 1
+        && error
+            .downcast_ref::<crate::app::container::PolicyRefusal>()
+            .is_some()
+}
+
 /// What runs a trial's guest in place of [`RunData::run_now`]. Production
 /// never sets one: it is a seam for tests, which drive analyze's searches,
 /// the journal and resume through [`RunData::launch`] without a guest.
@@ -5106,9 +5129,10 @@ mod tests {
 
         let mut own = RunData::new_baseline(&options, "prefix_round_001".into()).unwrap();
         own.runopts.bound_run_timeout(NonZeroU64::new(30).unwrap());
-        assert_eq!(
-            own.launch_trial().unwrap(),
-            TrialEnd::Unfinished(Stop::Bound)
+        let error = own.launch().unwrap_err();
+        assert!(
+            error.downcast_ref::<RunTimeoutMarker>().is_some(),
+            "{error:#}"
         );
         assert_eq!(options.journal.len(), 1, "its own bound ended it");
 

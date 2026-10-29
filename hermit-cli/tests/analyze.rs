@@ -1771,7 +1771,7 @@ fn a_budget_ends_analyze_with_a_partial_report_that_resume_finishes() {
         .or(uninterrupted["critical_event1"]["event_index"].as_u64())
         .unwrap_or_else(|| panic!("{label}: {uninterrupted}\n{combined}"));
 
-    let seed = race_then_target_seed("exit", &[]);
+    let seed = race_then_target_seed();
     let _guard = analyze_lock();
     let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
     let report_file = report_dir.path().join("report.json");
