@@ -8310,6 +8310,128 @@ pub(crate) mod kernel_signal_wait_failures {
         assert_eq!(ends(&mut guest, None, false, false), (false, false));
     }
 
+    /// The error-queue branch of `ioaction_based_on_fd_status`. A receive
+    /// with `MSG_ERRQUEUE` on a socket whose protocol reads that queue
+    /// without waiting (`crate::fd::error_queue_read_never_waits`, a UDP or
+    /// TCP socket) runs once (`PassThru`) on a socket the guest left
+    /// blocking, which Detcore keeps physically nonblocking, where the same
+    /// receive on a socket whose protocol ignores the flag (AF_UNIX) and a
+    /// call without it are retried (`NonblockizeRetry`). On a socket Detcore
+    /// leaves physically blocking the receive keeps the blocking path, and on
+    /// one the guest made `O_NONBLOCK` it runs once anyway.
+    /// `ioaction_based_on_fd`, the descriptor-only answer for a call that has
+    /// no per-call flags, ignores all of this and follows the descriptor.
+    #[test]
+    fn an_error_queue_read_runs_once_only_where_its_protocol_never_waits() {
+        use std::os::fd::AsRawFd;
+
+        use reverie::syscalls::Recvfrom;
+        use reverie::syscalls::Recvmmsg;
+        use reverie::syscalls::Recvmsg;
+        use reverie::syscalls::Sendto;
+
+        let (mut guest, _) = WaitGuest::live(guest_mask());
+        let (socket, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let fd = socket.as_raw_fd();
+        guest
+            .thread
+            .add_fd(fd, nix::fcntl::OFlag::O_RDWR, FdType::Socket, None)
+            .unwrap();
+        let errqueue = libc::MSG_ERRQUEUE;
+        // Each error-queue receive, and calls on the same socket that do not
+        // read the queue: a plain receive, and a send whose flags carry the
+        // bit (a send never reads the queue).
+        let decisions = |guest: &mut WaitGuest| {
+            [
+                (
+                    "recvfrom MSG_ERRQUEUE",
+                    ioaction_based_on_fd_status(
+                        guest,
+                        Recvfrom::new().with_fd(fd).with_flags(errqueue),
+                    ),
+                ),
+                (
+                    "recvmsg MSG_ERRQUEUE",
+                    ioaction_based_on_fd_status(
+                        guest,
+                        Recvmsg::new().with_sockfd(fd).with_flags(errqueue),
+                    ),
+                ),
+                (
+                    "recvmmsg MSG_ERRQUEUE",
+                    ioaction_based_on_fd_status(
+                        guest,
+                        Recvmmsg::new().with_fd(fd).with_flags(errqueue as u32),
+                    ),
+                ),
+            ]
+        };
+        let others = |guest: &mut WaitGuest| {
+            [
+                (
+                    "recvfrom",
+                    ioaction_based_on_fd_status(guest, Recvfrom::new().with_fd(fd)),
+                ),
+                (
+                    "sendto MSG_ERRQUEUE",
+                    ioaction_based_on_fd_status(
+                        guest,
+                        Sendto::new().with_fd(fd).with_flags(errqueue as u32),
+                    ),
+                ),
+            ]
+        };
+        let set_never_waits = |guest: &mut WaitGuest, never_waits: bool| {
+            guest
+                .thread
+                .with_detfd(fd, |d| d.set_error_queue_never_waits(never_waits))
+                .unwrap();
+        };
+        let by_fd = |guest: &mut WaitGuest| ioaction_based_on_fd(guest, fd);
+        let blocking = Ok(IOAction::Blocking);
+        let once = Ok(IOAction::PassThru);
+        let retry = Ok(IOAction::NonblockizeRetry);
+
+        // Physically blocking (an external socket under record and replay):
+        // the blocking path, whatever the protocol.
+        set_never_waits(&mut guest, true);
+        for (name, action) in decisions(&mut guest) {
+            assert_eq!(action, blocking, "{name}, physically blocking");
+        }
+        assert_eq!(by_fd(&mut guest), blocking, "by fd, physically blocking");
+
+        // Left blocking by the guest, physically nonblocking.
+        guest
+            .thread
+            .with_detfd(fd, |d| d.set_physically_nonblocking())
+            .unwrap();
+        // A protocol that ignores the flag (AF_UNIX): retried.
+        set_never_waits(&mut guest, false);
+        for (name, action) in decisions(&mut guest) {
+            assert_eq!(action, retry, "{name}, protocol waits");
+        }
+        // A protocol that reads the queue without waiting: runs once, and
+        // only the error-queue receives do.
+        set_never_waits(&mut guest, true);
+        for (name, action) in decisions(&mut guest) {
+            assert_eq!(action, once, "{name}, protocol never waits");
+        }
+        for (name, action) in others(&mut guest) {
+            assert_eq!(action, retry, "{name}, protocol never waits");
+        }
+        assert_eq!(by_fd(&mut guest), retry, "by fd, left blocking");
+
+        // Made O_NONBLOCK by the guest: every call runs once.
+        guest
+            .thread
+            .with_detfd(fd, |d| d.set_nonblocking(true))
+            .unwrap();
+        for (name, action) in decisions(&mut guest).into_iter().chain(others(&mut guest)) {
+            assert_eq!(action, once, "{name}, O_NONBLOCK");
+        }
+        assert_eq!(by_fd(&mut guest), once, "by fd, O_NONBLOCK");
+    }
+
     #[test]
     fn inherited_input_exempts_only_authenticated_reads_from_the_internal_guard() {
         use std::os::fd::AsRawFd;
