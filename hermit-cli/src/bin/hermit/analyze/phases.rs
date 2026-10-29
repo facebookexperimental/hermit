@@ -1122,6 +1122,13 @@ impl AnalyzeOpts {
     /// return whether it met the target with the stack at schedule position
     /// `position`: a replayed event, or, at `len`, the first event the
     /// scheduler ran after the prefix.
+    ///
+    /// The stack is requested by schedule position
+    /// (`--stacktrace-at-schedule-positions`), not by traced index: the trial
+    /// can observe events its schedule does not hold before `position`, such
+    /// as a polling retry the recording did not make, and a traced index
+    /// would then name a neighbouring event
+    /// (https://github.com/rrnewton/hermit/issues/4917).
     fn prefix_stack(
         &self,
         runname: &str,
@@ -1130,10 +1137,8 @@ impl AnalyzeOpts {
         position: usize,
         continuation: MaybeTimeslice,
     ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)> {
-        let mut run = self.prefix_trial(runname, schedule, len, continuation)?;
-        let stack_path = run.root_path().with_extension("stack");
-        run.runopts.det_opts.det_config.stacktrace_event =
-            vec![(position as u64, Some(stack_path.clone()))];
+        let (mut run, stack_path) =
+            self.prefix_stack_trial(runname, schedule, len, position, continuation)?;
         let is_match = self.launch_prefix_trial(&mut run, RunData::launch)?;
         eprintln!(
             ":: {}\n{}",
@@ -1147,6 +1152,24 @@ impl AnalyzeOpts {
             Err(_) => None,
         };
         Ok((is_match, stack))
+    }
+
+    /// The prefix trial `prefix_stack` launches, and the file its stack goes
+    /// to: the stack at schedule `position`, requested by position.
+    fn prefix_stack_trial(
+        &self,
+        runname: &str,
+        schedule: &PreemptionRecord,
+        len: usize,
+        position: usize,
+        continuation: MaybeTimeslice,
+    ) -> anyhow::Result<(RunData, PathBuf)> {
+        let mut run = self.prefix_trial(runname, schedule, len, continuation)?;
+        let stack_path = run.root_path().with_extension("stack");
+        let config = &mut run.runopts.det_opts.det_config;
+        config.stacktrace_event = vec![(position as u64, Some(stack_path.clone()))];
+        config.stacktrace_at_schedule_positions = true;
+        Ok((run, stack_path))
     }
 
     /// The completed outcome and schedule of a prefix trial: the replayed
@@ -1238,8 +1261,8 @@ impl AnalyzeOpts {
             );
         }
         // The thread the scheduler runs at event #decision once the prefix
-        // ends. `--stacktrace-event` names a position of the replayed schedule
-        // only, so the prefix trial without event #decision runs first with its
+        // ends. A stack is requested by a position of the replayed schedule,
+        // so the prefix trial without event #decision runs first with its
         // schedule recorded, and the stack is taken from a replay of that
         // schedule's first decision + 1 events.
         let (completed, continued_path) = continuation(&schedule, decision)?;
@@ -4319,6 +4342,41 @@ mod tests {
                 .validate()
                 .unwrap();
         }
+    }
+
+    /// A prefix stack trial asks for its stack by schedule position
+    /// (`--stacktrace-at-schedule-positions`), not by traced index: a trial
+    /// that makes a polling retry its recording did not make would otherwise
+    /// print a neighbouring event's stack
+    /// (https://github.com/rrnewton/hermit/issues/4917). The request names the
+    /// position, its stack file, and the replayed prefix, and the trial's
+    /// repro command carries the option.
+    #[test]
+    fn a_prefix_stack_trial_requests_its_stack_by_schedule_position() {
+        let parent = tempfile::tempdir().unwrap();
+        let tmp_dir = format!("--tmp-dir={}", parent.path().display());
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
+        options.phase0_initialize().unwrap();
+        let tid = detcore::types::DetTid::from_raw(3);
+        let target = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 4),
+            SchedEvent::branches(tid, 5),
+        ]);
+        let (run, stack_path) = options
+            .prefix_stack_trial("final_target_for_stacktraces", &target, 3, 2, None)
+            .unwrap();
+        let config = &run.runopts.det_opts.det_config;
+        assert!(config.stacktrace_at_schedule_positions);
+        assert_eq!(config.stacktrace_event, vec![(2, Some(stack_path))]);
+        assert!(config.replay_schedule_from.is_some());
+        assert!(
+            run.to_repro()
+                .contains(" --stacktrace-at-schedule-positions"),
+            "{}",
+            run.to_repro()
+        );
     }
 
     /// The final prefix report repeats the trial's counter caveat in its

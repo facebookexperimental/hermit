@@ -1401,6 +1401,7 @@ fn record_or_replay_config_with_timer_support(
         die_on_desync: true,
         replay_edited_preemptions: false,
         stacktrace_event: Vec::new(),
+        stacktrace_at_schedule_positions: false,
         stacktrace_signal: None,
         access_trace: None,
         access_trace_from: 0,

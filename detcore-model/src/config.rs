@@ -888,6 +888,24 @@ pub struct Config {
            value_parser = parse_index_with_path)]
     pub stacktrace_event: Vec<(u64, Option<PathBuf>)>,
 
+    /// Internal, for `hermit analyze`: under `--replay-schedule-from`, each
+    /// `--stacktrace-event` index names a position of the replayed schedule,
+    /// not a traced event count. The stack prints when the replay consumes the
+    /// recorded event at that position, however many events the run observed
+    /// before it: a polling retry the recording did not make, say. A position
+    /// at or past the schedule's end names the events the run makes after the
+    /// replay consumed its last recorded event. A position the replay skips to
+    /// resync, or drops with the rest of a released schedule, never prints and
+    /// is reported as missed.
+    #[serde(default)]
+    #[clap(
+        long,
+        hide = true,
+        requires = "replay_schedule_from",
+        conflicts_with = "strict_schedule_boundaries"
+    )]
+    pub stacktrace_at_schedule_positions: bool,
+
     /// Internal feature used to signal the guest with SIGINT at every `--stacktrace-event`, this is
     /// in-lieu of using hermit's internal stacktrace printing facility, to instead have an external
     /// debugger handle it.  Accepts either signal names or numbers.
@@ -2395,6 +2413,9 @@ impl fmt::Display for Config {
         if let Some(bytes) = self.access_trace_max_bytes {
             write!(f, " --access-trace-max-bytes={}", bytes)?;
         }
+        if self.stacktrace_at_schedule_positions {
+            write!(f, " --stacktrace-at-schedule-positions")?;
+        }
         if self.preemption_stacktrace {
             write!(f, " --preemption-stacktrace")?;
         }
@@ -3328,7 +3349,8 @@ impl Default for Config {
 /// an abstract `AF_UNIX` bind. So is [`Config::eager_lone_preemptions`], added after this form froze,
 /// which has no effect without a PMU timer and reads back as false. So is
 /// [`Config::standard_stream_aliases`], added after this form froze, set only for KVM, which
-/// reads back as unset. Every
+/// reads back as unset. So is [`Config::stacktrace_at_schedule_positions`], also added later,
+/// which reads back as false: the DBT runtime takes no stack traces. Every
 /// other field is serialized exactly as `serde_json::to_string(config)`
 /// serializes it.
 ///
@@ -3936,7 +3958,9 @@ mod legacy_backend_json {
     /// is never written and reads as false.
     /// `post_crash_timeslice` came after it too, and the scheduler acts on it
     /// as well, so it is never written and reads as off.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 51] = [
+    /// `stacktrace_at_schedule_positions` came after it too. It is never
+    /// written and reads as false: the DBT runtime takes no stack traces.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 52] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3988,6 +4012,7 @@ mod legacy_backend_json {
         "standard_stream_aliases",
         "rewrite_exclusives_in_memory",
         "count_store_exclusives",
+        "stacktrace_at_schedule_positions",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -4137,7 +4162,8 @@ mod legacy_backend_json {
                     | "replay_continue_fairly"
                     | "strict_binder"
                     | "rewrite_exclusives_in_memory"
-                    | "count_store_exclusives",
+                    | "count_store_exclusives"
+                    | "stacktrace_at_schedule_positions",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
                 Some("in_guest_reserved_signals" | "access_trace_from") => {
@@ -4497,7 +4523,8 @@ mod legacy_backend_json {
                 | "access_trace_max_records"
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
-                | "count_store_exclusives" => Ok(()),
+                | "count_store_exclusives"
+                | "stacktrace_at_schedule_positions" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -5479,7 +5506,8 @@ mod tests {
                 | "access_trace_max_records"
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
-                | "count_store_exclusives" => {}
+                | "count_store_exclusives"
+                | "stacktrace_at_schedule_positions" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
@@ -5517,11 +5545,12 @@ mod tests {
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
         // `access_trace_max_bytes`, `replay_continue_fairly`,
         // `standard_stream_aliases`, `sleep_registration`, `strict_binder`,
-        // `post_crash_timeslice`, `rewrite_exclusives_in_memory`
+        // `post_crash_timeslice`, `rewrite_exclusives_in_memory`,
+        // `stacktrace_at_schedule_positions`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // fifty fewer, so thirty-six keys fewer than fields.
+        // fifty-one fewer, so thirty-seven keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 36);
+        assert_eq!(fields.len(), keys.len() + 37);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -6460,6 +6489,82 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .eager_lone_preemptions
+        );
+    }
+
+    /// `stacktrace_at_schedule_positions` came after the legacy form froze, so
+    /// it never enters it, and both the object and the array form read it
+    /// back as false.
+    #[test]
+    fn stacktrace_at_schedule_positions_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            stacktrace_at_schedule_positions: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("stacktrace_at_schedule_positions"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .stacktrace_at_schedule_positions
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .stacktrace_at_schedule_positions
+        );
+    }
+
+    /// `--stacktrace-at-schedule-positions` needs a replayed schedule, is
+    /// refused with `--strict-schedule-boundaries` (whose indices are
+    /// boundary-stream positions already), and round-trips through the
+    /// configuration's command line.
+    #[test]
+    fn stacktrace_at_schedule_positions_needs_a_replayed_schedule_and_round_trips() {
+        assert!(Config::try_parse_from(["detcore", "--stacktrace-at-schedule-positions"]).is_err());
+        assert!(
+            Config::try_parse_from([
+                "detcore",
+                "--replay-schedule-from=schedule.json",
+                "--strict-schedule-boundaries",
+                "--stacktrace-at-schedule-positions",
+            ])
+            .is_err()
+        );
+        let config = Config::try_parse_from([
+            "detcore",
+            "--replay-schedule-from=schedule.json",
+            "--stacktrace-event=7",
+            "--stacktrace-at-schedule-positions",
+        ])
+        .unwrap();
+        assert!(config.stacktrace_at_schedule_positions);
+        let rendered = config.to_string();
+        assert!(
+            rendered.contains(" --stacktrace-at-schedule-positions"),
+            "{rendered}"
+        );
+        let words: Vec<String> = shell_words::split(&rendered)
+            .unwrap()
+            .into_iter()
+            .filter(|word| word.starts_with("--replay-") || word.starts_with("--stacktrace-"))
+            .collect();
+        let reparsed =
+            Config::try_parse_from(std::iter::once("detcore".to_owned()).chain(words)).unwrap();
+        assert!(reparsed.stacktrace_at_schedule_positions, "{rendered}");
+        assert_eq!(
+            reparsed.stacktrace_event, config.stacktrace_event,
+            "{rendered}"
         );
     }
 

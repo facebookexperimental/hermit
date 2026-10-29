@@ -1273,6 +1273,12 @@
       "why": "tests/c/liteinst_inert_runtime.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this export-shaped but constructor-free DSO, selects the LiteInst backend, injects it as the in-guest Detcore runtime override, and asserts rejection before the guest is dispatched; it remains a guest fixture because a generic manifest cannot express that build, injection, and fail-closed diagnostic contract."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/loopback_accept_reader.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/loopback_accept_reader.c is owned by hermit-cli/tests/cli.rs: The integration test a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries records this guest, whose connect makes polling retries as the kernel's state calls for, and replays a prefix of its schedule as recorded, without its first polling retry and with it doubled, requiring the --stacktrace-at-schedule-positions stack at the main thread's next syscall entry in each (https://github.com/rrnewton/hermit/issues/4917); a generic manifest cannot express the schedule edits or the stack's position."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/lseek_positioning.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
