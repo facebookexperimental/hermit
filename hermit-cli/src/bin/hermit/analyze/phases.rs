@@ -2455,7 +2455,7 @@ mod tests {
                 .unwrap();
             assert_eq!(warnings.len(), usize::from(inexact));
             let expected = warnings.first().map(|line| line.trim_end());
-            let report = options.prefix_report(&schedule, 0, &schedule, [None, None]);
+            let report = options.prefix_report(&schedule, 0, &schedule, [None, None], None);
             let json = serde_json::to_value(&report).unwrap();
             assert_eq!(
                 json.get("branch_counter_warning")
