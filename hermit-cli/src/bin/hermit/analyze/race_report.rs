@@ -56,7 +56,6 @@ use crate::app::analyze::races::Window;
 use crate::app::analyze::races::find_racing_accesses;
 use crate::app::analyze::races::outcome_point;
 use crate::app::analyze::rundata::RunData;
-use crate::app::analyze::rundata::TrialEnd;
 use crate::app::analyze::types::AnalyzeOpts;
 use crate::app::container::RunTimeoutMarker;
 
@@ -466,6 +465,16 @@ fn guest_reached_a_refusal(error: &anyhow::Error) -> bool {
 /// (or why its recorded schedule gives none).
 type CheckOutcome = (anyhow::Result<TrialEnd>, Result<Option<Departure>, String>);
 
+/// How a check's replay that completed ended. One that did not complete has
+/// no outcome: its launch's error leaves the check unchecked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrialEnd {
+    /// It met the target criteria.
+    Met,
+    /// It did not.
+    Missed,
+}
+
 /// Check `candidate` (the `index`th) by intervention: replay one of the
 /// two runs ([`edit_for`]) with the candidate's turn order reversed
 /// ([`reverse_turns`], which says what it moved), then continue as the
@@ -747,7 +756,15 @@ fn check_replay(
         }
     };
     let path = run.sched_path_out().to_path_buf();
-    let ended = run.launch_trial();
+    // Only a replay that completed has an outcome; one that did not is an
+    // error, which leaves the check unchecked.
+    let ended = run.launch().map(|()| {
+        if run.is_a_match() {
+            TrialEnd::Met
+        } else {
+            TrialEnd::Missed
+        }
+    });
     let left =
         realized_schedule(&path).map(|realized| departure(schedule, &realized, reversal.replay));
     (ended, left)
@@ -800,9 +817,6 @@ fn control_reproduces(
              reversal and continued, the target run misses the target"
                 .to_string(),
         ),
-        (TrialEnd::Unfinished(stop), _) => {
-            Err(format!("its control replay did not finish ({stop:?})"))
-        }
     }
 }
 
@@ -847,10 +861,6 @@ fn verdict_of(
         (TrialEnd::Missed, true) => (
             CheckVerdict::DoesNotDecide,
             "still misses the target, as the unedited control does".to_string(),
-        ),
-        (TrialEnd::Unfinished(stop), _) => (
-            CheckVerdict::NotChecked,
-            format!("was not checked: its replay did not finish ({stop:?})"),
         ),
     }
 }
