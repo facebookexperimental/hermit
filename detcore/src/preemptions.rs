@@ -371,6 +371,7 @@ impl PreemptionRecord {
             replay_departed_at,
             format_version,
             time_skips,
+            queued_sleeps_registered_at_first_pass,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -441,6 +442,7 @@ impl PreemptionRecord {
                         .collect::<Vec<_>>()
                 })
                 .filter(|skips| !skips.is_empty()),
+            queued_sleeps_registered_at_first_pass: *queued_sleeps_registered_at_first_pass,
         }
     }
 
@@ -2167,6 +2169,27 @@ mod tests {
             assert_eq!(
                 record.schedule_prefix(len).chaos_timeslice,
                 Some(4321),
+                "prefix of {len} events"
+            );
+        }
+    }
+
+    /// The rule that registered queued sleeps is a setting of the whole run,
+    /// as the other run settings are: a prefix of the schedule keeps it,
+    /// whether it is shorter or whole.
+    #[test]
+    fn a_schedule_prefix_keeps_the_sleep_registration_rule() {
+        let tid = DetTid::from_raw(3);
+        let record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_queued_sleeps_registered_at_first_pass(true);
+        for len in [0, 1, 2, 9] {
+            assert!(
+                record
+                    .schedule_prefix(len)
+                    .queued_sleeps_registered_at_first_pass,
                 "prefix of {len} events"
             );
         }
