@@ -9522,6 +9522,7 @@ impl Scheduler {
     }
 
     /// Reschedule all threads blocked on a particular futex.
+    #[cfg(test)]
     pub fn wake_futex_waiters(
         &mut self,
         waker: DetTid,
@@ -33309,7 +33310,7 @@ mod test {
         }
         assert_eq!(
             scheduler.requeue_futex_waiters(requeuer, cond, mutex, 1, 1),
-            (1, 1)
+            (1, 1, false)
         );
         assert_eq!(
             scheduler.wake_futex_waiters(unlocker, mutex, 1, u32::MAX),
@@ -33909,11 +33910,11 @@ mod test {
         scheduler.sleep_futex_waiter(&plain, from, None, u32::MAX, None);
         scheduler.sleep_pi_futex_waiter(pi_waiter, from, None, None, owner);
         assert_eq!(
-            scheduler.requeue_futex_waiters(from, to, 0, 0),
+            scheduler.requeue_futex_waiters(owner, from, to, 0, 0),
             (0, 0, false)
         );
         assert_eq!(
-            scheduler.requeue_futex_waiters(from, to, 0, 5),
+            scheduler.requeue_futex_waiters(owner, from, to, 0, 5),
             (0, 1, true)
         );
         assert_eq!(futex_waiter_order(&scheduler, to), vec![plain]);
@@ -33945,11 +33946,11 @@ mod test {
             (0, true)
         );
         assert_eq!(
-            scheduler.requeue_futex_waiters(futex, pi_futex(0x404120), 1, 0),
+            scheduler.requeue_futex_waiters(owner, futex, pi_futex(0x404120), 1, 0),
             (0, 0, true)
         );
         assert_eq!(
-            scheduler.requeue_futex_waiters(futex, pi_futex(0x404120), 0, 0),
+            scheduler.requeue_futex_waiters(owner, futex, pi_futex(0x404120), 0, 0),
             (0, 0, false)
         );
         assert_eq!(
