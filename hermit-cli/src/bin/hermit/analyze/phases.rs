@@ -2740,7 +2740,7 @@ mod tests {
             assert!(!run.has_launched());
 
             let error = options
-                .launch_for_stacktraces("final", Path::new("schedule.json"), 1, |run| {
+                .replay_for_stacks("final", Path::new("schedule.json"), &[], 1, |run| {
                     std::fs::write(run.root_path().with_extension("stack2"), "retained stack")?;
                     Err(stopped_trial(kind))
                 })
@@ -2839,15 +2839,15 @@ mod tests {
         options.tmp_dir = Some(dir.path().to_path_buf());
         let schedule = PreemptionRecord::from_sched_events(Vec::new());
         let error = options
-            .prefix_continuation(&schedule, 0, None, |_| Ok(false))
+            .prefix_continuation("final_baseline_schedule", &schedule, 0, None, |_| Ok(false))
             .err()
             .expect("a missing record must not stand in for an observed empty trace");
         assert!(
             error.to_string().contains("no readable recorded schedule"),
             "{error:#}"
         );
-        let completed = options
-            .prefix_continuation(&schedule, 0, None, |run| {
+        let (completed, _) = options
+            .prefix_continuation("final_baseline_schedule", &schedule, 0, None, |run| {
                 schedule
                     .write_to_disk(run.sched_path_out())
                     .map_err(anyhow::Error::msg)?;
@@ -2862,6 +2862,11 @@ mod tests {
     fn a_prefix_report_requires_completed_opposite_outcomes_even_without_stacks() {
         let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         let events = critical(&[3, 5, 7], 1).failing_schedule;
+        // The continuation runs another thread at the decision than the
+        // target schedule, so the report is the two-thread one: one that runs
+        // the same thread there is reported as a timing decision, which
+        // replays both continuations.
+        let continued = critical(&[3, 7, 5], 1).failing_schedule;
         // None denotes a timeout. All completed stack trials deliberately have
         // no stack artifact: diagnostic availability cannot prove an outcome.
         for (target, continuation, len, baseline, expected_error, expected_stacks) in [
@@ -2927,10 +2932,13 @@ mod tests {
                 |_, prefix| {
                     continuations += 1;
                     assert_eq!(prefix, 1);
-                    Ok(CompletedScheduleTrial {
-                        target_met: continuation.ok_or_else(|| Error::new(RunTimeoutMarker))?,
-                        schedule: events[..len].to_vec(),
-                    })
+                    Ok((
+                        CompletedScheduleTrial {
+                            target_met: continuation.ok_or_else(|| Error::new(RunTimeoutMarker))?,
+                            schedule: continued[..len].to_vec(),
+                        },
+                        PathBuf::from("final_baseline_schedule.preempts"),
+                    ))
                 },
             );
             if let Some(expected) = expected_error {
