@@ -4917,22 +4917,24 @@ mod tests {
         assert!(changed.answer_from_journal(&entry).unwrap().is_none());
     }
 
-    /// A run its own bound stopped is journaled as such, and answered as the
-    /// same unfinished trial; one a refusal stopped likewise.
+    /// A run its own bound stopped is journaled as such, and resumes as the
+    /// same error, which ends the analysis again: a stopped run has no
+    /// outcome (main's completed-outcome rule). One a refusal stopped
+    /// likewise.
     #[test]
-    fn a_journaled_timeout_or_refusal_is_answered_as_one() {
+    fn a_journaled_timeout_or_refusal_resumes_as_the_same_error() {
         let dir = tempfile::tempdir().unwrap();
         let options = journaled_options(dir.path());
-        for (name, error, expected) in [
+        for (name, error, timeout) in [
             (
                 "bisect_round_001",
                 anyhow::Error::new(RunTimeoutMarker),
-                TrialEnd::Unfinished(Stop::Bound),
+                true,
             ),
             (
                 "bisect_round_002",
                 anyhow::Error::new(crate::app::container::PolicyRefusal),
-                TrialEnd::Unfinished(Stop::Refusal),
+                false,
             ),
         ] {
             let mut first = RunData::new_baseline(&options, name.into()).unwrap();
@@ -4941,7 +4943,19 @@ mod tests {
                 .journal_outcome(&options.journal, key, &Err(error))
                 .unwrap();
             let mut again = RunData::new_baseline(&options, name.into()).unwrap();
-            assert_eq!(again.launch_trial().unwrap(), expected, "{name}");
+            let resumed = again.launch().unwrap_err();
+            assert_eq!(
+                resumed.downcast_ref::<RunTimeoutMarker>().is_some(),
+                timeout,
+                "{name}: {resumed:#}"
+            );
+            assert_eq!(
+                resumed
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
+                    .is_some(),
+                !timeout,
+                "{name}: {resumed:#}"
+            );
         }
         // Any other error is not journaled: it ends the analysis, and a
         // resume runs the trial again.

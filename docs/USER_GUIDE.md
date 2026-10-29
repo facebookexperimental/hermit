@@ -1203,22 +1203,16 @@ phase was running:
   long ones meet it, so the report names the longest prefix whose replay
   finished and missed, the shortest whose replay met it, and the range of
   events between them that holds the deciding event.
-- A budget that runs out after the search decided, during its stack-trace
-  runs, still reports the decision, in the fields a complete report uses:
-  `deciding_event` for `--prefix-search` and `critical_event1` and
-  `critical_event2` for the default search, without stacks (`partial.stacks`
-  says why); `--resume` takes them. On the prefix path both critical events
-  name the deciding event too, until the stack-trace runs place them: which
-  shape the complete report takes (critical events at the deciding event, or
-  a timing decision with `deciding_event` and the critical events at
-  continuation positions) is known only after those runs. So in a partial
-  report `deciding_event`'s presence does not mean a timing decision; a
-  script reads `partial` first.
+- A budget that runs out after the search finished, during its final
+  replays, reports no decision: analyze names one only once those replays
+  repeat the search's outcomes, so the report's event fields are absent and
+  `partial.stacks` says why; `--resume` runs them. A partial report never
+  names a decision, so a script reads `partial` first.
 
 In a report file such a report's `verdict` is `partial`, and `partial` holds
-what it found. Its event fields name the events the search decided on when it
-had decided (`partial.decided`), and otherwise where the closest pair first
-differs, which is the deciding event or one before it, not critical events.
+what it found. While the default search runs, `critical_event1` and
+`critical_event2` name where its closest pair first differs, which is the
+deciding event or one before it; otherwise the event fields are absent.
 
 Analyze stops itself only between runs, and the default search's computation
 between runs and the stack replays after the budget can take a little longer,
@@ -1234,22 +1228,24 @@ run's outcome (`analyze-journal.jsonl`), what the analysis is of
 without `--keep-tmp`, and the report gives the command that continues it: the
 same arguments plus `--resume=WORKSPACE`. A resumed analysis runs again from
 its start, and every run in the journal takes its recorded outcome instead of
-running. The default search restarts at the pass whose interval the progress
-names, from that interval's two schedules in the workspace, rather than
-replaying its earlier passes, which would need every trial's schedules. So the
-resumed analysis makes the same decisions and reports what an uninterrupted
-analysis would. It refuses (exit 122), naming each difference, when the hermit
-binary, the guest program, the run arguments, the target criteria, the search
-options and `--max-log-bytes`, the record or schedule files given as runs, or
-`--analyze-seed` differ from the recorded ones; to start over anyway, run the
-command without `--resume`. With `--image` in the run arguments, `--resume`,
-`--time-budget` and `--trial-budget` are refused (exit 122): the image
-reference can name another image by the next invocation, and the program runs
-from the image's root, so analyze cannot show that a resumed analysis has the
-same guest. A workspace that `--keep-tmp` kept, or that a
-SIGKILL left, can be resumed the same way. A resumed analysis that errors or
-is stopped keeps the workspace, whatever its retention, so that it can be
-resumed again.
+running. A run its own bound stopped, or Hermit refused, is journaled too, and
+resumes as the same error, which ends the analysis there again: such a run has
+no outcome. The default search restarts at the pass whose interval the
+progress names, from that interval's two schedules in the workspace, rather
+than replaying its earlier passes, which would need every trial's schedules.
+So the resumed analysis makes the same decisions and reports what an
+uninterrupted analysis would. It refuses (exit 122), naming each difference,
+when the hermit binary, the guest program, the run arguments, the target
+criteria, the search options and `--max-log-bytes`, the record or schedule
+files given as runs, or `--analyze-seed` differ from the recorded ones; to
+start over anyway, run the command without `--resume`. With `--image` in the
+run arguments, `--resume`, `--time-budget` and `--trial-budget` are refused
+(exit 122): the image reference can name another image by the next invocation,
+and the program runs from the image's root, so analyze cannot show that a
+resumed analysis has the same guest. A workspace that `--keep-tmp` kept, or
+that a SIGKILL left, can be resumed the same way. A resumed analysis that
+errors or is stopped keeps the workspace, whatever its retention, so that it
+can be resumed again.
 
 ```bash
 hermit analyze --prefix-search --time-budget=30m --run1-seed=1 \

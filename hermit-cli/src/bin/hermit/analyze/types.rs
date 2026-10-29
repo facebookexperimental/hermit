@@ -381,8 +381,9 @@ pub struct AnalyzeOpts {
     /// --keep-tmp, and the report gives the command that continues the analysis (--resume).
     /// The default search's report replays its two schedules for their stacks only when two
     /// such runs fit min(120 s, 5% of the budget) after it ran out; the report says when they
-    /// did not. A budget that runs out after the search decided, during its stack-trace runs,
-    /// still reports the decision: the deciding event or the critical pair, without stacks.
+    /// did not. A budget that runs out after the search finished, during its final replays,
+    /// reports no decision: analyze names one only once those replays repeat the search's
+    /// outcomes.
     /// Computation between runs (the default search's schedule distances) is not
     /// interrupted, so analyze may overrun the budget by that much; an outer kill bound should
     /// sit above the budget plus that grace, so that analyze stops itself first.
@@ -771,13 +772,8 @@ pub struct Report {
     /// then the threads that run next in each continuation, and their
     /// `event_index` is a position in that continuation's recorded schedule
     /// (the header names both files); where no other thread runs, it is that
-    /// schedule's length and the stack is empty.
-    ///
-    /// In a partial report (`partial` set) its presence does NOT mean a timing
-    /// decision: when a budget ends the stack-trace runs of a prefix search,
-    /// the deciding event and both critical events all name the decision,
-    /// because which shape the complete report takes is known only after
-    /// those runs. Read `partial` first.
+    /// schedule's length and the stack is empty. A partial report never sets
+    /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deciding_event: Option<ReportCriticalEvent>,
 
@@ -788,8 +784,7 @@ pub struct Report {
 
     /// Set when a budget (--time-budget, --trial-budget) ended the analysis
     /// before it found the critical events: what it found so far. Read it
-    /// before the event fields, whose shape differs in a partial report (see
-    /// `deciding_event` and [`PartialReport::decided`]).
+    /// before the event fields: a partial report names no decision in them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial: Option<PartialReport>,
 }
@@ -816,13 +811,6 @@ pub struct PartialReport {
     pub interval: Option<BisectInterval>,
     /// `--prefix-search`'s bracket, if it got that far.
     pub bracket: Option<PrefixBracket>,
-    /// The search's result, if it had one before the stack traces. The
-    /// report's event fields then carry it too, without stacks: for
-    /// `--prefix-search` the deciding event and both critical events name
-    /// the decision until the stack-trace runs place them, so
-    /// `deciding_event`'s presence does not mean a timing decision; for the
-    /// default search the critical events are the critical pair.
-    pub decided: Option<String>,
     /// Whether the stack traces were taken, or why not.
     pub stacks: String,
     /// Commands that replay the runs the report rests on.

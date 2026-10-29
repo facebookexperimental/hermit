@@ -49,11 +49,10 @@ pub enum Verdict {
     /// says so and names no event.
     ReproducedWithoutSchedule,
     /// A budget (`--time-budget`, `--trial-budget`) ended the analysis before
-    /// it concluded (exit 120): `partial` says what it found so far. Its
-    /// event fields are the events the search decided on when it had decided
-    /// before the budget ran out (`partial.decided`), and otherwise where the
-    /// closest pair of schedules found first differs, which is the deciding
-    /// event or one before it, not critical events.
+    /// it concluded (exit 120): `partial` says what it found so far, and the
+    /// report names no decision. While the default search runs, both event
+    /// fields name where its closest pair of schedules first differs, which
+    /// is the deciding event or one before it; otherwise they are absent.
     Partial,
 }
 

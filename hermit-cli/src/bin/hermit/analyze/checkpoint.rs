@@ -474,11 +474,8 @@ pub struct IntervalResume {
     /// alignment search (--run-needleman).
     pub event_level: bool,
     /// How many trials the search had started, so the next is named as the
-    /// uninterrupted search names it, and how many of them a bound stopped
-    /// or Hermit refused, for the warnings the result carries.
+    /// uninterrupted search names it.
     pub trials: usize,
-    pub unfinished: usize,
-    pub refused: usize,
 }
 
 /// `--prefix-search`'s current bracket. Short prefixes miss the target and
@@ -498,9 +495,6 @@ pub struct PrefixBracket {
     /// The shortest prefix whose trial met the target, and that trial.
     pub meets: Option<usize>,
     pub meets_run: Option<String>,
-    /// Prefixes in between whose trials a bound stopped or Hermit refused:
-    /// not outcomes.
-    pub unfinished: Vec<usize>,
 }
 
 /// [`PROGRESS_FILE`]'s contents.
@@ -511,24 +505,6 @@ pub struct Progress {
     pub interval: Option<BisectInterval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bracket: Option<PrefixBracket>,
-    /// The search's result, once it has one (the stack traces may follow).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decided: Option<String>,
-    /// The same result's events, which a partial report carries in its
-    /// structured fields.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decision: Option<DecidedEvents>,
-}
-
-/// The events a finished search decided on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DecidedEvents {
-    /// `--prefix-search`: the deciding event of the target schedule.
-    Deciding(usize),
-    /// The default search: the critical pair of the failing schedule, the
-    /// event before the critical one and the critical one.
-    CriticalPair(usize, usize),
 }
 
 /// The analysis's progress, written to [`PROGRESS_FILE`] on every change
@@ -593,13 +569,6 @@ impl ProgressHandle {
 
     pub fn bracket(&self, bracket: PrefixBracket) {
         self.update(|progress| progress.bracket = Some(bracket));
-    }
-
-    pub fn decided(&self, decided: String, events: DecidedEvents) {
-        self.update(|progress| {
-            progress.decided = Some(decided);
-            progress.decision = Some(events);
-        });
     }
 
     /// Change the progress and write it. A write that fails is reported and
@@ -798,7 +767,6 @@ mod tests {
             misses_run: Some("prefix_round_004".into()),
             meets: Some(50),
             meets_run: Some("prefix_round_003".into()),
-            unfinished: vec![45],
         };
         progress.bracket(bracket.clone());
         let read: Progress =

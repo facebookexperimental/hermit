@@ -42,7 +42,6 @@ use crate::app::analyze::budget::BudgetKind;
 use crate::app::analyze::checkpoint::BisectInterval;
 use crate::app::analyze::checkpoint::CHECKPOINT_VERSION;
 use crate::app::analyze::checkpoint::Checkpoint;
-use crate::app::analyze::checkpoint::DecidedEvents;
 use crate::app::analyze::checkpoint::FileIdentity;
 use crate::app::analyze::checkpoint::Identity;
 use crate::app::analyze::checkpoint::IntervalResume;
@@ -232,7 +231,7 @@ fn knock_out_latest(record: &PreemptionRecord) -> Option<PreemptionRecord> {
 /// lies between the longest prefix known to miss and the shortest known to
 /// meet.
 fn describe_bracket(bracket: &PrefixBracket) -> String {
-    let mut said = match (bracket.misses, bracket.meets) {
+    match (bracket.misses, bracket.meets) {
         (Some(misses), Some(meets)) => format!(
             "The prefix search's bracket, continuing without chaos {}: replaying the first \
              {misses} of the target schedule's {} events misses the target ({}), and replaying \
@@ -266,20 +265,7 @@ fn describe_bracket(bracket: &PrefixBracket) -> String {
                 bracket.misses_run.as_deref().unwrap_or("a trial")
             )),
         ),
-    };
-    if !bracket.unfinished.is_empty() {
-        said.push_str(&format!(
-            "The trials of the prefixes of {} events in between did not finish (a bound or a \
-             refusal stopped them); they are not outcomes.\n",
-            bracket
-                .unfinished
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
     }
-    said
 }
 
 /// The command line that continues this analysis in `workspace`: this
@@ -391,8 +377,6 @@ struct SearchState {
     endpoints: String,
     event_level: bool,
     trials: usize,
-    unfinished: usize,
-    refused: usize,
 }
 
 impl IntervalFiles {
@@ -465,20 +449,18 @@ impl IntervalFiles {
                 failing_hash: hashes[1].clone(),
                 event_level: state.event_level,
                 trials: state.trials,
-                unfinished: state.unfinished,
-                refused: state.refused,
             }),
         });
     }
 }
 
-/// How the last trial of each prefix ended, per continuation, and the
-/// wall-clock bound it ran under, in seconds.
-type Ends = BTreeMap<(usize, MaybeTimeslice), (TrialEnd, Option<u64>)>;
+/// How the last trial of each prefix ended, per continuation: it met the
+/// target or missed it, since a trial that does not finish ends the search.
+type Ends = BTreeMap<(usize, MaybeTimeslice), TrialEnd>;
 
 /// `--prefix-search`'s bracket at `continuation` over a schedule of
 /// `events` events, from each prefix's last trial (`ends`) and the run that
-/// was (`runs`): only trials that finished bound it.
+/// was (`runs`).
 fn prefix_bracket(
     ends: &Ends,
     runs: &BTreeMap<(usize, MaybeTimeslice), String>,
@@ -487,22 +469,12 @@ fn prefix_bracket(
 ) -> PrefixBracket {
     let at = |end: TrialEnd| {
         ends.iter()
-            .filter(move |((_, timeslice), (ended, _))| *timeslice == continuation && *ended == end)
+            .filter(move |((_, timeslice), ended)| *timeslice == continuation && **ended == end)
             .map(|((prefix, _), _)| *prefix)
     };
     let meets = at(TrialEnd::Met).min();
     let below = meets.unwrap_or(usize::MAX);
     let misses = at(TrialEnd::Missed).filter(|&prefix| prefix < below).max();
-    let unfinished = ends
-        .iter()
-        .filter(|((prefix, timeslice), (end, _))| {
-            *timeslice == continuation
-                && !end.finished()
-                && *prefix < below
-                && misses.is_none_or(|misses| *prefix > misses)
-        })
-        .map(|((prefix, _), _)| *prefix)
-        .collect();
     let run = |prefix: Option<usize>| {
         prefix.and_then(|prefix| runs.get(&(prefix, continuation)).cloned())
     };
@@ -513,7 +485,6 @@ fn prefix_bracket(
         misses_run: run(misses),
         meets,
         meets_run: run(meets),
-        unfinished,
     }
 }
 
@@ -1598,7 +1569,7 @@ impl AnalyzeOpts {
             } else {
                 TrialEnd::Missed
             };
-            ends.insert((len, continuation), (end, None));
+            ends.insert((len, continuation), end);
             runs.insert((len, continuation), format!("prefix_round_{trial:03}"));
             self.progress
                 .bracket(prefix_bracket(&ends, &runs, continuation, target.len()));
@@ -1863,13 +1834,6 @@ impl AnalyzeOpts {
             continuation: timeslice,
         } = found;
         self.progress.phase(Phase::StackTraces);
-        self.progress.decided(
-            format!(
-                "event #{decision} of the target schedule decides the outcome ({})",
-                schedule.schedevents()[decision]
-            ),
-            DecidedEvents::Deciding(decision),
-        );
         let trace_from = self.race_trace_from(decision);
         let (target_met, chosen, target_trace) = stack(
             "final_target_for_stacktraces",
@@ -2942,8 +2906,6 @@ impl AnalyzeOpts {
         let resumed = self.resumable_interval(&endpoints);
         let resume = resumed.as_ref().map(|(resume, ..)| resume);
         let trials = Cell::new(resume.map_or(0, |resume| resume.trials));
-        let unfinished = Cell::new(resume.map_or(0, |resume| resume.unfinished));
-        let refused = Cell::new(resume.map_or(0, |resume| resume.refused));
         // Unfinished trials have no observed outcome or realized trace. Keep
         // the typed error and the last completed endpoints by ending the search.
         let test_fn = |sched: &[SchedEvent]| -> TrialOutcome {
@@ -2995,8 +2957,6 @@ impl AnalyzeOpts {
                         endpoints: endpoints.clone(),
                         event_level: at.event_level,
                         trials: trials.get(),
-                        unfinished: unfinished.get(),
-                        refused: refused.get(),
                     };
                     interval.record(
                         self,
@@ -3162,18 +3122,6 @@ impl AnalyzeOpts {
             critical_event_index,
         } = crit;
         self.progress.phase(Phase::StackTraces);
-        self.progress.decided(
-            format!(
-                "events #{} and #{critical_event_index} of the failing schedule are the critical \
-                 pair, in {}",
-                critical_event_index - 1,
-                self.get_tmp()?
-                    .join("final_target_for_stacktraces")
-                    .with_extension(SCHED_EXT)
-                    .display()
-            ),
-            DecidedEvents::CriticalPair(critical_event_index - 1, critical_event_index),
-        );
 
         let runname1 = "final_target_for_stacktraces";
         let runname2 = "final_baseline_for_stacktraces";
@@ -3579,37 +3527,23 @@ impl AnalyzeOpts {
         let mut critical = [None, None];
         let mut stacks =
             "not applicable: the default search had no pair of schedules yet".to_owned();
-        // The events the report's structured fields name: the critical pair's
-        // and the deciding event's indices.
-        let mut critical_indices = progress
-            .interval
-            .as_ref()
-            .map_or([0, 0], |interval| [interval.common_prefix; 2]);
-        let mut deciding_event = None;
-        if let Some(decided) = &progress.decided {
-            header.push_str(&format!(
-                "The search had finished: {decided}. Its stack-trace runs did not finish within \
-                 the budget; --resume takes them.\n"
-            ));
-            // A budget hit after the search decided still reports the
-            // decision, in the fields a complete report puts it in; only the
-            // stacks are missing.
-            stacks = "not taken: the budget ran out during the stack-trace runs; --resume takes \
-                      them"
+        // The event the report's structured fields name: where the default
+        // search's closest pair first differs, while it searches. Otherwise
+        // they are left out.
+        let critical_index = match &progress.interval {
+            Some(interval) if progress.phase == Phase::Bisect => Some(interval.common_prefix),
+            _ => None,
+        };
+        if progress.phase == Phase::StackTraces {
+            // Only the final replays, once they repeat the search's outcomes,
+            // let analyze report what the search found.
+            header.push_str(
+                "The search had finished, but its final replays, which must repeat its outcomes \
+                 before analyze reports a decision, did not finish within the budget, so this \
+                 report names none; --resume runs them.\n",
+            );
+            stacks = "not taken: the budget ran out during the final replays; --resume takes them"
                 .to_owned();
-            match progress.decision {
-                Some(DecidedEvents::Deciding(decision)) => {
-                    critical_indices = [decision; 2];
-                    deciding_event = Some(ReportCriticalEvent {
-                        event_index: decision,
-                        stack: None,
-                    });
-                }
-                Some(DecidedEvents::CriticalPair(first, second)) => {
-                    critical_indices = [first, second];
-                }
-                None => {}
-            }
         } else if let Some(interval) = &progress.interval
             && progress.phase == Phase::Bisect
         {
@@ -3703,16 +3637,16 @@ impl AnalyzeOpts {
             header: header.clone(),
             additional_context: String::new(),
             baseline_run: true,
-            critical_event1: Some(ReportCriticalEvent {
-                event_index: critical_indices[0],
+            critical_event1: critical_index.map(|event_index| ReportCriticalEvent {
+                event_index,
                 stack: critical1,
             }),
-            critical_event2: Some(ReportCriticalEvent {
-                event_index: critical_indices[1],
+            critical_event2: critical_index.map(|event_index| ReportCriticalEvent {
+                event_index,
                 stack: critical2,
             }),
             branch_counter_warning: self.branch_counter_warning.clone(),
-            deciding_event,
+            deciding_event: None,
             racing_accesses: None,
             partial: Some(PartialReport {
                 reason: expired.kind,
@@ -3725,7 +3659,6 @@ impl AnalyzeOpts {
                 cut_run: expired.cut.clone(),
                 interval: progress.interval.clone(),
                 bracket: progress.bracket.clone(),
-                decided: progress.decided.clone(),
                 stacks,
                 replay_commands,
                 workspace: workspace.clone(),
@@ -8969,7 +8902,7 @@ mod tests {
                     end
                 }
             };
-            self.ends.insert((prefix, None), (end, None));
+            self.ends.insert((prefix, None), end);
             self.runs
                 .insert((prefix, None), format!("prefix_round_{prefix}"));
             Ok(end == TrialEnd::Met)
@@ -9016,7 +8949,6 @@ mod tests {
         assert_eq!(outcome(meets), TrialEnd::Met);
         assert!(misses <= decision && decision < meets, "{bracket:?}");
         assert_eq!(bracket.meets_run, Some(format!("prefix_round_{meets}")));
-        assert!(bracket.unfinished.is_empty());
 
         let resumed_budget = Budget::default();
         let resumed =
@@ -9070,27 +9002,24 @@ mod tests {
         assert_eq!((bracket.misses, bracket.meets), (Some(375), Some(500)));
     }
 
-    /// Only trials that finished bound the bracket: a stopped one in between
-    /// is named as no outcome.
+    /// The bracket is the longest prefix whose trial missed the target and
+    /// the shortest whose trial met it.
     #[test]
     fn a_bracket_rests_on_finished_trials() {
-        use crate::app::analyze::rundata::Stop;
         let mut ends = Ends::new();
         let mut runs = BTreeMap::new();
         for (prefix, end) in [
             (0, TrialEnd::Missed),
             (10, TrialEnd::Missed),
-            (20, TrialEnd::Unfinished(Stop::Bound)),
             (30, TrialEnd::Met),
             (40, TrialEnd::Met),
         ] {
-            ends.insert((prefix, None), (end, None));
+            ends.insert((prefix, None), end);
             runs.insert((prefix, None), format!("prefix_round_{prefix:03}"));
         }
         let bracket = prefix_bracket(&ends, &runs, None, 50);
         assert_eq!(bracket.misses, Some(10));
         assert_eq!(bracket.meets, Some(30));
-        assert_eq!(bracket.unfinished, [20]);
         let said = describe_bracket(&bracket);
         assert!(
             said.contains(
@@ -9100,12 +9029,8 @@ mod tests {
             ),
             "{said}"
         );
-        assert!(
-            said.contains("prefixes of 20 events in between did not finish"),
-            "{said}"
-        );
         // Before any trial met the target there is no upper end.
-        ends.retain(|_, (end, _)| *end != TrialEnd::Met);
+        ends.retain(|_, end| *end != TrialEnd::Met);
         let open = prefix_bracket(&ends, &runs, None, 50);
         assert_eq!((open.misses, open.meets), (Some(10), None));
         assert!(
@@ -9142,8 +9067,8 @@ mod tests {
         let expired = options.budget.start_trial().unwrap_err();
         options.progress.phase(Phase::PrefixSearch);
         let mut ends = Ends::new();
-        ends.insert((100, None), (TrialEnd::Missed, None));
-        ends.insert((200, None), (TrialEnd::Met, None));
+        ends.insert((100, None), TrialEnd::Missed);
+        ends.insert((200, None), TrialEnd::Met);
         let runs = BTreeMap::from([
             ((100, None), "prefix_round_004".to_owned()),
             ((200, None), "prefix_round_003".to_owned()),
@@ -9214,8 +9139,6 @@ mod tests {
                 endpoints: endpoints.clone(),
                 event_level: true,
                 trials: 7,
-                unfinished: 1,
-                refused: 0,
             }),
         );
         options.resumed_progress = Some(options.progress.snapshot());
@@ -9223,10 +9146,7 @@ mod tests {
         let (resume, pass, resumed_passing, resumed_failing) =
             options.resumable_interval(&endpoints).unwrap();
         assert_eq!(pass, 3);
-        assert_eq!(
-            (resume.trials, resume.unfinished, resume.refused),
-            (7, 1, 0)
-        );
+        assert_eq!(resume.trials, 7);
         assert!(resume.event_level);
         assert_eq!(resumed_passing, passing);
         assert_eq!(resumed_failing, failing);
@@ -9245,97 +9165,60 @@ mod tests {
         assert!(options.resumable_interval(&endpoints).is_none());
     }
 
-    /// A budget hit after the search decided, during the stack-trace runs,
-    /// still reports the decision in the report's structured fields: the
-    /// deciding event for `--prefix-search`, and the critical pair for the
-    /// default search, with no stacks, and exits 120. Before, the decision
-    /// was only text, and the event indices were 0 on the prefix path.
+    /// A budget hit after the search finished, during its final replays,
+    /// reports no decision: only those replays, once they repeat the search's
+    /// outcomes, let analyze report one (main's completed-outcome rule). The
+    /// report's event fields stay empty, it says why, and analyze exits 120.
     #[test]
-    fn a_budget_hit_after_the_decision_reports_it() {
-        for (decided, events, critical, deciding) in [
-            (
-                "event #41 of the target schedule decides the outcome (tid 3)",
-                DecidedEvents::Deciding(41),
-                [41, 41],
-                Some(41),
-            ),
-            (
-                "events #6 and #7 of the failing schedule are the critical pair",
-                DecidedEvents::CriticalPair(6, 7),
-                [6, 7],
-                None,
-            ),
-        ] {
-            let parent = tempfile::tempdir().unwrap();
-            let report_file = parent.path().join("report.json");
-            let report = format!("--report-file={}", report_file.display());
-            let (mut options, _workspace) =
-                analysis_in(parent.path(), &[report.as_str(), "--time-budget=30m"]);
-            options.budget = Budget::new(options.time_budget, options.trial_budget);
-            options.progress.phase(Phase::StackTraces);
-            options.progress.decided(decided.to_owned(), events);
-            let expired = BudgetExpired {
-                kind: BudgetKind::TimeBudget,
-                cut: Some("final_target_for_stacktraces".to_owned()),
-            };
+    fn a_budget_hit_during_the_final_replays_reports_no_decision() {
+        let parent = tempfile::tempdir().unwrap();
+        let report_file = parent.path().join("report.json");
+        let report = format!("--report-file={}", report_file.display());
+        let (mut options, _workspace) =
+            analysis_in(parent.path(), &[report.as_str(), "--time-budget=30m"]);
+        options.budget = Budget::new(options.time_budget, options.trial_budget);
+        options.progress.phase(Phase::StackTraces);
+        let expired = BudgetExpired {
+            kind: BudgetKind::TimeBudget,
+            cut: Some("final_target_for_stacktraces".to_owned()),
+        };
 
-            let status = options.report_partial(expired).unwrap();
-            assert_eq!(
-                status,
-                ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
-            );
-            let written: Report =
-                serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
-            assert_eq!(
-                [
-                    written.critical_event1.event_index,
-                    written.critical_event2.event_index
-                ],
-                critical,
-                "{events:?}"
-            );
-            assert_eq!(
-                written
-                    .deciding_event
-                    .as_ref()
-                    .map(|event| event.event_index),
-                deciding,
-                "{events:?}"
-            );
-            assert!(written.critical_event1.stack.is_none());
-            assert!(written.critical_event2.stack.is_none());
-            assert!(
-                written
-                    .deciding_event
-                    .as_ref()
-                    .is_none_or(|event| event.stack.is_none())
-            );
-            let partial = written.partial.unwrap();
-            assert_eq!(partial.phase, Phase::StackTraces);
-            assert_eq!(partial.decided.as_deref(), Some(decided));
-            assert_eq!(
-                partial.stacks,
-                "not taken: the budget ran out during the stack-trace runs; --resume takes them"
-            );
-            assert!(
-                written
-                    .header
-                    .contains(&format!("The search had finished: {decided}.")),
-                "{}",
-                written.header
-            );
-        }
+        let status = options.report_partial(expired).unwrap();
+        assert_eq!(
+            status,
+            ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
+        );
+        let written: Report =
+            serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
+        assert_eq!(written.verdict, Verdict::Partial);
+        assert!(written.critical_event1.is_none());
+        assert!(written.critical_event2.is_none());
+        assert!(written.deciding_event.is_none());
+        let partial = written.partial.unwrap();
+        assert_eq!(partial.phase, Phase::StackTraces);
+        assert_eq!(
+            partial.stacks,
+            "not taken: the budget ran out during the final replays; --resume takes them"
+        );
+        assert!(
+            written.header.contains(
+                "its final replays, which must repeat its outcomes before analyze reports a \
+                 decision, did not finish within the budget, so this report names none"
+            ),
+            "{}",
+            written.header
+        );
     }
 
     /// The same, through the real cut path: a prefix search with a trial
     /// runner in place of the guest and `--trial-budget` set to the trials the
     /// search takes, so the budget runs out at the first stack-trace run
     /// (`final_target_for_stacktraces`), and `end_on_budget` reports it as
-    /// `analyze` does. The report carries the decision as above. Resumed
+    /// `analyze` does. The report names no decision, as above. Resumed
     /// through the journal, the analysis answers the search's trials from it
-    /// and finishes with the same deciding event.
+    /// and finishes with the deciding event, once its final replays ran.
     #[test]
-    fn a_trial_budget_that_ends_at_the_stack_trace_runs_reports_the_decision() {
+    fn a_trial_budget_that_ends_at_the_final_replays_reports_no_decision() {
         use std::sync::Arc;
         use std::sync::Mutex;
 
@@ -9361,6 +9244,9 @@ mod tests {
                     .load_all()
                     .schedevents()
                     .len();
+                // A completed run records the schedule it ran, which main's
+                // completed-outcome checks read: here, the one it replayed.
+                std::fs::copy(&replayed, run.sched_path_out()).unwrap();
                 run.finish_for_test(prefix > deciding, std::time::Duration::from_secs(1));
                 Ok(())
             })))
@@ -9413,40 +9299,21 @@ mod tests {
         );
         let written: Report =
             serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
-        assert_eq!(
-            written
-                .deciding_event
-                .as_ref()
-                .map(|event| event.event_index),
-            Some(deciding)
-        );
-        assert_eq!(
-            [
-                written.critical_event1.event_index,
-                written.critical_event2.event_index
-            ],
-            [deciding, deciding]
-        );
-        assert!(written.critical_event1.stack.is_none());
-        assert!(written.critical_event2.stack.is_none());
+        assert_eq!(written.verdict, Verdict::Partial);
+        assert!(written.deciding_event.is_none());
+        assert!(written.critical_event1.is_none());
+        assert!(written.critical_event2.is_none());
         assert!(
-            written
-                .deciding_event
-                .as_ref()
-                .is_some_and(|event| event.stack.is_none())
+            !written.header.contains(&format!("event #{deciding}")),
+            "{}",
+            written.header
         );
         let partial = written.partial.unwrap();
         assert_eq!(partial.reason, BudgetKind::TrialBudget);
         assert_eq!(partial.phase, Phase::StackTraces);
-        assert!(
-            partial.decided.as_deref().is_some_and(|decided| decided
-                .starts_with(&format!("event #{deciding} of the target schedule decides"))),
-            "{:?}",
-            partial.decided
-        );
         assert_eq!(
             partial.stacks,
-            "not taken: the budget ran out during the stack-trace runs; --resume takes them"
+            "not taken: the budget ran out during the final replays; --resume takes them"
         );
 
         // Resumed, the search's trials come from the journal and only the
@@ -9465,7 +9332,10 @@ mod tests {
         assert!(resumed_ran.lock().unwrap().is_empty());
         let complete = resumed.phase6_record_prefix_outputs(decision).unwrap();
         assert!(complete.partial.is_none());
-        assert_eq!(complete.critical_event1.event_index, deciding);
+        assert_eq!(
+            complete.critical_event1.map(|event| event.event_index),
+            Some(deciding)
+        );
         assert_eq!(
             resumed_ran.lock().unwrap().first().map(String::as_str),
             Some("final_target_for_stacktraces")
