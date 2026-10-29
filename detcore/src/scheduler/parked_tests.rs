@@ -45,6 +45,8 @@ struct Backend {
     child_publications: Mutex<Vec<ChildExitCompletion>>,
     fail_child_publication: std::sync::atomic::AtomicBool,
     fail_publication: std::sync::atomic::AtomicBool,
+    /// Every alarm and timer publication reports its signal already pending.
+    coalesce: std::sync::atomic::AtomicBool,
     fail_recipients: Mutex<Option<SignalProcessId>>,
     fail_reservation: std::sync::atomic::AtomicBool,
     failure_processes: Mutex<Vec<SignalProcessId>>,
@@ -82,7 +84,7 @@ impl ProcessSignalControl for Backend {
         let receipt = ProcessSignalPublication {
             process,
             pending_generation: 0,
-            coalesced: false,
+            coalesced: self.coalesce.load(std::sync::atomic::Ordering::Relaxed),
             disposition: reverie::ProcessAlarmSignalDisposition::Caught,
         };
         if self
@@ -109,7 +111,7 @@ impl ProcessSignalControl for Backend {
         ProcessSignalPublicationResult::Committed(ProcessSignalPublication {
             process,
             pending_generation: 0,
-            coalesced: false,
+            coalesced: self.coalesce.load(std::sync::atomic::Ordering::Relaxed),
             disposition: reverie::ProcessAlarmSignalDisposition::Caught,
         })
     }
@@ -7926,3 +7928,104 @@ fn a_caught_timer_interruption_of_an_observed_nanosleep_notes_the_timers_due_tim
     }
 }
 
+/// Dispatches process 100's POSIX timer 3 expiration due at `due`, aimed at
+/// the process, through the control.
+fn dispatch_posix_expiry(s: &mut Scheduler, tid: DetTid, due: u64) {
+    s.dispatch_timed_signal(
+        at(due),
+        timed_waiters::SignalTimerId::Posix(DetPid::from_raw(100), 3),
+        timed_waiters::SignalTarget::Process(tid),
+        timed_waiters::TimerSignal::Send(Signal::SIGUSR1),
+        true,
+        at(due),
+    );
+}
+
+/// A coalesced timer publication installs nothing: Linux keeps the first
+/// pending event. A recurring process-directed POSIX timer published at 10 and
+/// again, coalesced, at 20 before the signal is dequeued keeps the due time
+/// 10, and a caught interruption of an observed `nanosleep` by that event
+/// reports its remaining time from 10
+/// (https://github.com/rrnewton/hermit/issues/4931).
+#[test]
+fn a_coalesced_timer_publication_keeps_the_pending_events_first_due_time() {
+    let (mut s, b) = fixture();
+    let (tid, mm, site) = add(&mut s, 100, 100);
+    let response = sleep(&mut s, tid, mm, site, 100);
+    s.committed_time = at(20);
+    dispatch_posix_expiry(&mut s, tid, 10);
+    b.coalesce.store(true, std::sync::atomic::Ordering::Relaxed);
+    dispatch_posix_expiry(&mut s, tid, 20);
+    let rows: Vec<_> = s.parked.timer_publications.iter().map(|p| p.due).collect();
+    assert_eq!(rows, vec![at(10)]);
+    let (process, event) = b.timer_publications.lock().unwrap()[0];
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    s.select_parked_alarm().unwrap();
+    let observed = selected(&response);
+    let removal = reverie::SignalDequeue {
+        process,
+        sequence: 1,
+        consumer: reverie::SignalConsumer::ReturnToUser,
+        domain: reverie::PendingDomain::Process,
+        event,
+    };
+    s.apply_signal_dequeue(DetPid::from_raw(100), tid, removal)
+        .unwrap();
+    let ack = Ivar::new();
+    s.post_control(
+        tid,
+        mm,
+        ControlIntent::Finish {
+            wait: observed.continuation,
+            lease: observed.lease,
+            site,
+            finish: ObservationFinish::InterruptForCaught {
+                selection: reverie::PreparedSignalToken {
+                    site,
+                    selection_nonce: 1,
+                },
+                dequeue: Some(removal.id()),
+            },
+            ack: ack.clone(),
+        },
+    )
+    .unwrap();
+    s.drain_control_intents();
+    assert_eq!(ack.try_read(), Some(Ok(FinishAck::Interrupted)));
+    assert_eq!(s.take_sleep_interruption(tid), Some(at(10)));
+}
+
+/// A coalesced publication whose pending signal no tracked timer publication
+/// installed (here an `ITIMER_REAL` expiry whose `SIGALRM` was already pending
+/// from elsewhere) creates no entry, so no timer due time is ever attributed
+/// to that signal.
+#[test]
+fn a_coalesced_publication_with_no_tracked_timer_records_nothing() {
+    let (mut s, b) = fixture();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    b.coalesce.store(true, std::sync::atomic::Ordering::Relaxed);
+    s.replace_real_timer(tid, tid, at(0), at(10), at(0), Signal::SIGALRM)
+        .unwrap();
+    s.committed_time = at(10);
+    s.step2b_process_timed(&committed_clock(&s));
+    assert!(!s.backend_failed());
+    assert_eq!(b.publications.lock().unwrap().len(), 1);
+    assert!(s.parked.timer_publications.is_empty());
+    dispatch_posix_expiry(&mut s, tid, 10);
+    assert_eq!(b.timer_publications.lock().unwrap().len(), 1);
+    assert!(s.parked.timer_publications.is_empty());
+}
+
+/// A publication that installed its event replaces an identical entry, which
+/// can only be stale: no identical event was pending.
+#[test]
+fn a_fresh_timer_publication_replaces_a_stale_identical_entry() {
+    let (mut s, _) = fixture();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    dispatch_posix_expiry(&mut s, tid, 10);
+    dispatch_posix_expiry(&mut s, tid, 20);
+    let rows: Vec<_> = s.parked.timer_publications.iter().map(|p| p.due).collect();
+    assert_eq!(rows, vec![at(20)]);
+}

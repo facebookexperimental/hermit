@@ -289,8 +289,10 @@ pub(super) struct ParkedRequests {
     pub failure_wakes: Vec<futures::channel::oneshot::Sender<()>>,
     /// Timer expirations published through the control and not yet dequeued,
     /// with the time each was due: the instant Linux sends the signal
-    /// (`publish_real_expiry`, `publish_posix_timer_expiry`). An identical
-    /// event published again replaces the earlier entry.
+    /// (`publish_real_expiry`, `publish_posix_timer_expiry`, through
+    /// `note_timer_publication`). A coalesced publication, whose standard
+    /// signal was already pending, keeps the pending event's entry and its
+    /// first due time, and adds none.
     pub(super) timer_publications: Vec<TimerPublication>,
     /// For a thread observing a parked wait, the removal of a timer's
     /// published signal that its observation made, with the timer's due time
@@ -320,15 +322,29 @@ pub(super) struct ObservedTimerDequeue {
 }
 
 impl ParkedRequests {
-    /// Records a committed timer publication due at `due`, replacing an
-    /// identical event's earlier one.
-    fn record_timer_publication(
+    /// Records a timer publication due at `due`, from the backend's receipt.
+    ///
+    /// A publication that installed its event (`coalesced` false) is recorded
+    /// with its due time, replacing an identical event's entry, which can only
+    /// be stale since no identical event was pending. A coalesced one
+    /// installed nothing: the kernel keeps the first pending event, so an
+    /// identical entry keeps its first due time, and with none tracked (the
+    /// pending signal is not a timer's this ledger saw) no entry is made.
+    /// A publication that did not commit records nothing.
+    fn note_timer_publication(
         &mut self,
         pid: DetPid,
         process: SignalProcessId,
         event: SignalEvent,
         due: LogicalTime,
+        outcome: &ProcessSignalPublicationResult,
     ) {
+        let ProcessSignalPublicationResult::Committed(receipt) = outcome else {
+            return;
+        };
+        if receipt.coalesced {
+            return;
+        }
         self.timer_publications
             .retain(|p| !(p.pid == pid && p.process == process && p.event == event));
         self.timer_publications.push(TimerPublication {
@@ -1223,10 +1239,8 @@ impl Scheduler {
         ) {
             self.parked.failures.push(process);
         }
-        if matches!(outcome, ProcessSignalPublicationResult::Committed(_)) {
-            self.parked
-                .record_timer_publication(pid, process, event, deadline);
-        }
+        self.parked
+            .note_timer_publication(pid, process, event, deadline, &outcome);
         self.real_timers.publication(expiry, outcome)?;
         Ok(())
     }
@@ -1265,14 +1279,13 @@ impl Scheduler {
         siginfo[16..20].copy_from_slice(&timer.to_ne_bytes());
         let event = SignalEvent::new(signo, siginfo, SignalTarget::Process { pid: process.tgid })
             .map_err(|_| ProtocolFailure::Identity)?;
-        match control.process.publish_timer_expiry(process, event) {
-            ProcessSignalPublicationResult::Committed(_) => {
-                // Due at the expiration being dispatched (`signal_sent_at`).
-                let due = self.signal_sent_at();
-                self.parked
-                    .record_timer_publication(pid, process, event, due);
-                Ok(())
-            }
+        let outcome = control.process.publish_timer_expiry(process, event);
+        // Due at the expiration being dispatched (`signal_sent_at`).
+        let due = self.signal_sent_at();
+        self.parked
+            .note_timer_publication(pid, process, event, due, &outcome);
+        match outcome {
+            ProcessSignalPublicationResult::Committed(_) => Ok(()),
             ProcessSignalPublicationResult::FailedAfterCommit { .. } => {
                 self.parked.failures.push(process);
                 Ok(())
