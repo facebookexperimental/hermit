@@ -446,9 +446,9 @@ fn timing_decision_header(
 }
 
 /// What a stack-trace replay of a critical pair gave.
-struct StackReplay {
+pub(super) struct StackReplay {
     /// It met the target criteria (it finished: [`AnalyzeOpts::replay_for_stacks`]).
-    met_target: bool,
+    pub(super) met_target: bool,
     /// The stacks at its schedule's events `index - 1` and `index`.
     stacks: [Option<PrettyBacktrace>; 2],
     /// Where it left its schedule before passing event `index`, if it did.
@@ -765,7 +765,7 @@ impl AnalyzeOpts {
     /// schedule the replay realized. A replay that does not finish ends the
     /// analysis with its error (`incomplete_trial`): its stacks stay in the
     /// workspace, but only a finished replay's are used.
-    fn replay_for_stacks(
+    pub(super) fn replay_for_stacks(
         &self,
         runname: &str,
         schedule_path: &Path,
@@ -2488,8 +2488,10 @@ mod tests {
     }
 
     /// Capturing both stacks is not proof that the candidate completed. This
-    /// drives the final adapter used by production reporting, including its
-    /// expected-outcome comparator, rather than only the stack launcher.
+    /// drives the stack-trace replay used by production reporting
+    /// ([`AnalyzeOpts::replay_for_stacks`]), whose completed outcome the
+    /// report then compares with the search's, rather than only the stack
+    /// launcher.
     #[test]
     fn a_timed_out_final_replay_cannot_validate_the_expected_outcome() {
         let dir = tempfile::tempdir().unwrap();
@@ -2506,12 +2508,14 @@ mod tests {
         }))
         .unwrap();
         let bytes = serde_json::to_vec(&stack).unwrap();
-        for expected_match in [false, true] {
-            let result = options.run_and_retrieve_stacks_with(
-                "unfinished_final",
-                dir.path().join("candidate.json"),
+        // Each of the two replays the report takes, the passing and the
+        // failing one.
+        for runname in ["unfinished_final_passing", "unfinished_final"] {
+            let result = options.replay_for_stacks(
+                runname,
+                &dir.path().join("candidate.json"),
+                &[],
                 1,
-                expected_match,
                 |run| {
                     assert!(!run.has_launched());
                     for extension in ["stack1", "stack2"] {
@@ -2520,8 +2524,9 @@ mod tests {
                     Err(Error::new(RunTimeoutMarker))
                 },
             );
-            let error =
-                result.expect_err("captured stacks must not certify an unfinished candidate");
+            let error = result
+                .err()
+                .expect("captured stacks must not certify an unfinished candidate");
             assert!(
                 error.downcast_ref::<RunTimeoutMarker>().is_some(),
                 "{error:#}"
@@ -2532,8 +2537,7 @@ mod tests {
             );
             for extension in ["stack1", "stack2"] {
                 assert_eq!(
-                    std::fs::read(dir.path().join(format!("unfinished_final.{extension}")))
-                        .unwrap(),
+                    std::fs::read(dir.path().join(format!("{runname}.{extension}"))).unwrap(),
                     bytes,
                     "retain captured diagnostics"
                 );

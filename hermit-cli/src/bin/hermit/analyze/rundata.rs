@@ -3441,8 +3441,10 @@ mod tests {
             .refuse_unenforceable_trial_timeout()
             .unwrap();
     }
-    /// The final adapter must compare observed completed predicates, including
-    /// guest nonzero exits, even when neither diagnostic stack is available.
+    /// The stack-trace replay the report takes must give the observed
+    /// completed predicate, including a guest's nonzero exit, even when neither
+    /// diagnostic stack is available: the report compares that outcome with
+    /// the search's, and ends the analysis when they differ.
     #[test]
     fn final_replays_require_the_observed_completed_outcome() {
         use reverie::process::ExitStatus;
@@ -3451,12 +3453,12 @@ mod tests {
         let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         options.tmp_dir = Some(dir.path().to_path_buf());
         for actual in [false, true] {
-            for expected in [false, true] {
-                let result = options.run_and_retrieve_stacks_with(
+            let replay = options
+                .replay_for_stacks(
                     "completed_final",
-                    dir.path().join("candidate.json"),
+                    &dir.path().join("candidate.json"),
+                    &[],
                     1,
-                    expected,
                     |run| {
                         assert!(!run.has_launched());
                         let output = Output {
@@ -3469,21 +3471,15 @@ mod tests {
                         // product API that could manufacture completion.
                         run.is_a_match = Some(options.output_matches(&output));
                         assert_eq!(run.is_a_match(), actual);
+                        // A completed replay records the schedule it ran.
+                        PreemptionRecord::from_sched_events(Vec::new())
+                            .write_to_disk(run.sched_path_out())
+                            .map_err(anyhow::Error::msg)?;
                         Ok(())
                     },
-                );
-                if actual == expected {
-                    let (first, second) = result.expect("a completed matching replay is valid");
-                    assert!(first.is_none() && second.is_none());
-                } else {
-                    let error = result
-                        .expect_err("a contradictory final replay cannot certify a candidate");
-                    assert!(
-                        error.to_string().contains("observed the opposite"),
-                        "{error:#}"
-                    );
-                }
-            }
+                )
+                .expect("a completed replay gives its outcome");
+            assert_eq!(replay.met_target, actual);
         }
     }
 
