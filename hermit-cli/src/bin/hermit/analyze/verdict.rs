@@ -181,7 +181,8 @@ impl AnalyzeVerdict {
                      failure needs no \
                      chaos decision under them, so no event decides it, and a two-seed search \
                      against a passing seed can end the same way, as it falls back to this \
-                     search when no single swap separates its endpoints. To name a deciding \
+                     search when it establishes no exact one-swap pair of schedules with \
+                     opposite outcomes. To name a deciding \
                      event, analyze a new failing run with {alts} in the run arguments, if one \
                      fails there."
                 ),
@@ -354,8 +355,9 @@ impl std::fmt::Display for AnalyzePrecondition {
 impl std::error::Error for AnalyzePrecondition {}
 
 /// The precondition `error` concludes, if any: an [`AnalyzePrecondition`], or
-/// one of the schedule search's typed ends that no single reordering
-/// separates the endpoints, which reach `main.rs` only from `hermit bisect`.
+/// the schedule search's typed end that it established no exact one-swap
+/// pair of schedules with opposite outcomes, which reaches `main.rs` only
+/// from `hermit bisect`.
 pub fn precondition_class(error: &anyhow::Error) -> Option<PreconditionClass> {
     if let Some(precondition) = error.downcast_ref::<AnalyzePrecondition>() {
         return Some(precondition.class);
@@ -458,8 +460,9 @@ mod tests {
              timeslices, misses it (prefix_alternative_timing.repro in the workspace). The \
              failure needs no chaos \
              decision under them, so no event decides it, and a two-seed search against a \
-             passing seed can end the same way, as it falls back to this search when no single \
-             swap separates its endpoints. To name a deciding event, analyze a new failing run \
+             passing seed can end the same way, as it falls back to this search when it \
+             establishes no exact one-swap pair of schedules with opposite outcomes. To name a \
+             deciding event, analyze a new failing run \
              with no --pipe-wake-latency in the run arguments, if one fails there."
         );
         assert_eq!(
@@ -506,8 +509,8 @@ mod tests {
         assert_eq!(later, VerdictReason::Unknown);
     }
 
-    /// The schedule search's two typed ends that no single reordering
-    /// separates the endpoints conclude `endpoints-not-separable`; a hint
+    /// The schedule search's typed end that it established no exact one-swap
+    /// pair, with or without a swap left, concludes `endpoints-not-separable`; a hint
     /// keeps the class and adds to the explanation.
     #[test]
     fn the_search_ends_that_no_swap_separates_are_a_precondition() {

@@ -1139,7 +1139,7 @@ line that says which. The class line is the first line on stderr:
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | The target run, the failing endpoint of a bisection, or `--minimize`'s last record does not meet the target criteria. |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced` | The baseline meets the target too, or the baseline the user chose does not finish. |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation` | No continuation timeslice allows a prefix search. |
-| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable` | `hermit bisect` only: no single reordering separates `--good` from `--bad`. Analyze searches within the target schedule instead. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable` | `hermit bisect` only: its search established no exact one-swap pair of schedules with opposite outcomes between `--good` and `--bad`. Analyze attempts a prefix search within the target schedule instead. |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-identical` | `hermit bisect` only: `--good` and `--bad` contain identical event traces. |
 | 2 | none | clap's usage error: the command line did not parse. |
 | 122 | `HERMIT_POLICY_REFUSAL class=policy-refusal` | Hermit refused the target run, or analyze or bisect refused its options or schedules. |

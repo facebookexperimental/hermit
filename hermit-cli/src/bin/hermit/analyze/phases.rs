@@ -5996,8 +5996,9 @@ mod tests {
         assert_eq!(error.to_string(), "searched");
     }
 
-    /// Both of the bisection's ends that no single reordering separates the
-    /// endpoints send analyze to a prefix search; other ends do not. An
+    /// Both of the bisection's ends that establish no exact one-swap pair of
+    /// schedules with opposite outcomes send analyze to attempt a prefix
+    /// search; other ends do not. An
     /// endpoint of analyze's own that did not reproduce is pointed at replay.
     #[test]
     fn bisection_ends_are_answered_by_their_kind() {

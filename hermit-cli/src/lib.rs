@@ -156,7 +156,8 @@ pub const HERMIT_VERIFICATION_DIVERGENCE_EXIT: i32 = 1;
 ///
 /// The target run does not meet the target criteria, the baseline does not
 /// miss it or does not finish, no continuation allows a prefix search, or
-/// bisect's endpoints are identical or no reordering separates them.
+/// bisect's endpoints are identical or its search established no exact
+/// one-swap pair of schedules with opposite outcomes between them.
 /// Analyze concluded that, and says what to change; Hermit did not fail, so
 /// it is not 125, and no fail-closed policy refused a run, so it is not 122
 /// (which analyze exits with when Hermit refuses one of its runs). It
@@ -379,8 +380,8 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //              analyze what it needs, `diff`'s "trouble":
 //              `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced`,
 //              `class=baseline-not-reproduced`, `class=no-prefix-continuation`,
-//              `class=endpoints-not-separable` (bisect; analyze searches
-//              within the target schedule instead) or `class=endpoints-identical`
+//              `class=endpoints-not-separable` (bisect; analyze attempts a
+//              prefix search within the target schedule instead) or `class=endpoints-identical`
 //              (bisect). clap's usage error is 2 too, with no class line.
 //   122        HERMIT_POLICY_REFUSAL_EXIT: Hermit refused the target run, or
 //              analyze or bisect refused its options or schedules

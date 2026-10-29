@@ -225,7 +225,7 @@ same way and exits the same. Every exit status of `hermit analyze` and
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | The first run without `--search`, the failing endpoint of a bisection (bisect's `--bad`), or `--minimize`'s last record does not meet the target. |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced` | The passing endpoint (bisect's `--good`) meets the target, the baseline run meets it, or the baseline the user chose does not finish. |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation` | No continuation timeslice allows a prefix search. |
-| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable` | Bisect only: no single reordering separates its endpoints. Analyze searches within the target schedule instead. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable` | Bisect only: its search established no exact one-swap pair of schedules with opposite outcomes between its endpoints. Analyze attempts a prefix search within the target schedule instead. |
 | 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-identical` | Bisect only: `--good` and `--bad` contain identical event traces. |
 | 2 | none (clap's `error:` and usage) | The command line did not parse. |
 | 122 | `HERMIT_POLICY_REFUSAL class=policy-refusal` | Hermit refused the target run, or analyze or bisect refused its options or schedules (for example schedules recorded under different epochs). |
