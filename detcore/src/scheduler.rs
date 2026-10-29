@@ -15875,9 +15875,12 @@ impl Scheduler {
                 return Err(SkipTurn);
             } // End of the record and replay policy.
 
-            // Run mode has no rejoin log, so host completion timing must not decide
-            // whether a ready continuation overtakes guest work that was already
-            // runnable: a finished call is readmitted only once no such work is queued.
+            // A run must be deterministic on its own: a preemption record it writes
+            // stores where each call rejoined only for a later replay of that
+            // record, unlike record mode's log, which its replay follows. So host
+            // completion timing must not decide whether a ready continuation
+            // overtakes guest work that was already runnable: a finished call is
+            // readmitted only once no such work is queued.
             // Pollers are excluded because they commonly wait for the completed
             // operation and would otherwise starve it.
             let only_pollers = self.run_queue.only_pollers() && !self.vfork_child_runs_turn();
