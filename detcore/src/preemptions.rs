@@ -495,6 +495,8 @@ impl PreemptionRecord {
             chaos_timeslice,
             guest_ids,
             reserved_input,
+            post_crash_timeslice,
+            post_crash,
             callback_checkpoints,
             rng_seed,
             expired_wait_runs_charged_once,
@@ -552,6 +554,12 @@ impl PreemptionRecord {
             chaos_timeslice: *chaos_timeslice,
             guest_ids: *guest_ids,
             reserved_input: reserved_input.clone(),
+            post_crash_timeslice: *post_crash_timeslice,
+            // The switches the run took name points of the recorded run, as
+            // the checkpoints do. A prefix of the whole schedule keeps them;
+            // a shorter one lists none and is not checked against them, as a
+            // record derived from another (`clone_preemptions_only`) is not.
+            post_crash: if followed { None } else { post_crash.clone() },
             callback_checkpoints,
             rng_seed: *rng_seed,
             expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
@@ -2959,6 +2967,46 @@ mod tests {
                     "prefix of {len} events"
                 );
             }
+    /// The post-crash bound is a setting of the whole run, which every prefix
+    /// of the schedule keeps; the switches the run took are points of it,
+    /// which only a prefix of the whole schedule keeps (a shorter one lists
+    /// none and is not checked against them).
+    #[test]
+    fn a_schedule_prefix_keeps_the_post_crash_bound_and_the_switches_only_for_the_whole_schedule() {
+        let tid = DetTid::from_raw(3);
+        let switch = crate::post_crash::PostCrashSwitch {
+            dtid: tid,
+            signal: libc::SIGABRT,
+            exec_by: None,
+            turn: 4,
+            bound: 200_000_000,
+        };
+        let mut record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_post_crash_timeslice(Some(200_000_000));
+        record.post_crash = Some(vec![switch]);
+        for len in [0, 1, 2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).post_crash_timeslice(),
+                Some(200_000_000),
+                "prefix of {len} events"
+            );
+        }
+        for len in [2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).post_crash_complete(),
+                Some(&[switch][..]),
+                "prefix of {len} events"
+            );
+        }
+        for len in [0, 1] {
+            assert_eq!(
+                record.schedule_prefix(len).post_crash_complete(),
+                None,
+                "prefix of {len} events"
+            );
         }
     }
 
