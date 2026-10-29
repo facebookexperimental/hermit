@@ -450,47 +450,6 @@ fn selfcheck_conclusion(
     Err(AnalyzeFailure::ReplayNotReproducible(format!("{difference} {HOST}")).into())
 }
 
-/// The verdict of a prefix search whose empty prefix meets the target when
-/// continued without chaos at `continuation` (`error`, an
-/// [`EmptyPrefixMeetsTarget`]), naming any coarser one of `candidates` it did
-/// not try.
-fn empty_prefix_verdict(
-    error: &Error,
-    candidates: &[Option<NonZeroU64>],
-    continuation: Option<NonZeroU64>,
-) -> AnalyzeVerdict {
-    // The empty prefix's first trial was stopped, so the continuation looked
-    // usable and any coarser candidate went untried; name it rather than let
-    // the host's speed decide.
-    let untried: Vec<String> = candidates
-        .iter()
-        .skip_while(|&&candidate| candidate != continuation)
-        .skip(1)
-        .map(|&candidate| describe_continuation(candidate))
-        .collect();
-    let untried = if untried.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " The search did not try continuing {}, because the empty prefix's first trial did \
-             not finish; --continuation-timeslice selects one.",
-            untried.join(" or ")
-        )
-    };
-    AnalyzeVerdict::no_deciding_event(
-        format!(
-            "no event of the target schedule decides the outcome: {error}, so without chaos {}, the \
-         scheduler alone, replaying none of the target schedule, meets the target. The outcome \
-         does not depend on a chaos decision, so debug that run directly: the reproducer of the \
-         last trial in the workspace runs it. To bisect against a run that misses the target \
-         instead, pass --continuation-timeslice with a timeslice at which the scheduler alone \
-         misses it, or use the default search with a passing --run2-seed.{untried}",
-            describe_continuation(continuation)
-        ),
-        continuation,
-    )
-}
-
 /// `args` without the option `name`, as `name=VALUE` or as `name` and its
 /// value, before any `--` that starts the guest command, whose arguments are
 /// kept as they are.
@@ -5767,27 +5726,6 @@ mod tests {
             crate::classify_failure(&replay),
             "HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation"
         );
-    }
-
-    /// A prefix search whose empty prefix already meets the target concludes
-    /// that no event decides the outcome, naming a coarser continuation it did
-    /// not try.
-    #[test]
-    fn an_empty_prefix_that_meets_the_target_is_a_verdict() {
-        let ns = |nanos: u64| NonZeroU64::new(nanos);
-        let candidates = [ns(1_000), ns(200_000_000)];
-        let error = Error::new(EmptyPrefixMeetsTarget);
-        let AnalyzeVerdict::NoDecidingEvent { explanation, .. } =
-            empty_prefix_verdict(&error, &candidates, ns(1_000));
-        assert!(
-            explanation.starts_with("no event of the target schedule decides the outcome: ")
-                && explanation
-                    .contains("The search did not try continuing at a 200000000 ns timeslice"),
-            "{explanation}"
-        );
-        let AnalyzeVerdict::NoDecidingEvent { explanation, .. } =
-            empty_prefix_verdict(&error, &candidates, ns(200_000_000));
-        assert!(!explanation.contains("did not try"), "{explanation}");
     }
 
     /// A verdict that names no event is reported as a completed analysis:
