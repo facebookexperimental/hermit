@@ -447,9 +447,7 @@ fn timing_decision_header(
 
 /// What a stack-trace replay of a critical pair gave.
 struct StackReplay {
-    /// It finished (no bound or refusal stopped it).
-    finished: bool,
-    /// It finished and met the target criteria.
+    /// It met the target criteria (it finished: [`AnalyzeOpts::replay_for_stacks`]).
     met_target: bool,
     /// The stacks at its schedule's events `index - 1` and `index`.
     stacks: [Option<PrettyBacktrace>; 2],
@@ -468,7 +466,6 @@ impl StackReplay {
             None => true,
             Some(Departure::OtherEvent { index, .. }) => *index > event,
             Some(Departure::Ended { events }) => *events > event,
-            Some(Departure::Unknown) => false,
         }
     }
 }
@@ -486,8 +483,6 @@ enum Departure {
     },
     /// It ended after this many events.
     Ended { events: usize },
-    /// It recorded no schedule (a bound or a refusal stopped it).
-    Unknown,
 }
 
 impl std::fmt::Display for Departure {
@@ -502,10 +497,6 @@ impl std::fmt::Display for Departure {
                 "ran {ran} at event #{index}, where the schedule has {expected}"
             ),
             Departure::Ended { events } => write!(f, "ended after {events} events"),
-            Departure::Unknown => write!(
-                f,
-                "did not finish (a bound or a refusal stopped it), so it recorded no schedule"
-            ),
         }
     }
 }
@@ -614,21 +605,13 @@ fn missing_stack_reason(
             "followed its schedule through event #{event}, but left no readable stack there"
         ),
     };
-    let unfinished = [baseline, target]
-        .iter()
-        .any(|replay| replay.left_schedule == Some(Departure::Unknown));
     format!(
         "{which} is not available: no stack-trace replay captured that operation (event #{event} \
-         of the passing schedule). The baseline replay {}; the target replay {}. {}",
+         of the passing schedule). The baseline replay {}; the target replay {}. Schedule replay \
+         did not reproduce these runs; check that they replay (--selfcheck) on a host with an \
+         exact branch counter (hermit host-capabilities).",
         describe(baseline, event),
         describe(target, target_event),
-        if unfinished {
-            "A replay that did not finish was stopped by a bound (raise --trial-timeout) or \
-             refused by Hermit (its reason is in its log)."
-        } else {
-            "Schedule replay did not reproduce these runs; check that they replay (--selfcheck) \
-             on a host with an exact branch counter (hermit host-capabilities)."
-        },
     )
 }
 
@@ -779,8 +762,9 @@ impl AnalyzeOpts {
 
     /// Replay `schedule` (written at `schedule_path`) for the stacks of the
     /// critical pair, its events `index - 1` and `index`, recording the
-    /// schedule the replay realized. A replay that a bound stops or Hermit
-    /// refuses still returns what it captured.
+    /// schedule the replay realized. A replay that does not finish ends the
+    /// analysis with its error (`incomplete_trial`): its stacks stay in the
+    /// workspace, but only a finished replay's are used.
     fn replay_for_stacks(
         &self,
         runname: &str,
@@ -803,16 +787,11 @@ impl AnalyzeOpts {
             (index as u64, Some(paths[1].clone())),
         ];
         launch(&mut run).map_err(|error| incomplete_trial(error, &root_path))?;
-        let finished = true;
         eprintln!(
             "\n:: {}\n{}",
-            if finished {
-                "Stack-trace replay finished.  Repro command:"
-            } else {
-                "Stack-trace replay stopped.  Repro command:"
-            }
-            .green()
-            .bold(),
+            "Stack-trace replay finished.  Repro command:"
+                .green()
+                .bold(),
             run.to_repro()
         );
         let mut stacks = [None, None];
@@ -829,22 +808,22 @@ impl AnalyzeOpts {
                 ),
             }
         }
-        let (left_schedule, ran) = if realized.exists() {
-            let realized = PreemptionReader::new(&realized).load_all().into_global();
-            let ran_at = |event: usize| realized.get(event).map(|event| event.dettid);
-            (
-                departure(schedule, &realized, index + 1),
-                [ran_at(index - 1), ran_at(index)],
-            )
-        } else {
-            (Some(Departure::Unknown), [None, None])
-        };
+        let realized = PreemptionReader::try_new(&realized)
+            .with_context(|| {
+                format!(
+                    "completed stack-trace replay {runname} has no readable recorded schedule at \
+                     {}; retain the trial diagnostics and retry recording before analysis",
+                    realized.display()
+                )
+            })?
+            .into_inner()
+            .into_global();
+        let ran_at = |event: usize| realized.get(event).map(|event| event.dettid);
         Ok(StackReplay {
-            finished,
-            met_target: finished && run.is_a_match(),
+            met_target: run.is_a_match(),
             stacks,
-            left_schedule,
-            ran,
+            left_schedule: departure(schedule, &realized, index + 1),
+            ran: [ran_at(index - 1), ran_at(index)],
         })
     }
 
@@ -1215,6 +1194,13 @@ impl AnalyzeOpts {
             continuation,
             |run| self.launch_prefix_trial(run, RunData::launch),
         )?;
+        if !target_completed.target_met {
+            bail!(
+                "final target prefix continuation did not meet the target criteria; no \
+                 opposite-outcome pair was established. Inspect final_target_schedule diagnostics \
+                 and stabilize replay before retrying analysis."
+            );
+        }
         let target_continued = target_completed.schedule;
         let with = slice_from(&target_continued, decision, thread);
         let without = slice_from(continued, decision, thread);
@@ -1249,10 +1235,11 @@ impl AnalyzeOpts {
             &without,
         )?;
         if !target_met || (with.next.is_some() && !next_target_met) || baseline_met {
-            eprintln!(
-                ":: {} the stack-trace runs did not repeat the search's outcomes; read the \
-                 stacks with care",
-                "WARNING:".yellow().bold(),
+            bail!(
+                "the stack-trace runs did not repeat the search's outcomes; no opposite-outcome \
+                 pair was established. Inspect final_target_next_for_stacktraces and \
+                 final_baseline_next_for_stacktraces diagnostics and stabilize replay before \
+                 retrying analysis."
             );
         }
         let next_index = |variant: &[SchedEvent], slice: &Slice| {
@@ -1938,27 +1925,26 @@ impl AnalyzeOpts {
             critical_event_index,
             RunData::launch,
         )?;
-        if (baseline.finished && baseline.met_target) || (target.finished && !target.met_target) {
-            eprintln!(
-                ":: {} the stack-trace replays did not repeat the search's outcomes (baseline \
-                 met the target: {}, target met it: {}); read the stacks with care",
-                "WARNING:".yellow().bold(),
+        if baseline.met_target || !target.met_target {
+            bail!(
+                "the stack-trace replays did not repeat the search's outcomes (baseline met the \
+                 target: {}, target met it: {}); no opposite-outcome pair was established. \
+                 Inspect {runname2} and {runname1} diagnostics and stabilize replay before \
+                 retrying analysis.",
                 baseline.met_target,
                 target.met_target,
             );
         }
-        if target.met_target
-            && let Some(change) = target_run.and_then(|run| {
-                changed_output(
-                    run,
-                    &tmp_dir.join(runname1),
-                    [
-                        ("stdout", self.target_stdout.as_ref()),
-                        ("stderr", self.target_stderr.as_ref()),
-                    ],
-                )
-            })
-        {
+        if let Some(change) = target_run.and_then(|run| {
+            changed_output(
+                run,
+                &tmp_dir.join(runname1),
+                [
+                    ("stdout", self.target_stdout.as_ref()),
+                    ("stderr", self.target_stderr.as_ref()),
+                ],
+            )
+        }) {
             eprintln!(":: {} {change}", "WARNING:".yellow().bold());
             header.push_str(&format!("Note: {change}\n"));
         }
@@ -3342,8 +3328,7 @@ mod tests {
             }))
             .unwrap()
         };
-        let replay = |finished, stacks, left_schedule, ran| StackReplay {
-            finished,
+        let replay = |stacks, left_schedule, ran| StackReplay {
             met_target: false,
             stacks,
             left_schedule,
@@ -3357,14 +3342,8 @@ mod tests {
             expected: SchedEvent::branches(tid(5), 10),
             ran: SchedEvent::branches(tid(9), 10),
         });
-        let baseline = replay(
-            true,
-            [None, None],
-            left.clone(),
-            [Some(tid(9)), Some(tid(9))],
-        );
+        let baseline = replay([None, None], left.clone(), [Some(tid(9)), Some(tid(9))]);
         let target = replay(
-            true,
             [Some(on(7, "close")), None],
             None,
             [Some(tid(7)), Some(tid(5))],
@@ -3387,29 +3366,26 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("--selfcheck"), "{reason}");
-        let followed_without = replay(true, [None, None], None, [Some(tid(7)), Some(tid(5))]);
+        let followed_without = replay([None, None], None, [Some(tid(7)), Some(tid(5))]);
         let reason = missing_stack_reason("stack1", (1093, 1094), &baseline, &followed_without);
         assert!(
             reason.contains("the target replay followed its schedule through event #1094, but left no readable stack there"),
             "{reason}"
         );
-        let stopped = replay(false, [None, None], Some(Departure::Unknown), [None, None]);
-        let reason = missing_stack_reason("stack1", (1093, 1094), &baseline, &stopped);
-        assert!(
-            reason.contains("did not finish") && reason.contains("--trial-timeout"),
-            "{reason}"
+        let ended_early = replay(
+            [None, None],
+            Some(Departure::Ended { events: 1000 }),
+            [None, None],
         );
 
         // The baseline replay took its stacks but left its schedule first:
         // the target replay, which followed its own, is preferred.
         let early = replay(
-            true,
             [Some(on(5, "early-read")), Some(on(9, "early-write"))],
             left,
             [Some(tid(5)), Some(tid(9))],
         );
         let followed = replay(
-            true,
             [Some(on(7, "close")), Some(on(5, "read"))],
             None,
             [Some(tid(7)), Some(tid(5))],
@@ -3424,25 +3400,23 @@ mod tests {
         // With no replay that followed its schedule, a stack taken on the
         // operation's thread is kept with a caveat; one taken on another
         // thread (thread 9 where the schedule has thread 7) is left out.
-        let [read, close] = merge_stacks(&early, &stopped, 1094, threads);
+        let [read, close] = merge_stacks(&early, &ended_early, 1094, threads);
         let (read, source) = read.unwrap();
         assert_eq!(read, on(5, "early-read"));
         assert!(source.contains("may be another occurrence"), "{source}");
         assert_eq!(close, None);
-        // A stopped replay recorded no schedule; its stack still counts when
-        // it was taken on the operation's thread.
-        let stopped_with = replay(
-            false,
+        // A replay that left its schedule before the pair keeps a stack it
+        // took on the operation's thread.
+        let left_with = replay(
             [Some(on(7, "close")), Some(on(9, "other"))],
-            Some(Departure::Unknown),
+            Some(Departure::Ended { events: 1000 }),
             [None, None],
         );
-        let [read, close] = merge_stacks(&baseline, &stopped_with, 1094, threads);
+        let [read, close] = merge_stacks(&baseline, &left_with, 1094, threads);
         assert_eq!(read, None);
         assert_eq!(close.unwrap().0, on(7, "close"));
 
         let both = replay(
-            true,
             [Some(on(5, "read")), Some(on(7, "close"))],
             None,
             [Some(tid(5)), Some(tid(7))],
