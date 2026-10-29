@@ -450,6 +450,7 @@ impl PreemptionRecord {
             time_skips,
             queued_sleeps_registered_at_first_pass,
             rejoins,
+            background_starts,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -503,7 +504,6 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             // A prefix of an inexact record is inexact too.
             replay_departed_at: *replay_departed_at,
-            format_version: *format_version,
             // The jumps the prefix reaches, in stream order, as analyze and
             // bisect carry them (`hermit-cli`'s `time_skip_carry`): one at its
             // end still waits there for a FIFO open's poll, and one beyond it
@@ -527,6 +527,18 @@ impl PreemptionRecord {
             // (`forget_run_points`), so its replay readmits a finished call
             // when it finds it finished.
             rejoins: if followed { None } else { rejoins.clone() },
+            // The background starts are points of the recorded run too, and
+            // go the same way. The format goes with them, as an edited
+            // record's does (`forget_run_points`): a format that notes
+            // background starts says the record holds every start its run
+            // took, so a shorter prefix that kept it without them would tell
+            // its replay that no call began.
+            format_version: if followed { None } else { *format_version },
+            background_starts: if followed {
+                Vec::new()
+            } else {
+                background_starts.clone()
+            },
         }
     }
 
@@ -2448,6 +2460,48 @@ mod tests {
                 record.schedule_prefix(len).rejoins.is_none(),
                 "prefix of {len} events"
             );
+        }
+    }
+
+    /// The background starts name points of the recorded run, as the
+    /// readmissions do, and the record's format says it holds them all: a
+    /// prefix of the whole schedule keeps both, and a shorter one drops both,
+    /// as an edited record does, so its replay starts each call as before.
+    #[test]
+    fn a_schedule_prefix_keeps_the_background_starts_only_for_the_whole_schedule() {
+        let tid = DetTid::from_raw(3);
+        let mut record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ]);
+        record.format_version = Some(PREEMPTION_RECORD_FORMAT);
+        record.background_starts.push(BackgroundStart {
+            after: 1,
+            thread: tid,
+            call: 1,
+        });
+        record.validate().unwrap();
+        for len in [2, 9] {
+            let prefix = record.schedule_prefix(len);
+            assert_eq!(
+                prefix.format_version, record.format_version,
+                "prefix of {len} events"
+            );
+            assert_eq!(
+                prefix.background_starts(),
+                record.background_starts(),
+                "prefix of {len} events"
+            );
+            prefix.validate().unwrap();
+        }
+        for len in [0, 1] {
+            let prefix = record.schedule_prefix(len);
+            assert_eq!(prefix.format_version, None, "prefix of {len} events");
+            assert!(
+                prefix.background_starts().is_empty(),
+                "prefix of {len} events"
+            );
+            prefix.validate().unwrap();
         }
     }
 
