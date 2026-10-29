@@ -460,6 +460,14 @@ fn bisect_rejects_a_timed_out_replay() {
 /// same with `spin`; only the behavior after a wins changes. This keeps seed
 /// discovery bounded without waiting for every losing seed to time out.
 fn race_then_target_seed() -> u64 {
+    race_then_target_seed_matching("exit", &[])
+}
+
+/// [`race_then_target_seed`] in mode `stand_in`, under the run arguments
+/// `run_args`. The fixture acts on its mode only after the race, so a
+/// `stand_in` that terminates whichever thread wins finds the seed for any
+/// mode with the same argc and argument length before the race.
+fn race_then_target_seed_matching(stand_in: &str, run_args: &[&str]) -> u64 {
     let guest = &workloads().race_then;
     for seed in 0..40 {
         let mut command = Command::new("timeout");
@@ -467,13 +475,14 @@ fn race_then_target_seed() -> u64 {
             .args(["--signal=KILL", "30s"])
             .arg(hermit_test::hermit_binary())
             .args(["run", "--chaos", "--timeout=2"])
+            .args(run_args)
             .arg(format!("--seed={seed}"));
         if let Some(margin) = std::env::var_os(ANALYZE_SKID_MARGIN_ENV) {
             command.arg(format!("--skid-margin={}", margin.to_string_lossy()));
         }
-        // Match spin's argc and argument length before the race. The mode is
-        // inspected only after the winning thread is known.
-        command.arg("--").arg(guest).arg("exit");
+        // Match the mode's argc and argument length before the race. The mode
+        // is inspected only after the winning thread is known.
+        command.arg("--").arg(guest).arg(stand_in);
         let output = hermit_test::hermit_output("terminating race seed discovery", &mut command);
         match output.status.code() {
             Some(0) => {
@@ -822,6 +831,50 @@ fn analyze_ends_with_a_refused_target_run() {
         diagnostics.contains("unsupported syscall: restart_syscall"),
         "{diagnostics}"
     );
+}
+
+/// `hermit analyze` of the analyze_race_then fixture in mode `then` (one
+/// that terminates whichever thread wins), with `analyze_opts` and the run
+/// arguments `run_args`, from a chaos seed under which thread b wins: the
+/// output, and the report if analyze wrote one. It runs under the analyze
+/// lock and an outer bound, with the calibrated skid margin, as the spin
+/// tests do.
+fn analyze_race_then_with(
+    then: &str,
+    analyze_opts: &[&str],
+    run_args: &[&str],
+) -> (Output, Option<serde_json::Value>) {
+    let _guard = analyze_lock();
+    let seed = race_then_target_seed_matching(then, run_args);
+    let dir = tempfile::tempdir().unwrap();
+    let report_file = dir.path().join("report.json");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--signal=KILL", "120s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "analyze",
+            "--target-stdout=b-first",
+            "--target-exit-code=0",
+            "--trial-timeout=3",
+        ])
+        .args(analyze_opts)
+        .arg(format!("--run1-seed={seed}"))
+        .arg(format!("--report-file={}", report_file.display()));
+    add_calibrated_skid_margin(&mut command, then);
+    command
+        .args(["--", "--chaos"])
+        .args(run_args)
+        .arg("--")
+        .arg(&workloads().race_then)
+        .arg(then);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let report = fs::read_to_string(&report_file).ok().map(|text| {
+        serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!("unreadable report: {error}\n{}", combined_output(&output))
+        })
+    });
+    (output, report)
 }
 
 /// A race found only at a short timeslice: at the run's own 100 us, thread a
