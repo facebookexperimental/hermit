@@ -401,11 +401,21 @@ fn learn(state: &mut crate::tool_local::ThreadState<impl Sized>, bound: Option<N
 /// signal delivery before the kernel installs the handler's mask): if the
 /// thread is armed and its crash handler has returned, the step that disarms
 /// it.
+///
+/// Not while a lone thread's skipped slice end is processed
+/// (`ThreadState::replaying_lone_slice_end`): such an end reads nothing from
+/// the guest but its branch count (`Detcore::catch_up_lone_slice_ends`), and
+/// the thread's mask is read where it is now, not at that end. The thread's
+/// next stop of its own, which comes before another thread can run, checks
+/// instead.
 pub(crate) async fn note_stop<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    if guest.thread_state().replaying_lone_slice_end.is_some() {
+        return;
+    }
     let Some(signal) = guest.thread_state().crash_armed else {
         return;
     };
