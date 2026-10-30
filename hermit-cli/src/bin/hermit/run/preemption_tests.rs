@@ -570,10 +570,17 @@ fn seeded_replays_and_baseline_keep_a_minimum_above_the_default() {
         assert_eq!(run.seeded_chaos_timeslice(), None, "{what} draws nothing");
         assert_eq!(maximum(run), Some(ONE_RCB), "{what}");
     };
-    run.det_opts.det_config.replay_preemptions_from = Some("unused-preemptions".into());
+    // Validation reads a replayed record for the timeslice its run drew, so
+    // each replay needs a readable record; this one states none.
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("preemptions.json");
+    detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+        .write_to_disk(&record)
+        .unwrap();
+    run.det_opts.det_config.replay_preemptions_from = Some(record.clone());
     revalidated(&mut run, "a preemption replay");
     run.det_opts.det_config.replay_preemptions_from = None;
-    run.det_opts.det_config.replay_schedule_from = Some("unused-schedule".into());
+    run.det_opts.det_config.replay_schedule_from = Some(record);
     revalidated(&mut run, "a schedule replay");
     run.det_opts.det_config.replay_schedule_from = None;
     run.det_opts.det_config.chaos = false;
