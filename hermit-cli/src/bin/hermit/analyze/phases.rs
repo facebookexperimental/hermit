@@ -501,6 +501,34 @@ impl std::fmt::Display for Departure {
     }
 }
 
+/// Ends the analysis unless every stack-trace replay observed the outcome the
+/// search observed for its schedule. Each replay is `(name, whether the
+/// search's run met the target, whether the replay met it)`. A replay that
+/// observed the opposite outcome cannot certify the decision, in either
+/// direction, so no opposite-outcome pair is established; `inspect` names the
+/// diagnostics to read.
+fn require_repeated_outcomes(replays: &[(&str, bool, bool)], inspect: &str) -> anyhow::Result<()> {
+    let opposite: Vec<String> = replays
+        .iter()
+        .filter(|(_, expected, observed)| expected != observed)
+        .map(|(replay, expected, _)| {
+            format!(
+                "{replay} observed the opposite of the search's run, which {} the target",
+                if *expected { "met" } else { "missed" }
+            )
+        })
+        .collect();
+    if opposite.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "the stack-trace replays did not repeat the search's outcomes ({}); no opposite-outcome \
+         pair was established. Inspect {inspect} diagnostics and stabilize replay before \
+         retrying analysis.",
+        opposite.join("; ")
+    )
+}
+
 /// Whether `ran` is the event `expected`, as the scheduler compares them when
 /// it takes a stack: the count and the time aside.
 fn same_event(expected: &SchedEvent, ran: &SchedEvent) -> bool {
@@ -1234,14 +1262,17 @@ impl AnalyzeOpts {
             &without_record,
             &without,
         )?;
-        if !target_met || (with.next.is_some() && !next_target_met) || baseline_met {
-            bail!(
-                "the stack-trace runs did not repeat the search's outcomes; no opposite-outcome \
-                 pair was established. Inspect final_target_next_for_stacktraces and \
-                 final_baseline_next_for_stacktraces diagnostics and stabilize replay before \
-                 retrying analysis."
-            );
+        let mut replays = vec![
+            ("final_target_for_stacktraces", true, target_met),
+            ("final_baseline_next_for_stacktraces", false, baseline_met),
+        ];
+        if with.next.is_some() {
+            replays.push(("final_target_next_for_stacktraces", true, next_target_met));
         }
+        require_repeated_outcomes(
+            &replays,
+            "final_target_next_for_stacktraces and final_baseline_next_for_stacktraces",
+        )?;
         let next_index = |variant: &[SchedEvent], slice: &Slice| {
             slice.next.map_or(variant.len(), |(index, _)| index)
         };
@@ -1925,16 +1956,13 @@ impl AnalyzeOpts {
             critical_event_index,
             RunData::launch,
         )?;
-        if baseline.met_target || !target.met_target {
-            bail!(
-                "the stack-trace replays did not repeat the search's outcomes (baseline met the \
-                 target: {}, target met it: {}); no opposite-outcome pair was established. \
-                 Inspect {runname2} and {runname1} diagnostics and stabilize replay before \
-                 retrying analysis.",
-                baseline.met_target,
-                target.met_target,
-            );
-        }
+        require_repeated_outcomes(
+            &[
+                (runname2, false, baseline.met_target),
+                (runname1, true, target.met_target),
+            ],
+            &format!("{runname2} and {runname1}"),
+        )?;
         if let Some(change) = target_run.and_then(|run| {
             changed_output(
                 run,
@@ -2492,6 +2520,43 @@ mod tests {
     /// ([`AnalyzeOpts::replay_for_stacks`]), whose completed outcome the
     /// report then compares with the search's, rather than only the stack
     /// launcher.
+    /// A stack-trace replay certifies the decision only when it observes the
+    /// outcome the search did: all four (expected, observed) pairs, for one
+    /// replay and for either of the default search's two, as main's final
+    /// replays required. Both callers, the default search's report and the
+    /// timing decision, check their replays through this helper.
+    #[test]
+    fn stack_trace_replays_must_repeat_the_searchs_outcomes() {
+        for expected in [false, true] {
+            for observed in [false, true] {
+                let result = require_repeated_outcomes(&[("final", expected, observed)], "final");
+                if expected == observed {
+                    result.expect("a replay that repeats its outcome is valid");
+                } else {
+                    let error = result
+                        .expect_err("a contradictory final replay cannot certify a candidate")
+                        .to_string();
+                    assert!(error.contains("observed the opposite"), "{error}");
+                    assert!(error.contains("did not repeat"), "{error}");
+                    let searched = if expected { "met" } else { "missed" };
+                    assert!(
+                        error.contains(&format!("which {searched} the target")),
+                        "{error}"
+                    );
+                }
+            }
+        }
+        // The default search's pair: the passing replay must miss, the
+        // failing one meet. Either contradiction ends the analysis.
+        for (baseline, target) in [(false, true), (true, true), (false, false), (true, false)] {
+            let result = require_repeated_outcomes(
+                &[("final_passing", false, baseline), ("final", true, target)],
+                "final_passing and final",
+            );
+            assert_eq!(result.is_ok(), (baseline, target) == (false, true));
+        }
+    }
+
     #[test]
     fn a_timed_out_final_replay_cannot_validate_the_expected_outcome() {
         let dir = tempfile::tempdir().unwrap();
