@@ -515,6 +515,23 @@ pub struct Config {
     #[clap(skip)]
     pub launch_image: Option<LaunchImage>,
 
+    /// The mount IDs and filesystem types of the mount namespace hermit-cli
+    /// was launched in, read in its outer process before it creates its
+    /// container ([`crate::host_input::LaunchNamespaceMounts`]). A descriptor
+    /// the guest inherits from outside the container (the user's redirected
+    /// stdio, `/dev/null`, a `--verify` stdin snapshot) names one of these
+    /// mounts in its `fdinfo`, which the container's own mountinfo does not
+    /// list, so Detcore reads the guest's standard descriptor kinds with it
+    /// (`crate::host_input::StdioKind::of_guest_descriptor`). Empty for a
+    /// library caller, whose descriptors' mounts are in its own namespace.
+    ///
+    /// The host sets it, not a flag. In-process only, as `happens_before`
+    /// is: never serialized, so neither a recording nor DBT's legacy form
+    /// carries it, and a replay never reads another host's mount IDs.
+    #[serde(skip)]
+    #[clap(skip)]
+    pub launch_namespace_mounts: crate::host_input::LaunchNamespaceMounts,
+
     /// The seccomp state the guest inherits from the thread that starts it
     /// ([`InheritedSeccomp`]). The caller that starts the guest states it, as
     /// only the caller knows the filters its launch installs, such as those of
@@ -5909,6 +5926,48 @@ mod tests {
                 .unwrap()
                 .in_guest_detlog_forward_policy
                 .is_none()
+        );
+    }
+
+    /// `launch_namespace_mounts` is never serialized: neither DBT's legacy
+    /// form nor the configuration's own (which recordings keep) carries it,
+    /// both read back with an empty table, and the run-start log line shows
+    /// only its size.
+    #[test]
+    fn launch_namespace_mounts_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            launch_namespace_mounts: crate::host_input::LaunchNamespaceMounts(vec![
+                (29, "ext4".to_owned()),
+                (31, "devtmpfs".to_owned()),
+            ]),
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("launch_namespace_mounts"), "{json}");
+        assert!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .launch_namespace_mounts
+                .0
+                .is_empty()
+        );
+        let full = serde_json::to_string(&on).unwrap();
+        assert!(!full.contains("launch_namespace_mounts"), "{full}");
+        assert!(
+            serde_json::from_str::<Config>(&full)
+                .unwrap()
+                .launch_namespace_mounts
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            format!("{:?}", on.launch_namespace_mounts),
+            "LaunchNamespaceMounts { mounts: 2 }"
         );
     }
 

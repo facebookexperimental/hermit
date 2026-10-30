@@ -26873,6 +26873,75 @@ fn a_schedule_replay_names_a_stdio_kind_changed_since_the_recording() {
     );
 }
 
+/// A plain `hermit run`, which runs its guest in a container, records the
+/// kinds of the standard descriptors the guest inherits from outside it:
+/// here its stdin is `/dev/null` and its stdout and stderr are files. Those
+/// descriptors name mounts of the namespace Hermit was launched in, which the
+/// container's own mount table does not list, so without that namespace's
+/// table (`Config::launch_namespace_mounts`) all three read as unknown. Each
+/// file is `file` on a local, in-kernel filesystem, as the test's target
+/// directory normally is, and `unknown` on any other (an overlay), whose
+/// type Hermit does not read.
+#[test]
+fn a_containerized_run_records_the_stdio_kinds_it_inherits() {
+    use std::os::fd::AsRawFd;
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let summary = directory.path().join("summary.json");
+    let summary_arg = format!("--summary-json={}", summary.display());
+    let args = [
+        "run",
+        "--base-env=minimal",
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        summary_arg.as_str(),
+        "--",
+        "/bin/true",
+    ];
+    let stdout_file = fs::File::create(directory.path().join("hermit.stdout")).unwrap();
+    let stderr_path = directory.path().join("hermit.stderr");
+    let stderr_file = fs::File::create(&stderr_path).unwrap();
+    // What Hermit can read of these files: their mount's type, by this
+    // process's own mount table, where they were opened.
+    let file_kind = {
+        let fdinfo =
+            fs::read_to_string(format!("/proc/self/fdinfo/{}", stdout_file.as_raw_fd())).unwrap();
+        let mount: u64 = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mounts = detcore_model::host_input::mount_types(
+            &fs::read_to_string("/proc/self/mountinfo").unwrap(),
+        );
+        let (_, fstype) = mounts.iter().find(|(id, _)| *id == mount).unwrap();
+        if detcore_model::host_input::LOCAL_KERNEL_FILESYSTEMS.contains(&fstype.as_str()) {
+            "file"
+        } else {
+            "unknown"
+        }
+    };
+    let mut command = hermit_command(&args);
+    command.stdin(Stdio::null());
+    command.stdout(stdout_file);
+    command.stderr(stderr_file);
+    let output = hermit_test::hermit_output("containerized-stdio-kinds", &mut command);
+    let written = fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        output.status.success(),
+        "hermit {args:?} failed with {}\nstderr:\n{written}",
+        output.status
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+    assert_eq!(
+        summary["host_inputs"]["stdio"],
+        serde_json::json!({"stdin": "char_device", "stdout": file_kind, "stderr": file_kind}),
+        "{written}"
+    );
+}
+
 /// A library caller's `Command` decides the guest's standard descriptors,
 /// and the run records the kinds the guest has at its first exec, not the
 /// caller's own. Here the guest's stdout is one end of a socket pair, which

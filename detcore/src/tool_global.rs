@@ -2690,16 +2690,19 @@ impl GlobalState {
     /// a filesystem that could wait on a server or see a request the native
     /// program never made. `/proc/<pid>` is the root only if its maps map
     /// the file its `exe` link names with that inode, all procfs text
-    /// (`detcore_model::host_input::maps_name_image`). Each descriptor is
-    /// classified by the name its `/proc/<pid>/fd/<n>` link gives, and
-    /// otherwise by its type, read with a cached `statx` through that link
-    /// only on a local, in-kernel filesystem
-    /// (`StdioKind::of_guest_descriptor`,
-    /// `detcore_model::host_input::LOCAL_KERNEL_FILESYSTEMS`). Nothing is
-    /// kept where there is no such process or image (KVM, whose guest
-    /// threads are no host tasks; DBT, which records no host inputs; SaBRe,
-    /// whose root never execs; a root that changed its root directory) or a
-    /// descriptor's kind cannot be told that way.
+    /// (`detcore_model::host_input::maps_name_image`). A descriptor whose
+    /// `/proc/<pid>/fd/<n>` link is no path (a pipe, a socket, an anonymous
+    /// inode) is classified by that kernel-made name; any other by its own
+    /// type, read with a cached `statx` through that link only on a local,
+    /// in-kernel filesystem (`StdioKind::of_guest_descriptor`,
+    /// `detcore_model::host_input::LOCAL_KERNEL_FILESYSTEMS`), its mount
+    /// looked up in the guest's namespace, this process's and the one Hermit
+    /// was launched in (`Config::launch_namespace_mounts`). A descriptor it
+    /// does not read is `StdioKind::Unknown`, which is never compared.
+    /// Nothing is kept where there is no such process or image (KVM, whose
+    /// guest threads are no host tasks; DBT, which records no host inputs;
+    /// SaBRe, whose root never execs; a root that changed its root
+    /// directory).
     fn read_guest_stdio(
         &self,
         pid: i32,
@@ -2721,37 +2724,38 @@ impl GlobalState {
         if !is_root {
             return Vec::new();
         }
-        let guest_mounts = read(&task.join("mountinfo"));
-        let own_mounts = read(Path::new("/proc/self/mountinfo"));
-        let mountinfos: Vec<&str> = [guest_mounts.as_deref(), own_mounts.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect();
+        // The guest's mounts, this process's, and those of the namespace
+        // Hermit was launched in, where descriptors the guest inherits from
+        // outside its container live.
+        let mut mounts: Vec<(u64, String)> =
+            [task.join("mountinfo"), "/proc/self/mountinfo".into()]
+                .iter()
+                .filter_map(|path| read(path))
+                .flat_map(|text| detcore_model::host_input::mount_types(&text))
+                .collect();
+        mounts.extend(self.cfg.launch_namespace_mounts.0.iter().cloned());
         let drivers = read(Path::new("/proc/tty/drivers"));
         let kind = |fd: i32| {
             let entry = task.join("fd").join(fd.to_string());
             let link = match std::fs::read_link(&entry) {
                 Ok(link) => link,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Some(StdioKind::Closed);
+                    return StdioKind::Closed;
                 }
-                Err(_) => return None,
+                Err(_) => return StdioKind::Unknown,
             };
             StdioKind::of_guest_descriptor(
                 link.as_os_str().as_bytes(),
                 read(&task.join("fdinfo").join(fd.to_string())).as_deref(),
-                &mountinfos,
+                &mounts,
                 drivers.as_deref(),
                 || cached_file_type(&entry),
             )
         };
-        let (Some(stdin), Some(stdout), Some(stderr)) = (kind(0), kind(1), kind(2)) else {
-            return Vec::new();
-        };
         let now = StdioKinds {
-            stdin,
-            stdout,
-            stderr,
+            stdin: kind(0),
+            stdout: kind(1),
+            stderr: kind(2),
         };
         let changes = self
             .recorded_stdio

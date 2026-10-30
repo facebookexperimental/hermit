@@ -1467,6 +1467,7 @@ fn record_or_replay_config_with_timer_support(
         proc_level: default_config.proc_level,
         interrupt_at: vec![],
         happens_before: None,
+        launch_namespace_mounts: Default::default(),
         record_host_inputs: false,
         host_input_log: None,
         host_input_snapshots: Vec::new(),
