@@ -555,7 +555,9 @@ mod tests {
     /// `rejoins` (rrnewton/hermit#4751) reads back from a flat record written
     /// before the record's serde moved into `RawRecord`, and survives writing
     /// and reading the current form, plain and inside the incomplete-record
-    /// envelope.
+    /// envelope. So do the popped events a readmission names: an empty list
+    /// is written, so that it stays apart from a readmission that names none
+    /// (`None`, as in older records), which is not.
     #[test]
     fn rejoins_round_trip_through_the_record_serde() {
         let old =
@@ -565,6 +567,7 @@ mod tests {
             turn: 4,
             wakes: 1,
             calls: vec![(DetTid::from_raw(3), 2)],
+            popped: None,
         }];
         assert_eq!(record.rejoins, expected);
         for marker in [None, Some(7)] {
@@ -574,6 +577,42 @@ mod tests {
             let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
             assert_eq!(read.rejoins, expected, "{written}");
             assert_eq!(read.replay_departed_at(), marker, "{written}");
+        }
+
+        use crate::scheduler::rejoin_log::PoppedEvent;
+        use crate::scheduler::rejoin_log::TimedEventId;
+        let mut named = record;
+        named.rejoins = vec![
+            crate::scheduler::rejoin_log::Rejoin {
+                popped: Some(vec![
+                    PoppedEvent {
+                        event: TimedEventId::Thread(DetTid::from_raw(5)),
+                        deadline: crate::types::LogicalTime::from_nanos(1_000),
+                    },
+                    PoppedEvent {
+                        event: TimedEventId::Posix(crate::types::DetPid::from_raw(3), 1),
+                        deadline: crate::types::LogicalTime::from_nanos(2_500),
+                    },
+                ]),
+                ..expected[0].clone()
+            },
+            crate::scheduler::rejoin_log::Rejoin {
+                turn: 5,
+                popped: Some(Vec::new()),
+                ..expected[0].clone()
+            },
+            crate::scheduler::rejoin_log::Rejoin {
+                turn: 6,
+                ..expected[0].clone()
+            },
+        ];
+        for marker in [None, Some(7)] {
+            let mut copy = named.clone();
+            copy.replay_departed_at = marker;
+            let written = serde_json::to_string(&copy).unwrap();
+            assert_eq!(written.matches(r#""popped":"#).count(), 2, "{written}");
+            let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(read.rejoins, named.rejoins, "{written}");
         }
     }
 }

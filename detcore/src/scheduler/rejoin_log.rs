@@ -46,7 +46,11 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 
+use super::timed_waiters::SignalTimerId;
+use super::timed_waiters::TimedEvent;
+use crate::types::DetPid;
 use crate::types::DetTid;
+use crate::types::LogicalTime;
 
 /// Name of the rejoin log within the recording directory.
 pub(crate) const REJOIN_LOG_NAME: &str = "rejoins";
@@ -70,6 +74,80 @@ pub(crate) struct Rejoin {
     pub(crate) wakes: u64,
     /// Each readmitted thread and the `ExternalOpId::sequence` of its call.
     pub(crate) calls: Vec<(DetTid, u64)>,
+    /// The timed events the scheduler popped in this turn before the
+    /// readmission, in order, each with the deadline it popped at
+    /// (`Scheduler::note_timed_pop`), in a `hermit run` preemption record. A
+    /// schedule replay readmits at the recorded turn once it has made these
+    /// pops, by whatever step, rather than at the recorded wake count, which
+    /// its lagging virtual time can reach by another step
+    /// (`Scheduler::rejoin_place`). `None` in `hermit record`'s text log,
+    /// which does not carry it, and in records written before the field
+    /// existed, which replay by the wake count as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) popped: Option<Vec<PoppedEvent>>,
+}
+
+/// A timed event, as a readmission names one it followed
+/// ([`Rejoin::popped`]): the thread whose timed wait ended, or the timer that
+/// fired.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TimedEventId {
+    /// A thread's timed wait: a sleep, or a wait with a timeout.
+    Thread(DetTid),
+    /// A process's `ITIMER_REAL` (`alarm`, `setitimer`).
+    Alarm(DetPid),
+    /// A process's POSIX timer, by its timer ID.
+    Posix(DetPid, i32),
+    /// The `SIGCHLD` of a child's exit, to its parent.
+    ChildExit { child: DetPid, parent: DetPid },
+}
+
+impl From<TimedEvent> for TimedEventId {
+    fn from(event: TimedEvent) -> Self {
+        match event {
+            TimedEvent::ThreadEvt(tid) => TimedEventId::Thread(tid),
+            TimedEvent::SignalEvt(SignalTimerId::Alarm(pid), _, _) => TimedEventId::Alarm(pid),
+            TimedEvent::SignalEvt(SignalTimerId::Posix(pid, timer), _, _) => {
+                TimedEventId::Posix(pid, timer)
+            }
+            TimedEvent::SignalEvt(SignalTimerId::ChildExit { child, parent }, _, _) => {
+                TimedEventId::ChildExit { child, parent }
+            }
+        }
+    }
+}
+
+/// One pop of a timed event: the event, and the deadline it popped at. A
+/// replay has made it once that event has no pending entry due at or before
+/// that deadline (`Scheduler::pop_made`). A periodic timer fires again under
+/// the same name, and how many of its periods fire depends on virtual time
+/// (a late timer skips the periods it missed), so the deadline, not a count
+/// of pops, tells which firing it was.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub(crate) struct PoppedEvent {
+    pub(crate) event: TimedEventId,
+    pub(crate) deadline: LogicalTime,
 }
 
 impl Rejoin {
@@ -116,7 +194,12 @@ impl Rejoin {
         if calls.is_empty() {
             return Err(format!("no calls in {line:?}"));
         }
-        Ok(Rejoin { turn, wakes, calls })
+        Ok(Rejoin {
+            turn,
+            wakes,
+            calls,
+            popped: None,
+        })
     }
 }
 
@@ -217,6 +300,7 @@ mod tests {
                 .iter()
                 .map(|(dtid, sequence)| (DetTid::from_raw(*dtid), *sequence))
                 .collect(),
+            popped: None,
         }
     }
 

@@ -127,9 +127,11 @@ use crate::resources::LOOPBACK_POLL_YIELD_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::scheduler::rejoin_log::PoppedEvent;
 use crate::scheduler::rejoin_log::Rejoin;
 use crate::scheduler::rejoin_log::RejoinRefusal;
 use crate::scheduler::rejoin_log::RejoinWriter;
+use crate::scheduler::rejoin_log::TimedEventId;
 use crate::scheduler::replayer::StopReason;
 use crate::syscalls::KernelSignalState;
 use crate::syscalls::pi_futex::PiFutexState;
@@ -1954,6 +1956,9 @@ pub struct Scheduler {
     /// queue empty. With `turn`, it names a point in the schedule for the
     /// rejoin log, because such a wake does not advance `turn`.
     empty_queue_wakes: u64,
+    /// The timed events popped in turn `.0`, in order, with their deadlines:
+    /// a readmission logs those of its own turn (`log_rejoin`).
+    turn_pops: (u64, Vec<PoppedEvent>),
     /// Work and span of the schedule (`--work-span-report`, [`work_span`]);
     /// empty when off.
     work_span: work_span::WorkSpanState,
@@ -5172,6 +5177,28 @@ fn validate_strict_boundary_config(cfg: &Config) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Where a replay stands relative to the next readmission its log names
+/// (`Scheduler::rejoin_place`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejoinPlace {
+    /// The replay has not reached it yet.
+    NotYet,
+    /// The replay is at it.
+    Due,
+    /// The replay went past it.
+    Passed,
+}
+
+/// The calls a logged readmission readmits, for a message.
+fn describe_rejoin_calls(rejoin: &Rejoin) -> String {
+    rejoin
+        .calls
+        .iter()
+        .map(|(dtid, sequence)| format!("thread {} call {}", dtid.as_raw(), sequence))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The readmissions a replayed preemption record carries, for a run that
 /// replays one (`--replay-preemptions-from`, `--replay-schedule-from`; the
 /// first when both name a record). `None` when the run replays no record, or
@@ -5617,6 +5644,7 @@ impl Scheduler {
             replay_exhausted_since: None,
             replay_gated_since: None,
             empty_queue_wakes: 0,
+            turn_pops: (0, Vec::new()),
             work_span: work_span::WorkSpanState::new(cfg),
             #[cfg(test)]
             host_signal_attempts: 0,
@@ -10611,7 +10639,12 @@ impl Scheduler {
         // pops one due timed event, the replayed thread's last if others pop
         // ahead of it.
         let held_for_replayed_wake = self.replay_fast_forward_to_recorded_wake(global_time);
+        // Likewise for the timed events the recording popped in this turn
+        // before its next readmission (`replay_holds_for_recorded_pops`).
+        self.replay_fast_forward_to_recorded_pops(global_time);
         self.step2b_process_timed(global_time);
+        let held_for_replayed_wake =
+            held_for_replayed_wake || self.replay_holds_for_recorded_pops();
         if !held_for_replayed_wake {
             self.step2b_restore_due_pollers();
             self.upgrade_pollers_on_time();
@@ -11173,13 +11206,23 @@ impl Scheduler {
         let Some(op_id) = self.blocked.external_io_blockers.get(&parent).copied() else {
             return;
         };
-        if let Some(rejoins) = self.rejoin_replay.as_mut() {
-            let point = (self.turn, self.empty_queue_wakes);
-            let due_here = rejoins.front().is_some_and(|next| {
-                next.point() == point && next.calls == [(parent, op_id.sequence)]
-            });
+        if self.rejoin_replay.is_some() {
+            // A recorded vfork readmission names no popped events: the passes
+            // of its turn wait at the barrier above until the continuation
+            // arrives, so this step comes before any pop of that turn, and a
+            // schedule replay finds it due at its turn.
+            let due_here = self
+                .rejoin_replay
+                .as_ref()
+                .and_then(|rejoins| rejoins.front())
+                .is_some_and(|next| {
+                    self.rejoin_place(next) == RejoinPlace::Due
+                        && next.calls == [(parent, op_id.sequence)]
+                });
             if due_here {
-                rejoins.pop_front();
+                if let Some(rejoins) = self.rejoin_replay.as_mut() {
+                    rejoins.pop_front();
+                }
                 self.rejoin_stalled_since = None;
             } else if self.rejoin_from_preemption_record {
                 // This readmission's point is fixed by the child's release
@@ -11632,6 +11675,7 @@ impl Scheduler {
             .timed_waiters
             .pop_if_before(self.committed_time)
         {
+            self.note_timed_pop(time_ns, evt);
             match evt {
                 TimedEvent::ThreadEvt(tid) => self.wake_timed_event(time_ns, tid),
                 TimedEvent::SignalEvt(id, tid, sig) => {
@@ -15570,12 +15614,11 @@ impl Scheduler {
             .replay_log_served
             .iter()
             .any(|dtid| !self.blocker_has_finished(*dtid));
-        let point = (self.turn, self.empty_queue_wakes);
         let due_waiting = self
             .rejoin_replay
             .as_ref()
             .and_then(|rejoins| rejoins.front())
-            .filter(|next| next.point() == point)
+            .filter(|next| self.rejoin_place(next) == RejoinPlace::Due)
             .is_some_and(|next| {
                 next.calls.iter().all(|(dtid, sequence)| {
                     self.blocked
@@ -15617,7 +15660,181 @@ impl Scheduler {
         self.rejoin_replay
             .as_ref()
             .and_then(|rejoins| rejoins.front())
-            .is_some_and(|next| next.point() <= (self.turn, self.empty_queue_wakes))
+            .is_some_and(|next| {
+                matches!(
+                    self.rejoin_place(next),
+                    RejoinPlace::Due | RejoinPlace::Passed
+                )
+            })
+    }
+
+    /// Where this replay stands relative to `next`, its next logged
+    /// readmission.
+    ///
+    /// `hermit replay`, a preemption replay, and a replay of a record that
+    /// names no popped events (written before readmissions carried them)
+    /// compare the point (`turn`, `empty_queue_wakes`) with the recorded one.
+    ///
+    /// A schedule replay (`replayer`) of a record that names them compares the
+    /// turn, and within the recorded turn is due once it has made every pop
+    /// the readmission names ([`Rejoin::popped`], `pop_made`), by whatever
+    /// step. Its context switches are replay turns, which charge no scheduler
+    /// time, so its virtual time lags its recording's; it catches up through
+    /// step2b pops held for a replayed sleeper's wake
+    /// (`replay_fast_forward_to_recorded_wake`) or for a readmission's pops
+    /// (`replay_fast_forward_to_recorded_pops`), which `empty_queue_wakes`
+    /// does not count, where its recording popped the same events with
+    /// nothing to run, which it counts, or the other way round. So the wake
+    /// count of one turn need not match there. A pop of an event the
+    /// recording popped in an earlier turn, which a lagging replay makes
+    /// late, names nothing this readmission waits for and does not count.
+    fn rejoin_place(&self, next: &Rejoin) -> RejoinPlace {
+        use std::cmp::Ordering;
+        match (&next.popped, self.replayer.is_some()) {
+            (Some(popped), true) => match self.turn.cmp(&next.turn) {
+                Ordering::Less => RejoinPlace::NotYet,
+                Ordering::Greater => RejoinPlace::Passed,
+                Ordering::Equal if self.first_unmade(popped).is_none() => RejoinPlace::Due,
+                Ordering::Equal => RejoinPlace::NotYet,
+            },
+            _ => match next.point().cmp(&(self.turn, self.empty_queue_wakes)) {
+                Ordering::Greater => RejoinPlace::NotYet,
+                Ordering::Equal => RejoinPlace::Due,
+                Ordering::Less => RejoinPlace::Passed,
+            },
+        }
+    }
+
+    /// Why this replay has passed `next` (`RejoinPlace::Passed`), for its
+    /// refusal or warning.
+    fn rejoin_passed_reason(&self, next: &Rejoin) -> String {
+        let calls = describe_rejoin_calls(next);
+        if next.popped.is_some() && self.replayer.is_some() {
+            format!(
+                "the recording readmitted {calls} at turn {}, and replay reached turn {} first",
+                next.turn, self.turn
+            )
+        } else {
+            format!(
+                "the recording readmitted {calls} at turn {} after {} timer wakes, and replay \
+                 reached turn {} after {} first",
+                next.turn, next.wakes, self.turn, self.empty_queue_wakes
+            )
+        }
+    }
+
+    /// Note that the scheduler popped `event`, due at `deadline`, from the
+    /// timed waiters, in step2b or in step2d: a readmission later in this turn
+    /// logs it (`log_rejoin`, [`Rejoin::popped`]).
+    fn note_timed_pop(&mut self, deadline: LogicalTime, event: TimedEvent) {
+        if self.turn_pops.0 != self.turn {
+            self.turn_pops = (self.turn, Vec::new());
+        }
+        self.turn_pops.1.push(PoppedEvent {
+            event: TimedEventId::from(event),
+            deadline,
+        });
+    }
+
+    /// The timed events popped in this turn so far, in order.
+    fn pops_this_turn(&self) -> &[PoppedEvent] {
+        if self.turn_pops.0 == self.turn {
+            &self.turn_pops.1
+        } else {
+            &[]
+        }
+    }
+
+    /// Whether this run has made `pop`: its event has no pending entry due at
+    /// or before the deadline the recording popped it at. One still due by
+    /// then is that firing or wait, or an earlier one a lagging replay has yet
+    /// to pop; one due later (a periodic timer that skipped the periods it
+    /// missed, or a later wait), or none, means it is made.
+    fn pop_made(&self, pop: &PoppedEvent) -> bool {
+        self.pending_due_by(pop.event, pop.deadline).is_none()
+    }
+
+    /// The first of `popped` this run has yet to make.
+    fn first_unmade<'a>(&self, popped: &'a [PoppedEvent]) -> Option<&'a PoppedEvent> {
+        popped.iter().find(|pop| !self.pop_made(pop))
+    }
+
+    /// The deadline of `event`'s pending entry among the timed waiters, if it
+    /// is due at or before `bound`.
+    fn pending_due_by(&self, event: TimedEventId, bound: LogicalTime) -> Option<LogicalTime> {
+        self.blocked
+            .timed_waiters
+            .iter()
+            .find(|(_, pending)| TimedEventId::from(*pending) == event)
+            .map(|(deadline, _)| deadline)
+            .filter(|deadline| *deadline <= bound)
+    }
+
+    /// Under `--replay-schedule-from`, at the turn of the next logged
+    /// readmission that names popped events: the pending deadline of the
+    /// first of them this replay has yet to make (`pop_made`), which is at or
+    /// before the deadline the recording popped it at. `None` elsewhere, and
+    /// once it has made them all.
+    fn next_recorded_pop_deadline(&self) -> Option<LogicalTime> {
+        self.replayer.as_ref()?;
+        let next = self.rejoin_replay.as_ref()?.front()?;
+        let popped = next.popped.as_ref()?;
+        if next.turn != self.turn {
+            return None;
+        }
+        let pop = self.first_unmade(popped)?;
+        self.pending_due_by(pop.event, pop.deadline)
+    }
+
+    /// Under `--replay-schedule-from`, at the turn of the next logged
+    /// readmission, while the recording popped a timed event in that turn
+    /// before the readmission that this replay has yet to pop: move global
+    /// time to that event's pending deadline, as
+    /// `replay_fast_forward_to_recorded_wake` does for a replayed sleeper, so
+    /// that step2b pops it (events ordered ahead of it first, one per pass)
+    /// while `replay_holds_for_recorded_pops` keeps the pass from a turn.
+    ///
+    /// That deadline is at or before the one the recording popped the event
+    /// at, in that turn, so the recording's virtual time had reached it: time
+    /// only moves forward, and never past the recording's at that point. A
+    /// schedule with callback checkpoints keeps the recording's time, and its
+    /// time is never moved here.
+    fn replay_fast_forward_to_recorded_pops(&self, global_time: &Arc<Mutex<GlobalTime>>) {
+        if self.callback_history_active {
+            return;
+        }
+        let Some(deadline) = self.next_recorded_pop_deadline() else {
+            return;
+        };
+        let mut gt = global_time.lock().unwrap();
+        let now = gt.as_nanos();
+        if deadline > now {
+            info!(
+                "[scheduler] The replayed schedule readmits a backgrounded call at turn {} after a timed event at {}; skipping global time ahead to it.",
+                self.turn, deadline
+            );
+            gt.add_extra_time(deadline.duration_since(now));
+        }
+    }
+
+    /// Whether the pass must end without a turn because the next logged
+    /// readmission is at this turn, after timed events the recording popped
+    /// first, and this schedule replay has yet to pop one of them
+    /// (`replay_fast_forward_to_recorded_pops`). Asked after step2b's pop, so
+    /// the pass that makes the last of them goes on and readmits the call.
+    /// Each held pass pops one due event and no thread runs to arm another,
+    /// except a periodic timer's re-arm, which falls later each time and is
+    /// bounded by the recorded deadline, so the hold ends.
+    ///
+    /// With callback checkpoints the replay keeps the recording's time and
+    /// holds only while that event is due, as
+    /// `replay_fast_forward_to_recorded_wake` does: one not due yet comes, as
+    /// in the recording, from step2d with nothing to run, which the pass goes
+    /// on to.
+    fn replay_holds_for_recorded_pops(&self) -> bool {
+        self.next_recorded_pop_deadline().is_some_and(|deadline| {
+            !self.callback_history_active || deadline <= self.committed_time
+        })
     }
 
     /// Whether a vfork barrier's child is queued to run a turn (not only
@@ -15959,6 +16176,7 @@ impl Scheduler {
                     (*dtid, op_id.sequence)
                 })
                 .collect(),
+            popped: Some(self.pops_this_turn().to_vec()),
         };
         // A preemption record keeps its readmissions inside itself, so that a
         // `--replay-preemptions-from` replay follows them as `hermit replay`
@@ -16020,29 +16238,14 @@ impl Scheduler {
             Some(rejoins) => rejoins.front().cloned(),
             None => unreachable!("only replay follows the rejoin log"),
         };
-        let describe = |rejoin: &Rejoin| {
-            rejoin
-                .calls
-                .iter()
-                .map(|(dtid, sequence)| format!("thread {} call {}", dtid.as_raw(), sequence))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let point = (self.turn, self.empty_queue_wakes);
+        let describe = describe_rejoin_calls;
         if let Some(next) = next {
-            if next.point() < point {
-                let reason = format!(
-                    "the recording readmitted {} at turn {} after {} timer wakes, and replay \
-                     reached turn {} after {} first",
-                    describe(&next),
-                    next.turn,
-                    next.wakes,
-                    self.turn,
-                    self.empty_queue_wakes
-                );
+            let place = self.rejoin_place(&next);
+            if place == RejoinPlace::Passed {
+                let reason = self.rejoin_passed_reason(&next);
                 return self.refuse_rejoin(reason);
             }
-            if next.point() == point {
+            if place == RejoinPlace::Due {
                 for (dtid, sequence) in &next.calls {
                     let parked = blockers
                         .iter()
@@ -17034,6 +17237,7 @@ impl Scheduler {
                     .expect("internal error: no timed events found");
                 debug_assert_eq!(event_ns, next_deadline);
                 self.empty_queue_wakes += 1;
+                self.note_timed_pop(event_ns, evt);
                 let observed_now = {
                     let mut gt = global_time.lock().unwrap();
                     let gt_now_ns = gt.as_nanos();
@@ -29324,6 +29528,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(parent, 7)],
+                popped: None,
             }])
         );
     }
@@ -29337,6 +29542,7 @@ mod test {
             turn: 12,
             wakes: 0,
             calls: vec![(DetTid::from_raw(3), 7)],
+            popped: None,
         };
         let make = |turn| {
             let (mut scheduler, op_id, _, child) = backgrounded_vfork_pair();
@@ -29561,11 +29767,13 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(DetTid::from_raw(3), 7)],
+                popped: None,
             },
             Rejoin {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(DetTid::from_raw(13), 4)],
+                popped: None,
             },
         ]);
         let mut selections = Vec::new();
@@ -29620,6 +29828,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(call.tid, 9)],
+                popped: None,
             }],
         );
         assert!(scheduler.step2c_process_io_blockers().is_ok());
@@ -29644,11 +29853,13 @@ mod test {
                     turn: 12,
                     wakes: 0,
                     calls: vec![(parent, 7)],
+                    popped: None,
                 },
                 Rejoin {
                     turn: 12,
                     wakes: 0,
                     calls: vec![(other.tid, 9)],
+                    popped: None,
                 },
             ],
         );
@@ -30384,6 +30595,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(op_id.tid, 9)],
+                popped: None,
             }])
         );
     }
@@ -30413,6 +30625,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(op_id.tid, 9)],
+                popped: Some(Vec::new()),
             }]
         );
 
@@ -30490,6 +30703,7 @@ mod test {
                         turn: 7,
                         wakes: 0,
                         calls: vec![(op_id.tid, 9)],
+                        popped: Some(Vec::new()),
                     });
                     assert_eq!(
                         rejoins,
@@ -30513,6 +30727,7 @@ mod test {
             turn: 12,
             wakes: 0,
             calls: vec![(op_id.tid, 9)],
+            popped: None,
         };
         let replay = |finished: bool| {
             let mut scheduler = run_rejoin_fixture(op_id, true, finished);
@@ -30562,6 +30777,7 @@ mod test {
             turn: 12,
             wakes: 0,
             calls: vec![(op_id.tid, 9)],
+            popped: None,
         };
         replaying(&mut scheduler, std::slice::from_ref(&logged));
         assert!(scheduler.unreplayed_rejoins().is_some());
@@ -30586,6 +30802,7 @@ mod test {
                 turn: 20,
                 wakes: 0,
                 calls: vec![(op_id.tid, 9)],
+                popped: None,
             }],
         );
         scheduler.turn = 12;
@@ -30664,6 +30881,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(child.tid, 4)],
+                popped: None,
             }],
         );
         assert_eq!(scheduler.vfork_gated_background_child(), Some(child.tid));
@@ -30697,6 +30915,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(op_id.tid, 7)],
+                popped: None,
             }],
         );
         scheduler.turn = 11;
@@ -30715,6 +30934,7 @@ mod test {
                 turn: 11,
                 wakes: 0,
                 calls: vec![(op_id.tid, 7)],
+                popped: Some(Vec::new()),
             }]
         );
     }
@@ -30735,6 +30955,7 @@ mod test {
                 turn: 20,
                 wakes: 0,
                 calls: vec![(child.tid, 4)],
+                popped: None,
             }],
             vec![],
         ] {
@@ -30923,6 +31144,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(other.tid, 9), (child.tid, 4)],
+                popped: None,
             }])
         );
     }
@@ -30956,6 +31178,7 @@ mod test {
                 turn: 40,
                 wakes: 0,
                 calls: vec![(poll.tid, 3)],
+                popped: None,
             }])
         );
 
@@ -30988,6 +31211,7 @@ mod test {
                 turn: 50,
                 wakes: 0,
                 calls: vec![(running.tid, 9)],
+                popped: None,
             }],
         );
         replay.turn = 40;
@@ -31043,6 +31267,7 @@ mod test {
                 turn: 6,
                 wakes: 0,
                 calls: vec![(middle.tid, 2)],
+                popped: None,
             }])
         );
     }
@@ -31057,6 +31282,7 @@ mod test {
             turn: 12,
             wakes: 0,
             calls: vec![(child.tid, 4)],
+            popped: None,
         };
         let make = || {
             let mut scheduler = Scheduler::new(&Config::default());
@@ -31199,6 +31425,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(op_id.tid, 4)],
+                popped: None,
             }],
         );
         scheduler.turn = 12;
@@ -31220,6 +31447,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(op_id.tid, 4)],
+                popped: None,
             }],
         );
         scheduler.turn = 12;
@@ -31258,6 +31486,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(op_id.tid, 4)],
+                popped: None,
             }],
         );
         scheduler.turn = 12;
@@ -31291,6 +31520,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(op_id.tid, 5)],
+                popped: None,
             }],
         );
         scheduler.turn = 12;
@@ -31363,6 +31593,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(child.tid, 4)],
+                popped: None,
             }],
         );
         scheduler.turn = 12;
@@ -31407,6 +31638,7 @@ mod test {
             turn: 12,
             wakes: 0,
             calls: vec![(op_id.tid, 9)],
+            popped: None,
         };
         replaying(&mut scheduler, std::slice::from_ref(&logged));
         scheduler.turn = 11;
@@ -31439,6 +31671,7 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(op_id.tid, 9)],
+                popped: None,
             }],
         );
         scheduler.turn = 12;
@@ -31474,6 +31707,7 @@ mod test {
                     turn: 12,
                     wakes: 0,
                     calls: vec![(op_id.tid, 9)],
+                    popped: None,
                 }],
             ),
             (
@@ -31483,6 +31717,7 @@ mod test {
                     turn: 12,
                     wakes: 0,
                     calls: vec![(op_id.tid, 9)],
+                    popped: None,
                 }],
             ),
             (
@@ -31492,6 +31727,7 @@ mod test {
                     turn: 12,
                     wakes: 0,
                     calls: vec![(op_id.tid, 8)],
+                    popped: None,
                 }],
             ),
         ];
@@ -31525,6 +31761,7 @@ mod test {
                 turn: 999_999_999,
                 wakes: 0,
                 calls: vec![(op_id.tid, 1)],
+                popped: None,
             }],
         );
         let refusal = scheduler.unreplayed_rejoins().expect("no refusal");
@@ -32496,6 +32733,376 @@ mod test {
         assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
     }
 
+    /// The pop of `event` due at `deadline`, as a readmission names it.
+    fn pop_of(event: TimedEventId, deadline: LogicalTime) -> PoppedEvent {
+        PoppedEvent { event, deadline }
+    }
+
+    /// The readmission of `op_id`'s call at `turn`, logged after `wakes`
+    /// empty-queue wakes and after the pops `popped`.
+    fn logged_after(
+        op_id: ExternalOpId,
+        turn: u64,
+        wakes: u64,
+        popped: Option<Vec<PoppedEvent>>,
+    ) -> Rejoin {
+        Rejoin {
+            turn,
+            wakes,
+            calls: vec![(op_id.tid, op_id.sequence)],
+            popped,
+        }
+    }
+
+    /// A schedule replay (`hermit run --replay-schedule-from`) at turn 10 of
+    /// a record whose only readmission is `op_id`'s finished call at turn 10
+    /// after `wakes` empty-queue wakes and the pops `popped` names, given the
+    /// deadline of `sleeper`, which is asleep; the schedule's next event
+    /// resumes `resumed`.
+    fn schedule_replay_with_a_sleeper(
+        op_id: ExternalOpId,
+        sleeper: DetTid,
+        resumed: DetTid,
+        wakes: u64,
+        popped: impl FnOnce(LogicalTime) -> Option<Vec<PoppedEvent>>,
+    ) -> (Scheduler, Arc<Mutex<GlobalTime>>, LogicalTime) {
+        let mut scheduler = rejoin_fixture(op_id, None, true);
+        scheduler.recordreplay_modes = false;
+        scheduler.rejoin_from_preemption_record = true;
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+        scheduler.replayer = Some(replayer::Replayer::new(vec![SchedEvent::syscall(
+            resumed,
+            Sysno::clock_nanosleep,
+            SyscallPhase::Posthook,
+        )]));
+        replaying(
+            &mut scheduler,
+            &[logged_after(op_id, 10, wakes, popped(deadline))],
+        );
+        scheduler.turn = 10;
+        (scheduler, global_time, deadline)
+    }
+
+    /// A recording names, with each readmission, the timed events popped in
+    /// its turn before it, each with the deadline it popped at: step2b's pops
+    /// (here with a thread queued) and step2d's (with nothing to run) alike.
+    /// A new turn starts with none, and the preemption record carries them.
+    #[test]
+    fn a_preemption_record_names_the_timed_events_each_readmission_followed() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let mut scheduler = run_rejoin_fixture(op_id, false, true);
+        scheduler.preemption_writer = Some(PreemptionWriter::new(None));
+        let sleeper = DetTid::from_raw(5);
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+        let call = [(op_id.tid, op_id, true)];
+
+        // Turn 7: step2b pops the sleeper's due wake, with dtid 3 queued.
+        scheduler.turn = 7;
+        scheduler.committed_time = deadline;
+        assert!(scheduler.step2b_process_timed(&global_time));
+        assert_eq!(scheduler.empty_queue_wakes, 0);
+        scheduler.log_rejoin(&call, &[op_id.tid]);
+
+        // Turn 8: it sleeps again, and step2d wakes it with nothing to run.
+        scheduler.turn = 8;
+        scheduler.run_queue = Default::default();
+        let again = deadline + LogicalTime::from_nanos(1_000);
+        scheduler.blocked.timed_waiters.insert(again, sleeper);
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(scheduler.empty_queue_wakes, 1);
+        scheduler.log_rejoin(&call, &[op_id.tid]);
+
+        // Turn 9: nothing popped.
+        scheduler.turn = 9;
+        scheduler.log_rejoin(&call, &[op_id.tid]);
+
+        let record: serde_json::Value =
+            serde_json::from_str(&scheduler.preemption_writer.take().unwrap().into_string())
+                .unwrap();
+        let rejoins: Vec<Rejoin> = serde_json::from_value(record["rejoins"].clone()).unwrap();
+        let slept = TimedEventId::Thread(sleeper);
+        assert_eq!(
+            rejoins,
+            vec![
+                logged_after(op_id, 7, 0, Some(vec![pop_of(slept, deadline)])),
+                logged_after(op_id, 8, 1, Some(vec![pop_of(slept, again)])),
+                logged_after(op_id, 9, 1, Some(vec![])),
+            ]
+        );
+    }
+
+    /// The recording woke a sleeper with nothing to run (step2d, which counts
+    /// an empty-queue wake) and readmitted a backgrounded call after it in the
+    /// same turn. The schedule replay, whose virtual time lags, wakes the same
+    /// sleeper through the hold for its replayed resume
+    /// (`replay_fast_forward_to_recorded_wake`; step2b, which counts none),
+    /// and still readmits the call at that turn, after the wake: it matches
+    /// the popped events, not the wake count. Named by the wake count alone,
+    /// as a record written before readmissions named their pops, the same
+    /// readmission is never due at that turn and is passed at the next.
+    #[test]
+    fn a_schedule_replay_readmits_after_the_pops_its_recording_made_whatever_step_makes_them() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let sleeper = DetTid::from_raw(5);
+        for named in [true, false] {
+            let (mut scheduler, global_time, deadline) =
+                schedule_replay_with_a_sleeper(op_id, sleeper, sleeper, 1, |deadline| {
+                    named.then(|| vec![pop_of(TimedEventId::Thread(sleeper), deadline)])
+                });
+            queue_worker(&mut scheduler, DetTid::from_raw(3));
+            assert!(
+                scheduler.step2_process_blocked(&global_time).is_err(),
+                "the pass holds for the replayed wake"
+            );
+            assert!(!scheduler.run_queue.contains_tid(op_id.tid));
+            // Step 1 of the next pass brings committed time up to global time.
+            scheduler.committed_time = deadline;
+            assert!(scheduler.step2_process_blocked(&global_time).is_ok());
+            assert!(scheduler.run_queue.contains_tid(sleeper));
+            assert_eq!(scheduler.empty_queue_wakes, 0);
+            assert_eq!(
+                scheduler.run_queue.contains_tid(op_id.tid),
+                named,
+                "named pops {named}: readmitted at the recorded turn"
+            );
+            if named {
+                assert_eq!(scheduler.unreplayed_rejoins(), None);
+            } else {
+                scheduler.turn = 11;
+                assert!(scheduler.step2c_process_io_blockers().is_err());
+                assert!(
+                    scheduler.rejoin_replay.is_none(),
+                    "the replay passed the readmission and left its record"
+                );
+            }
+        }
+    }
+
+    /// The recording popped a sleeper's wake in step2b, with work queued, so
+    /// counted no empty-queue wake before the readmission. A lagging replay
+    /// with nothing queued moves time to that wake and holds its passes until
+    /// step2b pops it, then readmits the call at that turn. One that keeps
+    /// the recording's time (callback checkpoints) reaches the wake through
+    /// step2d instead, which counts a wake the recording did not, and is due
+    /// all the same.
+    #[test]
+    fn a_schedule_replay_readmits_after_a_wake_its_recording_popped_with_work_queued() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let sleeper = DetTid::from_raw(5);
+        let named = |deadline| Some(vec![pop_of(TimedEventId::Thread(sleeper), deadline)]);
+
+        // The schedule resumes the readmitted call next, not the sleeper.
+        let (mut scheduler, global_time, deadline) =
+            schedule_replay_with_a_sleeper(op_id, sleeper, op_id.tid, 0, named);
+        assert!(
+            scheduler.step2_process_blocked(&global_time).is_err(),
+            "the pass holds for the recorded pop"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert!(!scheduler.run_queue.contains_tid(sleeper));
+        scheduler.committed_time = deadline;
+        assert!(scheduler.step2_process_blocked(&global_time).is_ok());
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert!(scheduler.run_queue.contains_tid(op_id.tid));
+        assert_eq!(scheduler.empty_queue_wakes, 0);
+        assert_eq!(scheduler.unreplayed_rejoins(), None);
+
+        let (mut scheduler, global_time, deadline) =
+            schedule_replay_with_a_sleeper(op_id, sleeper, op_id.tid, 0, named);
+        scheduler.callback_history_active = true;
+        scheduler.committed_time = deadline - LogicalTime::from_nanos(10);
+        assert!(
+            scheduler.step2_process_blocked(&global_time).is_err(),
+            "step2d wakes the sleeper with nothing to run"
+        );
+        assert_eq!(scheduler.empty_queue_wakes, 1);
+        assert!(!scheduler.run_queue.contains_tid(op_id.tid));
+        assert!(scheduler.step2_process_blocked(&global_time).is_ok());
+        assert!(scheduler.run_queue.contains_tid(op_id.tid));
+        assert_eq!(scheduler.unreplayed_rejoins(), None);
+    }
+
+    /// A lagging schedule replay also pops, at the readmission's turn, events
+    /// its recording popped in earlier turns: another thread's wake here.
+    /// Those are not what the readmission names, so they do not count toward
+    /// it, and the replay holds its passes until it has made the pop the
+    /// recording made.
+    #[test]
+    fn a_schedule_replay_does_not_count_lagged_pops_toward_a_readmission() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let sleeper = DetTid::from_raw(5);
+        let lagged = DetTid::from_raw(7);
+        let (mut scheduler, global_time, deadline) =
+            schedule_replay_with_a_sleeper(op_id, sleeper, op_id.tid, 0, |deadline| {
+                Some(vec![pop_of(TimedEventId::Thread(sleeper), deadline)])
+            });
+        register_known_thread(&mut scheduler, lagged);
+        let now = global_time.lock().unwrap().as_nanos();
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(now + LogicalTime::from_nanos(1), lagged);
+        scheduler.committed_time = deadline;
+        assert!(
+            scheduler.step2_process_blocked(&global_time).is_err(),
+            "the lagged wake pops first, and the pass holds"
+        );
+        assert!(scheduler.run_queue.contains_tid(lagged));
+        assert!(!scheduler.run_queue.contains_tid(sleeper));
+        assert!(!scheduler.run_queue.contains_tid(op_id.tid));
+        assert!(scheduler.step2_process_blocked(&global_time).is_ok());
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert!(scheduler.run_queue.contains_tid(op_id.tid));
+        assert_eq!(scheduler.unreplayed_rejoins(), None);
+    }
+
+    /// A named pop is the firing due at the deadline the recording popped it
+    /// at. A periodic timer still due by then (here a firing the replay has
+    /// yet to make, possibly an earlier one) holds the readmission, and the
+    /// replay moves time to it, never past the recorded deadline; a timer
+    /// whose next firing is later (one that skipped the periods it missed, as
+    /// a late timer does), an indefinite wait, or no pending entry at all
+    /// means the pop is made.
+    #[test]
+    fn a_named_pop_is_made_once_nothing_of_its_event_is_due_by_its_deadline() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let alarm = DetPid::from_raw(3);
+        let config = Config::default();
+        let start = GlobalTime::new(&config).as_nanos();
+        let at = |nanos| start + LogicalTime::from_nanos(nanos);
+        let recorded = at(9_000);
+        let logged = logged_after(
+            op_id,
+            10,
+            0,
+            Some(vec![pop_of(TimedEventId::Alarm(alarm), recorded)]),
+        );
+        for (pending, due) in [
+            (Some(at(5_000)), false),
+            (Some(recorded), false),
+            (Some(at(10_000)), true),
+            (Some(LogicalTime::INDEFINITE), true),
+            (None, true),
+        ] {
+            let mut scheduler = Scheduler::new(&config);
+            scheduler.replayer = Some(replayer::Replayer::new(Vec::new()));
+            replaying(&mut scheduler, std::slice::from_ref(&logged));
+            scheduler.turn = 10;
+            if let Some(deadline) = pending {
+                scheduler.blocked.timed_waiters.insert_alarm(
+                    deadline,
+                    alarm,
+                    DetTid::from_raw(3),
+                    nix::sys::signal::Signal::SIGALRM,
+                    LogicalTime::from_nanos(1_000),
+                );
+            }
+            let expected = if due {
+                RejoinPlace::Due
+            } else {
+                RejoinPlace::NotYet
+            };
+            assert_eq!(scheduler.rejoin_place(&logged), expected, "{pending:?}");
+            assert_eq!(
+                scheduler.replay_holds_for_recorded_pops(),
+                !due,
+                "{pending:?}"
+            );
+            let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+            scheduler.replay_fast_forward_to_recorded_pops(&global_time);
+            let now = global_time.lock().unwrap().as_nanos();
+            let moved_to = if due { start } else { pending.unwrap() };
+            assert_eq!(now, moved_to, "{pending:?}");
+            assert!(
+                now <= recorded,
+                "{pending:?}: never past the recorded deadline"
+            );
+        }
+    }
+
+    /// Two readmissions in one turn, the first before any pop and the second
+    /// after one: a schedule replay finds the first due at once, and the
+    /// second, held until it has made that pop, in that turn and no other.
+    #[test]
+    fn a_schedule_replay_follows_two_readmissions_in_one_turn() {
+        let first = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let second = ExternalOpId::new(DetTid::from_raw(23), 4);
+        let sleeper = DetTid::from_raw(5);
+        let slept = TimedEventId::Thread(sleeper);
+        let mut scheduler = Scheduler::new(&Config::default());
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+        scheduler.replayer = Some(replayer::Replayer::new(Vec::new()));
+        let logged = [
+            logged_after(first, 10, 0, Some(vec![])),
+            logged_after(second, 10, 0, Some(vec![pop_of(slept, deadline)])),
+        ];
+        replaying(&mut scheduler, &logged);
+        scheduler.turn = 9;
+        assert_eq!(scheduler.rejoin_place(&logged[0]), RejoinPlace::NotYet);
+        assert_eq!(scheduler.next_recorded_pop_deadline(), None);
+        scheduler.turn = 10;
+        assert_eq!(scheduler.rejoin_place(&logged[0]), RejoinPlace::Due);
+        assert_eq!(
+            scheduler.next_recorded_pop_deadline(),
+            None,
+            "the first names no pop"
+        );
+        assert!(!scheduler.replay_holds_for_recorded_pops());
+        // The first is readmitted; the second is held for its pop.
+        scheduler.rejoin_replay.as_mut().unwrap().pop_front();
+        assert_eq!(scheduler.rejoin_place(&logged[1]), RejoinPlace::NotYet);
+        assert_eq!(scheduler.next_recorded_pop_deadline(), Some(deadline));
+        assert!(scheduler.replay_holds_for_recorded_pops());
+        scheduler.committed_time = deadline;
+        assert!(scheduler.step2b_process_timed(&global_time));
+        assert_eq!(scheduler.rejoin_place(&logged[1]), RejoinPlace::Due);
+        assert!(!scheduler.replay_holds_for_recorded_pops());
+        scheduler.turn = 11;
+        assert_eq!(scheduler.rejoin_place(&logged[1]), RejoinPlace::Passed);
+    }
+
+    /// A record written before readmissions named their pops has none
+    /// (`popped` absent), and a schedule replay of it follows the wake count
+    /// as before; so do a preemption replay and `hermit replay`, whichever
+    /// record they follow.
+    #[test]
+    fn a_record_without_popped_events_replays_by_the_wake_count() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let old: Rejoin =
+            serde_json::from_str(r#"{"turn":10,"wakes":1,"calls":[[21,9]]}"#).unwrap();
+        assert_eq!(old, logged_after(op_id, 10, 1, None));
+        let named = logged_after(op_id, 10, 1, Some(vec![]));
+        let mut scheduler = Scheduler::new(&Config::default());
+        let place = |scheduler: &mut Scheduler, turn, wakes, logged: &Rejoin| {
+            scheduler.turn = turn;
+            scheduler.empty_queue_wakes = wakes;
+            scheduler.rejoin_place(logged)
+        };
+        for schedule_replay in [true, false] {
+            scheduler.replayer = schedule_replay.then(|| replayer::Replayer::new(Vec::new()));
+            for (turn, wakes, expected) in [
+                (9, 3, RejoinPlace::NotYet),
+                (10, 0, RejoinPlace::NotYet),
+                (10, 1, RejoinPlace::Due),
+                (10, 2, RejoinPlace::Passed),
+                (11, 0, RejoinPlace::Passed),
+            ] {
+                assert_eq!(
+                    place(&mut scheduler, turn, wakes, &old),
+                    expected,
+                    "schedule replay {schedule_replay}, turn {turn}, wakes {wakes}"
+                );
+            }
+        }
+        // Only a schedule replay of a record that names its pops ignores the
+        // wake count.
+        scheduler.replayer = None;
+        assert_eq!(place(&mut scheduler, 10, 0, &named), RejoinPlace::NotYet);
+        scheduler.replayer = Some(replayer::Replayer::new(Vec::new()));
+        assert_eq!(place(&mut scheduler, 10, 0, &named), RejoinPlace::Due);
+        assert_eq!(place(&mut scheduler, 10, 7, &named), RejoinPlace::Due);
+    }
+
     /// With a backgrounded call unfinished and nothing queued, record wakes a
     /// thread sleeping in virtual time instead of spinning: the call may wait
     /// on that thread (https://github.com/rrnewton/hermit/issues/3881).
@@ -32528,6 +33135,7 @@ mod test {
             turn: 12,
             wakes: 1,
             calls: vec![(op_id.tid, 9)],
+            popped: None,
         };
 
         let mut early = rejoin_fixture(op_id, None, true);
@@ -37723,6 +38331,7 @@ mod test {
             turn: 12,
             wakes: 0,
             calls: vec![(make, 1016), (child, 199)],
+            popped: None,
         };
         // (what make's continuation carries, the kept mask, who runs first)
         let interrupted_known = (Some(0), false, Some(Some(0)), Some(make));
@@ -37839,6 +38448,7 @@ mod test {
             turn: 12,
             wakes: 0,
             calls: vec![(waiter, 40), (child, 199)],
+            popped: None,
         };
         let mut picks = Vec::new();
         for replay in [false, true] {
