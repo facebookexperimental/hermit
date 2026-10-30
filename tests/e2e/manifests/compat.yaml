@@ -1484,7 +1484,12 @@ corpus:
     # buffers differ, each a valid Linux answer that depends on timing: the
     # revents of xargs's startup poll of 4 descriptors, and two pipe mtimes
     # (xargs's fstat of fd 0, expr's of fd 1) that KVM gives exactly 500
-    # microseconds later than ptrace.
+    # microseconds later than ptrace. vmstat-disk joined on 2026-10-29 once
+    # Detcore rendered /proc/diskstats from the host's block devices on every
+    # backend (slice N3 of the kvm lane's verify-100 plan; before, KVM's open
+    # of it was EACCES): 21 of 21 canonical strict verify pairs on the tree
+    # that enabled it (bitwise parity, 2025 INFO records each side), its
+    # stdout byte-identical to ptrace's.
     - backend: kvm
       rows:
         [
@@ -1510,8 +1515,9 @@ corpus:
           sqlite3, ss, stat, stdbuf, strings, strip, sum, sync, sysctl-random-uuid, tac, tar,
           tar-roundtrip, taskset, tcl, tee, test, time, timeout, top, touch, tr,
           "true", truncate, tsort, tty, uname, unexpand, uniq, uptime, users,
-          uuidgen, vmstat, wc, wc-lines, wget-localhost, whoami, xargs, xmllint,
-          xxd, xz, xz-roundtrip, "yes", zip-unzip, zstd, zstd-roundtrip
+          uuidgen, vmstat, vmstat-disk, wc, wc-lines, wget-localhost, whoami,
+          xargs, xmllint, xxd, xz, xz-roundtrip, "yes", zip-unzip, zstd,
+          zstd-roundtrip
         ]
       disabled_reason: >-
         Not in the 2026-10-13 KVM survey: its KVM verify cell was not green

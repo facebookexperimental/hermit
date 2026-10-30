@@ -136,17 +136,38 @@ const INCARNATION_BITS: u32 = 8;
 /// tasks below `PID_MAX_LIMIT`, 2^22.
 const PID_BITS: u32 = 22;
 
-/// Bits of a per-process inode number for the file's index among the
-/// per-process files Detcore renders, from 1. Full since `comm` took index 7
-/// (package K slice A+): the next per-process file needs a new layout, which
-/// renumbers every per-process inode.
-const INDEX_BITS: u32 = 3;
+/// Bits of a per-process inode number for the file's tag among the
+/// per-process files Detcore renders ([`per_process_tag`]), from 1: the top
+/// four bits of the number.
+const TAG_BITS: u32 = 4;
+
+/// How many per-process files kept the inode numbers they had when the field
+/// above the pid was a set bit 63 and a 3-bit index from 1 (`cgroup` to
+/// `comm`, the first seven of `PER_PROCESS_NAMES`): each takes tag 8 + its
+/// old index, whose bits are those two fields'.
+const FIRST_LAYOUT_FILES: usize = 7;
 
 const _: () = assert!(
-    crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len() < 1 << INDEX_BITS,
-    "every per-process file needs an index in its inode number"
+    crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len() < 1 << TAG_BITS,
+    "every per-process file needs a tag in its inode number"
 );
-const _: () = assert!(1 + INDEX_BITS + 2 * PID_BITS + 2 * INCARNATION_BITS == 64);
+const _: () = assert!(TAG_BITS + 2 * PID_BITS + 2 * INCARNATION_BITS == 64);
+
+/// The tag of the per-process file at `index` in `PER_PROCESS_NAMES`, from
+/// 1, which the top [`TAG_BITS`] bits of its inode number hold. The first
+/// [`FIRST_LAYOUT_FILES`] files take 9 to 15, the bits of the set bit 63 and
+/// the 3-bit index from 1 that their numbers had before the field grew, so
+/// their numbers are unchanged; the files after them take 1 to 8. A tag of 1
+/// or more puts every per-process number at 2^60 or above, out of the range
+/// of a system-wide rendered file's number (below 2^32) and of every number
+/// Detcore's inode pool mints (counting up from a few thousand).
+fn per_process_tag(index: usize) -> u64 {
+    if index < FIRST_LAYOUT_FILES {
+        8 + index as u64 + 1
+    } else {
+        (index - FIRST_LAYOUT_FILES) as u64 + 1
+    }
+}
 
 /// Whether a per-process file of the task with identity `incarnation` has an
 /// inode number of its own ([`MAX_INCARNATION`]).
@@ -159,13 +180,11 @@ pub(crate) fn incarnation_fits(incarnation: crate::procfs::TaskIncarnation) -> b
 
 /// The inode number of the per-process file `name`, on every backend: the
 /// fields of its identity laid out in 64 bits, so that two files share a
-/// number only if they are the same file of the same task. Bit 63 is set,
-/// which neither a system-wide rendered file's number (below 2^32, above) nor
-/// any number Detcore's inode pool mints (counting up from a few thousand)
-/// has. Then, from the high bits: the file's index among the per-process
-/// files Detcore renders (3 bits, from 1), the process (22 bits) and the
-/// thread below its `task` (22 bits, 0 for none), and the incarnation of each
-/// (8 bits each, from 1; 0 for no thread). Linux numbers tasks below
+/// number only if they are the same file of the same task. From the high
+/// bits: the file's tag among the per-process files Detcore renders (4 bits,
+/// from 1, [`per_process_tag`]), the process (22 bits) and the thread below
+/// its `task` (22 bits, 0 for none), and the incarnation of each (8 bits
+/// each, from 1; 0 for no thread). Linux numbers tasks below
 /// `PID_MAX_LIMIT`, 2^22, so 22 bits hold every pid and tid, and a task Linux
 /// could not number has no file (its lookup is ENOENT first). An incarnation
 /// holds up to [`MAX_INCARNATION`], 255: 254 reuses of one number in a run.
@@ -179,8 +198,7 @@ pub(crate) fn per_process_inode(name: crate::procfs::PerProcessName) -> u64 {
     let index = crate::procfs::ProcfsFile::PER_PROCESS_NAMES
         .iter()
         .position(|candidate| *candidate == name.filename)
-        .expect("a per-process file Detcore renders has an index")
-        + 1;
+        .expect("a per-process file Detcore renders has an index");
     let field = |value: i64, bits: u32, what: &str| -> u64 {
         assert!(
             (0..1_i64 << bits).contains(&value),
@@ -189,7 +207,7 @@ pub(crate) fn per_process_inode(name: crate::procfs::PerProcessName) -> u64 {
         );
         value as u64
     };
-    let index = field(index as i64, INDEX_BITS, "file index");
+    let tag = field(per_process_tag(index) as i64, TAG_BITS, "file tag");
     let process = field(name.task.process.into(), PID_BITS, "pid");
     let thread = field(name.task.thread.unwrap_or(0).into(), PID_BITS, "tid");
     let incarnation = name.incarnation.unwrap_or(crate::procfs::TaskIncarnation {
@@ -206,8 +224,7 @@ pub(crate) fn per_process_inode(name: crate::procfs::PerProcessName) -> u64 {
         INCARNATION_BITS,
         "tid incarnation",
     );
-    1 << 63
-        | index << (PID_BITS * 2 + INCARNATION_BITS * 2)
+    tag << (PID_BITS * 2 + INCARNATION_BITS * 2)
         | process << (PID_BITS + INCARNATION_BITS * 2)
         | thread << (INCARNATION_BITS * 2)
         | process_incarnation << INCARNATION_BITS
@@ -239,7 +256,10 @@ fn fdinfo_inode(name: crate::procfs::PerProcessName, fd: &str) -> u64 {
         fnv1a(hash, &field.to_le_bytes())
     });
     let hash = fnv1a(hash, fd.as_bytes());
-    1 << 63 | (hash & ((1 << (64 - 1 - INDEX_BITS)) - 1))
+    // The low 60 bits: the width below bit 63 and the 3-bit file-index
+    // field this number's layout had when `fdinfo_inode` was added (the
+    // field is `TAG_BITS` wide now, and this hash takes none of it).
+    1 << 63 | (hash & ((1 << 60) - 1))
 }
 
 /// The bit every path key sets, which no 32-bit procfs inode number has.
@@ -1175,6 +1195,48 @@ mod tests {
         assert!(!incarnation_fits(identity(256, None)));
         assert!(!incarnation_fits(identity(1, Some(256))));
         assert!(!incarnation_fits(identity(u32::MAX, Some(1))));
+    }
+
+    /// The first seven per-process files keep the numbers they had when the
+    /// field above the pid was bit 63 and a 3-bit index from 1 (tags 9 to
+    /// 15); the files after them take tags 1, 2 and 3 below them; and every
+    /// file of one task has a number of its own, at 2^60 or above.
+    #[test]
+    fn per_process_files_take_tags_that_keep_the_first_seven_numbers() {
+        assert_eq!(
+            (0..crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len())
+                .map(per_process_tag)
+                .collect::<Vec<_>>(),
+            [9, 10, 11, 12, 13, 14, 15, 1, 2, 3]
+        );
+        let task = 3 << (PID_BITS + 2 * INCARNATION_BITS) | 1 << INCARNATION_BITS;
+        let inode = |name: &str| {
+            let mut file =
+                crate::procfs::ProcfsFile::from_path(Path::new(&format!("/proc/self/{name}")))
+                    .unwrap();
+            file.bind_task(3, 3);
+            file.set_task_incarnation(crate::procfs::TaskIncarnation {
+                process: 1,
+                thread: None,
+            });
+            rendered_inode(file.into_rendered().opened_path().unwrap())
+        };
+        // As before the field grew: bit 63, then index 1 for `cgroup` and 7
+        // for `comm`.
+        assert_eq!(inode("cgroup"), 1 << 63 | 1 << 60 | task);
+        assert_eq!(inode("comm"), 1 << 63 | 7 << 60 | task);
+        assert_eq!(inode("statm"), 1 << 60 | task);
+        assert_eq!(inode("io"), 2 << 60 | task);
+        assert_eq!(inode("arch_status"), 3 << 60 | task);
+        let numbers = crate::procfs::ProcfsFile::PER_PROCESS_NAMES
+            .iter()
+            .map(|name| inode(name))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            numbers.len(),
+            crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len()
+        );
+        assert!(numbers.iter().all(|number| *number >= 1 << 60));
     }
 
     /// A host call that fails inside `preserving_errno` leaves the caller's

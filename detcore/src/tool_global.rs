@@ -1234,6 +1234,19 @@ pub struct GlobalState {
     /// announced (`GlobalRequest::AnnounceRefusedSignalControls`): the signals,
     /// bit `n - 1` for signal `n`, and whether an alternate stack.
     announced_refused_signal_controls: Mutex<(u64, bool)>,
+    /// The host's `/proc/diskstats` as this run first read it, in the
+    /// coordinator's own process, or the errno of that read: every
+    /// `/proc/diskstats` Detcore renders in the run starts from it
+    /// (`GlobalRequest::HostDiskstats`), whatever process asks and whatever
+    /// its descriptor table holds.
+    host_diskstats: std::sync::OnceLock<Result<Vec<u8>, i32>>,
+    /// The record sequence of each per-process file's open file description
+    /// that a fork copied where the tool runs in each guest process, as the
+    /// last read, positioned read or seek of it left it
+    /// (`GlobalRequest::ProcfsSequence`, `ProcfsFile::sequence_is_shared`).
+    /// Each lives until the run ends, as committed shared open file models do
+    /// (`crate::shared_open_files`): one per description open at a fork.
+    procfs_sequences: Mutex<BTreeMap<OpenFileId, crate::procfs::ProcfsSequence>>,
 
     // Why the fail-closed policy ended the run, from the Tool image that
     // refused (`GlobalRequest::PolicyRefusal`); the first report is kept.
@@ -1931,6 +1944,8 @@ impl GlobalState {
             store_exclusive: Mutex::new(Default::default()),
             announced_handlers_not_installed: Mutex::new(BTreeSet::new()),
             announced_refused_signal_controls: Mutex::new((0, false)),
+            host_diskstats: std::sync::OnceLock::new(),
+            procfs_sequences: Mutex::new(BTreeMap::new()),
             policy_refusal: Mutex::new(None),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
@@ -3425,6 +3440,21 @@ impl GlobalState {
         // before the caller receives the fixed, allocation-free answer.
     }
 
+    /// The host's `/proc/diskstats` as this run first read it, in this
+    /// process (the coordinator's), or the errno of that read
+    /// (`GlobalState::host_diskstats`). Read once: every rendered
+    /// `/proc/diskstats` of the run starts from the same table, in every
+    /// process and after every `exec`, as Linux's own reads of the file do
+    /// while the host's block devices do not change.
+    fn host_diskstats(&self) -> Result<Vec<u8>, i32> {
+        self.host_diskstats
+            .get_or_init(|| {
+                std::fs::read("/proc/diskstats")
+                    .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+            })
+            .clone()
+    }
+
     /// Prints, once per run, a WARN for each signal whose handler an in-guest
     /// runtime refused and one for a refused alternate stack
     /// (`crate::refused_signal_controls`), whichever process reports it.
@@ -3516,6 +3546,28 @@ impl GlobalState {
         if let GlobalRequest::AnnounceRefusedSignalControls(actions, alternate_stack) = &gr.2 {
             self.announce_refused_signal_controls(*actions, *alternate_stack);
             return (None, GlobalResponse::AnnounceRefusedSignalControls(()));
+        }
+        // The host's block-device table, a fact of the host the run reads
+        // once (`GlobalState::host_diskstats`): answered here too, with no
+        // time either way.
+        if let GlobalRequest::HostDiskstats = &gr.2 {
+            return (None, GlobalResponse::HostDiskstats(self.host_diskstats()));
+        }
+        // The record sequence of a per-process file's open file description a
+        // fork copied where the tool runs in each guest process
+        // (`Detcore::take_procfs_sequence`): taken and kept by the thread that
+        // reads or moves it, in its turn, so in the order of the guest's
+        // operations, and answered here too, with no time either way.
+        if let GlobalRequest::ProcfsSequence(id) = &gr.2 {
+            let sequence = self.procfs_sequences.lock().unwrap().get(id).cloned();
+            return (None, GlobalResponse::ProcfsSequence(sequence));
+        }
+        if let GlobalRequest::StoreProcfsSequence(id, sequence) = &gr.2 {
+            self.procfs_sequences
+                .lock()
+                .unwrap()
+                .insert(*id, sequence.clone());
+            return (None, GlobalResponse::StoreProcfsSequence(()));
         }
         // Records an in-guest Tool forwarded before sending this request are queued,
         // and the sender's are written now if it runs alone (the order rule at
@@ -4065,6 +4117,12 @@ impl GlobalState {
                 unreachable!(
                     "refused signal controls are answered before the forwarded-record drain"
                 )
+            }
+            GlobalRequest::HostDiskstats => {
+                unreachable!("the host's diskstats are answered before the forwarded-record drain")
+            }
+            GlobalRequest::ProcfsSequence(..) | GlobalRequest::StoreProcfsSequence(..) => {
+                unreachable!("record sequences are answered before the forwarded-record drain")
             }
             GlobalRequest::MappingCapture(_) => {
                 unreachable!("coherent mapping capture precedes clock accounting")
@@ -5260,6 +5318,25 @@ impl GlobalState {
                     .await
                     .procfs_ids(to_kernel, &ids),
             ),
+            GlobalRequest::UserNamespaceRelation(reader, task) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let reader = sched.registered_process(reader).unwrap_or(reader);
+                let task = sched.registered_process(task).unwrap_or(task);
+                let record = &sched.thread_tree.user_namespaces;
+                R::UserNamespaceRelation(
+                    record.relation(reader, task),
+                    record.owner_may_differ_below(reader, task),
+                )
+            }
+            GlobalRequest::UserNamespaceOwnerMayDiffer(process) => {
+                let mut sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(process).unwrap_or(process);
+                sched
+                    .thread_tree
+                    .user_namespaces
+                    .note_owner_may_differ(process);
+                R::UserNamespaceOwnerMayDiffer(())
+            }
             GlobalRequest::ProcessImage(process) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 // `/proc/<tid>/exe` names a thread's process's image.
@@ -6173,6 +6250,14 @@ impl GlobalState {
                 if new_pid_namespace {
                     sched.thread_tree.enter_new_pid_namespace(child_dettid);
                     sched.thread_tree.mark_pid_namespace_init(child_dettid);
+                }
+                // A new process made with CLONE_NEWUSER lives in a new user
+                // namespace below its creator's, recorded in its creator's
+                // turn (`scheduler::user_namespaces`).
+                if is_group_leader
+                    && flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_NEWUSER))
+                {
+                    sched.thread_tree.enter_new_user_namespace(child_dettid);
                 }
                 // A nested task's pid in each namespace is fixed now, in its
                 // creator's turn, before either runs again
@@ -7489,7 +7574,7 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 20;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 21;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -8387,6 +8472,34 @@ pub enum GlobalRequest {
     /// (`procfs::locks::LockLedger::note_record_locks_held_as_ofd`). Appended
     /// last.
     RecordLocksHeldAsOfd(Option<Vec<String>>),
+    /// The host's `/proc/diskstats` as the run first read it, which every
+    /// `/proc/diskstats` Detcore renders starts from
+    /// (`GlobalState::host_diskstats`). A fact of the host, not of the
+    /// guest's state: answered before any clock accounting, with no time.
+    /// Appended last.
+    HostDiskstats,
+    /// Where the user namespace of the process of task `.1` is from that of
+    /// the process of thread `.0`, and whether the namespace whose owner
+    /// Linux's rule asks about there may be owned by an effective user ID
+    /// other than the real user ID every guest task has
+    /// (`scheduler::user_namespaces`). Appended last.
+    UserNamespaceRelation(DetTid, DetTid),
+    /// The clone that made process `.0`, which made a user namespace, was a
+    /// creator's whose effective user ID was not its real user ID, read as
+    /// the overflow ID, or could not be read; sent once the clone succeeded,
+    /// in the turn that registered the process
+    /// (`UserNamespaces::note_owner_may_differ`). Appended last.
+    UserNamespaceOwnerMayDiffer(DetTid),
+    /// The record sequence of the open file description `.0`, a per-process
+    /// file whose description a fork copied where the tool runs in each guest
+    /// process, as the last read, positioned read or seek of it, in whichever
+    /// process, left it (`Detcore::take_procfs_sequence`); none before the
+    /// first. Appended last.
+    ProcfsSequence(OpenFileId),
+    /// Keep `.1` as the record sequence of the open file description `.0`
+    /// after a read, positioned read or seek of it
+    /// (`Detcore::store_procfs_sequence`). Appended last.
+    StoreProcfsSequence(OpenFileId, crate::procfs::ProcfsSequence),
 }
 
 /// Responses from the global object
@@ -8737,6 +8850,21 @@ pub enum GlobalResponse {
     HoldTable(Result<(), String>),
     /// Appended last.
     RecordLocksHeldAsOfd(()),
+    /// The answer to `GlobalRequest::HostDiskstats`: the file's bytes, or
+    /// the errno of the coordinator's read of it. Appended last.
+    HostDiskstats(Result<Vec<u8>, i32>),
+    /// The answer to `GlobalRequest::UserNamespaceRelation`. Appended last.
+    UserNamespaceRelation(
+        crate::scheduler::user_namespaces::UserNamespaceRelation,
+        bool,
+    ),
+    /// The answer to `GlobalRequest::UserNamespaceOwnerMayDiffer`. Appended
+    /// last.
+    UserNamespaceOwnerMayDiffer(()),
+    /// The answer to `GlobalRequest::ProcfsSequence`. Appended last.
+    ProcfsSequence(Option<crate::procfs::ProcfsSequence>),
+    /// The answer to `GlobalRequest::StoreProcfsSequence`. Appended last.
+    StoreProcfsSequence(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -8910,6 +9038,17 @@ pub async fn prepare_exec<G, T>(
                 .thread_state()
                 .maps_for_exec(guest.runtime_private_memory_regions().as_ref())
                 .expect("prepared maps descriptors are no longer live")
+        } else {
+            None
+        },
+        // A per-process file that follows its record's sequence, with its
+        // open file's identity and sequence, and the table's numbering,
+        // carried where the backend rebuilds the table after exec.
+        procfs_records: if guest.config().backend.rediscovers_descriptors_after_exec {
+            guest
+                .thread_state()
+                .procfs_records_for_exec()
+                .expect("prepared per-process descriptors are no longer live")
         } else {
             None
         },
@@ -9149,6 +9288,77 @@ pub(crate) async fn announce_refused_signal_controls<G, T>(
         ))
         .await;
     debug_assert_eq!(response, GlobalResponse::AnnounceRefusedSignalControls(()));
+}
+
+/// The host's `/proc/diskstats` as this run first read it
+/// (`GlobalRequest::HostDiskstats`), or the errno of that read. The
+/// coordinator reads it, in its own process, so no guest descriptor is
+/// needed, and every process of the run is answered the same bytes.
+/// Answered before any clock accounting, as
+/// [`announce_refused_signal_controls`] is.
+pub(crate) async fn host_diskstats<G, T>(guest: &mut G) -> Result<Vec<u8>, crate::Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = guest
+        .send_rpc((
+            DetTime::default(),
+            MmId::initial(DetTid::from_raw(0)),
+            GlobalRequest::HostDiskstats,
+        ))
+        .await;
+    match response {
+        GlobalResponse::HostDiskstats(answer) => answer.map_err(crate::Errno::new),
+        other => panic!("unexpected response to HostDiskstats: {other:?}"),
+    }
+}
+
+/// The record sequence of the open file description `id`, as the last read,
+/// positioned read or seek of it, in whichever process, left it
+/// (`GlobalRequest::ProcfsSequence`); none before the first.
+pub(crate) async fn procfs_sequence<G, T>(
+    guest: &mut G,
+    id: OpenFileId,
+) -> Option<crate::procfs::ProcfsSequence>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = guest
+        .send_rpc((
+            DetTime::default(),
+            MmId::initial(DetTid::from_raw(0)),
+            GlobalRequest::ProcfsSequence(id),
+        ))
+        .await;
+    match response {
+        GlobalResponse::ProcfsSequence(sequence) => sequence,
+        other => panic!("unexpected response to ProcfsSequence: {other:?}"),
+    }
+}
+
+/// Keep `sequence` as the record sequence of the open file description `id`
+/// (`GlobalRequest::StoreProcfsSequence`).
+pub(crate) async fn store_procfs_sequence<G, T>(
+    guest: &mut G,
+    id: OpenFileId,
+    sequence: crate::procfs::ProcfsSequence,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = guest
+        .send_rpc((
+            DetTime::default(),
+            MmId::initial(DetTid::from_raw(0)),
+            GlobalRequest::StoreProcfsSequence(id, sequence),
+        ))
+        .await;
+    match response {
+        GlobalResponse::StoreProcfsSequence(()) => {}
+        other => panic!("unexpected response to StoreProcfsSequence: {other:?}"),
+    }
 }
 
 /// Tells the coordinator a guest's disposition for `signum` was answered with
@@ -12470,6 +12680,49 @@ where
     }
 }
 
+/// Where the user namespace of `task`'s process is from the caller's
+/// process's, and whether the namespace whose owner Linux's rule asks about
+/// there may be owned by an effective user ID other than the real user ID
+/// every guest task has (`scheduler::user_namespaces`).
+pub(crate) async fn user_namespace_relation<G, T>(
+    guest: &mut G,
+    task: DetTid,
+) -> (
+    crate::scheduler::user_namespaces::UserNamespaceRelation,
+    bool,
+)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let reader = guest.thread_state().dettid;
+    let response =
+        send_and_update_time(guest, GlobalRequest::UserNamespaceRelation(reader, task)).await;
+    match response.1 {
+        GlobalResponse::UserNamespaceRelation(relation, owner_may_differ) => {
+            (relation, owner_may_differ)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Record that the user namespace `process`'s clone made was made by a
+/// creator whose effective user ID was not its real user ID, read as the
+/// overflow ID, or could not be read, once that clone has succeeded
+/// (`UserNamespaces::note_owner_may_differ`).
+pub(crate) async fn note_user_namespace_owner_may_differ<G, T>(guest: &mut G, process: DetTid)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::UserNamespaceOwnerMayDiffer(process)).await;
+    match response.1 {
+        GlobalResponse::UserNamespaceOwnerMayDiffer(()) => {}
+        _ => unreachable!(),
+    }
+}
+
 /// The kernel's number for each guest process or thread number in `ids`
 /// (`to_kernel`), or the guest's for each kernel number, as `/proc` spells
 /// them (`Scheduler::procfs_ids`).
@@ -13126,6 +13379,95 @@ mod tests {
             "{refused:?}"
         );
         assert!(state.held_tables.lock().unwrap().is_empty());
+    }
+
+    /// The host's `/proc/diskstats` is read once per run, in the
+    /// coordinator's own process, and every request of the run, whatever
+    /// process sends it, is answered the same bytes, with no time
+    /// (`GlobalRequest::HostDiskstats`): a rendered `/proc/diskstats` rebuilt
+    /// in another process needs no descriptor of its own to start from the
+    /// table its open took.
+    #[tokio::test]
+    async fn the_host_diskstats_are_read_once_and_answered_alike() {
+        use reverie::Tid;
+        let config = Config::default();
+        let state = GlobalState::initialize(&config, false);
+        let ask = |from: i32| {
+            state.receive_rpc(
+                Tid::from_raw(from),
+                (
+                    DetTime::default(),
+                    MmId::initial(DetTid::from_raw(0)),
+                    super::GlobalRequest::HostDiskstats,
+                ),
+            )
+        };
+        let (time, first) = ask(3).await;
+        assert_eq!(time, None, "answered with no time");
+        let host = std::fs::read("/proc/diskstats").map_err(|error| error.raw_os_error());
+        match (&first, &host) {
+            (super::GlobalResponse::HostDiskstats(Ok(bytes)), Ok(_)) => {
+                assert!(!bytes.is_empty() || host.as_ref().is_ok_and(Vec::is_empty));
+            }
+            (super::GlobalResponse::HostDiskstats(Err(errno)), Err(Some(expected))) => {
+                assert_eq!(errno, expected);
+            }
+            other => panic!("the coordinator's read disagrees with this process's: {other:?}"),
+        }
+        for from in [4, 3, 9] {
+            assert_eq!(ask(from).await.1, first, "the same table for every request");
+        }
+    }
+
+    /// The record sequence of a per-process file's open file description a
+    /// fork copied where the tool runs in each guest process is kept here
+    /// between operations, whichever process sends them, and answered with no
+    /// time (`GlobalRequest::ProcfsSequence`,
+    /// `GlobalRequest::StoreProcfsSequence`): none before the first store,
+    /// then the last one stored, for that description alone.
+    #[tokio::test]
+    async fn a_shared_record_sequence_is_the_last_one_stored() {
+        use reverie::Tid;
+        let config = Config::default();
+        let state = GlobalState::initialize(&config, false);
+        let send = |from: i32, request: super::GlobalRequest| {
+            state.receive_rpc(
+                Tid::from_raw(from),
+                (
+                    DetTime::default(),
+                    MmId::initial(DetTid::from_raw(0)),
+                    request,
+                ),
+            )
+        };
+        let id = crate::OpenFileId::new(DetTid::from_raw(3), 7);
+        let other = crate::OpenFileId::new(DetTid::from_raw(4), 7);
+        let (time, none) = send(3, super::GlobalRequest::ProcfsSequence(id)).await;
+        assert_eq!(time, None, "answered with no time");
+        assert_eq!(none, super::GlobalResponse::ProcfsSequence(None));
+        let first = crate::procfs::ProcfsSequence::for_test(4, Some(4), b"rchar: 0\n");
+        let second = crate::procfs::ProcfsSequence::for_test(6, Some(6), b"rchar: 0\n");
+        for (from, sequence) in [(3, &first), (5, &second)] {
+            let (time, stored) = send(
+                from,
+                super::GlobalRequest::StoreProcfsSequence(id, sequence.clone()),
+            )
+            .await;
+            assert_eq!(time, None, "answered with no time");
+            assert_eq!(stored, super::GlobalResponse::StoreProcfsSequence(()));
+        }
+        for from in [3, 5, 9] {
+            assert_eq!(
+                send(from, super::GlobalRequest::ProcfsSequence(id)).await.1,
+                super::GlobalResponse::ProcfsSequence(Some(second.clone())),
+                "the last one stored, for every process"
+            );
+        }
+        assert_eq!(
+            send(3, super::GlobalRequest::ProcfsSequence(other)).await.1,
+            super::GlobalResponse::ProcfsSequence(None),
+            "another description has its own"
+        );
     }
 
     /// `response` as `receive_rpc` returns it after a turn was granted
@@ -19421,6 +19763,7 @@ mod tests {
             robust_wakes: Vec::new(),
             open_files: None,
             maps: None,
+            procfs_records: None,
             channels: Default::default(),
             open_file_namespace: None,
             random_device_sequence: 0,

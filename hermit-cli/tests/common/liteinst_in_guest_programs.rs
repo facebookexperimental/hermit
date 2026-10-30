@@ -585,8 +585,9 @@ fn liteinst_in_guest_heap_growth_avoids_trampoline_mappings() {
 /// is a sealed memfd: /proc/loadavg reads as on Linux, beside /proc/uptime,
 /// the phase's own admitted capture (the captured kernel loadavg was refused
 /// before https://github.com/rrnewton/hermit/issues/4213's package K
-/// rendered it), while a capture that may wait, /proc/diskstats, is still
-/// refused in the same process.
+/// rendered it), and so does /proc/diskstats, a capture that was refused
+/// until Detcore rendered it too (the kvm lane's slice N3), while a capture
+/// that may wait, /proc/net/sockstat, is still refused in the same process.
 #[test]
 fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
     let _guard = hermit_run_guard();
@@ -673,14 +674,21 @@ fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
         .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
         .arg("--")
         .arg(&procfs_reader)
-        .args(["/proc/loadavg", "/proc/uptime", "/proc/diskstats"])
+        .args([
+            "/proc/loadavg",
+            "/proc/uptime",
+            "/proc/net/sockstat",
+            "/proc/diskstats",
+        ])
         .stdin(Stdio::null())
         .output()
         .expect("failed to run Hermit LiteInst");
     let output = assert_liteinst_in_guest_output(output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines = stdout.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 3, "{stdout}");
+    // The reader prints at most 255 bytes of a file, so /proc/diskstats, read
+    // last, takes one line per block device it reaches.
+    assert!(lines.len() >= 4, "{stdout}");
     assert_eq!(lines[0], "/proc/loadavg: 0.00 0.00 0.00 1/1 1", "{stdout}");
     assert!(
         lines[1].starts_with("/proc/uptime: ") && !lines[1].contains("errno"),
@@ -688,7 +696,15 @@ fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
     );
     assert_eq!(
         lines[2],
-        format!("/proc/diskstats: read errno {}", libc::EOPNOTSUPP),
+        format!("/proc/net/sockstat: read errno {}", libc::EOPNOTSUPP),
+        "{stdout}"
+    );
+    // Its first row is a device with the sanitizer's fixed counters
+    // (`procfs::sanitize_diskstats`): an empty table would not do.
+    assert!(
+        lines[3].starts_with("/proc/diskstats: ")
+            && lines[3].contains(" 1 0 8 0 1 0 8 0")
+            && !lines[3..].iter().any(|line| line.contains("errno")),
         "{stdout}"
     );
 }

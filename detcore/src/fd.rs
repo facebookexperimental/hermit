@@ -1194,6 +1194,24 @@ struct OpenFileDescription {
     /// its lock calls natively, while one does. Not printed.
     #[serde(default)]
     may_hold_ofd_lock: bool,
+    /// True when this is an open file of a per-process file that follows
+    /// its record's sequence (`ProcfsFile::follows_record_sequence`), which
+    /// Linux keeps in the one `struct file` every holder shares, and this
+    /// process's Detcore cannot know that sequence: a rendered file rebuilt
+    /// from a placeholder that reached this process over `SCM_RIGHTS` when
+    /// neither its table nor its registry knows the open file
+    /// (`Detcore::adopt_received_placeholder`,
+    /// `FileMetadata::adopt_placeholder`), or such a file the kernel opened,
+    /// received or found so (`tool_local::kernel_record_file_link`). Every
+    /// read, positioned read, vectored read and seek through it is refused by
+    /// name (`Detcore::refuse_unknown_record_sequence`), so it never moves a
+    /// sequence another holder's Detcore keeps, nor reads a record Linux would
+    /// not show (on SaBRe, where a refusal that ended the run would strand it,
+    /// `refusal_would_strand_the_run`, the call gets EOPNOTSUPP). Shared by
+    /// every alias, copied at fork,
+    /// and carried across exec (`ExecProcfsRecord`). Not printed.
+    #[serde(default)]
+    record_sequence_unknown: bool,
     /// For an `AF_UNIX` socket: its type, name and peer, and the
     /// descriptors queued to it in `SCM_RIGHTS` messages
     /// (`crate::syscalls::scm_rights`). It names descriptions by handles
@@ -1673,6 +1691,7 @@ impl DetFd {
                 lock_tracked: false,
                 received_for_locks: false,
                 may_hold_ofd_lock: false,
+                record_sequence_unknown: false,
                 rights: SocketRights::default(),
                 in_flight: 0,
                 fdinfo_facts: None,
@@ -2237,6 +2256,19 @@ impl DetFd {
         })
     }
 
+    /// Carry a per-process file that follows its record's sequence
+    /// (`ProcfsFile::follows_record_sequence`), its sequence included,
+    /// through the authenticated exec handoff instead of rediscovering it
+    /// with none (`ThreadState::procfs_records_for_exec`).
+    pub(crate) fn procfs_record_for_exec(&self) -> Option<ProcfsFile> {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .filter(|p| p.follows_record_sequence() && p.private_mapping_format().is_none())
+                .cloned()
+        })
+    }
+
     /// Whether this procfs file lists the guest's own address space, so
     /// its capture must not create a mapping that the listing would show.
     pub(crate) fn procfs_lists_address_space(&self) -> bool {
@@ -2285,6 +2317,22 @@ impl DetFd {
 
     pub(crate) fn procfs_is_cpuinfo(&self) -> bool {
         self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::is_cpuinfo))
+    }
+
+    /// Whether this is a rendered `/proc/diskstats`, whose snapshot starts
+    /// from the host's table as the run first read it
+    /// (`ProcfsFile::renders_host_diskstats`).
+    pub(crate) fn procfs_renders_host_diskstats(&self) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::renders_host_diskstats)
+        })
+    }
+
+    /// Whether this is a task's `arch_status` (`ProcfsFile::is_arch_status`).
+    pub(crate) fn procfs_is_arch_status(&self) -> bool {
+        self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::is_arch_status))
     }
 
     pub(crate) fn procfs_needs_boot_time(&self) -> bool {
@@ -2368,7 +2416,8 @@ impl DetFd {
         });
     }
 
-    /// Whether this is a process's `stat` Detcore opened as rendered
+    /// Whether this is a process's `stat` or a task's `comm` Detcore opened
+    /// as rendered, rendered from the task's facts
     /// (`ProcfsFile::renders_task_record`).
     pub(crate) fn procfs_renders_task_record(&self) -> bool {
         self.with_description(|d| {
@@ -2378,17 +2427,27 @@ impl DetFd {
         })
     }
 
-    /// Drop a rendered `stat`'s snapshot before a read at `position` that
-    /// Linux would render anew (`ProcfsFile::drop_stale_task_snapshot`).
-    pub(crate) fn procfs_drop_stale_task_snapshot(&self, position: usize) {
+    /// Whether this is a rendered per-process file that follows its one
+    /// record's sequence (`ProcfsFile::follows_record_sequence`).
+    pub(crate) fn procfs_follows_record_sequence(&self) -> bool {
         self.with_description(|d| {
-            if let Some(procfs) = d.procfs.as_mut() {
-                procfs.drop_stale_task_snapshot(position);
-            }
-        });
+            d.procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::follows_record_sequence)
+        })
     }
 
-    /// Record where a positioned read left a rendered `stat`'s sequence
+    /// Whether Linux runs the record's `show` for a read at `position`, and
+    /// if so drop the buffered record (`ProcfsFile::drop_stale_task_snapshot`).
+    pub(crate) fn procfs_drop_stale_task_snapshot(&self, position: usize) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_mut()
+                .is_some_and(|procfs| procfs.drop_stale_task_snapshot(position))
+        })
+    }
+
+    /// Record where a positioned read left a record's sequence
     /// (`ProcfsFile::note_read_end`).
     pub(crate) fn procfs_note_read_end(&self, position: usize) {
         self.with_description(|d| {
@@ -2398,8 +2457,8 @@ impl DetFd {
         });
     }
 
-    /// Record the outcome of rendering a rendered `stat`'s record for a read
-    /// at `position` (`ProcfsFile::note_task_record_rendered`).
+    /// Record the outcome of rendering a record for a read at `position`
+    /// (`ProcfsFile::note_task_record_rendered`).
     pub(crate) fn procfs_note_task_record_rendered(&self, position: usize, rendered: bool) {
         self.with_description(|d| {
             if let Some(procfs) = d.procfs.as_mut() {
@@ -2408,9 +2467,9 @@ impl DetFd {
         });
     }
 
-    /// Move a rendered `stat`'s cursor as `seq_lseek` does
-    /// (`ProcfsFile::seek_task_record`): whether the caller must render its
-    /// record now.
+    /// Move a record's cursor as `seq_lseek` does
+    /// (`ProcfsFile::seek_task_record`): whether the caller must run its
+    /// `show` now.
     pub(crate) fn seek_procfs_task_record(&self, offset: usize) -> bool {
         self.with_description(|d| {
             d.procfs
@@ -2419,12 +2478,58 @@ impl DetFd {
         })
     }
 
-    /// Leave a rendered `stat` whose `show` failed at a seek as `seq_lseek`
-    /// does (`ProcfsFile::reset_task_record`).
+    /// Leave a record whose `show` failed at a seek as `seq_lseek` does
+    /// (`ProcfsFile::reset_task_record`).
     pub(crate) fn reset_procfs_task_record(&self) {
         self.with_description(|d| {
             if let Some(procfs) = d.procfs.as_mut() {
                 procfs.reset_task_record();
+            }
+        });
+    }
+
+    /// Before a fork copies this process's tool state where the tool runs in
+    /// each guest process: a per-process file that follows its record's
+    /// sequence keeps that sequence in Detcore's global state from then on
+    /// (`ProcfsFile::share_sequence`). Only a description this process holds
+    /// itself; one already in the global state is shared whole.
+    pub(crate) fn share_procfs_sequence(&self) -> bool {
+        let mut state = self.open_file.lock().expect("open file mutex poisoned");
+        match &mut *state {
+            OpenFileState::Local(description) => description
+                .procfs
+                .as_mut()
+                .is_some_and(ProcfsFile::share_sequence),
+            OpenFileState::Shared(_) => false,
+        }
+    }
+
+    /// The identity of this descriptor's open file description, where its
+    /// per-process file's record sequence lives in Detcore's global state
+    /// between operations (`ProcfsFile::sequence_is_shared`).
+    pub(crate) fn procfs_shared_sequence(&self) -> Option<OpenFileId> {
+        let state = self.open_file.lock().expect("open file mutex poisoned");
+        match &*state {
+            OpenFileState::Local(description) => description
+                .procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::sequence_is_shared)
+                .then_some(description.id),
+            OpenFileState::Shared(_) => None,
+        }
+    }
+
+    /// This procfs file's record sequence (`ProcfsFile::sequence`).
+    pub(crate) fn procfs_sequence(&self) -> Option<crate::procfs::ProcfsSequence> {
+        self.with_description(|d| d.procfs.as_ref().map(ProcfsFile::sequence))
+    }
+
+    /// Take a procfs file's record sequence as the last operation on its
+    /// description left it (`ProcfsFile::adopt_sequence`).
+    pub(crate) fn adopt_procfs_sequence(&self, sequence: crate::procfs::ProcfsSequence) {
+        self.with_description(|d| {
+            if let Some(procfs) = d.procfs.as_mut() {
+                procfs.adopt_sequence(sequence);
             }
         });
     }
@@ -3511,6 +3616,41 @@ impl DetFd {
     /// Whether this description may hold an OFD lock.
     pub(crate) fn may_hold_ofd_lock(&self) -> bool {
         self.with_description(|d| d.may_hold_ofd_lock)
+    }
+
+    /// Mark this open file's record sequence as one Detcore cannot know
+    /// here (`OpenFileDescription::record_sequence_unknown`). Permanent.
+    /// Only a local description, which every procfs file's is.
+    pub(crate) fn mark_record_sequence_unknown(&self) {
+        let mut state = self.open_file.lock().expect("open file mutex poisoned");
+        if let OpenFileState::Local(description) = &mut *state {
+            description.record_sequence_unknown = true;
+        }
+    }
+
+    /// Whether this open file's record sequence is one Detcore cannot know
+    /// here (`OpenFileDescription::record_sequence_unknown`). Read without a
+    /// lease, so a shared model (a random device, a timerfd), which is never
+    /// so marked, answers false at no cost.
+    pub(crate) fn record_sequence_unknown(&self) -> bool {
+        let state = self.open_file.lock().expect("open file mutex poisoned");
+        match &*state {
+            OpenFileState::Local(description) => description.record_sequence_unknown,
+            OpenFileState::Shared(_) => false,
+        }
+    }
+
+    /// Give this descriptor's open file, which it alone refers to and which
+    /// Detcore just made for a rendered file's placeholder, the identity `id`
+    /// of the open file the placeholder belongs to, as this process's
+    /// registry names it (`FileMetadata::adopt_placeholder`,
+    /// `Detcore::adopt_received_placeholder`), so it takes the record
+    /// sequence that open file keeps in Detcore's global state.
+    pub(crate) fn rebind_open_file_id(&self, id: OpenFileId) {
+        let mut state = self.open_file.lock().expect("open file mutex poisoned");
+        if let OpenFileState::Local(description) = &mut *state {
+            description.id = id;
+        }
     }
 
     /// Mark this open file as passed over `SCM_RIGHTS`. Permanent.

@@ -256,6 +256,7 @@ static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCESS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCESS_AUXV_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RENDERED_IO_AND_DISKSTATS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_MOUNT_TABLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_ONCE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1735,6 +1736,34 @@ fn rendered_process_files_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "rendered-process-files guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// tests/c/rendered_io_and_diskstats.c: a task's io and /proc/diskstats,
+/// which Detcore renders, answer as Linux's files do.
+fn rendered_io_and_diskstats_guest() -> &'static Path {
+    RENDERED_IO_AND_DISKSTATS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("rendered-io-and-diskstats");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create rendered-io-and-diskstats directory");
+        let guest = build_root.join("rendered_io_and_diskstats");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/rendered_io_and_diskstats.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile rendered-io-and-diskstats guest");
+        assert!(
+            output.status.success(),
+            "rendered-io-and-diskstats guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -5542,6 +5571,190 @@ const PROCFS_BACKENDS: [&str; 7] = [
 /// deliver the preemption timer yet.
 const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
     (
+        "a_second_threads_io_spellings_read_zeros_on_every_backend",
+        "liteinst, in-guest-trap",
+        "the in-guest backend refuses pthread_create (clone3) by name \
+         (https://github.com/rrnewton/hermit/issues/4450)",
+    ),
+    (
+        "a_second_threads_io_spellings_read_zeros_on_every_backend",
+        "sabre",
+        "the second thread's two spellings read zeros in both runs, but under load the runs \
+         of a pair diverge at the main thread's pthread_join, whose futex wait on the joined \
+         thread's ID word returns EAGAIN in one run and 0 in the other (measured 2026-10-30 in \
+         the pinned root's test.cli, twice; the test alone passed), the thread-join divergence \
+         of https://github.com/rrnewton/hermit/issues/4007",
+    ),
+    (
+        "a_guest_memfd_with_a_stand_in_name_stays_a_memfd_outside_the_proc_level_on_every_backend",
+        "kvm",
+        "KVM's LinuxEmu implements no memfd seals (fcntl F_ADD_SEALS is ENOSYS, \
+         https://github.com/rrnewton/reverie/issues/1221), so the guest cannot make a sealed \
+         memfd there; Detcore runs outside the guest on KVM and takes no memfd for a stand-in \
+         by its name, so such a memfd reads as itself there at any level",
+    ),
+    (
+        "another_processs_io_after_the_reader_changes_its_root_reads_as_linux_on_every_backend",
+        "kvm",
+        "chroot is ENOSYS on KVM (measured 2026-10-18, and again 2026-10-30 for this test's \
+         guest), so no KVM guest changes its root, and new syscall support in reverie-kvm is \
+         stopped by the owner's 2026-10-15 rule that backends only intercept",
+    ),
+    (
+        "another_processs_io_after_the_reader_changes_its_root_reads_as_linux_on_every_backend",
+        "dbt",
+        "once a process has changed its root to a tree with no /proc, the exit of a child it \
+         forked before never finishes under DBT: the child's exit_group is the last call either \
+         makes, and the run does not end (measured 2026-10-30 with this test's guest and with a \
+         chroot-only guest, on the binary before this change too; no issue is filed for it \
+         yet)",
+    ),
+    (
+        "another_processs_io_after_the_reader_changes_its_root_reads_as_linux_on_every_backend",
+        "liteinst, in-guest-trap",
+        "a process that changed its root loses its in-guest Tool's RPC channel: the guest prints \
+         Linux's lines, then the run ends with \"reverie-liteinst tool error: rpc i/o error: \
+         NotFound\" and exit status 125, on in-guest-trap in every run and on LiteInst in every \
+         --verify run (measured 2026-10-30 with this test's guest, 6 of 6 --verify runs on \
+         LiteInst at this change and 6 of 6 before it, and with a chroot-only guest), the loss \
+         detcore_follows_the_target_processs_root_for_its_mount_table names",
+    ),
+    (
+        "another_processs_io_after_the_reader_changes_its_root_reads_as_linux_on_every_backend \
+         (effective set only)",
+        "kvm",
+        "chroot is ENOSYS on KVM, as for the first part",
+    ),
+    (
+        "another_processs_io_after_the_reader_changes_its_root_reads_as_linux_on_every_backend \
+         (effective set only)",
+        "dbt",
+        "a child's exit after its parent's chroot never finishes under DBT, as for the first part",
+    ),
+    (
+        "another_processs_io_after_the_reader_changes_its_root_reads_as_linux_on_every_backend \
+         (effective set only)",
+        "liteinst, in-guest-trap",
+        "a process that changed its root loses its in-guest Tool's RPC channel, as for the first \
+         part: the guest prints Linux's four lines, then the --verify run ends with exit status \
+         125 (measured 2026-10-31 on LiteInst in the pinned root's test.cli; in-guest-trap ends so \
+         in every run, plain runs included)",
+    ),
+    (
+        "another_processs_io_after_the_reader_changes_its_root_reads_as_linux_on_every_backend \
+         (a target in a user namespace the reader owns)",
+        "kvm",
+        "chroot is ENOSYS on KVM, as for the first part",
+    ),
+    (
+        "another_processs_io_after_the_reader_changes_its_root_reads_as_linux_on_every_backend \
+         (a target in a user namespace the reader owns)",
+        "dbt",
+        "a child's exit after its parent's chroot never finishes under DBT, as for the first part",
+    ),
+    (
+        "another_processs_io_after_the_reader_changes_its_root_reads_as_linux_on_every_backend \
+         (a target in a user namespace the reader owns)",
+        "liteinst, in-guest-trap",
+        "the in-guest backend refuses by name the clone(CLONE_NEWUSER) that makes the target \
+         (\"clone, clone3 and vfork other than a plain fork are not forwarded\", measured \
+         2026-10-30), the limit https://github.com/rrnewton/hermit/issues/4450 records for \
+         pthread_create",
+    ),
+    (
+        "positioned_reads_of_another_processs_files_show_as_linux_on_every_backend \
+         (opened by the kernel)",
+        "kvm",
+        "KVM's provider refuses every /proc spelling the kernel would open, through .. or a \
+         symbolic link, with EACCES, so the guest's first open there fails",
+    ),
+    (
+        "a_record_sequence_a_fork_shares_reads_as_linux_on_every_backend (opened by the kernel)",
+        "kvm",
+        "KVM's provider refuses every /proc spelling the kernel would open, through .. or a \
+         symbolic link, with EACCES, as for the positioned reads",
+    ),
+    (
+        "a_record_sequence_received_over_scm_rights_reads_as_linux_or_is_refused_on_every_backend \
+         (opened by the kernel)",
+        "kvm",
+        "KVM's provider refuses every /proc spelling the kernel would open, through .. or a \
+         symbolic link, with EACCES, as for the positioned reads",
+    ),
+    (
+        "a_record_sequence_received_over_scm_rights_reads_as_linux_or_is_refused_on_every_backend \
+         (a receiver forked before the open, opened by the kernel)",
+        "kvm",
+        "KVM's provider refuses every /proc spelling the kernel would open, through .. or a \
+         symbolic link, with EACCES, as for the positioned reads",
+    ),
+    (
+        "a_record_sequence_received_over_scm_rights_reads_as_linux_or_is_refused_on_every_backend \
+         (a pread at 0 by a receiver forked before the open, opened by the kernel)",
+        "kvm",
+        "KVM's provider refuses every /proc spelling the kernel would open, through .. or a \
+         symbolic link, with EACCES, as for the positioned reads",
+    ),
+    (
+        "a_record_sequence_an_exec_keeps_reads_as_linux_on_every_backend",
+        "liteinst, in-guest-trap",
+        "the in-guest backend refuses the run by name at the child's execve (\"execve and \
+         execveat are not forwarded\", exit 122, measured 2026-10-31), the limit \
+         https://github.com/rrnewton/hermit/issues/4476 records",
+    ),
+    (
+        "a_record_sequence_an_exec_keeps_reads_as_linux_on_every_backend (opened by the kernel)",
+        "liteinst, in-guest-trap",
+        "the in-guest backend refuses the run by name at the child's execve (\"execve and \
+         execveat are not forwarded\", exit 122, measured 2026-10-31), the limit \
+         https://github.com/rrnewton/hermit/issues/4476 records",
+    ),
+    (
+        "a_record_sequence_an_exec_keeps_reads_as_linux_on_every_backend (opened by the kernel)",
+        "kvm",
+        "KVM's provider refuses every /proc spelling the kernel would open, through .. or a \
+         symbolic link, with EACCES, as for the positioned reads",
+    ),
+    (
+        "another_processs_io_reads_with_a_full_descriptor_table_on_every_backend",
+        "dbt",
+        "a guest that fills its descriptor table ends the DBT run with exit status 125 \
+         (\"protected evidence record send failed\", \
+         https://github.com/rrnewton/hermit/issues/4964), as in the received-diskstats test",
+    ),
+    (
+        "another_processs_io_reads_with_a_full_descriptor_table_on_every_backend",
+        "kvm",
+        "KVM's LinuxEmu panics cloning its file table once the guest has filled the run's \
+         descriptor limit (https://github.com/rrnewton/reverie/issues/1218); KVM decides \
+         another process's io by the reader's own CAP_SYS_PTRACE, with no descriptor, so its \
+         check needs no free slot there",
+    ),
+    (
+        "a_received_diskstats_descriptor_reads_its_table_at_the_descriptor_limit_on_every_backend",
+        "dbt",
+        "a guest that fills its descriptor table ends the DBT run with exit status 125 \
+         (\"protected evidence record send failed\", \
+         https://github.com/rrnewton/hermit/issues/4964); with a free descriptor the same receipt \
+         reads the table on DBT (measured 2026-10-30)",
+    ),
+    (
+        "a_received_diskstats_descriptor_reads_its_table_at_the_descriptor_limit_on_every_backend",
+        "sabre",
+        "a run whose guest fills its descriptor table does not finish under SaBRe \
+         (https://github.com/rrnewton/hermit/issues/4965); with a free descriptor the same receipt \
+         reads the table on SaBRe (measured 2026-10-30)",
+    ),
+    (
+        "a_received_diskstats_descriptor_reads_its_table_at_the_descriptor_limit_on_every_backend",
+        "kvm",
+        "KVM's LinuxEmu panics cloning its file table once the guest has filled the run's \
+         descriptor limit, where Linux answers the guest's last open with EMFILE \
+         (https://github.com/rrnewton/reverie/issues/1218); KVM's own Tool does not share the \
+         guest's descriptor table, so the rendered file's snapshot does not depend on a free slot \
+         there",
+    ),
+    (
         "piped_stdin_verifies_at_bitwise_parity_on_every_backend",
         "liteinst, in-guest-trap",
         "the in-guest backends refuse --verify by name before reading stdin \
@@ -7004,9 +7217,10 @@ fn detcore_omits_the_procfs_names_outside_the_level_on(test: &str, among: &[&str
         "/proc/self/status",
         "/proc/self/task",
     ];
-    // KVM's own /proc refuses these level names: its directories, and the
-    // per-process files it does not serve (design note, slices B3 and B4).
-    let kvm_refuses = ["/proc/sys/fs", "/proc/self/task", "/proc/self/io"];
+    // KVM's own /proc refuses these level names: its directories (design
+    // note, slices B3 and B4). A process's `io` is Detcore's on every
+    // backend (slice N3 of the kvm lane's verify-100 plan).
+    let kvm_refuses = ["/proc/sys/fs", "/proc/self/task"];
     // What KVM's own /proc (until slice B4 of
     // https://github.com/rrnewton/hermit/issues/4266 removes it) and its
     // missing inotify leave unchecked, which the guest names in its output.
@@ -9694,6 +9908,1369 @@ const KVM_KNOWN_DIFFERENCES: [(&str, &str); 4] = [
         "clone_vm: not attempted: the backend refuses a CLONE_VM process by name\n",
     ),
 ];
+
+/// A recording made before Detcore rendered a task's `io`, `arch_status` and
+/// `/proc/diskstats` (RECORD_VERSION 0x197) holds the reads of those files
+/// differently: a thread's `io` was then read from the kernel without a
+/// capture, and a kernel-opened `arch_status` returned the recorded kernel
+/// line. Replayed by this binary it is refused by the version gate rather
+/// than replayed out of step, where it used to fail mid-replay with a desync
+/// (Claude review of the kvm lane's slice N3). A recording this binary makes
+/// replays.
+#[test]
+fn a_recording_from_before_rendered_io_and_arch_status_is_refused_by_version() {
+    let guest = rendered_io_and_diskstats_guest()
+        .to_str()
+        .expect("guest path is UTF-8")
+        .to_owned();
+    let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let directory = data.path().to_str().expect("data path is UTF-8");
+    let record_args = [
+        "record",
+        "--proc=standard",
+        "--data-dir",
+        directory,
+        "--",
+        guest.as_str(),
+        "--read-io-and-arch-status",
+    ];
+    let record = hermit(&record_args);
+    assert_success(&record, &record_args);
+    let replay_args = ["replay", "--autopilot", "--data-dir", directory];
+    let replay = hermit(&replay_args);
+    assert_success(&replay, &replay_args);
+    let metadata_path = {
+        let mut found = None;
+        for entry in fs::read_dir(data.path()).unwrap() {
+            let candidate = entry.unwrap().path().join("metadata.json");
+            if candidate.is_file() {
+                found = Some(candidate);
+            }
+        }
+        found.expect("no recording metadata.json")
+    };
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    assert_eq!(
+        metadata["version"], 0x198,
+        "RECORD_VERSION moved; point this test at the current version and the one before"
+    );
+    metadata["version"] = serde_json::json!(0x197);
+    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+    let refused = hermit(&replay_args);
+    assert!(
+        !refused.status.success(),
+        "a 0x197 recording was replayed:\n{}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("Version mismatch"),
+        "a 0x197 recording was not refused by the version gate:\n{}",
+        stderr(&refused)
+    );
+}
+
+/// The one line of `rendered_io_and_diskstats --io-access` KVM answers
+/// otherwise: its provider refuses every `/proc` file, so the kernel beneath
+/// cannot decide another process's `io` there, and the fallback asks only for
+/// the reader's own `CAP_SYS_PTRACE`, refusing a dumpable target whose
+/// permitted capabilities the reader's effective ones cover, which Linux
+/// allows (the same named difference as `KVM_KNOWN_DIFFERENCES` for `auxv`).
+const IO_ACCESS_KVM_KNOWN_DIFFERENCES: [(&str, &str); 1] = [(
+    "io access: without CAP_SYS_PTRACE, dumpable, a target without CAP_SYS_PTRACE permitted: \
+     open opened, read read\n",
+    "io access: without CAP_SYS_PTRACE, dumpable, a target without CAP_SYS_PTRACE permitted: \
+     open opened, read EACCES\n",
+)];
+
+/// The `--verify-strict` report of `args` (a `run` that writes it to
+/// `report`) is at bitwise parity, over nonzero and equal INFO counts.
+fn assert_bitwise_report(backend: &str, report: &Path) {
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "{backend} compared no INFO messages: {verdict}"
+    );
+}
+
+/// A task's `io` asks, at every `show`, whether the reader may read the task,
+/// as Linux's `do_io_accounting` asks `ptrace_may_access(task,
+/// PTRACE_MODE_READ_FSCREDS)` (fs/proc/base.c:3036-3039 in 6.17); its mode,
+/// 0400, is checked at the open only (Codex review of the kvm lane's slice
+/// N3). The guest reads another process's `io` while that process is
+/// dumpable and while it is not, with and without `CAP_SYS_PTRACE` in its
+/// effective set: through a descriptor opened while the target allowed it, one
+/// whose first read buffered the file, a rewind, a seek that runs `show`, a new
+/// open, its own process's files, and a dumpable target with and without
+/// `CAP_SYS_PTRACE` in its permitted set (commoncap's
+/// `cap_ptrace_access_check` asks that the target's permitted capabilities be
+/// a subset of the reader's effective ones), and, once the target has exited
+/// and is not yet reaped, a descriptor opened while it ran (Linux still reads
+/// it; an open of the task's `auxv`, which Detcore's check used before, is
+/// refused once the task's memory is gone: Claude review, round 2). It prints
+/// the same lines natively, as root in a user namespace (Hermit's guests are
+/// root in theirs), and on every backend, at bitwise parity; KVM differs in
+/// the line `IO_ACCESS_KVM_KNOWN_DIFFERENCES` names.
+#[test]
+fn a_tasks_io_asks_ptrace_may_access_at_every_show_on_every_backend() {
+    let test = "a_tasks_io_asks_ptrace_may_access_at_every_show_on_every_backend";
+    let guest = rendered_io_and_diskstats_guest();
+    let native = Command::new("unshare")
+        .args(["--user", "--map-root-user"])
+        .arg(guest)
+        .arg("--io-access")
+        .output()
+        .expect("run rendered-io-and-diskstats --io-access natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    for line in [
+        "io access: with CAP_SYS_PTRACE, not dumpable: open opened, read read\n",
+        "io access: without CAP_SYS_PTRACE, not dumpable: a descriptor opened before reads \
+         EACCES\n",
+        "io access: without CAP_SYS_PTRACE, not dumpable: one whose first read buffered the file \
+         reads on: read\n",
+        "io access: without CAP_SYS_PTRACE, not dumpable: a rewind returns 0, then a read \
+         EACCES\n",
+        "io access: without CAP_SYS_PTRACE, not dumpable: a seek to 5 returns -1 (EACCES), and \
+         leaves the position at 0\n",
+        "io access: without CAP_SYS_PTRACE, not dumpable: a new open opened, its read EACCES, \
+         its pread EACCES\n",
+        "io access: without CAP_SYS_PTRACE, dumpable again, a target with CAP_SYS_PTRACE \
+         permitted: open opened, read EACCES\n",
+        IO_ACCESS_KVM_KNOWN_DIFFERENCES[0].0,
+        "io access: an exited target not yet reaped, through a descriptor opened while it ran: \
+         read read, a rewind returns 0 then a read read, a seek to 5 returns 5 (no error), pread \
+         read\n",
+    ] {
+        assert!(expected.contains(line), "native lacks {line:?}: {expected}");
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec!["--backend", backend, "run", "--strict"];
+        if backend == "liteinst" || backend == "in-guest-trap" {
+            args.push("--max-timeslice=disabled");
+        }
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--proc=standard",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--io-access",
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_bitwise_report(backend, &report);
+        let mut want = expected.clone();
+        if backend == "kvm" {
+            for (linux, kvm) in IO_ACCESS_KVM_KNOWN_DIFFERENCES {
+                eprintln!("{test}: kvm: KNOWN DIFFERENCE: {kvm:?} where Linux gives {linux:?}");
+                want = want.replace(linux, kvm);
+            }
+        }
+        assert_eq!(stdout(&output), want, "{backend} differs from Linux");
+        if backend == "kvm" {
+            // The refusal by the reader's own capabilities is named once, at
+            // Hermit's default level (Claude review, round 2), in a run
+            // without --verify, whose runs' warnings go to their logs.
+            let plain = [
+                "--backend",
+                backend,
+                "run",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--proc=standard",
+                "--base-env=minimal",
+                "--",
+                guest.to_str().expect("guest path is UTF-8"),
+                "--io-access",
+            ];
+            let output = hermit(&plain);
+            assert_success(&output, &plain);
+            assert_eq!(stdout(&output), want, "kvm without --verify");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr
+                    .matches(
+                        "another process's /proc/<pid>/io is refused with EACCES because the \
+                         caller has no CAP_SYS_PTRACE"
+                    )
+                    .count(),
+                1,
+                "kvm names its refusal once: {stderr}"
+            );
+        }
+    }
+}
+
+/// Every spelling of a thread's `io` Detcore renders reads every counter 0,
+/// the bytes its sanitizer gave the kernel's file, on every backend: the
+/// thread's own (`/proc/thread-self/io`, `/proc/self/task/<tid>/io`,
+/// `/proc/<pid>/task/<tid>/io`), relative to a task directory and to an
+/// `O_PATH` one, and `thread-self/io` relative to `/proc` (a second
+/// thread's are the next test's). Before Detcore rendered it, ptrace
+/// classified only the process-level spellings, and the thread-level ones
+/// read the host's own counters (Claude review of the kvm lane's slice N3).
+/// Linux shows the thread's real counters, so the guest is not compared
+/// natively. KVM serves
+/// a task's directory only in a container
+/// (`run_kvm_procfs_directories_are_served_only_in_a_container`), so there
+/// the two names relative to one are not reached: the lines
+/// `IO_SPELLINGS_KVM_KNOWN_DIFFERENCES` names.
+#[test]
+fn every_spelling_of_a_threads_io_reads_zeros_on_every_backend() {
+    let test = "every_spelling_of_a_threads_io_reads_zeros_on_every_backend";
+    let guest = rendered_io_and_diskstats_guest();
+    let expected = [
+        "/proc/self/io",
+        "/proc/thread-self/io",
+        "/proc/self/task/<tid>/io",
+        "/proc/<pid>/task/<tid>/io",
+        "io relative to a task directory",
+        "io relative to an O_PATH task directory",
+        "thread-self/io relative to /proc",
+    ]
+    .map(|spelling| format!("io spellings: {spelling}: zeros\n"))
+    .concat();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec!["--backend", backend, "run", "--strict"];
+        if backend == "liteinst" || backend == "in-guest-trap" {
+            args.push("--max-timeslice=disabled");
+        }
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--proc=standard",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--io-spellings",
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_bitwise_report(backend, &report);
+        let mut want = expected.clone();
+        if backend == "kvm" {
+            for (linux, kvm) in IO_SPELLINGS_KVM_KNOWN_DIFFERENCES {
+                eprintln!("{test}: kvm: KNOWN DIFFERENCE: {kvm:?} where the others give {linux:?}");
+                want = want.replace(linux, kvm);
+            }
+        }
+        assert_eq!(stdout(&output), want, "{backend}");
+    }
+}
+
+/// A second thread's spellings of its process's `io` and its own read every
+/// counter 0 on every backend (`/proc/<pid>/task/<main tid>/io` and
+/// `/proc/thread-self/io`), as the calling thread's do
+/// (`every_spelling_of_a_threads_io_reads_zeros_on_every_backend`): before
+/// Detcore rendered them, ptrace read the host's counters there (Claude
+/// review of the kvm lane's slice N3). Linux shows the threads' real
+/// counters, so the guest is not compared natively.
+#[test]
+fn a_second_threads_io_spellings_read_zeros_on_every_backend() {
+    let test = "a_second_threads_io_spellings_read_zeros_on_every_backend";
+    let guest = rendered_io_and_diskstats_guest();
+    let expected = "io spellings: a second thread's /proc/<pid>/task/<main tid>/io: zeros\n\
+                    io spellings: a second thread's /proc/thread-self/io: zeros\n";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--proc=standard",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--io-spellings-thread",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_bitwise_report(backend, &report);
+        assert_eq!(stdout(&output), expected, "{backend}");
+    }
+}
+
+/// The lines of `rendered_io_and_diskstats --io-spellings` KVM answers
+/// otherwise: outside a container its provider serves no task directory
+/// (`run_kvm_procfs_directories_are_served_only_in_a_container`), so the
+/// guest cannot open one to name `io` relative to it.
+const IO_SPELLINGS_KVM_KNOWN_DIFFERENCES: [(&str, &str); 2] = [
+    (
+        "io spellings: io relative to a task directory: zeros\n",
+        "io spellings: a task directory: open EACCES\n",
+    ),
+    (
+        "io spellings: io relative to an O_PATH task directory: zeros\n",
+        "io spellings: an O_PATH task directory: open EACCES\n",
+    ),
+];
+
+/// A `/proc/diskstats` descriptor received over SCM_RIGHTS by a process
+/// forked before the file was opened, whose descriptor table is then full,
+/// reads the table, as Linux reads an open file without a free descriptor
+/// (Codex review of the kvm lane's slice N3): on a backend whose Tool runs in
+/// the guest's process, the rebuilt descriptor carries no snapshot, and the
+/// table it starts from comes from the run's coordinator
+/// (`tool_global::host_diskstats`), not from a read that needs a descriptor
+/// slot. Forked before the open, the receiver's Detcore, where Detcore runs in
+/// each guest process, never registered the placeholder: DBT and SaBRe
+/// discover it by its name and seals when it is first used, and LiteInst and
+/// in-guest-trap, which record a received descriptor as it arrives, recognize
+/// it by them there (`Detcore::received_placeholder`). Before that, LiteInst
+/// recorded the empty memfd, and both reads returned end of file, with a
+/// free slot or without (measured 2026-10-30 in the pinned root). The guest
+/// prints the same lines on every backend, at bitwise parity, run at a real
+/// descriptor limit ([`hermit_at_descriptor_limit`]), as natively, but that
+/// Linux runs show again at the pread at 0, so natively the host's counters
+/// may have moved since the read ("other bytes", measured 2026-10-31 on a
+/// loaded host), which Detcore's fixed counters never do.
+#[test]
+fn a_received_diskstats_descriptor_reads_its_table_at_the_descriptor_limit_on_every_backend() {
+    let test =
+        "a_received_diskstats_descriptor_reads_its_table_at_the_descriptor_limit_on_every_backend";
+    let guest = rendered_io_and_diskstats_guest();
+    let native = Command::new(guest)
+        .arg("--diskstats-received")
+        .output()
+        .expect("run rendered-io-and-diskstats --diskstats-received natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let expected = "diskstats received at the descriptor limit: the table is full: yes\n\
+                    diskstats received at the descriptor limit: read a nonempty table, pread at 0 \
+                    the same bytes\n";
+    let native_stdout = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(
+        native_stdout == expected
+            || native_stdout == expected.replace("the same bytes", "other bytes"),
+        "native: {native_stdout}"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec!["--backend", backend, "run", "--strict"];
+        if backend == "liteinst" || backend == "in-guest-trap" {
+            args.push("--max-timeslice=disabled");
+        }
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--proc=standard",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--diskstats-received",
+        ]);
+        let output = hermit_at_descriptor_limit(&args);
+        assert_success(&output, &args);
+        assert_bitwise_report(backend, &report);
+        assert_eq!(stdout(&output), expected, "{backend} differs from Linux");
+    }
+}
+
+/// `hermit_command(args)`, run under a real descriptor limit of 2048, which
+/// the guest inherits and fills: Hermit's guests cannot lower their real
+/// limit (`RLIMIT_NOFILE` is virtual there), and 2048 is above the numbers
+/// the in-guest runtimes keep for themselves (1025 and up).
+fn hermit_at_descriptor_limit(args: &[&str]) -> Output {
+    let mut command = hermit_command(args);
+    // SAFETY: setrlimit only lowers this child's descriptor limit, which the
+    // guest inherits; it allocates nothing and is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 2048,
+                rlim_max: 2048,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command)
+}
+
+/// Another process's `io`, read, sought to a position and pread through a
+/// descriptor opened before the reader filled its descriptor table, reads as
+/// Linux reads it: Linux needs no free descriptor to read an open file, and
+/// `do_io_accounting` asks only `ptrace_may_access` (fs/proc/base.c:3036-3039
+/// in 6.17). Detcore decides that check by a readlink of the task's `cwd`,
+/// which takes no descriptor (`Detcore::io_read_allowed`); before, an open of
+/// the task's `auxv` answered it, and the read failed with EMFILE (Claude and
+/// Codex reviews of the kvm lane's slice N3, round 2). The guest prints the
+/// same lines natively and on every backend, at bitwise parity, run at a real
+/// descriptor limit ([`hermit_at_descriptor_limit`]).
+#[test]
+fn another_processs_io_reads_with_a_full_descriptor_table_on_every_backend() {
+    let test = "another_processs_io_reads_with_a_full_descriptor_table_on_every_backend";
+    let guest = rendered_io_and_diskstats_guest();
+    let native = Command::new(guest)
+        .arg("--io-access-full-table")
+        .output()
+        .expect("run rendered-io-and-diskstats --io-access-full-table natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert_eq!(
+        expected,
+        "io full table: the table is full: yes\n\
+         io full table: another process's io through a descriptor opened before: read read, a \
+         seek to 5 returns 5 (no error), pread read\n",
+        "native"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec!["--backend", backend, "run", "--strict"];
+        if backend == "liteinst" || backend == "in-guest-trap" {
+            args.push("--max-timeslice=disabled");
+        }
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--proc=standard",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--io-access-full-table",
+        ]);
+        let output = hermit_at_descriptor_limit(&args);
+        assert_success(&output, &args);
+        assert_bitwise_report(backend, &report);
+        assert_eq!(stdout(&output), expected, "{backend} differs from Linux");
+    }
+}
+
+/// Another process's `io`, read through descriptors opened before the reader
+/// changed its root to a tree with no `/proc` (`/dev`), reads as Linux reads
+/// it: `do_io_accounting` asks only `ptrace_may_access(task,
+/// PTRACE_MODE_READ_FSCREDS)` (fs/proc/base.c:3036-3039 in 6.17), which does
+/// not depend on the reader's root. Before, Detcore's readlink probes both
+/// failed there and the reader's own `CAP_SYS_PTRACE` decided, so a reader
+/// without it got EACCES where Linux reads (Codex review of the kvm lane's
+/// slice N3, round 3). Now the kernel beneath answers by the task's number
+/// (`kcmp`), with the reader's and the task's capability sets
+/// (`Detcore::io_read_allowed_by_number`). The guest reads while the target
+/// allows it, gets EACCES while it is not dumpable, reads again once it is
+/// (a rewind, a seek and a pread too), and reads once it has exited and is
+/// not reaped; it prints the same lines natively, as root in a user
+/// namespace, and on every backend, at bitwise parity.
+///
+/// Where that answer does not decide Linux's (the reader lacks
+/// `CAP_SYS_PTRACE` in its effective set but holds every capability the
+/// task's permitted set has in its permitted set: Linux's answer then turns
+/// on whether the two share a user namespace), the kernel is asked the check
+/// itself through a pidfd, and once the target has exited, which leaves it
+/// no namespaces to ask about, Detcore's record of user namespaces answers
+/// (`scheduler::user_namespaces`). Two parts check it, each under its own
+/// key: a target in the reader's user namespace, which Linux refuses
+/// (EACCES), and one in a user namespace the reader made with
+/// `clone(CLONE_NEWUSER)`, which Linux reads, live and once it has exited
+/// and is not yet reaped (Claude review, round 3b). Before, the exited
+/// target stopped the run with a named refusal in both parts (Codex review
+/// of the kvm lane's slice N3, round 3b). In the second part the target
+/// first tries two clones that make no user namespace, which change nothing
+/// the reader reads: before, the first of them stopped the run at the exited
+/// target's read (Codex's narrow check of round 4). Both print Linux's lines
+/// on every backend that runs them, at bitwise parity.
+#[test]
+fn another_processs_io_after_the_reader_changes_its_root_reads_as_linux_on_every_backend() {
+    let test =
+        "another_processs_io_after_the_reader_changes_its_root_reads_as_linux_on_every_backend";
+    let guest = rendered_io_and_diskstats_guest();
+    let native_of = |mode: &str| {
+        let native = Command::new("unshare")
+            .args(["--user", "--map-root-user"])
+            .arg(guest)
+            .arg(mode)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("run rendered-io-and-diskstats {mode} natively: {error}")
+            });
+        assert!(native.status.success(), "native {mode}: {native:?}");
+        String::from_utf8_lossy(&native.stdout).into_owned()
+    };
+    let expected = native_of("--io-access-after-chroot");
+    assert_eq!(
+        expected,
+        "io after chroot: CAP_SYS_PTRACE in the effective set: 0\n\
+         io after chroot: before it, another process's io reads: read\n\
+         io after chroot: in a root without /proc, an open of /proc/self/io: ENOENT\n\
+         io after chroot: a descriptor opened before, rewound: read read\n\
+         io after chroot: once the target is not dumpable: read EACCES\n\
+         io after chroot: once it is dumpable again: read read, a rewind returns 0 then a read \
+         read, a seek to 5 returns 5 (no error), pread read\n\
+         io after chroot: an exited target not yet reaped: read read, pread read\n",
+        "native"
+    );
+    let effective_only = native_of("--io-access-after-chroot-effective-only");
+    assert_eq!(
+        effective_only,
+        "io after chroot: CAP_SYS_PTRACE in the effective set: 0\n\
+         io after chroot: in a root without /proc, an open of /proc/self/io: ENOENT\n\
+         io after chroot: without CAP_SYS_PTRACE in the effective set, a target with it \
+         permitted: read EACCES\n\
+         io after chroot: without CAP_SYS_PTRACE in the effective set, once that target has \
+         exited and is not yet reaped: read EACCES\n",
+        "native, effective set only"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut common = vec!["--backend", backend, "run", "--strict"];
+        if backend == "liteinst" || backend == "in-guest-trap" {
+            common.push("--max-timeslice=disabled");
+        }
+        let mut args = common.clone();
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--proc=standard",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--io-access-after-chroot",
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_bitwise_report(backend, &report);
+        assert_eq!(stdout(&output), expected, "{backend} differs from Linux");
+    }
+    // The reader that dropped CAP_SYS_PTRACE from its effective set only, in
+    // two parts, each under its own key so that a backend that cannot run it
+    // yet keeps the others: each prints Linux's lines at bitwise parity.
+    let reads_as_linux = |part: &str, mode: &str, expected: &str| {
+        for backend in procfs_backends(part) {
+            let report = directory.path().join(format!("{backend}-{mode}.json"));
+            let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+            let mut args = vec!["--backend", backend, "run", "--strict"];
+            if backend == "liteinst" || backend == "in-guest-trap" {
+                args.push("--max-timeslice=disabled");
+            }
+            args.extend([
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                &report_arg,
+                "--epoch=2026-01-01T00:00:00Z",
+                "--proc=standard",
+                "--base-env=minimal",
+                "--",
+                guest.to_str().expect("guest path is UTF-8"),
+                mode,
+            ]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_bitwise_report(backend, &report);
+            assert_eq!(
+                stdout(&output),
+                expected,
+                "{part}: {backend} differs from Linux"
+            );
+        }
+    };
+    reads_as_linux(
+        &format!("{test} (effective set only)"),
+        "--io-access-after-chroot-effective-only",
+        &effective_only,
+    );
+    // The target in a user namespace the reader owns: the pidfd probe allows
+    // the live read, and the record of user namespaces the exited one, as
+    // Linux reads both. First the target tries two clones that make no
+    // namespace (EINVAL for CLONE_NEWUSER with CLONE_FS; EPERM for a creator
+    // its namespace does not map), which leave the record as it was: before,
+    // the first noted its creator's IDs before the clone, and the exited
+    // target's read then stopped the run with a named refusal after three
+    // lines (Codex's narrow check of the kvm lane's slice N3, round 4).
+    let own_userns = native_of("--io-access-after-chroot-own-userns");
+    assert_eq!(
+        own_userns,
+        "io after chroot: in its own user namespace, the target's clone with CLONE_NEWUSER and \
+         CLONE_FS: EINVAL, with CLONE_NEWUSER alone: EPERM\n\
+         io after chroot: CAP_SYS_PTRACE in the effective set: 0\n\
+         io after chroot: in a root without /proc, an open of /proc/self/io: ENOENT\n\
+         io after chroot: without CAP_SYS_PTRACE in the effective set, a target in a user \
+         namespace the reader owns: read read\n\
+         io after chroot: without CAP_SYS_PTRACE in the effective set, that target once it has \
+         exited and is not yet reaped: read read\n",
+        "native, a target in a user namespace the reader owns"
+    );
+    reads_as_linux(
+        &format!("{test} (a target in a user namespace the reader owns)"),
+        "--io-access-after-chroot-own-userns",
+        &own_userns,
+    );
+}
+
+/// Another process's `io`, `statm`, `arch_status` and `cgroup`, each a
+/// `seq_file` of one record whose `show` Linux runs at a read at 0 and at a
+/// read or seek elsewhere than where the sequence is (`m->read_pos`), and
+/// never for a read that continues it or one at its end (`seq_read_iter`,
+/// `seq_lseek`, fs/seq_file.c:188-206 and 308-340 in 6.17), answer as Linux's
+/// do for positioned reads too: `pread`, `preadv` and `read` mixed on one
+/// descriptor; `io` refusing each read at 0, the read at the cursor, the
+/// read after a rewind and a `pread` elsewhere once the reader drops
+/// `CAP_SYS_PTRACE` from its effective set, while a descriptor read to its
+/// end still reads end of file and ones whose `read` or `pread` buffered the
+/// record read on; and, once the target is reaped, every file refusing each
+/// read at 0, the read and a seek with ESRCH. The mixed reads print only
+/// whether each succeeded: Hermit's `statm` and `cgroup` hold other bytes
+/// than the host's, and its `arch_status` is empty where the CPU the guest's
+/// CPUID instruction reports has no AVX-512F, as Linux's is on such a CPU. Before, a `pread` of these three files at 0 after one at 0
+/// reused the buffered record, compared with the shared cursor instead of
+/// the sequence, past the refusal and the reaping (Codex review of the kvm
+/// lane's slice N3, round 3b). The guest prints the same lines natively, as
+/// root in a user namespace, and on every backend, at bitwise parity.
+///
+/// A second part, under its own key, opens the same files as
+/// `/proc/<pid>/../<pid>/<name>`, which Hermit leaves to the kernel to open,
+/// serving the kernel's bytes sanitized; so does a session that does not
+/// render a file (SaBRe, which does not intercept CPUID, so the kernel opens
+/// `arch_status` in the first part too). There each read that runs a `show`
+/// takes a new capture of the kernel's file, whose own `show` answers, and
+/// `readv` and `preadv` read: before, such a file kept its first read's
+/// snapshot, past a reaped task, and its vectored reads were ENOSYS.
+///
+/// Both parts also seek: `seq_lseek` starts SEEK_CUR from the file's
+/// position and traverses wherever the sequence is not, so after a refused
+/// `pread` a seek to the cursor or to 5 is refused too and leaves the
+/// position at 0, and a seek that traverses once allowed buffers the record a
+/// later read continues without `show` (Claude's sequences p0 to p3 and e1,
+/// narrow check of round 4; and a seek to the cursor once the target is
+/// reaped, whose answer the guest prints as whether it is `seq_lseek`'s for
+/// the cursor, since Hermit's `arch_status` is empty where the host's is
+/// not). Before, a seek of a file the kernel opened, while Detcore held no
+/// snapshot of it, went to the kernel's own file, whose position Detcore's
+/// captures had moved: p0 to p3 and e1 differed from Linux through `..` on
+/// every backend that opens it, and the seek to the cursor on SaBRe's
+/// `arch_status`.
+///
+/// Both parts also seek through descriptors opened write-only, which
+/// `seq_lseek` never refuses for their access mode (nor does `vfs_llseek`,
+/// fs/read_write.c:385-390 in 6.17): a seek to 5 traverses and returns 5, a
+/// seek to where the sequence is runs no `show`, `io` refuses one without
+/// `CAP_SYS_PTRACE` (EACCES, the position left at 0), and once the target is
+/// reaped a seek elsewhere is ESRCH; before, each was EBADF (both narrow
+/// checks of the kvm lane's slice N3, round 5). And past LLONG_MAX: SEEK_CUR
+/// adds in a signed 64-bit number, which wraps negative (EINVAL, the
+/// position kept, fs/seq_file.c:315-320), where before Hermit answered
+/// EOVERFLOW.
+#[test]
+fn positioned_reads_of_another_processs_files_show_as_linux_on_every_backend() {
+    let test = "positioned_reads_of_another_processs_files_show_as_linux_on_every_backend";
+    let guest = rendered_io_and_diskstats_guest();
+    let native = Command::new("unshare")
+        .args(["--user", "--map-root-user"])
+        .arg(guest)
+        .arg("--positioned-reads")
+        .output()
+        .expect("run rendered-io-and-diskstats --positioned-reads natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    let mut lines = Vec::new();
+    for name in ["io", "statm", "arch_status", "cgroup"] {
+        lines.push(format!(
+            "positioned reads: {name}: a pread of 4 bytes at 0 ok, a pread at 0 ok, a preadv at 0 \
+             ok, a read of 2 bytes ok, a read ok, a pread at 1 ok, a pread at 0 ok\n"
+        ));
+    }
+    lines.push(
+        "positioned reads: io read to its end: a read read, a read end of file; a read of 4 \
+         bytes read; a pread of 2 bytes at 0 read\n"
+            .to_owned(),
+    );
+    lines.push(
+        "positioned reads: io without CAP_SYS_PTRACE in the effective set: a pread at 0 EACCES, \
+         a preadv at 0 EACCES, a read EACCES, a rewind returns 0 (no error) then a read EACCES\n"
+            .to_owned(),
+    );
+    lines.push(
+        "positioned reads: io without CAP_SYS_PTRACE in the effective set, through descriptors \
+         read before: one at its end reads end of file, one whose read buffered the record reads \
+         read, one whose pread buffered it: a pread at 2 read, then a pread at 1 EACCES\n"
+            .to_owned(),
+    );
+    lines.push("positioned reads: io with CAP_SYS_PTRACE again: a pread at 0 read\n".to_owned());
+    lines.push(
+        "positioned reads: io, p0: a fresh descriptor sought to 5 returns 5 (no error); without \
+         CAP_SYS_PTRACE in the effective set a read read\n"
+            .to_owned(),
+    );
+    lines.push(
+        "positioned reads: io, p1: a read read; without CAP_SYS_PTRACE a pread at 0 EACCES, then \
+         lseek(0, SEEK_CUR) returns -1 (EACCES); with it again a read read\n"
+            .to_owned(),
+    );
+    lines.push(
+        "positioned reads: io, p2: a read read; without CAP_SYS_PTRACE a pread at 0 EACCES, then \
+         a seek to 5 returns -1 (EACCES); with it again a read read\n"
+            .to_owned(),
+    );
+    lines.push(
+        "positioned reads: io, p3: a read read; without CAP_SYS_PTRACE a pread at 0 EACCES; with \
+         it a seek to 5 returns 5 (no error); without it again a read read\n"
+            .to_owned(),
+    );
+    for name in ["io", "statm", "arch_status", "cgroup"] {
+        lines.push(format!(
+            "positioned reads: {name} write-only: a seek to 5 returns 5 (no error), lseek(0, \
+             SEEK_CUR) returns 5 (no error), a seek to 5 again returns 5 (no error)\n"
+        ));
+    }
+    lines.push(
+        "positioned reads: io write-only without CAP_SYS_PTRACE in the effective set: a seek to 3 \
+         returns -1 (EACCES), then lseek(0, SEEK_CUR) returns 0 (no error); with it again a seek \
+         to 3 returns 3 (no error)\n"
+            .to_owned(),
+    );
+    for name in ["io", "statm", "arch_status", "cgroup"] {
+        lines.push(format!(
+            "positioned reads: {name}, past LLONG_MAX: a seek to 4 returns 4 (no error), \
+             lseek(LLONG_MAX, SEEK_CUR) returns -1 (EINVAL), lseek(0, SEEK_CUR) returns 4 (no \
+             error), a read ok; a seek to LLONG_MAX returns 9223372036854775807 (no error), \
+             lseek(1, SEEK_CUR) returns -1 (EINVAL), lseek(0, SEEK_CUR) returns \
+             9223372036854775807 (no error)\n"
+        ));
+    }
+    for name in ["io", "statm", "arch_status", "cgroup"] {
+        lines.push(format!(
+            "positioned reads: {name} once the target is reaped: a pread at 0 ESRCH, a preadv at \
+             0 ESRCH, a read ESRCH, a seek to the cursor answers as seq_lseek does at the cursor, \
+             a seek to 5 returns -1 (ESRCH)\n"
+        ));
+    }
+    lines.push(
+        "positioned reads: statm, e1: a read read; once the target is reaped a pread at 0 ESRCH, \
+         then lseek(0, SEEK_CUR) returns -1 (ESRCH), then a read ESRCH\n"
+            .to_owned(),
+    );
+    for (name, at) in [("io", 3), ("statm", 5), ("arch_status", 5), ("cgroup", 5)] {
+        lines.push(format!(
+            "positioned reads: {name} write-only once the target is reaped: a seek to {at}, where \
+             the sequence is, returns {at} (no error), a seek to 2 returns -1 (ESRCH), then \
+             lseek(0, SEEK_CUR) returns 0 (no error)\n"
+        ));
+    }
+    assert_eq!(expected, lines.concat(), "native");
+    // The same files opened as /proc/<pid>/../<pid>/<name>, which Hermit
+    // leaves to the kernel to open, serving its bytes sanitized: there the
+    // kernel's own show answers each read that runs one. Natively the
+    // spelling names the same files.
+    let native_through_dotdot = Command::new("unshare")
+        .args(["--user", "--map-root-user"])
+        .arg(guest)
+        .arg("--positioned-reads-through-dotdot")
+        .output()
+        .expect("run rendered-io-and-diskstats --positioned-reads-through-dotdot natively");
+    assert!(
+        native_through_dotdot.status.success(),
+        "native: {native_through_dotdot:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&native_through_dotdot.stdout),
+        expected,
+        "native, through .."
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for (part, mode) in [
+        (test.to_owned(), "--positioned-reads"),
+        (
+            format!("{test} (opened by the kernel)"),
+            "--positioned-reads-through-dotdot",
+        ),
+    ] {
+        for backend in procfs_backends(&part) {
+            let report = directory.path().join(format!("{backend}-{mode}.json"));
+            let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+            let mut args = vec!["--backend", backend, "run", "--strict"];
+            if backend == "liteinst" || backend == "in-guest-trap" {
+                args.push("--max-timeslice=disabled");
+            }
+            args.extend([
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                &report_arg,
+                "--epoch=2026-01-01T00:00:00Z",
+                "--proc=standard",
+                "--base-env=minimal",
+                "--",
+                guest.to_str().expect("guest path is UTF-8"),
+                mode,
+            ]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_bitwise_report(backend, &report);
+            assert_eq!(
+                stdout(&output),
+                expected,
+                "{part}: {backend} differs from Linux"
+            );
+        }
+    }
+}
+
+/// Another process's `io` read through descriptors a fork shares reads as
+/// Linux reads it: Linux keeps the file's position, where the record's
+/// sequence is and the buffered record in the one open file every process
+/// holding it shares (`struct file` and its `seq_file`), so a read by one
+/// process continues where a read by the other left the record, a `pread`
+/// by one moves the sequence for the other, and a read that continues the
+/// record runs no `show`, whoever reads and whatever its capabilities
+/// (fs/seq_file.c:171-206 in 6.17). Three descriptors: one read 4 bytes
+/// before a fork, 2 more by the second reader, then to its end, without
+/// `CAP_SYS_PTRACE`, by the reader; one whose second reader's `pread` at 1
+/// makes the reader's next read traverse, refused; and one the fork shares
+/// before its first read, read in turn by both. Before, where the tool runs
+/// in each guest process, each process kept its own copy of the sequence and
+/// the record: on SaBRe the reader's read after the second reader's was
+/// refused with EACCES where Linux reads (Codex's narrow check of the kvm
+/// lane's slice N3, round 4). Now a fork there moves the sequence to
+/// Detcore's global state (`Detcore::take_procfs_sequence`). The guest prints
+/// the same lines natively, as root in a user namespace, and on every
+/// backend, at bitwise parity, by both spellings (`/proc/<pid>/io`, which
+/// Detcore renders, and `/proc/<pid>/../<pid>/io`, which the kernel opens).
+#[test]
+fn a_record_sequence_a_fork_shares_reads_as_linux_on_every_backend() {
+    let test = "a_record_sequence_a_fork_shares_reads_as_linux_on_every_backend";
+    let guest = rendered_io_and_diskstats_guest();
+    let native_of = |mode: &str| {
+        let native = Command::new("unshare")
+            .args(["--user", "--map-root-user"])
+            .arg(guest)
+            .arg(mode)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("run rendered-io-and-diskstats {mode} natively: {error}")
+            });
+        assert!(native.status.success(), "native {mode}: {native:?}");
+        String::from_utf8_lossy(&native.stdout).into_owned()
+    };
+    let expected = native_of("--sequence-across-fork");
+    assert_eq!(
+        expected,
+        "sequence across fork: io read 4 bytes before a fork: the reader read; the second reader, \
+         2 bytes: read; the reader, without CAP_SYS_PTRACE in its effective set: read, then end of \
+         file\n\
+         sequence across fork: io read 4 bytes before a fork: the reader read; the second reader's \
+         pread of 2 bytes at 1: read; the reader's read, without CAP_SYS_PTRACE in its effective \
+         set: EACCES\n\
+         sequence across fork: io a fork shares before its first read: the reader, 4 bytes: read; \
+         the second reader, 2 bytes: read; without CAP_SYS_PTRACE in either's effective set, the \
+         reader, 3 bytes: read; the second reader: read; the reader: end of file\n",
+        "native"
+    );
+    assert_eq!(
+        native_of("--sequence-across-fork-through-dotdot"),
+        expected,
+        "native, through .."
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for (part, mode) in [
+        (test.to_owned(), "--sequence-across-fork"),
+        (
+            format!("{test} (opened by the kernel)"),
+            "--sequence-across-fork-through-dotdot",
+        ),
+    ] {
+        for backend in procfs_backends(&part) {
+            let report = directory.path().join(format!("{backend}-{mode}.json"));
+            let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+            let mut args = vec!["--backend", backend, "run", "--strict"];
+            if backend == "liteinst" || backend == "in-guest-trap" {
+                args.push("--max-timeslice=disabled");
+            }
+            args.extend([
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                &report_arg,
+                "--epoch=2026-01-01T00:00:00Z",
+                "--proc=standard",
+                "--base-env=minimal",
+                "--",
+                guest.to_str().expect("guest path is UTF-8"),
+                mode,
+            ]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_bitwise_report(backend, &report);
+            assert_eq!(
+                stdout(&output),
+                expected,
+                "{part}: {backend} differs from Linux"
+            );
+        }
+    }
+}
+
+/// Runs `guest` in `mode` natively, as root in a user namespace, and returns
+/// its standard output.
+fn native_rendered_io_and_diskstats(guest: &Path, mode: &str) -> String {
+    let native = Command::new("unshare")
+        .args(["--user", "--map-root-user"])
+        .arg(guest)
+        .arg(mode)
+        .output()
+        .unwrap_or_else(|error| panic!("run rendered-io-and-diskstats {mode} natively: {error}"));
+    assert!(native.status.success(), "native {mode}: {native:?}");
+    String::from_utf8_lossy(&native.stdout).into_owned()
+}
+
+/// The arguments of a strict run of `guest` in `mode` on `backend`, with a
+/// verification report at `report` where it is `Some`.
+fn rendered_io_and_diskstats_run<'a>(
+    backend: &'a str,
+    report: Option<&'a str>,
+    guest: &'a Path,
+    mode: &'a str,
+) -> Vec<&'a str> {
+    let mut args = vec!["--backend", backend, "run", "--strict"];
+    if backend == "liteinst" || backend == "in-guest-trap" {
+        args.push("--max-timeslice=disabled");
+    }
+    if let Some(report) = report {
+        args.extend(["--verify", "--verify-strict", "--verify-json", report]);
+    }
+    args.extend([
+        "--epoch=2026-01-01T00:00:00Z",
+        "--proc=standard",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        mode,
+    ]);
+    args
+}
+
+/// Another process's `io` received over SCM_RIGHTS reads as Linux reads the
+/// one `struct file` the receipt installs (`receive_fd`), or, where Detcore
+/// cannot know the record sequence that open file keeps, every read and seek
+/// through the received descriptor is refused by name, so no holder answers
+/// otherwise than Linux without saying so: the policy's exit, 122, and the
+/// reason on standard error, on LiteInst and in-guest-trap; on DBT, whose
+/// runtime ends a run at any Detcore refusal through its own exit and report
+/// path, the same reason and exit 101, or an end by the SIGKILL that path's
+/// refusing process sends the run's root first (Reverie's
+/// `terminate_runtime_tree`: both measured 2026-10-31); on SaBRe, where an exit
+/// would leave the run waiting on the refusing process, EOPNOTSUPP for the
+/// refused call and the same reason on standard error, and the run goes on
+/// (before, SaBRe refused nothing and answered stale bytes, end of file and,
+/// for a file the kernel opened, the host's own statm: Claude's final check
+/// of the kvm lane's slice N3).
+///
+/// Received by a process that holds the open file already, inherited at a
+/// fork after the reader's first read: a read through the received copy
+/// continues the record and moves the position the inherited descriptor
+/// shares (to 6), and a read through the inherited descriptor, without
+/// `CAP_SYS_PTRACE`, continues from there (a read that ran `show` would be
+/// EACCES). Every backend gives Linux's lines for `/proc/<pid>/io`, which
+/// Detcore renders: before, LiteInst and in-guest-trap made the copy a
+/// separate open file, and the inherited descriptor stayed at 4 (Claude's
+/// narrow check of the kvm lane's slice N3, round 5). Through
+/// `/proc/<pid>/../<pid>/io`, which the kernel opens, ptrace and e9patch
+/// preprocessing with ptrace join the sender's open file, and DBT, SaBRe,
+/// LiteInst and in-guest-trap, which cannot name the kernel's open file, refuse
+/// the copy's first read; before, it read end of file.
+///
+/// Received by a process forked before the open, which holds no other
+/// descriptor of it: its `pread` at 0 moves the sequence, so the reader's next
+/// read without `CAP_SYS_PTRACE` traverses and is refused with EACCES, also
+/// where the reader closed its descriptor while the message was queued. ptrace,
+/// KVM and e9patch preprocessing with ptrace join the sender's open file; DBT,
+/// LiteInst and in-guest-trap, whose receiver's Detcore never knew it, refuse
+/// the copy's `pread`; before, the copy was a separate open file, and the
+/// reader's read returned data where Linux refuses it (Codex's narrow check,
+/// round 5). The guest prints the same lines natively, as root in a
+/// user namespace, by both spellings; every run that is not refused prints
+/// them at bitwise parity. SaBRe's refused parts print, at bitwise parity,
+/// Linux's lines with EOPNOTSUPP for each call through the received copy and
+/// what follows from it: the inherited descriptor at 4, and the reader's read
+/// continuing its own record, where the copy's call never moved it.
+///
+/// A last part reads another process's `statm` through `..`, received by a
+/// process forked before the open, which reads through the copy and preads
+/// it at 0: ptrace and e9patch preprocessing with ptrace read Detcore's
+/// record, every counter 0, where Linux reads the kernel's; DBT, LiteInst and
+/// in-guest-trap refuse by name; SaBRe answers EOPNOTSUPP to both calls,
+/// where its pread had read the host's own `statm`. No run may read a
+/// counter that is not 0.
+#[test]
+fn a_record_sequence_received_over_scm_rights_reads_as_linux_or_is_refused_on_every_backend() {
+    use std::os::unix::process::ExitStatusExt;
+    let test =
+        "a_record_sequence_received_over_scm_rights_reads_as_linux_or_is_refused_on_every_backend";
+    let guest = rendered_io_and_diskstats_guest();
+    let alias = native_rendered_io_and_diskstats(guest, "--sequence-received-alias");
+    assert_eq!(
+        alias,
+        "sequence received: io read 4 bytes before a fork, then sent to the second reader, which \
+         holds it: the reader read; the second reader, 2 bytes through the received copy: read; \
+         lseek(0, SEEK_CUR) through its own: returns 6; without CAP_SYS_PTRACE in its effective \
+         set, through its own: read, then end of file; the reader, without it: end of file\n",
+        "native"
+    );
+    let no_alias = native_rendered_io_and_diskstats(guest, "--sequence-received-no-alias");
+    assert_eq!(
+        no_alias,
+        "sequence received: io read 4 bytes, then sent to a second reader forked before its \
+         open: the reader read; the second reader's pread of 2 bytes at 0 through the received \
+         copy: read; the reader's read, without CAP_SYS_PTRACE in its effective set: EACCES\n\
+         sequence received: io read 4 bytes, then sent and closed while queued: the reader read; \
+         the second reader's pread of 2 bytes at 0 through the received copy: read; its read at \
+         the position, without CAP_SYS_PTRACE in its effective set: EACCES\n",
+        "native"
+    );
+    for (mode, expected) in [
+        ("--sequence-received-alias-through-dotdot", &alias),
+        ("--sequence-received-no-alias-through-dotdot", &no_alias),
+    ] {
+        assert_eq!(
+            &native_rendered_io_and_diskstats(guest, mode),
+            expected,
+            "native, {mode}"
+        );
+    }
+    let pread = native_rendered_io_and_diskstats(guest, "--sequence-received-dotdot-pread");
+    assert_eq!(
+        pread,
+        "sequence received through ..: statm read 4 bytes, then sent to a second reader forked \
+         before its open: the reader read; the second reader's read through the received copy: \
+         read; its pread at 0: read, some counter not 0\n",
+        "native"
+    );
+    // Detcore's statm, which every backend that follows the sequence reads.
+    let pread_detcore = pread.replace("some counter not 0", "every counter 0");
+    // SaBRe's refused parts: EOPNOTSUPP at each call through the received
+    // copy, and the inherited descriptor and the reader's read where that
+    // call left them, unmoved.
+    let alias_sabre = alias
+        .replace(
+            "2 bytes through the received copy: read;",
+            "2 bytes through the received copy: EOPNOTSUPP;",
+        )
+        .replace("through its own: returns 6;", "through its own: returns 4;");
+    let no_alias_sabre = "sequence received: io read 4 bytes, then sent to a second reader forked \
+         before its open: the reader read; the second reader's pread of 2 bytes at 0 through the \
+         received copy: EOPNOTSUPP; the reader's read, without CAP_SYS_PTRACE in its effective \
+         set: read\n\
+         sequence received: io read 4 bytes, then sent and closed while queued: the reader read; \
+         the second reader's pread of 2 bytes at 0 through the received copy: EOPNOTSUPP; its read \
+         at the position, without CAP_SYS_PTRACE in its effective set: EOPNOTSUPP\n"
+        .to_owned();
+    let pread_sabre = "sequence received through ..: statm read 4 bytes, then sent to a second \
+         reader forked before its open: the reader read; the second reader's read through the \
+         received copy: EOPNOTSUPP; its pread at 0: EOPNOTSUPP\n"
+        .to_owned();
+    let in_guest = ["dbt", "liteinst", "in-guest-trap"];
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for (part, mode, expected, refusing, sabre) in [
+        (
+            test.to_owned(),
+            "--sequence-received-alias",
+            &alias,
+            &[][..],
+            None,
+        ),
+        (
+            format!("{test} (opened by the kernel)"),
+            "--sequence-received-alias-through-dotdot",
+            &alias,
+            &in_guest[..],
+            Some(&alias_sabre),
+        ),
+        (
+            format!("{test} (a receiver forked before the open)"),
+            "--sequence-received-no-alias",
+            &no_alias,
+            &in_guest[..],
+            Some(&no_alias_sabre),
+        ),
+        (
+            format!("{test} (a receiver forked before the open, opened by the kernel)"),
+            "--sequence-received-no-alias-through-dotdot",
+            &no_alias,
+            &in_guest[..],
+            Some(&no_alias_sabre),
+        ),
+        (
+            format!(
+                "{test} (a pread at 0 by a receiver forked before the open, opened by the kernel)"
+            ),
+            "--sequence-received-dotdot-pread",
+            &pread_detcore,
+            &in_guest[..],
+            Some(&pread_sabre),
+        ),
+    ] {
+        for backend in procfs_backends(&part) {
+            if let (Some(sabre), "sabre") = (sabre, backend) {
+                // Refused with EOPNOTSUPP, named on standard error at the
+                // default log level, and the run goes on, at bitwise parity.
+                let report = directory.path().join(format!("{backend}-{mode}.json"));
+                let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+                let args = rendered_io_and_diskstats_run(backend, Some(&report_arg), guest, mode);
+                let output = hermit(&args);
+                let stderr = stderr(&output);
+                assert_success(&output, &args);
+                assert_bitwise_report(backend, &report);
+                let printed = stdout(&output);
+                assert_eq!(&printed, sabre, "{part}: {backend}: {stderr}");
+                assert!(
+                    printed.contains("EOPNOTSUPP") && !printed.contains("some counter not 0"),
+                    "{part}: {backend}: {printed}"
+                );
+                for named in [
+                    "Detcore refuses ",
+                    "without joining an open file of it this process's Detcore models",
+                    "the call gets EOPNOTSUPP",
+                ] {
+                    assert!(
+                        stderr.contains(named),
+                        "{part}: {backend}: the refusal does not say {named:?}: {stderr}"
+                    );
+                }
+                continue;
+            }
+            if refusing.contains(&backend) {
+                let args = rendered_io_and_diskstats_run(backend, None, guest, mode);
+                let output = hermit(&args);
+                let stderr = stderr(&output);
+                // DBT's runtime ends every Detcore refusal through its own
+                // exit and report path ("unsupported syscall"): the refusing
+                // process sends the run's root SIGKILL and exits 101, so Hermit
+                // reports 101, or is ended by that SIGKILL first (host-timed).
+                // Elsewhere the policy's exit.
+                if backend == "dbt" {
+                    assert!(
+                        output.status.code() == Some(101)
+                            || output.status.signal() == Some(libc::SIGKILL),
+                        "{part}: {backend}: {args:?}: {:?}: {stderr}",
+                        output.status
+                    );
+                    assert!(
+                        stderr.contains("detcore-dbt: unsupported syscall: "),
+                        "{part}: {backend}: {stderr}"
+                    );
+                } else {
+                    assert_eq!(
+                        output.status.code(),
+                        Some(HERMIT_POLICY_REFUSAL_EXIT),
+                        "{part}: {backend}: {args:?}: {stderr}"
+                    );
+                    assert!(
+                        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+                        "{part}: {backend}: {stderr}"
+                    );
+                }
+                assert!(
+                    stderr.contains(
+                        "without joining an open file of it this process's Detcore models"
+                    ),
+                    "{part}: {backend}: the refusal does not name its reason: {stderr}"
+                );
+                continue;
+            }
+            let report = directory.path().join(format!("{backend}-{mode}.json"));
+            let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+            let args = rendered_io_and_diskstats_run(backend, Some(&report_arg), guest, mode);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_bitwise_report(backend, &report);
+            assert_eq!(
+                &stdout(&output),
+                expected,
+                "{part}: {backend} differs from Linux"
+            );
+        }
+    }
+}
+
+/// Another process's `statm` read through a descriptor an exec kept reads as
+/// Linux reads the one `struct file`, which survives exec: the reader reads 4
+/// bytes and forks a child that execs (the guest again) and reads 2 bytes
+/// through the descriptor it kept; once the target is reaped, the reader's
+/// read continues the record from byte 6, with no `show` (one would find the
+/// task gone, ESRCH), then reads end of file. On DBT and SaBRe, which rebuild
+/// their descriptor table after exec, the descriptor is carried with its open
+/// file's identity and record sequence, and the table's identity numbering
+/// (`ExecProcfsRecords`); before, the new image rebuilt it with no sequence,
+/// and the reader's read was ESRCH, or through `/proc/<pid>/../<pid>/statm`
+/// the child's own read was end of file (Claude's narrow check of the kvm
+/// lane's slice N3, round 5, case 11). The guest prints the same lines
+/// natively, as root in a user namespace, and on every backend, at bitwise
+/// parity, by both spellings.
+#[test]
+fn a_record_sequence_an_exec_keeps_reads_as_linux_on_every_backend() {
+    let test = "a_record_sequence_an_exec_keeps_reads_as_linux_on_every_backend";
+    let guest = rendered_io_and_diskstats_guest();
+    let expected = native_rendered_io_and_diskstats(guest, "--sequence-across-exec");
+    assert_eq!(
+        expected,
+        "sequence across exec: the exec'd child, 2 bytes through the descriptor it kept: read\n\
+         sequence across exec: statm read 4 bytes before a fork: the reader read; once the exec'd \
+         child read and the target is reaped, the reader: read, then end of file\n",
+        "native"
+    );
+    assert_eq!(
+        native_rendered_io_and_diskstats(guest, "--sequence-across-exec-through-dotdot"),
+        expected,
+        "native, through .."
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for (part, mode) in [
+        (test.to_owned(), "--sequence-across-exec"),
+        (
+            format!("{test} (opened by the kernel)"),
+            "--sequence-across-exec-through-dotdot",
+        ),
+    ] {
+        for backend in procfs_backends(&part) {
+            let report = directory.path().join(format!("{backend}-{mode}.json"));
+            let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+            let args = rendered_io_and_diskstats_run(backend, Some(&report_arg), guest, mode);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_bitwise_report(backend, &report);
+            assert_eq!(
+                stdout(&output),
+                expected,
+                "{part}: {backend} differs from Linux"
+            );
+        }
+    }
+}
+
+/// A memfd the guest makes with the name of Detcore's stand-in for a file the
+/// run's `--proc` level omits, and the four seals Detcore's stand-ins carry,
+/// stays the empty memfd it is, as natively, by every route that reaches it:
+/// sent over SCM_RIGHTS to a process forked before it existed
+/// (`Detcore::received_placeholder`); opened through `/proc/self/fd/N`,
+/// `/proc/thread-self/fd/N`, `/proc/<pid>/fd/N` and `/dev/fd/N`
+/// (`Detcore::rendered_procfs_behind`); opened by a process forked after it
+/// through `/proc/<pid>/fd/N`; its link's text and its fstat; and an unsealed
+/// one reopened through an O_PATH descriptor's link, where the name alone was
+/// read. At `--proc=minimal`, `/proc/diskstats` and `/proc/interrupts` are
+/// absent, and Detcore never makes a stand-in for an absent file. Before,
+/// LiteInst and in-guest-trap read both files at the receipt (Claude review
+/// of the kvm lane's slice N3, round 2), and DBT and SaBRe at every link
+/// route, which also showed the file's link text and metadata (round 3). The
+/// guest prints the same lines natively and on every backend, at bitwise
+/// parity.
+#[test]
+fn a_guest_memfd_with_a_stand_in_name_stays_a_memfd_outside_the_proc_level_on_every_backend() {
+    let test =
+        "a_guest_memfd_with_a_stand_in_name_stays_a_memfd_outside_the_proc_level_on_every_backend";
+    let guest = rendered_io_and_diskstats_guest();
+    let native = Command::new(guest)
+        .arg("--stand-in-memfds")
+        .output()
+        .expect("run rendered-io-and-diskstats --stand-in-memfds natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    let mut want = String::new();
+    for name in [
+        "hermit-procfs:/proc/diskstats@",
+        "hermit-procfs:/proc/interrupts@",
+    ] {
+        want.push_str(&format!(
+            "stand-in memfd {name}, received by a process forked before it: read end of file\n"
+        ));
+    }
+    for name in [
+        "hermit-procfs:/proc/diskstats@",
+        "hermit-procfs:/proc/interrupts@",
+    ] {
+        for route in [
+            "/proc/self/fd/N",
+            "/proc/thread-self/fd/N",
+            "/proc/<pid>/fd/N",
+            "/dev/fd/N",
+        ] {
+            want.push_str(&format!(
+                "stand-in memfd {name}: opened through {route}: read end of file\n"
+            ));
+        }
+        want.push_str(&format!(
+            "stand-in memfd {name}: its link reads /memfd:{name} (deleted)\n\
+             stand-in memfd {name}: fstat: a regular file of 0 bytes with 0 links, mode 777\n\
+             stand-in memfd {name}: opened by a process forked after it, through \
+             /proc/<pid>/fd/N: read end of file\n"
+        ));
+    }
+    for name in [
+        "hermit-procfs:/proc/diskstats@",
+        "hermit-procfs:/proc/interrupts@",
+    ] {
+        want.push_str(&format!(
+            "unsealed memfd {name}: reopened through an O_PATH descriptor's link: read end of \
+             file\n"
+        ));
+    }
+    assert_eq!(expected, want, "native");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec!["--backend", backend, "run", "--strict"];
+        if backend == "liteinst" || backend == "in-guest-trap" {
+            args.push("--max-timeslice=disabled");
+        }
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--proc=minimal",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--stand-in-memfds",
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_bitwise_report(backend, &report);
+        assert_eq!(stdout(&output), expected, "{backend} differs from Linux");
+    }
+}
 
 /// Detcore renders a process's auxv file, `/proc/<pid>/auxv`, from the
 /// auxiliary vector each new image finds on its initial stack, without the
@@ -41215,7 +42792,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x197, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x198, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];

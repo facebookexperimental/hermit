@@ -806,8 +806,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     where
         G: Guest<Self>,
     {
-        if let Some(path) =
-            crate::procfs::placeholder_link_path(raw_target, self.rendered_files(guest))
+        if let Some(path) = self.placeholder_link_within_level(guest, raw_target)
             && self.placeholder_link_confirmed(guest, link).await
         {
             // Another process's link to a procfs file Detcore renders names
@@ -1114,7 +1113,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(length) => {
                 let mut target = vec![0; (length as usize).min(ANONYMOUS_PROC_FD_TARGET_CAPACITY)];
                 guest.memory().read_exact(scratch.cast(), &mut target)?;
-                crate::procfs::placeholder_link_path(&target, self.rendered_files(guest))
+                self.placeholder_link_within_level(guest, &target)
             }
             Err(_) => None,
         };

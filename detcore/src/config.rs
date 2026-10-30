@@ -161,6 +161,23 @@ mod tests {
         // revisions 17 to 19, never on main, became this one when main took
         // 17 to 19).
         (20, "3fb2388350b1a2fa", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::HostDiskstats` and `GlobalResponse::HostDiskstats`:
+        // the host's /proc/diskstats as the run first read it, which every
+        // rendered /proc/diskstats starts from;
+        // `GlobalRequest::UserNamespaceRelation` and
+        // `GlobalRequest::UserNamespaceOwnerMayDiffer` and their responses,
+        // Detcore's record of user namespaces; and
+        // `GlobalRequest::ProcfsSequence` and
+        // `GlobalRequest::StoreProcfsSequence` and their responses, the record
+        // sequence of a per-process file a fork or a send shares where the
+        // tool runs in each guest process. Serialized fields this digest does
+        // not cover: `ProcfsFile::sequence_shared`, which a shared open file
+        // model carries; the open file model's `record_sequence_unknown`; and
+        // `ExecFdState::procfs_records`, which `GlobalRequest::PrepareExec`
+        // carries (the kvm lane's slice N3, revision 17 on its own base,
+        // renumbered to 21 at landing after main's 20; digests measured at
+        // this head).
+        (21, "9d583ef0f9243c61", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

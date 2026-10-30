@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 3070,
-      "applicable": 2245,
-      "selectable": 1756,
+      "applicable": 2246,
+      "selectable": 1757,
       "population": 3010,
-      "population_candidate_selected": 1756,
+      "population_candidate_selected": 1757,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 779
+      "population_candidate_disabled": 778
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 614,
-        "applicable": 580,
-        "selectable": 573,
+        "applicable": 581,
+        "selectable": 574,
         "population": 602,
-        "population_candidate_selected": 573,
+        "population_candidate_selected": 574,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 26
+        "population_candidate_disabled": 25
       },
       "liteinst": {
         "cells": 614,
@@ -2627,7 +2627,7 @@
     {"test_id":"compat/vmstat","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/vmstat-disk","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/vmstat-disk","backend":"in-guest-trap","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/vmstat-disk","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Not in the 2026-10-13 KVM survey: its KVM verify cell was not green on the compatibility ledger"},
+    {"test_id":"compat/vmstat-disk","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/vmstat-disk","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/vmstat-disk","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/wc","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

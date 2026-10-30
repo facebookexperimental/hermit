@@ -99,6 +99,15 @@ pub struct FileMetadata {
     /// field had while only random devices were promoted.)
     #[serde(default, rename = "has_promoted_random_files")]
     has_promoted_shared_files: bool,
+    /// A description from this table has kept its record's sequence in
+    /// Detcore's global state (`ProcfsFile::share_sequence`, at a fork or a
+    /// send), keyed by its identity: so an exec on a backend that rebuilds
+    /// the table carries this table's identity numbering, and no description
+    /// of the new image takes an identity whose sequence another process may
+    /// still hold (`ThreadState::procfs_records_for_exec`). Kept after the
+    /// description closes, and by `fork_for` and `for_exec`.
+    #[serde(default)]
+    has_shared_procfs_sequences: bool,
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
     /// Deserialization restores aliasing (`crate::fd::intern_open_files`).
@@ -127,11 +136,26 @@ pub struct FileMetadata {
     #[serde(default)]
     cpuinfo_placeholders: Option<bool>,
     /// Descriptors rediscovered before [`Self::cpuinfo_placeholders`] was
-    /// decided whose memfd is named as a `/proc/cpuinfo` placeholder: kept as
-    /// the ordinary descriptors they look like until the session's answer
-    /// says whether they are placeholders (`decide_cpuinfo_placeholders`).
+    /// decided whose memfd is named as a placeholder for a file rendered only
+    /// where `/proc/cpuinfo` is (the file itself, or a task's `arch_status`):
+    /// kept as the ordinary descriptors they look like until the session's
+    /// answer says whether they are placeholders
+    /// (`decide_cpuinfo_placeholders`).
     #[serde(default)]
     pending_cpuinfo_placeholders: Vec<RawFd>,
+    /// The run's `--proc` level, so that a memfd named as a placeholder for
+    /// a file the level omits stays the memfd it is when this table
+    /// discovers it (`discover_fd_from_current_process`): Detcore makes no
+    /// placeholder for such a file, whose open fails with ENOENT. Noted as
+    /// the table is made for a thread (`ThreadState::new`) and again at each
+    /// image's first guest callback (`decide_cpuinfo_placeholders`), kept by
+    /// `fork_for` and `for_exec`, and serialized with the table, so a table
+    /// carried across a fork or an `exec` knows it before it rediscovers a
+    /// descriptor. `None` until noted (a table no thread made) and when absent
+    /// from an older serialized table, where no name is refused for its
+    /// level.
+    #[serde(default)]
+    proc_level: Option<detcore_model::config::ProcLevel>,
     /// Descriptors open in this table that Detcore keeps no description of,
     /// with whether each is close-on-exec: a received anonymous inode, or a
     /// received descriptor whose facts could not be taken
@@ -367,6 +391,13 @@ pub struct ExecFdState {
     /// aliases and any cached bytes. Kernel EOF must not erase this authority.
     #[serde(default)]
     pub(crate) maps: Option<ExecMapsFiles>,
+    /// On a backend that rebuilds its descriptor table after exec: the
+    /// surviving descriptors of per-process files that follow their record's
+    /// sequence, with their open files' identities, models and sequences, and
+    /// the old table's identity numbering, where it has either
+    /// (`ThreadState::procfs_records_for_exec`).
+    #[serde(default)]
+    pub(crate) procfs_records: Option<ExecProcfsRecords>,
     /// Under `--pipe-wake-latency`, on a backend that rediscovers its
     /// descriptors after exec: the channel end each surviving descriptor is,
     /// reattached after rediscovery (`crate::pipe_wake`).
@@ -413,6 +444,9 @@ impl std::fmt::Debug for ExecFdState {
             // transport-only; they must not enter canonical guest logs.
             debug.field("maps_survivors", &maps.handles.len());
         }
+        if let Some(records) = &self.procfs_records {
+            debug.field("procfs_record_survivors", &records.handles.len());
+        }
         if !self.channels.is_empty() {
             debug.field("channels", &self.channels);
         }
@@ -450,6 +484,33 @@ struct ExecMapsFile {
     procfs: crate::procfs::ProcfsFile,
     flags: i32,
     path: Option<std::path::PathBuf>,
+}
+
+/// The descriptors of per-process files that follow their record's sequence
+/// (`ProcfsFile::follows_record_sequence`) surviving an exec on a backend
+/// that rebuilds its descriptor table after exec, and the old table's open
+/// file creator and next identity (`ThreadState::procfs_records_for_exec`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecProcfsRecords {
+    creator: DetTid,
+    next_sequence: u64,
+    handles: BTreeMap<RawFd, ExecProcfsRecord>,
+}
+
+/// One surviving descriptor of [`ExecProcfsRecords`]: its open file's
+/// identity, authenticated against the descriptor after the exec, its model,
+/// its record's sequence whole (the model does not serialize where the
+/// sequence is, `ProcfsFile::read_pos`), its status flags and path, and
+/// whether that sequence is one Detcore cannot know
+/// (`DetFd::record_sequence_unknown`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ExecProcfsRecord {
+    identity: ExecOpenFile,
+    procfs: crate::procfs::ProcfsFile,
+    sequence: crate::procfs::ProcfsSequence,
+    flags: i32,
+    path: Option<std::path::PathBuf>,
+    sequence_unknown: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,6 +571,7 @@ impl ExecFdState {
             .map(|files| files.creator)
             .or_else(|| self.open_file_namespace.map(|(creator, _)| creator))
             .or_else(|| self.maps.as_ref().map(|maps| maps.creator))
+            .or_else(|| self.procfs_records.as_ref().map(|records| records.creator))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -519,6 +581,7 @@ impl ExecFdState {
             && self.initial_input.is_none()
             && self.open_files.is_none()
             && self.maps.is_none()
+            && self.procfs_records.is_none()
             && self.channels.is_empty()
             && self.open_file_namespace.is_none()
             && self.random_device_sequence == 0
@@ -959,11 +1022,13 @@ impl FileMetadata {
             next_socket_open_file_sequence: 0,
             next_random_device_sequence: 0,
             has_promoted_shared_files: false,
+            has_shared_procfs_sequences: false,
             file_handles: HashMap::new(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
             cpuinfo_placeholders: None,
             pending_cpuinfo_placeholders: Vec::new(),
+            proc_level: None,
             present_unmodelled: BTreeMap::new(),
             unaccounted_receipts: false,
             descriptor_capacity: default_descriptor_capacity(),
@@ -1042,13 +1107,33 @@ impl FileMetadata {
         }
     }
 
+    /// Note the run's `--proc` level ([`Self::proc_level`]).
+    pub(crate) fn note_proc_level(&mut self, level: detcore_model::config::ProcLevel) {
+        self.proc_level = Some(level);
+    }
+
+    /// The placeholder `found` names, unless it names a file outside the
+    /// run's `--proc` level ([`Self::proc_level`]), for which Detcore makes
+    /// no placeholder.
+    fn within_proc_level(
+        &self,
+        found: Option<(&'static std::path::Path, Vec<u8>)>,
+    ) -> Option<(&'static std::path::Path, Vec<u8>)> {
+        found.filter(|(path, _)| {
+            self.proc_level.is_none_or(|level| {
+                !crate::syscalls::rendered_procfs::named_file_outside_level(path, level)
+            })
+        })
+    }
+
     /// Take the session's answer to whether it renders `/proc/cpuinfo`
     /// (`rendered`: `Detcore::rendered_files(guest).cpuinfo`), at the first
     /// guest callback of this image, before guest code runs. A descriptor
-    /// rediscovered before it whose memfd is named as a `/proc/cpuinfo`
-    /// placeholder becomes the placeholder it is where the session renders
-    /// the file, and stays an ordinary memfd where it does not. Later answers
-    /// of the same session are the same and change nothing.
+    /// rediscovered before it whose memfd is named as a placeholder for a
+    /// file rendered only where `/proc/cpuinfo` is (the file itself, or a
+    /// task's `arch_status`) becomes the placeholder it is where the session
+    /// renders the file, and stays an ordinary memfd where it does not. Later
+    /// answers of the same session are the same and change nothing.
     pub(crate) fn decide_cpuinfo_placeholders(&mut self, rendered: bool) -> Result<(), Errno> {
         if self.cpuinfo_placeholders.is_some() {
             return Ok(());
@@ -1066,7 +1151,7 @@ impl FileMetadata {
                 stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
             let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
             if let Some((path, snapshot)) =
-                placeholder_behind(fd, crate::procfs::RenderedFiles::ALL)
+                self.within_proc_level(placeholder_behind(fd, crate::procfs::RenderedFiles::ALL))
             {
                 self.adopt_placeholder(fd, &raw_stat, fd_flags, path, snapshot)?;
             }
@@ -1205,11 +1290,13 @@ impl FileMetadata {
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
             next_random_device_sequence: self.next_random_device_sequence,
             has_promoted_shared_files: self.has_promoted_shared_files,
+            has_shared_procfs_sequences: self.has_shared_procfs_sequences,
             file_handles: self.file_handles.clone(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
             cpuinfo_placeholders: self.cpuinfo_placeholders,
             pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
+            proc_level: self.proc_level,
             present_unmodelled: self.present_unmodelled.clone(),
             unaccounted_receipts: self.unaccounted_receipts,
             descriptor_capacity: self.forked_descriptor_capacity(),
@@ -1227,6 +1314,7 @@ impl FileMetadata {
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
             next_random_device_sequence: self.next_random_device_sequence,
             has_promoted_shared_files: self.has_promoted_shared_files,
+            has_shared_procfs_sequences: self.has_shared_procfs_sequences,
             file_handles: self
                 .file_handles
                 .iter()
@@ -1236,6 +1324,7 @@ impl FileMetadata {
             next_accept_wait: 0,
             cpuinfo_placeholders: self.cpuinfo_placeholders,
             pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
+            proc_level: self.proc_level,
             present_unmodelled: self
                 .present_unmodelled
                 .iter()
@@ -1573,6 +1662,33 @@ impl FileMetadata {
             }
             self.next_open_file_sequence = self.next_open_file_sequence.max(maps.next_sequence);
         }
+        if shared_guest_table && let Some(records) = &state.procfs_records {
+            // The same for the per-process files carried with their record's
+            // sequence, and their table's numbering, reserved before any
+            // rediscovery allocates an identity whose sequence another
+            // process may still hold.
+            for (&fd, survivor) in &records.handles {
+                if ExecOpenFile::capture(fd, survivor.identity.id)? != survivor.identity {
+                    return Err(Errno::EIO);
+                }
+            }
+            if state
+                .open_files
+                .as_ref()
+                .is_some_and(|files| files.creator != records.creator)
+                || state
+                    .open_file_namespace
+                    .is_some_and(|(creator, _)| creator != records.creator)
+                || state
+                    .maps
+                    .as_ref()
+                    .is_some_and(|maps| maps.creator != records.creator)
+            {
+                return Err(Errno::EIO);
+            }
+            self.next_open_file_sequence = self.next_open_file_sequence.max(records.next_sequence);
+            self.has_shared_procfs_sequences = true;
+        }
         // Legacy discovery also allocates IDs. Reserve the complete old
         // namespace before it can create any nonrandom descriptions, including
         // same-leader exec where the creator did not change.
@@ -1592,6 +1708,8 @@ impl FileMetadata {
             creator
         } else if shared_guest_table && let Some(maps) = &state.maps {
             maps.creator
+        } else if shared_guest_table && let Some(records) = &state.procfs_records {
+            records.creator
         } else {
             owner
         };
@@ -1671,6 +1789,62 @@ impl FileMetadata {
             // same proc inode remain separate because their IDs differ.
             crate::fd::intern_open_files(&mut handles);
             self.file_handles.extend(handles);
+        }
+        if let Some(records) = state.procfs_records {
+            self.restore_procfs_records(records)?;
+        }
+        Ok(())
+    }
+
+    /// Restore the per-process files carried across exec with their open
+    /// files' identities and record sequences (`ExecProcfsRecords`), already
+    /// authenticated against the descriptors (`apply_exec_fd_state`): the
+    /// new image's table names the same open files as every other process
+    /// holding them, takes and stores a sequence a fork or a send moved to
+    /// Detcore's global state, and keeps one it alone held. A rendered file's
+    /// placeholder is registered again, under the open file it belongs to,
+    /// as its open registered it (`rendered_procfs::register_placeholder_open`).
+    fn restore_procfs_records(&mut self, records: ExecProcfsRecords) -> Result<(), Errno> {
+        let mut handles = HashMap::new();
+        let mut placeholders = Vec::new();
+        for (fd, survivor) in records.handles {
+            let raw_stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) })
+                .map_err(|error| Errno::new(error as i32))?;
+            let handle = DetFd::new(
+                fd,
+                OFlag::from_bits_truncate(survivor.flags),
+                FdType::Regular,
+                survivor.identity.id,
+            )
+            .with_stat(DetStat::from(raw_stat));
+            if let Some(path) = survivor.path {
+                handle.set_path(path);
+            }
+            let mut procfs = survivor.procfs;
+            procfs.adopt_sequence(survivor.sequence);
+            if let Some(rendered) = procfs.opened_path() {
+                placeholders.push((fd, (survivor.identity.dev, survivor.identity.ino), rendered));
+            }
+            handle.set_procfs(procfs);
+            handle.mark_flock_mode_unobserved();
+            if survivor.sequence_unknown {
+                handle.mark_record_sequence_unknown();
+            }
+            handles.insert(fd, handle);
+        }
+        crate::fd::intern_open_files(&mut handles);
+        self.file_handles.extend(handles);
+        for (fd, identity, rendered) in placeholders {
+            crate::syscalls::rendered_procfs::register_placeholder(
+                identity.0, identity.1, rendered,
+            );
+            let handle = &self.file_handles[&fd];
+            crate::syscalls::rendered_procfs::register_placeholder_open(
+                identity,
+                handle.open_file_handle(),
+                handle.open_file_id(),
+                Vec::new(),
+            );
         }
         Ok(())
     }
@@ -1825,6 +1999,8 @@ impl FileMetadata {
         // A `/proc/cpuinfo` placeholder only once the session's answer says
         // it renders the file (`decide_cpuinfo_placeholders`); before that
         // answer, one waits for it as the ordinary descriptor it looks like.
+        // So does a placeholder for a task's `arch_status`, which Detcore
+        // renders exactly where it renders `/proc/cpuinfo`.
         let decided = self.cpuinfo_placeholders;
         // A process's `mountinfo` or `mounts` has a placeholder only in a
         // session with a container mount table, the only one that renders it.
@@ -1835,14 +2011,20 @@ impl FileMetadata {
             // never rediscovers its descriptors.
             locks: false,
         };
-        let found = may_be_placeholder
-            .then(|| placeholder_behind(fd, files))
-            .flatten();
+        let found = self.within_proc_level(
+            may_be_placeholder
+                .then(|| placeholder_behind(fd, files))
+                .flatten(),
+        );
+        // Before the answer, `files` differs from every rendered file only in
+        // the files rendered where `/proc/cpuinfo` is: a placeholder it does
+        // not find but every rendered file does is one of those.
         if found.is_none()
             && decided.is_none()
             && may_be_placeholder
-            && placeholder_behind(fd, crate::procfs::RenderedFiles::ALL)
-                .is_some_and(|(path, _)| path == std::path::Path::new("/proc/cpuinfo"))
+            && self
+                .within_proc_level(placeholder_behind(fd, crate::procfs::RenderedFiles::ALL))
+                .is_some()
         {
             self.pending_cpuinfo_placeholders.push(fd);
         }
@@ -1875,6 +2057,28 @@ impl FileMetadata {
                 detfd.set_path(path);
                 detfd.set_procfs(procfs.clone());
                 detfd.set_procfs_offset(offset);
+            })?;
+        }
+        // A per-process file that follows its record's sequence, which the
+        // kernel opened in another process and sent here over `SCM_RIGHTS`:
+        // where that sequence is and the record it buffered belong to the open
+        // file, which every holder shares and the sender's Detcore keeps,
+        // and which this one cannot know, so every read and seek through it
+        // is refused by name (`Detcore::refuse_unknown_record_sequence`; on
+        // DBT, through its runtime's exit path; on SaBRe, where a refusal that
+        // ended the run would strand it, with EOPNOTSUPP), so no read reaches
+        // the kernel's file. Before, it read the kernel's file, where the
+        // sender's captures had left it (end of file), unsanitized (Claude's
+        // narrow check of the kvm lane's slice N3, round 5; on SaBRe until its
+        // final check, which saw the host's own statm). One the exec that
+        // made this image kept is carried with its sequence instead
+        // (`ExecProcfsRecords`).
+        else if let Some(path) =
+            own_fd_link(fd).and_then(|link| kernel_record_file_link(&raw_stat, &link))
+        {
+            self.with_detfd(fd, |detfd| {
+                detfd.set_path(path.clone());
+                detfd.mark_record_sequence_unknown();
             })?;
         }
         if let Some(resource) = stdio_resource(fd) {
@@ -1950,6 +2154,25 @@ impl FileMetadata {
     /// `fd_flags`) is, with the snapshot its name carries. Returns whether it
     /// joined another descriptor's open file (an alias), whose state it then
     /// shares.
+    ///
+    /// Otherwise the open file is rebuilt. A per-process file that follows
+    /// its record's sequence (`ProcfsFile::follows_record_sequence`) needs
+    /// more than its placeholder keeps: where its sequence is and the record
+    /// it buffered, which Linux keeps in the one open file every holder
+    /// shares. Where this process's registry names the open file the
+    /// placeholder belongs to (this process, or an ancestor before a fork,
+    /// opened it: `rendered_procfs::placeholder_open_id`), the descriptor
+    /// takes that open file's identity, and its sequence from Detcore's global
+    /// state, where every holder keeps it once the open file has left a
+    /// process (`ThreadState::share_procfs_sequences` at a fork,
+    /// `Detcore::share_sent_record_sequences` at a send). Otherwise (a
+    /// descriptor another process sent to one that never held the open file)
+    /// the sequence cannot be known, and every read and seek through it is
+    /// refused by name (`DetFd::mark_record_sequence_unknown`), on DBT through
+    /// its runtime's exit path, and on SaBRe, where a refusal that ended the
+    /// run would strand it, with EOPNOTSUPP. An open file
+    /// surviving `exec` is carried with its sequence instead
+    /// (`ExecProcfsRecords`), before this rediscovery could reach it.
     fn adopt_placeholder(
         &mut self,
         fd: RawFd,
@@ -1982,15 +2205,34 @@ impl FileMetadata {
         let procfs = crate::procfs::ProcfsFile::from_rendered_path(path)
             .expect("a rendered path is a procfs file")
             .into_rendered();
-        let procfs = if snapshot.is_empty() {
+        let mut procfs = if snapshot.is_empty() {
             procfs
         } else {
             procfs.with_rendered_snapshot(snapshot)
         };
+        let follows = procfs.follows_record_sequence();
+        let joined = follows
+            .then(|| {
+                crate::syscalls::rendered_procfs::placeholder_open_id((
+                    raw_stat.st_dev,
+                    raw_stat.st_ino,
+                ))
+            })
+            .flatten();
+        if joined.is_some() {
+            procfs.share_sequence();
+            self.has_shared_procfs_sequences = true;
+        }
         self.with_detfd(fd, |detfd| {
+            if let Some(id) = joined {
+                detfd.rebind_open_file_id(id);
+            }
             detfd.set_path(path);
             detfd.set_procfs(procfs.clone());
             detfd.set_procfs_offset(offset);
+            if follows && joined.is_none() {
+                detfd.mark_record_sequence_unknown();
+            }
         })?;
         Ok(false)
     }
@@ -3844,6 +4086,128 @@ mod file_metadata_tests {
         );
     }
 
+    /// A task's `arch_status` is rendered exactly where `/proc/cpuinfo` is,
+    /// so a memfd named and sealed as its placeholder, met before the
+    /// session's answer, waits for that answer as a `/proc/cpuinfo`
+    /// placeholder does, and becomes the placeholder it is once the session
+    /// renders the files (Claude review of the kvm lane's slice N3: it was
+    /// neither adopted nor queued, and stayed an ordinary memfd).
+    #[test]
+    fn an_arch_status_placeholder_waits_for_the_sessions_answer() {
+        let owner = DetTid::from_raw(9);
+        let stand_in = || {
+            // SAFETY: the name is NUL-terminated; the result is checked.
+            let raw = unsafe {
+                libc::memfd_create(
+                    c"hermit-procfs:/proc/3/arch_status#1@".as_ptr(),
+                    libc::MFD_ALLOW_SEALING,
+                )
+            };
+            assert!(
+                raw >= 0,
+                "memfd_create: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: `raw` is a descriptor this test just made and owns.
+            let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+            let seals = crate::syscalls::rendered_procfs::PLACEHOLDER_SEALS;
+            assert_eq!(unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seals) }, 0);
+            fd
+        };
+        // The session does not render the files: it stays an ordinary memfd.
+        let fd = stand_in();
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .discover_fd_from_current_process(owner, fd.as_raw_fd())
+            .unwrap();
+        assert!(
+            metadata.file_handles[&fd.as_raw_fd()]
+                .procfs_rendered_path()
+                .is_none()
+        );
+        metadata.decide_cpuinfo_placeholders(false).unwrap();
+        assert!(
+            metadata.file_handles[&fd.as_raw_fd()]
+                .procfs_rendered_path()
+                .is_none()
+        );
+        // The session renders them: the waiting descriptor becomes the
+        // task's arch_status.
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .discover_fd_from_current_process(owner, fd.as_raw_fd())
+            .unwrap();
+        assert!(
+            metadata.file_handles[&fd.as_raw_fd()]
+                .procfs_rendered_path()
+                .is_none()
+        );
+        metadata.decide_cpuinfo_placeholders(true).unwrap();
+        assert_eq!(
+            metadata.file_handles[&fd.as_raw_fd()].procfs_rendered_path(),
+            Some(std::path::Path::new("/proc/3/arch_status"))
+        );
+    }
+
+    /// A memfd named and sealed as the placeholder of a file the run's
+    /// `--proc` level omits stays the ordinary memfd it is when a table
+    /// discovers it: Detcore makes no placeholder for such a file, whose open
+    /// fails with ENOENT (Claude review of the kvm lane's slice N3, round 2).
+    /// At a level that has the file it is the placeholder, as before.
+    #[test]
+    fn a_memfd_with_a_stand_in_name_outside_the_proc_level_stays_a_memfd() {
+        use detcore_model::config::ProcLevel;
+        let owner = DetTid::from_raw(9);
+        // SAFETY: the name is NUL-terminated; the result is checked.
+        let raw = unsafe {
+            libc::memfd_create(
+                c"hermit-procfs:/proc/diskstats@".as_ptr(),
+                libc::MFD_ALLOW_SEALING,
+            )
+        };
+        assert!(
+            raw >= 0,
+            "memfd_create: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `raw` is a descriptor this test just made and owns.
+        let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+        let seals = crate::syscalls::rendered_procfs::PLACEHOLDER_SEALS;
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seals) }, 0);
+        let diskstats = std::path::Path::new("/proc/diskstats");
+        assert!(crate::syscalls::rendered_procfs::named_file_outside_level(
+            diskstats,
+            ProcLevel::Minimal
+        ));
+        assert!(!crate::syscalls::rendered_procfs::named_file_outside_level(
+            diskstats,
+            ProcLevel::Standard
+        ));
+        let mut noted = FileMetadata::new(owner);
+        noted.note_proc_level(ProcLevel::Minimal);
+        // Carried through serialization, as a table is across a fork or an
+        // exec on an in-guest backend, before it rediscovers a descriptor.
+        let mut minimal: FileMetadata =
+            serde_json::from_slice(&serde_json::to_vec(&noted.for_exec(owner)).unwrap()).unwrap();
+        minimal
+            .discover_fd_from_current_process(owner, fd.as_raw_fd())
+            .unwrap();
+        assert!(
+            minimal.file_handles[&fd.as_raw_fd()]
+                .procfs_rendered_path()
+                .is_none()
+        );
+        let mut standard = FileMetadata::new(owner);
+        standard.note_proc_level(ProcLevel::Standard);
+        standard
+            .discover_fd_from_current_process(owner, fd.as_raw_fd())
+            .unwrap();
+        assert_eq!(
+            standard.file_handles[&fd.as_raw_fd()].procfs_rendered_path(),
+            Some(diskstats)
+        );
+    }
+
     #[test]
     fn inherited_terminal_aliases_survive_fork_serialization_and_exec_handoff() {
         use std::os::fd::FromRawFd;
@@ -4725,6 +5089,276 @@ mod file_metadata_tests {
             "a non-CLOEXEC alias keeps the OFD live across exec"
         );
     }
+
+    /// A rendered per-process file `spelling` (`/proc/<pid>/<name>`) bound to
+    /// a task, as a rendered open makes one.
+    fn rendered_record_file(spelling: &str) -> crate::procfs::ProcfsFile {
+        let mut file = crate::procfs::ProcfsFile::from_path(Path::new(spelling)).unwrap();
+        file.bind_task(3, 5);
+        file.set_task_incarnation(crate::procfs::TaskIncarnation {
+            process: 1,
+            thread: None,
+        });
+        file.into_rendered()
+    }
+
+    /// A per-process file that follows its record's sequence survives an
+    /// exec on a backend that rebuilds its descriptor table with its open
+    /// file's identity, its model and its sequence (the cursor, where the
+    /// sequence is, the buffered record), aliases kept and a close-on-exec
+    /// copy dropped, and with the old table's numbering: so the new image
+    /// continues the record where every holder's sequence is (Claude's
+    /// narrow check of the kvm lane's slice N3, round 5: before, the new image
+    /// rebuilt it with no sequence) and allocates no identity a sequence in
+    /// Detcore's global state may still hold (Codex's, round 5: before, it
+    /// numbered from 0 again), also where the only such description closed
+    /// at the exec after a fork shared its sequence. A survivor whose sequence
+    /// Detcore cannot know stays so, and a slot reused since the preparation
+    /// is refused (EIO).
+    #[test]
+    fn record_sequence_exec_survivors_keep_identity_sequence_and_numbering() {
+        if isolated_child(
+            "tool_local::file_metadata_tests::record_sequence_exec_survivors_keep_identity_sequence_and_numbering",
+        ) {
+            return;
+        }
+        use crate::procfs::ProcfsFile;
+        use crate::procfs::ProcfsSnapshotContext;
+
+        let owner = DetTid::from_raw(9031);
+        let config = Config::default();
+        let mut parent = ThreadState::new(owner, &config, ());
+        let statm = std::fs::File::open("/proc/self/statm").unwrap();
+        let alias = statm.try_clone().unwrap();
+        let closed = statm.try_clone().unwrap();
+        let received = std::fs::File::open("/proc/self/statm").unwrap();
+        let (fd, alias_fd, closed_fd, received_fd) = (
+            statm.as_raw_fd(),
+            alias.as_raw_fd(),
+            closed.as_raw_fd(),
+            received.as_raw_fd(),
+        );
+        for number in [fd, received_fd] {
+            parent
+                .add_fd(number, OFlag::O_RDONLY, FdType::Regular, None)
+                .unwrap();
+            parent
+                .with_detfd(number, |handle| {
+                    handle.set_path("/proc/self/statm");
+                    handle
+                        .set_procfs(ProcfsFile::from_path(Path::new("/proc/self/statm")).unwrap());
+                })
+                .unwrap();
+        }
+        parent.dup_fd(fd, alias_fd, OFlag::empty()).unwrap();
+        parent.dup_fd(fd, closed_fd, OFlag::O_CLOEXEC).unwrap();
+        let record = b"1 2 3 4 5 6 7\n".to_vec();
+        parent
+            .with_detfd(fd, |handle| {
+                handle.initialize_procfs(record.clone(), ProcfsSnapshotContext::default());
+                handle.commit_procfs_read(0, 4);
+                handle.procfs_note_read_end(4);
+            })
+            .unwrap();
+        parent
+            .with_detfd(received_fd, |handle| handle.mark_record_sequence_unknown())
+            .unwrap();
+        // A fork marks the sequences shared.
+        parent.share_procfs_sequences();
+        let old_id = parent.with_detfd(fd, |h| h.open_file_id()).unwrap();
+        let sequence = parent
+            .with_detfd(fd, |h| h.procfs_sequence())
+            .unwrap()
+            .unwrap();
+        let records = parent.procfs_records_for_exec().unwrap().unwrap();
+        assert!(!records.handles.contains_key(&closed_fd));
+        assert_eq!(
+            records.handles[&fd].identity.id,
+            records.handles[&alias_fd].identity.id
+        );
+        assert!(records.handles[&received_fd].sequence_unknown);
+        let next_sequence = records.next_sequence;
+        let state = ExecFdState {
+            procfs_records: Some(records),
+            ..ExecFdState::default()
+        };
+        assert!(!state.is_empty());
+        assert_eq!(state.open_file_creator(), Some(owner));
+        // The serialized exec preparation and completion payload.
+        let state: ExecFdState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let receiving = DetTid::from_raw(9032);
+        let mut successor_thread = ThreadState::new(receiving, &config, ());
+        // The creator choice the exec-completion handler makes.
+        successor_thread.set_open_file_creator(state.open_file_creator().unwrap());
+        let mut successor = successor_thread.metadata();
+        successor
+            .apply_exec_fd_state(receiving, state.clone(), true)
+            .unwrap();
+        assert!(!successor.file_handles.contains_key(&closed_fd));
+        for number in [fd, alias_fd] {
+            let handle = &successor.file_handles[&number];
+            assert_eq!(handle.open_file_id(), old_id);
+            assert_eq!(handle.procfs_shared_sequence(), Some(old_id));
+            assert_eq!(handle.procfs_sequence(), Some(sequence.clone()));
+            assert!(!handle.record_sequence_unknown());
+        }
+        assert!(successor.file_handles[&received_fd].record_sequence_unknown());
+        // One open file: a read through the alias moves the other's cursor.
+        successor.file_handles[&alias_fd].commit_procfs_read(4, 2);
+        assert_eq!(successor.file_handles[&fd].procfs_position().unwrap().0, 6);
+        assert!(successor.next_open_file_sequence >= next_sequence);
+        assert!(successor.has_shared_procfs_sequences);
+        drop(successor);
+        let next = tempfile::tempfile().unwrap();
+        successor_thread
+            .add_fd(next.as_raw_fd(), OFlag::O_RDWR, FdType::Regular, None)
+            .unwrap();
+        assert_eq!(
+            successor_thread
+                .with_detfd(next.as_raw_fd(), |h| h.open_file_id())
+                .unwrap(),
+            OpenFileId::new(owner, next_sequence),
+        );
+        // A table whose shared description closed at the exec still carries
+        // its numbering.
+        let lone = ThreadState::new(owner, &config, ());
+        let cloexec = std::fs::File::open("/proc/self/statm").unwrap();
+        lone.add_fd(cloexec.as_raw_fd(), OFlag::O_CLOEXEC, FdType::Regular, None)
+            .unwrap();
+        lone.with_detfd(cloexec.as_raw_fd(), |handle| {
+            handle.set_procfs(ProcfsFile::from_path(Path::new("/proc/self/statm")).unwrap());
+        })
+        .unwrap();
+        assert!(lone.procfs_records_for_exec().unwrap().is_none());
+        lone.share_procfs_sequences();
+        let numbering = lone.procfs_records_for_exec().unwrap().unwrap();
+        assert!(numbering.handles.is_empty());
+        assert_eq!(
+            numbering.next_sequence,
+            lone.metadata().next_open_file_sequence
+        );
+        assert!(numbering.next_sequence > 0);
+        // A reused numeric slot cannot take the old open file's identity.
+        let replacement = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::dup2(replacement.as_raw_fd(), alias_fd) },
+            alias_fd
+        );
+        assert_eq!(
+            FileMetadata::new(owner).apply_exec_fd_state(owner, state, true),
+            Err(Errno::EIO)
+        );
+    }
+
+    /// A descriptor's link names a per-process file that follows its record's
+    /// sequence as the kernel opens one only for an empty regular file with a
+    /// link (never a placeholder, which has none) whose link names a task's
+    /// `stat`, `statm`, `io`, `arch_status` or `cgroup`: not its `comm`, which
+    /// the kernel's own open file serves, nor any other file.
+    #[test]
+    fn a_kernel_record_file_link_names_only_a_sequence_file() {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        stat.st_mode = libc::S_IFREG | 0o444;
+        stat.st_nlink = 1;
+        for name in ["stat", "statm", "io", "arch_status", "cgroup"] {
+            let link = format!("/proc/12/{name}");
+            assert_eq!(
+                kernel_record_file_link(&stat, link.as_bytes()),
+                Some(std::path::PathBuf::from(&link)),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            kernel_record_file_link(&stat, b"/proc/12/task/13/statm"),
+            Some(std::path::PathBuf::from("/proc/12/task/13/statm"))
+        );
+        for link in [
+            "/proc/12/comm",
+            "/proc/12/status",
+            "/proc/12/maps",
+            "/proc/uptime",
+            "/tmp/statm",
+        ] {
+            assert_eq!(
+                kernel_record_file_link(&stat, link.as_bytes()),
+                None,
+                "{link}"
+            );
+        }
+        let mut placeholder = stat;
+        placeholder.st_nlink = 0;
+        assert_eq!(
+            kernel_record_file_link(&placeholder, b"/proc/12/statm"),
+            None
+        );
+        let mut sized = stat;
+        sized.st_size = 1;
+        assert_eq!(kernel_record_file_link(&sized, b"/proc/12/statm"), None);
+        let mut directory = stat;
+        directory.st_mode = libc::S_IFDIR | 0o555;
+        assert_eq!(kernel_record_file_link(&directory, b"/proc/12/statm"), None);
+    }
+
+    /// A rendered per-process file that follows its record's sequence keeps
+    /// that sequence in Detcore's global state once a send passes its
+    /// descriptor over `SCM_RIGHTS` (`ThreadState::share_sent_procfs_sequence`),
+    /// as a fork's copies do: marked, under its open file's identity, and
+    /// noted in the table's history. Not a file the kernel opened (a receiver
+    /// cannot name its open file), not one whose sequence Detcore cannot know
+    /// here, and not a file that follows no record's sequence.
+    #[test]
+    fn a_sent_rendered_record_file_shares_its_sequence() {
+        let owner = DetTid::from_raw(9033);
+        let config = Config::default();
+        let state = ThreadState::new(owner, &config, ());
+        state.metadata().file_handles.clear();
+        for (fd, spelling, rendered) in [
+            (40, "/proc/7/statm", true),
+            (41, "/proc/7/statm", false),
+            (42, "/proc/7/statm", true),
+            (43, "/proc/7/auxv", true),
+        ] {
+            state
+                .add_fd(fd, OFlag::O_RDONLY, FdType::Regular, None)
+                .unwrap();
+            let procfs = if rendered {
+                rendered_record_file(spelling)
+            } else {
+                crate::procfs::ProcfsFile::from_path(Path::new(spelling)).unwrap()
+            };
+            state
+                .with_detfd(fd, |handle| handle.set_procfs(procfs.clone()))
+                .unwrap();
+        }
+        state
+            .with_detfd(42, |handle| handle.mark_record_sequence_unknown())
+            .unwrap();
+        let id = state
+            .with_detfd(40, |handle| handle.open_file_id())
+            .unwrap();
+        assert!(!state.metadata().has_shared_procfs_sequences);
+        assert_eq!(state.share_sent_procfs_sequence(40), Some(id));
+        assert_eq!(
+            state
+                .with_detfd(40, |handle| handle.procfs_shared_sequence())
+                .unwrap(),
+            Some(id)
+        );
+        assert!(state.metadata().has_shared_procfs_sequences);
+        // Sent again: the same identity, the mark kept.
+        assert_eq!(state.share_sent_procfs_sequence(40), Some(id));
+        for fd in [41, 42, 43, 44] {
+            assert_eq!(state.share_sent_procfs_sequence(fd), None, "{fd}");
+        }
+        assert_eq!(
+            state
+                .with_detfd(41, |handle| handle.procfs_shared_sequence())
+                .unwrap(),
+            None
+        );
+        assert_eq!(state.rendered_descriptors(), vec![40, 42, 43]);
+    }
 }
 
 /// Various measurements of one guest thread's execution. This is useful for printing
@@ -4850,6 +5484,13 @@ pub struct PendingVfork {
     pub flags: CloneFlags,
     pub exit_signal: libc::c_int,
     pub child_priority_entropy: Option<u64>,
+    /// With `CLONE_NEWUSER`: the creator's effective user ID may not have
+    /// been its real one, read before the clone
+    /// (`Detcore::user_namespace_owner_may_differ`). The child notes it for
+    /// the namespace the clone made when it registers itself, once the clone
+    /// has succeeded.
+    #[serde(default)]
+    pub user_namespace_owner_may_differ: bool,
 }
 
 // TODO-HUMAN-REVIEW(#797): Review process-wide logical CPU aggregation.
@@ -5278,6 +5919,14 @@ pub struct ThreadState<T> {
     /// comes back after the signal that interrupted it, and keeps its ID
     /// (`Detcore::plan_clone_id`). Any other call retires it.
     pub(crate) restarted_clone_id: Option<crate::syscalls::chosen_ids::RestartedCloneId>,
+
+    /// The open file description whose record sequence this thread took from
+    /// Detcore's global state for the read, positioned read or seek it is
+    /// handling, which stores it back when it ends
+    /// (`Detcore::take_procfs_sequence`); `None` outside one. The handler it
+    /// runs again sees it and takes nothing more.
+    #[serde(skip)]
+    pub(crate) procfs_sequence_taken: Option<OpenFileId>,
 
     /// Shared file metadata among all threads in the same process.
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.
@@ -6443,6 +7092,7 @@ impl<T> ThreadState<T> {
         let last_accounted_system_time = thread_logical_time.system_cpu_time();
         let file_metadata = if cfg.backend.tool_shares_guest_descriptor_table {
             let mut metadata = FileMetadata::new(pid);
+            metadata.note_proc_level(cfg.proc_level);
             for fd in 0..=2 {
                 match metadata.discover_fd_from_current_process(pid, fd) {
                     Ok(()) | Err(Errno::EBADF) => {}
@@ -6451,7 +7101,10 @@ impl<T> ThreadState<T> {
             }
             metadata
         } else {
-            FileMetadata::new(pid).setup_stdio(pid.into(), pid, cfg.standard_stream_aliases)
+            let mut metadata =
+                FileMetadata::new(pid).setup_stdio(pid.into(), pid, cfg.standard_stream_aliases);
+            metadata.note_proc_level(cfg.proc_level);
+            metadata
         };
         let process_files = Some(file_metadata.files_id);
         ThreadState {
@@ -6509,6 +7162,7 @@ impl<T> ThreadState<T> {
             clone_flags: None,
             pending_vfork: None,
             restarted_clone_id: None,
+            procfs_sequence_taken: None,
             // For the root thread, we initialize from the seed in the config:
             prng: crate::random::root_prng(cfg.rng_seed()),
             initialized_random_auxv: None,
@@ -7283,11 +7937,14 @@ impl<T> ThreadState<T> {
     /// (their cursor) and timerfds (their virtual-time expirations,
     /// `crate::fd::VirtualTimerfd`) -- before a backend physically copies or
     /// replaces its in-process Tool. The shared model owns their full state;
-    /// this does not promote sockets or other OFDs. Call only while this task
+    /// this does not promote sockets or other OFDs. The record sequences of
+    /// per-process files move to Detcore's global state on their own
+    /// (`share_procfs_sequences`, first). Call only while this task
     /// owns its serial grant, before the native lifecycle operation can expose
     /// a child/new image. Ptrace's host-side Arc needs no promotion. See
     /// <https://github.com/rrnewton/hermit/issues/4381>.
     pub fn promote_shared_open_files(&self) -> Result<(), crate::fd::SharedOpenFileError> {
+        self.share_procfs_sequences();
         let mut metadata = self.metadata();
         let mut fds: Vec<_> = metadata.file_handles.keys().copied().collect();
         fds.sort_unstable();
@@ -7300,6 +7957,65 @@ impl<T> ThreadState<T> {
             }
         }
         Ok(())
+    }
+
+    /// Before a backend whose tool runs in each guest process physically
+    /// copies this process (a fork) or replaces its image: every description
+    /// of a per-process file that follows its record's sequence keeps that
+    /// sequence in Detcore's global state from then on, so the copies a fork
+    /// makes share it as Linux's processes share the one `struct file` and
+    /// `seq_file` (`ProcfsFile::share_sequence`, `Detcore::take_procfs_sequence`).
+    /// Local and RPC-free: the first operation after the fork, in either
+    /// process, finds no sequence there yet and keeps its copy, which is the
+    /// one the fork made. Runs in the caller's turn, before the copy exists
+    /// (`promote_shared_open_files`, and `Detcore::handle_clone_family` for
+    /// SaBRe, whose runtime promotes nothing).
+    pub fn share_procfs_sequences(&self) {
+        let mut metadata = self.metadata();
+        let mut shared = false;
+        for handle in metadata.file_handles.values() {
+            shared |= handle.share_procfs_sequence();
+        }
+        metadata.has_shared_procfs_sequences |= shared;
+    }
+
+    /// Before a send passes descriptor `fd` over `SCM_RIGHTS`, where the tool
+    /// runs in each guest process: a rendered per-process file that follows
+    /// its record's sequence keeps that sequence in Detcore's global state
+    /// from then on, as a fork's copies do (`share_procfs_sequences`). The
+    /// identity it is kept under, which the caller then takes and stores
+    /// (`Detcore::share_sent_record_sequences`). `None` for any other
+    /// descriptor, and for one whose sequence Detcore cannot know here
+    /// (`DetFd::record_sequence_unknown`). Local and RPC-free.
+    pub(crate) fn share_sent_procfs_sequence(&self, fd: RawFd) -> Option<OpenFileId> {
+        let mut metadata = self.metadata();
+        let handle = metadata.file_handles.get(&fd)?;
+        if handle.is_shared()
+            || handle.record_sequence_unknown()
+            || handle.procfs_rendered_path().is_none()
+            || !handle.share_procfs_sequence()
+        {
+            return None;
+        }
+        let id = handle.procfs_shared_sequence();
+        metadata.has_shared_procfs_sequences |= id.is_some();
+        id
+    }
+
+    /// The descriptors of this thread's table open on a rendered procfs file
+    /// (`DetFd::procfs_rendered_path`), lowest first. A shared model (a
+    /// random device, a timerfd) is never one, and is passed over without a
+    /// lease.
+    pub(crate) fn rendered_descriptors(&self) -> Vec<RawFd> {
+        let metadata = self.metadata();
+        let mut fds: Vec<RawFd> = metadata
+            .file_handles
+            .iter()
+            .filter(|(_, detfd)| !detfd.is_shared() && detfd.procfs_rendered_path().is_some())
+            .map(|(&fd, _)| fd)
+            .collect();
+        fds.sort_unstable();
+        fds
     }
 
     /// Rebuild only process-local locks after a physical process copy. This
@@ -7355,6 +8071,55 @@ impl<T> ThreadState<T> {
             creator: self.open_file_creator.unwrap_or(self.dettid),
             next_sequence: metadata.next_open_file_sequence,
             next_socket_sequence: metadata.next_socket_open_file_sequence,
+            handles,
+        }))
+    }
+
+    /// Before an exec on a backend that rebuilds its descriptor table after
+    /// exec: each surviving descriptor of a per-process file that follows its
+    /// record's sequence, with its open file's identity, model and sequence
+    /// (`DetFd::procfs_record_for_exec`), so the new image's table names the
+    /// same open file as every other process holding it, and a read there
+    /// continues where the open file's sequence is (before, the new image
+    /// rebuilt it from its placeholder with no sequence: an exec'd child's
+    /// read moved the shared position while the other holder kept its own
+    /// sequence, and on DBT and SaBRe that holder's next read ran show where
+    /// Linux continues the record, Claude's narrow check of the kvm lane's
+    /// slice N3, round 5); and this table's open file creator and next
+    /// identity, so no description of the new image takes an identity whose
+    /// sequence another process may still hold in Detcore's global state
+    /// (before, the new image numbered its descriptions from 0 again, Codex's
+    /// narrow check, round 5). `None` where the table has no such descriptor
+    /// and never shared a sequence (`FileMetadata::has_shared_procfs_sequences`).
+    pub(crate) fn procfs_records_for_exec(&self) -> Result<Option<ExecProcfsRecords>, Errno> {
+        let metadata = self.metadata();
+        let mut handles = BTreeMap::new();
+        for (&fd, handle) in &metadata.file_handles {
+            if handle.is_cloexec() || handle.is_shared() {
+                continue;
+            }
+            let Some(procfs) = handle.procfs_record_for_exec() else {
+                continue;
+            };
+            let sequence = procfs.sequence();
+            handles.insert(
+                fd,
+                ExecProcfsRecord {
+                    identity: ExecOpenFile::capture(fd, handle.open_file_id())?,
+                    procfs,
+                    sequence,
+                    flags: handle.status_flags(),
+                    path: handle.path(),
+                    sequence_unknown: handle.record_sequence_unknown(),
+                },
+            );
+        }
+        if handles.is_empty() && !metadata.has_shared_procfs_sequences {
+            return Ok(None);
+        }
+        Ok(Some(ExecProcfsRecords {
+            creator: self.open_file_creator.unwrap_or(self.dettid),
+            next_sequence: metadata.next_open_file_sequence,
             handles,
         }))
     }
@@ -10721,6 +11486,7 @@ mod native_exec_cut_tests {
                         flags: CloneFlags::CLONE_VFORK,
                         exit_signal: libc::SIGCHLD,
                         child_priority_entropy: None,
+                        user_namespace_owner_may_differ: false,
                     })
                 }
                 6 => thread.own_signal_turn_hold = Some(libc::SIGALRM),
@@ -10964,6 +11730,32 @@ fn own_fd_link(fd: RawFd) -> Option<Vec<u8>> {
         .ok()
         .filter(|length| *length < target.len())?;
     Some(target[..length].to_vec())
+}
+
+/// The path a descriptor's link `link` names where it is a per-process file
+/// that follows its record's sequence as the kernel opens one, and the
+/// descriptor's file (`raw_stat`) is an empty regular file with a link, as
+/// every procfs file is (a placeholder has none): a task's `stat`, `statm`,
+/// `io`, `arch_status` or `cgroup` (`ProcfsFile::follows_record_sequence`),
+/// not its `comm`, which Detcore leaves to the kernel's own file whoever
+/// opened it, so the kernel's one open file serves every holder. ASSUMED,
+/// as for `fixed_procfs_behind`: a link under `/proc` naming such a file is
+/// the procfs file, not an ordinary file a changed root put at that path.
+pub(crate) fn kernel_record_file_link(
+    raw_stat: &libc::stat,
+    link: &[u8],
+) -> Option<std::path::PathBuf> {
+    if raw_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || raw_stat.st_size != 0
+        || raw_stat.st_nlink == 0
+    {
+        return None;
+    }
+    let path =
+        std::path::Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(link));
+    crate::procfs::ProcfsFile::from_path(path)
+        .filter(|file| file.follows_record_sequence() && !file.is_task_comm())
+        .map(|_| path.to_path_buf())
 }
 
 /// The fixed procfs file the kernel opened at `fd`, if its descriptor link

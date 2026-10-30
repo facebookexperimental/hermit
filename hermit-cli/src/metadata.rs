@@ -909,7 +909,33 @@ impl RecordVersion {
 // though the new idle-poller time jumps are excluded from binary record/replay.
 // Refuse that stream before starting the guest rather than desynchronizing it.
 // https://github.com/rrnewton/hermit/pull/4864
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x197);
+// 0x197 -> 0x198 (HIGHEST_SHIPPED+1 at the change's rebase onto main
+// fd59b85c, under land-time numbering; reserved in dev-hermit
+// ai_docs/hermit-record-version-reservations.md and minibeads dh-gxmvo):
+// Detcore renders a task's statm, io and
+// arch_status, and /proc/diskstats, with no kernel file (the kvm lane's slice
+// N3). Six changes reach recordings:
+// - every spelling of a thread's io (/proc/thread-self/io,
+//   /proc/<pid>/task/<tid>/io, a name relative to a task directory) is now
+//   classified, so Detcore takes a capture read of the kernel's file where
+//   the guest's own read went to the kernel before; an older recording has
+//   no such read, and its replay desyncs;
+// - a kernel-opened arch_status under record and replay now reads the
+//   virtual CPU's bytes (empty for Hermit's CPU profiles) where it read the
+//   recorded kernel line, so the guest's read returns a different count;
+// - a kernel-opened /proc/diskstats now takes Detcore's rendered-file path
+//   for readv, preadv, preadv2 and lseek, where readv and preadv were
+//   ENOSYS and lseek was injected;
+// - every per-process seq file the kernel opened takes a new capture read
+//   at each read or seek that runs show, where later reads were served from
+//   the first read's snapshot;
+// - a seek of such a file through a descriptor that cannot read goes to the
+//   kernel's file as an absolute seek to Detcore's position, recorded;
+// - a received empty regular file with a link has its descriptor's link
+//   read, recorded, to tell whether it is such a file.
+// An older recording that reads any of these is refused here instead of
+// failing mid-replay.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x198);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -934,7 +960,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x197);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x197;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x198;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

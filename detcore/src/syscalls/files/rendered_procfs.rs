@@ -91,6 +91,7 @@ use crate::stat::StatxAttributes;
 use crate::syscalls::namespace::proc_fd_target;
 use crate::syscalls::namespace::proc_fd_target_with_leading_zeros;
 use crate::tool_local::Detcore;
+use crate::types::OpenFileId;
 use crate::util::raw_result;
 use crate::util::raw_syscall;
 
@@ -206,40 +207,55 @@ pub(crate) fn register_placeholder(dev: u64, ino: u64, path: &'static Path) {
 }
 
 /// The open file description each placeholder this tool process opened
-/// belongs to, and the snapshot its name carries, by the placeholder's kernel
-/// identity: every rendered open makes its own placeholder, so one identity
-/// is one open file description (`Detcore::adopt_received_placeholders`).
-/// One small entry per rendered open of the run, as `PLACEHOLDERS` keeps one;
-/// the handle keeps no description alive.
+/// belongs to, its identity, and the snapshot its name carries, by the
+/// placeholder's kernel identity: every rendered open makes its own
+/// placeholder, so one identity is one open file description
+/// (`Detcore::adopt_received_placeholders`). One small entry per rendered
+/// open of the run, as `PLACEHOLDERS` keeps one; the handle keeps no
+/// description alive. Where the tool runs in each guest process, a fork's
+/// child has its own copy, whose handles may reach the parent's model of a
+/// description rather than the copy the child's table holds; the identity
+/// (`OpenFileId`), which every copy keeps, is what names the open file there
+/// (`FileMetadata::adopt_placeholder`).
 static PLACEHOLDER_OPENS: std::sync::Mutex<
     std::collections::BTreeMap<(u64, u64), PlaceholderOpen>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// The open file description a placeholder belongs to, and the snapshot its
-/// name carries (`PLACEHOLDER_OPENS`).
-type PlaceholderOpen = (crate::fd::OpenFileHandle, Vec<u8>);
+/// The open file description a placeholder belongs to, its identity, and the
+/// snapshot its name carries (`PLACEHOLDER_OPENS`).
+type PlaceholderOpen = (crate::fd::OpenFileHandle, OpenFileId, Vec<u8>);
 
 /// Record that the placeholder `identity` belongs to the open file
-/// description `handle`, its name carrying `snapshot`.
+/// description `handle`, whose identity is `id`, its name carrying
+/// `snapshot`.
 pub(crate) fn register_placeholder_open(
     identity: (u64, u64),
     handle: crate::fd::OpenFileHandle,
+    id: OpenFileId,
     snapshot: Vec<u8>,
 ) {
     PLACEHOLDER_OPENS
         .lock()
         .expect("placeholder open registry poisoned")
-        .insert(identity, (handle, snapshot));
+        .insert(identity, (handle, id, snapshot));
 }
 
-/// The open file description the placeholder `identity` belongs to, and the
-/// snapshot its name carries, if this tool process opened it.
+/// The open file description the placeholder `identity` belongs to, its
+/// identity, and the snapshot its name carries, if this tool process opened
+/// it (or, where the tool runs in each guest process, its process or an
+/// ancestor before a fork did).
 fn placeholder_open(identity: (u64, u64)) -> Option<PlaceholderOpen> {
     PLACEHOLDER_OPENS
         .lock()
         .expect("placeholder open registry poisoned")
         .get(&identity)
         .cloned()
+}
+
+/// The identity of the open file the placeholder `identity` belongs to, as
+/// this tool process's registry names it (`PLACEHOLDER_OPENS`).
+pub(crate) fn placeholder_open_id(identity: (u64, u64)) -> Option<OpenFileId> {
+    placeholder_open(identity).map(|(_, id, _)| id)
 }
 
 /// Whether this tool process knows any placeholder.
@@ -261,12 +277,14 @@ pub(crate) fn placeholder_identity(dev: u64, ino: u64) -> Option<&'static Path> 
 }
 
 /// The procfs files Detcore renders from its run state, as opposed to the
-/// fixed files of `procfs::fixed`.
-const DYNAMIC_PATHS: [&std::ffi::CStr; 4] = [
+/// fixed files of `procfs::fixed`; `/proc/diskstats` from the host's block
+/// devices, which `/sys/block` shows the guest too.
+const DYNAMIC_PATHS: [&std::ffi::CStr; 5] = [
     c"/proc/sys/kernel/random/uuid",
     c"/proc/sys/kernel/pty/nr",
     c"/proc/uptime",
     c"/proc/stat",
+    c"/proc/diskstats",
 ];
 
 /// The paths of every procfs file a session renders (`files`):
@@ -620,9 +638,10 @@ fn rendered_stat(path: &Path, epoch: Timespec, owner: (u32, u32)) -> DetStat {
 }
 
 /// Whether the rendered file `path` is readable by its owner only (0400): a
-/// process's `auxv` (`proc_pid_auxv`'s `S_IRUSR`).
+/// process's `auxv` (`proc_pid_auxv`'s `S_IRUSR`) and a task's `io`
+/// (`ONE("io", S_IRUSR, ...)`, fs/proc/base.c).
 pub(super) fn rendered_path_is_owner_only(path: &Path) -> bool {
-    crate::procfs::per_process_name(path).is_some_and(|name| name.filename == "auxv")
+    crate::procfs::per_process_name(path).is_some_and(|name| matches!(name.filename, "auxv" | "io"))
 }
 
 /// Whether the rendered file `path` has Linux's mode 0644: a task's `comm`
@@ -867,6 +886,323 @@ pub(super) fn auxv_access_answer(
     }
 }
 
+/// Whether the rendered file `path`, which a memfd's name names as a
+/// placeholder, is outside the run's `--proc` level `level`: Detcore makes no
+/// placeholder for such a file, whose open fails with ENOENT, so a name
+/// naming one is not a placeholder Detcore made, and the memfd stays the
+/// memfd it is (`Detcore::received_placeholder`,
+/// `FileMetadata::discover_fd_from_current_process`).
+pub(crate) fn named_file_outside_level(
+    path: &Path,
+    level: detcore_model::config::ProcLevel,
+) -> bool {
+    super::procfs_levels::absent_prefix(path, level).is_some()
+}
+
+/// The rendered file a memfd's descriptor link `link` names as its
+/// placeholder ([`placeholder_link_path`]), where the session renders it
+/// (`files`) and the run's `--proc` level (`level`) has it
+/// ([`named_file_outside_level`]).
+pub(super) fn placeholder_link_within(
+    link: &[u8],
+    files: RenderedFiles,
+    level: detcore_model::config::ProcLevel,
+) -> Option<&'static Path> {
+    placeholder_link_path(link, files).filter(|path| !named_file_outside_level(path, level))
+}
+
+/// What decides another thread group's read of a rendered task's `io`
+/// ([`io_access_answer`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IoAccess {
+    /// Linux's `ptrace_may_access` allows the reader.
+    Allowed,
+    /// The kernel beneath refused it: the read is EACCES.
+    Refused,
+    /// The kernel beneath serves no `/proc` link but the reader's own here
+    /// (KVM's provider): `CAP_SYS_PTRACE` in the reader's own effective set
+    /// decides.
+    CallerCapability,
+    /// No `/proc` under the reader's root (a `chroot` to a tree without
+    /// one): the kernel beneath is asked without a path
+    /// ([`io_access_by_real_credentials`]).
+    NoProcfs,
+    /// A probe failed with this errno, which says nothing about access.
+    Undecided(Errno),
+}
+
+/// What decides another thread group's read of a rendered task's `io`
+/// ([`Detcore::io_read_allowed`]), from the reader's `readlinkat` of the
+/// task's `/proc/<pid>/cwd` (`target`) and, where that fails, of its own
+/// `/proc/thread-self/cwd` (`serves`). Linux 6.17 answers a readlink of a
+/// task's `cwd` through `proc_pid_readlink` (fs/proc/base.c:1846-1864): EACCES
+/// exactly where `proc_fd_access_allowed` (fs/proc/base.c:708-722) refuses,
+/// which asks `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)`, the one
+/// check `do_io_accounting` makes (fs/proc/base.c:3036-3039); after it
+/// passes, `proc_cwd_link` (fs/proc/base.c:221-235) is ENOENT for a task
+/// that has dropped its `fs` (exiting, or exited and not reaped), whose io
+/// Linux still reads. The probe takes no descriptor and asks nothing else
+/// (an open of the task's `auxv` also checks the file's owner, which Linux
+/// makes global root once the task's memory is gone, and needs a free
+/// descriptor). The reader's own link, which every task that makes a call
+/// has, tells whether the kernel beneath serves its `/proc` at all.
+/// - `target` succeeds: allowed.
+/// - `target` is ENOENT and `serves` succeeds: the task's `fs` is gone after
+///   the access check passed: allowed.
+/// - `target` is EACCES and `serves` succeeds (or is ENOENT): the kernel
+///   beneath serves the reader's `/proc` and refused: EACCES.
+/// - `serves` is EACCES, the provider's backstop for every other `/proc`
+///   link (KVM): the kernel beneath cannot be asked, and the reader's
+///   `CAP_SYS_PTRACE` decides.
+/// - Both are ENOENT: no `/proc` under the reader's root (a `chroot` to a
+///   tree without one), where Linux still reads a descriptor the reader
+///   holds, as its check does not depend on the reader's root: the kernel
+///   beneath is asked without a path.
+/// - Any other errno, or a failed `target` with no `serves`, decides
+///   nothing.
+pub(super) fn io_access_answer(
+    target: Result<(), Errno>,
+    serves: Option<Result<(), Errno>>,
+) -> IoAccess {
+    match (target, serves) {
+        (Ok(()), _) | (Err(Errno::ENOENT), Some(Ok(()))) => IoAccess::Allowed,
+        (Err(Errno::EACCES), Some(Ok(()) | Err(Errno::ENOENT))) => IoAccess::Refused,
+        (Err(Errno::EACCES | Errno::ENOENT), Some(Err(Errno::EACCES))) => {
+            IoAccess::CallerCapability
+        }
+        (Err(Errno::ENOENT), Some(Err(Errno::ENOENT))) => IoAccess::NoProcfs,
+        (Err(Errno::EACCES | Errno::ENOENT), Some(Err(errno))) => IoAccess::Undecided(errno),
+        (Err(errno), _) => IoAccess::Undecided(errno),
+    }
+}
+
+/// The reader's own credentials, as the kernel beneath holds them (injected
+/// `getuid`, `geteuid`, `getgid`, and `setfsuid(-1)` and `setfsgid(-1)`,
+/// which change nothing and return the filesystem IDs: kernel/sys.c:904-916
+/// and 948-960 in 6.17), and its capability sets ([`CapabilitySets`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ReaderCredentials {
+    pub(super) uid: u32,
+    pub(super) euid: u32,
+    pub(super) fsuid: u32,
+    pub(super) gid: u32,
+    pub(super) fsgid: u32,
+    pub(super) capabilities: CapabilitySets,
+}
+
+/// The ID the kernel reports for one its caller's user namespace does not
+/// map (`from_kuid_munged`, `overflowuid`'s default): two IDs that both read
+/// as it may still differ.
+const OVERFLOW_ID: u32 = 65534;
+
+/// Linux's answer to another thread group's read of a rendered task's `io`
+/// where the reader's root has no kernel `/proc` to ask
+/// ([`io_access_by_real_credentials`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IoAccessByCredentials {
+    /// `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)` allows it.
+    Allowed,
+    /// It refuses it: EACCES.
+    Refused,
+    /// It refuses it where the task shares the reader's user namespace and
+    /// allows it where the task is in one the reader owns: the kernel beneath
+    /// is asked the check itself, with the reader's filesystem credentials
+    /// ([`Detcore::inject_pidfd_namespace_answer`]), and where it cannot be
+    /// asked, Detcore's record of user namespaces answers
+    /// ([`io_access_by_user_namespaces`]).
+    AskTheKernel,
+    /// What the kernel beneath answered does not decide Linux's check; the
+    /// reason, for a named refusal.
+    Unanswerable(&'static str),
+}
+
+/// Linux's `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)`, the check
+/// `do_io_accounting` makes (fs/proc/base.c:3036-3039 in 6.17), decided
+/// without a path where the reader's root has no kernel `/proc`: from the
+/// kernel beneath's `ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)`,
+/// which `kcmp` asks (kernel/kcmp.c:146-166 and 223-225) of a task named
+/// by its number, whatever the reader's root (`real_credentials_allow`); the
+/// reader's own credentials and capability sets (`reader`); and the task's
+/// permitted set (`task_permitted`, from `capget`, which asks no
+/// permission).
+///
+/// The two modes differ in two places only (kernel/ptrace.c:276-347): the
+/// caller's IDs that must match the task's (`fsuid` and `fsgid` with
+/// FSCREDS, `uid` and `gid` with REALCREDS), and, in commoncap, the caller's
+/// set that must cover the task's permitted set (effective with FSCREDS,
+/// permitted with REALCREDS: security/commoncap.c:164-186). The rest is the
+/// same in both modes: `ptrace_has_cap`, and the task's dumpability, which
+/// 6.17 checks only while the task has memory (kernel/ptrace.c:341-344) and
+/// 7.1 also after it has none, from the dumpability `exit_mm` saved, then
+/// overridden only by `CAP_SYS_PTRACE` in the initial user namespace
+/// (`task_still_dumpable`, kernel/ptrace.c:275-287 and kernel/exit.c:574
+/// in 7.1); and so are the kernel's other `ptrace_access_check` hooks
+/// (Yama, SELinux, AppArmor, Smack, Landlock), which read neither flag in
+/// 6.17 or 7.1. So:
+/// - the reader's filesystem IDs must be its real IDs (Detcore makes the
+///   guest's credential calls no-ops, so they keep the IDs the guest started
+///   with), else, or where an ID reads as [`OVERFLOW_ID`], so that whether
+///   they are cannot be told, the answer is unanswerable;
+/// - REALCREDS refuses: FSCREDS refuses too (the effective set is within
+///   the permitted set, so commoncap's FSCREDS condition implies its
+///   REALCREDS one);
+/// - REALCREDS allows, and the task's permitted set is within the reader's
+///   effective set, or the reader has `CAP_SYS_PTRACE` in it, or the task's
+///   permitted set is not within the reader's permitted set (so REALCREDS
+///   passed commoncap by `ns_capable(CAP_SYS_PTRACE)`, which reads the
+///   effective set in both modes): FSCREDS allows;
+/// - REALCREDS allows, and the task's permitted set is within the reader's
+///   permitted set but not its effective set, which lacks `CAP_SYS_PTRACE`:
+///   FSCREDS refuses where the task shares the reader's user namespace and
+///   allows where the task is in one the reader owns, which nothing here
+///   tells apart: the kernel is asked the FSCREDS check itself, else the
+///   record of user namespaces answers ([`io_access_by_user_namespaces`]).
+pub(super) fn io_access_by_real_credentials(
+    real_credentials_allow: bool,
+    reader: ReaderCredentials,
+    task_permitted: u64,
+) -> IoAccessByCredentials {
+    if reader.uid != reader.fsuid || reader.gid != reader.fsgid {
+        return IoAccessByCredentials::Unanswerable(
+            "the reader's filesystem IDs are not its real IDs, which the kernel's check by \
+             number compares instead",
+        );
+    }
+    if reader.fsuid == OVERFLOW_ID || reader.fsgid == OVERFLOW_ID {
+        return IoAccessByCredentials::Unanswerable(
+            "an ID of the reader's reads as the overflow ID 65534, so whether its filesystem \
+             IDs are its real IDs, which the kernel's check by number compares instead, cannot \
+             be told",
+        );
+    }
+    if !real_credentials_allow {
+        return IoAccessByCredentials::Refused;
+    }
+    let CapabilitySets {
+        effective,
+        permitted,
+    } = reader.capabilities;
+    let within_effective = task_permitted & !effective == 0;
+    let within_permitted = task_permitted & !permitted == 0;
+    let ptrace = effective & (1 << CAP_SYS_PTRACE) != 0;
+    if within_effective || ptrace || !within_permitted {
+        IoAccessByCredentials::Allowed
+    } else {
+        IoAccessByCredentials::AskTheKernel
+    }
+}
+
+/// Linux's answer in the case [`io_access_by_real_credentials`] leaves to the
+/// user namespaces ([`IoAccessByCredentials::AskTheKernel`]), where the
+/// kernel cannot be asked it ([`PidfdAccess::NotAsked`]: the task has exited,
+/// so its namespaces are gone, or no descriptor is free), from Detcore's
+/// record of user namespaces (`scheduler::user_namespaces`): where the task's
+/// namespace is from the reader's (`relation`), and, for a task below the
+/// reader's namespace, whether the namespace Linux's walk asks about, the one
+/// on the task's side whose parent is the reader's, may be owned by an
+/// effective user ID other than the real user ID every guest task has
+/// (`owner_may_differ`).
+///
+/// In that case the reader lacks `CAP_SYS_PTRACE` in its effective set and
+/// the task's permitted set is not within it, so commoncap's subset rule
+/// fails and only `ns_capable(task's namespace, CAP_SYS_PTRACE)` can allow
+/// the reader (`cap_ptrace_access_check`, security/commoncap.c:164-186 in
+/// 6.17). `cap_capable_helper` (security/commoncap.c:68-104) walks up from
+/// the task's namespace: the reader's own namespace answers from its
+/// effective set, which lacks the capability; a namespace at or above the
+/// reader's level refuses; a namespace whose parent is the reader's allows
+/// exactly where its owner, the effective user ID of the task that made it
+/// (`create_user_ns`, kernel/user_namespace.c:82-136), is the reader's
+/// effective user ID. So:
+/// - the task in the reader's namespace, or anywhere but below it: refused;
+/// - below it: allowed exactly where that owner is the reader's effective
+///   user ID. Every guest task has the same real user ID (Detcore makes the
+///   credential-setting calls no-ops), and that namespace's creator had its
+///   real one as its effective one unless the record notes otherwise for
+///   that namespace (`owner_may_differ`), so the owner is the reader's
+///   effective ID exactly where the reader's effective ID is its real ID.
+///   Where the record notes otherwise for that namespace, or the reader's
+///   effective ID reads as the overflow ID, the answer cannot be told.
+pub(super) fn io_access_by_user_namespaces(
+    relation: crate::scheduler::user_namespaces::UserNamespaceRelation,
+    owner_may_differ: bool,
+    reader: ReaderCredentials,
+) -> IoAccessByCredentials {
+    use crate::scheduler::user_namespaces::UserNamespaceRelation;
+    match relation {
+        UserNamespaceRelation::Same | UserNamespaceRelation::Elsewhere => {
+            IoAccessByCredentials::Refused
+        }
+        UserNamespaceRelation::Below if owner_may_differ => IoAccessByCredentials::Unanswerable(
+            "the user namespace between the reader's and the task's was made by a task whose \
+             effective user ID may not have been its real user ID, so whether the reader owns it \
+             cannot be told",
+        ),
+        UserNamespaceRelation::Below if reader.euid == OVERFLOW_ID => {
+            IoAccessByCredentials::Unanswerable(
+                "the reader's effective user ID reads as the overflow ID 65534, so whether it \
+                 owns the namespace above the task's cannot be told",
+            )
+        }
+        UserNamespaceRelation::Below if reader.euid == reader.uid => IoAccessByCredentials::Allowed,
+        UserNamespaceRelation::Below => IoAccessByCredentials::Refused,
+    }
+}
+
+/// What a pidfd's `PIDFD_GET_USER_NAMESPACE` ioctl tells of the kernel's
+/// `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)` for its caller
+/// ([`Detcore::inject_pidfd_namespace_answer`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PidfdAccess {
+    /// The check allows the caller.
+    Allowed,
+    /// The check refuses the caller: EACCES.
+    Refused,
+    /// The check was not reached: `pidfd_open` failed (`opened` false), or
+    /// the ioctl failed before the check (`opened` true), with `errno`.
+    NotAsked { opened: bool, errno: Errno },
+}
+
+/// [`PidfdAccess`] from the ioctl's result, once `pidfd_open` has
+/// succeeded. Before the check, `pidfd_ioctl` fails with ENOTTY (a request
+/// it does not know), EINVAL, or ESRCH (the task is gone, or has no
+/// namespaces left: it has exited); the check itself fails with EACCES;
+/// after the check, the ioctl fails only where the namespace's descriptor
+/// cannot be made: EOPNOTSUPP (no namespace to open) or `open_namespace`'s
+/// EMFILE, ENFILE or ENOMEM (fs/pidfs.c:449-566 in 6.17, 537-667 in 7.1).
+/// Those mean the check allowed the caller.
+pub(super) fn pidfd_ioctl_access(answer: Result<i64, Errno>) -> PidfdAccess {
+    match answer {
+        Ok(_) | Err(Errno::EOPNOTSUPP | Errno::EMFILE | Errno::ENFILE | Errno::ENOMEM) => {
+            PidfdAccess::Allowed
+        }
+        Err(Errno::EACCES) => PidfdAccess::Refused,
+        Err(errno) => PidfdAccess::NotAsked {
+            opened: true,
+            errno,
+        },
+    }
+}
+
+/// Which file a refusal by the reader's own capabilities is for
+/// ([`Detcore::caller_capability_answer`]), each warned about once.
+#[derive(Clone, Copy, Debug)]
+enum CapabilityRefusal {
+    /// Another process's `/proc/<pid>/auxv`, at its open.
+    Auxv,
+    /// Another thread group's `/proc/<pid>/io`, at a read or a seek.
+    Io,
+}
+
+/// Whether the run has warned that the reader's own capabilities refused
+/// another process's `auxv` (`AUXV`) or `io` (`IO`) where Linux might allow
+/// it: once each per tool process, which is once per run where the kernel
+/// beneath serves no `/proc` (KVM's tool runs in Hermit's process).
+static CAPABILITY_REFUSAL_WARNED_AUXV: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CAPABILITY_REFUSAL_WARNED_IO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The owner Linux reports for the rendered file `path`: a per-process file
 /// belongs to its process's owner (`task_dump_owner`), which for every guest
 /// process is Detcore's virtual root, 0 (the credential calls are emulated to
@@ -898,8 +1234,8 @@ pub(super) struct FileAccess {
     /// The caller owns the file.
     owner: bool,
     /// The caller may read the file: every rendered file's mode lets anyone
-    /// read it (0444) but a process's `auxv`'s (0400), which only its owner
-    /// may ([`rendered_path_is_owner_only`]).
+    /// read it (0444) but a process's `auxv`'s and a task's `io`'s (0400),
+    /// which only their owner may ([`rendered_path_is_owner_only`]).
     readable: bool,
     /// `CAP_DAC_OVERRIDE`: write access despite the mode.
     dac_override: bool,
@@ -972,6 +1308,14 @@ pub(super) enum CapabilitySet {
     Permitted,
 }
 
+/// A task's effective and permitted capability sets, their low 64 bits, as
+/// `capget` reports them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CapabilitySets {
+    pub(super) effective: u64,
+    pub(super) permitted: u64,
+}
+
 /// The configured epoch as a stat time.
 pub(super) fn epoch_time(epoch: chrono::DateTime<chrono::Utc>) -> Timespec {
     Timespec {
@@ -1018,7 +1362,7 @@ fn rendered_open_flags(flags: OFlag, access: FileAccess) -> Result<OFlag, Errno>
         return Err(Errno::ENOTDIR);
     }
     // No mode bit allows writing; `O_TRUNC` asks for write access. Reading
-    // an owner-only file (`auxv`) needs its owner (`FileAccess::readable`).
+    // an owner-only file (`auxv`, `io`) needs its owner (`FileAccess::readable`).
     let accmode = flags & OFlag::O_ACCMODE;
     let reads =
         accmode == OFlag::O_RDONLY || accmode == OFlag::O_RDWR || accmode == OFlag::O_ACCMODE;
@@ -1420,11 +1764,30 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// buffer does not hold (`traverse`). Only a file whose `show` runs at a
     /// read (`ProcfsFile::shows_at_read`): a process's `auxv` reads the
     /// memory map its open pinned, whatever became of the task since.
+    ///
+    /// A task's `io` also asks, at every `show`, whether the reader may read
+    /// the task: `do_io_accounting` refuses with EACCES where
+    /// `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)` fails
+    /// (fs/proc/base.c:3036-3039 in 6.17). The file's mode, 0400, is checked
+    /// at the open only, so a descriptor opened while the task allowed it is
+    /// refused at a later `show` once the task no longer does (it made itself
+    /// not dumpable, say). The reader's own thread group needs no permission
+    /// (`__ptrace_may_access`'s `same_thread_group`); another's is decided
+    /// without a descriptor ([`Self::io_read_allowed`]: the kernel beneath,
+    /// through the reader's `/proc` where it serves it and by the task's
+    /// number where the reader's root has none; on KVM, whose provider serves
+    /// no other task's link, the reader's own `CAP_SYS_PTRACE`). Bytes a
+    /// `show` already buffered are read on without asking again, as Linux
+    /// reads on from its buffer.
+    ///
+    /// `Err` with an errno is Linux's answer; any other `Err` is a probe
+    /// Detcore could not finish cleanly, after the failure policy
+    /// ([`Self::io_read_allowed`]).
     pub(crate) async fn require_rendered_task<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
-    ) -> Result<(), Errno> {
+    ) -> Result<(), Error> {
         let Some(path) = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.procfs_rendered_path())
@@ -1439,10 +1802,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         match self.rendered_task_state(guest, path).await {
             // An fdinfo's `seq_show` finds no task: ENOENT (fs/proc/fd.c).
-            Some((_, false)) if file.is_fdinfo() => Err(Errno::ENOENT),
-            Some((_, false)) => Err(Errno::ESRCH),
-            _ => Ok(()),
+            Some((_, false)) if file.is_fdinfo() => return Err(Errno::ENOENT.into()),
+            Some((_, false)) => return Err(Errno::ESRCH.into()),
+            _ => {}
         }
+        if file.is_process_io()
+            && let Some(task) = file.bound_task()
+            && self.own_detpid(guest) != detcore_model::pid::DetPid::from_raw(task.process)
+        {
+            // Boxed: the probe's injected calls would otherwise grow every
+            // read's future, which some backends poll on a small stack.
+            Box::pin(Self::io_read_allowed(guest, task)).await??;
+        }
+        Ok(())
     }
 
     /// The owner Linux reports for the rendered file `path`
@@ -1656,7 +2028,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// process made is known by its kernel identity. One it did not (another
     /// process's, under a backend whose tool runs in each guest process) is
     /// known by its memfd's name and seals, which a placeholder carries where
-    /// the backend supports seals.
+    /// the backend supports seals, for a file the run's `--proc` level has
+    /// ([`Self::placeholder_named`]): Detcore makes none for a file the level
+    /// omits, so a memfd named for one is read as the memfd it is.
     pub(super) async fn rendered_procfs_behind<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1672,7 +2046,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // Where the tool runs in one process for every guest, it made every
         // placeholder, and its identity is the whole answer. Elsewhere a name
-        // and seals a guest could imitate decide: a known limitation, see
+        // and seals decide, within the run's `--proc` level; a guest can give
+        // a memfd of its own the same name and seals, a known limitation, see
         // <https://github.com/rrnewton/hermit/issues/4263>.
         if !self.cfg.backend.tool_shares_guest_descriptor_table {
             return Ok(None);
@@ -1697,8 +2072,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         }))
     }
 
+    /// The rendered file a memfd's descriptor link `link` names as its
+    /// placeholder ([`placeholder_link_path`]), where this session renders
+    /// it and the run's `--proc` level has it. Detcore makes no placeholder
+    /// for a file the level omits, whose open fails with ENOENT
+    /// ([`named_file_outside_level`]), so a memfd named for one is the memfd
+    /// it is, whichever route reaches it: a descriptor link's open, a
+    /// spelling that reaches the memfd (`placeholder_reached`), or the
+    /// descriptor link's text.
+    pub(crate) fn placeholder_link_within_level<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        link: &[u8],
+    ) -> Option<&'static Path> {
+        placeholder_link_within(link, self.rendered_files(guest), self.cfg.proc_level)
+    }
+
     /// The rendered procfs file that descriptor `fd`'s memfd is named for,
-    /// read from its link.
+    /// read from its link, within the run's `--proc` level
+    /// ([`Self::placeholder_link_within_level`]).
     async fn placeholder_named<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1727,7 +2119,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(length) => {
                 let mut bytes = vec![0; (length as usize).min(TARGET_CAPACITY)];
                 guest.memory().read_exact(target.cast::<u8>(), &mut bytes)?;
-                placeholder_link_path(&bytes, self.rendered_files(guest))
+                self.placeholder_link_within_level(guest, &bytes)
             }
             Err(_) => None,
         };
@@ -1797,8 +2189,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// its memfd's name and seals, and then known by its identity. A path is
     /// opened `O_PATH` for that, which no file notices; an `O_PATH`
     /// descriptor shows no seals, so for a path, or an `O_PATH` descriptor,
-    /// the name alone decides. (A guest could imitate the name and seals: a known
-    /// limitation, see <https://github.com/rrnewton/hermit/issues/4263>.)
+    /// the name alone decides, within the run's `--proc` level
+    /// ([`Self::placeholder_link_within_level`]). (A guest can give a memfd
+    /// of its own the same name and seals: a known limitation, see
+    /// <https://github.com/rrnewton/hermit/issues/4263>.)
     pub(super) async fn recognize_placeholder<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1899,7 +2293,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A task that has exited (a zombie), or is gone, has no memory map,
         // and Linux gives its files to global root (`task_dump_owner`): then
         // the caller owns nothing and no capability of its namespace applies,
-        // so it reads an owner-only file (`auxv`, 0400) no more than it
+        // so it reads an owner-only file (`auxv` or `io`, 0400) no more than it
         // writes any (EACCES).
         match self.rendered_task_state(guest, path).await {
             Some((answer, true)) if !answer.without_mm => {}
@@ -1930,8 +2324,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         set: CapabilitySet,
     ) -> Result<Option<u64>, Error> {
-        // The header (8 bytes) and the data (two 12-byte words) in borrowed
-        // stack scratch, whose original bytes go back on every path.
+        Ok(match Self::inject_capget_of(guest, 0).await? {
+            Some(Ok(sets)) => Some(match set {
+                CapabilitySet::Effective => sets.effective,
+                CapabilitySet::Permitted => sets.permitted,
+            }),
+            Some(Err(_)) | None => None,
+        })
+    }
+
+    /// The effective and permitted capability sets (their low 64 bits) of
+    /// the task the kernel numbers `pid` in the caller's PID namespace, or of
+    /// the calling thread for 0, as `capget` reports them (`cap_capget`, no
+    /// permission asked: kernel/capability.c:105-126 and
+    /// security/commoncap.c:230-243 in 6.17). `Ok(Some(Err(errno)))` where
+    /// `capget` fails (ESRCH: no such task), `Ok(None)` where no stack
+    /// scratch can be borrowed, with nothing changed. `Err` where the
+    /// borrowed scratch could not be put back; the failure policy has then
+    /// been applied (`scratch_failure`), so the caller returns it as it is,
+    /// never as an ordinary answer.
+    async fn inject_capget_of<G: Guest<Self>>(
+        guest: &mut G,
+        pid: i32,
+    ) -> Result<Option<Result<CapabilitySets, Errno>>, Error> {
+        // The header (8 bytes: the version, then the pid) and the data (two
+        // 12-byte words) in borrowed stack scratch, whose original bytes go
+        // back on every path.
         let (scratch, original, stack_guard) = match Self::borrow_scratch::<G, 32>(guest).await {
             Ok(Some(borrowed)) => borrowed,
             Ok(None) => return Ok(None),
@@ -1944,24 +2362,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Moved into the block by value: a borrowed address would make the
         // future not `Send`.
         let caller = &mut *guest;
-        let words = async move {
+        let words: Option<Result<[u8; 24], Errno>> = async move {
             let guest = caller;
             let header = scratch;
             let data = AddrMut::<u8>::from_raw(scratch.as_raw() + 8)?;
             let mut bytes = [0_u8; 32];
             bytes[..4].copy_from_slice(&LINUX_CAPABILITY_VERSION_3.to_ne_bytes());
+            bytes[4..8].copy_from_slice(&pid.to_ne_bytes());
             guest.memory().write_exact(header, &bytes).ok()?;
-            guest
+            if let Err(errno) = guest
                 .inject(
                     syscalls::Capget::new()
                         .with_header(AddrMut::from_raw(header.as_raw()))
                         .with_data(AddrMut::from_raw(data.as_raw())),
                 )
                 .await
-                .ok()?;
+            {
+                return Some(Err(errno));
+            }
             let mut read = [0_u8; 24];
             guest.memory().read_exact(data, &mut read).ok()?;
-            Some(read)
+            Some(Ok(read))
         }
         .await;
         let restored = guest.memory().write_exact(scratch, &original);
@@ -1975,18 +2396,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
         }
         // Each 32-bit word holds `effective`, `permitted`, `inheritable`.
-        let Some(words) = words else {
-            return Ok(None);
+        let words = match words {
+            Some(Ok(words)) => words,
+            Some(Err(errno)) => return Ok(Some(Err(errno))),
+            None => return Ok(None),
         };
         let word =
             |index: usize| u32::from_ne_bytes(words[index * 4..index * 4 + 4].try_into().unwrap());
-        let index = match set {
-            CapabilitySet::Effective => 0,
-            CapabilitySet::Permitted => 1,
-        };
-        Ok(Some(
-            u64::from(word(index)) | (u64::from(word(index + 3)) << 32),
-        ))
+        let set = |index: usize| u64::from(word(index)) | (u64::from(word(index + 3)) << 32);
+        Ok(Some(Ok(CapabilitySets {
+            effective: set(0),
+            permitted: set(1),
+        })))
     }
 
     /// `N` bytes of the guest's stack scratch (below the red zone), borrowed
@@ -2126,8 +2547,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         let snapshot = match opened {
             Some(bytes) => Some(bytes),
             None if procfs.is_process_auxv() || procfs.is_process_cmdline() => None,
+            None if procfs.snapshot_at_first_read() => None,
             None => {
-                (!procfs.snapshot_at_first_read()).then(|| self.render_snapshot(guest, &procfs))
+                // `/proc/diskstats` starts from the host's table as the run
+                // first read it, from the coordinator: an open that cannot
+                // have it fails with the errno of the coordinator's read,
+                // never with a table of no devices.
+                let host_diskstats = if procfs.renders_host_diskstats() {
+                    Some(crate::tool_global::host_diskstats(guest).await?)
+                } else {
+                    None
+                };
+                Some(self.render_snapshot(guest, &procfs, host_diskstats))
             }
         };
         // A process's `auxv`'s snapshot does not fit a memfd name: it stays
@@ -2167,12 +2598,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(snapshot) => procfs.with_rendered_snapshot(snapshot),
             None => procfs,
         };
-        let handle = guest.thread_state().with_detfd(fd, |detfd| {
+        let (handle, id) = guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_path(path);
             detfd.set_procfs(procfs.clone());
-            detfd.open_file_handle()
+            (detfd.open_file_handle(), detfd.open_file_id())
         })?;
-        register_placeholder_open(identity, handle, registered);
+        register_placeholder_open(identity, handle, id, registered);
         Ok(fd as i64)
     }
 
@@ -2260,21 +2691,543 @@ impl<T: RecordOrReplay> Detcore<T> {
         match auxv_access_answer(target, serves) {
             AuxvAccess::Answer(answer) => Ok(answer),
             AuxvAccess::CallerCapability => {
-                match Self::inject_capget(guest, CapabilitySet::Effective).await? {
-                    Some(effective) if effective & (1 << CAP_SYS_PTRACE) != 0 => Ok(Ok(())),
-                    Some(_) => Ok(Err(Errno::EACCES)),
-                    None => Err(Self::scratch_failure(
-                        guest,
-                        reverie::syscalls::Sysno::openat,
-                        "the caller's capabilities, which decide another process's \
-                         /proc/<pid>/auxv where the kernel beneath serves no /proc, could \
-                         not be read"
-                            .to_string(),
-                    )
-                    .await),
+                Self::caller_capability_answer(guest, CapabilityRefusal::Auxv).await
+            }
+        }
+    }
+
+    /// Linux's `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)` for the
+    /// reader and `task`, the task whose rendered `io` it reads, in another
+    /// thread group, as `do_io_accounting` asks it at every `show`
+    /// (fs/proc/base.c:3036-3039 in 6.17): `Ok(Ok(()))` where the read reads,
+    /// `Ok(Err(errno))` where it fails with `errno` (EACCES, or ESRCH for a
+    /// task the kernel does not list).
+    ///
+    /// Decided without a descriptor, by the reader's `readlinkat` of the
+    /// kernel's `/proc/<pid>/cwd` (by the kernel's number,
+    /// `kernel_procfs_number`) and, where that fails, of its own
+    /// `/proc/thread-self/cwd` ([`io_access_answer`]): the kernel beneath,
+    /// where it serves the reader's `/proc`, applies Linux's whole rule
+    /// (credentials, capabilities and commoncap's subset rule, user
+    /// namespaces, dumpability) with nothing else, so a full descriptor table
+    /// or a task that exited and is not reaped reads as Linux reads it. Where
+    /// KVM's provider refuses every other `/proc` link with EACCES,
+    /// `CAP_SYS_PTRACE` in the reader's own effective set decides
+    /// ([`Self::caller_capability_answer`]): KVM's named difference, which
+    /// never allows a read Linux refuses (every guest process shares one user
+    /// namespace, where that capability passes every part of Linux's rule).
+    ///
+    /// Linux's check does not depend on the reader's root. Once the reader
+    /// has changed its root (`ThreadState::changed_root`), what `/proc`
+    /// names there need not be the kernel's procfs, nor number its tasks as
+    /// Detcore's table does, and under a root with no `/proc` both links are
+    /// ENOENT: there the kernel beneath is asked without a path
+    /// ([`Self::io_read_allowed_by_number`]).
+    ///
+    /// With sequentialized threads every call runs in the reader's turn, so
+    /// the answer is the guest's own history's. Without them
+    /// (`--no-sequentialize-threads`, a declared relaxation) the task may
+    /// change its credentials or dumpability concurrently, and the answer is
+    /// host-timed.
+    ///
+    /// `Err` is a probe Detcore could not finish cleanly (no stack scratch,
+    /// scratch it could not put back, an errno that decides nothing, the
+    /// reader's capabilities unreadable), or a case Linux's answer cannot be
+    /// decided in, after the failure policy (`scratch_failure`): never an
+    /// access answer.
+    // TODO-HUMAN-REVIEW(#4213): Review the read-time access check of another
+    // thread group's rendered /proc/<pid>/io by a readlink of its cwd.
+    pub(crate) async fn io_read_allowed<G: Guest<Self>>(
+        guest: &mut G,
+        task: crate::procfs::BoundTask,
+    ) -> Result<Result<(), Errno>, Error> {
+        let named = task.thread.unwrap_or(task.process);
+        if guest
+            .thread_state()
+            .changed_root
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Box::pin(Self::io_read_allowed_by_number(guest, named)).await;
+        }
+        let Some(kernel) = Self::kernel_procfs_number(guest, named).await else {
+            return Ok(Err(Errno::ESRCH));
+        };
+        let target = Self::readlink_probe(guest, format!("/proc/{kernel}/cwd").as_bytes()).await?;
+        let serves = match target {
+            Err(Errno::EACCES | Errno::ENOENT) => {
+                Some(Self::readlink_probe(guest, b"/proc/thread-self/cwd").await?)
+            }
+            _ => None,
+        };
+        match io_access_answer(target, serves) {
+            IoAccess::Allowed => Ok(Ok(())),
+            IoAccess::Refused => Ok(Err(Errno::EACCES)),
+            IoAccess::CallerCapability => {
+                Self::caller_capability_answer(guest, CapabilityRefusal::Io).await
+            }
+            IoAccess::NoProcfs => Box::pin(Self::io_read_allowed_by_number(guest, named)).await,
+            IoAccess::Undecided(errno) => Err(Self::scratch_failure(
+                guest,
+                reverie::syscalls::Sysno::read,
+                format!(
+                    "the access check of a read or seek of another process's /proc/{named}/io \
+                     could not be decided: its readlinkat probe failed with {errno}"
+                ),
+            )
+            .await),
+        }
+    }
+
+    /// [`Self::io_read_allowed`] for a reader whose root may have no kernel
+    /// `/proc` (it changed its root, or neither link reads): the kernel
+    /// beneath's `ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)`, asked
+    /// by an injected `kcmp(pid, pid, KCMP_VM)` of the task's number in the
+    /// reader's PID namespace (`tool_global::procfs_ids`), which takes no
+    /// descriptor and no path (kernel/kcmp.c:146-166 and 223-225 in 6.17:
+    /// ESRCH for no such task, EPERM where the check refuses); the reader's
+    /// credentials and capability sets and the task's permitted set; and from
+    /// them Linux's FSCREDS answer ([`io_access_by_real_credentials`]). A `kcmp`
+    /// EPERM is the check's only where `kcmp` of the reader's own thread,
+    /// which the check always allows, succeeds; otherwise the call itself is
+    /// unavailable to the guest. In the one case where the user namespaces
+    /// decide, the kernel is asked the FSCREDS check itself, through a pidfd
+    /// ([`Self::inject_pidfd_namespace_answer`]), which takes two descriptors
+    /// for the call's length; where it cannot be asked (the task has exited,
+    /// so its namespaces are gone, or no descriptor is free), Detcore's
+    /// record of user namespaces answers ([`io_access_by_user_namespaces`]),
+    /// which the clones that made each namespace fixed in their turns.
+    ///
+    /// Where that cannot decide Linux's answer (a nested PID namespace, whose
+    /// numbers are not the table's; `kcmp` or `capget` unavailable; the cases
+    /// [`io_access_by_real_credentials`] and [`io_access_by_user_namespaces`]
+    /// name), the run stops with a named refusal (the failure policy), never
+    /// an EACCES Linux might not give.
+    async fn io_read_allowed_by_number<G: Guest<Self>>(
+        guest: &mut G,
+        named: i32,
+    ) -> Result<Result<(), Errno>, Error> {
+        let refuse = |detail: String| {
+            format!(
+                "reading another process's /proc/{named}/io after the reader changed its root \
+                 to one without the kernel's /proc is not supported here: {detail}"
+            )
+        };
+        if guest.thread_state().nested_pid_namespace {
+            let reason = refuse(
+                "the reader is in a nested PID namespace, whose numbers are not \
+                                 Detcore's"
+                    .to_owned(),
+            );
+            return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+        }
+        let Some(kernel) = crate::tool_global::procfs_ids(guest, true, vec![named])
+            .await
+            .into_iter()
+            .next()
+            .flatten()
+        else {
+            return Ok(Err(Errno::ESRCH));
+        };
+        let real_credentials_allow = match Self::inject_kcmp_vm(guest, kernel).await {
+            Ok(_) => true,
+            Err(Errno::ESRCH) => return Ok(Err(Errno::ESRCH)),
+            Err(Errno::EPERM) => {
+                let own = guest.inject(syscalls::Gettid::new()).await;
+                match own {
+                    Ok(own) => match Self::inject_kcmp_vm(guest, own as i32).await {
+                        Ok(_) => false,
+                        Err(errno) => {
+                            let reason = refuse(format!(
+                                "kcmp, which asks the kernel's check by number, is unavailable \
+                                 (kcmp of the reader's own thread failed with {errno})"
+                            ));
+                            return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+                        }
+                    },
+                    Err(errno) => {
+                        let reason = refuse(format!("gettid failed with {errno}"));
+                        return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+                    }
+                }
+            }
+            Err(errno) => {
+                let reason = refuse(format!(
+                    "kcmp, which asks the kernel's check by number, failed with {errno}"
+                ));
+                return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+            }
+        };
+        let reader = match Self::inject_reader_credentials(guest).await? {
+            Ok(reader) => reader,
+            Err(detail) => {
+                let reason = refuse(detail);
+                return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+            }
+        };
+        let task_permitted = match Self::inject_capget_of(guest, kernel).await? {
+            Some(Ok(sets)) => sets.permitted,
+            Some(Err(Errno::ESRCH)) => return Ok(Err(Errno::ESRCH)),
+            Some(Err(errno)) => {
+                let reason = refuse(format!("capget of the task failed with {errno}"));
+                return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+            }
+            None => {
+                let reason = refuse("no guest stack scratch can hold capget's data".to_owned());
+                return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+            }
+        };
+        match io_access_by_real_credentials(real_credentials_allow, reader, task_permitted) {
+            IoAccessByCredentials::Allowed => Ok(Ok(())),
+            IoAccessByCredentials::Refused => Ok(Err(Errno::EACCES)),
+            IoAccessByCredentials::AskTheKernel => {
+                match Self::inject_pidfd_namespace_answer(guest, kernel).await {
+                    Ok(PidfdAccess::Allowed) => Ok(Ok(())),
+                    Ok(PidfdAccess::Refused) => Ok(Err(Errno::EACCES)),
+                    Ok(PidfdAccess::NotAsked { opened, errno }) => {
+                        // The kernel cannot be asked: Detcore's record of
+                        // user namespaces answers.
+                        let (relation, owner_may_differ) =
+                            crate::tool_global::user_namespace_relation(
+                                guest,
+                                crate::types::DetTid::from_raw(named),
+                            )
+                            .await;
+                        match io_access_by_user_namespaces(relation, owner_may_differ, reader) {
+                            IoAccessByCredentials::Allowed => Ok(Ok(())),
+                            IoAccessByCredentials::Refused => Ok(Err(Errno::EACCES)),
+                            IoAccessByCredentials::AskTheKernel => {
+                                unreachable!("the record of user namespaces answers by itself")
+                            }
+                            IoAccessByCredentials::Unanswerable(detail) => {
+                                let why = match (opened, errno) {
+                                    (true, Errno::ESRCH) => "the task has exited, so the kernel \
+                                                             has no namespaces of it to ask \
+                                                             about"
+                                        .to_owned(),
+                                    (false, Errno::EMFILE | Errno::ENFILE) => {
+                                        format!("the pidfd needs a free descriptor ({errno})")
+                                    }
+                                    (false, errno) => format!("pidfd_open failed with {errno}"),
+                                    (true, errno) => format!("the ioctl failed with {errno}"),
+                                };
+                                let reason = refuse(format!(
+                                    "the task's permitted capabilities are within the reader's \
+                                     permitted set but not its effective set, which lacks \
+                                     CAP_SYS_PTRACE, so Linux's answer turns on the user \
+                                     namespaces; the kernel's own check, asked through a \
+                                     pidfd's user-namespace ioctl, cannot answer ({why}), and \
+                                     Detcore's record of user namespaces cannot either: \
+                                     {detail}"
+                                ));
+                                Err(Self::scratch_failure(guest, Sysno::read, reason).await)
+                            }
+                        }
+                    }
+                    Err(reason) => Err(Self::scratch_failure(guest, Sysno::read, reason).await),
+                }
+            }
+            IoAccessByCredentials::Unanswerable(detail) => {
+                let reason = refuse(detail.to_owned());
+                Err(Self::scratch_failure(guest, Sysno::read, reason).await)
+            }
+        }
+    }
+
+    /// The kernel beneath's `ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)`
+    /// for the caller and the task the kernel numbers `pid` in the caller's
+    /// PID namespace, asked with a pidfd (`pidfd_open(pid, PIDFD_THREAD)`)
+    /// and its `PIDFD_GET_USER_NAMESPACE` ioctl, which makes exactly that
+    /// check before it opens the task's user namespace (fs/pidfs.c:471-491 in
+    /// 6.17, 558-578 in 7.1), and needs no path ([`pidfd_ioctl_access`]). It
+    /// cannot be asked where `pidfd_open` fails (EMFILE or ENFILE: no free
+    /// descriptor) or the task has exited (the ioctl's ESRCH: its namespaces
+    /// are gone). It takes up to two descriptors for the call's length, each
+    /// the lowest free one, and closes both before the guest runs again; with
+    /// sequentialized threads no other guest thread runs in between. A call
+    /// Reverie reports did not run (ERESTARTSYS) is retried; a close that
+    /// fails otherwise than with EINTR, after which Linux has released the
+    /// descriptor, is `Err`, a probe that could not be finished cleanly.
+    async fn inject_pidfd_namespace_answer<G: Guest<Self>>(
+        guest: &mut G,
+        pid: i32,
+    ) -> Result<PidfdAccess, String> {
+        /// `PIDFD_THREAD` (`O_EXCL`), so that a thread's pidfd opens too.
+        const PIDFD_THREAD: usize = libc::O_EXCL as usize;
+        /// `PIDFD_GET_USER_NAMESPACE`, `_IO(PIDFS_IOCTL_MAGIC, 9)`
+        /// (include/uapi/linux/pidfd.h).
+        const PIDFD_GET_USER_NAMESPACE: usize = 0xff09;
+        async fn retried<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+            guest: &mut G,
+            call: Syscall,
+        ) -> Result<i64, Errno> {
+            loop {
+                match guest.inject(call).await {
+                    Err(Errno::ERESTARTSYS) => continue,
+                    answer => return answer,
                 }
             }
         }
+        async fn close<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+            guest: &mut G,
+            fd: RawFd,
+            what: &str,
+        ) -> Result<(), String> {
+            loop {
+                match guest.inject(syscalls::Close::new().with_fd(fd)).await {
+                    Ok(_) | Err(Errno::EINTR) => return Ok(()),
+                    Err(Errno::ERESTARTSYS) => continue,
+                    Err(errno) => {
+                        return Err(format!(
+                            "the {what} descriptor {fd} of the access probe could not be closed: \
+                             {errno}"
+                        ));
+                    }
+                }
+            }
+        }
+        let raw = |values: [usize; 6]| super::procfs_levels::raw_args(values);
+        let pidfd = match retried(
+            guest,
+            Syscall::from_raw(
+                Sysno::pidfd_open,
+                raw([pid as usize, PIDFD_THREAD, 0, 0, 0, 0]),
+            ),
+        )
+        .await
+        {
+            Ok(fd) => fd as RawFd,
+            Err(errno) => {
+                return Ok(PidfdAccess::NotAsked {
+                    opened: false,
+                    errno,
+                });
+            }
+        };
+        let answer = retried(
+            guest,
+            Syscall::from_raw(
+                Sysno::ioctl,
+                raw([pidfd as usize, PIDFD_GET_USER_NAMESPACE, 0, 0, 0, 0]),
+            ),
+        )
+        .await;
+        if let Ok(namespace) = answer {
+            close(guest, namespace as RawFd, "user namespace").await?;
+        }
+        close(guest, pidfd, "pidfd").await?;
+        Ok(pidfd_ioctl_access(answer))
+    }
+
+    /// The kernel beneath's answer to the caller's `kcmp(pid, pid, KCMP_VM,
+    /// 0, 0)`, which compares the task's memory map with itself once
+    /// `ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)` allows the
+    /// caller (kernel/kcmp.c:146-185 in 6.17). It reads nothing of the
+    /// guest's memory and takes no descriptor. A call Reverie reports did not
+    /// run (ERESTARTSYS) is retried.
+    async fn inject_kcmp_vm<G: Guest<Self>>(guest: &mut G, pid: i32) -> Result<i64, Errno> {
+        /// `KCMP_VM` (include/uapi/linux/kcmp.h).
+        const KCMP_VM: i32 = 1;
+        loop {
+            match guest
+                .inject(
+                    syscalls::Kcmp::new()
+                        .with_pid1(pid)
+                        .with_pid2(pid)
+                        .with_typ(KCMP_VM),
+                )
+                .await
+            {
+                Err(Errno::ERESTARTSYS) => continue,
+                answer => return answer,
+            }
+        }
+    }
+
+    /// The reader's credentials as the kernel beneath holds them, and its
+    /// capability sets ([`ReaderCredentials`]): `Ok(Err(detail))` where they
+    /// cannot be read, with what failed.
+    async fn inject_reader_credentials<G: Guest<Self>>(
+        guest: &mut G,
+    ) -> Result<Result<ReaderCredentials, String>, Error> {
+        // `setfsuid(-1)` and `setfsgid(-1)` name no ID, so they change
+        // nothing and return the current filesystem IDs.
+        let no_id = u32::MAX as usize;
+        let mut ids = [0_u32; 5];
+        for (slot, call) in ids.iter_mut().zip([
+            Syscall::from_raw(Sysno::getuid, super::procfs_levels::raw_args([0; 6])),
+            Syscall::from_raw(Sysno::geteuid, super::procfs_levels::raw_args([0; 6])),
+            Syscall::from_raw(
+                Sysno::setfsuid,
+                super::procfs_levels::raw_args([no_id, 0, 0, 0, 0, 0]),
+            ),
+            Syscall::from_raw(Sysno::getgid, super::procfs_levels::raw_args([0; 6])),
+            Syscall::from_raw(
+                Sysno::setfsgid,
+                super::procfs_levels::raw_args([no_id, 0, 0, 0, 0, 0]),
+            ),
+        ]) {
+            let number = call.number();
+            match guest.inject(call).await {
+                Ok(id) => *slot = id as u32,
+                Err(errno) => return Ok(Err(format!("{number} failed with {errno}"))),
+            }
+        }
+        let capabilities = match Self::inject_capget_of(guest, 0).await? {
+            Some(Ok(sets)) => sets,
+            Some(Err(errno)) => {
+                return Ok(Err(format!(
+                    "capget of the reader's own capabilities failed with {errno}"
+                )));
+            }
+            None => {
+                return Ok(Err(
+                    "no guest stack scratch can hold capget's data".to_owned()
+                ));
+            }
+        };
+        let [uid, euid, fsuid, gid, fsgid] = ids;
+        Ok(Ok(ReaderCredentials {
+            uid,
+            euid,
+            fsuid,
+            gid,
+            fsgid,
+            capabilities,
+        }))
+    }
+
+    /// `CAP_SYS_PTRACE` in the caller's own effective set (`capget`), which
+    /// decides `refusal`'s file where the kernel beneath serves no `/proc`:
+    /// `Ok(Ok(()))` with it, `Ok(Err(EACCES))` without it. A refusal is
+    /// named once per tool process at Hermit's default level (WARN): Linux
+    /// also allows a reader with the task's credentials, a dumpable task and
+    /// the task's permitted capabilities. `Err` where the capabilities
+    /// cannot be read, after the failure policy.
+    async fn caller_capability_answer<G: Guest<Self>>(
+        guest: &mut G,
+        refusal: CapabilityRefusal,
+    ) -> Result<Result<(), Errno>, Error> {
+        let (file, sysno, warned) = match refusal {
+            CapabilityRefusal::Auxv => (
+                "auxv",
+                reverie::syscalls::Sysno::openat,
+                &CAPABILITY_REFUSAL_WARNED_AUXV,
+            ),
+            CapabilityRefusal::Io => (
+                "io",
+                reverie::syscalls::Sysno::read,
+                &CAPABILITY_REFUSAL_WARNED_IO,
+            ),
+        };
+        match Self::inject_capget(guest, CapabilitySet::Effective).await? {
+            Some(effective) if effective & (1 << CAP_SYS_PTRACE) != 0 => Ok(Ok(())),
+            Some(_) => {
+                if !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        "[detcore] another process's /proc/<pid>/{file} is refused with EACCES \
+                         because the caller has no CAP_SYS_PTRACE: the kernel beneath serves no \
+                         /proc here, so the caller's own capability decides, where Linux's \
+                         ptrace_may_access also allows a caller with the target's credentials, \
+                         a dumpable target and its permitted capabilities (named once per run)"
+                    );
+                }
+                Ok(Err(Errno::EACCES))
+            }
+            None => Err(Self::scratch_failure(
+                guest,
+                sysno,
+                format!(
+                    "the caller's capabilities, which decide another process's \
+                     /proc/<pid>/{file} where the kernel beneath serves no /proc, could not be \
+                     read"
+                ),
+            )
+            .await),
+        }
+    }
+
+    /// [`Self::kernel_procfs_readlink_answer`], with the failure policy
+    /// applied to a probe Detcore could not finish cleanly.
+    async fn readlink_probe<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+    ) -> Result<Result<(), Errno>, Error> {
+        match Self::kernel_procfs_readlink_answer(guest, path).await {
+            Ok(answer) => Ok(answer),
+            Err(reason) => {
+                Err(Self::scratch_failure(guest, reverie::syscalls::Sysno::read, reason).await)
+            }
+        }
+    }
+
+    /// The kernel beneath's answer to the caller's `readlinkat` of `path` (a
+    /// kernel `/proc` link): `Ok(Ok(()))` where it reads the link (truncated
+    /// to the buffer, which the probe does not look at), `Ok(Err(errno))`
+    /// where it fails with `errno`. It takes no descriptor. A call Reverie
+    /// reports did not run (ERESTARTSYS) is retried, so that errno never
+    /// reaches the guest. The path and the buffer live in borrowed stack
+    /// scratch whose original bytes go back on every path
+    /// ([`Self::borrow_scratch`]). `Err` (no scratch for them, scratch not
+    /// put back) is a probe that could not be finished cleanly.
+    async fn kernel_procfs_readlink_answer<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+    ) -> Result<Result<(), Errno>, String> {
+        const PATH_CAPACITY: usize = 32;
+        const TARGET_CAPACITY: usize = 32;
+        let (scratch, original, stack_guard) =
+            match Self::borrow_scratch::<G, { PATH_CAPACITY + TARGET_CAPACITY }>(guest).await? {
+                Some(borrowed) => borrowed,
+                None => {
+                    return Err(format!(
+                        "no guest stack scratch can hold the access probe of {}",
+                        String::from_utf8_lossy(path)
+                    ));
+                }
+            };
+        // Moved into the block by value: a borrowed address would make the
+        // future not `Send`.
+        let probe = &mut *guest;
+        let answer: Result<Result<(), Errno>, String> = async move {
+            let guest = probe;
+            let bytes = c_string::<PATH_CAPACITY>(path);
+            if let Err(errno) = guest.memory().write_exact(scratch, &bytes) {
+                return Err(format!(
+                    "the path of the access probe of {} could not be written to the guest \
+                     stack scratch: {errno}",
+                    String::from_utf8_lossy(path)
+                ));
+            }
+            // SAFETY: the scratch holds PATH_CAPACITY + TARGET_CAPACITY bytes.
+            let target = unsafe { scratch.add(PATH_CAPACITY) };
+            loop {
+                match guest
+                    .inject(
+                        syscalls::Readlinkat::new()
+                            .with_dirfd(libc::AT_FDCWD)
+                            .with_path(PathPtr::from_ptr(scratch.as_raw() as *const libc::c_char))
+                            .with_buf(Some(target.cast::<libc::c_char>()))
+                            .with_buf_len(TARGET_CAPACITY),
+                    )
+                    .await
+                {
+                    Err(Errno::ERESTARTSYS) => continue,
+                    Ok(_) => return Ok(Ok(())),
+                    Err(errno) => return Ok(Err(errno)),
+                }
+            }
+        }
+        .await;
+        let restored = guest.memory().write_exact(scratch, &original);
+        drop(stack_guard);
+        if let Err(errno) = restored {
+            return Err(format!(
+                "the guest stack scratch under the access probe of {} could not be restored: \
+                 {errno}",
+                String::from_utf8_lossy(path)
+            ));
+        }
+        answer
     }
 
     /// [`Self::kernel_procfs_open_answer`], with the failure policy applied
@@ -2376,8 +3329,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Detcore's state, as its first read used to: a UUID from the thread's
     /// generator, Detcore's count of open ptys, the virtual CPU's table
     /// (`Detcore::virtual_cpuid`, which answers the guest's CPUID
-    /// instruction), or a fact of the machine description.
-    fn render_snapshot<G: Guest<Self>>(&self, guest: &mut G, procfs: &ProcfsFile) -> Vec<u8> {
+    /// instruction), a fact of the machine description, or, for
+    /// `/proc/diskstats`, `host_diskstats`, the host's block-device table as
+    /// the run first read it (`tool_global::host_diskstats`), which the
+    /// caller asked for.
+    fn render_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        procfs: &ProcfsFile,
+        host_diskstats: Option<Vec<u8>>,
+    ) -> Vec<u8> {
         use rand::RngExt as _;
         let mut file = procfs.clone();
         let random_uuid = file
@@ -2390,13 +3351,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.virtual_cpuid()
                 .cpuinfo(guest.config().virtual_cpu_count())
         });
-        let template = file.rendering_template().to_vec();
+        let virtual_arch_status = file
+            .is_arch_status()
+            .then(|| self.virtual_cpuid().arch_status());
+        let template = match host_diskstats {
+            Some(table) if file.renders_host_diskstats() => table,
+            _ => file.rendering_template().to_vec(),
+        };
         file.initialize(
             template,
             crate::procfs::ProcfsSnapshotContext {
                 random_uuid,
                 virtual_pty_count,
                 virtual_cpuinfo,
+                virtual_arch_status,
                 machine: crate::machine::MachineDescription::of(guest.config()),
                 ..Default::default()
             },
@@ -3436,24 +4404,41 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`sync_rendered_procfs_position`). Where one tool process serves every
     /// guest, the cursor itself is shared.
     ///
-    /// DECLARED for a rendered `stat` (package K slice D4c-1), whose
-    /// description is never promoted to Detcore's global state: where the
-    /// tool runs in each guest process (DBT, SaBRe, LiteInst), each process
-    /// that holds it after `fork` keeps its own copy of its snapshot and
-    /// sequence (`ProcfsFile::read_pos`), and only this kernel cursor is
-    /// shared. A read by a process whose copy holds no snapshot, or whose
-    /// sequence is not at the shared cursor (another process read or seeked
-    /// since), renders the record anew at the shared cursor, in the reader's
-    /// turn, where Linux continues the one buffered record (and is at its end
-    /// once another process consumed it). A stat descriptor sent with
-    /// `SCM_RIGHTS` to another process that holds no alias of the same open
-    /// file Detcore models is rebuilt there from its placeholder (the registry
-    /// of placeholders is each tool process's own) and renders anew at its
-    /// next read, even while the sender still holds it; a receiver that
-    /// already holds an alias (inherited at `fork`, say) joins that local
-    /// description (`FileMetadata::adopt_placeholder`) and shares its copy's
-    /// state. Every outcome follows from the guest's own sequentialized
-    /// history.
+    /// A per-process file that follows its record's sequence keeps that
+    /// sequence, the record it buffered and the cursor in Detcore's global
+    /// state, where the tool runs in each guest process, from the first fork
+    /// that copies its description or send that passes it over `SCM_RIGHTS`
+    /// (`ProcfsFile::sequence_is_shared`, `Detcore::take_procfs_sequence`,
+    /// `Detcore::share_sent_record_sequences`), so the processes holding it
+    /// share them as Linux's share the one `struct file` and `seq_file`; this
+    /// kernel cursor then agrees with the stored one.
+    ///
+    /// Which holders share it, by route. A `dup` and a fork's copy: on every
+    /// backend. A descriptor received over `SCM_RIGHTS`: where one tool
+    /// process serves every guest (ptrace, KVM), whenever the receipt joins
+    /// the open file its sender's table modeled (`crate::syscalls::scm_rights`);
+    /// where the tool runs in each guest process (DBT, SaBRe, LiteInst,
+    /// in-guest-trap), when the receiver's table holds the open file
+    /// (`Detcore::placeholder_alias_in_table`, `FileMetadata::adopt_placeholder`)
+    /// or its registry names it, which holds where the receiver or an
+    /// ancestor before a fork opened it (`Detcore::rebuild_received_placeholder`).
+    /// A descriptor `exec` keeps: on ptrace and KVM, whose model survives exec,
+    /// and on DBT and SaBRe, which carry it with its sequence
+    /// (`ThreadState::procfs_records_for_exec`); LiteInst and in-guest-trap
+    /// refuse `execve` by name. Every other receipt cannot know where the
+    /// sequence is (on DBT, SaBRe, LiteInst and in-guest-trap, a rendered
+    /// file's by a process that never held the open file, and every receipt
+    /// of a file the kernel opened; on ptrace and KVM, a receipt Detcore
+    /// could not match, of a file the kernel opened, or of a rendered one
+    /// whose every modeled alias closed first): every read and seek through
+    /// it is refused by name (`Detcore::refuse_unknown_record_sequence`: exit
+    /// 122 and the reason, or on DBT, whose runtime ends a run at any Detcore
+    /// refusal through its own exit path, 101 or 137 and the reason; on SaBRe,
+    /// where a refusal that ended the run would leave it waiting on the
+    /// refusing process, `refusal_would_strand_the_run`, EOPNOTSUPP and the
+    /// reason on the guest's standard error, no process ended), so no holder
+    /// answers otherwise than Linux without saying so. Every outcome follows
+    /// from the guest's own sequentialized history.
     pub(super) async fn adopt_rendered_procfs_position<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3648,7 +4633,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest
             .memory()
             .read_exact(address.cast::<u8>(), &mut bytes)?;
-        match placeholder_link_path(&bytes, self.rendered_files(guest)) {
+        match self.placeholder_link_within_level(guest, &bytes) {
             Some(path) if self.placeholder_link_confirmed(guest, link).await => {
                 let written = write_link(&mut guest.memory(), path, buffer, buffer_len)?;
                 crate::syscalls::namespace::restore_link_tail(
@@ -4125,8 +5110,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Adopt, before `call` runs, each descriptor it names that Detcore has
-    /// no record of and that is a placeholder this tool process made: a
-    /// rendered procfs descriptor that reached this table over `SCM_RIGHTS`
+    /// no record of and that is a placeholder ([`Self::received_placeholder`]):
+    /// a rendered procfs descriptor that reached this table over `SCM_RIGHTS`
     /// and was not recorded as it arrived. Where the tool does not discover
     /// descriptors as they are used (ptrace and KVM), Detcore records each
     /// received descriptor as the receive returns, adopting a placeholder
@@ -4139,20 +5124,26 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// The descriptor shares the sender's `struct file`, so it is an alias of
     /// the sender's open file description while Detcore still models that
-    /// description (`PLACEHOLDER_OPENS`): one cursor, one snapshot, one set
-    /// of status flags, exactly as Linux shares them. Once no modeled
-    /// descriptor refers to it (the sender closed its own), the description
-    /// is rebuilt from what the kernel keeps of it, as an in-guest backend
-    /// rebuilds a placeholder it rediscovers (`adopt_placeholder`): the file
-    /// and task its identity names, the status flags (`F_GETFL`), the cursor
-    /// Detcore keeps at the kernel position (`sync_rendered_procfs_position`),
-    /// and the snapshot its name carries; a file whose snapshot is taken at
-    /// its first read takes it then (`initialize_procfs_snapshot`).
+    /// description (`PLACEHOLDER_OPENS`, or where the tool runs in each guest
+    /// process this table: [`Self::adopt_received_placeholder`]): one cursor,
+    /// one snapshot, one set of status flags, exactly as Linux shares them.
+    /// Once no modeled descriptor refers to it (the sender closed its own),
+    /// the description is rebuilt from what the kernel keeps of it, as an
+    /// in-guest backend rebuilds a placeholder it rediscovers
+    /// (`adopt_placeholder`): the file and task its identity names, the status
+    /// flags (`F_GETFL`), the cursor Detcore keeps at the kernel position
+    /// (`sync_rendered_procfs_position`), and the snapshot its name carries; a
+    /// file whose snapshot is taken at its first read takes it then
+    /// (`initialize_procfs_snapshot`). A per-process file that follows its
+    /// record's sequence takes that sequence from Detcore's global state where
+    /// it can, and is otherwise refused at every read and seek
+    /// ([`Self::rebuild_received_placeholder`]).
     ///
-    /// Only once this tool process has made a placeholder, and only for a
-    /// descriptor Detcore has no record of: one injected `fstat`, for each
-    /// such descriptor a listed call names, every time (no cache: a
-    /// descriptor number's identity can only be learned by asking).
+    /// Only once this tool process has made a placeholder, or where Detcore
+    /// runs in each guest process (where another process may have made one),
+    /// and only for a descriptor Detcore has no record of: one injected
+    /// `fstat`, for each such descriptor a listed call names, every time (no
+    /// cache: a descriptor number's identity can only be learned by asking).
     // TODO-HUMAN-REVIEW(#4213): Review the adoption of rendered descriptors
     // received over SCM_RIGHTS: the alias of a modeled description, the
     // rebuild of one no longer modeled, and the refusal without
@@ -4165,7 +5156,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (sysno, args) = call.into_parts();
         // The number first: it takes no lock, and most calls name no
         // descriptor (`descriptor_arguments` would name none).
-        if !names_a_descriptor(sysno) || !placeholders_exist() || !self.renders_procfs(guest) {
+        let per_process =
+            !crate::syscalls::timerfd::detcore_runs_outside_the_guest(&self.cfg.backend);
+        if !names_a_descriptor(sysno)
+            || (!placeholders_exist() && !per_process)
+            || !self.renders_procfs(guest)
+        {
             return Ok(());
         }
         for fd in descriptor_arguments(&guest.memory(), sysno, &args) {
@@ -4196,7 +5192,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 continue;
             }
             let identity = (stat.st_dev, stat.st_ino);
-            let Some(path) = placeholder_identity(identity.0, identity.1) else {
+            let Some((path, named)) = self.received_placeholder(guest, fd, &stat).await? else {
                 continue;
             };
             // Without sequentialized threads (a declared relaxation) another
@@ -4225,22 +5221,156 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
                 .map(|_| ());
             }
-            self.adopt_received_placeholder(guest, fd, path, identity)
+            self.adopt_received_placeholder(guest, fd, path, identity, named)
                 .await?;
         }
         Ok(())
     }
 
+    /// The rendered file that descriptor `fd`, whose `fstat` is `stat` (an
+    /// empty regular file with no link), is Detcore's placeholder for, as it
+    /// is received over `SCM_RIGHTS`, and the snapshot its memfd's name
+    /// carries where the placeholder is known by that name (`None` where this
+    /// tool process registered it: its open is in `PLACEHOLDER_OPENS`).
+    ///
+    /// Where one tool process serves every guest process (ptrace, KVM), it
+    /// made every placeholder, so the kernel identity it registered is the
+    /// whole answer. Where Detcore runs in each guest process
+    /// (`detcore_runs_outside_the_guest` is false: LiteInst and
+    /// in-guest-trap, whose received descriptors are recorded as they
+    /// arrive), a process knows only the placeholders it made, inherited at
+    /// `fork` or rediscovered after `exec`. One that another process made
+    /// after this one was forked, and sent it, is known by its name and
+    /// seals instead, as the in-guest discovery of DBT and SaBRe knows one
+    /// (`discover_fd_from_current_process`), and then registered here. Before
+    /// this, such a descriptor was recorded as the empty memfd it is, so its
+    /// reads returned end of file where Linux reads the file.
+    ///
+    /// A name and seals are also what a guest can give a memfd of its own (a
+    /// known limitation, see <https://github.com/rrnewton/hermit/issues/4263>):
+    /// a guest that makes a memfd with a placeholder's name and the four
+    /// seals and sends it to a process forked before reads, there, the
+    /// rendered file the name names, deterministically, and no write through
+    /// it changes anything (Detcore answers the write family of a rendered
+    /// file itself), though its descriptor keeps the memfd's access mode,
+    /// O_RDWR. A name naming a file outside the run's `--proc` level is not
+    /// one: Detcore never makes such a placeholder, so the memfd stays the
+    /// memfd it is and no file the level omits is read through it.
+    /// Registering each placeholder's kernel identity with the run's
+    /// coordinator as it is made would make the name unnecessary (issue
+    /// 4263).
+    pub(crate) async fn received_placeholder<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        stat: &libc::stat,
+    ) -> Result<Option<(&'static Path, Option<Vec<u8>>)>, Error> {
+        if let Some(path) = placeholder_identity(stat.st_dev, stat.st_ino) {
+            return Ok(Some((path, None)));
+        }
+        if crate::syscalls::timerfd::detcore_runs_outside_the_guest(&self.cfg.backend) {
+            return Ok(None);
+        }
+        let Some(link) = self.received_placeholder_link(guest, fd).await else {
+            return Ok(None);
+        };
+        let Some((path, snapshot)) =
+            crate::procfs::placeholder_link(&link, self.rendered_files(guest))
+        else {
+            return Ok(None);
+        };
+        // Detcore makes no placeholder for a file outside the run's `--proc`
+        // level: its open fails with ENOENT. So a name naming one is not a
+        // placeholder Detcore made, whatever its seals, and stays the memfd it
+        // is: no file its level omits is read through a memfd so named.
+        if named_file_outside_level(path, self.cfg.proc_level) {
+            return Ok(None);
+        }
+        let seals = guest
+            .inject(
+                syscalls::Fcntl::new()
+                    .with_fd(fd)
+                    .with_cmd(syscalls::FcntlCmd::F_GET_SEALS),
+            )
+            .await;
+        // `MFD_NOEXEC_SEAL` adds `F_SEAL_EXEC` to the seals Detcore sets. An
+        // `O_PATH` descriptor cannot show its seals (EBADF); its name decides.
+        let wanted = i64::from(PLACEHOLDER_SEALS);
+        let sealed = match seals {
+            Ok(seals) => seals & wanted == wanted,
+            Err(errno) => errno == Errno::EBADF,
+        };
+        if !sealed {
+            return Ok(None);
+        }
+        register_placeholder(stat.st_dev, stat.st_ino, path);
+        Ok(Some((path, Some(snapshot))))
+    }
+
+    /// The link of descriptor `fd` (`readlinkat` of
+    /// `/proc/thread-self/fd/<fd>`, injected), at most a placeholder's
+    /// (`PLACEHOLDER_LINK_CAPACITY`): `None` where it cannot be read or is
+    /// longer. It takes no descriptor, so it reads a descriptor received into
+    /// the last free slot of a full table. The path and the result share one
+    /// buffer, staged as `inject_fstat` stages its own
+    /// ([`crate::syscalls::scratch::inject_with_scratch`]).
+    async fn received_placeholder_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<Vec<u8>> {
+        const LINK_PATH: usize = 32;
+        const LINK_TARGET: usize = crate::procfs::PLACEHOLDER_LINK_CAPACITY;
+        let mut buffer = [0_u8; LINK_PATH + LINK_TARGET];
+        let spelled = format!("/proc/thread-self/fd/{fd}");
+        buffer
+            .get_mut(..spelled.len())?
+            .copy_from_slice(spelled.as_bytes());
+        let (length, bytes) =
+            crate::syscalls::scratch::inject_with_scratch(guest, buffer, |base| {
+                // SAFETY: the buffer holds LINK_PATH + LINK_TARGET bytes.
+                let target = unsafe { base.add(LINK_PATH) };
+                syscalls::Readlinkat::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
+                    .with_buf(Some(target.cast::<libc::c_char>()))
+                    .with_buf_len(LINK_TARGET)
+                    .into()
+            })
+            .await
+            .ok()?;
+        usize::try_from(length)
+            .ok()
+            .filter(|length| *length < LINK_TARGET)
+            .map(|length| bytes[LINK_PATH..LINK_PATH + length].to_vec())
+    }
+
     /// Make descriptor `fd`, which Detcore has no record of, the placeholder
     /// `identity` for the rendered file `path` it is, as it is received
     /// (`Detcore::record_received_descriptors`) or first named
-    /// ([`Self::adopt_received_placeholders`]).
+    /// ([`Self::adopt_received_placeholders`]). `named` is the snapshot its
+    /// memfd's name carries where it is known by that name
+    /// ([`Self::received_placeholder`]).
+    ///
+    /// Linux installs the sender's `struct file`, so the descriptor joins the
+    /// open file Detcore models for the placeholder wherever it can: where one
+    /// tool process serves every guest (ptrace, KVM), the one model the
+    /// registry reaches, whichever process's table holds it; where the tool
+    /// runs in each guest process (DBT, SaBRe, LiteInst, in-guest-trap), a
+    /// descriptor of this process's table on the same placeholder
+    /// ([`Self::placeholder_alias_in_table`]), not the registry's handle,
+    /// which in a fork's child reaches the parent's model of the open file
+    /// rather than the copy the child's table holds (on LiteInst and
+    /// in-guest-trap the copy then read as a separate open file, Claude's
+    /// narrow check of the kvm lane's slice N3, round 5). Where none is
+    /// joined, the description is rebuilt ([`Self::rebuild_received_placeholder`]).
     pub(crate) async fn adopt_received_placeholder<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
         path: &'static Path,
         identity: (u64, u64),
+        named: Option<Vec<u8>>,
     ) -> Result<(), Error> {
         let descriptor_flags = guest
             .inject(
@@ -4251,13 +5381,96 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         let cloexec = descriptor_flags & i64::from(libc::FD_CLOEXEC) != 0;
         let registered = placeholder_open(identity);
-        if let Some(alias) = registered
-            .as_ref()
-            .and_then(|(description, _)| description.descriptor(fd, cloexec))
-        {
+        let per_process =
+            !crate::syscalls::timerfd::detcore_runs_outside_the_guest(&self.cfg.backend);
+        let alias = if per_process {
+            self.placeholder_alias_in_table(guest, fd, identity).await
+        } else {
+            registered
+                .as_ref()
+                .and_then(|(description, _, _)| description.descriptor(fd, cloexec))
+        };
+        if let Some(mut alias) = alias {
+            alias.set_cloexec(cloexec);
             guest.thread_state().install_alias(alias);
             return Ok(());
         }
+        self.rebuild_received_placeholder(guest, fd, path, identity, named, cloexec, registered)
+            .await
+    }
+
+    /// A copy, as descriptor `fd`, of a descriptor of this process's table
+    /// other than `fd` that is open on the placeholder `identity`: an alias
+    /// of the open file the received `fd` is, as the in-guest discovery of
+    /// DBT and SaBRe finds one (`FileMetadata::adopt_placeholder`). Every
+    /// descriptor of a rendered file is a candidate, asked by an injected
+    /// `fstat`, lowest number first. Only where the tool runs in each guest
+    /// process ([`Self::adopt_received_placeholder`]).
+    async fn placeholder_alias_in_table<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        identity: (u64, u64),
+    ) -> Option<crate::fd::DetFd> {
+        for other in guest.thread_state().rendered_descriptors() {
+            if other == fd {
+                continue;
+            }
+            let Ok(stat) = self.inject_fstat(guest, other).await else {
+                continue;
+            };
+            if (stat.st_dev, stat.st_ino) == identity {
+                return guest
+                    .thread_state()
+                    .with_detfd(other, |detfd| detfd.clone().with_fd(fd))
+                    .ok();
+            }
+        }
+        None
+    }
+
+    /// Rebuild, as descriptor `fd` (`cloexec`), the open file of the
+    /// placeholder `identity` for the rendered file `path`, which no
+    /// description this process models holds
+    /// ([`Self::adopt_received_placeholder`]), from what the kernel keeps of
+    /// it: the file and task its identity names, the status flags
+    /// (`F_GETFL`), the cursor Detcore keeps at the kernel position
+    /// (`sync_rendered_procfs_position`), and the snapshot `registered` (this
+    /// process's registry's entry for it) or its name (`named`) carries; a
+    /// file whose snapshot is taken at its first read takes it then
+    /// (`initialize_procfs_snapshot`).
+    ///
+    /// A per-process file that follows its record's sequence
+    /// (`ProcfsFile::follows_record_sequence`: a task's statm, io,
+    /// arch_status, cgroup, stat and comm) has more: Linux keeps where its
+    /// sequence is and the record it buffered in the one open file every
+    /// holder shares, and a rebuilt description has neither. Where the tool
+    /// runs in each guest process and this process's registry names the open
+    /// file (this process, or an ancestor before a fork, opened it), the
+    /// descriptor takes that open file's identity and its sequence from
+    /// Detcore's global state, where every holder keeps it once the open file
+    /// has left a process (`ThreadState::share_procfs_sequences` at a fork,
+    /// `Detcore::share_sent_record_sequences` at a send), so it continues
+    /// the sender's record as Linux's descriptor does. Anywhere else (a
+    /// process that never held the open file, or, where one tool process
+    /// serves every guest, a receipt Detcore could not match whose every
+    /// modeled alias closed first) the sequence cannot be known: every read
+    /// and seek through the descriptor is refused by name
+    /// (`Detcore::refuse_unknown_record_sequence`), so it never moves the
+    /// sequence another holder's Detcore keeps, nor shows a record Linux
+    /// would not (on SaBRe, where a refusal that ended the run would strand
+    /// it, `refusal_would_strand_the_run`, the call gets EOPNOTSUPP).
+    #[allow(clippy::too_many_arguments)]
+    async fn rebuild_received_placeholder<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        path: &'static Path,
+        identity: (u64, u64),
+        named: Option<Vec<u8>>,
+        cloexec: bool,
+        registered: Option<PlaceholderOpen>,
+    ) -> Result<(), Error> {
         let status = guest
             .inject(
                 syscalls::Fcntl::new()
@@ -4282,51 +5495,54 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Linux's `show` running again, exact, but at a position above 0
         // Linux reads on from the buffer the first read filled in another
         // process. That is exact only while every snapshot of the file is
-        // the same, as `cgroup`'s template is. A per-process file whose bytes
-        // change (`status`, `stat`) must carry its first read's snapshot on
-        // its placeholder (as `/proc/uptime` carries its first read's uptime,
-        // `first_read_uptime`) before it is rendered, or its rebuilt
-        // descriptor reads other bytes than the sender's buffer held.
-        // DECLARED for a process's `stat` (package K slice D4c-1), which
-        // carries none: its record is rendered again wherever Linux's
-        // seq_file traverses, so no one snapshot can be carried, and neither
-        // the placeholder's name, fixed when it is made, nor its modification
-        // time, 64 bits, can hold one. A rebuilt `stat` renders its record
-        // again at its next read, at the shared cursor, where Linux continues
-        // the buffered one: where one tool process serves every guest
-        // (ptrace, KVM), a descriptor received outside the turn, or after a
-        // receive Detcore could not match left its queued message untrusted
-        // (`Detcore::record_received_facts`), whose every modeled alias
-        // closed before the receiver's first call naming it (a queued
-        // message holds the description it carries, so the receiver
-        // continues the sender's record: tests/misc/proc_stat_lifecycle.rs
-        // `a_queued_stat_descriptor_whose_sender_closed_it_continues_its_record`);
-        // where the tool runs in each guest process, a descriptor another
-        // process receives when it holds no alias of the open file Detcore
-        // models, and the image after `exec`
-        // (`Detcore::adopt_rendered_procfs_position`).
-        let snapshot = registered.map(|(_, snapshot)| snapshot).unwrap_or_default();
+        // the same, as `cgroup`'s template is, or where the description
+        // takes the sequence its open file keeps in Detcore's global state
+        // (below). A per-process file whose bytes change (`status`) must
+        // carry its first read's snapshot on its placeholder (as
+        // `/proc/uptime` carries its first read's uptime,
+        // `first_read_uptime`) before it is rendered, or follow its record's
+        // sequence as `stat` does, or its rebuilt descriptor reads other
+        // bytes than the sender's buffer held.
+        let per_process =
+            !crate::syscalls::timerfd::detcore_runs_outside_the_guest(&self.cfg.backend);
+        let (registered_id, snapshot) = match registered {
+            Some((_, id, snapshot)) => (Some(id), snapshot),
+            None => (None, named.unwrap_or_default()),
+        };
         let metadata = self.rendered_metadata(guest, path).await?;
         let mut flags = OFlag::from_bits_truncate(status);
         flags.set(OFlag::O_CLOEXEC, cloexec);
         guest
             .thread_state()
             .add_fd(fd, flags, FdType::Regular, Some(metadata))?;
-        let procfs = ProcfsFile::from_rendered_path(path)
+        let mut procfs = ProcfsFile::from_rendered_path(path)
             .expect("a placeholder's path is a rendered procfs file")
             .into_rendered();
-        let procfs = if snapshot.is_empty() {
-            procfs
+        if !snapshot.is_empty() {
+            procfs = procfs.with_rendered_snapshot(snapshot.clone());
+        }
+        let follows = procfs.follows_record_sequence();
+        let joined = if follows && per_process {
+            registered_id
         } else {
-            procfs.with_rendered_snapshot(snapshot.clone())
+            None
         };
-        let handle = guest.thread_state().with_detfd(fd, |detfd| {
+        if joined.is_some() {
+            procfs.share_sequence();
+        }
+        let (handle, id) = guest.thread_state().with_detfd(fd, |detfd| {
+            if let Some(id) = joined {
+                detfd.rebind_open_file_id(id);
+            }
             detfd.set_path(path);
             detfd.set_procfs(procfs.clone());
             detfd.set_procfs_offset(offset);
-            detfd.open_file_handle()
+            if follows && joined.is_none() {
+                detfd.mark_record_sequence_unknown();
+            }
+            (detfd.open_file_handle(), detfd.open_file_id())
         })?;
-        register_placeholder_open(identity, handle, snapshot);
+        register_placeholder_open(identity, handle, id, snapshot);
         Ok(())
     }
 
@@ -5923,6 +7139,43 @@ fn cmdline_path_overlaps(
 mod tests {
     use super::*;
 
+    /// Where one tool process serves every guest process (ptrace's
+    /// capabilities), a memfd identity it did not register is no
+    /// placeholder, and learning that takes no injected call: the registry
+    /// is the whole answer. Where Detcore runs in each guest process (in-guest
+    /// LiteInst's), another process may have made the placeholder, so the
+    /// descriptor's name is asked for (`Detcore::received_placeholder`); that
+    /// path is exercised end to end by the CLI test
+    /// `a_received_diskstats_descriptor_reads_its_table_at_the_descriptor_limit_on_every_backend`.
+    #[test]
+    fn an_unregistered_identity_is_no_placeholder_where_one_tool_serves_every_guest() {
+        use crate::record_or_replay::NoopTool;
+        use crate::syscall_hot_path_tests::InjectGuest;
+        futures::executor::block_on(async {
+            let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+            tool.cfg.backend = reverie::BackendCapabilities::PTRACE;
+            assert!(crate::syscalls::timerfd::detcore_runs_outside_the_guest(
+                &tool.cfg.backend
+            ));
+            assert!(!crate::syscalls::timerfd::detcore_runs_outside_the_guest(
+                &reverie::BackendCapabilities::LITEINST_IN_GUEST
+            ));
+            let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+            // SAFETY: plain integers; zero is a valid value for each.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            stat.st_mode = libc::S_IFREG;
+            // No memfd of this run has this identity, so no test registers it.
+            stat.st_dev = u64::MAX;
+            stat.st_ino = u64::MAX;
+            let found = tool
+                .received_placeholder(&mut guest, 9, &stat)
+                .await
+                .unwrap();
+            assert!(found.is_none());
+            assert!(guest.injected().is_empty(), "{:?}", guest.injected());
+        })
+    }
+
     /// A guest for [`Detcore::bind_task_identity`]: its registers name the
     /// call being answered (`openat`), and nothing else is used.
     struct RefusalGuest<'a> {
@@ -6474,8 +7727,20 @@ mod tests {
             ),
             Some((Path::new("/proc/cpuinfo"), Vec::new()))
         );
+        // A /proc/diskstats placeholder carries no snapshot: the new image
+        // renders it again, from the run's table
+        // (`ProcfsFile::snapshot_is_rerendered`), so a name carrying one
+        // (below) is not one.
+        assert_eq!(
+            crate::procfs::placeholder_link(
+                b"/memfd:hermit-procfs:/proc/diskstats@ (deleted)",
+                RenderedFiles::ALL
+            ),
+            Some((Path::new("/proc/diskstats"), Vec::new()))
+        );
         for link in [
             b"/memfd:hermit-procfs:/proc/diskstats@30 (deleted)".as_slice(),
+            b"/memfd:hermit-procfs:/proc/cpuinfo@30 (deleted)",
             b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid (deleted)",
             b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@3 (deleted)",
             b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@zz (deleted)",
@@ -6503,7 +7768,7 @@ mod tests {
         );
         assert_eq!(
             rendered_path_within(Path::new("/diskstats"), RenderedFiles::ALL),
-            None
+            Some(Path::new("/proc/diskstats"))
         );
         assert_eq!(
             rendered_path_within(Path::new("/self/stat"), RenderedFiles::ALL),
@@ -7180,6 +8445,34 @@ mod tests {
         ));
     }
 
+    /// A task's `io` is mode 0400, as `ONE("io", S_IRUSR, ...)` makes it in
+    /// Linux, readable by its owner only, like a process's `auxv` (next
+    /// test); its `statm` and `arch_status` are 0444. Each is a regular file
+    /// with Detcore's procfs device and its task's inode number.
+    #[test]
+    fn a_task_io_is_readable_by_its_owner_only() {
+        let epoch = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        for (name, mode) in [("io", 0o400), ("statm", 0o444), ("arch_status", 0o444)] {
+            let mut file =
+                crate::procfs::ProcfsFile::from_path(Path::new(&format!("/proc/self/{name}")))
+                    .unwrap();
+            file.bind_task(3, 3);
+            let path = file.into_rendered().opened_path().unwrap();
+            assert_eq!(rendered_path_is_owner_only(path), mode == 0o400, "{name}");
+            let stat = rendered_stat(path, epoch, (0, 0));
+            assert_eq!(stat.mode, libc::S_IFREG | mode, "{name}");
+            assert_eq!(stat.dev, procfs_inode::VIRTUAL_PROC_DEVICE, "{name}");
+            assert_eq!(stat.inode, procfs_inode::rendered_inode(path), "{name}");
+        }
+        assert_eq!(
+            rendered_stat(Path::new("/proc/diskstats"), epoch, (0, 0)).mode,
+            libc::S_IFREG | 0o444
+        );
+    }
+
     /// A process's `auxv` is mode 0400, readable by its owner only, measured
     /// natively on Linux 7.1: its owner opens it to read; a zombie's (global
     /// root's) cannot be opened, `access(R_OK)` and a `user.` attribute read
@@ -7280,6 +8573,281 @@ mod tests {
             assert_eq!(
                 auxv_access_answer(Err(Errno::EACCES), Err(operational)),
                 Answer(Err(operational))
+            );
+        }
+    }
+
+    /// What decides another thread group's read of a rendered `io`, from the
+    /// reader's readlinks of the task's `cwd` and of its own: the task's
+    /// reads, allowed; it is ENOENT while the reader's own reads (a task with
+    /// no `fs`, exited and not reaped: the access check passed), allowed; it
+    /// is EACCES while the reader's own reads, refused; the reader's own is
+    /// EACCES (no `/proc` provider beneath), the reader's `CAP_SYS_PTRACE`
+    /// decides; both are ENOENT (no `/proc` under the reader's root), the
+    /// kernel beneath is asked without a path (Codex review, round 3: the
+    /// reader's capability decided there too, refusing reads Linux allows);
+    /// any other errno, and a failed probe of the task with no second probe,
+    /// decides nothing. Measured natively on Linux 7.1.3 as root in a user
+    /// namespace: the probe of the task and Linux's io read agree for a live
+    /// task, a task not dumpable to a reader without CAP_SYS_PTRACE,
+    /// commoncap's subset rule, a full descriptor table and an unreaped task.
+    #[test]
+    fn another_thread_groups_io_is_decided_by_a_readlink_of_its_cwd() {
+        use IoAccess::Allowed;
+        use IoAccess::CallerCapability;
+        use IoAccess::NoProcfs;
+        use IoAccess::Refused;
+        use IoAccess::Undecided;
+        for serves in [None, Some(Ok(())), Some(Err(Errno::EACCES))] {
+            assert_eq!(io_access_answer(Ok(()), serves), Allowed);
+        }
+        assert_eq!(io_access_answer(Err(Errno::ENOENT), Some(Ok(()))), Allowed);
+        for serves in [Ok(()), Err(Errno::ENOENT)] {
+            assert_eq!(io_access_answer(Err(Errno::EACCES), Some(serves)), Refused);
+        }
+        for target in [Errno::EACCES, Errno::ENOENT] {
+            assert_eq!(
+                io_access_answer(Err(target), Some(Err(Errno::EACCES))),
+                CallerCapability
+            );
+            assert_eq!(io_access_answer(Err(target), None), Undecided(target));
+        }
+        assert_eq!(
+            io_access_answer(Err(Errno::ENOENT), Some(Err(Errno::ENOENT))),
+            NoProcfs
+        );
+        for other in [Errno::ENOMEM, Errno::EFAULT, Errno::ELOOP, Errno::EMFILE] {
+            assert_eq!(io_access_answer(Err(other), None), Undecided(other));
+            assert_eq!(io_access_answer(Err(other), Some(Ok(()))), Undecided(other));
+            for target in [Errno::EACCES, Errno::ENOENT] {
+                assert_eq!(
+                    io_access_answer(Err(target), Some(Err(other))),
+                    Undecided(other)
+                );
+            }
+        }
+    }
+
+    /// Where the reader's root has no kernel `/proc`, Linux's FSCREDS answer
+    /// for another thread group's `io` follows from the kernel's REALCREDS
+    /// answer (`kcmp`) and the capability sets, as
+    /// `io_access_by_real_credentials` reads kernel/ptrace.c:276-347 and
+    /// security/commoncap.c:164-186 in 6.17: a refusal stands; an allowance
+    /// stands where the task's permitted set is within the reader's
+    /// effective set, where the reader has CAP_SYS_PTRACE in it, or where the
+    /// task's permitted set is outside the reader's permitted set; the one
+    /// remaining case turns on the user namespaces, so the kernel is asked
+    /// the FSCREDS check itself; filesystem IDs that are not the real IDs (or
+    /// read as the overflow ID) are unanswerable, never an EACCES.
+    #[test]
+    fn io_access_without_procfs_follows_the_real_credentials_answer() {
+        use IoAccessByCredentials::Allowed;
+        use IoAccessByCredentials::AskTheKernel;
+        use IoAccessByCredentials::Refused;
+        use IoAccessByCredentials::Unanswerable;
+        let full: u64 = (1 << 41) - 1;
+        let ptrace = 1 << CAP_SYS_PTRACE;
+        let reader = |effective: u64, permitted: u64| ReaderCredentials {
+            uid: 0,
+            euid: 0,
+            fsuid: 0,
+            gid: 0,
+            fsgid: 0,
+            capabilities: CapabilitySets {
+                effective,
+                permitted,
+            },
+        };
+        // A refusal stands, whatever the sets.
+        for (effective, permitted, task) in [
+            (full, full, full),
+            (full & !ptrace, full & !ptrace, full & !ptrace),
+            (0, 0, 0),
+        ] {
+            assert_eq!(
+                io_access_by_real_credentials(false, reader(effective, permitted), task),
+                Refused
+            );
+        }
+        // The task's permitted set within the reader's effective set (the
+        // chroot test's reader and target, which dropped CAP_SYS_PTRACE
+        // from both sets before the fork).
+        let dropped = full & !ptrace;
+        assert_eq!(
+            io_access_by_real_credentials(true, reader(dropped, dropped), dropped),
+            Allowed
+        );
+        assert_eq!(
+            io_access_by_real_credentials(true, reader(full, full), full),
+            Allowed
+        );
+        // CAP_SYS_PTRACE in the reader's effective set.
+        assert_eq!(
+            io_access_by_real_credentials(true, reader(ptrace, full), full),
+            Allowed
+        );
+        // The task's permitted set outside the reader's permitted set: the
+        // kernel's allowance came from ns_capable, which reads the effective
+        // set in both modes.
+        assert_eq!(
+            io_access_by_real_credentials(true, reader(dropped, dropped), full),
+            Allowed
+        );
+        // Within the permitted set but not the effective set, which lacks
+        // CAP_SYS_PTRACE: the user namespaces decide, so the kernel is asked
+        // (the chroot test's reader that dropped it from its effective set
+        // only).
+        assert_eq!(
+            io_access_by_real_credentials(true, reader(dropped, full), full),
+            AskTheKernel
+        );
+        // Filesystem IDs that are not the real IDs, or the overflow ID.
+        for (uid, fsuid, gid, fsgid) in [
+            (0, 1000, 0, 0),
+            (0, 0, 0, 1000),
+            (OVERFLOW_ID, OVERFLOW_ID, 0, 0),
+            (0, 0, OVERFLOW_ID, OVERFLOW_ID),
+            (OVERFLOW_ID, 0, 0, 0),
+        ] {
+            let credentials = ReaderCredentials {
+                uid,
+                fsuid,
+                gid,
+                fsgid,
+                ..reader(full, full)
+            };
+            for allowed in [true, false] {
+                assert!(
+                    matches!(
+                        io_access_by_real_credentials(allowed, credentials, full),
+                        Unanswerable(reason) if reason.contains("filesystem IDs")
+                    ),
+                    "{credentials:?}"
+                );
+            }
+        }
+    }
+
+    /// Where the user namespaces decide and the kernel cannot be asked (the
+    /// task has exited), the record of user namespaces answers as
+    /// `cap_capable_helper` walks (security/commoncap.c:68-104 in 6.17): a
+    /// task in the reader's namespace, or not below it, is refused; one below
+    /// it is allowed where the reader's effective user ID, its real one, owns
+    /// the namespace above the task's, and refused where the reader's
+    /// effective ID is another; a run where a namespace's owner may differ,
+    /// or a reader whose effective ID reads as the overflow ID, cannot be
+    /// told (Codex review of the kvm lane's slice N3, round 3b: the exited
+    /// targets of `--io-access-after-chroot-effective-only` and
+    /// `-own-userns`).
+    #[test]
+    fn io_access_by_user_namespaces_follows_the_namespace_walk() {
+        use crate::scheduler::user_namespaces::UserNamespaceRelation::*;
+        let full: u64 = (1 << 41) - 1;
+        let reader = |uid: u32, euid: u32| ReaderCredentials {
+            uid,
+            euid,
+            fsuid: euid,
+            gid: 0,
+            fsgid: 0,
+            capabilities: CapabilitySets {
+                effective: full & !(1 << CAP_SYS_PTRACE),
+                permitted: full,
+            },
+        };
+        for owner_may_differ in [false, true] {
+            for relation in [Same, Elsewhere] {
+                assert_eq!(
+                    io_access_by_user_namespaces(relation, owner_may_differ, reader(0, 0)),
+                    IoAccessByCredentials::Refused,
+                    "{relation:?} {owner_may_differ}"
+                );
+            }
+        }
+        assert_eq!(
+            io_access_by_user_namespaces(Below, false, reader(0, 0)),
+            IoAccessByCredentials::Allowed
+        );
+        assert_eq!(
+            io_access_by_user_namespaces(Below, false, reader(1000, 0)),
+            IoAccessByCredentials::Refused
+        );
+        for (owner_may_differ, credentials) in
+            [(true, reader(0, 0)), (false, reader(0, OVERFLOW_ID))]
+        {
+            assert!(
+                matches!(
+                    io_access_by_user_namespaces(Below, owner_may_differ, credentials),
+                    IoAccessByCredentials::Unanswerable(reason) if reason.contains("cannot be told")
+                ),
+                "{owner_may_differ} {credentials:?}"
+            );
+        }
+    }
+
+    /// A memfd's descriptor link names the stand-in for a rendered file only
+    /// within the run's `--proc` level: at `--proc=minimal`, which omits
+    /// `/proc/diskstats` and `/proc/interrupts`, a link naming either names no
+    /// stand-in, whichever route reads it (a descriptor link's open, a
+    /// spelling that reaches the memfd, the link's text), so such a memfd is
+    /// read as the memfd it is; at `--proc=standard` it names the file
+    /// (Claude review of the kvm lane's slice N3, round 3: DBT and SaBRe read
+    /// both files at `--proc=minimal` through `/proc/self/fd/N`).
+    #[test]
+    fn a_stand_in_link_names_a_file_only_within_the_proc_level() {
+        use detcore_model::config::ProcLevel;
+        for files in [RenderedFiles::ALL, RenderedFiles::WITHOUT_CPUINFO] {
+            for (level, within) in [(ProcLevel::Minimal, false), (ProcLevel::Standard, true)] {
+                for path in ["/proc/diskstats", "/proc/interrupts"] {
+                    let link = format!("/memfd:hermit-procfs:{path}@ (deleted)");
+                    assert_eq!(
+                        placeholder_link_within(link.as_bytes(), files, level),
+                        within.then_some(Path::new(path)),
+                        "{files:?} {level:?} {path}"
+                    );
+                }
+            }
+        }
+        // A name of no procfs file names none at either level.
+        assert_eq!(
+            placeholder_link_within(
+                b"/memfd:hermit-procfs:/etc/passwd@ (deleted)",
+                RenderedFiles::ALL,
+                ProcLevel::Standard
+            ),
+            None
+        );
+    }
+
+    /// Once `pidfd_open` succeeded, the `PIDFD_GET_USER_NAMESPACE` ioctl's
+    /// answer is the kernel's FSCREDS check: a namespace descriptor, or an
+    /// error that only the namespace's open makes after the check (EOPNOTSUPP,
+    /// EMFILE, ENFILE, ENOMEM), allows the reader; EACCES refuses it; ESRCH
+    /// (an exited task), ENOTTY and EINVAL come before the check and decide
+    /// nothing (Claude review of the kvm lane's slice N3, round 3b: a reader
+    /// with one free descriptor was stopped where Linux reads).
+    #[test]
+    fn a_pidfd_ioctl_error_after_the_check_means_allowed() {
+        for answer in [
+            Ok(7),
+            Err(Errno::EOPNOTSUPP),
+            Err(Errno::EMFILE),
+            Err(Errno::ENFILE),
+            Err(Errno::ENOMEM),
+        ] {
+            assert_eq!(
+                pidfd_ioctl_access(answer),
+                PidfdAccess::Allowed,
+                "{answer:?}"
+            );
+        }
+        assert_eq!(pidfd_ioctl_access(Err(Errno::EACCES)), PidfdAccess::Refused);
+        for errno in [Errno::ESRCH, Errno::ENOTTY, Errno::EINVAL, Errno::EBADF] {
+            assert_eq!(
+                pidfd_ioctl_access(Err(errno)),
+                PidfdAccess::NotAsked {
+                    opened: true,
+                    errno
+                }
             );
         }
     }

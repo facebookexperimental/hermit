@@ -2063,6 +2063,50 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Before a clone that makes a process, where Detcore runs inside each
+    /// guest process: the record sequences of per-process files move to
+    /// Detcore's global state (`ThreadState::share_procfs_sequences`), so the
+    /// copies of the tool's state the fork makes share them, as Linux's
+    /// processes share the one `struct file` and `seq_file`. In-guest
+    /// LiteInst does so as it promotes (`promote_before_native_lifecycle`),
+    /// and DBT's runtime before its native fork; this covers SaBRe, whose
+    /// runtime promotes nothing. Only with sequentialized threads, whose turns
+    /// order every process's operations on the sequence.
+    fn share_procfs_sequences_before_copy<G: Guest<Self>>(&self, guest: &G) {
+        if self.cfg.sequentialize_threads
+            && !crate::syscalls::timerfd::detcore_runs_outside_the_guest(&guest.config().backend)
+        {
+            guest.thread_state().share_procfs_sequences();
+        }
+    }
+
+    /// Before a clone that makes a user namespace: Linux makes the caller's
+    /// effective user ID the new namespace's owner (`create_user_ns`,
+    /// kernel/user_namespace.c:82-136 in 6.17), and Detcore's record of user
+    /// namespaces (`scheduler::user_namespaces`) takes that owner to be the
+    /// real user ID every guest task has. It is, unless the caller runs, or
+    /// was forked from, an image of a set-user-ID file: Detcore makes the
+    /// credential-setting calls no-ops, so an exec is the one way a guest
+    /// task's effective ID comes to differ from its real one, which never
+    /// changes. The caller's IDs as the kernel beneath holds them (injected
+    /// `getuid` and `geteuid`, read before the clone, as `create_user_ns`
+    /// reads them) decide: true for a caller whose two differ, or that reads
+    /// either as the overflow ID 65534 (two such IDs may still differ), or
+    /// whose IDs cannot be read. Only once the clone has made the namespace is
+    /// that noted, for that namespace alone
+    /// (`UserNamespaces::note_owner_may_differ`), by the turn that registers
+    /// the new process: a clone that fails (EINVAL for `CLONE_NEWUSER` with
+    /// `CLONE_FS`; EPERM for a creator whose IDs its namespace does not map)
+    /// makes no namespace and notes nothing.
+    async fn user_namespace_owner_may_differ<G: Guest<Self>>(&self, guest: &mut G) -> bool {
+        /// `overflowuid`'s default, which an ID the caller's user namespace
+        /// does not map reads as.
+        const OVERFLOW_ID: i64 = 65534;
+        let uid = guest.inject(syscalls::Getuid::new()).await;
+        let euid = guest.inject(syscalls::Geteuid::new()).await;
+        !matches!((uid, euid), (Ok(uid), Ok(euid)) if uid == euid && uid != OVERFLOW_ID)
+    }
+
     /// Clone, clone3, fork, vfork system calls
     pub async fn handle_clone_family<G: Guest<Self>>(
         &self,
@@ -2133,6 +2177,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(refused);
         }
 
+        // A clone that makes a user namespace makes it the caller's effective
+        // user ID's (`user_namespace_owner_may_differ`): read now, noted once
+        // the clone has made the namespace. Only where Detcore renders procfs
+        // files, whose access checks read the record of user namespaces: not
+        // under record and replay.
+        let user_namespace_owner_may_differ = flags.contains(CloneFlags::CLONE_NEWUSER)
+            && !flags.contains(CloneFlags::CLONE_THREAD)
+            && !self.cfg.recordreplay_modes
+            && self.user_namespace_owner_may_differ(guest).await;
+
         // The child's ID, when Detcore chooses the IDs: taken here, in this
         // turn, before the vfork parent below gives the turn up.
         let clone_plan = self
@@ -2165,6 +2219,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 flags,
                 exit_signal,
                 child_priority_entropy,
+                user_namespace_owner_may_differ,
             });
         }
 
@@ -2179,6 +2234,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if !flags.contains(CloneFlags::CLONE_THREAD) {
             self.promote_before_native_lifecycle(guest);
+            self.share_procfs_sequences_before_copy(guest);
         }
 
         // Actions shared with a new process are withdrawn from the
@@ -2318,6 +2374,12 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if !is_vfork {
             create_child_thread(guest, child_dettid, ctid, Some(flags), exit_signal, None).await;
+            // The clone made the namespace: note its owner, in the turn that
+            // registered the child (a vfork child notes its own at its
+            // registration, `Detcore::handle_thread_start`).
+            if user_namespace_owner_may_differ {
+                crate::tool_global::note_user_namespace_owner_may_differ(guest, child_dettid).await;
+            }
         }
 
         if let Some(address) = pidfd_address {

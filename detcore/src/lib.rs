@@ -854,12 +854,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// file (`FileMetadata::decide_cpuinfo_placeholders`).
     fn decide_cpuinfo_placeholders<G: Guest<Self>>(&self, guest: &G) -> Result<(), Errno> {
         let rendered = self.rendered_files(guest).cpuinfo;
-        guest
-            .thread_state()
-            .file_metadata
-            .lock()
-            .unwrap()
-            .decide_cpuinfo_placeholders(rendered)
+        let mut metadata = guest.thread_state().file_metadata.lock().unwrap();
+        // The run's `--proc` level too, which a table restored across `exec`
+        // does not carry (`FileMetadata::note_proc_level`).
+        metadata.note_proc_level(self.cfg.proc_level);
+        metadata.decide_cpuinfo_placeholders(rendered)
     }
 
     /// Signal phase 1, step I4 (design section 4, "The commit"): when the
@@ -5217,6 +5216,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
                     restarted_clone_id: None,
+                    procfs_sequence_taken: None,
 
                     // Child RNG identity follows the deterministic creation
                     // pedigree, never the backend/host Tid. Guest-visible IDs
@@ -5340,7 +5340,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
+            // The vfork that made this process made a user namespace whose
+            // creator's effective ID may differ from its real one: noted for
+            // that namespace now that the clone has made it, in the turn of
+            // this process's own registration (`scheduler::user_namespaces`).
+            let note_owner = vfork.user_namespace_owner_may_differ
+                && vfork.flags.contains(CloneFlags::CLONE_NEWUSER);
             create_vfork_child_thread(guest, new_dettid, vfork).await;
+            if note_owner {
+                tool_global::note_user_namespace_owner_may_differ(guest, new_dettid).await;
+            }
         } else if needs_registration {
             // A root has no parent registration. A fresh runtime after exec
             // also needs this handshake, even when the Guest has an in-tree

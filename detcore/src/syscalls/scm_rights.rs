@@ -36,7 +36,10 @@
 //! session's `/proc/cpuinfo` decision (those are an exec image's own
 //! descriptors); a rendered procfs placeholder is adopted through the
 //! placeholder registry instead, as `Detcore::adopt_received_placeholders`
-//! adopts one when it is first named.
+//! adopts one when it is first named, or, where Detcore runs in each guest
+//! process (LiteInst and in-guest-trap record received descriptors too), by
+//! the name and seals of a placeholder another process made
+//! (`Detcore::received_placeholder`).
 //!
 //! An anonymous inode has no file type, so `fstat` does not tell its kind.
 //! Its descriptor link does: one that reads `anon_inode:inotify` (an injected
@@ -437,8 +440,6 @@ use crate::fd::SentDescriptor;
 use crate::fd::TakenRights;
 use crate::record_or_replay::RecordOrReplay;
 use crate::syscalls::files::SocketRole;
-use crate::syscalls::rendered_procfs::placeholder_identity;
-use crate::syscalls::rendered_procfs::placeholders_exist;
 use crate::tool_local::Detcore;
 
 /// The bytes `received_descriptor_link` gives the path
@@ -2767,12 +2768,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             return Ok(Receipt::Unrecorded);
         }
+        // A rendered procfs file's placeholder, by the identity this tool
+        // process registered or, where Detcore runs in each guest process, by
+        // its name and seals (`Detcore::received_placeholder`): the file again,
+        // never the empty memfd behind it.
         if may_be_placeholder(stat)
-            && placeholders_exist()
             && self.renders_procfs(guest)
-            && let Some(path) = placeholder_identity(stat.st_dev, stat.st_ino)
+            && let Some((path, named)) = self.received_placeholder(guest, fd, stat).await?
         {
-            self.adopt_received_placeholder(guest, fd, path, (stat.st_dev, stat.st_ino))
+            self.adopt_received_placeholder(guest, fd, path, (stat.st_dev, stat.st_ino), named)
                 .await?;
             return Ok(Receipt::New);
         }
@@ -2786,6 +2790,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             stat,
             link.as_deref(),
         )?;
+        // A per-process file that follows its record's sequence which the
+        // kernel opened, received without joining the open file its sender's
+        // table modeled (above): where the tool runs in each guest process
+        // (LiteInst, in-guest-trap), every such receipt; where one tool
+        // process serves every guest, one Detcore could not match. That
+        // sequence belongs to the open file, which every holder shares and
+        // the sender's Detcore keeps, and which this table cannot know, so
+        // every read and seek through it is refused by name
+        // (`Detcore::refuse_unknown_record_sequence`), as the in-guest
+        // discovery of DBT and SaBRe refuses one
+        // (`FileMetadata::discover_fd_from_current_process`). Before, it read
+        // the kernel's file, where the sender's captures had left it (end of
+        // file), unsanitized. Its link is read through the recording, as
+        // every received fact is.
+        if stat.st_mode & libc::S_IFMT == libc::S_IFREG
+            && stat.st_size == 0
+            && stat.st_nlink > 0
+            && let Some(link) = self.received_descriptor_link(guest, fd).await?
+            && let Some(path) = crate::tool_local::kernel_record_file_link(stat, &link)
+        {
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.set_path(path.clone());
+                detfd.mark_record_sequence_unknown();
+            })?;
+        }
         // A placeholder descriptor, which its identity and its tag tell apart
         // (`descriptor_directory`).
         self.recognize_received_placeholder(guest, fd, stat, facts.status_flags)

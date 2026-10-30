@@ -3185,7 +3185,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Recount at 4e916633ca: the selection lists 3321 (3279 + 42, the T2
     // preemption-timer units among them), by cargo nextest list -p
     // hermit-detcore --lib --bins; all 3321 pass locally.
-    ("test.detcore_unit", 3321),
+    // N3 (rendered statm/io/arch_status/diskstats) adds twenty-seven
+    // detcore units, measured at its base (3279 + 27 = 3306, listed) and
+    // re-measured at this landing by cargo nextest run -p hermit-detcore
+    // --lib (3348 passed): 3321 + 27 = 3348.
+    ("test.detcore_unit", 3348),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4535,7 +4539,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // re-measured in the test.cli tight loop at 351565c0ae (763 passed).
     // Recount at bc48233db5: 764 executed in the confirming validate, all
     // passing.
-    ("test.cli", 764),
+    // N3 adds twelve cli cases, measured at its base (763 + 12 = 775 in
+    // its tight loop): 764 + 12 = 776.
+    ("test.cli", 776),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5135,7 +5141,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same retry-stack cli case: 663 + 1 = 664.
     // The same eighteen integrated-chain cli cases: 664 + 18 = 682.
     // The same recount at bc48233db5 as test.cli: 682 + 1 = 683.
-    ("test.cli_on_host", 683),
+    // The same twelve N3 cli cases: 683 + 12 = 695.
+    ("test.cli_on_host", 695),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1958 - 14 = 1944, re-measured 2026-10-31.
     ("test.regular_crates_on_host", 1944),
@@ -5658,7 +5665,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // on main. 3037 -> 3242 to match that measured recount.
     // The same thirty-seven NR units: 3242 + 37 = 3279.
     // The same recount at 4e916633ca as test.detcore_unit: 3279 + 42 = 3321.
-    ("test.detcore_unit_on_host", 3321),
+    // The same twenty-seven N3 detcore units: 3321 + 27 = 3348.
+    ("test.detcore_unit_on_host", 3348),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

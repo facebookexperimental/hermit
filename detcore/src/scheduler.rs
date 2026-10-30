@@ -44,6 +44,7 @@ pub(crate) mod signal_control;
 pub(crate) mod signal_lists;
 mod sleep_signal;
 pub mod timed_waiters;
+pub(crate) mod user_namespaces;
 pub(crate) mod work_span;
 
 use std::collections::BTreeMap;
@@ -2731,6 +2732,11 @@ pub struct ThreadTree {
     /// Each nested task's pid in each namespace it belongs to, recorded at its
     /// creation (`pid_namespaces`).
     pub(crate) pid_namespaces: pid_namespaces::PidNamespaces,
+    /// The user namespace each process lives in, relative to the container's,
+    /// recorded at its creation (`user_namespaces`): a new process inherits
+    /// its creator's, and `clone(CLONE_NEWUSER)` puts it in a new one below
+    /// (`Self::enter_new_user_namespace`).
+    pub(crate) user_namespaces: user_namespaces::UserNamespaces,
     /// Each task's name, Linux's `task_struct::comm` (`procfs::task_stat`),
     /// which a rendered `/proc/<pid>/stat` shows where its guest threads are
     /// not host tasks whose name the tool reads (`Detcore::comm_source`,
@@ -3052,6 +3058,14 @@ impl ThreadTree {
             }
             // A reused pid is not a namespace init until registered as one.
             self.pid_namespace_inits.remove(&child_dettid);
+            // And it lives in its creator's user namespace until
+            // `enter_new_user_namespace` says otherwise (`copy_creds`).
+            let creator = self
+                .thread_to_leader
+                .get(&parent_dettid)
+                .copied()
+                .filter(|_| parent_dettid != child_dettid);
+            self.user_namespaces.inherit(child_dettid, creator);
             if parent_dettid == child_dettid {
                 self.process_wait.insert(
                     child_dettid,
@@ -3524,6 +3538,12 @@ impl ThreadTree {
     /// `pid_ns_depth` of `pid`.
     pub fn pid_ns_depth(&self, pid: DetPid) -> u32 {
         self.pid_ns_depth.get(&pid).copied().unwrap_or(0)
+    }
+
+    /// `pid` was created with `CLONE_NEWUSER`: it lives in a new user
+    /// namespace, one level below its creator's (`user_namespaces`).
+    pub fn enter_new_user_namespace(&mut self, pid: DetPid) {
+        self.user_namespaces.enter_new(pid);
     }
 
     /// Record that `child` went to the container's init (`init_orphans`).

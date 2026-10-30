@@ -219,7 +219,33 @@ impl InterceptedCpuid {
     }
 }
 
+/// A task's `arch_status` on a CPU with AVX-512F (`avx512f`) or without it
+/// ([`InterceptedCpuid::arch_status`]).
+fn arch_status_for(avx512f: bool) -> Vec<u8> {
+    if avx512f {
+        b"AVX512_elapsed_ms:\t0\n".to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 impl InterceptedCpuid {
+    /// A task's `/proc/<pid>/arch_status` for the CPU this table describes:
+    /// Linux prints its one line, `AVX512_elapsed_ms`, exactly when the CPU
+    /// has AVX-512F (`proc_pid_arch_status`, arch/x86/kernel/fpu/xstate.c,
+    /// `cpu_feature_enabled(X86_FEATURE_AVX512F)`), leaf 7's EBX bit 16, and
+    /// nothing otherwise. The value is how long ago the task last used
+    /// AVX-512, or -1 for never: a host timing, which Detcore reports as 0,
+    /// the value its sanitizer gives the kernel's file. So the file and the
+    /// CPUID instruction show a guest the same CPU, as `/proc/cpuinfo` does.
+    pub fn arch_status(&self) -> Vec<u8> {
+        const AVX512F: u32 = 1 << 16;
+        arch_status_for(
+            self.cpuid(0x7, 0)
+                .is_some_and(|leaf| leaf.ebx & AVX512F != 0),
+        )
+    }
+
     /// `/proc/cpuinfo` for the virtual CPU this table describes, so that the
     /// file and the CPUID instruction show a guest the same CPU
     /// (<https://github.com/rrnewton/hermit/issues/4161>). Without this, the
@@ -1345,6 +1371,44 @@ mod tests {
         );
         assert_ne!(changed(|h| h.xcomp_perm = 0x207), digest);
         assert_ne!(changed(|h| h.xfeature_max = 19), digest);
+    }
+
+    /// A task's `arch_status` names AVX-512 only on a CPU that has
+    /// AVX-512F, as Linux's does: neither virtual CPU has it, so both give
+    /// the empty file a native kernel gives on such a CPU.
+    #[test]
+    fn arch_status_names_avx512_only_for_a_cpu_with_it() {
+        assert_eq!(InterceptedCpuid::new().arch_status(), b"");
+        assert_eq!(InterceptedCpuid::v3(&epyc_9d85()).arch_status(), b"");
+        assert_eq!(arch_status_for(true), b"AVX512_elapsed_ms:\t0\n");
+        assert_eq!(arch_status_for(false), b"");
+    }
+
+    /// `arch_status` reads AVX-512F from the table, leaf 7's EBX bit 16: the
+    /// host-no-rdrand table answers that leaf from this host's CPU, so the
+    /// file names AVX-512 exactly when this host's CPU has AVX-512F, the
+    /// branch neither virtual CPU reaches (on the development host, an AMD
+    /// EPYC 9D85, it does).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn arch_status_follows_the_tables_avx512f_bit() {
+        let config = crate::Config {
+            cpu_profile: CpuProfile::HostNoRdrand,
+            ..Default::default()
+        };
+        let table = InterceptedCpuid::for_config(&config);
+        let native = std::arch::x86_64::__cpuid_count(7, 0).ebx & (1 << 16) != 0;
+        let answered = table
+            .cpuid(0x7, 0)
+            .is_some_and(|leaf| leaf.ebx & (1 << 16) != 0);
+        assert_eq!(answered, native, "the host table passes AVX-512F through");
+        let expected: &[u8] = if native {
+            b"AVX512_elapsed_ms:\t0\n"
+        } else {
+            b""
+        };
+        eprintln!("this host's CPU has AVX-512F: {native}");
+        assert_eq!(table.arch_status(), expected);
     }
 
     #[test]

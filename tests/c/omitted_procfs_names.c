@@ -216,12 +216,11 @@ static void check_absent(const char* path, int kvm_local_procfs) {
   unlink(link);
 }
 
-/* The level's names that KVM's own /proc refuses: its directories, and the
- * per-process files it does not serve. */
+/* The level's names that KVM's own /proc refuses: its directories. A
+ * process's `io` is Detcore's on every backend now. */
 static int kvm_refuses(const char* path) {
   return strcmp(path, "/proc/sys/fs") == 0 ||
-      strcmp(path, "/proc/self/task") == 0 ||
-      strcmp(path, "/proc/self/io") == 0;
+      strcmp(path, "/proc/self/task") == 0;
 }
 
 /* `path` opens; returns whether it was checked. */

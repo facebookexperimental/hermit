@@ -215,7 +215,10 @@ pub(super) fn path_operands(sysno: Sysno) -> Option<&'static [(Option<usize>, us
 /// resolve, through any link before it), and where a component it reaches,
 /// the absent one included, is longer than `NAME_MAX` (the kernel's
 /// ENAMETOOLONG comes first).
-fn absent_prefix(path: &Path, level: detcore_model::config::ProcLevel) -> Option<PathBuf> {
+pub(super) fn absent_prefix(
+    path: &Path,
+    level: detcore_model::config::ProcLevel,
+) -> Option<PathBuf> {
     let mut components = path.components();
     if components.next() != Some(Component::RootDir) {
         return None;

@@ -4666,6 +4666,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(inspected) => inspected,
             Err(refusal) => return refusal,
         };
+        // A per-process file's record sequence, which every holder of the
+        // open file shares, moves to Detcore's global state before the
+        // descriptor can reach another process.
+        Box::pin(self.share_sent_record_sequences(guest, &headers)).await;
         let in_turn = self.completes_in_turn(guest, call);
         if outside_turn || !sent_descriptors(guest, &headers).0.is_empty() {
             Self::note_descriptors_passed_out(guest, call.fd(), &headers, outside_turn);

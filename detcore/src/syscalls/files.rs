@@ -872,6 +872,70 @@ fn verify_procfs_read_range(position: usize, count: usize) -> Result<(), Errno> 
         .ok_or(Errno::EINVAL)
 }
 
+/// Whether the unsupported-operation policy's refusal would strand the run:
+/// where the tool shares the guest's process and descriptor table, and the
+/// fail-closed policy ends a refusal with `unrecoverable_shutdown`, the exit
+/// ends only the refusing guest process, from inside its tool, which Detcore's
+/// model does not see as that process's exit, so a process waiting on it
+/// waits on, and the run does not end (SaBRe: measured 2026-10-31, the
+/// receiving process of tests/c/rendered_io_and_diskstats.c's
+/// --sequence-received-no-alias refused, and the run stopped at its
+/// deadline with nothing printed). DBT's runtime ends a refusal through its
+/// own exit and report path (it clears `shutdown_on_unsupported_syscall`):
+/// a failed run, 101, or 137 where that path's kill reaches Hermit first,
+/// and the reason; LiteInst and in-guest-trap keep their own descriptor table,
+/// and their launcher ends the run with exit 122 and the reason; ptrace and
+/// KVM exit with 122 from Hermit's process. A run with
+/// `--allow-unsupported-syscalls` refuses with an errno, which strands
+/// nothing, and so does a refusal of a record sequence Detcore cannot know
+/// where this holds (`Detcore::refuse_unknown_record_sequence`).
+fn refusal_would_strand_the_run(config: &crate::Config) -> bool {
+    config.shutdown_on_unsupported_syscall && config.backend.tool_shares_guest_descriptor_table
+}
+
+/// Writes `line` to the guest's standard error with one raw `write` loop,
+/// keeping the calling thread's `errno`, as `detlog::forward_to_stderr`
+/// writes a record. Where the tool runs in the guest's process (SaBRe) that
+/// `errno` is the guest's, and no log subscriber prints `error!`, so this is
+/// how a refusal there is named (`Detcore::refuse_unknown_record_sequence`).
+/// A failed write drops the rest; the call's EOPNOTSUPP still says it was
+/// refused.
+fn write_to_guest_stderr(line: &str) {
+    // SAFETY: `__errno_location` returns the calling thread's errno slot.
+    let saved = unsafe { *libc::__errno_location() };
+    let mut rest = line.as_bytes();
+    while !rest.is_empty() {
+        // SAFETY: `rest` is a live, initialized byte slice of the given length.
+        let written = unsafe { libc::write(libc::STDERR_FILENO, rest.as_ptr().cast(), rest.len()) };
+        if written > 0 {
+            rest = &rest[written as usize..];
+        } else if written == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+        {
+            break;
+        }
+    }
+    // SAFETY: as above.
+    unsafe { *libc::__errno_location() = saved };
+}
+
+/// Why Detcore refuses a read or a seek of descriptor `fd`, a per-process
+/// file (`path`, where Detcore knows it) whose record sequence it cannot know
+/// here (`Detcore::refuse_unknown_record_sequence`).
+fn unknown_record_sequence_reason(fd: RawFd, path: Option<&Path>) -> String {
+    let file = path.map_or_else(
+        || "a per-process /proc file".to_owned(),
+        |path| format!("the per-process file {}", path.display()),
+    );
+    format!(
+        "descriptor {fd}, {file}, reached this process (over SCM_RIGHTS, or found in its \
+         descriptor table) without joining an open file of it this process's Detcore models; \
+         Linux keeps where the file's record sequence is, and the record it buffered, in the \
+         one open file every process holding it shares, and Detcore cannot follow that \
+         sequence here, so it neither reads nor seeks it rather than answer otherwise than Linux"
+    )
+}
+
 fn rendered_procfs_seek(
     seek: RenderedSeek,
     whence: Whence,
@@ -896,7 +960,16 @@ fn rendered_procfs_seek(
         Whence::SEEK_DATA => requested,
         _ => return Err(Errno::EINVAL),
     };
-    let new_offset = usize::try_from(new_offset).map_err(|_| Errno::EINVAL)?;
+    // Each llseek adds in `loff_t`, so a sum past LLONG_MAX wraps negative,
+    // which it refuses as it refuses any negative position: EINVAL, the
+    // position unchanged (`seq_lseek`'s `offset += file->f_pos` and its
+    // `offset < 0` check, fs/seq_file.c:315-320 in 6.17). Never EOVERFLOW,
+    // which `ksys_lseek` returns only where `off_t` is narrower than `loff_t`
+    // (fs/read_write.c:393-408), not on x86_64.
+    let new_offset = i64::try_from(new_offset)
+        .ok()
+        .and_then(|offset| usize::try_from(offset).ok())
+        .ok_or(Errno::EINVAL)?;
     if seek == RenderedSeek::Generic && new_offset > MAX_NON_LFS {
         return Err(Errno::EINVAL);
     }
@@ -3240,13 +3313,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(copy_timer_slack_output(&mut guest.memory(), buffer, &bytes)? as i64)
     }
 
-    /// A vectored read of a procfs file Detcore renders: one read of its
-    /// snapshot, as Linux's `read_iter` serves the whole vector at once,
+    /// A vectored read of a procfs file Detcore renders, or of a per-process
+    /// seq file the kernel opened that the session does not render
+    /// (`ProcfsFile::follows_record_sequence`: `arch_status` where the guest's
+    /// CPUID instruction is not intercepted), whose reads Detcore already
+    /// serves from a sanitized capture (before, its vectored reads were
+    /// ENOSYS): one read of its snapshot, as Linux's `read_iter` serves the
+    /// whole vector at once,
     /// scattered over the `count` vectors at `address`, at `offset` or at
     /// (and advancing) the shared cursor. The order is `vfs_readv`'s: the
     /// descriptor's access mode, then the vectors' import (`EFAULT` for any
     /// destination outside the user address range, even at end of file), an
-    /// empty vector (0), the range (`rw_verify_area`), and the flags.
+    /// empty vector (0), the range (`rw_verify_area`), and the flags. A
+    /// record sequence a fork shares comes from Detcore's global state and
+    /// goes back to it (`Self::readv_with_shared_sequence`).
     async fn readv_rendered_procfs<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3256,6 +3336,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         offset: Option<i64>,
         flags: i32,
     ) -> Result<i64, Error> {
+        if let Some(id) = Self::procfs_sequence_to_take(guest, fd) {
+            return self
+                .readv_with_shared_sequence(guest, fd, address, count, offset, flags, id)
+                .await;
+        }
         let status = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.status_flags())?;
@@ -3328,16 +3413,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             return Ok(total as i64);
         }
-        // A rendered `stat` renders anew where the read does not continue
-        // the sequence (`ProcfsFile::drop_stale_task_snapshot`).
-        let renders_task_record = guest
+        // A rendered per-process file runs its record's `show` where the read
+        // does not continue the record's sequence
+        // (`ProcfsFile::drop_stale_task_snapshot`, `Self::check_record_show`).
+        let follows_record = guest
             .thread_state()
-            .with_detfd(fd, |detfd| detfd.procfs_renders_task_record())?;
-        let task_record_start = if renders_task_record {
+            .with_detfd(fd, |detfd| detfd.procfs_follows_record_sequence())?;
+        let task_record_start = if follows_record {
             let start = usize::try_from(position).map_err(|_| Errno::EINVAL)?;
-            guest
+            if guest
                 .thread_state()
-                .with_detfd(fd, |detfd| detfd.procfs_drop_stale_task_snapshot(start))?;
+                .with_detfd(fd, |detfd| detfd.procfs_drop_stale_task_snapshot(start))?
+            {
+                self.check_record_show(guest, fd, start).await?;
+            }
             Some(start)
         } else {
             None
@@ -3363,17 +3452,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 })?;
             }
             rendered?;
-        } else if let Some(offset) = offset
-            && !renders_task_record
-            && guest.thread_state().with_detfd(fd, |detfd| {
-                detfd
-                    .procfs_position()
-                    .is_some_and(|(position, _)| position as i64 != offset)
-            })?
-        {
-            // A read at a position the buffered snapshot does not start at
-            // runs a per-process file's `show` again (`traverse`).
-            self.require_rendered_task(guest, fd).await?;
         }
         let start = match offset {
             Some(offset) => offset as usize,
@@ -7581,6 +7659,245 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(copied as i64)
     }
 
+    /// Whether an operation on `fd` must be refused because its open file's
+    /// record sequence is one Detcore cannot know here
+    /// (`DetFd::record_sequence_unknown`): a read, positioned or vectored
+    /// (`seek` false), through a descriptor that can read, or a seek
+    /// (`seek` true) through one that has a position. A read through a
+    /// descriptor that cannot read never reaches the sequence (`vfs_read`
+    /// refuses it with EBADF first, fs/read_write.c:556-557 in 6.17), nor does
+    /// a seek of an `O_PATH` descriptor (EBADF): those keep their answers.
+    ///
+    /// Also where a refusal that ends the run would strand it
+    /// ([`refusal_would_strand_the_run`]): there the call gets EOPNOTSUPP
+    /// ([`Self::refuse_unknown_record_sequence`]), so no read through the
+    /// descriptor reaches a separate copy of the sequence or the kernel's own
+    /// file. Before, SaBRe refused nothing here, and answered stale bytes, end
+    /// of file and, for a file the kernel opened, the host's own unsanitized
+    /// statm, with no message (Claude's final check of the kvm lane's slice
+    /// N3).
+    fn refuses_unknown_record_sequence<G: Guest<Self>>(guest: &G, fd: RawFd, seek: bool) -> bool {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                detfd.record_sequence_unknown() && {
+                    let status = detfd.status_flags();
+                    if seek {
+                        status & libc::O_PATH == 0
+                    } else {
+                        can_read(status)
+                    }
+                }
+            })
+            .unwrap_or(false)
+    }
+
+    /// Refuse `sysno` on `fd` by name ([`Self::refuses_unknown_record_sequence`]),
+    /// through the unsupported-operation policy: a fail-closed run stops with
+    /// the policy's exit status (122) and this reason (on DBT, whose runtime
+    /// ends a refusal through its own exit and report path, 101 or 137 and the
+    /// reason), and a run started with `--allow-unsupported-syscalls` gives the
+    /// call EOPNOTSUPP. Where that stop would strand the run
+    /// ([`refusal_would_strand_the_run`], SaBRe's capabilities), the call gets
+    /// EOPNOTSUPP as with `--allow-unsupported-syscalls`, no process ends, and
+    /// the reason goes to the guest's standard error ([`write_to_guest_stderr`]):
+    /// the tool runs in the guest's process there and installs no log
+    /// subscriber, so `error!` would print nothing. Boxed, so the per-syscall
+    /// futures that call it stay within their bound
+    /// (`hot_path_futures_stay_small`).
+    fn refuse_unknown_record_sequence<'a, G: Guest<Self>>(
+        &'a self,
+        guest: &'a mut G,
+        sysno: Sysno,
+        fd: RawFd,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let path = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.path())
+                .ok()
+                .flatten();
+            let reason = unknown_record_sequence_reason(fd, path.as_deref());
+            let strands = refusal_would_strand_the_run(guest.config());
+            if strands {
+                write_to_guest_stderr(&format!(
+                    "Detcore refuses {sysno}: {reason}; the call gets EOPNOTSUPP, as a \
+                     refusal that ended the run would leave the run waiting on this process\n"
+                ));
+            } else {
+                // Named where the run's own output shows it: a backend whose
+                // tool runs in Hermit's process prints no stored reason.
+                error!("Detcore refuses {sysno}: {reason}");
+            }
+            crate::syscalls::helpers::refuse_unserviceable_operation_with(
+                guest,
+                self.cfg.panic_on_unsupported_syscalls && !strands,
+                sysno,
+                Errno::EOPNOTSUPP,
+                Some(&reason),
+            )
+            .await
+        })
+    }
+
+    /// The identity of `fd`'s open file description, where it is a per-process
+    /// file whose record sequence a fork shares, so that the sequence lives in
+    /// Detcore's global state between operations
+    /// (`ProcfsFile::sequence_is_shared`), and this thread has not taken it
+    /// already for the operation it is handling
+    /// (`ThreadState::procfs_sequence_taken`).
+    fn procfs_sequence_to_take<G: Guest<Self>>(guest: &G, fd: RawFd) -> Option<OpenFileId> {
+        let id = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_shared_sequence())
+            .ok()
+            .flatten()?;
+        (guest.thread_state().procfs_sequence_taken != Some(id)).then_some(id)
+    }
+
+    /// A vectored read of a per-process file whose record sequence a fork
+    /// shares, as [`Self::read_with_shared_sequence`].
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn readv_with_shared_sequence<'a, G: Guest<Self>>(
+        &'a self,
+        guest: &'a mut G,
+        fd: RawFd,
+        address: usize,
+        count: usize,
+        offset: Option<i64>,
+        flags: i32,
+        id: OpenFileId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.take_procfs_sequence(guest, fd, id).await;
+            let result = self
+                .readv_rendered_procfs(guest, fd, address, count, offset, flags)
+                .await;
+            self.store_procfs_sequence(guest, fd, id).await;
+            result
+        })
+    }
+
+    /// Before a read, positioned read, vectored read or seek of a per-process
+    /// file whose description a fork copied where the tool runs in each guest
+    /// process: take its record sequence (the cursor, where the sequence is,
+    /// and the buffered record) from Detcore's global state, as the last such
+    /// operation on the description, in whichever process, left it, so this
+    /// one decides from the state Linux's one `struct file` and `seq_file`
+    /// would hold (`seq_read_iter`, `seq_lseek`, fs/seq_file.c:171-206 and
+    /// 308-341 in 6.17). The first operation after the fork finds none there
+    /// and keeps this process's copy, which is the one the fork made
+    /// (`ThreadState::share_procfs_sequences`). It runs in this thread's turn,
+    /// as does [`Self::store_procfs_sequence`] after the operation, so every
+    /// process's operations follow one another in the guest's order; the
+    /// handler the operation runs again finds the sequence taken
+    /// (`ThreadState::procfs_sequence_taken`) and takes nothing more.
+    async fn take_procfs_sequence<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd, id: OpenFileId) {
+        let mut sequence = crate::tool_global::procfs_sequence(guest, id).await;
+        if sequence.is_some() {
+            // The descriptor is the one just looked up; nothing ran between.
+            let _ = guest.thread_state().with_detfd(fd, |detfd| {
+                if let Some(sequence) = sequence.take() {
+                    detfd.adopt_procfs_sequence(sequence);
+                }
+            });
+        }
+        guest.thread_state_mut().procfs_sequence_taken = Some(id);
+    }
+
+    /// After the operation [`Self::take_procfs_sequence`] preceded, whatever
+    /// its result: keep the description's record sequence in Detcore's global
+    /// state, for the next operation, in whichever process.
+    async fn store_procfs_sequence<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        id: OpenFileId,
+    ) {
+        guest.thread_state_mut().procfs_sequence_taken = None;
+        let sequence = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                (detfd.procfs_shared_sequence() == Some(id))
+                    .then(|| detfd.procfs_sequence())
+                    .flatten()
+            })
+            .ok()
+            .flatten();
+        if let Some(sequence) = sequence {
+            crate::tool_global::store_procfs_sequence(guest, id, sequence).await;
+        }
+    }
+
+    /// Before a send that passes the descriptors its messages at `headers`
+    /// name over `SCM_RIGHTS`, where the tool runs in each guest process:
+    /// each that is a rendered per-process file following its record's
+    /// sequence keeps that sequence in Detcore's global state from then on
+    /// (`ThreadState::share_sent_procfs_sequence`), taken and stored there now,
+    /// in the caller's turn, before the descriptor can reach another process:
+    /// a receiver whose registry names the open file takes it from there and
+    /// continues this process's record, as Linux's receiver does with the one
+    /// `struct file` (`Detcore::adopt_received_placeholder`,
+    /// `FileMetadata::adopt_placeholder`), and this process takes back what
+    /// that one stores. A description already shared there takes the stored
+    /// sequence first, so a stale copy never replaces it. Read from the
+    /// messages before the call, as `refuse_sending_virtual_timerfds` reads
+    /// them; a placeholder is never sent in a batch (`sendmmsg` refuses it).
+    pub(crate) async fn share_sent_record_sequences<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        headers: &[usize],
+    ) {
+        if crate::syscalls::timerfd::detcore_runs_outside_the_guest(&self.cfg.backend) {
+            return;
+        }
+        let (sent, _) = crate::syscalls::io::sent_descriptors(guest, headers);
+        for fd in sent {
+            let Some(id) = guest.thread_state().share_sent_procfs_sequence(fd) else {
+                continue;
+            };
+            self.take_procfs_sequence(guest, fd, id).await;
+            self.store_procfs_sequence(guest, fd, id).await;
+        }
+    }
+
+    /// The checks of the `show` of a per-process file's record, where a read
+    /// or a seek at `position` runs it (`ProcfsFile::drop_stale_task_snapshot`,
+    /// `ProcfsFile::seek_task_record`): for a rendered file the task must
+    /// still be the one the file was bound to (ESRCH), and a task's `io` asks
+    /// whether the reader may read it (EACCES)
+    /// (`Self::require_rendered_task`), before the record is rendered; for
+    /// one the kernel opened, nothing here: the new capture of the kernel's
+    /// file that follows is the kernel's own `show`, which answers. Linux's
+    /// `seq_read_iter` and `seq_lseek` run `show` at a read at 0 and at a read
+    /// or seek elsewhere than the sequence, and never for a read that
+    /// continues it, so a revoked `io` or a reaped task is found at those
+    /// reads only, positioned or not (fs/seq_file.c:188-206 and 308-340 in
+    /// 6.17). A process's `stat` and a task's `comm` find the task as they
+    /// render (`Self::rendered_task_stat`): nothing more here. A failed `show`
+    /// resets the sequence as `seq_read_iter` does after a failed traversal
+    /// (`ProcfsFile::note_task_record_rendered`), and leaves the shared cursor.
+    async fn check_record_show<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        position: usize,
+    ) -> Result<(), Error> {
+        if guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_renders_task_record())?
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.require_rendered_task(guest, fd).await {
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.procfs_note_task_record_rendered(position, false)
+            })?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     async fn initialize_procfs_snapshot<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -7645,26 +7962,53 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             Some(template) => {
                 // A per-process file's `show` finds its task again: a task
-                // that is gone, or whose pid another task now holds, is ESRCH.
-                // At position 0 only: a description that has no snapshot at
-                // another position is one rebuilt from a placeholder whose
-                // first read happened in another process
-                // (`adopt_received_placeholder`, `adopt_placeholder`), where
-                // Linux reads on from the buffer that read filled, without
-                // looking for the task.
-                let position = guest
-                    .thread_state()
-                    .with_detfd(call.fd(), |detfd| detfd.procfs_position())?
-                    .map_or(0, |(offset, _)| offset);
-                if position == 0 {
+                // that is gone, or whose pid another task now holds, is ESRCH;
+                // a task's `io` also asks whether the reader may read it. The
+                // caller runs those checks where Linux runs `show`
+                // (`Self::check_record_show`), except for a process's `stat`
+                // and a task's `comm`, whose rendering finds the task itself
+                // (`Self::rendered_task_stat`) and which are also checked here
+                // at the cursor 0. A description with no snapshot at another
+                // position is one rebuilt from a placeholder whose first read
+                // happened in another process (`adopt_received_placeholder`,
+                // `adopt_placeholder`), where Linux reads on from the buffer
+                // that read filled, without looking for the task.
+                let (position, task_record) =
+                    guest.thread_state().with_detfd(call.fd(), |detfd| {
+                        (
+                            detfd.procfs_position().map_or(0, |(offset, _)| offset),
+                            detfd.procfs_renders_task_record(),
+                        )
+                    })?;
+                if position == 0 && task_record {
                     self.require_rendered_task(guest, call.fd()).await?;
                 }
-                // `/proc/locks` Detcore renders: its lock ledger's rows now
-                // (package K slice K8-h).
-                match mount_table {
-                    Some(table) => table,
-                    None if ledger_locks => Box::pin(self.ledger_locks_text(guest)).await,
-                    None => template.to_vec(),
+                // A rendered `/proc/diskstats` starts from the host's table
+                // as the run first read it, from the coordinator, not from
+                // its template: one rebuilt from a placeholder in another
+                // process or image carries no snapshot, and asks for the
+                // same table its open took. A table the run could not read
+                // is a named failure, never a table of no devices.
+                if guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| detfd.procfs_renders_host_diskstats())?
+                {
+                    crate::tool_global::host_diskstats(guest)
+                        .await
+                        .map_err(|errno| {
+                            Error::Tool(anyhow::anyhow!(
+                                "the host's /proc/diskstats, which a rendered /proc/diskstats \
+                                 is made from, could not be read: {errno}"
+                            ))
+                        })?
+                } else {
+                    // `/proc/locks` Detcore renders: its lock ledger's rows now
+                    // (package K slice K8-h).
+                    match mount_table {
+                        Some(table) => table,
+                        None if ledger_locks => Box::pin(self.ledger_locks_text(guest)).await,
+                        None => template.to_vec(),
+                    }
                 }
             }
             // A mount table file the kernel opened takes no capture of the
@@ -7968,17 +8312,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A placeholder (`procfs_rendered_path`), which exists only where the
         // session renders the file, is rendered from the table: it holds no
         // other bytes.
-        let (is_cpuinfo, placeholder) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (
-                detfd.procfs_is_cpuinfo(),
-                detfd.procfs_rendered_path().is_some(),
-            )
-        })?;
-        let virtual_cpuinfo = (is_cpuinfo && (placeholder || self.rendered_files(guest).cpuinfo))
-            .then(|| {
-                self.virtual_cpuid()
-                    .cpuinfo(guest.config().virtual_cpu_count())
-            });
+        let (is_cpuinfo, is_arch_status, placeholder) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.procfs_is_cpuinfo(),
+                    detfd.procfs_is_arch_status(),
+                    detfd.procfs_rendered_path().is_some(),
+                )
+            })?;
+        let renders_virtual_cpu =
+            (is_cpuinfo || is_arch_status) && (placeholder || self.rendered_files(guest).cpuinfo);
+        let virtual_cpuinfo = (is_cpuinfo && renders_virtual_cpu).then(|| {
+            self.virtual_cpuid()
+                .cpuinfo(guest.config().virtual_cpu_count())
+        });
+        // A task's `arch_status` describes the same CPU. Detcore renders it
+        // from the same table exactly where it renders `/proc/cpuinfo`, and
+        // there one the kernel opened describes the virtual CPU too.
+        let virtual_arch_status =
+            (is_arch_status && renders_virtual_cpu).then(|| self.virtual_cpuid().arch_status());
         let needs_random_uuid = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_random_uuid())?;
@@ -8273,6 +8625,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     fdinfo_identity,
                     random_uuid,
                     virtual_cpuinfo: virtual_cpuinfo.clone(),
+                    virtual_arch_status: virtual_arch_status.clone(),
                     machine: machine.clone(),
                     schedstat_runtime,
                     published_sigblk: mask_facts.sigblk,
@@ -8561,12 +8914,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// SYS_read system call (MAYHANG), of a per-process file whose record
+    /// sequence a fork shares, description `id` (`Self::procfs_sequence_to_take`):
+    /// [`Self::handle_read`] with the sequence taken from Detcore's global
+    /// state and stored back (`Self::take_procfs_sequence`). Boxed here, so
+    /// that the handler's own future stays as it was.
+    #[allow(clippy::type_complexity)]
+    fn read_with_shared_sequence<'a, G: Guest<Self>>(
+        &'a self,
+        guest: &'a mut G,
+        call: syscalls::Read,
+        id: OpenFileId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.take_procfs_sequence(guest, call.fd(), id).await;
+            let result = self.handle_read(guest, call).await;
+            self.store_procfs_sequence(guest, call.fd(), id).await;
+            result
+        })
+    }
+
     /// SYS_read system call (MAYHANG).
     pub async fn handle_read<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<i64, Error> {
+        if Self::refuses_unknown_record_sequence(guest, call.fd(), false) {
+            return self
+                .refuse_unknown_record_sequence(guest, Sysno::read, call.fd())
+                .await;
+        }
+        if let Some(id) = Self::procfs_sequence_to_take(guest, call.fd()) {
+            return self.read_with_shared_sequence(guest, call, id).await;
+        }
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             return self
                 .read_timer_slack(guest, call.fd(), call.buf(), call.len())
@@ -8633,15 +9014,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.len(),
             )?;
         }
-        // A rendered `stat` renders anew where the read does not continue
-        // the sequence: after a `pread` or a `preadv` moved it, the shared
-        // cursor is elsewhere (`ProcfsFile::drop_stale_task_snapshot`). Only
-        // after `vfs_read`'s checks: the descriptor's access (above), the
-        // destination (`access_ok`, above) and the range (`rw_verify_area`:
-        // a cursor plus count past LLONG_MAX is EINVAL).
+        // A rendered per-process file runs its record's `show` where the read
+        // does not continue the record's sequence: at the cursor 0, and
+        // after a `pread` or a `preadv` moved the sequence, the shared cursor
+        // is elsewhere (`ProcfsFile::drop_stale_task_snapshot`,
+        // `Self::check_record_show`). Only after `vfs_read`'s checks: the
+        // descriptor's access (above), the destination (`access_ok`, above)
+        // and the range (`rw_verify_area`: a cursor plus count past LLONG_MAX
+        // is EINVAL).
         let task_record_cursor = if guest
             .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_renders_task_record())?
+            .with_detfd(call.fd(), |detfd| detfd.procfs_follows_record_sequence())?
         {
             self.adopt_rendered_procfs_position(guest, call.fd())
                 .await?;
@@ -8649,9 +9032,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.procfs_position().map_or(0, |(offset, _)| offset)
             })?;
             verify_procfs_read_range(cursor, call.len())?;
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
+            if guest.thread_state().with_detfd(call.fd(), |detfd| {
                 detfd.procfs_drop_stale_task_snapshot(cursor)
-            })?;
+            })? {
+                self.check_record_show(guest, call.fd(), cursor).await?;
+            }
             Some(cursor)
         } else {
             None
@@ -8959,12 +9344,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(done as i64)
     }
 
+    /// SYS_pread64 system call of a per-process file whose record sequence a
+    /// fork shares, as [`Self::read_with_shared_sequence`].
+    #[allow(clippy::type_complexity)]
+    fn pread64_with_shared_sequence<'a, G: Guest<Self>>(
+        &'a self,
+        guest: &'a mut G,
+        call: syscalls::Pread64,
+        id: OpenFileId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.take_procfs_sequence(guest, call.fd(), id).await;
+            let result = self.handle_pread64(guest, call).await;
+            self.store_procfs_sequence(guest, call.fd(), id).await;
+            result
+        })
+    }
+
     /// SYS_pread64 system call.
     pub async fn handle_pread64<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Pread64,
     ) -> Result<i64, Error> {
+        if Self::refuses_unknown_record_sequence(guest, call.fd(), false) {
+            return self
+                .refuse_unknown_record_sequence(guest, Sysno::pread64, call.fd())
+                .await;
+        }
+        if let Some(id) = Self::procfs_sequence_to_take(guest, call.fd()) {
+            return self.pread64_with_shared_sequence(guest, call, id).await;
+        }
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             return self
                 .pread_timer_slack(guest, call.fd(), call.buf(), call.len(), call.offset())
@@ -8994,12 +9404,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
-        let (serves_procfs_snapshot, cannot_read, renders_task_record) =
+        let (serves_procfs_snapshot, cannot_read, follows_record) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.procfs_serves_snapshot(),
                     !can_read(detfd.status_flags()),
-                    detfd.procfs_renders_task_record(),
+                    detfd.procfs_follows_record_sequence(),
                 )
             })?;
         // A descriptor that cannot read (`O_PATH`, write-only, access mode 3)
@@ -9016,15 +9426,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.len(),
             )?;
         }
-        // A rendered `stat` renders anew where the read does not continue
-        // the sequence (`ProcfsFile::drop_stale_task_snapshot`), only after
-        // `vfs_read`'s checks: access, destination (above) and range
-        // (`rw_verify_area`: a position plus count past LLONG_MAX is EINVAL).
-        if renders_task_record {
+        // A rendered per-process file runs its record's `show` where the read
+        // does not continue the record's sequence: a `pread` at 0, and one
+        // elsewhere than where the sequence is, whatever the shared cursor
+        // (`ProcfsFile::drop_stale_task_snapshot`, `Self::check_record_show`),
+        // only after `vfs_read`'s checks: access, destination (above) and
+        // range (`rw_verify_area`: a position plus count past LLONG_MAX is
+        // EINVAL).
+        if follows_record {
             verify_procfs_read_range(offset, call.len())?;
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
+            if guest.thread_state().with_detfd(call.fd(), |detfd| {
                 detfd.procfs_drop_stale_task_snapshot(offset)
-            })?;
+            })? {
+                self.check_record_show(guest, call.fd(), offset).await?;
+            }
         }
         // A task's `schedstat` shows the runtime anew at a read at 0
         // (`ProcfsFile::drop_schedstat_snapshot_for_read_at`).
@@ -9044,17 +9459,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.procfs_note_task_record_rendered(offset, rendered.is_ok())
             })?;
             rendered?;
-        } else if serves_procfs_snapshot
-            && !renders_task_record
-            && guest.thread_state().with_detfd(call.fd(), |detfd| {
-                detfd
-                    .procfs_position()
-                    .is_some_and(|(position, _)| position != offset)
-            })?
-        {
-            // A read at a position the buffered snapshot does not start at
-            // runs a per-process file's `show` again (`traverse`).
-            self.require_rendered_task(guest, call.fd()).await?;
         }
 
         let procfs_bytes = guest
@@ -9157,12 +9561,37 @@ impl<T: RecordOrReplay> Detcore<T> {
             .is_procfs()
     }
 
+    /// SYS_lseek system call of a per-process file whose record sequence a
+    /// fork shares, as [`Self::read_with_shared_sequence`].
+    #[allow(clippy::type_complexity)]
+    fn lseek_with_shared_sequence<'a, G: Guest<Self>>(
+        &'a self,
+        guest: &'a mut G,
+        call: syscalls::Lseek,
+        id: OpenFileId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.take_procfs_sequence(guest, call.fd(), id).await;
+            let result = self.handle_lseek(guest, call).await;
+            self.store_procfs_sequence(guest, call.fd(), id).await;
+            result
+        })
+    }
+
     /// SYS_lseek system call.
     pub async fn handle_lseek<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Lseek,
     ) -> Result<i64, Error> {
+        if Self::refuses_unknown_record_sequence(guest, call.fd(), true) {
+            return self
+                .refuse_unknown_record_sequence(guest, Sysno::lseek, call.fd())
+                .await;
+        }
+        if let Some(id) = Self::procfs_sequence_to_take(guest, call.fd()) {
+            return self.lseek_with_shared_sequence(guest, call, id).await;
+        }
         let timer_slack_binding = self.timer_slack_binding(guest, call.fd())?;
         // A seek must not move the position under a `getdents` that is
         // reading or serving this open file's directory.
@@ -9331,44 +9760,62 @@ impl<T: RecordOrReplay> Detcore<T> {
                 RenderedSeek::Default
             };
             let new_offset = rendered_procfs_seek(seek, call.whence(), call.offset(), current)?;
-            let result = i64::try_from(new_offset).map_err(|_| Errno::EOVERFLOW)?;
-            // A rendered `stat` traverses at the seek wherever the sequence
-            // is not (`ProcfsFile::seek_task_record`): to a positive position
-            // its record is rendered here, in the seeking thread's turn, and
-            // a failed `show` (ESRCH, or the named refusal) leaves the cursor
-            // and the sequence at 0, as `seq_lseek` does.
+            let result = i64::try_from(new_offset).map_err(|_| Errno::EINVAL)?;
+            // A rendered per-process file traverses at the seek wherever its
+            // record's sequence is not (`ProcfsFile::seek_task_record`): to a
+            // positive position its `show` runs here, in the seeking thread's
+            // turn (ESRCH once its task is gone, EACCES where a task's `io`
+            // refuses the reader), and the record is rendered, except through
+            // a descriptor that cannot read, which runs those checks only
+            // (`Self::seek_record`); a rewind or a seek to where the sequence
+            // is runs none. A failed `show` (ESRCH, EACCES, or the named
+            // refusal) leaves the cursor and the sequence at 0 with nothing
+            // buffered, as `seq_lseek` does (fs/seq_file.c:327-332 in 6.17), so
+            // the next read runs `show` again.
             if guest
                 .thread_state()
-                .with_detfd(call.fd(), |detfd| detfd.procfs_renders_task_record())?
+                .with_detfd(call.fd(), |detfd| detfd.procfs_follows_record_sequence())?
             {
-                let renders = guest
-                    .thread_state()
-                    .with_detfd(call.fd(), |detfd| detfd.seek_procfs_task_record(new_offset))?;
-                if renders
-                    && let Err(error) = self
-                        .initialize_procfs_snapshot(guest, syscalls::Read::new().with_fd(call.fd()))
-                        .await
-                {
-                    guest
-                        .thread_state()
-                        .with_detfd(call.fd(), |detfd| detfd.reset_procfs_task_record())?;
-                    self.sync_rendered_procfs_position(guest, call.fd()).await?;
-                    return Err(error);
-                }
-                self.sync_rendered_procfs_position(guest, call.fd()).await?;
-                return Ok(result);
-            }
-            // seq_lseek to another positive position traverses the file,
-            // which runs a per-process file's `show` (ESRCH once its task is
-            // gone); a rewind or a no-op does not.
-            if new_offset != 0 && new_offset != current {
-                self.require_rendered_task(guest, call.fd()).await?;
+                return self.seek_record(guest, call.fd(), new_offset, result).await;
             }
             guest
                 .thread_state()
                 .with_detfd(call.fd(), |detfd| detfd.seek_procfs(new_offset))?;
             self.sync_rendered_procfs_position(guest, call.fd()).await?;
             return Ok(result);
+        }
+
+        // A per-process file the kernel opened that follows its record's
+        // sequence (through `..` or a symbolic link, after `chroot`, under
+        // record and replay, or `arch_status` where the guest's CPUID
+        // instruction is not intercepted) seeks as a rendered one does
+        // (above), whether or not Detcore holds a snapshot of it (none on a
+        // fresh descriptor, nor after a failed `show`): from Detcore's own
+        // cursor, as `seq_lseek` starts SEEK_CUR from the file's position
+        // (fs/seq_file.c:308-341 in 6.17), with a traverse wherever the
+        // sequence is not, whose `show` is a new capture of the kernel's file
+        // (`Self::seek_record`). Never by the kernel's file itself, whose
+        // position and sequence Detcore's own captures moved
+        // (`Self::snapshot_procfs` rewinds it and reads it to its end), except
+        // through a descriptor that cannot read, which Detcore never captures
+        // through (`Self::seek_unreadable_kernel_record`). An `O_PATH`
+        // descriptor has no position (EBADF), as above.
+        if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_follows_record_sequence())?
+        {
+            if status_flags & libc::O_PATH != 0 {
+                return Err(Errno::EBADF.into());
+            }
+            let new_offset =
+                rendered_procfs_seek(RenderedSeek::SeqFile, call.whence(), call.offset(), current)?;
+            let result = i64::try_from(new_offset).map_err(|_| Errno::EINVAL)?;
+            if !can_read(status_flags) {
+                return self
+                    .seek_unreadable_kernel_record(guest, call.fd(), new_offset, result)
+                    .await;
+            }
+            return self.seek_record(guest, call.fd(), new_offset, result).await;
         }
 
         let Some(snapshot_len) = snapshot_len else {
@@ -9412,6 +9859,114 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(new_offset))?;
         self.sync_rendered_procfs_position(guest, call.fd()).await?;
         Ok(result)
+    }
+
+    /// A seek to `new_offset` (returning `result`) of a per-process file that
+    /// follows its record's sequence (`ProcfsFile::follows_record_sequence`),
+    /// as Linux's `seq_lseek` moves it (fs/seq_file.c:308-340 in 6.17): to
+    /// anywhere but where the sequence is it traverses, which runs the
+    /// record's `show` here, in the seeking thread's turn, for a positive
+    /// position (`Self::check_record_show`, then the record rendered or, for
+    /// a file the kernel opened, captured anew); a rewind or a seek to where
+    /// the sequence is runs none. A failed `show` (ESRCH, EACCES, or the
+    /// named refusal) leaves the cursor and the sequence at 0 with nothing
+    /// buffered, as `seq_lseek` does (fs/seq_file.c:327-332), so the next read
+    /// runs `show` again.
+    ///
+    /// `seq_lseek` never looks at the descriptor's access mode (nor does
+    /// `vfs_llseek`, which checks only `FMODE_LSEEK`, fs/read_write.c:385-390),
+    /// so a rendered file's descriptor that cannot read (write-only, or access
+    /// mode 3) traverses the same way and runs the same checks, the task's
+    /// (ESRCH) and an `io`'s reader's (EACCES), through
+    /// `Self::require_rendered_task` (`proc_single_show` and
+    /// `do_io_accounting`, fs/proc/base.c:800-816 and 3027-3039), and renders
+    /// nothing: nothing can read through it (`vfs_read` refuses it with EBADF
+    /// first, fs/read_write.c:556-557), and a snapshot is refused to it
+    /// (`Self::initialize_procfs_snapshot`). Such a descriptor of a file the
+    /// kernel opened goes to the kernel instead
+    /// (`Self::seek_unreadable_kernel_record`).
+    async fn seek_record<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        new_offset: usize,
+        result: i64,
+    ) -> Result<i64, Error> {
+        let (shows, readable) = guest.thread_state().with_detfd(fd, |detfd| {
+            (
+                detfd.seek_procfs_task_record(new_offset),
+                can_read(detfd.status_flags()),
+            )
+        })?;
+        if shows {
+            let shown = if !readable {
+                self.require_rendered_task(guest, fd).await
+            } else {
+                match self.check_record_show(guest, fd, new_offset).await {
+                    Ok(()) => {
+                        self.initialize_procfs_snapshot(guest, syscalls::Read::new().with_fd(fd))
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            if let Err(error) = shown {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.reset_procfs_task_record())?;
+                self.sync_rendered_procfs_position(guest, fd).await?;
+                return Err(error);
+            }
+        }
+        self.sync_rendered_procfs_position(guest, fd).await?;
+        Ok(result)
+    }
+
+    /// A seek to `new_offset` (returning `result`) of a per-process file the
+    /// kernel opened that follows its record's sequence, through a descriptor
+    /// that cannot read (write-only, or access mode 3): the kernel's own
+    /// `seq_lseek` answers, on the kernel's file, through the recording.
+    /// Detcore never captures through such a descriptor (its reads are EBADF
+    /// before anything, as `vfs_read`'s are, fs/read_write.c:556-557), so the
+    /// kernel's file holds this description's position and sequence exactly:
+    /// its traverse runs `show` where Linux's does, and nowhere else (ESRCH
+    /// for a task gone, EACCES for an `io` the opener may not read), and a
+    /// failed one leaves the position and the sequence at 0
+    /// (fs/seq_file.c:322-337 in 6.17). Every seek of such a descriptor comes
+    /// here, so the two never part. Detcore's record of the description
+    /// follows the answer, for a later SEEK_CUR and for the processes that
+    /// share the description.
+    async fn seek_unreadable_kernel_record<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        new_offset: usize,
+        result: i64,
+    ) -> Result<i64, Error> {
+        let sought = self
+            .record_or_replay(
+                guest,
+                syscalls::Lseek::new()
+                    .with_fd(fd)
+                    .with_offset(result)
+                    .with_whence(Whence::SEEK_SET),
+            )
+            .await;
+        match sought {
+            Ok(position) => {
+                let position_usize = usize::try_from(position).unwrap_or(new_offset);
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.seek_procfs_task_record(position_usize))?;
+                Ok(position)
+            }
+            Err(errno) => {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.reset_procfs_task_record())?;
+                Err(errno.into())
+            }
+        }
     }
 
     /// Helper for performing a deterministic read that retries until it gets all its
@@ -9542,9 +10097,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // reintroducing the nondeterminism the mediated read()/write() path
         // sanitizes. Failing closed with ENOSYS makes callers fall back to
         // that mediated path (glibc's sendfile does exactly this).
-        let in_is_procfs = guest
-            .thread_state()
-            .with_detfd(call.in_fd(), |detfd| detfd.procfs_position().is_some())?;
+        // A per-process file whose record's sequence Detcore cannot know here
+        // (`DetFd::record_sequence_unknown`) is one too: the caller's
+        // fallback, a read, is then refused by name.
+        let in_is_procfs = guest.thread_state().with_detfd(call.in_fd(), |detfd| {
+            detfd.record_sequence_unknown() || detfd.procfs_position().is_some()
+        })?;
         if in_is_procfs {
             return Err(Errno::ENOSYS.into());
         }
@@ -10225,6 +10783,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Readv,
         rng_output: &mut Option<Vec<crate::io_buffers::BufferExtent>>,
     ) -> Result<i64, Error> {
+        if Self::refuses_unknown_record_sequence(guest, call.fd(), false) {
+            return self
+                .refuse_unknown_record_sequence(guest, Sysno::readv, call.fd())
+                .await;
+        }
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             self.require_timer_slack_access(guest, call.fd(), false)?;
             let iovecs = read_iovecs(&guest.memory(), call.iov(), call.len())?;
@@ -10234,7 +10797,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let files = self.rendered_files(guest);
         if guest.thread_state().with_detfd(call.fd(), |detfd| {
-            detfd.procfs_renderable_path(files).is_some()
+            detfd.procfs_renderable_path(files).is_some() || detfd.procfs_follows_record_sequence()
         })? {
             let address = call.iov().map_or(0, |address| address.as_raw());
             return self
@@ -10364,6 +10927,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         if offset < 0 {
             return Err(Errno::EINVAL.into());
         }
+        if Self::refuses_unknown_record_sequence(guest, call.fd(), false) {
+            return self
+                .refuse_unknown_record_sequence(guest, Sysno::preadv, call.fd())
+                .await;
+        }
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             self.require_timer_slack_access(guest, call.fd(), false)?;
             let iovecs = read_iovecs(&guest.memory(), call.iov(), call.iov_len())?;
@@ -10373,7 +10941,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let files = self.rendered_files(guest);
         if guest.thread_state().with_detfd(call.fd(), |detfd| {
-            detfd.procfs_renderable_path(files).is_some()
+            detfd.procfs_renderable_path(files).is_some() || detfd.procfs_follows_record_sequence()
         })? {
             let address = call.iov().map_or(0, |address| address.as_raw());
             return self
@@ -10440,6 +11008,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         if offset < -1 {
             return Err(Errno::EINVAL.into());
         }
+        if Self::refuses_unknown_record_sequence(guest, call.fd(), false) {
+            return self
+                .refuse_unknown_record_sequence(guest, Sysno::preadv2, call.fd())
+                .await;
+        }
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             self.require_timer_slack_access(guest, call.fd(), false)?;
             let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
@@ -10454,7 +11027,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let files = self.rendered_files(guest);
         if guest.thread_state().with_detfd(call.fd(), |detfd| {
-            detfd.procfs_renderable_path(files).is_some()
+            detfd.procfs_renderable_path(files).is_some() || detfd.procfs_follows_record_sequence()
         })? {
             let address = call.iov().map_or(0, |address| address.as_raw());
             let offset = (offset != -1).then_some(offset);
@@ -18828,6 +19401,72 @@ mod test {
             super::rendered_procfs_seek(Generic, Whence::from_raw(99), 0, 0),
             Err(Errno::EINVAL)
         );
+        // A sum past LLONG_MAX wraps negative in `loff_t`: EINVAL for a
+        // seq_file and a sysctl file alike, never EOVERFLOW. LLONG_MAX itself
+        // is a position.
+        let end = i64::MAX as usize;
+        assert_eq!(
+            super::rendered_procfs_seek(SeqFile, Whence::SEEK_SET, i64::MAX, 4),
+            Ok(end)
+        );
+        for seek in [SeqFile, Default] {
+            assert_eq!(
+                super::rendered_procfs_seek(seek, Whence::SEEK_CUR, i64::MAX, 4),
+                Err(Errno::EINVAL)
+            );
+            assert_eq!(
+                super::rendered_procfs_seek(seek, Whence::SEEK_CUR, 1, end),
+                Err(Errno::EINVAL)
+            );
+            assert_eq!(
+                super::rendered_procfs_seek(seek, Whence::SEEK_CUR, 0, end),
+                Ok(end)
+            );
+        }
+    }
+
+    /// The reason Detcore gives where it refuses a read or a seek of a
+    /// per-process file whose record sequence it cannot know here
+    /// (`Detcore::refuse_unknown_record_sequence`) names the descriptor, the
+    /// file where Detcore knows it, and why.
+    #[test]
+    fn an_unknown_record_sequence_is_refused_by_name() {
+        let reason =
+            super::unknown_record_sequence_reason(5, Some(std::path::Path::new("/proc/7/statm")));
+        for part in [
+            "descriptor 5, the per-process file /proc/7/statm,",
+            "over SCM_RIGHTS",
+            "the one open file every process holding it shares",
+            "neither reads nor seeks it",
+        ] {
+            assert!(reason.contains(part), "{part}: {reason}");
+        }
+        assert!(
+            super::unknown_record_sequence_reason(5, None)
+                .contains("descriptor 5, a per-process /proc file,")
+        );
+        // The refusal ends the run wherever that ends it: not where the
+        // fail-closed exit would end only a guest process from inside its
+        // tool (SaBRe's capabilities), where the call gets EOPNOTSUPP instead.
+        let config = |backend, shutdown| crate::Config {
+            backend,
+            shutdown_on_unsupported_syscall: shutdown,
+            ..crate::Config::default()
+        };
+        assert!(super::refusal_would_strand_the_run(&config(
+            reverie::BackendCapabilities::SABRE,
+            true
+        )));
+        for (backend, shutdown) in [
+            (reverie::BackendCapabilities::SABRE, false),
+            (reverie::BackendCapabilities::DBT, false),
+            (reverie::BackendCapabilities::PTRACE, true),
+            (reverie::BackendCapabilities::KVM, true),
+        ] {
+            assert!(!super::refusal_would_strand_the_run(&config(
+                backend, shutdown
+            )));
+        }
     }
 
     #[test]
