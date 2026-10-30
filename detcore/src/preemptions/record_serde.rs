@@ -705,5 +705,22 @@ mod tests {
             assert_eq!(read.replay_departed_at(), marker, "{written}");
             assert_eq!(read, copy, "{written}");
         }
+    /// `rewrite_exclusives_in_memory` rides in `RawRecord`: a plain record
+    /// written before the envelope reads it back, a plain record written now
+    /// keeps its bytes, and a marked record keeps the setting inside its
+    /// envelope.
+    #[test]
+    fn the_in_memory_exclusive_rewrite_survives_the_record_serde() {
+        let old = r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true}"#;
+        let record: PreemptionRecord = serde_json::from_str(old).unwrap();
+        assert!(record.rewrite_exclusives_in_memory());
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+        let mut writer = PreemptionWriter::new(None).with_rewrite_exclusives_in_memory(true);
+        writer.mark_replay_departed(7);
+        let marked = writer.into_string();
+        assert!(marked.contains(ENVELOPE), "{marked}");
+        let back: PreemptionRecord = serde_json::from_str(&marked).unwrap();
+        assert!(back.rewrite_exclusives_in_memory());
+        assert_eq!(back.replay_departed_at(), Some(7));
     }
 }
