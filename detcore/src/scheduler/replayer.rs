@@ -2061,7 +2061,7 @@ mod tests {
             r.die_on_desync = true;
             assert_eq!(
                 r.observe_event(&exited),
-                ReplayAction::ContextSwitch(false, tid(3), Some(LogicalTime::from_rcbs(123)))
+                ReplayAction::ContextSwitch(false, tid(3), Some(stop_after(123)))
             );
             assert_eq!(r.cursor.peek(), Some(&next));
             assert_eq!((r.traced_event_count, r.events_popped), (1, 1));
