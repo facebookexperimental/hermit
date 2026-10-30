@@ -203,8 +203,13 @@ pub(crate) fn strict_refusal(
         BinderReplay::WithoutReadmissions => Some(
             "--strict refuses binder in a replay of a record that stores no readmissions: a \
              binder call that goes to the background here would have no recorded turn to \
-             rejoin at, so the replay could not repeat its recording. Record the run again \
-             without --strict with this Hermit, which stores them, and replay that record"
+             rejoin at, so the replay could not repeat its recording. A record written \
+             before Hermit stored readmissions has none. A record built from events alone, \
+             edited, or cut to a prefix of its schedule (as the records of hermit analyze's \
+             trials are) cannot carry them. To replay binder under \
+             --strict, record the run again without --strict with this Hermit \
+             (hermit run --record-preemptions-to=RECORD ...), which stores them, and replay \
+             that whole record"
                 .to_string(),
         ),
     }
@@ -625,6 +630,17 @@ mod tests {
             assert!(refusal.contains("--replay-preemptions-from"), "{refusal}");
             let refusal = strict_refusal(request, || WithoutReadmissions).unwrap();
             assert!(refusal.contains("stores no readmissions"), "{refusal}");
+            // It names each kind of record that has none, and what to do.
+            for named in [
+                "written before Hermit stored readmissions",
+                "built from events alone",
+                "prefix of its schedule",
+                "record the run again",
+                "--record-preemptions-to",
+                "whole record",
+            ] {
+                assert!(refusal.contains(named), "{named}: {refusal}");
+            }
             assert_eq!(strict_refusal(request, || WithReadmissions), None);
         }
         for request in [
@@ -657,8 +673,9 @@ mod tests {
     /// The record files `--strict`'s binder policy reads: one a run writes
     /// stores its readmissions even when none of its calls went to the
     /// background, so its replay may make binder calls. A record without
-    /// them, from a Hermit that did not log them, built from events alone, or
-    /// unreadable, is refused with the advice to record again.
+    /// them, from a Hermit that did not log them, built from events alone,
+    /// cut to a prefix of its schedule, edited, or unreadable, is refused with
+    /// the advice to record again.
     #[test]
     fn a_current_record_without_backgrounded_calls_may_replay_binder_under_strict() {
         let dir = tempfile::tempdir().unwrap();
@@ -666,16 +683,23 @@ mod tests {
         let event = crate::types::SchedEvent::branches(crate::types::DetTid::from_raw(3), 7);
         let mut current = crate::preemptions::PreemptionWriter::new(None);
         current.insert_schedevent(event.clone());
+        current.insert_schedevent(event.clone());
         let synthesized =
             crate::preemptions::PreemptionRecord::from_sched_events(vec![event]).to_string();
+        let current = current.into_string();
+        let whole: crate::preemptions::PreemptionRecord = serde_json::from_str(&current).unwrap();
+        let prefix = whole.schedule_prefix(1).to_string();
+        let edited = whole.clone_preemptions_only().to_string();
         for (name, text, allowed) in [
-            ("current", current.into_string(), true),
+            ("current", current, true),
             (
                 "legacy",
                 r#"{"per_thread":{},"global":[]}"#.to_string(),
                 false,
             ),
             ("synthesized", synthesized, false),
+            ("prefix", prefix, false),
+            ("edited", edited, false),
             ("unreadable", "not a record".to_string(), false),
         ] {
             let path = dir.path().join(format!("{name}.json"));
