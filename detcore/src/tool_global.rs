@@ -1290,9 +1290,10 @@ pub struct GlobalState {
     // Whether `settle_host_inputs` has run.
     host_inputs_settled: AtomicBool,
 
-    // The kinds of file behind the guest's standard descriptors when the run
-    // began, when `Config::record_host_inputs` is set, and those that differ
-    // from the replayed recording's (`detcore_model::host_input::StdioKinds`).
+    // The kinds of file behind the guest's standard descriptors as its
+    // launcher gave them (`Config::launch_stdio`), when
+    // `Config::record_host_inputs` is set, and those that differ from the
+    // replayed recording's (`detcore_model::host_input::StdioKinds`).
     // Information only, as `recorded_host_inputs` is.
     stdio: Option<detcore_model::host_input::StdioKinds>,
     stdio_changed: Vec<detcore_model::host_input::StdioChange>,
@@ -1923,10 +1924,12 @@ impl GlobalState {
                     .or_else(|| sched.lock().unwrap().recorded_host_inputs.clone())
             })
             .flatten();
-        // The guest inherits this process's standard descriptors. A replay
-        // names each whose kind differs from its recording's, before the
-        // guest runs.
-        let stdio = cfg.record_host_inputs.then(crate::host_inputs::stdio_kinds);
+        // The guest's standard descriptors are the ones its launcher gave it,
+        // which are not this process's own where the launch captures the
+        // guest's output (`Config::launch_stdio`); a launch that does not say
+        // records none. A replay names each whose kind differs from its
+        // recording's, before the guest runs.
+        let stdio = cfg.record_host_inputs.then_some(cfg.launch_stdio).flatten();
         let stdio_changed = match (
             recorded_host_inputs.as_ref().and_then(|set| set.stdio),
             stdio,

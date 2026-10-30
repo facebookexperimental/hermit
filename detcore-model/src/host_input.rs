@@ -332,6 +332,21 @@ impl StdioKind {
         }
     }
 
+    /// The kind of this process's descriptor `fd`: its `st_mode` and whether
+    /// it is a terminal, or [`Self::Closed`] where it is not open.
+    pub fn of_descriptor(fd: std::os::fd::RawFd) -> Self {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat writes a whole `struct stat` when it succeeds.
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            return Self::Closed;
+        }
+        // SAFETY: fstat succeeded, so it wrote the struct.
+        let stat = unsafe { stat.assume_init() };
+        // SAFETY: isatty only queries the descriptor.
+        let terminal = unsafe { libc::isatty(fd) } == 1;
+        Self::from_mode(stat.st_mode, terminal)
+    }
+
     fn describe(self) -> &'static str {
         match self {
             Self::File => "a regular file",
@@ -357,6 +372,16 @@ pub struct StdioKinds {
 }
 
 impl StdioKinds {
+    /// The kinds of this process's own standard descriptors, which a guest
+    /// launched to inherit them has.
+    pub fn of_this_process() -> Self {
+        Self {
+            stdin: StdioKind::of_descriptor(libc::STDIN_FILENO),
+            stdout: StdioKind::of_descriptor(libc::STDOUT_FILENO),
+            stderr: StdioKind::of_descriptor(libc::STDERR_FILENO),
+        }
+    }
+
     /// The descriptors whose kind differs between `recorded` and `now`, in
     /// descriptor order.
     pub fn changes(recorded: &Self, now: &Self) -> Vec<StdioChange> {

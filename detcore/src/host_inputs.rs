@@ -47,8 +47,6 @@ use detcore_model::host_input::HostInputLogEnd;
 use detcore_model::host_input::HostInputRecord;
 use detcore_model::host_input::HostInputSet;
 use detcore_model::host_input::HostMutationRecord;
-use detcore_model::host_input::StdioKind;
-use detcore_model::host_input::StdioKinds;
 use detcore_model::host_input::guest_rebound;
 use detcore_model::host_input::host_input_changed;
 use detcore_model::host_input::is_kernel_object;
@@ -140,28 +138,6 @@ pub(crate) fn input_set(records: &[HostInputRecord], mutated: &BTreeSet<String>)
         digest: hex(&hasher.finalize()),
         files,
         stdio: None,
-    }
-}
-
-/// The kinds of file behind this process's standard descriptors, which the
-/// guest inherits (`detcore_model::host_input::StdioKinds`).
-pub(crate) fn stdio_kinds() -> StdioKinds {
-    fn kind(fd: i32) -> StdioKind {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: fstat writes a whole `struct stat` when it succeeds.
-        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-            return StdioKind::Closed;
-        }
-        // SAFETY: fstat succeeded, so it wrote the struct.
-        let stat = unsafe { stat.assume_init() };
-        // SAFETY: isatty only queries the descriptor.
-        let terminal = unsafe { libc::isatty(fd) } == 1;
-        StdioKind::from_mode(stat.st_mode, terminal)
-    }
-    StdioKinds {
-        stdin: kind(libc::STDIN_FILENO),
-        stdout: kind(libc::STDOUT_FILENO),
-        stderr: kind(libc::STDERR_FILENO),
     }
 }
 

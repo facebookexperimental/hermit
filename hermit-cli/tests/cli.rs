@@ -26873,6 +26873,57 @@ fn a_schedule_replay_names_a_stdio_kind_changed_since_the_recording() {
     );
 }
 
+/// A run whose output Hermit captures records the kinds of the standard
+/// descriptors its guest was given, not Hermit's own. `--verify` gives each
+/// run's guest a snapshot of Hermit's stdin (here `/dev/null`) and piped
+/// stdout and stderr, so with Hermit's own stdout and stderr regular files
+/// the summary still says pipes, and the guest itself finds its stderr a pipe
+/// (`fsync` fails with `EINVAL`). Recording Hermit's descriptors instead
+/// would claim files the guest never had.
+#[test]
+fn a_verify_run_records_the_stdio_kinds_its_guest_was_given() {
+    let program = stderr_fsync_guest()
+        .to_str()
+        .expect("stderr-fsync guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let summary = directory.path().join("summary.json");
+    let summary_arg = format!("--summary-json={}", summary.display());
+    let args = [
+        "run",
+        "--verify",
+        "--base-env=minimal",
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        summary_arg.as_str(),
+        "--",
+        program,
+    ];
+    let stdout_path = directory.path().join("hermit.stdout");
+    let stderr_path = directory.path().join("hermit.stderr");
+    let mut command = hermit_command(&args);
+    command.stdin(Stdio::null());
+    command.stdout(fs::File::create(&stdout_path).unwrap());
+    command.stderr(fs::File::create(&stderr_path).unwrap());
+    let output = hermit_test::hermit_output("verify-stdio-kinds", &mut command);
+    let written = fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        output.status.success(),
+        "hermit {args:?} failed with {}\nstderr:\n{written}",
+        output.status
+    );
+    assert_eq!(
+        fs::read_to_string(&stdout_path).unwrap(),
+        "fsync(stderr) = Invalid argument\n",
+        "{written}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+    assert_eq!(
+        summary["host_inputs"]["stdio"],
+        serde_json::json!({"stdin": "char_device", "stdout": "pipe", "stderr": "pipe"}),
+        "{written}"
+    );
+}
+
 /// The program interpreter (`PT_INTERP`) an ELF64 executable names, or `None`
 /// for a static one.
 fn elf_program_interpreter(path: &Path) -> Option<String> {
