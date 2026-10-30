@@ -13984,7 +13984,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             binder::freeze_info(&guest.memory(), argument).as_ref(),
             nonblocking,
         );
-        let Some(waits) = waits else {
+        // Record and replay issue every binder call in the caller's turn, as
+        // main does: the ioctl recorder restores only the outer
+        // `binder_write_read`, so binder is unsupported there, and neither the
+        // poll below, which is not in the recording, nor the background path
+        // may add to what is recorded or replayed.
+        let Some(waits) = waits.filter(|_| !self.cfg.recordreplay_modes) else {
             return Ok((self.record_or_replay(guest, call).await?, false));
         };
         // A call whose read half has work waiting does not wait at all, so it
