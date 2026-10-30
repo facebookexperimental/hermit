@@ -148,9 +148,10 @@ pub(crate) enum BinderReplay {
     /// A fresh run: no record is replayed.
     Fresh,
     /// A preemption record that stores no readmissions: one made before they
-    /// were recorded, or by a run none of whose calls went to the background.
+    /// were recorded, or one built or edited in memory.
     WithoutReadmissions,
-    /// A preemption record that stores where each backgrounded call rejoined.
+    /// A preemption record whose run logged where each backgrounded call
+    /// rejoined: none at all when no call went to the background.
     WithReadmissions,
 }
 
@@ -211,24 +212,33 @@ pub(crate) fn strict_refusal(
 
 /// What the run replays (`--replay-preemptions-from`, else
 /// `--replay-schedule-from`), read once per process: every run, `--verify`
-/// half and analyze trial runs in its own. A record whose readmissions cannot
-/// be read, or are out of order, counts as storing none: the scheduler
-/// refuses an out-of-order record before any guest runs.
+/// half and analyze trial runs in its own (`replay_of`).
 pub(crate) fn binder_replay(cfg: &detcore_model::config::Config) -> BinderReplay {
     static REPLAY: std::sync::OnceLock<BinderReplay> = std::sync::OnceLock::new();
     *REPLAY.get_or_init(|| {
-        match cfg
-            .replay_preemptions_from
-            .as_ref()
-            .or(cfg.replay_schedule_from.as_ref())
-        {
-            None => BinderReplay::Fresh,
-            Some(path) => match crate::preemptions::read_recorded_rejoins(path) {
-                Ok(Some(rejoins)) if !rejoins.is_empty() => BinderReplay::WithReadmissions,
-                _ => BinderReplay::WithoutReadmissions,
-            },
-        }
+        replay_of(
+            cfg.replay_preemptions_from
+                .as_deref()
+                .or(cfg.replay_schedule_from.as_deref()),
+        )
     })
+}
+
+/// What replaying the record at `path`, if any, is for `--strict`'s binder
+/// policy. A record says whether its run logged readmissions
+/// (`read_recorded_rejoins` gives `Some` list): one that did stores them even
+/// when none of its calls went to the background, and its replay may use
+/// binder. A record that predates them, was built or edited in memory, or
+/// cannot be read, has none, and neither does one whose readmissions are out
+/// of order, which the scheduler refuses before any guest runs.
+fn replay_of(path: Option<&std::path::Path>) -> BinderReplay {
+    match path {
+        None => BinderReplay::Fresh,
+        Some(path) => match crate::preemptions::read_recorded_rejoins(path) {
+            Ok(Some(_)) => BinderReplay::WithReadmissions,
+            Ok(None) | Err(_) => BinderReplay::WithoutReadmissions,
+        },
+    }
 }
 
 /// Whether `request`, an `ioctl` request word, is `BINDER_WRITE_READ`.
@@ -642,6 +652,49 @@ mod tests {
         }
         // Only the low 32 bits are the request.
         assert!(is_binder_request(BINDER_WRITE_READ | 0xffff_ffff_0000_0000));
+    }
+
+    /// The record files `--strict`'s binder policy reads: one a run writes
+    /// stores its readmissions even when none of its calls went to the
+    /// background, so its replay may make binder calls. A record without
+    /// them, from a Hermit that did not log them, built from events alone, or
+    /// unreadable, is refused with the advice to record again.
+    #[test]
+    fn a_current_record_without_backgrounded_calls_may_replay_binder_under_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let version = binder_request(3, 9, size_of::<i32>());
+        let event = crate::types::SchedEvent::branches(crate::types::DetTid::from_raw(3), 7);
+        let mut current = crate::preemptions::PreemptionWriter::new(None);
+        current.insert_schedevent(event.clone());
+        let synthesized =
+            crate::preemptions::PreemptionRecord::from_sched_events(vec![event]).to_string();
+        for (name, text, allowed) in [
+            ("current", current.into_string(), true),
+            (
+                "legacy",
+                r#"{"per_thread":{},"global":[]}"#.to_string(),
+                false,
+            ),
+            ("synthesized", synthesized, false),
+            ("unreadable", "not a record".to_string(), false),
+        ] {
+            let path = dir.path().join(format!("{name}.json"));
+            std::fs::write(&path, &text).unwrap();
+            let replay = replay_of(Some(&path));
+            for request in [version, BINDER_WRITE_READ] {
+                let refusal = strict_refusal(request, || replay);
+                if allowed {
+                    assert_eq!(refusal, None, "{name}: {text}");
+                } else {
+                    let refusal = refusal.unwrap_or_else(|| panic!("{name}: {text}"));
+                    assert!(
+                        refusal.contains("stores no readmissions"),
+                        "{name}: {refusal}"
+                    );
+                }
+            }
+        }
+        assert_eq!(replay_of(None), BinderReplay::Fresh);
     }
 
     /// Every binder call that runs as external input is counted, and each
