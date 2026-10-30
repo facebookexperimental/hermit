@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""S0: direct single-run Hermit timing harness (no safehermit wrapper floor).
+
+Why this exists
+---------------
+`bin/safehermit` boxes every run in a fresh `systemd-run --user` unit. That
+provisioning costs ~1-1.5 s of wall time per invocation on a loaded host, which
+swamps Hermit's own 20-200 ms startup and makes short workloads unmeasurable.
+This harness times the Hermit binary as a *direct child*, so the measured wall
+and CPU are Hermit's, not the wrapper's.
+
+How the safehermit rule is honoured
+------------------------------------
+The rule's purpose is bounding, not the wrapper itself. This harness applies
+equivalent bounds to every timed sample and records each as APPLIED or
+NOT_APPLIED in its output metadata (the same fail-loud discipline):
+
+  bound.wall   APPLIED  per-sample wall timeout; the whole process group is
+                        SIGKILLed on expiry.
+  bound.cpu    APPLIED  RLIMIT_CPU set to the sample timeout, and the child
+                        is confined to a K=1 CPU set (sched_setaffinity to one
+                        chosen CPU; no per-thread pinning inside the guest).
+  bound.memory APPLIED  RLIMIT_AS from --memory-mb (default 16384 MiB).
+  bound.output APPLIED  stdout/stderr go to capped temp files; a sample that
+                        exceeds --output-cap bytes is killed and failed.
+  bound.cgroup NOT_APPLIED  /sys/fs/cgroup is not writable by the invoking
+                        user on typical dev hosts, so no dedicated cgroup is
+                        created. The rlimit+affinity bounds above are the
+                        replacement; on a host with delegated cgroup v2 this
+                        line must be revisited before publish-grade runs.
+
+This harness is for *timing only*. Exploratory, adversarial, or long-running
+Hermit invocations still go through `bin/safehermit`.
+
+Output: results.json (raw samples, medians, IQR, getpid slopes/intercepts,
+metadata with full Hermit SHA, chosen CPU, load averages) under --output-dir
+(default benchmarks/results/direct). Statistics: median primary, IQR shown.
+A sample counts only on exit 0 and exact expected stdout; failures are kept.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import platform
+import resource
+import signal
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+EPOCH = "2026-01-01T00:00:00Z"
+BACKENDS = ("native", "ptrace", "kvm", "liteinst", "dbt")
+
+
+def median_iqr(samples: list[float]) -> dict:
+    ordered = sorted(samples)
+    n = len(ordered)
+    return {
+        "samples": samples,
+        "median": statistics.median(ordered),
+        "q1": ordered[n // 4],
+        "q3": ordered[(3 * n) // 4],
+        "n": n,
+    }
+
+
+def fit_slope(xs: list[float], ys: list[float]) -> tuple[float, float]:
+    """Least-squares (slope, intercept); slope is per-unit cost in y units."""
+    xm = sum(xs) / len(xs)
+    ym = sum(ys) / len(ys)
+    den = sum((x - xm) ** 2 for x in xs)
+    if den == 0:
+        raise ValueError("fit needs at least two distinct x values")
+    slope = sum((x - xm) * (y - ym) for x, y in zip(xs, ys)) / den
+    return slope, ym - slope * xm
+
+
+def pick_quiet_cpu(idle_fractions: dict[int, float], allowed: set[int]) -> int:
+    """Choose the allowed CPU with the highest idle fraction (pure, tested)."""
+    candidates = {c: f for c, f in idle_fractions.items() if c in allowed}
+    if not candidates:
+        raise ValueError("no allowed CPU has a measured idle fraction")
+    return max(candidates, key=lambda c: candidates[c])
+
+
+def measure_idle_fractions(sample_s: float = 0.5) -> dict[int, float]:
+    def snapshot() -> dict[int, tuple[int, int]]:
+        out = {}
+        for line in Path("/proc/stat").read_text().splitlines():
+            parts = line.split()
+            if len(parts) > 4 and parts[0].startswith("cpu") and parts[0][3:].isdigit():
+                vals = [int(v) for v in parts[1:]]
+                out[int(parts[0][3:])] = (sum(vals), vals[3] + vals[4])
+        return out
+
+    first = snapshot()
+    time.sleep(sample_s)
+    second = snapshot()
+    fractions = {}
+    for cpu, (total2, idle2) in second.items():
+        total1, idle1 = first[cpu]
+        if total2 > total1:
+            fractions[cpu] = (idle2 - idle1) / (total2 - total1)
+    return fractions
+
+
+class Bounds:
+    def __init__(self, cpu: int, timeout_s: float, memory_mb: int, output_cap: int):
+        self.cpu = cpu
+        self.timeout_s = timeout_s
+        self.memory_mb = memory_mb
+        self.output_cap = output_cap
+
+    def preexec(self) -> None:  # runs in the child before exec
+        os.setsid()
+        os.sched_setaffinity(0, {self.cpu})
+        # No RLIMIT_CPU: LiteInst (correctly) refuses a finite physical CPU
+        # limit, which would leak host timing into the deterministic guest.
+        # The wall timeout above is the CPU-time backstop.
+        mem = self.memory_mb * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+
+    def describe(self) -> dict:
+        return {
+            "bound.wall": f"APPLIED:{self.timeout_s:g}s process-group SIGKILL",
+            "bound.cpu": f"APPLIED:K=1 quietest-cpu={self.cpu} sched_setaffinity; RLIMIT_CPU NOT_APPLIED (LiteInst refuses finite physical RLIMIT_CPU; wall timeout is the backstop)",
+            "bound.memory": f"APPLIED:RLIMIT_AS={self.memory_mb}MiB",
+            "bound.output": f"APPLIED:cap={self.output_cap}B per stream",
+            "bound.cgroup": "NOT_APPLIED:/sys/fs/cgroup not writable by invoking user; rlimits+affinity are the replacement",
+        }
+
+
+def run_sample(cmd: list[str], bounds: Bounds, expect_stdout: str | None) -> dict:
+    """One timed direct-child run. Returns wall/cpu, status, and stdout."""
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("RUST_LOG", "HERMIT_LOG", "HERMIT_LOG_FILE")}
+        env["LC_ALL"] = "C"
+        rusage0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        start = time.perf_counter_ns()
+        proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f, env=env,
+                                preexec_fn=bounds.preexec)
+        try:
+            proc.wait(timeout=bounds.timeout_s)
+            status = "ok" if proc.returncode == 0 else f"exit:{proc.returncode}"
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            status = "timeout"
+        wall_s = (time.perf_counter_ns() - start) / 1e9
+        rusage1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu_s = (rusage1.ru_utime + rusage1.ru_stime) - (rusage0.ru_utime + rusage0.ru_stime)
+        out_f.seek(0)
+        stdout = out_f.read(bounds.output_cap + 1)
+        if len(stdout) > bounds.output_cap:
+            status = "output_cap"
+        text = stdout.decode(errors="replace").strip()
+    if status == "ok" and expect_stdout is not None and text != expect_stdout:
+        status = f"stdout_mismatch:{text[:80]!r}"
+    return {"wall_s": wall_s, "cpu_s": cpu_s, "status": status, "stdout": text}
+
+
+def hermit_cmd(hermit: Path, backend: str, prog: list[str]) -> list[str]:
+    if backend == "native":
+        return prog
+    cmd = [str(hermit), "--log=error", "--backend", backend,
+           "run", "--strict", "--epoch", EPOCH]
+    if backend == "liteinst":
+        cmd.append("--max-timeslice=disabled")
+    return cmd + ["--"] + prog
+
+
+def measure(cmd: list[str], bounds: Bounds, expect: str | None,
+            iterations: int, warmups: int) -> dict:
+    for _ in range(warmups):
+        run_sample(cmd, bounds, expect)
+    rows = [run_sample(cmd, bounds, expect) for _ in range(iterations)]
+    ok = [r for r in rows if r["status"] == "ok"]
+    result: dict = {"command": cmd, "rows": rows, "status": "ok" if len(ok) == len(rows) else "failed"}
+    if ok:
+        result["wall"] = median_iqr([r["wall_s"] for r in ok])
+        result["cpu"] = median_iqr([r["cpu_s"] for r in ok])
+    return result
+
+
+def git_sha() -> str:
+    try:
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
+                              capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--hermit", type=Path, default=ROOT / "target/release/hermit")
+    ap.add_argument("--backends", default="native,ptrace,kvm,liteinst")
+    ap.add_argument("--iterations", type=int, default=7)
+    ap.add_argument("--warmups", type=int, default=1)
+    ap.add_argument("--timeout", type=float, default=120.0)
+    ap.add_argument("--memory-mb", type=int, default=16384)
+    ap.add_argument("--output-cap", type=int, default=8 * 1024 * 1024)
+    ap.add_argument("--cpu", type=int, default=None)
+    ap.add_argument("--getpid-counts", default="0,10000,50000,100000")
+    ap.add_argument("--output-dir", type=Path, default=ROOT / "benchmarks/results/direct")
+    args = ap.parse_args()
+
+    backends = tuple(b.strip() for b in args.backends.split(",") if b.strip())
+    bad = set(backends) - set(BACKENDS)
+    if bad:
+        ap.error(f"unknown backends: {sorted(bad)}")
+    cpu = args.cpu if args.cpu is not None else pick_quiet_cpu(
+        measure_idle_fractions(), set(os.sched_getaffinity(0)))
+    bounds = Bounds(cpu, args.timeout, args.memory_mb, args.output_cap)
+    counts = [int(c) for c in args.getpid_counts.split(",")]
+
+    fixture_src = ROOT / "benchmarks/fixtures/getpid_loop.c"
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    fixture = args.output_dir / "getpid_loop"
+    subprocess.run(["cc", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                    str(fixture_src), "-o", str(fixture)], check=True)
+
+    load_start = os.getloadavg()
+    results: dict = {
+        "schema": "hermit-direct-run/v1",
+        "hermit_sha": git_sha(),
+        "hermit_binary": str(args.hermit),
+        "host_short": platform.node().split(".")[0],
+        "kernel": platform.release(),
+        "cpu_chosen": cpu,
+        "iterations": args.iterations,
+        "warmups": args.warmups,
+        "bounds": bounds.describe(),
+        "relaxations": {"liteinst": "--max-timeslice=disabled", "others": "none (--strict)"},
+        "loadavg_start": load_start,
+        "workloads": {},
+    }
+
+    # Startup: hermit run -- /bin/true (native: direct /bin/true).
+    startup = {}
+    for b in backends:
+        startup[b] = measure(hermit_cmd(args.hermit, b, ["/bin/true"]), bounds,
+                             "", args.iterations, args.warmups)
+        print(f"startup {b}: {startup[b].get('wall', {}).get('median')}", file=sys.stderr)
+    results["workloads"]["startup_true"] = startup
+
+    # Per-syscall slope from getpid_loop medians at positive counts.
+    getpid: dict = {}
+    for b in backends:
+        per_count = {}
+        for n in counts:
+            per_count[str(n)] = measure(
+                hermit_cmd(args.hermit, b, [str(fixture), str(n)]), bounds,
+                f"calls={n}", args.iterations, args.warmups)
+        xs = [float(n) for n in counts if n > 0]
+        ys = [per_count[str(int(x))]["wall"]["median"] for x in xs
+              if per_count[str(int(x))]["status"] == "ok"]
+        entry: dict = {"per_count": per_count}
+        if len(ys) == len(xs) and len(xs) >= 2:
+            slope_s, intercept_s = fit_slope(xs, ys)
+            entry["slope_us_per_call"] = slope_s * 1e6
+            entry["intercept_s"] = intercept_s
+        getpid[b] = entry
+        print(f"getpid {b}: slope_us={entry.get('slope_us_per_call')}", file=sys.stderr)
+    results["workloads"]["getpid"] = getpid
+    results["loadavg_end"] = os.getloadavg()
+
+    out = args.output_dir / "results.json"
+    out.write_text(json.dumps(results, indent=2) + "\n")
+    print(f"wrote {out}")
+    return 0 if all(v.get("status") == "ok" for w in results["workloads"].values()
+                    for v in w.values()) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

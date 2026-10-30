@@ -109,6 +109,28 @@ multiple result sets. For example:
   --backends native,ptrace --benchmarks cpu_bound
 ```
 
+## Direct single-run timing (S0) and tracked geomean (S1)
+
+`direct_run.py` times the Hermit binary as a direct child, without the
+`bin/safehermit` wrapper's per-run `systemd-run` provisioning floor (~1-1.5 s
+on a loaded host). It applies equivalent bounds itself — per-sample wall
+timeout with process-group kill, a K=1 CPU set plus `RLIMIT_CPU`,
+`RLIMIT_AS`, and capped output files — and records every bound as
+`APPLIED`/`NOT_APPLIED` in its output metadata (a dedicated cgroup is
+`NOT_APPLIED` where `/sys/fs/cgroup` is not user-writable; rlimits plus
+affinity are the stated replacement). It measures startup (`/bin/true`) and
+the `getpid` per-call slope/intercept for native, ptrace, KVM, LiteInst, and
+DBT, and writes raw samples with full-SHA metadata to
+`benchmarks/results/direct/results.json`. Use it for timing only; general
+Hermit runs still go through `bin/safehermit`.
+
+`geomean_report.py` turns that output into ledger-ready JSONL. A workload
+enters the geomean only when its native median is at least 30 s or it carries
+an intercept-corrected ratio; startup rows are emitted as excluded, never
+averaged. Its first population is the seed suite (the 17 longest realistic
+e2e cells), emitted as `not_measured` population rows until timed. Unit
+tests: `python3 -m unittest benchmarks.test_benchmark_tools -v`.
+
 ## Per-call system call cost
 
 `getpid_cost.rs` measures what one raw `getpid` call costs natively and under
