@@ -25,6 +25,7 @@
 //! state a scheduling decision reads: the trace observes the run.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::io::BufWriter;
@@ -1004,6 +1005,12 @@ struct EdgeState {
     last_event: BTreeMap<DetTid, EventIndex>,
     /// The process of each thread, from its syscalls.
     process_of: BTreeMap<DetTid, DetPid>,
+    /// Threads whose first event no clone's return has claimed yet: one
+    /// that ran before its parent's clone returned, or the first thread.
+    first_unclaimed: BTreeSet<DetTid>,
+    /// The first event of each such thread that is gone, kept for its
+    /// parent's clone return (see [`AccessTraceWriter::note_thread_gone`]).
+    gone_first: BTreeMap<DetTid, EventIndex>,
     /// The latest event of any thread of each process.
     process_last: BTreeMap<DetPid, EventRef>,
     /// Edges that end at their waiter's next posthook: a futex wake, a
@@ -1013,6 +1020,18 @@ struct EdgeState {
     at_first_event: BTreeMap<DetTid, PendingEdge>,
     /// Signals sent and not yet delivered, in send order.
     signals: Vec<PendingSignal>,
+    /// The sends and arms the cap evicted (see [`MAX_PENDING_SIGNALS`]),
+    /// one per distinct target, signal and sender. A delivery one of them
+    /// could have caused gets no edge from then on: its cause may be the
+    /// evicted send, and the next pending candidate would claim more order
+    /// than the run had.
+    evicted: Vec<PendingSignal>,
+    /// More distinct sends were evicted than [`MAX_PENDING_SIGNALS`]: no
+    /// signal edge is written any more.
+    evictions_overflowed: bool,
+    /// The open syscalls of threads that are gone, which no posthook will
+    /// end, written with the open records when the trace finishes.
+    orphaned: Vec<SyscallRecord>,
 }
 
 /// An edge whose `to` end is not recorded yet.
@@ -1030,6 +1049,9 @@ struct PendingEdge {
 struct PendingSignal {
     from: EventRef,
     sender: DetPid,
+    /// The call that sent it, which decides the `si_code` its delivery
+    /// carries.
+    kind: SendKind,
     signo: i32,
     target: Task,
     /// For a timer: its id. A timer's expiry carries it as `si_tid`.
@@ -1051,7 +1073,66 @@ struct PendingSignal {
 /// of the run.
 const MAX_PENDING_SIGNALS: usize = 4096;
 
+/// How a pending signal was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendKind {
+    /// kill: its delivery carries `SI_USER` and the sender's pid.
+    Kill,
+    /// tkill, tgkill: `SI_TKILL` and the sender's pid.
+    Tkill,
+    /// rt_sigqueueinfo, rt_tgsigqueueinfo: the `si_code` and `si_pid` the
+    /// caller chose. Linux refuses only a code of zero or more, or
+    /// `SI_TKILL`, and only when the caller sends to another task
+    /// (`do_rt_sigqueueinfo`,
+    /// [kernel/signal.c:4188-4198 at v6.16](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/kernel/signal.c?h=v6.16#n4188),
+    /// and `do_rt_tgsigqueueinfo`,
+    /// [kernel/signal.c:4237-4242](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/kernel/signal.c?h=v6.16#n4237)),
+    /// so its delivery's `si_pid` names no sender: Detcore cannot tell
+    /// which send it was, and gives it no edge. A send to the caller's own
+    /// thread, or with rt_sigqueueinfo of the caller's own thread id to its
+    /// whole process, can carry any code, `SI_USER` and `SI_TKILL` among
+    /// them, and the latter can reach any thread of the process
+    /// (`complete_signal`,
+    /// [kernel/signal.c:963-997 at v6.16](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/kernel/signal.c?h=v6.16#n963)).
+    /// So while any thread of a process has a sigqueue send of a signal
+    /// pending, no delivery of that signal to a thread of that process gets
+    /// an edge.
+    Queue,
+    /// timer_settime: its expiry carries `SI_TIMER` and the timer's id.
+    Timer,
+}
+
 impl PendingSignal {
+    /// Whether this send could carry `code` with `si_pid` `pid` to its
+    /// delivery, where both are the kernel's (see [`SendKind`]).
+    fn fits(&self, code: i32, pid: DetPid) -> bool {
+        match self.kind {
+            SendKind::Kill => code == libc::SI_USER && self.sender == pid,
+            SendKind::Tkill => code == libc::SI_TKILL && self.sender == pid,
+            SendKind::Queue | SendKind::Timer => false,
+        }
+    }
+
+    /// Whether this is a sigqueue send of `signo` by a thread of `process`,
+    /// the receiving thread's, or of any process where that is unknown:
+    /// sent to its own thread or process, it may carry any `si_code` and
+    /// `si_pid` to any thread of that process (see [`SendKind::Queue`]).
+    fn queued_within(&self, signo: i32, process: Option<DetPid>) -> bool {
+        self.kind == SendKind::Queue
+            && self.signo == signo
+            && process.is_none_or(|process| process == self.sender)
+    }
+
+    /// Whether `other` is the same send as far as a delivery can tell.
+    fn same_key(&self, other: &PendingSignal) -> bool {
+        self.kind == other.kind
+            && self.sender == other.sender
+            && self.signo == other.signo
+            && self.target == other.target
+            && self.timer == other.timer
+            && (self.kind != SendKind::Queue || self.from.tid == other.from.tid)
+    }
+
     /// Whether a group send has reached every member listed at its posthook.
     fn reached_all(&self) -> bool {
         self.members
@@ -1224,8 +1305,11 @@ impl AccessTraceWriter {
         if let std::collections::btree_map::Entry::Vacant(first) = self.edges.first_event.entry(tid)
         {
             first.insert(index);
+            self.edges.gone_first.remove(&tid);
             if let Some(edge) = self.edges.at_first_event.remove(&tid) {
                 self.write_edge(edge, to);
+            } else {
+                self.edges.first_unclaimed.insert(tid);
             }
         }
         self.edges.last_event.insert(tid, index);
@@ -1275,8 +1359,11 @@ impl AccessTraceWriter {
                     from,
                     object: SyncObject::Thread(child),
                 };
-                // The child may have run before its parent's clone returned.
-                match self.edges.first_event.get(&child).copied() {
+                // The child may have run before its parent's clone returned,
+                // and even be gone.
+                self.edges.first_unclaimed.remove(&child);
+                let first = self.edges.first_event.get(&child).copied();
+                match first.or_else(|| self.edges.gone_first.remove(&child)) {
                     Some(first) if first > record.pre => self.write_edge(
                         edge,
                         EventRef {
@@ -1372,7 +1459,7 @@ impl AccessTraceWriter {
     /// of the group sends still waiting for it.
     fn forget_reaped(&mut self, child: DetPid) {
         let process_of = &self.edges.process_of;
-        self.edges.signals.retain_mut(|signal| match signal.target {
+        let mut reaches = |signal: &mut PendingSignal| match signal.target {
             _ if signal.timer.is_some() => signal.sender != child,
             Task::Process(target) => target != child,
             Task::Thread(thread) => process_of.get(&thread) != Some(&child),
@@ -1382,7 +1469,40 @@ impl AccessTraceWriter {
                 }
                 !signal.reached_all()
             }
-        });
+        };
+        self.edges.signals.retain_mut(&mut reaches);
+        self.edges.evicted.retain_mut(&mut reaches);
+    }
+
+    /// `tid` is gone: the scheduler retired it, after the wakes its exit
+    /// makes. Forget what the writer keeps for it, so a later task that
+    /// reuses its id ends none of its edges and is not taken for it: the
+    /// edges waiting for its next posthook or first event, its first and
+    /// latest events, its process, and the sends to it alone, which Linux
+    /// discards with it. Its open syscall, which no posthook will end, is
+    /// kept for the end of the trace, where every open record is written.
+    /// So is its first event while no clone's return has claimed it: a
+    /// child can run and be gone before its parent's clone returns (a
+    /// forked child that exits at once), and that return still starts its
+    /// creation edge.
+    pub fn note_thread_gone(&mut self, tid: DetTid) {
+        if let Some(record) = self.open.remove(&tid) {
+            self.edges.orphaned.push(record);
+        }
+        let edges = &mut self.edges;
+        if edges.first_unclaimed.remove(&tid)
+            && let Some(first) = edges.first_event.get(&tid)
+        {
+            edges.gone_first.insert(tid, *first);
+        }
+        edges.at_posthook.remove(&tid);
+        edges.at_first_event.remove(&tid);
+        edges.first_event.remove(&tid);
+        edges.last_event.remove(&tid);
+        edges.process_of.remove(&tid);
+        let to_it = |signal: &PendingSignal| signal.target == Task::Thread(tid);
+        edges.signals.retain(|signal| !to_it(signal));
+        edges.evicted.retain(|signal| !to_it(signal));
     }
 
     /// Make room for one more pending send (see [`MAX_PENDING_SIGNALS`]).
@@ -1393,14 +1513,22 @@ impl AccessTraceWriter {
             .position(|signal| signal.deleted)
             .or_else(|| signals.iter().position(|signal| signal.timer.is_none()))
             .unwrap_or(0);
-        self.edges.signals.remove(victim);
+        let evicted = self.edges.signals.remove(victim);
+        let edges = &mut self.edges;
+        if !edges.evicted.iter().any(|known| known.same_key(&evicted)) {
+            if edges.evicted.len() == MAX_PENDING_SIGNALS {
+                edges.evictions_overflowed = true;
+            } else {
+                edges.evicted.push(evicted);
+            }
+        }
     }
 
     /// Note a signal a syscall entry sends, or a timer it arms.
     fn note_signal_send(&mut self, from: EventRef, entry: &SyscallEntry) {
         let raw = |i: usize| entry.args[i] as i32;
         let pid = DetPid::from_raw;
-        let (target, signo, timer) = match entry.sysno {
+        let (target, signo, timer, kind) = match entry.sysno {
             Sysno::kill => {
                 let target = match raw(0) {
                     p if p > 0 => Task::Process(pid(p)),
@@ -1408,14 +1536,15 @@ impl AccessTraceWriter {
                     -1 => return,
                     p => Task::ProcessGroup(pid(p.wrapping_neg())),
                 };
-                (target, raw(1), None)
+                (target, raw(1), None, SendKind::Kill)
             }
-            Sysno::tkill => (Task::Thread(pid(raw(0))), raw(1), None),
-            Sysno::tgkill | Sysno::rt_tgsigqueueinfo => (Task::Thread(pid(raw(1))), raw(2), None),
-            Sysno::rt_sigqueueinfo => (Task::Process(pid(raw(0))), raw(1), None),
+            Sysno::tkill => (Task::Thread(pid(raw(0))), raw(1), None, SendKind::Tkill),
+            Sysno::tgkill => (Task::Thread(pid(raw(1))), raw(2), None, SendKind::Tkill),
+            Sysno::rt_tgsigqueueinfo => (Task::Thread(pid(raw(1))), raw(2), None, SendKind::Queue),
+            Sysno::rt_sigqueueinfo => (Task::Process(pid(raw(0))), raw(1), None, SendKind::Queue),
             // The expiry's signal comes from the sigevent timer_create
             // named, so a timer arm matches any signal carrying its id.
-            Sysno::timer_settime => (Task::Process(entry.pid), 0, Some(raw(0))),
+            Sysno::timer_settime => (Task::Process(entry.pid), 0, Some(raw(0)), SendKind::Timer),
             _ => return,
         };
         if signo == 0 && timer.is_none() {
@@ -1427,6 +1556,7 @@ impl AccessTraceWriter {
         self.edges.signals.push(PendingSignal {
             from,
             sender: entry.pid,
+            kind,
             signo,
             target,
             timer,
@@ -1440,10 +1570,16 @@ impl AccessTraceWriter {
     /// The send that caused `note`'s delivery to `tid`, if one is pending.
     ///
     /// A candidate is a send of that signal, to that thread, its process or
-    /// its group, from the process `si_pid` names. The delivery takes the
-    /// earliest candidate and uses up that one alone (a group send only for
-    /// this process, until it has reached every member listed at its
-    /// posthook). That holds for standard signals too, whose sends merge:
+    /// its group, by the call the delivery's `si_code` names, from the
+    /// process `si_pid` names: a kill for `SI_USER`, a tkill or tgkill for
+    /// `SI_TKILL`. A delivery with any other code, or one to a process a
+    /// thread of which has queued the signal, gets no edge, because its
+    /// `si_pid` may be the caller's choice (see [`SendKind::Queue`]). A
+    /// send the cap evicted counts as the earliest candidate of every
+    /// delivery it could have caused, and such a delivery gets no edge. The
+    /// delivery takes the earliest candidate and uses up that one alone (a
+    /// group send only for this process, until it has reached every member
+    /// listed at its posthook). That holds for standard signals too, whose sends merge:
     /// the k-th delivery is never matched with a send later than the
     /// latest cause among the first k deliveries, so no edge claims more
     /// order than the run had. Taking the latest send instead is unsound:
@@ -1473,10 +1609,20 @@ impl AccessTraceWriter {
         tid: DetTid,
         groups: &dyn ProcessGroups,
     ) -> Option<EventRef> {
-        let process = self.edges.process_of.get(&tid).copied();
-        let signals = &mut self.edges.signals;
+        let edges = &mut self.edges;
+        if edges.evictions_overflowed {
+            return None;
+        }
+        let process = edges.process_of.get(&tid).copied();
+        let signals = &mut edges.signals;
+        let evicted = &edges.evicted;
         if let Some(timer) = note.timer {
             let process = process?;
+            let arm =
+                |signal: &PendingSignal| signal.timer == Some(timer) && signal.sender == process;
+            if evicted.iter().any(arm) {
+                return None;
+            }
             let arms: Vec<usize> = (0..signals.len())
                 .filter(|&i| signals[i].timer == Some(timer) && signals[i].sender == process)
                 .collect();
@@ -1489,6 +1635,17 @@ impl AccessTraceWriter {
             }
             return Some(from);
         }
+        // Only kill's SI_USER and tkill's SI_TKILL carry a sender the kernel
+        // filled in, and not even those while a thread of the receiving
+        // process has queued the signal (see [`SendKind::Queue`]).
+        if !matches!(note.code, libc::SI_USER | libc::SI_TKILL)
+            || signals
+                .iter()
+                .chain(evicted)
+                .any(|signal| signal.queued_within(note.signo, process))
+        {
+            return None;
+        }
         let sender = note.sender?.pid;
         let group = process.and_then(|p| groups.group_of(p));
         let candidate = |signal: &PendingSignal| {
@@ -1500,7 +1657,7 @@ impl AccessTraceWriter {
             };
             signal.timer.is_none()
                 && signal.signo == note.signo
-                && signal.sender == sender
+                && signal.fits(note.code, sender)
                 && match target {
                     Task::Thread(thread) => thread == tid,
                     Task::Process(target) => Some(target) == process,
@@ -1510,6 +1667,11 @@ impl AccessTraceWriter {
                     }
                 }
         };
+        // An evicted send is older than every pending one, so it would be
+        // the earliest candidate.
+        if evicted.iter().any(&candidate) {
+            return None;
+        }
         let candidates: Vec<usize> = (0..signals.len())
             .filter(|&i| candidate(&signals[i]))
             .collect();
@@ -1644,7 +1806,10 @@ impl AccessTraceWriter {
     /// Write the calls that never returned and the end line, and flush.
     /// `events` is the number of events the run recorded.
     pub fn finish(mut self, events: u64) -> io::Result<()> {
-        for record in std::mem::take(&mut self.open).into_values() {
+        let mut open: Vec<SyscallRecord> = std::mem::take(&mut self.edges.orphaned);
+        open.extend(std::mem::take(&mut self.open).into_values());
+        open.sort_by_key(|record| (record.tid, record.pre));
+        for record in open {
             self.finish_record(record);
         }
         let records = self.records;
@@ -2949,6 +3114,40 @@ mod tests {
         }
     }
 
+    /// A child that runs and is gone before its parent's clone returns (a
+    /// forked child that exits at once) keeps its creation edge: the writer
+    /// holds its first event for that return, though it forgets the rest of
+    /// the thread.
+    #[test]
+    fn a_child_gone_before_its_parents_clone_returns_keeps_its_creation_edge() {
+        let (mut writer, bytes) = in_memory_writer();
+        writer.observe(
+            10,
+            &prehook(3, Sysno::clone),
+            entry_with(Sysno::clone, 3, [0; 6]),
+            &Groups,
+        );
+        writer.observe(11, &SchedEvent::branches(tid(8), 1), None, &Groups);
+        writer.observe(12, &SchedEvent::branches(tid(8), 2), None, &Groups);
+        writer.note_thread_gone(tid(8));
+        writer.observe(
+            13,
+            &posthook(3, Sysno::clone),
+            Some(exit(8, vec![])),
+            &Groups,
+        );
+        writer.finish(14).unwrap();
+        assert_eq!(
+            edges_of(&bytes),
+            vec![EdgeRecord {
+                kind: EdgeKind::Create,
+                from: at(3, 10),
+                to: at(8, 11),
+                object: SyncObject::Thread(tid(8)),
+            }]
+        );
+    }
+
     #[test]
     fn an_exit_wake_ends_at_the_joiners_wait_return() {
         let (mut writer, bytes) = in_memory_writer();
@@ -3233,9 +3432,11 @@ mod tests {
             &Groups,
         );
         writer.finish(8).unwrap();
+        // The delivery's code names the call: SI_TKILL the tgkill, SI_USER
+        // the kill, whichever came first.
         assert_eq!(
             signal_edges(&bytes),
-            vec![(at(3, 2), at(4, 6)), (at(3, 4), at(4, 7))]
+            vec![(at(3, 4), at(4, 6)), (at(3, 2), at(4, 7))]
         );
     }
 
@@ -3400,6 +3601,219 @@ mod tests {
             signal_edges(&bytes),
             vec![(at(3, 2), at(4, 4)), (at(3, 2), at(3, 5))]
         );
+    }
+
+    /// The cap evicts the oldest send. A later delivery of that signal to
+    /// that target from that sender may be the evicted send's, so it gets no
+    /// edge, where the next pending send would have claimed more order than
+    /// the run had; a delivery no evicted send could have caused still gets
+    /// its edge.
+    #[test]
+    fn a_delivery_an_evicted_send_could_have_caused_gets_no_edge() {
+        let (usr1, usr2) = (libc::SIGUSR1, libc::SIGUSR2);
+        let (mut writer, bytes) = in_memory_writer();
+        thread_4_runs(&mut writer, 1);
+        let sends = MAX_PENDING_SIGNALS as u64 + 1;
+        for n in 1..=sends {
+            call(
+                &mut writer,
+                2 * n,
+                Sysno::kill,
+                [4, usr1 as u64, 0, 0, 0, 0],
+                0,
+                vec![],
+            );
+        }
+        let other = 2 * (sends + 1);
+        call(
+            &mut writer,
+            other,
+            Sysno::kill,
+            [4, usr2 as u64, 0, 0, 0, 0],
+            0,
+            vec![],
+        );
+        assert_eq!(writer.edges.evicted.len(), 1, "one key, evicted twice");
+        writer.observe(
+            other + 2,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.observe(
+            other + 3,
+            &received(4, usr2),
+            delivered(usr2, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.finish(other + 4).unwrap();
+        assert_eq!(signal_edges(&bytes), vec![(at(3, other), at(4, other + 3))]);
+    }
+
+    /// A leader may queue a signal to its own process with a forged SI_USER
+    /// code and si_pid, and Linux may deliver it to a sibling thread: while
+    /// process 3's own sigqueue of SIGUSR1 is pending, its thread 7's SI_USER
+    /// delivery naming process 5 gets no edge, though process 5's kill of
+    /// process 3 is pending too.
+    #[test]
+    fn a_delivery_a_sibling_could_have_queued_gets_no_edge() {
+        let usr1 = libc::SIGUSR1;
+        let (mut writer, bytes) = in_memory_writer();
+        writer.observe(
+            1,
+            &prehook(7, Sysno::getpid),
+            entry_with(Sysno::getpid, 3, [0; 6]),
+            &Groups,
+        );
+        call(
+            &mut writer,
+            2,
+            Sysno::rt_sigqueueinfo,
+            [3, usr1 as u64, 0, 0, 0, 0],
+            0,
+            vec![],
+        );
+        let kill = [3, usr1 as u64, 0, 0, 0, 0];
+        writer.observe(
+            4,
+            &prehook(5, Sysno::kill),
+            entry_with(Sysno::kill, 5, kill),
+            &Groups,
+        );
+        writer.observe(5, &posthook(5, Sysno::kill), Some(exit(0, vec![])), &Groups);
+        writer.observe(
+            6,
+            &received(7, usr1),
+            delivered(usr1, libc::SI_USER, 5),
+            &Groups,
+        );
+        writer.finish(7).unwrap();
+        assert_eq!(signal_edges(&bytes), vec![]);
+    }
+
+    /// A sigqueue caller chooses its delivery's si_code and si_pid. Process
+    /// 5 queues SIGUSR1 to thread 4 alone, naming process 3, while process
+    /// 3's kill of process 4 is pending: Linux takes the thread's own
+    /// signal first, and its SI_QUEUE delivery gets no edge rather than
+    /// using up process 3's kill, which the SI_USER delivery then takes.
+    /// Once thread 4 queues SIGUSR1 to itself, which may carry SI_TKILL and
+    /// any si_pid, a delivery that looks like process 3's tgkill gets no
+    /// edge either.
+    #[test]
+    fn a_delivery_whose_sender_the_caller_chose_gets_no_edge() {
+        let usr1 = libc::SIGUSR1;
+        let (mut writer, bytes) = in_memory_writer();
+        thread_4_runs(&mut writer, 1);
+        call(
+            &mut writer,
+            2,
+            Sysno::kill,
+            [4, usr1 as u64, 0, 0, 0, 0],
+            0,
+            vec![],
+        );
+        let queue = [4, 4, usr1 as u64, 0, 0, 0];
+        writer.observe(
+            4,
+            &prehook(5, Sysno::rt_tgsigqueueinfo),
+            entry_with(Sysno::rt_tgsigqueueinfo, 5, queue),
+            &Groups,
+        );
+        writer.observe(
+            5,
+            &posthook(5, Sysno::rt_tgsigqueueinfo),
+            Some(exit(0, vec![])),
+            &Groups,
+        );
+        writer.observe(
+            6,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_QUEUE, 3),
+            &Groups,
+        );
+        writer.observe(
+            7,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_USER, 3),
+            &Groups,
+        );
+        writer.observe(
+            8,
+            &prehook(4, Sysno::rt_tgsigqueueinfo),
+            entry_with(Sysno::rt_tgsigqueueinfo, 4, queue),
+            &Groups,
+        );
+        writer.observe(
+            9,
+            &posthook(4, Sysno::rt_tgsigqueueinfo),
+            Some(exit(0, vec![])),
+            &Groups,
+        );
+        call(&mut writer, 10, Sysno::tgkill, queue, 0, vec![]);
+        writer.observe(
+            12,
+            &received(4, usr1),
+            delivered(usr1, libc::SI_TKILL, 3),
+            &Groups,
+        );
+        writer.finish(13).unwrap();
+        assert_eq!(signal_edges(&bytes), vec![(at(3, 2), at(4, 7))]);
+    }
+
+    /// A thread that a futex wake released but that is gone before its wait
+    /// returned (killed, say) leaves no edge waiting: a later task given its
+    /// id ends nothing at its own first posthook. Its open wait is still
+    /// written, without a posthook, at the end of the trace.
+    #[test]
+    fn a_gone_threads_waiting_edge_does_not_end_at_its_ids_next_task() {
+        let (mut writer, bytes) = in_memory_writer();
+        let futex = FutexID::private(mm(), 0x5000);
+        writer.observe(
+            2,
+            &prehook(5, Sysno::futex),
+            entry_with(Sysno::futex, 5, [0; 6]),
+            &Groups,
+        );
+        writer.observe(
+            3,
+            &prehook(3, Sysno::futex),
+            entry_with(Sysno::futex, 3, [0; 6]),
+            &Groups,
+        );
+        writer.note_wake(
+            EdgeKind::FutexWake,
+            tid(3),
+            tid(5),
+            SyncObject::Futex(futex),
+        );
+        writer.note_thread_gone(tid(5));
+        writer.observe(
+            4,
+            &prehook(5, Sysno::getpid),
+            entry_with(Sysno::getpid, 9, [0; 6]),
+            &Groups,
+        );
+        writer.observe(
+            5,
+            &posthook(5, Sysno::getpid),
+            Some(exit(9, vec![])),
+            &Groups,
+        );
+        writer.finish(6).unwrap();
+        assert_eq!(edges_of(&bytes), vec![]);
+        let waits: Vec<(EventIndex, Option<EventIndex>)> =
+            read_access_trace(&bytes.lock().unwrap()[..])
+                .unwrap()
+                .records
+                .iter()
+                .filter_map(|record| match record {
+                    TraceRecord::Syscall(call) if call.sysno == Sysno::futex => {
+                        Some((call.pre, call.post))
+                    }
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(waits, vec![(3, None), (2, None)]);
     }
 
     /// Reaping a member takes it out of a group send still waiting for it,

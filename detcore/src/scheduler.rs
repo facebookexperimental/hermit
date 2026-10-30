@@ -7033,6 +7033,11 @@ impl Scheduler {
                 }
             }
         }
+        // The access trace forgets the thread once its exit wakes are noted,
+        // so a later task that reuses its id ends none of its edges.
+        if let Some(writer) = self.access_trace.as_mut() {
+            writer.note_thread_gone(*dtid);
+        }
 
         if first_removal {
             let process = self.registered_process(*dtid).unwrap_or(*detpid);
