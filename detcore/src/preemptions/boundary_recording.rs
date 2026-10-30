@@ -737,15 +737,17 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"retained original");
     }
 
+    /// The default writer emits the legacy form, never the boundary envelope.
+    /// It also says that its run logged readmissions, none here
+    /// (`rejoins: []`), which a record built from events alone does not.
     #[test]
     fn writer_default_still_emits_exact_legacy_bytes() {
         let mut writer = PreemptionWriter::new(None);
         let event = SchedEvent::branches(DetTid::from_raw(3), 7);
         writer.insert_schedevent(event.clone());
-        assert_eq!(
-            writer.into_string(),
-            PreemptionRecord::from_sched_events(vec![event]).to_string()
-        );
+        let mut legacy = PreemptionRecord::from_sched_events(vec![event]);
+        legacy.rejoins = Some(Vec::new());
+        assert_eq!(writer.into_string(), legacy.to_string());
     }
 
     #[test]
