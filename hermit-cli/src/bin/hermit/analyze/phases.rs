@@ -6640,7 +6640,9 @@ mod replay_departure_tests {
                 &GlobalOpts::try_parse_from(["hermit"]).unwrap(),
                 &mut run,
             );
-            let projected = run.sched_out().cloned();
+            let projected = run
+                .require_complete_output()
+                .map(|()| run.preempts_out().schedevents().clone());
             let promoted = options.clone().save_final_target_sched_events(make_run());
             if marker.is_some() {
                 for error in [
