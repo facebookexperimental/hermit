@@ -657,6 +657,83 @@ mod tests {
         }
     }
 
+    /// A flat record written before the RawRecord remote existed (2c8e0352f)
+    /// keeps `post_crash_timeslice`: read from that JSON, written and read
+    /// again, plain and inside the incomplete-record envelope. A field
+    /// missing from RawRecord would be dropped silently here.
+    #[test]
+    fn a_flat_records_post_crash_timeslice_survives_plain_and_marked_round_trips() {
+        let flat = r#"{"per_thread":{},"global":[],"post_crash_timeslice":200000000}"#;
+        let record: PreemptionRecord = serde_json::from_str(flat).unwrap();
+        assert_eq!(record.post_crash_timeslice(), Some(200_000_000));
+        let plain = serde_json::to_string(&record).unwrap();
+        assert_eq!(plain, flat);
+        assert_eq!(
+            serde_json::from_str::<PreemptionRecord>(&plain).unwrap(),
+            record
+        );
+        let mut marked = record.clone();
+        marked.replay_departed_at = Some(7);
+        let enveloped = serde_json::to_string(&marked).unwrap();
+        assert!(
+            enveloped.starts_with(r#"{"incomplete_preemption_record":"#),
+            "{enveloped}"
+        );
+        assert!(
+            enveloped.contains(r#""post_crash_timeslice":200000000"#),
+            "{enveloped}"
+        );
+        let back: PreemptionRecord = serde_json::from_str(&enveloped).unwrap();
+        assert_eq!(back.post_crash_timeslice(), Some(200_000_000));
+        assert_eq!(back.replay_departed_at(), Some(7));
+        assert_eq!(back, marked);
+    }
+
+    /// The same for `post_crash`, both a list of switches and the empty list
+    /// that says a run with the switch on took none (absent means a record
+    /// that lists nothing).
+    #[test]
+    fn a_flat_records_post_crash_switches_survive_plain_and_marked_round_trips() {
+        let switch = crate::post_crash::PostCrashSwitch {
+            dtid: DetTid::from_raw(3),
+            signal: 6,
+            exec_by: Some(DetTid::from_raw(4)),
+            turn: 63906,
+            bound: 200_000_000,
+        };
+        for (flat, expected) in [
+            (
+                r#"{"per_thread":{},"global":[],"post_crash":[{"dtid":3,"signal":6,"exec_by":4,"turn":63906,"bound":200000000}]}"#,
+                vec![switch],
+            ),
+            (r#"{"per_thread":{},"global":[],"post_crash":[]}"#, vec![]),
+        ] {
+            let record: PreemptionRecord = serde_json::from_str(flat).unwrap();
+            assert_eq!(record.post_crash_complete(), Some(&expected[..]), "{flat}");
+            let plain = serde_json::to_string(&record).unwrap();
+            assert_eq!(plain, flat);
+            assert_eq!(
+                serde_json::from_str::<PreemptionRecord>(&plain).unwrap(),
+                record
+            );
+            let mut marked = record.clone();
+            marked.replay_departed_at = Some(7);
+            let enveloped = serde_json::to_string(&marked).unwrap();
+            assert!(
+                enveloped.starts_with(r#"{"incomplete_preemption_record":"#),
+                "{enveloped}"
+            );
+            let back: PreemptionRecord = serde_json::from_str(&enveloped).unwrap();
+            assert_eq!(
+                back.post_crash_complete(),
+                Some(&expected[..]),
+                "{enveloped}"
+            );
+            assert_eq!(back.replay_departed_at(), Some(7));
+            assert_eq!(back, marked);
+        }
+    }
+
     /// `format_version` (rrnewton/hermit#4847) reads back from a flat record
     /// written before the record's serde moved into `RawRecord`, and survives
     /// writing and reading the current form, plain and inside the
