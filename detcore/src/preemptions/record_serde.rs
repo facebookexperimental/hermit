@@ -551,4 +551,29 @@ mod tests {
             }
         }
     }
+
+    /// `rejoins` (rrnewton/hermit#4751) reads back from a flat record written
+    /// before the record's serde moved into `RawRecord`, and survives writing
+    /// and reading the current form, plain and inside the incomplete-record
+    /// envelope.
+    #[test]
+    fn rejoins_round_trip_through_the_record_serde() {
+        let old =
+            r#"{"per_thread":{},"global":[],"rejoins":[{"turn":4,"wakes":1,"calls":[[3,2]]}]}"#;
+        let record: PreemptionRecord = serde_json::from_str(old).unwrap();
+        let expected = vec![crate::scheduler::rejoin_log::Rejoin {
+            turn: 4,
+            wakes: 1,
+            calls: vec![(DetTid::from_raw(3), 2)],
+        }];
+        assert_eq!(record.rejoins, expected);
+        for marker in [None, Some(7)] {
+            let mut copy = record.clone();
+            copy.replay_departed_at = marker;
+            let written = serde_json::to_string(&copy).unwrap();
+            let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(read.rejoins, expected, "{written}");
+            assert_eq!(read.replay_departed_at(), marker, "{written}");
+        }
+    }
 }
