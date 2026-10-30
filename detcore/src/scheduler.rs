@@ -26596,10 +26596,9 @@ mod test {
                         let consumed = sched.consume_schedevent(&observed);
                         assert!(consumed.keep_running, "the exit grant supplies the handoff");
                         assert_eq!(consumed.event_ix, 0);
-                        assert_eq!(
-                            consumed.timeslice_remaining,
-                            (!boundary).then(|| LogicalTime::from_rcbs(123))
-                        );
+                        // The recorded slice length is the parent's, staged
+                        // for it below; the exiting thread takes none.
+                        assert_eq!(consumed.timeslice_remaining, None);
                         assert_eq!(sched.recorded_event_count, 0);
                     }
                     assert_eq!((sched.turn, sched.committed_time), before);
