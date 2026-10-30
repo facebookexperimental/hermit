@@ -58,6 +58,7 @@ use crate::app::analyze::races::find_racing_accesses;
 use crate::app::analyze::races::outcome;
 use crate::app::analyze::races::uncounted_signal_outcome;
 use crate::app::analyze::rundata::RunData;
+use crate::app::analyze::rundata::guest_reached_a_refusal;
 use crate::app::analyze::types::AnalyzeOpts;
 use crate::app::container::RunTimeoutMarker;
 
@@ -468,16 +469,6 @@ impl AnalyzeOpts {
         }
         Ok(paths.iter().map(|path| read_stack(path)).collect())
     }
-}
-
-/// Whether Hermit refused a run after its guest started: the container's
-/// exit-122 arm returns a bare `PolicyRefusal`. A refusal decided before the
-/// guest starts carries its reason as context instead.
-fn guest_reached_a_refusal(error: &anyhow::Error) -> bool {
-    error.chain().count() == 1
-        && error
-            .downcast_ref::<crate::app::container::PolicyRefusal>()
-            .is_some()
 }
 
 /// How a check's replay ended, and where it left the schedule it followed
@@ -1648,5 +1639,77 @@ mod tests {
             unchecked.detail
         );
         assert_eq!(calls.len(), 1);
+    }
+
+    /// The racing-access stack replay is a trial launched through
+    /// `RunData::launch` and `run_now`, whose refusals carry `run_error`'s
+    /// diagnostics. A refusal its guest reached still takes the path of a
+    /// replay that did not finish: the stacks it took are used, and the
+    /// analysis goes on. A refusal decided before the guest started ends the
+    /// analysis with its error, as before. Only `hermit run`'s result is
+    /// replaced (`AnalyzeOpts::hermit_run`).
+    #[test]
+    fn a_refusal_the_stack_replay_reached_uses_the_stacks_it_took() {
+        use std::sync::Arc;
+
+        use reverie::process::ExitStatus;
+        use reverie::process::RunError;
+
+        use crate::app::analyze::rundata::HermitRun;
+        use crate::app::analyze::rundata::RunResult;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let entries: [Option<EventIndex>; 2] = [Some(7), Some(9)];
+        for guest_started in [true, false] {
+            let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+            options.tmp_dir = Some(
+                workspace
+                    .path()
+                    .join(format!("guest_started_{guest_started}")),
+            );
+            std::fs::create_dir_all(options.tmp_dir.as_ref().unwrap()).unwrap();
+            options.hermit_run = HermitRun(Some(Arc::new(move |run: &RunData| {
+                // The replay took the first access's stack before Hermit
+                // refused it.
+                let taken = run.root_path().with_extension("access1.stack");
+                std::fs::write(
+                    &taken,
+                    r#"{"thread_id": 3, "thread_name": null, "frames": []}"#,
+                )
+                .unwrap();
+                Err(if guest_started {
+                    crate::app::container::classify_container_result::<RunResult>(Err(
+                        RunError::ExitStatus(ExitStatus::Exited(
+                            detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                        )),
+                    ))
+                    .unwrap_err()
+                } else {
+                    anyhow::Error::new(crate::app::container::PolicyRefusal)
+                        .context("unsupported configuration at admission")
+                })
+            })));
+            let replayed = options.replay_for_access_stacks(&entries, |name| {
+                RunData::new_baseline(&options, name.to_owned())
+            });
+            if guest_started {
+                let stacks = replayed.unwrap();
+                assert_eq!(stacks.len(), 2);
+                assert!(stacks[0].is_some(), "{stacks:?}");
+                assert!(stacks[1].is_none(), "{stacks:?}");
+            } else {
+                let error = replayed.unwrap_err();
+                assert!(
+                    error
+                        .downcast_ref::<crate::app::container::PolicyRefusal>()
+                        .is_some(),
+                    "{error:#}"
+                );
+                assert!(
+                    format!("{error:#}").contains("unsupported configuration at admission"),
+                    "{error:#}"
+                );
+            }
+        }
     }
 }
