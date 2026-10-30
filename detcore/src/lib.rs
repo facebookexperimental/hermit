@@ -9325,11 +9325,13 @@ mod subscription_tests {
     }
 
     /// aarch64: under `--passthru-opt` (record and replay turn it on),
-    /// `mprotect` and `pkey_mprotect` reach Detcore exactly where the
-    /// exclusive-loop scan reads guest tasks, which follows them; under
-    /// `hermit record` and `hermit replay`, or a backend whose tasks are not
-    /// the guest's, the event stream stays as it was. Without it every call
-    /// is delivered anyway.
+    /// `mprotect` reaches Detcore exactly where the exclusive-loop scan reads
+    /// guest tasks, which follows it; under `hermit record` and `hermit
+    /// replay`, or a backend whose tasks are not the guest's, the event stream
+    /// stays as it was. `pkey_mprotect` reaches it in every configuration,
+    /// since inotify fault recovery learns protection-key use from it
+    /// (`passthru_opt_intercepts_the_protection_key_calls`). Without
+    /// `--passthru-opt` every call is delivered anyway.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn protection_changes_reach_detcore_where_the_exclusive_scan_runs() {
@@ -9354,9 +9356,10 @@ mod subscription_tests {
                             .iter_syscalls()
                             .collect();
                         for sysno in protection {
+                            let expected = scans || !passthru_opt || sysno == Sysno::pkey_mprotect;
                             assert_eq!(
                                 delivered.contains(&sysno),
-                                scans || !passthru_opt,
+                                expected,
                                 "{sysno}: passthru_opt={passthru_opt} \
                                  recordreplay_modes={recordreplay_modes} \
                                  host_task_reads={host_task_reads_reach_guest_threads} \
