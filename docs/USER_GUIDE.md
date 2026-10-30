@@ -708,8 +708,10 @@ costs time and trades races:
 
 - A record that states a drawn value replays under it with no timeslice
   option, drawing nothing. It takes precedence over a range or
-  `--chaos-timeslice-draw` the replay gives; `--max-timeslice=N` is accepted
-  for its own N only, and `--chaos-seeded-timeslice` is refused.
+  `--chaos-timeslice-draw` the replay gives. `--max-timeslice=N` is accepted
+  for the recorded N only when the replay passes no range or per-run draw;
+  beside either, an explicit `--max-timeslice` is refused, whatever the
+  record states. `--chaos-seeded-timeslice` is refused.
 - A record that states none (one recorded at a fixed timeslice, or before
   records stated the draw) leaves the replay's own timeslice options in force.
   With `--chaos-timeslice-draw=run` the replay draws its maximum from its own
