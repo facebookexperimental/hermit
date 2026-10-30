@@ -508,6 +508,15 @@ pub struct StoreExclusiveRunCounts {
     pub fully_counted: bool,
 }
 
+/// How the warning Hermit prints on a host whose retired-branch counter
+/// failed Reverie's validation begins. The rest of the line names the
+/// command's consequence and Reverie's reason, whose measured counts differ
+/// from one process to the next, so a comparison of two runs' output drops
+/// the line by this prefix; sharing it keeps such filters in step with the
+/// warning.
+pub const INEXACT_BRANCH_COUNTER_WARNING: &str =
+    "WARNING: this host's retired-branch counter failed Reverie's performance-counter validation.";
+
 /// [`VerificationReport::exact_branch_counter`]: present, and the producer's
 /// evidence (the CPU and, when absent, the kind of validation failure).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

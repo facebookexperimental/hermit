@@ -49,6 +49,7 @@ use hermit::DetConfig;
 use hermit::Error;
 use hermit::Shebang;
 use hermit::SkidOvershootError;
+use hermit::canonical_verdict::INEXACT_BRANCH_COUNTER_WARNING;
 use hermit::canonical_verdict::Verdict;
 use hermit::happens_before::DebugInfoResolver;
 use hermit::happens_before::HbLaunch;
@@ -625,11 +626,10 @@ pub(crate) fn warning_for_an_inexact_branch_counter(
         CounterReader::Recording => "a replay of this recording is not guaranteed to follow it",
     };
     Some(format!(
-        "WARNING: this host's retired-branch counter failed Reverie's performance-counter \
-         validation. Hermit times preemptions, and by default virtual time, with that counter, \
-         so {not_guaranteed}. For reproducible results use a host whose counters pass the \
-         validation (`hermit host-capabilities` reports exact-branch-counter: PRESENT, \
-         validation passed); --strict refuses this host. Reverie reports: {reason}\n"
+        "{INEXACT_BRANCH_COUNTER_WARNING} Hermit times preemptions, and by default virtual time, \
+         with that counter, so {not_guaranteed}. For reproducible results use a host whose \
+         counters pass the validation (`hermit host-capabilities` reports exact-branch-counter: \
+         PRESENT, validation passed); --strict refuses this host. Reverie reports: {reason}\n"
     ))
 }
 

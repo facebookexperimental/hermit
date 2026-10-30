@@ -333,9 +333,10 @@ fn replay(
 }
 
 /// The one stderr line that measures the host: on a host whose
-/// performance counters fail Reverie's validation, Hermit reports how many
-/// locked instructions the check counted, which differs run to run.
-const HOST_PMU_LINE: &str = "WARNING: this host's performance counters failed Reverie's validation";
+/// retired-branch counter fails Reverie's validation, Hermit warns with the
+/// counts the check measured, which differ run to run. The filter takes the
+/// warning's own prefix, so it follows the warning's wording.
+const HOST_PMU_LINE: &str = hermit::canonical_verdict::INEXACT_BRANCH_COUNTER_WARNING;
 
 /// Stderr without the host line, and how many lines that dropped.
 fn guest_stderr(output: &Output) -> (Vec<String>, usize) {
