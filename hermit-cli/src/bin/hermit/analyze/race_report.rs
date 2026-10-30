@@ -1129,7 +1129,7 @@ mod tests {
             let path = dir.path().join(name);
             let lines = [
                 format!(
-                    r#"{{"kind":"header","format":"hermit-access-trace","version":1,"from":{from}}}"#
+                    r#"{{"kind":"header","format":"hermit-access-trace","version":2,"from":{from}}}"#
                 ),
                 r#"{"kind":"syscall","pre":1,"post":2,"tid":3,"pid":3,"nth":1,"sysno":"getpid","args":[0,0,0,0,0,0],"result":3}"#
                     .to_string(),
