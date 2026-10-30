@@ -654,13 +654,17 @@ mod tests {
     /// `format_version` (rrnewton/hermit#4847) reads back from a flat record
     /// written before the record's serde moved into `RawRecord`, and survives
     /// writing and reading the current form, plain and inside the
-    /// incomplete-record envelope.
+    /// incomplete-record envelope, and the whole record compares equal each
+    /// time.
     #[test]
     fn format_version_round_trips_through_the_record_serde() {
         let format = crate::preemptions::PREEMPTION_RECORD_FORMAT;
         let old = format!(r#"{{"per_thread":{{}},"global":[],"format_version":{format}}}"#);
         let record: PreemptionRecord = serde_json::from_str(&old).unwrap();
         assert_eq!(record.format_version, Some(format));
+        let mut whole = PreemptionRecord::from_sched_events(Vec::new());
+        whole.format_version = Some(format);
+        assert_eq!(record, whole);
         for marker in [None, Some(7)] {
             let mut copy = record.clone();
             copy.replay_departed_at = marker;
@@ -668,13 +672,15 @@ mod tests {
             let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
             assert_eq!(read.format_version, Some(format), "{written}");
             assert_eq!(read.replay_departed_at(), marker, "{written}");
+            assert_eq!(read, copy, "{written}");
         }
     }
 
     /// `background_starts` (rrnewton/hermit#4847) reads back from a flat
     /// record written before the record's serde moved into `RawRecord`, and
     /// survives writing and reading the current form, plain and inside the
-    /// incomplete-record envelope.
+    /// incomplete-record envelope, and the whole record compares equal each
+    /// time.
     #[test]
     fn background_starts_round_trip_through_the_record_serde() {
         let old = r#"{"per_thread":{},"global":[],"background_starts":[{"after":1,"thread":3,"call":2}]}"#;
@@ -685,6 +691,9 @@ mod tests {
             call: 2,
         }];
         assert_eq!(record.background_starts, expected);
+        let mut whole = PreemptionRecord::from_sched_events(Vec::new());
+        whole.background_starts = expected.clone();
+        assert_eq!(record, whole);
         for marker in [None, Some(7)] {
             let mut copy = record.clone();
             copy.replay_departed_at = marker;
@@ -692,6 +701,7 @@ mod tests {
             let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
             assert_eq!(read.background_starts, expected, "{written}");
             assert_eq!(read.replay_departed_at(), marker, "{written}");
+            assert_eq!(read, copy, "{written}");
         }
     }
 }
