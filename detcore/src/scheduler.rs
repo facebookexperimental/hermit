@@ -20409,19 +20409,48 @@ impl Scheduler {
     ///
     /// Only where change points are bounded (`chaos_bounds_starvation`: chaos
     /// with timer preemption and the default heuristic, not replaying
-    /// preemptions), not while a schedule replay still dictates the turns
-    /// (`schedule_replay_dictates_turns`: past the end of its schedule it
-    /// counts, as a run without a schedule does), and not under `hermit
-    /// record`/`hermit replay` (`recordreplay_modes`), as for every deadline
-    /// hint. The count is of committed turns, host-timed polling retries
-    /// aside, as for `previous_turn_tid`: background calls and skipped turns
-    /// do not commit, and host-timed admissions and signals change only which
-    /// pass a turn falls in, not how many turns a thread has taken. Both runs
-    /// of --verify therefore end the same slices. A preemption recording
-    /// records the slice end it causes like any other change point, and a
-    /// preemption replay, or a schedule replay until its schedule is over,
-    /// follows its recorded slice ends and applies no hint
-    /// (`cap_timeslice_at_deadline`), so a replay needs none there.
+    /// preemptions), and not under `hermit record`/`hermit replay`
+    /// (`recordreplay_modes`), as for every deadline hint. A schedule replay
+    /// (`has_schedule_replay`) has two phases:
+    /// - While its schedule dictates the turns
+    ///   (`schedule_replay_dictates_turns`), the recorded slice ends apply and
+    ///   no live deadline hint does (`cap_timeslice_at_deadline`), so this
+    ///   count, the first-turn bound (`chaos_first_turn_overdue`) and the
+    ///   starvation bound (`bound_chaos_starvation`) are off.
+    /// - Once the schedule is over, its last event consumed or the rest
+    ///   released (`schedule_replay_over`), the run goes on as a run without
+    ///   a schedule: each thread ends slices by that run's rules
+    ///   (`ThreadState::follows_replayed_schedule`), and this count, the
+    ///   first-turn bound and the starvation bound apply as they do there. A
+    ///   thread applies the deadline hint this count gives once it has heard
+    ///   the schedule is over, in the reply to its next traced event.
+    ///
+    /// In each phase these rules are functions of scheduler state. Where the
+    /// tail begins need not be. A tail that begins at the consumption of the
+    /// last recorded event begins at the same event in every run. A release,
+    /// though, also depends on how many recorded polling retries the replay
+    /// matched, since a matched retry ends the run of unmatched events
+    /// (`Replayer::release_schedule`). That count can be host-timed even
+    /// inside Hermit's stable-filesystem and no-network boundary: a guest call
+    /// on the background path finishes at a host-timed moment, and an actor
+    /// outside the container can make a descriptor ready
+    /// (`Scheduler::is_polling_turn`). So a released tail can begin at another
+    /// event, or not at all. The bounds then start where that release resets
+    /// the priorities and the slice rules
+    /// (`release_replay_priorities_if_exhausted`), and add no input of their
+    /// own.
+    ///
+    /// The count is of committed turns, host-timed polling retries aside, as
+    /// for `previous_turn_tid`: background calls and skipped turns do not
+    /// commit, and host-timed admissions and signals change only which pass a
+    /// turn falls in, not how many turns a thread has taken. Both runs of
+    /// --verify therefore end the same slices while their committed turns and
+    /// their phase of a schedule replay agree; a release that comes at another
+    /// event (above) moves where the tail begins, and with it the tail's
+    /// slices. A preemption recording records the slice end it causes like any
+    /// other change point, and a preemption replay, or a schedule replay while
+    /// its schedule dictates the turns, follows its recorded slice ends and
+    /// applies no hint (`cap_timeslice_at_deadline`), so it needs none there.
     /// Such a slice ends at a syscall check-in, and a preemption replay ends
     /// a slice recorded there at the same branch count, which can fall just
     /// before the syscall rather than after it; until
@@ -20841,7 +20870,9 @@ impl Scheduler {
     /// retries the replay matches can be host-timed
     /// (`Scheduler::is_polling_turn`). Under `--replay-continue-fairly` the
     /// threads of each band are then ordered by their run time
-    /// ([`Self::order_continuation_fairly`]).
+    /// ([`Self::order_continuation_fairly`]). From this point on the chaos
+    /// bounds apply as in a run without a schedule
+    /// (`schedule_replay_dictates_turns`).
     fn release_replay_priorities_if_exhausted(&mut self) {
         if self.replay_priorities_released
             || !self.has_schedule_replay()
