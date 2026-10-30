@@ -3183,7 +3183,7 @@ mod tests {
         let trial = run.trial_global_opts();
         assert_eq!(trial.log, Some(LevelFilter::WARN));
         assert_eq!(trial.log_file, None);
-        let repro = run.to_repro();
+        let repro = run.repro_command();
         assert!(repro.starts_with("hermit run "), "{repro}");
         assert!(!repro.contains("--log"), "{repro}");
         drop(workspace);
@@ -3199,7 +3199,7 @@ mod tests {
         let log = workspace.path().join("trial.log");
         assert_eq!(trial.log, Some(LevelFilter::DEBUG));
         assert_eq!(trial.log_file.as_deref(), Some(log.as_path()));
-        let repro = run.to_repro();
+        let repro = run.repro_command();
         let expected = format!("hermit --log=debug --log-file={} run ", log.display());
         assert!(repro.starts_with(&expected), "{repro}");
     }
@@ -3254,9 +3254,9 @@ mod tests {
                 format!("hermit{repro} run ")
             };
             assert!(
-                run.to_repro().starts_with(&expected),
+                run.repro_command().starts_with(&expected),
                 "{flags:?}: {}",
-                run.to_repro()
+                run.repro_command()
             );
         }
         assert!(
@@ -3330,9 +3330,9 @@ mod tests {
                         );
                         let logging = format!("hermit --log={level} --log-file={} ", log.display());
                         assert!(
-                            run.to_repro().starts_with(&logging),
+                            run.repro_command().starts_with(&logging),
                             "{flags:?} {}",
-                            run.to_repro()
+                            run.repro_command()
                         );
                     }
                     None => {
