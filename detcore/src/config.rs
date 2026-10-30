@@ -87,9 +87,10 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: 30 (PR #4728, returned for
-    /// a clean rebase). Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[30];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips nothing at this head: 28 is
+    /// PR #4789's, 29 is PR #4884's, 31 is PR #4867's, and 30 is this
+    /// change's (PR #4728), appended in landing order below.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -240,6 +241,16 @@ mod tests {
         // this rebase onto main's pidfd revision 27, skipping reserved
         // 30 (4728); digest measured at this head).
         (31, "b4bbaec490287ee5", "f013e36743d8d9e6"),
+        // `SchedEvent::stopless`, which the event's bincode always writes, and
+        // the `ReplayedSliceEnd` that `TraceSchedEventResponse` now carries
+        // (https://github.com/rrnewton/hermit/pull/4728; revision 30, reserved
+        // for this change by the D2 seal and appended here in landing order,
+        // after 29 (PR #4884) and 31 (PR #4867)). The digest now also
+        // covers the event `TraceSchedEvent` carries (domain 4: its fields and
+        // its `Serialize`) and the reply's fields (domain 5). #4780 defines
+        // domain 4 for the same event; whichever of the two lands second merges
+        // the item lists and records the next revision.
+        (30, "8b2876baa9a75d3b", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -285,11 +296,64 @@ mod tests {
         code
     }
 
+    /// The items of detcore-model's schedule.rs that decide how
+    /// `GlobalRequest::TraceSchedEvent` carries its event: the event's
+    /// fields and its hand-written `Serialize`, which decides which of them
+    /// the RPC's bincode writes.
+    const SCHED_EVENT_WIRE: [&str; 2] =
+        ["pub struct SchedEvent {", "impl Serialize for SchedEvent {"];
+
+    /// The items that decide how `GlobalResponse::TraceSchedEvent` carries
+    /// its reply: the reply's fields, in tool_global.rs, and the replayed
+    /// slice end one of them holds, in scheduler/replayer.rs.
+    const TRACE_REPLY_WIRE: [&str; 1] = ["pub struct TraceSchedEventResponse {"];
+    const REPLAYED_SLICE_END_WIRE: [&str; 1] = ["pub struct ReplayedSliceEnd {"];
+
+    /// The lines of code of the item `source` declares, unindented, on the
+    /// line `header`: the attributes just above it (its derives and serde
+    /// attributes decide its encoding), the header, and its body through
+    /// the closing brace without comments or blank lines.
+    fn wire_item(source: &str, header: &str) -> Vec<String> {
+        let lines: Vec<&str> = source.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| *line == header)
+            .unwrap_or_else(|| panic!("{header} is declared"));
+        let attributes = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|line| line.starts_with("#["))
+            .count();
+        let mut code: Vec<String> = lines[at - attributes..=at]
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect();
+        code.extend(
+            lines[at + 1..]
+                .iter()
+                .take_while(|line| **line != "}")
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty() && !line.starts_with("//"))
+                .map(str::to_owned),
+        );
+        code
+    }
+
+    /// The wire items `headers` of `source`, one after another.
+    fn wire_items(source: &str, headers: &[&str]) -> String {
+        headers
+            .iter()
+            .map(|header| wire_item(source, header).join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// A digest of the code of `GlobalRequest` and `GlobalResponse` in
-    /// `source`, and of the StoreExclusive payload's types in `payload`:
-    /// their variants, fields, payload types, order and attributes, not
-    /// their documentation.
-    fn definition_digest(source: &str, payload: &str) -> String {
+    /// `source`, of the StoreExclusive payload's types in `payload`, of the
+    /// scheduled event's wire items in `schedule`, and of the trace reply's
+    /// wire items in `source` and `replayer`: their variants, fields, payload
+    /// types, order and attributes, not their documentation.
+    fn definition_digest(source: &str, payload: &str, schedule: &str, replayer: &str) -> String {
         let request = definition(source, "pub enum GlobalRequest {").join("\n");
         let response = definition(source, "pub enum GlobalResponse {").join("\n");
         let payload = STORE_EXCLUSIVE_PAYLOAD
@@ -297,10 +361,18 @@ mod tests {
             .map(|header| nested_definition(payload, header).join("\n"))
             .collect::<Vec<_>>()
             .join("\n");
+        let event = wire_items(schedule, &SCHED_EVENT_WIRE);
+        let reply = [
+            wire_items(source, &TRACE_REPLY_WIRE),
+            wire_items(replayer, &REPLAYED_SLICE_END_WIRE),
+        ]
+        .join("\n");
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
             (3, payload.as_bytes()),
+            (4, event.as_bytes()),
+            (5, reply.as_bytes()),
         ])
     }
 
@@ -318,7 +390,9 @@ mod tests {
     fn the_global_rpc_revision_matches_its_definitions() {
         let source = include_str!("tool_global.rs");
         let payload = include_str!("store_exclusive.rs");
-        let digest = definition_digest(source, payload);
+        let schedule = include_str!("../../detcore-model/src/schedule.rs");
+        let replayer = include_str!("scheduler/replayer.rs");
+        let digest = definition_digest(source, payload, schedule, replayer);
         let resources = include_str!("resources.rs");
         let resources_digest = resources_definition_digest(resources);
         let revision = crate::tool_global::GLOBAL_RPC_REVISION;
@@ -359,13 +433,19 @@ mod tests {
             "pub enum GlobalRequest {\n    /// Documentation only.\n\n",
             1,
         );
-        assert_eq!(definition_digest(&documented, payload), digest);
+        assert_eq!(
+            definition_digest(&documented, payload, schedule, replayer),
+            digest
+        );
         let added = source.replacen(
             "pub enum GlobalRequest {\n",
             "pub enum GlobalRequest {\n    Added(u32),\n",
             1,
         );
-        assert_ne!(definition_digest(&added, payload), digest);
+        assert_ne!(
+            definition_digest(&added, payload, schedule, replayer),
+            digest
+        );
         // Retype GlobalRequest's VirtualInotifyCookies wherever it sits: later
         // revisions append variants after it.
         let retyped = source.replacen(
@@ -374,7 +454,10 @@ mod tests {
             1,
         );
         assert_ne!(retyped, source);
-        assert_ne!(definition_digest(&retyped, payload), digest);
+        assert_ne!(
+            definition_digest(&retyped, payload, schedule, replayer),
+            digest
+        );
         // A field added to a payload type changes it too, as this change's
         // own move from tuples to `ScannedMapping` and `Found` did; its
         // documentation does not.
@@ -384,14 +467,79 @@ mod tests {
             1,
         );
         assert_ne!(grown, payload);
-        assert_ne!(definition_digest(source, &grown), digest);
+        assert_ne!(
+            definition_digest(source, &grown, schedule, replayer),
+            digest
+        );
         let documented = payload.replacen(
             "    pub struct Found {\n",
             "    pub struct Found {\n        /// Documentation only.\n",
             1,
         );
         assert_ne!(documented, payload);
-        assert_eq!(definition_digest(source, &documented), digest);
+        assert_eq!(
+            definition_digest(source, &documented, schedule, replayer),
+            digest
+        );
+        // The event `TraceSchedEvent` carries is detcore-model's: a field
+        // added to it, or a change to which fields its `Serialize` writes,
+        // changes the digest; a doc line does not.
+        let grown = schedule.replacen(
+            "    pub stopless: bool,\n}",
+            "    pub stopless: bool,\n    pub added: u32,\n}",
+            1,
+        );
+        assert_ne!(grown, schedule);
+        assert_ne!(definition_digest(source, payload, &grown, replayer), digest);
+        let carried = schedule.replacen(
+            "let written_stopless = *stopless || !serializer.is_human_readable();",
+            "let written_stopless = *stopless;",
+            1,
+        );
+        assert_ne!(carried, schedule);
+        assert_ne!(
+            definition_digest(source, payload, &carried, replayer),
+            digest
+        );
+        let documented = schedule.replacen(
+            "pub struct SchedEvent {\n",
+            "pub struct SchedEvent {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, schedule);
+        assert_eq!(
+            definition_digest(source, payload, &documented, replayer),
+            digest
+        );
+        // So is the reply: a field added to the replayed slice end it holds,
+        // or its timeslice retyped, changes the digest; a doc line does not.
+        let grown = replayer.replacen(
+            "pub struct ReplayedSliceEnd {\n",
+            "pub struct ReplayedSliceEnd {\n    pub added: u32,\n",
+            1,
+        );
+        assert_ne!(grown, replayer);
+        assert_ne!(definition_digest(source, payload, schedule, &grown), digest);
+        let retyped = source.replacen(
+            "    timeslice: Option<ReplayedSliceEnd>,\n",
+            "    timeslice: Option<LogicalTime>,\n",
+            1,
+        );
+        assert_ne!(retyped, source);
+        assert_ne!(
+            definition_digest(&retyped, payload, schedule, replayer),
+            digest
+        );
+        let documented = replayer.replacen(
+            "pub struct ReplayedSliceEnd {\n",
+            "pub struct ReplayedSliceEnd {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, replayer);
+        assert_eq!(
+            definition_digest(source, payload, schedule, &documented),
+            digest
+        );
 
         let documented = resources.replacen(
             "pub struct Resources {\n",

@@ -8002,9 +8002,11 @@ pub enum SignalScope {
 /// register a placeholder (`Detcore::serves_placeholders`).
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair. 27 is pidfd's `PidfdSelfQualificationRefusal`;
-// 29 is PR 4884's `StoreExclusive` retype, and this change's `PostCrash`
-// pair is 31 (30 is reserved for 4728).
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 31;
+// 29 is PR 4884's `StoreExclusive` retype, and 31 is PR #4867's `PostCrash`
+// pair (both landed in batch D2).
+/// PR #4728's `SchedEvent::stopless` and `ReplayedSliceEnd` are revision 30,
+/// reserved for this change by the D2 seal and appended in landing order.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 30;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
