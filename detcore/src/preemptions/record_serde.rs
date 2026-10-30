@@ -1097,4 +1097,25 @@ mod tests {
         .unwrap();
         assert_ne!(boundary_off, boundary_info);
     }
+
+    /// The uncapped-slices mark is a record field main's serde must list: a
+    /// record in the plain form written before this serde, with the field,
+    /// reads back into it, and a plain record and a marked envelope written
+    /// now keep it.
+    #[test]
+    fn the_uncapped_slices_mark_round_trips_through_the_record_serde() {
+        let old: PreemptionRecord =
+            serde_json::from_str(r#"{"per_thread":{},"global":[],"uncapped_slices":9400000}"#)
+                .unwrap();
+        assert_eq!(old.uncapped_slices, Some(9_400_000));
+        let mut marked = old.clone();
+        marked.replay_departed_at = Some(3);
+        for record in [old, marked] {
+            let text = serde_json::to_string(&record).unwrap();
+            let back: PreemptionRecord = serde_json::from_str(&text).unwrap();
+            assert_eq!(back.uncapped_slices, Some(9_400_000), "{text}");
+            assert_eq!(back, record, "{text}");
+            assert_eq!(back.replay_departed_at, record.replay_departed_at, "{text}");
+        }
+    }
 }
