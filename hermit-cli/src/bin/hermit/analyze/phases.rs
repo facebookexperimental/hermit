@@ -3018,7 +3018,8 @@ impl AnalyzeOpts {
     /// decides the cause. A trial that missed shows the settings cause the
     /// outcome; one that met the target shows they do not; one that did not
     /// finish (a bound or a refusal: its launch's error) or could not run
-    /// shows nothing, and the verdict says it was not tried.
+    /// shows nothing, and the verdict says it was not tried and why: the
+    /// error and the class `hermit run` reports for it.
     fn try_alternative_timing_with(
         &self,
         timing: &[TimingSetting],
@@ -3048,26 +3049,31 @@ impl AnalyzeOpts {
         match launch(&alternative, runname) {
             Ok(false) => AlternativeTiming::Missed { trial },
             Ok(true) => AlternativeTiming::Met { trial },
-            Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
-                AlternativeTiming::Untried {
-                    why: format!("the trial with them ({trial} in the workspace) did not finish"),
-                }
-            }
-            Err(error)
-                if error.chain().count() == 1
-                    && error
-                        .downcast_ref::<crate::container::PolicyRefusal>()
-                        .is_some() =>
-            {
+            // A trial that did not complete has no outcome. The verdict says
+            // why it was not tried, with the trial's error and the class
+            // `hermit run` reports for it, and takes nothing else from it.
+            Err(error) => {
+                let ended = if error.downcast_ref::<RunTimeoutMarker>().is_some()
+                    || error
+                        .downcast_ref::<crate::container::LogCapExceeded>()
+                        .is_some()
+                {
+                    "was stopped by its bound"
+                } else if error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some()
+                {
+                    "was refused by Hermit"
+                } else {
+                    "failed"
+                };
                 AlternativeTiming::Untried {
                     why: format!(
-                        "the trial with them ({trial} in the workspace) was refused by Hermit"
+                        "the trial with them ({trial} in the workspace) {ended}: {error:#} ({})",
+                        crate::classify_failure(&error)
                     ),
                 }
             }
-            Err(error) => AlternativeTiming::Untried {
-                why: format!("the trial with them could not run ({error:#})"),
-            },
         }
     }
 
@@ -5878,6 +5884,34 @@ mod tests {
             })
         );
 
+        // A trial that did not complete supplies no outcome: the verdict
+        // keeps the cause the search established, makes no claim about the
+        // settings and says why the trial was not tried, with its error and
+        // the class `hermit run` reports for it.
+        let stopped = options.with_timing_tried(verdict.clone(), |timing, _| {
+            options.try_alternative_timing_with(timing, |_, _| Err(Error::new(RunTimeoutMarker)))
+        });
+        let json = written(
+            options.write_verdict_and_exit(&stopped),
+            ExitStatus::SUCCESS,
+        );
+        assert_eq!(
+            json["verdict_reason"],
+            serde_json::json!({
+                "cause": "scheduler_alone",
+                "timing_in_force": ["--pipe-wake-latency=50000"],
+            })
+        );
+        let header = json["header"].as_str().unwrap();
+        assert!(
+            header.contains(
+                "was not tried: the trial with them (prefix_alternative_timing.repro in the \
+                 workspace) was stopped by its bound: "
+            ) && header.contains("(HERMIT_RUN_TIMEOUT class=run-timeout)")
+                && !header.contains("because of"),
+            "{header}"
+        );
+
         // Any other end of the search ends the analysis, writing no report.
         let options = AnalyzeOpts::try_parse_from([
             "analyze".to_string(),
@@ -5905,7 +5939,8 @@ mod tests {
     /// The trial under the alternative timing runs without the settings it
     /// drops, and its end decides the cause: missed shows the settings cause
     /// the outcome, met shows they do not, and an unfinished (bound or
-    /// refused) or failed trial shows nothing.
+    /// refused) or failed trial shows nothing; the verdict then names its
+    /// error and class.
     #[test]
     fn the_alternative_timing_trial_decides_the_cause_by_how_it_ends() {
         let options = AnalyzeOpts::try_parse_from([
@@ -5923,23 +5958,29 @@ mod tests {
         );
         // How the trial ends, and what the cause must then be.
         type Case = (anyhow::Result<bool>, fn(&AlternativeTiming) -> bool);
-        let cases: [Case; 5] = [
+        let cases: [Case; 6] = [
             (
                 Ok(false),
                 |t| matches!(t, AlternativeTiming::Missed { trial } if trial == "prefix_alternative_timing.repro"),
             ),
             (Ok(true), |t| matches!(t, AlternativeTiming::Met { .. })),
+            // A trial that did not complete is not tried, and the verdict
+            // names its stop or failure: the error and its class.
             (
                 Err(anyhow::Error::new(RunTimeoutMarker)),
-                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("prefix_alternative_timing.repro")),
+                |t| matches!(t, AlternativeTiming::Untried { why } if why.starts_with("the trial with them (prefix_alternative_timing.repro in the workspace) was stopped by its bound: ") && why.ends_with("(HERMIT_RUN_TIMEOUT class=run-timeout)")),
+            ),
+            (
+                Err(anyhow::Error::new(LogCapExceeded)),
+                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("was stopped by its bound: ") && why.ends_with("(HERMIT_LOG_CAP class=log-cap)")),
             ),
             (
                 Err(anyhow::Error::new(PolicyRefusal)),
-                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("was refused by Hermit")),
+                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("was refused by Hermit: ") && why.ends_with("(HERMIT_POLICY_REFUSAL class=policy-refusal)")),
             ),
             (
                 Err(anyhow::anyhow!("no such binary")),
-                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("could not run (no such binary)")),
+                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("failed: no such binary (HERMIT_INTERNAL_FAILURE class=cli-error)")),
             ),
         ];
         // An explicit turn cost equal to the default charge is no setting.
