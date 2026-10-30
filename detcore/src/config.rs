@@ -223,6 +223,12 @@ mod tests {
         // image returns it (the release-05 pidfd pair, renumbered to 27 at
         // its rebase onto C2's 25 and 26; digest measured at this head).
         (27, "74ceb8dd663f2297", "f013e36743d8d9e6"),
+        // Retypes `GlobalResponse::StartNewThread` to carry the starting
+        // thread's replayed first timeslice
+        // (https://github.com/rrnewton/hermit/pull/4789; renumbered to 28 at
+        // its rebase onto main's pidfd revision 27; digest measured at this
+        // head).
+        (28, "0000000000000000", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
