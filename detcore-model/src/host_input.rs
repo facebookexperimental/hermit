@@ -338,8 +338,8 @@ impl StdioKind {
     /// driver, by `drivers`, the kernel's list of them (the text of
     /// `/proc/tty/drivers`: one driver per line, ending with its major
     /// number, its minor number or range, and its type). Detcore classifies
-    /// a guest's descriptor by `stat` of its `/proc/<pid>/fd` link, which
-    /// opens nothing, so it cannot ask `isatty`.
+    /// a guest's descriptor without opening it ([`Self::of_guest_descriptor`]),
+    /// so it cannot ask `isatty`.
     pub fn is_terminal_device(rdev: u64, drivers: &str) -> bool {
         // glibc's `gnu_dev_major` and `gnu_dev_minor`.
         let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
@@ -356,6 +356,100 @@ impl StdioKind {
                 && first.parse().is_ok_and(|first: u64| first <= minor)
                 && last.parse().is_ok_and(|last: u64| minor <= last)
         })
+    }
+
+    /// The kind of one of a guest's descriptors, from what Detcore can read
+    /// about it without opening it, and without reaching a FUSE filesystem,
+    /// whose daemon may be a guest process that cannot run then. `link` is
+    /// the target of its `/proc/<pid>/fd/<n>` link, a name the kernel gives
+    /// without asking the file's filesystem: a pipe, a socket, an anonymous
+    /// inode, and the terminals and memory devices under `/dev`, are told by
+    /// it alone. For any other file, `fdinfo` (the text of
+    /// `/proc/<pid>/fdinfo/<n>`) names its mount, which `mountinfos` (texts
+    /// of `/proc/<pid>/mountinfo`, the guest's and the coordinator's: mount
+    /// IDs are unique across namespaces) must show not to be a FUSE mount
+    /// before `stat` follows the link; a file on a FUSE mount is
+    /// [`Self::Other`]. `stat` gives the followed file's `st_mode` and
+    /// `st_rdev`, and `drivers` the text of `/proc/tty/drivers`, without
+    /// which a character device reached that way is not classified. `None`
+    /// where the kind cannot be told that way: no mount ID, a mount in
+    /// neither namespace, a failed `stat`, or a character device without
+    /// the driver list.
+    pub fn of_guest_descriptor(
+        link: &[u8],
+        fdinfo: Option<&str>,
+        mountinfos: &[&str],
+        drivers: Option<&str>,
+        stat: impl FnOnce() -> Option<(libc::mode_t, u64)>,
+    ) -> Option<Self> {
+        if let Some(kind) = Self::of_descriptor_name(link) {
+            return Some(kind);
+        }
+        let mount = fdinfo?
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:"))
+            .and_then(|id| id.trim().parse::<u64>().ok())?;
+        let fuse = mountinfos.iter().find_map(|mountinfo| {
+            mountinfo.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                if fields.next()?.parse::<u64>().ok()? != mount {
+                    return None;
+                }
+                // The filesystem type follows the `-` that ends the
+                // optional fields.
+                let fstype = fields.skip_while(|field| *field != "-").nth(1)?;
+                Some(fstype == "fuse" || fstype == "fuseblk" || fstype.starts_with("fuse."))
+            })
+        })?;
+        if fuse {
+            return Some(Self::Other);
+        }
+        let (mode, rdev) = stat()?;
+        if mode & libc::S_IFMT == libc::S_IFCHR {
+            let terminal = Self::is_terminal_device(rdev, drivers?);
+            return Some(Self::from_mode(mode, terminal));
+        }
+        Some(Self::from_mode(mode, false))
+    }
+
+    /// The kind a `/proc/<pid>/fd/<n>` link's target alone tells, if it
+    /// does: the kernel's own names for a pipe (`pipe:[ino]`), a socket
+    /// (`socket:[ino]`), an anonymous inode (`anon_inode:...`) and other
+    /// pseudo-filesystem objects (`<type>:[ino]`), the terminals
+    /// (`/dev/pts/<n>`, `/dev/tty...`, `/dev/console`) and the memory
+    /// devices (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`,
+    /// `/dev/urandom`).
+    fn of_descriptor_name(link: &[u8]) -> Option<Self> {
+        if link.starts_with(b"pipe:[") {
+            return Some(Self::Pipe);
+        }
+        if link.starts_with(b"socket:[") {
+            return Some(Self::Socket);
+        }
+        if !link.starts_with(b"/") {
+            return Some(Self::Other);
+        }
+        if let Some(pty) = link.strip_prefix(b"/dev/pts/")
+            && !pty.is_empty()
+            && pty.iter().all(u8::is_ascii_digit)
+        {
+            return Some(Self::Tty);
+        }
+        if link.starts_with(b"/dev/tty") || link == b"/dev/console" {
+            return Some(Self::Tty);
+        }
+        if [
+            &b"/dev/null"[..],
+            b"/dev/zero",
+            b"/dev/full",
+            b"/dev/random",
+            b"/dev/urandom",
+        ]
+        .contains(&link)
+        {
+            return Some(Self::CharDevice);
+        }
+        None
     }
 
     fn describe(self) -> &'static str {
@@ -493,6 +587,99 @@ mod tests {
     /// terminal only when it says so. A replay names each descriptor whose
     /// kind changed, in descriptor order. A set without stdio kinds is
     /// written as before, and one with them round-trips.
+    /// A guest descriptor's kind comes from its link's name where that tells
+    /// it, with no `stat`; any other file is stat'ed only once its mount is
+    /// shown not to be FUSE (here by injected mountinfo texts), and a FUSE
+    /// file is `other` without a `stat`. A mount in neither namespace, a
+    /// missing mount ID, and a character device without the driver list give
+    /// no kind.
+    #[test]
+    fn a_guest_descriptor_is_classified_without_reaching_a_fuse_filesystem() {
+        let guest_mounts = "\
+22 1 0:21 / /proc rw,nosuid shared:5 - proc proc rw
+40 29 0:45 / /mnt/remote rw,nosuid,nodev shared:30 - fuse.sshfs host:/ rw,user_id=0
+41 29 0:46 / /mnt/plain rw - fuse fuse rw
+42 29 8:1 / /mnt/disk rw - fuseblk /dev/sda1 rw
+43 29 0:47 / /sys/fs/fuse/connections rw - fusectl fusectl rw
+";
+        let host_mounts = "29 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n";
+        let mounts = [guest_mounts, host_mounts];
+        let fdinfo = |id: u64| format!("pos:\t0\nflags:\t0100002\nmnt_id:\t{id}\nino:\t5\n");
+        let no_stat =
+            || -> Option<(libc::mode_t, u64)> { panic!("stat'ed a file it must not reach") };
+        let classify = |link: &str, fdinfo: Option<&str>, drivers: Option<&str>| {
+            StdioKind::of_guest_descriptor(link.as_bytes(), fdinfo, &mounts, drivers, no_stat)
+        };
+        for (link, kind) in [
+            ("pipe:[1234]", StdioKind::Pipe),
+            ("socket:[99]", StdioKind::Socket),
+            ("anon_inode:[eventfd]", StdioKind::Other),
+            ("net:[4026531840]", StdioKind::Other),
+            ("/dev/pts/3", StdioKind::Tty),
+            ("/dev/tty1", StdioKind::Tty),
+            ("/dev/console", StdioKind::Tty),
+            ("/dev/null", StdioKind::CharDevice),
+        ] {
+            assert_eq!(classify(link, None, None), Some(kind), "{link}");
+        }
+        for id in [40, 41, 42] {
+            assert_eq!(
+                classify("/mnt/remote/out.log", Some(&fdinfo(id)), None),
+                Some(StdioKind::Other),
+                "mount {id}"
+            );
+        }
+        // Not on FUSE: the stat decides.
+        let stat_once = |mode: libc::mode_t, rdev: u64, drivers: Option<&str>| {
+            let mut stats = 0;
+            let kind = StdioKind::of_guest_descriptor(
+                b"/home/user/out.log",
+                Some(&fdinfo(29)),
+                &mounts,
+                drivers,
+                || {
+                    stats += 1;
+                    Some((mode, rdev))
+                },
+            );
+            assert_eq!(stats, 1);
+            kind
+        };
+        assert_eq!(
+            stat_once(libc::S_IFREG | 0o644, 0, None),
+            Some(StdioKind::File)
+        );
+        assert_eq!(stat_once(libc::S_IFIFO, 0, None), Some(StdioKind::Pipe));
+        let pty = (136 << 8) | 7;
+        let drivers = "pty_slave            /dev/pts      136 0-1048575 pty:slave\n";
+        assert_eq!(
+            stat_once(libc::S_IFCHR, pty, Some(drivers)),
+            Some(StdioKind::Tty)
+        );
+        assert_eq!(
+            stat_once(libc::S_IFCHR, (1 << 8) | 3, Some(drivers)),
+            Some(StdioKind::CharDevice)
+        );
+        assert_eq!(stat_once(libc::S_IFCHR, pty, None), None);
+        // A fusectl mount is no FUSE file system.
+        assert_eq!(
+            StdioKind::of_guest_descriptor(
+                b"/sys/fs/fuse/connections/45/waiting",
+                Some(&fdinfo(43)),
+                &mounts,
+                None,
+                || Some((libc::S_IFREG | 0o400, 0)),
+            ),
+            Some(StdioKind::File)
+        );
+        // No mount ID, or a mount neither namespace lists.
+        assert_eq!(classify("/home/user/out.log", None, None), None);
+        assert_eq!(
+            classify("/memfd:input (deleted)", Some(&fdinfo(7)), None),
+            None
+        );
+    }
+
     /// A character device is a terminal when a terminal driver in the
     /// kernel's list owns its major number and its minor number: a pty slave,
     /// a serial port and the console are; /dev/null and a minor number past

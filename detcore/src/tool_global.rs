@@ -2684,44 +2684,65 @@ impl GlobalState {
     /// recording's. `pid` is the root's host process, and `image` the device
     /// and inode the root's exec ran, as the root read them from its own
     /// `exe` link: `/proc/<pid>` is the root only if its `exe` names that
-    /// file. Each descriptor is read by `stat` of `/proc/<pid>/fd/<n>`, which
-    /// follows the link to the open file without creating or closing a
-    /// descriptor, so no file's open or flush runs; a character device is a
-    /// terminal by its device number (`StdioKind::is_terminal_device`).
-    /// Nothing is kept where there is no such process or image (KVM, whose
-    /// guest threads are no host tasks; DBT, which records no host inputs;
-    /// SaBRe, whose root never execs; a root that changed its root
-    /// directory) or a descriptor cannot be read.
+    /// file. Called without the scheduler lock, as the root waits at its
+    /// first exec.
+    ///
+    /// No descriptor is opened, copied or closed, so no file's open, flush or
+    /// release runs. Each is classified by the name its `/proc/<pid>/fd/<n>`
+    /// link gives, which the kernel forms without asking the file's
+    /// filesystem, and otherwise by `stat` through that link, only once its
+    /// `/proc/<pid>/fdinfo/<n>` mount is shown not to be a FUSE mount: a
+    /// FUSE daemon may be a guest process, which cannot answer then
+    /// (`StdioKind::of_guest_descriptor`). Nothing is kept where there is no
+    /// such process or image (KVM, whose guest threads are no host tasks;
+    /// DBT, which records no host inputs; SaBRe, whose root never execs; a
+    /// root that changed its root directory) or a descriptor's kind cannot be
+    /// told that way.
     fn read_guest_stdio(
         &self,
-        pid: Option<i32>,
+        pid: i32,
         image: Option<(u64, u64)>,
     ) -> Vec<detcore_model::host_input::StdioChange> {
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::MetadataExt;
+        use std::path::Path;
 
         use detcore_model::host_input::StdioKind;
         use detcore_model::host_input::StdioKinds;
-        let Some(task) = pid
-            .map(|pid| PathBuf::from(format!("/proc/{pid}")))
-            .filter(|task| {
-                image.is_some_and(|image| {
-                    std::fs::metadata(task.join("exe"))
-                        .is_ok_and(|exe| (exe.dev(), exe.ino()) == image)
-                })
-            })
-        else {
+        let task = PathBuf::from(format!("/proc/{pid}"));
+        if !image.is_some_and(|image| {
+            std::fs::metadata(task.join("exe")).is_ok_and(|exe| (exe.dev(), exe.ino()) == image)
+        }) {
             return Vec::new();
-        };
-        let directory = task.join("fd");
-        let drivers = std::fs::read_to_string("/proc/tty/drivers").unwrap_or_default();
-        let kind = |fd: i32| match std::fs::metadata(directory.join(fd.to_string())) {
-            Ok(stat) => {
-                let terminal = stat.mode() & libc::S_IFMT == libc::S_IFCHR
-                    && StdioKind::is_terminal_device(stat.rdev(), &drivers);
-                Some(StdioKind::from_mode(stat.mode(), terminal))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(StdioKind::Closed),
-            Err(_) => None,
+        }
+        let read = |path: &Path| std::fs::read_to_string(path).ok();
+        let guest_mounts = read(&task.join("mountinfo"));
+        let own_mounts = read(Path::new("/proc/self/mountinfo"));
+        let mountinfos: Vec<&str> = [guest_mounts.as_deref(), own_mounts.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        let drivers = read(Path::new("/proc/tty/drivers"));
+        let kind = |fd: i32| {
+            let entry = task.join("fd").join(fd.to_string());
+            let link = match std::fs::read_link(&entry) {
+                Ok(link) => link,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Some(StdioKind::Closed);
+                }
+                Err(_) => return None,
+            };
+            StdioKind::of_guest_descriptor(
+                link.as_os_str().as_bytes(),
+                read(&task.join("fdinfo").join(fd.to_string())).as_deref(),
+                &mountinfos,
+                drivers.as_deref(),
+                || {
+                    std::fs::metadata(&entry)
+                        .ok()
+                        .map(|stat| (stat.mode(), stat.rdev()))
+                },
+            )
         };
         let (Some(stdin), Some(stdout), Some(stderr)) = (kind(0), kind(1), kind(2)) else {
             return Vec::new();
@@ -4964,27 +4985,28 @@ impl GlobalState {
                     });
                 // The guest's standard descriptors, as the root's first image
                 // finds them: whatever its launch installed, which this
-                // process need not share. Read here, before the root's first
-                // instruction, and named on Hermit's stderr once the scheduler
-                // is released.
-                let stdio_changes = if first_image
+                // process need not share. Read before the root's first
+                // instruction (it waits for this reply), but after the
+                // scheduler is released: a stat can reach a filesystem whose
+                // server would need a turn (`GlobalState::read_guest_stdio`).
+                let stdio_root = (first_image
                     && self.cfg.record_host_inputs
-                    && self.root_dettid.get() == Some(&dtid)
-                {
+                    && self.root_dettid.get() == Some(&dtid))
+                .then(|| {
                     // The root's host process: the one its backend
                     // registered, or its own ID where guest threads are host
                     // tasks under the IDs the scheduler knows them by.
-                    let pid = sched.physical_process_id(dtid).or_else(|| {
+                    sched.physical_process_id(dtid).or_else(|| {
                         crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
                             .then_some(detpid.as_raw())
-                    });
-                    self.read_guest_stdio(pid, kernel_image)
-                } else {
-                    Vec::new()
-                };
+                    })
+                })
+                .flatten();
                 drop(sched);
-                for change in &stdio_changes {
-                    report_host_input_change(change);
+                if let Some(pid) = stdio_root {
+                    for change in &self.read_guest_stdio(pid, kernel_image) {
+                        report_host_input_change(change);
+                    }
                 }
                 R::MarkPastFirstExecve(Box::new(overrides))
             }
