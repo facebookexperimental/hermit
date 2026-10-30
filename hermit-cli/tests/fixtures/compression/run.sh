@@ -42,7 +42,13 @@ run_strict() {
 }
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
+# The checkout may be git-backed (CI) or a Sapling/Eden checkout (local
+# fbsource). Try git first so git checkouts behave exactly as before.
+if ! repo_root=$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null); then
+  if ! repo_root=$(sl --cwd "$script_dir" root 2>/dev/null); then
+    fail "could not determine repository root from $script_dir (not a git or Sapling checkout)"
+  fi
+fi
 hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
 artifact_root=${COMPRESSION_ARTIFACT_ROOT:-$repo_root/target/compression}
 runs=${COMPRESSION_RUNS:-3}
@@ -86,7 +92,7 @@ metadata=$evidence_dir/metadata.txt
 {
   printf 'schema_version=1\n'
   printf 'started_at_utc=%s\n' "$timestamp"
-  printf 'repository_commit=%s\n' "$(git -C "$repo_root" rev-parse HEAD)"
+  printf 'repository_commit=%s\n' "$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || sl --cwd "$repo_root" log -r . -T '{node}' 2>/dev/null || printf 'unknown')"
   printf 'host_kernel=%s\n' "$(uname -srmo)"
   printf 'runs=%s\n' "$runs"
   printf 'input_lines=%s\n' "$input_lines"
