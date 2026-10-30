@@ -555,20 +555,6 @@ range sets the run's `--max-timeslice` to MAX; give one or the other, and do
 not combine it with `--target-timeslice`. It needs PMU-backed preemption. A
 small MIN makes runs slower, because fine slices mean many preemptions.
 
-`--chaos-timeslice-draw=run` draws once per run instead: the run's
-`--max-timeslice` comes log-uniformly from the range, as a pure function of the
-scheduler seed, and the run is an ordinary chaos run under it. Each seed then
-explores one scale, which reaches a race that needs one scale throughout in
-more seeds, at a higher cost per run for the fine draws. `--summary-json`
-reports the drawn value (`preemption.max_timeslice_ns`), a
-`--record-preemptions-to` record stores it, and a replay of that record runs
-under it. Such a record's value takes precedence over any range the replay
-gives (no per-slice drawing then), so replay it with no `--max-timeslice`, or
-with `--max-timeslice=N` for its drawn N; the `--max-timeslice=MAX` advice
-above is for per-slice records. `hermit analyze` and `hermit bisect` take it
-from such a record, or as `--max-timeslice=N`, and refuse a per-run draw in
-their run arguments.
-
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
 `--replay-preemptions-from=FILE`. A record edited after it was recorded (for
@@ -670,6 +656,85 @@ are left out, and so are paths the guest itself renamed, linked or unlinked,
 or opened with `O_CREAT`. Under `--backend=dbt` nothing is recorded. The
 line is information, not a refusal: Hermit does not make a changing
 filesystem deterministic.
+
+#### Discovery mode
+
+For race discovery, sweep seeds with `--chaos-timeslice-draw=run`. Each run
+draws its `--max-timeslice` once, log-uniformly from the recommended range
+1000..200000000 virtual nanoseconds (1 us to 200 ms), as a pure function of the
+scheduler seed, and is then an ordinary chaos run under it, so the seeds of a
+sweep spread over the scales of the range, each seed at one scale:
+
+```bash
+for seed in $(seq 1 64); do
+  timeout 600 hermit run --chaos --chaos-timeslice-draw=run --sched-seed="$seed" \
+    --summary-json="$PWD/run-$seed.json" -- ./target/debug/hello_race
+done
+```
+
+The recommended range is `RECOMMENDED_CHAOS_TIMESLICE_RANGE` in
+`detcore-model/src/config.rs`, and `hermit run --help` states it; give
+`--chaos-timeslice-range=MIN..MAX` to draw from another range. It spans the
+fine timeslices at which races that the fixed default never reaches were found
+(1 us to 5 ms) and the default itself (200 ms). The default is unchanged: plain
+`--chaos` keeps the fixed 200 ms, and `--chaos-timeslice-draw=slice` (the
+default draw) draws each slice's mean from `--chaos-timeslice-range`, which it
+requires when given explicitly. The per-run draw is not the default because it
+costs time and trades races:
+
+- Fine draws mean many preemptions. On the repository's racy guests the p90
+  run took up to about 120 times as long as at the fixed default; in a study of
+  115 cases the draw took 4.4 times the run time in all, and 78 of its runs hit
+  their time cap against 9. Size time limits for the fine end.
+- Draws below about 3 us dilate guest-visible time by two to three orders of
+  magnitude. At draws near 1 us the fixed charge for each committed scheduler
+  turn (0.5 ms) makes up about 99% of guest-visible time
+  ([#4813](https://github.com/rrnewton/hermit/issues/4813)), so a guest's own
+  watchdogs can fire on threads that are making progress. Pass
+  `--cap-preemption-charge` beside fine draws: it caps that charge (in that
+  study it cut a control's watchdog aborts at a 1038 ns draw from 5 of 5 seeds
+  to 1 of 5). It is refused where no timeslice ends by expiry
+  (`--max-timeslice=disabled` without `--target-timeslice`), where no Detcore
+  scheduler orders the threads (`--namespace-only`, `--strace-only`,
+  `--no-sequentialize-threads`) and with the DBT backend, and it is never
+  applied in record mode.
+- A race that needs coarse slices is reached by fewer seeds than at the fixed
+  default.
+- It is meant for seed sweeps: without a seed every run is seed 0 and draws the
+  same value.
+
+`--summary-json` reports the drawn value (`preemption.max_timeslice_ns`), and a
+`--record-preemptions-to` record stores it (`chaos_timeslice`). On a replay:
+
+- A record that states a drawn value replays under it with no timeslice
+  option, drawing nothing. It takes precedence over a range or
+  `--chaos-timeslice-draw` the replay gives; `--max-timeslice=N` is accepted
+  for its own N only, and `--chaos-seeded-timeslice` is refused.
+- A record that states none (one recorded at a fixed timeslice, or before
+  records stated the draw) leaves the replay's own timeslice options in force.
+  With `--chaos-timeslice-draw=run` the replay draws its maximum from its own
+  scheduler seed, as a run without a record does; to replay such a record as it
+  was recorded, give the `--max-timeslice` it was recorded with, or no
+  timeslice option for the default 200000000.
+- A range without the per-run draw beside such a record replays its slice
+  ends under the range's MAX, as for any per-slice record.
+
+`hermit analyze` runs all its trials under the drawn value its recordings
+state (`--run1-preemptions`, `--run2-preemptions`), and `hermit bisect` all its
+replays under the one its `--good` and `--bad` schedules state, passed as
+`--max-timeslice=N`. Both refuse `--chaos-timeslice-draw=run` in their run
+arguments (each trial would draw its own value), recordings that state
+different values, a `--chaos-timeslice-range` in the run arguments beside a
+recording that states one, and a `--max-timeslice` that differs from it. The
+schedules analyze writes do not state the value: give a later `hermit bisect`
+of them the same `--max-timeslice=N`.
+
+The draw and the range need `--chaos` and PMU-backed preemption (the ptrace
+backend; the others refuse them), and conflict with an explicit
+`--max-timeslice`, with `--chaos-seeded-timeslice` and with
+`--target-timeslice`. Each bound of a range must be at least 10 virtual
+nanoseconds (one RCB at the default clock multiplier), and MIN no larger than
+MAX.
 
 ### Verify Mode
 
@@ -974,7 +1039,8 @@ hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
 | `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
 | `--cap-preemption-charge` | Charges a turn that ends an expired timeslice at most the time its thread ran since its previous turn. |
 | `--chaos-timeslice-range=MIN..MAX` | With `--chaos`, draws each slice's mean log-uniformly from MIN..MAX virtual nanoseconds and caps slices at MAX (the run's `--max-timeslice`). Not with `--chaos-seeded-timeslice`, which draws the maximum instead. |
-| `--chaos-timeslice-draw=run` | Draws the run's `--max-timeslice` once from the range, from the scheduler seed, instead of each slice's mean. |
+| `--chaos-timeslice-draw=run` | Discovery mode: draws the run's `--max-timeslice` once from the range (without one, the recommended 1000..200000000), from the scheduler seed. Fine draws make runs much slower. |
+| `--chaos-timeslice-draw=slice` | The default draw: each slice's mean from `--chaos-timeslice-range`, which it needs; what a range alone does. |
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes
