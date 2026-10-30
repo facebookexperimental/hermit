@@ -38,6 +38,7 @@ pub(crate) mod ids;
 pub(crate) mod levels;
 pub(crate) mod listing;
 pub(crate) mod locks;
+pub(crate) mod memory_map;
 pub(crate) mod private_maps;
 pub(crate) mod task_stat;
 
@@ -1260,6 +1261,19 @@ pub(crate) struct ProcfsFile {
     /// an authenticated kernel object and retain its open-time mm.
     #[serde(default)]
     maps_target: Option<MapsTarget>,
+    /// For a process's `maps` Detcore may render from the backend's memory
+    /// map, the task its open found and the address space the file lists, the
+    /// one that task held at the open, which was the opener's own
+    /// ([`ProcfsFile::bind_memory_map`]). `None` where the open bound none;
+    /// the file is then read from the kernel's, as before.
+    #[serde(default)]
+    memory_map: Option<memory_map::Binding>,
+    /// Whether this `maps` file's snapshot was rendered from the backend's
+    /// memory map ([`ProcfsFile::note_rendered_from_memory_map`]), so that
+    /// the kernel's file was never read and its position is the one Detcore
+    /// keeps there (`DetFd::procfs_keeps_kernel_position`).
+    #[serde(default)]
+    rendered_from_memory_map: bool,
     target_fd: Option<i32>,
     bound_thread_identity: Option<(i32, i32, i32)>,
     /// For a task's `schedstat`, the task it describes, found when it was
@@ -1895,6 +1909,8 @@ impl ProcfsFile {
             task,
             incarnation: None,
             maps_target: None,
+            memory_map: None,
+            rendered_from_memory_map: false,
             target_fd,
             bound_thread_identity: None,
             schedstat_thread: None,
@@ -2606,6 +2622,36 @@ impl ProcfsFile {
 
     pub(crate) fn maps_target(&self) -> Option<MapsTarget> {
         self.maps_target.clone()
+    }
+
+    /// Bind a process's `maps` to the task its open found and the address
+    /// space that task held then, as Linux takes the task's memory map at the
+    /// open (`proc_maps_open`). Only for a task of the opener's own process,
+    /// whose address space is the opener's.
+    pub(crate) fn bind_memory_map(&mut self, binding: memory_map::Binding) {
+        assert!(self.is_maps(), "only a maps file binds an address space");
+        self.memory_map = Some(binding);
+    }
+
+    /// What a process's `maps` was bound to at its open
+    /// ([`ProcfsFile::bind_memory_map`]), if anything.
+    pub(crate) fn memory_map(&self) -> Option<memory_map::Binding> {
+        self.memory_map
+    }
+
+    /// Note that this `maps` file's snapshot was rendered from the backend's
+    /// memory map (`Detcore::maps_from_memory_map`) rather than read from the
+    /// kernel's file, which the snapshot then left unread, at the position
+    /// the open gave it.
+    pub(crate) fn note_rendered_from_memory_map(&mut self) {
+        assert!(self.is_maps(), "only a maps file renders from a memory map");
+        self.rendered_from_memory_map = true;
+    }
+
+    /// Whether this file's snapshot was rendered from the backend's memory
+    /// map ([`ProcfsFile::note_rendered_from_memory_map`]).
+    pub(crate) fn snapshot_from_memory_map(&self) -> bool {
+        self.rendered_from_memory_map
     }
 
     /// True when this file lists the reading process's own virtual memory

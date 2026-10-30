@@ -1297,6 +1297,12 @@
       "why": "tests/c/madvise_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/main_stack_maps.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/main_stack_maps.c is owned by hermit-cli/tests/cli.rs: the_main_stack_is_read_from_maps_as_on_linux and run_kvm_the_main_stack_is_read_from_maps_as_on_linux run it natively and on ptrace and KVM at bitwise parity, and require at each step of its changes to its own stack the native run's stack-area lines of /proc/self/maps, pthread_getattr_np answers and descriptor size, and ESRCH for a descriptor whose task is reaped; on KVM but for where the lowest line starts, and for the two steps after which LinuxEmu loses track of the stack window, which must read its invented line, never an empty file (package K slice K9a of https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot compare a guest's output with its native run's."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/map_shadow_stack_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

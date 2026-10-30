@@ -6434,6 +6434,36 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .expect("a classified procfs file disappeared")
                         .bind_schedstat_thread(thread);
                 }
+                // A process's `maps` lists the address space its task held at
+                // the open: Linux takes the task's memory map then
+                // (`proc_maps_open`), or none for a task that has released
+                // it, whose file then reads empty. Detcore may render the
+                // file from the backend's memory map
+                // (`Detcore::maps_from_memory_map`) where that task is of the
+                // opener's own process, whose address space it shares, and
+                // still holds it at the open, as Detcore's process table says
+                // (`procfs::memory_map::Binding`), which also tells which task
+                // holding those numbers it is. Named by a spelling, as
+                // `schedstat` above is.
+                if procfs.as_ref().is_some_and(ProcfsFile::is_maps)
+                    && self.renders_procfs(guest)
+                    && let Some((pid, tid)) = self
+                        .procfs_caller_ids(guest)
+                        .filter(|_| classified_by_spelling)
+                    && let Some(task) = crate::procfs::maps_task_at(&procfs_spelling, pid, tid)
+                    && task.process == pid
+                {
+                    let answer = crate::tool_global::procfs_task(guest, task).await;
+                    let opener = guest.thread_state().mm_id;
+                    if let Some(binding) =
+                        crate::procfs::memory_map::Binding::at_open(task, &answer, opener)
+                    {
+                        procfs
+                            .as_mut()
+                            .expect("a classified procfs file disappeared")
+                            .bind_memory_map(binding);
+                    }
+                }
                 if procfs
                     .as_ref()
                     .and_then(ProcfsFile::timer_slack_target)
@@ -7064,6 +7094,90 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(err.into())
             }
         }
+    }
+
+    /// A process's `maps`, opened on descriptor `fd`, rendered from the
+    /// backend's memory map (`Guest::memory_map`, `procfs::memory_map`)
+    /// rather than read from the kernel's file, where the backend gives one
+    /// (package K slice K9a of <https://github.com/rrnewton/hermit/issues/4213>):
+    /// on ptrace the kernel's own text for the guest's address space; on KVM
+    /// the mappings of the stack window that LinuxEmu keeps, `[stack]` and
+    /// the parts a split left of it, each as Linux prints it. The rest of the
+    /// address space a native process lists (the image, the interpreter, the
+    /// vDSO, the heap, every `mmap(2)` mapping) is missing there, a named
+    /// difference of the KVM provider
+    /// (<https://github.com/rrnewton/reverie/issues/1211>).
+    ///
+    /// Linux's read first finds the task the open found, by the pid the
+    /// file's inode holds (`m_start`), and answers ESRCH once that task is
+    /// reaped, whichever task holds its number by then; it then prints the
+    /// mappings of the address space the open took, whichever thread reads.
+    /// Where the open bound the file (`ProcfsFile::bind_memory_map`), ESRCH
+    /// where Detcore's process table no longer has the task the open found
+    /// (`procfs::memory_map::Binding`): on every backend, whatever the
+    /// backend's own file would give. On KVM a descriptor received over
+    /// `SCM_RIGHTS` carries no binding, and reads LinuxEmu's file, a named
+    /// difference (`docs/ARCHITECTURE.md`). Then, where the bound address
+    /// space is still the reader's, the reader's map is the file's. `None`,
+    /// to read the file as before, where it is not (another process that
+    /// inherited the descriptor, or the same one after `exec`), where the
+    /// open bound nothing, where Detcore renders no procfs file (under record
+    /// and replay, after a `chroot`), where the descriptor cannot read (the
+    /// kernel's read answers EBADF), and where the backend's map does not
+    /// answer, lists nothing while incomplete, or lists a mapping the
+    /// renderer does not know (`procfs::memory_map::render`).
+    ///
+    /// TODO(package K slice K10): on KVM the open still reaches LinuxEmu's
+    /// synthetic `/proc/self/maps`, the last file of its synthetic path
+    /// table, which the guest's descriptor is read through. Its one invented
+    /// `[stack]` line is still the file wherever this rendering does not
+    /// apply, and an `mmap(2)` of the descriptor still maps it where Linux
+    /// refuses one (ENODEV); a `stat` of the descriptor reports Linux's size
+    /// (`Self::with_procfs_maps_size`), but one of its path, or of its
+    /// `/proc/self/fd` link, reports its length. K10 deletes the file, with
+    /// the path table.
+    async fn maps_from_memory_map<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let (binding, flags) = guest.thread_state().with_detfd(fd, |detfd| {
+            (detfd.procfs_memory_map(), detfd.status_flags())
+        })?;
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        if !self.renders_procfs(guest) || !can_read(flags) {
+            return Ok(None);
+        }
+        let answer = crate::tool_global::procfs_task(guest, binding.task()).await;
+        if !binding.finds_its_task(&answer) {
+            trace!("maps of fd {fd}: the task its open found is gone (ESRCH)");
+            return Err(Errno::ESRCH.into());
+        }
+        if !binding.held_by(guest.thread_state().mm_id) {
+            return Ok(None);
+        }
+        let rendered = match guest.memory_map(guest.tid()) {
+            Ok(map) => {
+                let rendered = crate::procfs::memory_map::render(&map);
+                if rendered.is_none() {
+                    trace!("maps of fd {fd} read from the kernel's file: memory map gives no file");
+                }
+                rendered
+            }
+            Err(error) => {
+                trace!("maps of fd {fd} read from the kernel's file: memory map {error:?}");
+                None
+            }
+        };
+        if let Some(rendered) = &rendered {
+            trace!(
+                "maps of fd {fd} rendered from the memory map: {} bytes",
+                rendered.len()
+            );
+        }
+        Ok(rendered)
     }
 
     async fn snapshot_procfs<G: Guest<Self>>(
@@ -8046,6 +8160,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                         return Err(Errno::EBADF.into());
                     }
                     crate::tool_global::mapping_capture::capture(guest, target)?
+                } else if let Some(rendered) = self.maps_from_memory_map(guest, call.fd()).await? {
+                    // The kernel's file stays unread, so Detcore keeps its
+                    // position at the cursor from now on, as a read of it
+                    // would move it (`DetFd::procfs_keeps_kernel_position`).
+                    guest.thread_state().with_detfd(call.fd(), |detfd| {
+                        detfd.note_procfs_rendered_from_memory_map()
+                    })?;
+                    rendered
                 } else {
                     self.snapshot_procfs(guest, call).await?
                 }
@@ -11950,6 +12072,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(stat)
     }
 
+    /// `stat`, of the file `target` names, with Linux's size where that is a
+    /// process's `maps` that Detcore may render from the backend's memory map
+    /// (`Self::maps_from_memory_map`), named by its descriptor: 0, and no
+    /// blocks, as for every file procfs prints at read time, whatever the
+    /// backend's own file holds. On KVM that is LinuxEmu's in-memory file,
+    /// whose size is its invented line's length, while a read gives Detcore's
+    /// rendering; elsewhere the kernel's file already reports 0.
+    fn with_procfs_maps_size<G: Guest<Self>>(
+        guest: &G,
+        target: StatTarget<'_>,
+        mut stat: DetStat,
+    ) -> DetStat {
+        let rendered = target.descriptor().is_some_and(|fd| {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.procfs_memory_map().is_some())
+                .unwrap_or(false)
+        });
+        if rendered {
+            stat.size = 0;
+            stat.blocks = 0;
+        }
+        stat
+    }
+
     /// Handles all stat syscalls.
     pub async fn handle_stat_family<G: Guest<Self>>(
         &self,
@@ -12027,6 +12174,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let stat = self
                 .determinize_stat(guest, stat, inode_override, procfs)
                 .await?;
+            let stat = Self::with_procfs_maps_size(guest, target, stat);
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
@@ -12166,6 +12314,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let stat = self
                 .determinize_stat(guest, stat, inode_override, procfs)
                 .await?;
+            let stat = Self::with_procfs_maps_size(guest, target, stat);
             let mut statx: reverie::syscalls::linux_abi::Statx = stat.into();
             self.fill_statx_mount_id(guest, &mut statx, raw_mount_id, unique)
                 .await;

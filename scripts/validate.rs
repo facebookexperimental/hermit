@@ -18910,7 +18910,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "118");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "119");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -19021,10 +19021,12 @@ mod nextest_timeout_tests {
         // declarations, every one selected. And
         // run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name: 116. And
         // run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name
-        // (https://github.com/rrnewton/hermit/issues/4768): 117.
+        // (https://github.com/rrnewton/hermit/issues/4768): 117. And
+        // run_kvm_the_main_stack_is_read_from_maps_as_on_linux (package K slice
+        // K9a, https://github.com/rrnewton/hermit/issues/4213): 118.
         assert_eq!(
             names.len(),
-            117,
+            118,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -19074,6 +19076,7 @@ mod nextest_timeout_tests {
             "run_kvm_a_late_timer_event_is_a_verify_infrastructure_error",
             "run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name",
             "run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name",
+            "run_kvm_the_main_stack_is_read_from_maps_as_on_linux",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -20190,8 +20193,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // And run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name:
         // 117. And
         // run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name
-        // (https://github.com/rrnewton/hermit/issues/4768): 118 selected.
-        ("privileged-only-test.cli_kvm", 118usize),
+        // (https://github.com/rrnewton/hermit/issues/4768): 118 selected. And
+        // run_kvm_the_main_stack_is_read_from_maps_as_on_linux (package K
+        // slice K9a): 119 selected.
+        ("privileged-only-test.cli_kvm", 119usize),
     ] {
         let step = privileged
             .steps

@@ -330,6 +330,8 @@ static REPLAY_DESYNC_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static MAIN_STACK_MAPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static MAIN_STACK_BOUNDS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
@@ -8587,6 +8589,521 @@ fn run_kvm_the_virtual_cpus_are_listed_by_every_spelling() {
         return;
     }
     list_the_virtual_cpus_by_every_spelling("kvm");
+}
+
+/// Where LinuxEmu's stack window starts: 8 MiB less a page below the stack's
+/// top, all mapped from the start, where Linux maps the stack's pages as the
+/// stack grows.
+const KVM_STACK_WINDOW_START: &str = "7fffff800000";
+
+/// The steps of `main_stack_maps.c` after which KVM's memory map lists
+/// nothing, as LinuxEmu has lost track of the stack window: an `mprotect`
+/// across a hole, which LinuxEmu refuses whole where Linux changes the pages
+/// before the hole.
+const KVM_UNKNOWN_WINDOW_STEPS: [&str; 1] = ["hole"];
+
+/// Why KVM refuses the vfork child of `main_stack_maps.c`'s step "vfork",
+/// which leaves the page it made read-only: KVM runs a vfork child on a copy
+/// of its parent's memory, and the copy carries contents back to the parent,
+/// not mapping changes (<https://github.com/rrnewton/reverie/issues/1087>).
+const KVM_VFORK_MAPPING_REFUSAL: &str = "unsupported KVM vfork child operation vfork \
+    write-back: the vfork child left a mapping changed (by mmap, munmap, mprotect or mremap) \
+    when its window ended, which on Linux would be its parent's too, and a copy carries back \
+    contents, not mappings";
+
+/// What such a step prints on KVM: the file as it was before Detcore
+/// rendered it, LinuxEmu's one invented line over the whole stack window, and
+/// glibc's answer from it, 8 MiB.
+const KVM_INVENTED_STEP: &str = "\
+    7fffff800000-7ffffffff000 rw-p 00000000 00:00 0 [stack]\n\
+    stack 0 7ffffffff000 800000 800000\n";
+
+/// `tests/c/main_stack_maps.c`'s guest.
+fn main_stack_maps_guest() -> &'static Path {
+    compiled_c_guest(&MAIN_STACK_MAPS_GUEST, "main_stack_maps")
+}
+
+/// `hermit-cli/tests/fixtures/main_stack_bounds.rs`, built once per test
+/// process with the toolchain's `rustc`.
+fn main_stack_bounds_guest() -> &'static Path {
+    MAIN_STACK_BOUNDS_GUEST.get_or_init(|| {
+        let build_root = process_build_root("main_stack_bounds");
+        fs::create_dir_all(&build_root).expect("failed to create the guest's build directory");
+        let guest = build_root.join("main_stack_bounds");
+        let output = Command::new("rustc")
+            .args(["--edition=2024", "-C", "debuginfo=1"])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/main_stack_bounds.rs"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to compile main_stack_bounds: {error}"));
+        assert!(
+            output.status.success(),
+            "main_stack_bounds compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// Sets the soft rlimit of the stack of the process `command` starts to
+/// 8 MiB, no more than its hard limit, and of its core file to 0. 8 MiB is
+/// the limit Detcore tells a guest it has; on ptrace it is also the limit
+/// the guest's stack really grows to, where an overflow faults.
+fn limit_the_main_stack(command: &mut Command) {
+    // SAFETY: getrlimit(2) and setrlimit(2) change only the child about to
+    // exec, and are async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            for (resource, soft) in [(libc::RLIMIT_STACK, 8 << 20), (libc::RLIMIT_CORE, 0)] {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(resource, &mut limit) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = limit.rlim_max.min(soft);
+                if libc::setrlimit(resource, &limit) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+/// What `guest ARGS` prints run natively as Hermit runs it: without address
+/// randomization, with the limits of [`limit_the_main_stack`], and with only
+/// the two variables Hermit gives a guest under `--base-env=empty`, so that
+/// its initial stack is laid out as in Hermit's run.
+fn native_main_stack_output(guest: &str, args: &[&str]) -> String {
+    let mut command = Command::new(guest);
+    command
+        .args(args)
+        .env_clear()
+        .env("ASAN_OPTIONS", "detect_leaks=0")
+        .env("LSAN_OPTIONS", "detect_leaks=0")
+        .stdin(Stdio::null());
+    limit_the_main_stack(&mut command);
+    // SAFETY: personality(2) changes only the child about to exec, and is
+    // async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::personality(libc::ADDR_NO_RANDOMIZE as libc::c_ulong) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {guest} natively: {error}"));
+    assert!(
+        output.status.success(),
+        "native {guest} {args:?}: {output:?}"
+    );
+    String::from_utf8(output.stdout).expect("the guest prints text")
+}
+
+/// What `guest ARGS` prints under Hermit on `backend` at L2: two runs at
+/// bitwise parity under `--verify-strict`, with the same nonzero number of
+/// INFO records compared, and the limits of [`limit_the_main_stack`].
+fn main_stack_output_at_l2(backend: &str, guest: &str, args: &[&str]) -> String {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report = report.to_str().unwrap();
+    let mut hermit_args = vec![
+        "--log=info",
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=empty",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report,
+        "--",
+        guest,
+    ];
+    hermit_args.extend_from_slice(args);
+    let mut command = hermit_command(&hermit_args);
+    limit_the_main_stack(&mut command);
+    let (status, log) =
+        run_with_deadline(command, directory.path(), Duration::from_secs(240), false);
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{backend} {guest} {args:?}:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_bitwise_parity(report, &format!("{backend} {guest} {args:?}"));
+    stdout
+}
+
+/// What `guest ARGS` does under Hermit on `backend` in one run, with the
+/// limits of [`limit_the_main_stack`] and without `--verify`, which refuses a
+/// run that exits nonzero: Hermit's exit status, the guest's stdout and
+/// Hermit's stderr.
+fn main_stack_output_once(
+    backend: &str,
+    guest: &str,
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut hermit_args = vec![
+        "--log=info",
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=empty",
+        "--",
+        guest,
+    ];
+    hermit_args.extend_from_slice(args);
+    let mut command = hermit_command(&hermit_args);
+    limit_the_main_stack(&mut command);
+    let (status, log) =
+        run_with_deadline(command, directory.path(), Duration::from_secs(240), false);
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    (status.and_then(|status| status.code()), stdout, log)
+}
+
+/// `output` cut before each `step` line: the text before the first one, then
+/// each step's text, its `step` line first.
+fn step_sections(output: &str) -> Vec<String> {
+    let mut sections = vec![String::new()];
+    for line in output.split_inclusive('\n') {
+        if line.starts_with("step ") {
+            sections.push(String::new());
+        }
+        sections
+            .last_mut()
+            .expect("a section to append to")
+            .push_str(line);
+    }
+    sections
+}
+
+/// `output`, with the start of each `maps` line and of the first stack-area
+/// line after each `step` line, the lowest, written `LOWEST`; and those
+/// starts.
+fn without_the_lowest_starts(output: &str) -> (String, Vec<String>) {
+    let mut normalized = String::new();
+    let mut starts = Vec::new();
+    let mut lowest_next = false;
+    for line in output.split_inclusive('\n') {
+        if line.starts_with("step ") {
+            lowest_next = true;
+            normalized.push_str(line);
+            continue;
+        }
+        let (prefix, mapping) = match line.strip_prefix("maps ") {
+            Some(mapping) => ("maps ", Some(mapping)),
+            None if lowest_next && line.as_bytes().first().is_some_and(u8::is_ascii_hexdigit) => {
+                ("", Some(line))
+            }
+            None => ("", None),
+        };
+        match mapping.and_then(|mapping| mapping.split_once('-')) {
+            Some((start, rest)) => {
+                lowest_next = false;
+                starts.push(start.to_owned());
+                normalized.push_str(prefix);
+                normalized.push_str("LOWEST-");
+                normalized.push_str(rest);
+            }
+            None => normalized.push_str(line),
+        }
+    }
+    (normalized, starts)
+}
+
+/// glibc's `pthread_getattr_np` finds the main thread's stack in
+/// `/proc/self/maps`: its top from `__libc_stack_end`, and its size from the
+/// stack's rlimit, less the part of the line holding `__libc_stack_end` above
+/// that top, and no more than reaches the end of the line before it. The JVM
+/// and Rust's standard library take the main thread's stack bounds from it.
+/// Detcore renders the file from the backend's memory map (package K slice
+/// K9a of <https://github.com/rrnewton/hermit/issues/4213>): on ptrace the
+/// kernel's own text, on KVM the stack window's mappings that LinuxEmu keeps,
+/// and nothing else.
+///
+/// `main_stack_maps.c` changes its own stack: a guard zone made inaccessible,
+/// as the JVM protects its guard zones, a recursion down to it, a page made
+/// read-only and then writable, `madvise` advice that splits a mapping and
+/// advice that joins it again, advice that changes no mapping, a forked
+/// child's copy of the zone made accessible, the zone made accessible again,
+/// a page made read-only by a `vfork` child in a forked child, a page
+/// unmapped, and an `mprotect` across that hole, which Linux applies to the
+/// pages before the hole. At each step it prints the stack area's lines of
+/// the file and `pthread_getattr_np`'s answer; at the start also the size
+/// `fstat` and `statx` report for a descriptor of the file, 0 as for every
+/// file procfs prints at read time. Linux binds the file to its
+/// task and that task's address space at the open: a grandchild reads the
+/// descriptor its parent opened once the parent is reaped, which fails
+/// ESRCH. On ptrace it also reads through other descriptors opened
+/// elsewhere: a forked child reads the one its parent opened, which lists the
+/// parent's stack, the parent reads another child's maps, which list the
+/// child's, it reads the one a `CLONE_VM | CLONE_VFORK | CLONE_FILES` child
+/// opened once that child is reaped, which fails ESRCH (KVM refuses such a
+/// clone, EOPNOTSUPP), and an image reads one opened before its `exec`, which
+/// reads nothing. There it also prints the position `/proc/self/fdinfo`
+/// shows for a descriptor after a read of 100 bytes, which Detcore keeps in
+/// the kernel's file though it never reads it, and reads a descriptor a
+/// child read 100 bytes of, sent over `SCM_RIGHTS` and closed, which
+/// continues where the child stopped. `main_stack_bounds.rs` prints the
+/// line of the file that holds a local of its `main`, read through
+/// `std::fs`, and the answer; on ptrace it then overflows its main stack in a
+/// child, which std reports as an overflow only for a fault in the guard page
+/// it put below the answer.
+///
+/// Every line and answer must be the native run's, at bitwise parity, but
+/// for three things on KVM. The lowest stack-area line starts where
+/// LinuxEmu's window does, as it maps the whole window at once
+/// (`KVM_STACK_WINDOW_START`), a named difference
+/// (<https://github.com/rrnewton/reverie/issues/1211>). After the `mprotect`
+/// across the hole, LinuxEmu has lost track of the window, and its memory map
+/// lists nothing: the file is then what it was before Detcore rendered it,
+/// LinuxEmu's invented line (`KVM_INVENTED_STEP`), and never an empty file, in
+/// which glibc would find no stack (ENOENT). And the `vfork` step does not
+/// run there: KVM runs a vfork child on a copy of its parent's memory, which
+/// carries contents back to the parent but not mapping changes, so it refuses
+/// by name the child that leaves the page it made read-only
+/// (`KVM_VFORK_MAPPING_REFUSAL`). Both compared runs on KVM pass the guest
+/// `no-vfork`, which skips that step alone; the test checks that skipping it
+/// changes no other step of the native run, and that Hermit refuses the
+/// guest with the step by that name. Before this rendering, KVM's file was
+/// the invented line at every step, whatever the guest did, so glibc
+/// answered 8 MiB at the nine steps besides the hole where Linux answers
+/// 0x10000 or 0x11000. Three differences of KVM's are out of reach here: a
+/// descriptor that names another address space still reads LinuxEmu's invented
+/// line, since KVM's memory map answers only for the asking process; a fault
+/// below the window ends the run (guest exception vector 14) where Linux
+/// delivers SIGSEGV, so the overflow is not run there; and the stack's other
+/// neighbours are missing from the file, so a soft limit beyond the window's
+/// reach gives another answer (reverie-kvm's README).
+fn read_the_main_stack_from_maps_as_on_linux(backend: &str) {
+    let kvm = backend == "kvm";
+    let guest = main_stack_maps_guest().to_str().unwrap().to_owned();
+    // The descriptor steps read a maps file through descriptors opened
+    // elsewhere: on KVM one that names another address space than the
+    // reader's still reads LinuxEmu's invented line, as KVM's memory map does
+    // not answer for it, and the clone of the step "reaped" is refused. KVM
+    // refuses the vfork step's child by name (see above), so both of its runs
+    // skip that step.
+    let args: &[&str] = if kvm { &["no-vfork"] } else { &["descriptors"] };
+    let native = native_main_stack_output(&guest, args);
+    let mut steps = vec![
+        "start",
+        "guarded",
+        "used",
+        "read-only",
+        "writable",
+        "random",
+        "normal",
+        "dontneed",
+        "child",
+        "unguarded",
+        "orphaned",
+        "vfork",
+        "unmapped",
+        "hole",
+    ];
+    if kvm {
+        steps.retain(|step| *step != "vfork");
+    } else {
+        steps.insert(10, "inherited");
+        steps.insert(11, "other");
+        steps.insert(12, "reaped");
+        steps.insert(13, "position");
+        steps.push("exec");
+    }
+    assert_eq!(
+        native
+            .lines()
+            .filter_map(|line| line.strip_prefix("step "))
+            .collect::<Vec<_>>(),
+        steps,
+        "{native}"
+    );
+    // The guard zone ends glibc's answer at its top, and a read-only page
+    // at its own: what KVM's invented line hid.
+    let answers = native
+        .lines()
+        .filter(|line| line.starts_with("stack 0 "))
+        .count();
+    let narrowed = native
+        .lines()
+        .filter(|line| line.starts_with("stack 0 ") && !line.ends_with(" 800000 800000"))
+        .count();
+    let expected = if kvm { (12, 10) } else { (15, 12) };
+    assert_eq!((answers, narrowed), expected, "{native}");
+    // A step's lines, and its answer.
+    let lines = |step: &str| {
+        native
+            .split(&format!("step {step}\n"))
+            .nth(1)
+            .and_then(|rest| rest.split("stack ").next())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let answer = |step: &str| {
+        native
+            .split(&format!("step {step}\n"))
+            .nth(1)
+            .and_then(|rest| rest.lines().find(|line| line.starts_with("stack ")))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // A descriptor of the file has no size; one whose task is reaped reads
+    // nothing but ESRCH, in another process; the mprotect across the hole
+    // failed and made the two pages before the hole read-only, which leaves
+    // glibc's answer as it was.
+    assert!(
+        native.contains("o_path read -1 9\nfstat size 0 statx size 0\n"),
+        "{native}"
+    );
+    assert!(native.contains("step orphaned\nread -1 3\n"), "{native}");
+    assert!(
+        native.contains("hole mprotect -1 12\nstep hole\n"),
+        "{native}"
+    );
+    assert_eq!(lines("hole").matches(" r--p ").count(), 1, "{native}");
+    assert_eq!(
+        lines("hole").lines().count(),
+        lines("unmapped").lines().count() + 1,
+        "{native}"
+    );
+    assert_eq!(answer("hole"), answer("unmapped"), "{native}");
+    if !kvm {
+        // The vfork child's change shows in the address space it shared; the
+        // descriptor a child inherited lists its parent's stack, without the
+        // child's read-only page; another child's maps list its own, with it;
+        // one whose task is reaped reads nothing but ESRCH, in the address
+        // space it names too; fdinfo shows the position a read left, and a
+        // received copy continues from it; a descriptor that outlived an exec
+        // reads nothing.
+        assert_eq!(lines("vfork").matches(" r--p ").count(), 1, "{native}");
+        assert_eq!(lines("inherited"), lines("unguarded"), "{native}");
+        assert!(native.contains("step reaped\nread -1 3\n"), "{native}");
+        assert!(
+            native.contains("step position\nfdinfo pos 100\nreceived continues 1 pos 1\n"),
+            "{native}"
+        );
+        assert_eq!(lines("other").matches(" r--p ").count(), 1, "{native}");
+        assert!(native.ends_with("step exec\nbytes 0\n"), "{native}");
+    }
+    let hermit = main_stack_output_at_l2(backend, &guest, args);
+    let rust = main_stack_bounds_guest().to_str().unwrap().to_owned();
+    // A fault below KVM's window is no SIGSEGV there (see above).
+    let rust_args: &[&str] = if kvm { &[] } else { &["overflow"] };
+    let rust_native = native_main_stack_output(&rust, rust_args);
+    if !kvm {
+        assert!(
+            rust_native.ends_with("overflow signal Some(6) reported true\n"),
+            "{rust_native}"
+        );
+    }
+    let rust_hermit = main_stack_output_at_l2(backend, &rust, rust_args);
+    if kvm {
+        // The vfork step, skipped above, runs in a forked child: natively,
+        // the guest with it prints every other step as the guest without it.
+        let with_vfork = native_main_stack_output(&guest, &[]);
+        let mut with_vfork_steps = step_sections(&with_vfork);
+        let vfork_step = with_vfork_steps
+            .iter()
+            .position(|step| step.starts_with("step vfork\n"))
+            .unwrap_or_else(|| panic!("no vfork step:\n{with_vfork}"));
+        with_vfork_steps.remove(vfork_step);
+        assert_eq!(with_vfork_steps, step_sections(&native), "{with_vfork}");
+        // With the step, Hermit refuses the run by name when the vfork child
+        // exits with the page still read-only, before its parent prints the
+        // step.
+        let (code, stdout, stderr) = main_stack_output_once(backend, &guest, &[]);
+        // KNOWN DEFECT (https://github.com/rrnewton/hermit/issues/5025): this
+        // named refusal exits 125 as an internal failure, where it should exit
+        // 122 as a policy refusal, because `is_policy_refusal` does not yet
+        // recognize VF1's vfork refusals. This assertion is meant to fail when
+        // the class is fixed; the expectation then moves to 122,
+        // `HERMIT_POLICY_REFUSAL_EXIT`.
+        // EXIT-CLASS: hermit
+        assert_eq!(
+            code,
+            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(stderr.contains(KVM_VFORK_MAPPING_REFUSAL), "{stderr}");
+        assert!(
+            stdout.contains("step orphaned\n") && !stdout.contains("step vfork"),
+            "{stdout}"
+        );
+        // The steps after which LinuxEmu's window is unknown read its
+        // invented line; every other step is compared with the native run's.
+        let (hermit_steps, native_steps) = (step_sections(&hermit), step_sections(&native));
+        assert_eq!(hermit_steps.len(), native_steps.len(), "{hermit}");
+        let (mut hermit_known, mut native_known) = (String::new(), String::new());
+        for (hermit_step, native_step) in hermit_steps.iter().zip(&native_steps) {
+            let name = hermit_step
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("step "))
+                .unwrap_or_default();
+            if KVM_UNKNOWN_WINDOW_STEPS.contains(&name) {
+                assert_eq!(
+                    hermit_step,
+                    &format!("step {name}\n{KVM_INVENTED_STEP}"),
+                    "{hermit}"
+                );
+                assert_ne!(hermit_step, native_step, "{native}");
+            } else {
+                hermit_known.push_str(hermit_step);
+                native_known.push_str(native_step);
+            }
+        }
+        for (hermit, native) in [(&hermit_known, &native_known), (&rust_hermit, &rust_native)] {
+            let (hermit, hermit_starts) = without_the_lowest_starts(hermit);
+            let (native, native_starts) = without_the_lowest_starts(native);
+            assert_eq!(hermit, native);
+            assert!(!hermit_starts.is_empty());
+            assert!(
+                hermit_starts
+                    .iter()
+                    .all(|start| start == KVM_STACK_WINDOW_START),
+                "{hermit_starts:?}"
+            );
+            assert!(
+                native_starts
+                    .iter()
+                    .all(|start| start.as_str() > KVM_STACK_WINDOW_START),
+                "{native_starts:?}"
+            );
+        }
+    } else {
+        assert_eq!(hermit, native);
+        assert_eq!(rust_hermit, rust_native);
+    }
+}
+
+/// [`read_the_main_stack_from_maps_as_on_linux`] on ptrace.
+#[test]
+fn the_main_stack_is_read_from_maps_as_on_linux() {
+    read_the_main_stack_from_maps_as_on_linux("ptrace");
+}
+
+/// [`read_the_main_stack_from_maps_as_on_linux`] on KVM.
+#[test]
+fn run_kvm_the_main_stack_is_read_from_maps_as_on_linux() {
+    let test = "run_kvm_the_main_stack_is_read_from_maps_as_on_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    read_the_main_stack_from_maps_as_on_linux("kvm");
 }
 
 /// A `readlink` of the caller's descriptor link to `/proc/self/fd`, open on

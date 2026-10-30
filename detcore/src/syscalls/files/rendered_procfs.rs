@@ -4471,9 +4471,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(())
     }
 
-    /// Keep a placeholder's kernel position at Detcore's cursor, which a
+    /// Keep the kernel position of a procfs file whose position Detcore keeps
+    /// (`DetFd::procfs_keeps_kernel_position`: a placeholder, a fixed file,
+    /// or a `maps` rendered from the memory map) at Detcore's cursor, which a
     /// backend that rediscovers descriptors after `exec`, or another process
-    /// sharing the open file, reads back (`adopt_rendered_procfs_position`).
+    /// sharing the open file, reads back (`adopt_rendered_procfs_position`),
+    /// and which Linux's `fdinfo` shows.
     pub(super) async fn sync_rendered_procfs_position<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -4496,8 +4499,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await;
             // A placeholder takes any position. The kernel's own file may
-            // refuse one past its contents, which differ from Detcore's;
-            // Detcore's cursor still answers the guest.
+            // refuse one past its contents, which differ from Detcore's, and
+            // a `maps` refuses every one once its task is reaped (ESRCH from
+            // `seq_lseek`, which leaves the kernel's position at 0); Detcore's
+            // cursor still answers the guest.
             if placeholder {
                 moved?;
             }

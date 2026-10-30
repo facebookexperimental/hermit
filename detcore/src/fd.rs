@@ -2121,14 +2121,32 @@ impl DetFd {
     }
 
     /// Whether Detcore keeps this procfs file's kernel position at its own
-    /// cursor: a placeholder, or a fixed file the kernel opened (whose
-    /// snapshot Detcore renders without reading the kernel's file). A backend
-    /// that rediscovers descriptors after `exec` reads the position back.
+    /// cursor: a placeholder, a fixed file the kernel opened (whose snapshot
+    /// Detcore renders without reading the kernel's file), or a process's
+    /// `maps` whose snapshot Detcore rendered from the backend's memory map
+    /// (`ProcfsFile::snapshot_from_memory_map`), which did not read the
+    /// kernel's file either. Linux's `fdinfo` shows that position, and a
+    /// descriptor of the open file that Detcore's model does not join (one
+    /// received over `SCM_RIGHTS` that Detcore records as an open file of its
+    /// own) reads the kernel's file from it. A backend that rediscovers
+    /// descriptors after `exec` reads the position back.
     pub(crate) fn procfs_keeps_kernel_position(&self) -> bool {
         self.with_description(|d| {
-            d.procfs
-                .as_ref()
-                .is_some_and(|procfs| procfs.is_rendered() || procfs.snapshot_is_fixed())
+            d.procfs.as_ref().is_some_and(|procfs| {
+                procfs.is_rendered()
+                    || procfs.snapshot_is_fixed()
+                    || procfs.snapshot_from_memory_map()
+            })
+        })
+    }
+
+    /// Note that this process's `maps` snapshot was rendered from the
+    /// backend's memory map (`ProcfsFile::note_rendered_from_memory_map`).
+    pub(crate) fn note_procfs_rendered_from_memory_map(&self) {
+        self.with_description(|d| {
+            if let Some(procfs) = d.procfs.as_mut() {
+                procfs.note_rendered_from_memory_map();
+            }
         })
     }
 
@@ -2260,6 +2278,12 @@ impl DetFd {
 
     pub(crate) fn procfs_maps_target(&self) -> Option<crate::procfs::MapsTarget> {
         self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::maps_target))
+    }
+
+    /// What a process's `maps` was bound to at its open
+    /// (`ProcfsFile::memory_map`).
+    pub(crate) fn procfs_memory_map(&self) -> Option<crate::procfs::memory_map::Binding> {
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::memory_map))
     }
 
     /// Carry the opened Maps/Smaps description, including its old target and cursor,

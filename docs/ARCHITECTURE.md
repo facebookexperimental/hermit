@@ -724,6 +724,71 @@ and stores the sanitized buffer on the open file description. Subsequent
 sequential reads return slices from that immutable snapshot using a shared
 logical offset, so partial reads of that one snapshot are consistent.
 
+A process's own `maps` (`/proc/self/maps`, `thread-self`, its pid or
+`task/<tid>`) is not captured where the backend reports its memory map
+(`Guest::memory_map`; package K slice K9a of
+<https://github.com/rrnewton/hermit/issues/4213>) and Detcore renders procfs
+(outside record and replay, and before any `chroot`). The open binds the file
+to the task its path names and to that task's address space, as Detcore's
+process table identifies them. At the first read, a bound file whose task is
+gone, or whose number another task holds by then, fails ESRCH, as Linux's read
+does; otherwise, where the reader holds the bound address space, Detcore
+prints each listed mapping as Linux's `show_map_vma` does
+(`detcore/src/procfs/memory_map.rs`), and the result takes the same identity
+rewrite. The process table identifies an address space by the number of the
+task that made it and an exec count (`MmId`), which a reused number can
+repeat: on ptrace, once the kernel's pid space wraps, a task that shares a
+reaped task's address space (a `CLONE_VM` child that is not a thread) can open
+its maps and then fork a child that gets the reaped task's number, whose
+address space then has the same identity, so that child reads its own map
+through the inherited descriptor where Linux prints its parent's. LinuxEmu
+never reuses a task's number. A `stat` of a bound descriptor reports size 0,
+as Linux's does. The kernel's file stays unread, so Detcore keeps the kernel's
+position at the file's cursor after every read and seek, as a read of it would
+move it: on ptrace `fdinfo` shows Linux's position (KVM shows no `fdinfo` for
+the file), and a descriptor of the open file that Detcore records as an open
+file of its own (one received over `SCM_RIGHTS` that it does not join) reads
+the kernel's file on from there. On ptrace each such seek walks the mappings
+up to the position, which grows with the square of the file's size for a guest
+that reads it in small pieces (a guest with 20,000 mappings that reads its
+982 KB file 1 KiB at a time spends 1.05 to 1.40 s more system time a pass,
+about 1.3 ms a read at a position of 0.5 MB; one with 5,000 no measurable
+time), and once the task is reaped, the kernel refuses the seek and its
+position falls to 0. On ptrace the map is the kernel's own text, so the file
+reads as before but for a `[uprobes]` line, which is left out of this file
+only (it stays in `smaps`, `numa_maps` and every `maps` captured from the
+kernel): the kernel adds that page to a process when a uprobe installed by
+something else on the host fires in it, so it can be there in one run and not
+in the next. On KVM the map lists
+the mappings of the stack window that LinuxEmu keeps, `[stack]` and the parts a
+split left of it, exactly as Linux prints them, so glibc's `pthread_getattr_np`
+finds the main thread's stack as on Linux. The image, the interpreter, the
+vDSO, the heap and every `mmap(2)` mapping are missing, a named difference of
+the KVM provider (<https://github.com/rrnewton/reverie/issues/1211>), and the
+lowest line starts where LinuxEmu's window does, 8 MiB less a page below the
+stack's top. Once LinuxEmu loses track of the window (an `mprotect(2)` across
+a hole in it, which it refuses whole, or a change a `vfork` partner made), its
+map lists nothing, and the file is again LinuxEmu's one invented `[stack]` line
+over the whole window, in the process and the children it forks, until it
+executes another program. On KVM only `self` and the pid spelling open:
+`thread-self` and `task/<tid>` fail with EACCES, as before this rendering, as
+LinuxEmu's synthetic path table has no entry for them, and so do
+`/proc/self/../self/maps` and `open("/proc/self", O_DIRECTORY)`, through which
+an `openat` would reach the file; a reopen through `/proc/self/fd/N` reads the
+invented line, where Linux reads a fresh map. A descriptor received over
+`SCM_RIGHTS` on KVM is not bound: it reads the invented line while the task
+that opened it is a zombie (Linux reads nothing) and once that task is reaped
+(Linux fails ESRCH), and a process that sends its own descriptor to itself
+reads the invented line through the received copy and the rendered map
+through the original, where Linux's two descriptors share one open file, its
+contents and its position. The descriptor there is
+still LinuxEmu's in-memory file, so `mmap(2)` of it maps the invented line,
+where Linux refuses with ENODEV, and a `stat` of its path or its descriptor
+link reports that line's length; package K slice K10 removes that file.
+Another process's `maps`, which the open does not bind, and a descriptor read
+where the reader does not hold the bound address space (in another process
+that inherited it, or after an `exec`), are captured from the kernel as above.
+
 This is not a complete host-independent representation of any of the three
 files. Fields not listed above remain exactly as the host kernel reported them,
 and a separately opened file receives a separate snapshot. The normalized
@@ -1004,6 +1069,7 @@ The main implementation entry points are:
 | Resource identities and requests | `detcore/src/resources.rs` |
 | FD model | `detcore/src/fd.rs` |
 | Deterministic procfs snapshots | `detcore/src/procfs.rs`, `detcore/src/syscalls/files.rs` |
+| A process's own `maps` from the backend's memory map | `detcore/src/procfs/memory_map.rs` |
 | Logical time | `detcore-model/src/time.rs`, `detcore/src/syscalls/time.rs` |
 | Signal handling | `detcore/src/syscalls/signal.rs` |
 | CPUID table | `detcore/src/cpuid.rs` |
