@@ -377,6 +377,16 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "cli",
         ]),
+        // The deadline_slice_cap suite under the KVM node's features, the
+        // same feature set as the KVM CLI node above.
+        "privileged-test.deadline_slice_cap_kvm" => Some(&[
+            "-p",
+            "hermit-run",
+            "--features",
+            "third-party-backends,kvm-execution-tests",
+            "--test",
+            "deadline_slice_cap",
+        ]),
         "test.sabre_examples" | "sabrecompat.sabre_examples" => Some(&[
             "-p",
             "hermit-run",
@@ -521,6 +531,10 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// The KVM gap-ledger runner, which lists and runs a suite through the prepared
+/// Nextest executables with the Cargo selection after its `--`.
+const KVM_GAP_LEDGER_RUN: &str = "kvm-gap-ledger.rs run";
+
 /// Recover the exact authored payload from the one supported execution wrapper.
 /// Both the generator and its preparation audit inspect the same command bytes
 /// the container's final bash executes, including literal shell quoting.
@@ -599,11 +613,25 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
             "{tag} does not require prepared Nextest executables"
         ));
     }
-    for marker in ["run-nextest-counted.sh", "nextest-binaries.rs list"] {
+    for marker in [
+        "run-nextest-counted.sh",
+        "nextest-binaries.rs list",
+        KVM_GAP_LEDGER_RUN,
+    ] {
         if !command.contains(marker) {
             continue;
         }
         let mut arguments = command_arguments(&command, marker)?;
+        if marker == KVM_GAP_LEDGER_RUN {
+            // `run -- NEXTEST_ARGS`: the runner hands NEXTEST_ARGS to both its
+            // Nextest list and its counted run, and reads its ledger from
+            // crate::known_gaps::LEDGER_ENV.
+            let separator = arguments
+                .iter()
+                .position(|argument| argument == "--")
+                .ok_or_else(|| format!("{tag} gives {KVM_GAP_LEDGER_RUN} no `--`"))?;
+            arguments.drain(..=separator);
+        }
         if marker == "run-nextest-counted.sh" {
             match arguments.first().map(String::as_str) {
                 Some("--calibration-host") => {
@@ -1301,7 +1329,38 @@ mod tests {
         assert_ne!(terminal_key, hardware_key);
         assert_eq!(full.get(&terminal_key), Some(&terminal_selection));
         assert!(!portable.contains_key(&terminal_key));
-        assert_eq!(full.len(), portable.len() + 2);
+        // The KVM gap-ledger node lists and runs its suite through the prepared
+        // executables of the selection after its runner's `--`.
+        let ledger = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-test.deadline_slice_cap_kvm")
+            .unwrap();
+        assert_command_selection(ledger).unwrap();
+        assert_eq!(
+            ledger.env[crate::known_gaps::LEDGER_ENV],
+            "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv"
+        );
+        let ledger_selection: Vec<String> =
+            serde_json::from_str(&ledger.env[SELECTION_ENV]).unwrap();
+        let ledger_key = crate::nextest_binaries::selection_key(&ledger_selection);
+        assert_eq!(full.get(&ledger_key), Some(&ledger_selection));
+        assert!(!portable.contains_key(&ledger_key));
+        let mut narrowed = ledger.clone();
+        narrowed.cmd = narrowed
+            .cmd
+            .replace("--test deadline_slice_cap;", "--test cli;");
+        let error = assert_command_selection(&narrowed).unwrap_err();
+        assert!(error.contains("command has Cargo selection"), "{error}");
+        let mut separatorless = ledger.clone();
+        separatorless.cmd = separatorless
+            .cmd
+            .replace("kvm-gap-ledger.rs run -- ", "kvm-gap-ledger.rs run ");
+        let error = assert_command_selection(&separatorless).unwrap_err();
+        assert!(error.contains("no `--`"), "{error}");
+        // The hardware CLI selection, the inherited-terminal selection and the
+        // KVM gap-ledger selection are full-only.
+        assert_eq!(full.len(), portable.len() + 3);
         for (key, selection) in &portable {
             assert_eq!(full.get(key), Some(selection));
         }

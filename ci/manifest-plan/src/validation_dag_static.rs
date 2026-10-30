@@ -62,22 +62,26 @@ pub(super) enum StructuredResultProducerKind {
     Envelope,
     Applications,
     Conformance,
+    KvmGapLedger,
 }
 
 impl StructuredResultProducerKind {
     /// The exact structured-result schema this producer writes: schema 4 for a
     /// harness node of a bucket in
     /// [`crate::validation_dag::DIAGNOSTIC_MANIFEST_BUCKETS`], which runs with
-    /// `--diagnostic-results`; the default schema 2 for every other producer.
+    /// `--diagnostic-results`, and for a KVM gap-ledger node, whose failing gap
+    /// rows are diagnostic failures (never passes); the default schema 2 for
+    /// every other producer.
     pub(super) fn declaration(
         self,
         owner: String,
         manifest_category: Option<&str>,
     ) -> StructuredTestResultsManifest {
-        let diagnostic = self == Self::TestHarness
-            && manifest_category.is_some_and(|category| {
-                crate::validation_dag::DIAGNOSTIC_MANIFEST_BUCKETS.contains(&category)
-            });
+        let diagnostic = self == Self::KvmGapLedger
+            || self == Self::TestHarness
+                && manifest_category.is_some_and(|category| {
+                    crate::validation_dag::DIAGNOSTIC_MANIFEST_BUCKETS.contains(&category)
+                });
         if diagnostic {
             StructuredTestResultsManifest::diagnostic(owner)
         } else {
@@ -85,12 +89,13 @@ impl StructuredResultProducerKind {
         }
     }
 
-    pub(super) const ALL: [Self; 5] = [
+    pub(super) const ALL: [Self; 6] = [
         Self::Nextest,
         Self::TestHarness,
         Self::Envelope,
         Self::Applications,
         Self::Conformance,
+        Self::KvmGapLedger,
     ];
 
     pub(super) const fn command_marker(self) -> &'static str {
@@ -100,6 +105,7 @@ impl StructuredResultProducerKind {
             Self::Envelope => "write-structured-test-counts.sh",
             Self::Applications => "tests/e2e/lib/applications/run_all.sh",
             Self::Conformance => "ci/conformance-test-counts.sh",
+            Self::KvmGapLedger => "ci/kvm-gap-ledger.rs run",
         }
     }
 
@@ -110,6 +116,7 @@ impl StructuredResultProducerKind {
             Self::Envelope => ENVELOPE_RESULT_PRODUCERS,
             Self::Applications => APPLICATION_RESULT_PRODUCERS,
             Self::Conformance => CONFORMANCE_RESULT_PRODUCERS,
+            Self::KvmGapLedger => KVM_GAP_LEDGER_RESULT_PRODUCERS,
         }
     }
 }
@@ -276,6 +283,14 @@ pub(super) const CONFORMANCE_RESULT_PRODUCERS: &[&str] = &[
     "test.isolation_matrix_dbt_in_guest",
     "privileged-test.isolation_matrix_kvm",
 ];
+/// Nodes that run a Hermit test suite on KVM through `ci/kvm-gap-ledger.rs
+/// run`, held to the suite's known-gap ledger: required tests pass, gap rows
+/// that fail as their rows say are diagnostic failures, and a gap row that
+/// passes or fails another way fails the node. Each has its ledger in
+/// crate::known_gaps::DECLARATIONS, which `materialize` writes into its
+/// environment.
+pub(super) const KVM_GAP_LEDGER_RESULT_PRODUCERS: &[&str] =
+    &["privileged-test.deadline_slice_cap_kvm"];
 
 pub(super) const PMU_MEMORY_FAILURE_FAMILY: &str = "super.Weekly PMU parallel memory diagnostic";
 pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
@@ -1222,7 +1237,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The retry stack adds three: 1929 + 3 = 1932, re-measured 2026-10-31.
     // The integrated chain adds six: 1932 + 6 = 1938, re-measured in the
     // test.regular_crates tight loop at 351565c0ae (1937 passed, one failed).
-    ("test.regular_crates", 1938),
+    // The known-gap ledger module (hermit-manifest-plan known_gaps) adds twenty
+    // units: 1938 + 20 = 1958, as test.regular_crates executed in the pinned root.
+    ("test.regular_crates", 1958),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4744,6 +4761,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and run_kvm_argument_errors_on_another_process_procfs_answer_as_linux
     // (the KVM named refusals): 105 + 3 = 108 (107 run_kvm_), listed.
     ("privileged-test.cli_kvm", 108),
+    // The required tests of hermit-cli/tests/deadline_slice_cap.rs on KVM: the
+    // suite's 42 tests less the 20 rows of its known-gap ledger
+    // (hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv), measured on Hermit
+    // main badaea3ee96 and 2c255403749 with
+    // https://github.com/rrnewton/hermit/issues/4929's first slice on top. ci/kvm-gap-ledger.rs runs all 42 and refuses a
+    // population that does not leave exactly this many required. Deleting a
+    // row (a gap that now passes) or adding a test raises it.
+    ("privileged-test.deadline_slice_cap_kvm", 22),
     // The same three https://github.com/rrnewton/hermit/issues/3260 tests as
     // test.cli; all 99 prior identities retained. The same
     // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli
@@ -5086,8 +5111,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same eighteen integrated-chain cli cases: 664 + 18 = 682.
     ("test.cli_on_host", 682),
     // The hosted twin carries the local regular_crates selection minus its
-    // 14 PMU/timer/replay skips: 1938 - 14 = 1924, re-measured 2026-10-31.
-    ("test.regular_crates_on_host", 1924),
+    // 14 PMU/timer/replay skips: 1958 - 14 = 1944, re-measured 2026-10-31.
+    ("test.regular_crates_on_host", 1944),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6227,7 +6252,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // The retry stack: the same three added cases: 1932 - 14 = 1918.
     // The integrated chain: the same six added cases: 1938 - 14 = 1924.
-    ("test.regular_crates_on_host", 1924),
+    // The same twenty known_gaps units, none of them hosted-excluded: 1958 - 14 = 1944.
+    ("test.regular_crates_on_host", 1944),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
@@ -6278,6 +6304,10 @@ pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredRes
             CONFORMANCE_RESULT_PRODUCERS,
             StructuredResultProducerKind::Conformance,
         ),
+        (
+            KVM_GAP_LEDGER_RESULT_PRODUCERS,
+            StructuredResultProducerKind::KvmGapLedger,
+        ),
     ] {
         if tags.contains(&tag) {
             return Some(kind);
@@ -6286,7 +6316,7 @@ pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredRes
     None
 }
 
-fn expected_nextest_count(tag: &str) -> Option<u64> {
+pub(crate) fn expected_nextest_count(tag: &str) -> Option<u64> {
     NEXTEST_EXPECTED_COUNTS
         .iter()
         .find_map(|(candidate, count)| (*candidate == tag).then_some(*count))
@@ -6381,10 +6411,15 @@ impl StaticStepSpec {
             .map(|(name, value)| ((*name).into(), (*value).into()))
             .collect::<BTreeMap<String, String>>();
         if let Some(expected) = expected_nextest_count(&tag) {
-            assert_eq!(
-                producer,
-                Some(StructuredResultProducerKind::Nextest),
-                "{tag} has an expected Nextest count but is not a declared Nextest producer"
+            assert!(
+                matches!(
+                    producer,
+                    Some(
+                        StructuredResultProducerKind::Nextest
+                            | StructuredResultProducerKind::KvmGapLedger
+                    )
+                ),
+                "{tag} has an expected Nextest count but is not a declared Nextest or KVM gap-ledger producer"
             );
             assert!(
                 env.insert("NEXTEST_EXPECTED_EXECUTED".into(), expected.to_string())
@@ -6393,6 +6428,7 @@ impl StaticStepSpec {
             );
         }
         if producer == Some(StructuredResultProducerKind::Nextest)
+            || producer == Some(StructuredResultProducerKind::KvmGapLedger)
             || self.cmd.contains("nextest-binaries.rs executable ")
         {
             let selection = crate::nextest_build_selections::for_step(&tag)
@@ -6407,6 +6443,26 @@ impl StaticStepSpec {
             assert!(
                 env.insert(crate::nextest_binaries::REQUIRED_ENV.into(), "1".into())
                     .is_none()
+            );
+        }
+        // A known-gap ledger is declared once, in crate::known_gaps::DECLARATIONS, and reaches
+        // its node only through this variable: the node's runner reads the ledger from it, and
+        // the receipt qualifier reads the declaration from ci/dag/validate.json.
+        assert!(
+            !env.contains_key(crate::known_gaps::LEDGER_ENV),
+            "{tag} sets {} by hand; declare its ledger in crate::known_gaps::DECLARATIONS",
+            crate::known_gaps::LEDGER_ENV
+        );
+        let ledger = crate::known_gaps::declaration_for_node(&tag);
+        assert_eq!(
+            ledger.is_some(),
+            producer == Some(StructuredResultProducerKind::KvmGapLedger),
+            "{tag}: every KVM gap-ledger producer, and no other node, declares a ledger in crate::known_gaps::DECLARATIONS"
+        );
+        if let Some(declaration) = ledger {
+            env.insert(
+                crate::known_gaps::LEDGER_ENV.into(),
+                declaration.ledger.into(),
             );
         }
         Step {
@@ -10252,6 +10308,35 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         hint: HintSpec {
             resources: &[],
             est_duration_s: 60.0,
+            rss_baseline_bytes: Some(8589934592),
+            hard_mem_max_bytes: Some(17179869184),
+            classification: StepClass::CpuBound,
+            preferred_inner_jobs: Some(8),
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 180,
+        cpu_timeout: 7200,
+        jobs_flag: Some(""),
+        jobs_env: Some("NEXTEST_TEST_THREADS"),
+    },
+    StaticStepSpec {
+        group: r########"privileged-test"########,
+        job: r########"deadline_slice_cap_kvm"########,
+        desc: r########"deadline_slice_cap on KVM, held to its known-gap ledger"########,
+        description: r########"Runs all 42 tests of hermit-cli/tests/deadline_slice_cap.rs on KVM after requiring /dev/kvm, held to the suite's known-gap ledger, hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv, which this node declares as HERMIT_KNOWN_GAP_LEDGER (ci/manifest-plan/src/known_gaps.rs, the format the receipt qualifier reads). The suite's own HERMIT_TEST_BACKEND=kvm switch names --backend=kvm on every Hermit run of it, and capped_schedules_verify_bitwise proves it: each of its verified runs must show KVM's backend banner and record kvm in HERMIT_TEST_BACKEND_PROOF, kept beside the node's results as .backend-proof, or the node fails (KVM-BACKEND-UNPROVEN); the proof test must be in the run's selection and results, and cannot be a gap row or ignored. The ptrace nodes run the same 42 tests on ptrace and are unchanged. Until this node the suite ran on KVM only through a shim outside validation, which left the five tests that named --backend=ptrace themselves on ptrace and counted them as KVM passes; four of them fail on KVM, and capped_schedules_verify_bitwise passes there. ci/kvm-gap-ledger.rs checks the ledger first: every row names a test of the suite, its tracking issue as a full URL, and how it must fail (an ordinary failure whose output shows the row's signature, or a stop by the per-test CPU budget). It reads the suite's tests from its source with a parser that refuses every attribute form it does not understand (a cfg_attr test, a conditional ignore, a test-generating macro), and compares them, test by test, with Nextest's list of the built suite: the same names, the same ignored tests, and nothing filtered out, so no test can be ignored or replaced while the counts stay the same. make lint-checks holds the ledger to its committed history (lint-check-known-gap-ledgers): a row is a baseline row only if it has been present, unchanged, since the ledger's introduction, and a row added or changed later, or a required test deleted or ignored, needs an approval URL that a commit-message line binds to it. The runner then lists the suite with the prepared Nextest runner, refuses unless the tests not in the ledger number exactly NEXTEST_EXPECTED_EXECUTED (22: the 42 less the 20 rows), and runs all 42 once each (NEXTEST_RETRIES=0) in one counted run. A required test that fails, fails the node (KVM-REQUIRED-FAIL). A gap row that fails the way its row says is printed as KNOWN-KVM-GAP with its gap and issue and recorded as a diagnostic failure in structured-result schema 4, counted apart from passes and never as one; a gap row that fails another way fails the node (KVM-GAP-WRONG-FAILURE), and one that passes fails it with "now passing, promote to required" (KVM-GAP-NOW-PASSING). The counted run's CPU report and event stream stay beside the node's results (.cpu.json, .events.jsonl), and SCORECARD.md and ci/compat-envelope/known-gaps.json list the 20 gaps outside every count. The 20 rows: 15 need KVM's preemption timer (https://github.com/rrnewton/hermit/issues/4954; KVM refuses --max-timeslice in 14 of them before the guest starts, and the no-syscall spinner is never preempted), and C, D, E, E+F' and G are the gaps of https://github.com/rrnewton/hermit/issues/4929. MEASURED 2026-10-30 in the pinned root, eight tests at a time, on Hermit main cc676e30f2ee, badaea3ee96 and later with that issue's first slice on top: the node took 32-35 s and the counted run 24.3-24.6 s, 22 passed, 20 failed as their rows say, and the schema-4 report held 22 pass and 20 diagnostic_fail rows. The longest test is the gap a_spinner_without_syscalls_keeps_its_maximum_slice, whose spinner KVM never preempts: the ordinary 22-second per-test CPU budget stops it (cpu_timeout after 22.0 s of CPU, 24.3 s of wall time), which is its row's expected outcome; the required tests took at most 8 s each on a host run. If Nextest's 57-second wall backstop stopped it first, its CPU record could be lost and the whole report refused, a red node with no results (https://github.com/rrnewton/hermit/issues/4962). The 180-second wall (as privileged-test.cli_kvm's) is five times the measured run and leaves room for the CPU budget's multiplier on a loaded host; the 7200-second CPU bound and the memory hints are cli_kvm's, whose eight concurrent KVM guests this node's eight match."########,
+        labels: &[r########"full"########, r########"kvm"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'privileged-test.deadline_slice_cap_kvm: /dev/kvm could not be opened, so the suite cannot run on KVM. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; ./ci/kvm-gap-ledger.rs run -- ${CI:+--profile ci} -p hermit-run --features third-party-backends,kvm-execution-tests --test deadline_slice_cap; exit $?"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: Some(&[r########"deadline_slice_cap"########]),
+        deps: &[r########"privileged-build.privileged_tests"########],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 35.0,
             rss_baseline_bytes: Some(8589934592),
             hard_mem_max_bytes: Some(17179869184),
             classification: StepClass::CpuBound,

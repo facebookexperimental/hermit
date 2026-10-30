@@ -10,6 +10,7 @@ mod git_environment;
 pub mod host_capability;
 pub mod imported_results;
 pub mod invocation_cgroup;
+pub mod known_gaps;
 pub mod ledger;
 #[path = "../../../hermit-cli/src/logdiff_report.rs"]
 pub mod logdiff_report;

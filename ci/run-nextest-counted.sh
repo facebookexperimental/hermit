@@ -87,6 +87,33 @@ function configured_cpu_report_path {
     fi
 }
 
+# The path a caller asked to keep the typed event stream at
+# (HERMIT_NEXTEST_EVENTS_PATH), or `-` when it asked for none.
+function configured_events_path {
+    if [[ ${HERMIT_NEXTEST_EVENTS_PATH+x} ]]; then
+        if [[ -z $HERMIT_NEXTEST_EVENTS_PATH ]]; then
+            printf 'run-nextest-counted: HERMIT_NEXTEST_EVENTS_PATH must not be empty\n' >&2
+            return 2
+        fi
+        printf '%s\n' "$HERMIT_NEXTEST_EVENTS_PATH"
+    else
+        printf '%s\n' -
+    fi
+}
+
+# Keep a copy of the typed event stream (libtest-json-plus, message format
+# 0.1) for a caller that asked for one: its failed events carry each failing
+# test's captured output, which ci/kvm-gap-ledger.rs matches against a gap
+# row's expected-failure signature. It never replaces an existing file.
+function retain_events {
+    local events=$1 destination=$2
+    [[ $destination == - ]] && return 0
+    if ! (set -o noclobber; cat -- "$events" >"$destination"); then
+        printf 'run-nextest-counted: cannot keep the typed event stream at %s\n' "$destination" >&2
+        return 2
+    fi
+}
+
 function configured_wall_timeout_multiplier {
     printf '%s\n' "${HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER-1}"
 }
@@ -489,7 +516,23 @@ PYEOF
     grep -q 'unsupported test event "future"' "$scratch/refusal" || return 1
     [[ ! -e $scratch/refused.json ]] || return 1
 
-    printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls)\n'
+    retain_events "$scratch/events.jsonl" - || return 1
+    [[ ! -e $scratch/kept-events.jsonl ]] || return 1
+    retain_events "$scratch/events.jsonl" "$scratch/kept-events.jsonl" || return 1
+    cmp -s "$scratch/events.jsonl" "$scratch/kept-events.jsonl" || return 1
+    status=0
+    retain_events "$scratch/failed-events.jsonl" "$scratch/kept-events.jsonl" \
+        2>"$scratch/retain-refusal" || status=$?
+    [[ $status == 2 ]] || return 1
+    grep -q 'cannot keep the typed event stream' "$scratch/retain-refusal" || return 1
+    cmp -s "$scratch/events.jsonl" "$scratch/kept-events.jsonl" || return 1
+    [[ $(HERMIT_NEXTEST_EVENTS_PATH="$scratch/asked" configured_events_path) == "$scratch/asked" ]] || return 1
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; configured_events_path) == - ]] || return 1
+    status=0
+    HERMIT_NEXTEST_EVENTS_PATH='' configured_events_path >/dev/null 2>&1 || status=$?
+    [[ $status == 2 ]] || return 1
+
+    printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls, event retention)\n'
 }
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
@@ -521,6 +564,11 @@ mkdir "$cpu_attempt_records" || exit $?
 trap 'cleanup_nextest_config; cleanup_cpu_measurement_dir; rm -f "$events_log"' EXIT
 cpu_wrapper=$(build_cpu_wrapper) || exit $?
 cpu_report=$(configured_cpu_report_path) || exit $?
+events_destination=$(configured_events_path) || exit $?
+if [[ $events_destination != - && ( $events_destination == "${DAGRUN_TEST_COUNTS_PATH:--}" || $events_destination == "$cpu_report" ) ]]; then
+    printf 'run-nextest-counted: HERMIT_NEXTEST_EVENTS_PATH must differ from DAGRUN_TEST_COUNTS_PATH and the CPU report path\n' >&2
+    exit 2
+fi
 if "$calibration_host"; then
     capture_manifest=${HERMIT_RUST_SCRIPT_ARTIFACT_ROOT:-$SCRIPT_DIR/../target/ci/rust-scripts}/manifest.tsv
     if [[ -e $capture_manifest || -L $capture_manifest ]]; then
@@ -564,6 +612,7 @@ nextest_status=0
 run_nextest "$events_log" "$(configured_wall_timeout_multiplier)" "$cpu_wrapper" \
     "$cpu_attempt_records" "$cpu_binary_map" "$cpu_inventory" "$cpu_report" "$@" \
     || nextest_status=$?
+retain_events "$events_log" "$events_destination" || nextest_status=2
 skid_retries=$(wc -l <"$skid_retry_record") || exit $?
 printf 'run-nextest-counted: skid-overshoot retries: %d\n' "$skid_retries" >&2
 retry_records=$(wc -l <"$HERMIT_RETRY_RECORD_FILE") || exit $?

@@ -16,7 +16,9 @@
 #   test-harness sync-cells      ci/expected-e2e-plan.json, ci/optional-e2e-cells.txt
 #   generate-parity-cells        ci/compat-envelope/parity-cells.json (the parity
 #                                population, derived from the manifests)
-#   scorecard.rs update          SCORECARD.md, ci/compat-envelope/cells.json
+#   scorecard.rs update          SCORECARD.md, ci/compat-envelope/cells.json,
+#                                ci/compat-envelope/known-gaps.json (the known-gap
+#                                ledgers' rows, outside every count)
 #   generate-validation-dag      ci/dag/validate.json
 #   generate-test-footprints     checked only; a flip does not move a footprint
 #

@@ -19,11 +19,21 @@
 //! The cap ends a slice at the thread's next check-in (a syscall, signal or
 //! timer event). It does not lower the PMU maximum: a thread that makes no
 //! syscalls still runs to it, as before. The last test pins that scope.
+//!
+//! The suite runs on ptrace unless the harness names a backend in
+//! `HERMIT_TEST_BACKEND` (see [`backend_option`]). The validation node
+//! privileged-test.deadline_slice_cap_kvm runs it on KVM, where every test must
+//! pass except those in `deadline_slice_cap.kvm-gaps.tsv`, the KVM gap ledger
+//! beside this file: each row names a known KVM gap and the issue tracking it,
+//! must still fail on KVM the way the row says, and never counts as a pass.
+//! [`capped_schedules_verify_bitwise`] also proves to that node that its runs
+//! were on KVM ([`BACKEND_PROOF_ENV`]).
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -46,6 +56,45 @@ const UNCAPPED_WAIT_US: i64 = 150_000;
 /// under a slow timer; it takes about 200 ms
 /// (https://github.com/rrnewton/hermit/issues/4139).
 const MIN_STORM_WORK_US: i64 = 50_000;
+
+/// The `--backend` option every Hermit run of the suite gets, from the
+/// harness's `HERMIT_TEST_BACKEND` (`ptrace` or `kvm`). Unset, there is none:
+/// the runs use Hermit's default backend, ptrace, exactly as before this
+/// switch, and the verification runs keep the `--backend=ptrace` they have
+/// always named ([`verification_backend_option`]). With `kvm`, every run names
+/// KVM, the verification runs included, so no test can pass on KVM's behalf by
+/// running on ptrace. Any other value, an empty one included, refuses: a
+/// misspelled backend must not fall back to ptrace and report a KVM pass.
+fn backend_option() -> Option<&'static str> {
+    static OPTION: OnceLock<Option<&'static str>> = OnceLock::new();
+    *OPTION.get_or_init(|| {
+        let value = std::env::var_os("HERMIT_TEST_BACKEND")?;
+        match value.to_str() {
+            Some("ptrace") => Some("--backend=ptrace"),
+            Some("kvm") => Some("--backend=kvm"),
+            _ => panic!("HERMIT_TEST_BACKEND must be ptrace or kvm, got {value:?}"),
+        }
+    })
+}
+
+/// The `--backend` option of a `--verify` run: the harness's backend
+/// ([`backend_option`]), or ptrace, which these runs have always named.
+fn verification_backend_option() -> &'static str {
+    backend_option().unwrap_or("--backend=ptrace")
+}
+
+/// What a verified `--backend=kvm` run prints after its comparison, and no
+/// other backend prints (hermit-cli/src/bin/hermit/run.rs and verify_run.rs).
+const KVM_VERIFY_BANNER: &str = ":: Backend: KVM (reverie-kvm KvmGuest<Detcore>)";
+
+/// The file a node's runner names for the backend proof
+/// (`known_gaps::BACKEND_PROOF_ENV` in ci/manifest-plan): when it is set,
+/// [`capped_schedules_verify_bitwise`] appends the backend each verified run
+/// showed, one line per run. ci/kvm-gap-ledger.rs requires every line to name
+/// the node's backend, so a runner that stopped passing `HERMIT_TEST_BACKEND`,
+/// or a suite that stopped honouring it, fails the node instead of running the
+/// suite on ptrace.
+const BACKEND_PROOF_ENV: &str = "HERMIT_TEST_BACKEND_PROOF";
 
 static SPIN_WAIT: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_RESUME: OnceLock<PathBuf> = OnceLock::new();
@@ -143,6 +192,7 @@ fn strict_output_env(
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
         .arg(hermit_test::hermit_binary())
+        .args(backend_option())
         .args(hermit_args)
         .args([
             "run",
@@ -382,7 +432,7 @@ fn capped_schedules_verify_bitwise() {
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
-                "--backend=ptrace",
+                verification_backend_option(),
                 "run",
                 "--base-env=minimal",
                 "--strict",
@@ -407,6 +457,27 @@ fn capped_schedules_verify_bitwise() {
             stderr.contains("comparison=BitwiseInfoV1 relaxations=none"),
             "verify did not use the canonical comparator: {rendered}\nstderr:\n{stderr}"
         );
+        // The positive control of the backend switch: the verified run ran on
+        // the backend it was asked for, which only KVM's banner shows.
+        let on_kvm = stderr.contains(KVM_VERIFY_BANNER);
+        assert_eq!(
+            on_kvm,
+            verification_backend_option() == "--backend=kvm",
+            "the verified run did not show the requested {}: {rendered}\nstderr:\n{stderr}",
+            verification_backend_option()
+        );
+        if let Some(path) = std::env::var_os(BACKEND_PROOF_ENV) {
+            let mut proof = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap_or_else(|error| {
+                    panic!("cannot open {BACKEND_PROOF_ENV}={path:?}: {error}")
+                });
+            writeln!(proof, "{}", if on_kvm { "kvm" } else { "ptrace" }).unwrap_or_else(|error| {
+                panic!("cannot write {BACKEND_PROOF_ENV}={path:?}: {error}")
+            });
+        }
     }
 }
 
@@ -952,7 +1023,7 @@ fn verify_bitwise(args: &[&str], run_args: &[&str]) {
         .arg(hermit_test::hermit_binary())
         .args([
             "--log=info",
-            "--backend=ptrace",
+            verification_backend_option(),
             "run",
             "--base-env=minimal",
             "--strict",

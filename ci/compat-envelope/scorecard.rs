@@ -89,6 +89,7 @@ use tempfile::NamedTempFile;
 
 const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
+const KNOWN_GAPS: &str = "ci/compat-envelope/known-gaps.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SCHEMA: u64 = 8;
 const CATALOGUE_SCHEMA: u64 = 9;
@@ -3512,6 +3513,8 @@ struct Derived {
     /// Selected verify cells that declare the stripped comparator: below L2,
     /// counted as selected but never as canonical.
     stripped_selected: BTreeSet<CellId>,
+    /// The validation nodes held to a known-gap ledger, reported outside every count.
+    known_gaps: Vec<KnownGapNode>,
 }
 
 /// The cells a retained import reads: the applicable ones. Disabled
@@ -4875,7 +4878,121 @@ fn derive(root: &Path) -> Result<Derived, String> {
         green,
         selected_custom,
         stripped_selected,
+        known_gaps: known_gap_nodes(root)?,
     })
+}
+
+/// One validation node held to a known-gap ledger (ci/manifest-plan/src/known_gaps.rs), as the
+/// scorecard reports it: outside every count, each gap a failing test.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KnownGapNode {
+    node: String,
+    backend: String,
+    ledger: String,
+    required_tests: u64,
+    rows: Vec<hermit_manifest_plan::known_gaps::Row>,
+}
+
+/// Every declared known-gap ledger, read from `root`.
+fn known_gap_nodes(root: &Path) -> Result<Vec<KnownGapNode>, String> {
+    use hermit_manifest_plan::known_gaps;
+    known_gaps::DECLARATIONS
+        .iter()
+        .map(|declaration| {
+            let text = fs::read_to_string(root.join(declaration.ledger))
+                .map_err(|e| format!("cannot read known-gap ledger {}: {e}", declaration.ledger))?;
+            let rows = known_gaps::parse(&text)
+                .map_err(|e| format!("known-gap ledger {}: {e}", declaration.ledger))?;
+            let required_tests = known_gaps::required_tests(declaration).ok_or_else(|| {
+                format!(
+                    "{} has no pinned number of required tests",
+                    declaration.node
+                )
+            })?;
+            Ok(KnownGapNode {
+                node: declaration.node.to_string(),
+                backend: declaration.backend.to_string(),
+                ledger: declaration.ledger.to_string(),
+                required_tests,
+                rows,
+            })
+        })
+        .collect()
+}
+
+/// The scorecard's section for the known gaps: every row of every declared ledger, outside every
+/// count above it. Empty when there is no ledger.
+fn render_known_gaps(nodes: &[KnownGapNode]) -> String {
+    if nodes.is_empty() {
+        return String::new();
+    }
+    let total = nodes.iter().map(|node| node.rows.len()).sum::<usize>();
+    let mut out = format!(
+        "\n## Known gaps of validation nodes, outside every count above\n\n\
+Each row below is a test that a validation node runs and expects to FAIL on its backend: a known \
+gap, listed with its tracking issue in the node's known-gap ledger. These **{total}** rows are not \
+manifest cells, so they are in none of the counts or percentages above. Each one counts as a \
+failing test, never as a pass and never as not applicable. The node records it as \
+`diagnostic_fail` when it fails the way its row says, and fails outright when it passes (promote it \
+to required) or fails some other way. In a signature, `\\n` is a newline and `<N>` any run of \
+digits. The same rows, with their tracking URLs, are in `{KNOWN_GAPS}`.\n"
+    );
+    for node in nodes {
+        out.push_str(&format!(
+            "\n### `{}` (`--backend={}`)\n\n**{}** required tests must pass; **{}** known gaps, from \
+`{}`:\n\n| Test | Gap | Tracking issue | Must fail with | Status |\n| --- | --- | --- | --- | --- |\n",
+            node.node,
+            node.backend,
+            node.required_tests,
+            node.rows.len(),
+            node.ledger
+        ));
+        for row in &node.rows {
+            let test = row
+                .id
+                .split_once('$')
+                .map_or(row.id.as_str(), |(_, test)| test);
+            let expected = match &row.signature {
+                Some(signature) => format!(
+                    "output showing `{}`",
+                    signature.replace('|', "\\|").replace('`', "'")
+                ),
+                None => "a stop by its CPU budget".to_string(),
+            };
+            out.push_str(&format!(
+                "| `{test}` | {} | {} | {expected} | failing (known gap) |\n",
+                row.gap, row.issue
+            ));
+        }
+    }
+    out
+}
+
+/// `ci/compat-envelope/known-gaps.json`: the machine-readable form of [`render_known_gaps`].
+fn encoded_known_gaps(nodes: &[KnownGapNode]) -> Result<String, String> {
+    let value = serde_json::json!({
+        "schema": 1,
+        "description": "Known gaps of validation nodes: tests a node runs and expects to fail, each with its tracking issue (ci/manifest-plan/src/known_gaps.rs). They are outside every E2E count and percentage. A known gap is a failing test: never a pass and never not applicable.",
+        "generated_by": "./ci/compat-envelope/scorecard.rs update",
+        "nodes": nodes.iter().map(|node| serde_json::json!({
+            "node": node.node,
+            "backend": node.backend,
+            "ledger": node.ledger,
+            "required_tests": node.required_tests,
+            "known_gaps": node.rows.iter().map(|row| serde_json::json!({
+                "id": row.id,
+                "gap": row.gap,
+                "issue": row.issue,
+                "outcome": row.outcome.value(),
+                "signature": row.signature,
+                "status": "known-gap",
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    });
+    let mut text = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("cannot encode {KNOWN_GAPS}: {e}"))?;
+    text.push('\n');
+    Ok(text)
 }
 
 /// The archived execution paths ([`hermit_manifest_plan::archived::ARCHIVED`]),
@@ -5625,6 +5742,7 @@ for by either this table or the comparable green cells above.\n\n\
             ));
         }
     }
+    out.push_str(&render_known_gaps(&derived.known_gaps));
     out
 }
 
@@ -9427,6 +9545,10 @@ fn check_tracked(root: &Path) -> Result<Derived, String> {
         )?;
         compare_file(&root.join(CELLS), &encoded_cells(&cells)?)?;
     }
+    compare_file(
+        &root.join(KNOWN_GAPS),
+        &encoded_known_gaps(&derived.known_gaps)?,
+    )?;
     Ok(derived)
 }
 
@@ -9473,6 +9595,11 @@ fn update_tracked(
         .map_err(|e| format!("cannot write {SCORECARD}: {e}"))?;
     fs::write(root.join(CELLS), encoded_catalogue(&cells)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
+    fs::write(
+        root.join(KNOWN_GAPS),
+        encoded_known_gaps(&derived.known_gaps)?,
+    )
+    .map_err(|e| format!("cannot write {KNOWN_GAPS}: {e}"))?;
     // NOT APPLICABLE IS REPORTED SEPARATELY, NOT FOLDED INTO RED. This line is
     // the number people quote; leaving it as "population minus green" is exactly
     // how 4,940 never-applicable cells were read as failures.
@@ -22264,6 +22391,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green,
         selected_custom: selected_custom.clone(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     let rendered = render_scorecard(&selected_fixture);
     let status_prose = rendered
@@ -22351,6 +22479,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     if !render_scorecard(&visible_red).contains("**1** are not selected by full") {
         return Err("scorecard prose did not derive its not-selected-by-full count".into());
@@ -22464,6 +22593,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     let status_section = render_scorecard(&not_applicable);
     if !status_section.contains("**1** are **Not applicable**")
@@ -22496,6 +22626,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     if tracked_from(&regressed, Some(old_green), None, false).is_ok() {
         return Err("negative ratchet bracket accepted green-to-red movement".into());
@@ -22548,6 +22679,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::from([id.clone()]),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     let recovered = tracked_from(&back_to_green, Some(overridden), None, false)
         .map_err(|e| format!("recovery after an override was refused: {e}"))?;
@@ -24190,6 +24322,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     if retained_import_cells(&red_import_fixture) != BTreeSet::from([validate_id.clone()]) {
         return Err(
@@ -31250,6 +31383,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     let rederived = tracked_from(&derived_fixture, Some(stamped.clone()), None, false)?;
     if rederived.projection != stamped.projection {
@@ -40505,6 +40639,7 @@ mod retired_id_join_tests {
             green: selected,
             selected_custom: BTreeSet::new(),
             stripped_selected: BTreeSet::new(),
+            known_gaps: Vec::new(),
         };
         assert_eq!(
             super::stripped_selected_sentence(&derived),
@@ -40532,6 +40667,7 @@ mod retired_id_join_tests {
             green: BTreeSet::new(),
             selected_custom: BTreeSet::new(),
             stripped_selected: BTreeSet::new(),
+            known_gaps: Vec::new(),
         };
         let carried = tracked_from(&derived, Some(recorded.clone()), None, false).unwrap();
         assert_eq!(carried.cells.len(), 1);
@@ -44141,6 +44277,7 @@ mod parity_summary_tests {
             green: BTreeSet::from([green.id.clone()]),
             selected_custom: BTreeSet::new(),
             stripped_selected: BTreeSet::new(),
+            known_gaps: Vec::new(),
         };
         (derived, tracked(vec![green, red]))
     }

@@ -629,6 +629,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.pmu_integration_cases",
     "test.pmu_integration_cases_2",
     "privileged-test.cli_kvm",
+    "privileged-test.deadline_slice_cap_kvm",
     "privileged-test.isolation_matrix_kvm",
     "privileged-only-cpuid.faulting",
     "privileged-only-pmu.preemption",
@@ -755,9 +756,12 @@ const PROFILES: [Profile; 11] = [
         // 102/103 since the host compatprep.fixtures step retired from
         // full/portable whenever its pinned-root twin exists (one writer
         // for the shared fixtures, issue 4997): 103/104 before.
+        // privileged-test.deadline_slice_cap_kvm, the deadline_slice_cap suite
+        // on KVM held to its gap ledger, adds one full-only node: 102/103
+        // before.
         label: "full",
-        direct_steps: 102,
-        selected_steps: 103,
+        direct_steps: 103,
+        selected_steps: 104,
     },
     Profile {
         // 81/82 with the same host-fixtures retirement: 82/83 before.
@@ -3144,9 +3148,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // producers (2026-10-17).
     // 146 with sabrecompat.sabre_examples, the archived SaBRe suite's tests
     // outside the per-commit smoke pair (2026-10-26).
-    if expected.len() != 146 {
+    // 147 with privileged-test.deadline_slice_cap_kvm, the KVM gap-ledger
+    // producer (2026-10-30).
+    if expected.len() != 147 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 146",
+            "structured result producer registry has {} entries, expected 147",
             expected.len()
         ));
     }
@@ -3170,9 +3176,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // The second PMU integration shard adds one.
     // sabrecompat.sabre_examples, the archived SaBRe suite outside the smoke
     // pair, adds one.
-    if expected_counts.len() != 52 {
+    // privileged-test.deadline_slice_cap_kvm's required KVM tests add one.
+    if expected_counts.len() != 53 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 52",
+            "Nextest expected-count registry has {} entries, expected 53",
             expected_counts.len()
         ));
     }
@@ -3208,6 +3215,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             ));
         }
         if command_kind == Some(StructuredResultProducerKind::Nextest)
+            || command_kind == Some(StructuredResultProducerKind::KvmGapLedger)
             || step.cmd.contains("nextest-binaries.rs executable ")
         {
             crate::nextest_build_selections::assert_command_selection(step)?;
@@ -3325,7 +3333,8 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // The second PMU integration shard adds the 77th Nextest writer.
     // Conformance 3: the three isolation-matrix nodes (2026-10-17).
     // sabrecompat.sabre_examples adds the 78th Nextest writer (2026-10-26).
-    if actual_group_counts != [78, 56, 7, 2, 3] {
+    // KvmGapLedger 1: privileged-test.deadline_slice_cap_kvm (2026-10-30).
+    if actual_group_counts != [78, 56, 7, 2, 3, 1] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -4559,9 +4568,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // reaches Hermit through build.host_hermit_link like every other host
     // consumer, so the retired build.workspace/build.e2e_artifact base
     // producers stay retired (446 - 2).
-    if cfg.steps.len() != 444 {
+    // 445 with privileged-test.deadline_slice_cap_kvm, the deadline_slice_cap
+    // suite on KVM held to its gap ledger (444 + 1).
+    if cfg.steps.len() != 445 {
         return Err(format!(
-            "superset has {} steps, expected 444",
+            "superset has {} steps, expected 445",
             cfg.steps.len()
         ));
     }
@@ -7249,7 +7260,9 @@ sys.exit(37)
         // pinned root on compatprep.fixtures_in_pinned_root (106 full nodes),
         // and 101 since the host fixtures route through build.host_hermit_link
         // and the retired base producers stay retired (104 full nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 101);
+        // (103 full nodes), and 102 with privileged-test.deadline_slice_cap_kvm
+        // (105 full nodes).
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 102);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

@@ -1,0 +1,175 @@
+{
+  "description": "Known gaps of validation nodes: tests a node runs and expects to fail, each with its tracking issue (ci/manifest-plan/src/known_gaps.rs). They are outside every E2E count and percentage. A known gap is a failing test: never a pass and never not applicable.",
+  "generated_by": "./ci/compat-envelope/scorecard.rs update",
+  "nodes": [
+    {
+      "backend": "kvm",
+      "known_gaps": [
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$a_spinner_without_syscalls_keeps_its_maximum_slice",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "cpu_timeout",
+          "signature": null,
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$a_timed_waiter_keeps_the_stops_an_untimed_waiter_does_not",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "D",
+          "id": "hermit-run::deadline_slice_cap$itimer_a_private_descriptor_table_consumer_re_arms",
+          "issue": "https://github.com/rrnewton/hermit/issues/4929",
+          "outcome": "failed",
+          "signature": "\"privfd\" \"5000\"\\nstatus: exit status: 2\\nstdout:\\n\\nstderr:\\n\\nnote: run with",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$itimer_a_recorded_schedule_replays",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "C",
+          "id": "hermit-run::deadline_slice_cap$itimer_a_sigsuspend_loop_takes_every_expiry",
+          "issue": "https://github.com/rrnewton/hermit/issues/4929",
+          "outcome": "failed",
+          "signature": "failed: deliveries=",
+          "status": "known-gap"
+        },
+        {
+          "gap": "E",
+          "id": "hermit-run::deadline_slice_cap$itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue",
+          "issue": "https://github.com/rrnewton/hermit/issues/4929",
+          "outcome": "failed",
+          "signature": "failed: ignored_remaining_us=",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$itimer_coalescing_schedules_verify_bitwise",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$itimer_coalescing_verifies_under_chaos",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$itimer_coalescing_verifies_under_the_random_heuristic",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$itimer_expiries_recur_once_per_slice_end",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "E+F'",
+          "id": "hermit-run::deadline_slice_cap$itimer_generation_discard_follows_the_wait_mask",
+          "issue": "https://github.com/rrnewton/hermit/issues/4929",
+          "outcome": "failed",
+          "signature": "failed: poll: result=0 first_us=",
+          "status": "known-gap"
+        },
+        {
+          "gap": "G",
+          "id": "hermit-run::deadline_slice_cap$itimer_mixed_masks_keep_the_timer_running",
+          "issue": "https://github.com/rrnewton/hermit/issues/4929",
+          "outcome": "failed",
+          "signature": "\\npositive=<N> samples=20 progress=<N>\\n\\nnote: run with",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$itimer_two_cpu_bound_threads_finish_in_their_work_time",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$itimer_waiting_schedules_verify_bitwise",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$skipped_slice_ends_come_before_a_cpuid",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$skipped_slice_ends_come_before_a_signal",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$skipped_slice_ends_come_before_a_trapped_instruction",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$skipped_slice_ends_survive_exec",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2+oracle",
+          "id": "hermit-run::deadline_slice_cap$skipped_slice_ends_survive_the_backstop",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        },
+        {
+          "gap": "T2",
+          "id": "hermit-run::deadline_slice_cap$slice_ends_taken_without_a_stop_leave_the_run_unchanged",
+          "issue": "https://github.com/rrnewton/hermit/issues/4954",
+          "outcome": "failed",
+          "signature": "unsupported_preemption: --backend=kvm refuses --max-timeslice",
+          "status": "known-gap"
+        }
+      ],
+      "ledger": "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv",
+      "node": "privileged-test.deadline_slice_cap_kvm",
+      "required_tests": 22
+    }
+  ],
+  "schema": 1
+}

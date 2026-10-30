@@ -12722,7 +12722,11 @@ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
 
 // These literal consumer sets include the dedicated DBT workdir node, which
 // uses the same prepared CLI binary and already carries the same resource token.
-const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &[&str]); 2] = [
+// Since 2026-10-30 privileged-test.deadline_slice_cap_kvm runs the
+// deadline_slice_cap binary on KVM beside the ptrace shards that run it; like
+// privileged-test.cli_kvm it holds no token (see below): nothing relinks the
+// prepared binary while a consumer runs it.
+const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &[&str]); 3] = [
     (
         "cli",
         &[
@@ -12731,6 +12735,17 @@ const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &[&str]); 2] = [
             "privileged-test.pmu_cli_cases",
             "test.cli",
             "test.isolated_dbt_workdir",
+        ],
+    ),
+    (
+        "deadline_slice_cap",
+        &[
+            "privileged-test.deadline_slice_cap_kvm",
+            "test.hermit_integration",
+            "test.hermit_integration_2",
+            "test.hermit_integration_3",
+            "test.pmu_integration_cases",
+            "test.pmu_integration_cases_2",
         ],
     ),
     (
@@ -13129,6 +13144,7 @@ fn privileged_nodes_for_scope(
         match backend.as_str() {
             "kvm" => wanted.extend([
                 "privileged-test.cli_kvm",
+                "privileged-test.deadline_slice_cap_kvm",
                 "privileged-test.isolation_matrix_kvm",
                 "privileged-e2e.manifest_applications",
                 "privileged-e2e.manifest_c_programs",

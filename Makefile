@@ -235,6 +235,7 @@ LINT_CHECK_TARGETS := \
     lint-check-reverie-pin \
     lint-check-nested-lockfiles \
     lint-check-record-version-floor \
+    lint-check-known-gap-ledgers \
     lint-check-buck-reindeer-features \
     lint-check-reverie-dbt-buck-inventory \
     lint-check-core-review-protocol \
@@ -371,6 +372,11 @@ lint-check-nested-lockfiles:
 
 lint-check-record-version-floor:
 	./scripts/check-record-version-floor.rs $(_VALIDATE_PIN_ARG)
+
+# Every known-gap ledger (ci/manifest-plan/src/known_gaps.rs) against its suite and its own
+# history: the ledger can only shrink, and a row added later carries a bound approval.
+lint-check-known-gap-ledgers:
+	./ci/kvm-gap-ledger.rs history
 
 lint-check-buck-reindeer-features:
 	./scripts/check-buck-reindeer-features.rs
