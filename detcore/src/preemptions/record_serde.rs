@@ -555,7 +555,8 @@ mod tests {
     /// `rejoins` (rrnewton/hermit#4751) reads back from a flat record written
     /// before the record's serde moved into `RawRecord`, and survives writing
     /// and reading the current form, plain and inside the incomplete-record
-    /// envelope. So do the popped events a readmission names: an empty list
+    /// envelope, and the whole record compares equal each time. So do the
+    /// popped events a readmission names: an empty list
     /// is written, so that it stays apart from a readmission that names none
     /// (`None`, as in older records), which is not. Likewise a record whose
     /// run logged no readmission keeps its empty list, apart from a record
@@ -572,6 +573,9 @@ mod tests {
             popped: None,
         }];
         assert_eq!(record.rejoins.as_ref(), Some(&expected));
+        let mut whole = PreemptionRecord::from_sched_events(Vec::new());
+        whole.rejoins = Some(expected.clone());
+        assert_eq!(record, whole);
         for marker in [None, Some(7)] {
             let mut copy = record.clone();
             copy.replay_departed_at = marker;
@@ -579,6 +583,7 @@ mod tests {
             let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
             assert_eq!(read.rejoins.as_ref(), Some(&expected), "{written}");
             assert_eq!(read.replay_departed_at(), marker, "{written}");
+            assert_eq!(read, copy, "{written}");
         }
 
         use crate::scheduler::rejoin_log::PoppedEvent;
@@ -615,6 +620,7 @@ mod tests {
             assert_eq!(written.matches(r#""popped":"#).count(), 2, "{written}");
             let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
             assert_eq!(read.rejoins, named.rejoins, "{written}");
+            assert_eq!(read, copy, "{written}");
         }
 
         let fresh = PreemptionWriter::new(None).into_string();
@@ -628,6 +634,7 @@ mod tests {
             assert!(written.contains(r#""rejoins":[]"#), "{written}");
             let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
             assert_eq!(read.rejoins, Some(Vec::new()), "{written}");
+            assert_eq!(read, copy, "{written}");
         }
         for older in [
             r#"{"per_thread":{},"global":[]}"#,
@@ -635,6 +642,9 @@ mod tests {
         ] {
             let read: PreemptionRecord = serde_json::from_str(older).unwrap();
             assert_eq!(read.rejoins, None, "{older}");
+            let mut whole = PreemptionRecord::from_sched_events(Vec::new());
+            whole.replay_departed_at = read.replay_departed_at;
+            assert_eq!(read, whole, "{older}");
         }
     }
 }
