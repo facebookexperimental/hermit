@@ -26877,8 +26877,10 @@ fn a_schedule_replay_names_a_stdio_kind_changed_since_the_recording() {
 /// and the run records the kinds the guest has at its first exec, not the
 /// caller's own. Here the guest's stdout is one end of a socket pair, which
 /// this test process's stdout never is: the summary says `socket`, and the
-/// guest's output arrives on the other end. Recording the calling process's
-/// descriptors would name its stdout instead.
+/// guest's output arrives on the other end. Its stdin is a regular file on
+/// procfs, a local in-kernel filesystem, so its type comes from the file
+/// itself: `file`, where this process's stdin is `/dev/null`. Recording the
+/// calling process's descriptors would name its own instead.
 #[test]
 fn a_library_run_records_the_stdio_kinds_of_its_commands_descriptors() {
     use std::io::Read;
@@ -26921,7 +26923,7 @@ fn a_library_run_records_the_stdio_kinds_of_its_commands_descriptors() {
             };
             let mut command = reverie::process::Command::new("/bin/echo");
             command.arg("through the socket");
-            command.stdin(reverie::process::Stdio::null());
+            command.stdin(fs::File::open("/proc/version").unwrap());
             command.stdout(guest_end);
             hermit::run(command, config, false, &summary_path)
                 .map(|status| status.code())
@@ -26937,7 +26939,7 @@ fn a_library_run_records_the_stdio_kinds_of_its_commands_descriptors() {
     let summary: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
     let stdio = &summary["host_inputs"]["stdio"];
-    assert_eq!(stdio["stdin"], "char_device", "{summary}");
+    assert_eq!(stdio["stdin"], "file", "{summary}");
     assert_eq!(stdio["stdout"], "socket", "{summary}");
 }
 

@@ -2683,39 +2683,44 @@ impl GlobalState {
     /// run's host-input set, and return those that differ from the
     /// recording's. `pid` is the root's host process, and `image` the device
     /// and inode the root's exec ran, as the root read them from its own
-    /// `exe` link: `/proc/<pid>` is the root only if its `exe` names that
-    /// file. Called without the scheduler lock, as the root waits at its
-    /// first exec.
+    /// `exe` link. Called without the scheduler lock, as the root waits at
+    /// its first exec.
     ///
-    /// No descriptor is opened, copied or closed, so no file's open, flush or
-    /// release runs. Each is classified by the name its `/proc/<pid>/fd/<n>`
-    /// link gives, which the kernel forms without asking the file's
-    /// filesystem, and otherwise by `stat` through that link, only once its
-    /// `/proc/<pid>/fdinfo/<n>` mount is shown not to be a FUSE mount: a
-    /// FUSE daemon may be a guest process, which cannot answer then
-    /// (`StdioKind::of_guest_descriptor`). Nothing is kept where there is no
-    /// such process or image (KVM, whose guest threads are no host tasks;
-    /// DBT, which records no host inputs; SaBRe, whose root never execs; a
-    /// root that changed its root directory) or a descriptor's kind cannot be
-    /// told that way.
+    /// Nothing here opens, copies or closes a descriptor, and nothing reaches
+    /// a filesystem that could wait on a server or see a request the native
+    /// program never made. `/proc/<pid>` is the root only if its maps map
+    /// the file its `exe` link names with that inode, all procfs text
+    /// (`detcore_model::host_input::maps_name_image`). Each descriptor is
+    /// classified by the name its `/proc/<pid>/fd/<n>` link gives, and
+    /// otherwise by its type, read with a cached `statx` through that link
+    /// only on a local, in-kernel filesystem
+    /// (`StdioKind::of_guest_descriptor`,
+    /// `detcore_model::host_input::LOCAL_KERNEL_FILESYSTEMS`). Nothing is
+    /// kept where there is no such process or image (KVM, whose guest
+    /// threads are no host tasks; DBT, which records no host inputs; SaBRe,
+    /// whose root never execs; a root that changed its root directory) or a
+    /// descriptor's kind cannot be told that way.
     fn read_guest_stdio(
         &self,
         pid: i32,
         image: Option<(u64, u64)>,
     ) -> Vec<detcore_model::host_input::StdioChange> {
         use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::MetadataExt;
         use std::path::Path;
 
         use detcore_model::host_input::StdioKind;
         use detcore_model::host_input::StdioKinds;
         let task = PathBuf::from(format!("/proc/{pid}"));
-        if !image.is_some_and(|image| {
-            std::fs::metadata(task.join("exe")).is_ok_and(|exe| (exe.dev(), exe.ino()) == image)
-        }) {
+        let read = |path: &Path| std::fs::read_to_string(path).ok();
+        let is_root = image.is_some_and(|(_, ino)| {
+            let exe = std::fs::read_link(task.join("exe"));
+            let maps = read(&task.join("maps"));
+            matches!((exe, maps), (Ok(exe), Some(maps))
+                if detcore_model::host_input::maps_name_image(&maps, exe.as_os_str().as_bytes(), ino))
+        });
+        if !is_root {
             return Vec::new();
         }
-        let read = |path: &Path| std::fs::read_to_string(path).ok();
         let guest_mounts = read(&task.join("mountinfo"));
         let own_mounts = read(Path::new("/proc/self/mountinfo"));
         let mountinfos: Vec<&str> = [guest_mounts.as_deref(), own_mounts.as_deref()]
@@ -2737,11 +2742,7 @@ impl GlobalState {
                 read(&task.join("fdinfo").join(fd.to_string())).as_deref(),
                 &mountinfos,
                 drivers.as_deref(),
-                || {
-                    std::fs::metadata(&entry)
-                        .ok()
-                        .map(|stat| (stat.mode(), stat.rdev()))
-                },
+                || cached_file_type(&entry),
             )
         };
         let (Some(stdin), Some(stdout), Some(stderr)) = (kind(0), kind(1), kind(2)) else {
@@ -9932,6 +9933,48 @@ pub(crate) async fn record_host_input<G, T>(
         (time, response),
         (None, GlobalResponse::RecordHostInput(()))
     );
+}
+
+/// The `st_mode` and device number of the file `path` names (following a
+/// link), from the inode's cached attributes: `statx` with
+/// `AT_STATX_DONT_SYNC`, asking only for its type and mode (and inode), which
+/// never change. Used only on local, in-kernel filesystems
+/// (`detcore_model::host_input::LOCAL_KERNEL_FILESYSTEMS`), which answer from
+/// the host; the flag keeps a filesystem that would revalidate from doing
+/// so.
+fn cached_file_type(path: &std::path::Path) -> Option<(libc::mode_t, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buffer = std::mem::MaybeUninit::<libc::statx>::uninit();
+    // SAFETY: `path` is NUL-terminated and `buffer` has room for a whole
+    // `struct statx`.
+    let result = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_STATX_DONT_SYNC,
+            libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_INO,
+            buffer.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: statx succeeded, so it wrote the struct.
+    let buffer = unsafe { buffer.assume_init() };
+    if buffer.stx_mask & libc::STATX_TYPE == 0 {
+        return None;
+    }
+    // glibc's `gnu_dev_makedev`.
+    let (major, minor) = (
+        u64::from(buffer.stx_rdev_major),
+        u64::from(buffer.stx_rdev_minor),
+    );
+    let rdev = ((major & 0xfff) << 8)
+        | ((major & !0xfff) << 32)
+        | (minor & 0xff)
+        | ((minor & !0xff) << 12);
+    Some((libc::mode_t::from(buffer.stx_mode), rdev))
 }
 
 /// Print `change`, a host input that changed since its recording, on Hermit's

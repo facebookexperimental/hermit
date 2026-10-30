@@ -318,6 +318,41 @@ pub enum StdioKind {
     Other,
 }
 
+/// The filesystems on which Detcore reads the type of a file behind one of
+/// the guest's standard descriptors ([`StdioKind::of_guest_descriptor`]):
+/// local, in-kernel filesystems whose `getattr` answers from the host
+/// itself, so the read waits on no server and makes no request another
+/// process could see. Network filesystems (NFS, CIFS, 9p, Ceph), FUSE,
+/// whose server may be a guest process, and overlay, whose `getattr` goes to
+/// its layers, are left out, and so is every type not listed here.
+pub const LOCAL_KERNEL_FILESYSTEMS: [&str; 10] = [
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "ramfs", "devtmpfs", "proc", "sysfs",
+];
+
+/// Whether `maps`, the text of a process's `/proc/<pid>/maps`, maps the file
+/// `exe` (the target of its `/proc/<pid>/exe` link) with inode number `ino`.
+/// Detcore knows a process as the root it expects when its image is the
+/// file the root's exec ran, and both texts come from procfs, which names
+/// the file and its inode without asking the file's filesystem. Inode 0 is
+/// an anonymous mapping's, never a file's.
+pub fn maps_name_image(maps: &str, exe: &[u8], ino: u64) -> bool {
+    ino != 0
+        && maps.lines().any(|line| {
+            // address, perms, offset, dev, inode, then the pathname, which may
+            // hold spaces.
+            let mut rest = line;
+            let mut fields = Vec::with_capacity(5);
+            for _ in 0..5 {
+                rest = rest.trim_start();
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                fields.push(&rest[..end]);
+                rest = &rest[end..];
+            }
+            fields[4].parse::<u64>().is_ok_and(|inode| inode == ino)
+                && rest.trim_start().as_bytes() == exe
+        })
+}
+
 impl StdioKind {
     /// The kind of an open descriptor whose `st_mode` is `mode`, with
     /// `terminal` whether it is a terminal (`isatty`).
@@ -359,22 +394,22 @@ impl StdioKind {
     }
 
     /// The kind of one of a guest's descriptors, from what Detcore can read
-    /// about it without opening it, and without reaching a FUSE filesystem,
-    /// whose daemon may be a guest process that cannot run then. `link` is
-    /// the target of its `/proc/<pid>/fd/<n>` link, a name the kernel gives
-    /// without asking the file's filesystem: a pipe, a socket, an anonymous
-    /// inode, and the terminals and memory devices under `/dev`, are told by
-    /// it alone. For any other file, `fdinfo` (the text of
-    /// `/proc/<pid>/fdinfo/<n>`) names its mount, which `mountinfos` (texts
-    /// of `/proc/<pid>/mountinfo`, the guest's and the coordinator's: mount
-    /// IDs are unique across namespaces) must show not to be a FUSE mount
-    /// before `stat` follows the link; a file on a FUSE mount is
-    /// [`Self::Other`]. `stat` gives the followed file's `st_mode` and
-    /// `st_rdev`, and `drivers` the text of `/proc/tty/drivers`, without
-    /// which a character device reached that way is not classified. `None`
-    /// where the kind cannot be told that way: no mount ID, a mount in
-    /// neither namespace, a failed `stat`, or a character device without
-    /// the driver list.
+    /// about it without opening it and without an operation on its file's
+    /// filesystem that could wait on a server. `link` is the target of its
+    /// `/proc/<pid>/fd/<n>` link, a name the kernel gives without asking the
+    /// file's filesystem: a pipe, a socket, an anonymous inode, and the
+    /// terminals and memory devices under `/dev`, are told by it alone. For
+    /// any other file, `fdinfo` (the text of `/proc/<pid>/fdinfo/<n>`) names
+    /// its mount, which `mountinfos` (texts of `/proc/<pid>/mountinfo`, the
+    /// guest's and the coordinator's: mount IDs are unique across
+    /// namespaces) must show to be one of [`LOCAL_KERNEL_FILESYSTEMS`] before
+    /// `stat` reads the file's type through the link; a file on any other
+    /// mount is [`Self::Other`], unstat'ed. `stat` gives the followed file's
+    /// `st_mode` and `st_rdev`, and `drivers` the text of `/proc/tty/drivers`,
+    /// without which a character device reached that way is not classified.
+    /// `None` where the kind cannot be told that way: no mount ID, a mount in
+    /// neither namespace, a failed `stat`, or a character device without the
+    /// driver list.
     pub fn of_guest_descriptor(
         link: &[u8],
         fdinfo: Option<&str>,
@@ -389,7 +424,7 @@ impl StdioKind {
             .lines()
             .find_map(|line| line.strip_prefix("mnt_id:"))
             .and_then(|id| id.trim().parse::<u64>().ok())?;
-        let fuse = mountinfos.iter().find_map(|mountinfo| {
+        let local = mountinfos.iter().find_map(|mountinfo| {
             mountinfo.lines().find_map(|line| {
                 let mut fields = line.split_whitespace();
                 if fields.next()?.parse::<u64>().ok()? != mount {
@@ -398,10 +433,10 @@ impl StdioKind {
                 // The filesystem type follows the `-` that ends the
                 // optional fields.
                 let fstype = fields.skip_while(|field| *field != "-").nth(1)?;
-                Some(fstype == "fuse" || fstype == "fuseblk" || fstype.starts_with("fuse."))
+                Some(LOCAL_KERNEL_FILESYSTEMS.contains(&fstype))
             })
         })?;
-        if fuse {
+        if !local {
             return Some(Self::Other);
         }
         let (mode, rdev) = stat()?;
@@ -588,19 +623,25 @@ mod tests {
     /// kind changed, in descriptor order. A set without stdio kinds is
     /// written as before, and one with them round-trips.
     /// A guest descriptor's kind comes from its link's name where that tells
-    /// it, with no `stat`; any other file is stat'ed only once its mount is
-    /// shown not to be FUSE (here by injected mountinfo texts), and a FUSE
-    /// file is `other` without a `stat`. A mount in neither namespace, a
-    /// missing mount ID, and a character device without the driver list give
-    /// no kind.
+    /// it, with no `stat`. Any other file is stat'ed only when its mount is
+    /// one of the local, in-kernel filesystems (here by injected mountinfo
+    /// texts): a file on NFS, CIFS, 9p, FUSE, overlay or a type not listed is
+    /// `other`, unstat'ed. A mount in neither namespace, a missing mount ID,
+    /// and a character device without the driver list give no kind.
     #[test]
-    fn a_guest_descriptor_is_classified_without_reaching_a_fuse_filesystem() {
+    fn a_guest_descriptor_is_statted_only_on_a_local_kernel_filesystem() {
         let guest_mounts = "\
 22 1 0:21 / /proc rw,nosuid shared:5 - proc proc rw
 40 29 0:45 / /mnt/remote rw,nosuid,nodev shared:30 - fuse.sshfs host:/ rw,user_id=0
 41 29 0:46 / /mnt/plain rw - fuse fuse rw
 42 29 8:1 / /mnt/disk rw - fuseblk /dev/sda1 rw
-43 29 0:47 / /sys/fs/fuse/connections rw - fusectl fusectl rw
+43 29 0:47 / /mnt/nfs rw shared:31 - nfs4 server:/export rw,vers=4.2
+44 29 0:48 / /mnt/smb rw - cifs //server/share rw
+45 29 0:49 / /mnt/9p rw - 9p hostshare rw,trans=virtio
+46 29 0:50 / /mnt/layers rw - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w
+47 29 0:51 / /mnt/ceph rw - ceph mon:/ rw
+48 29 0:52 / /sys/fs/fuse/connections rw - fusectl fusectl rw
+49 29 0:53 / /dev/shm rw - tmpfs tmpfs rw
 ";
         let host_mounts = "29 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n";
         let mounts = [guest_mounts, host_mounts];
@@ -622,19 +663,19 @@ mod tests {
         ] {
             assert_eq!(classify(link, None, None), Some(kind), "{link}");
         }
-        for id in [40, 41, 42] {
+        for id in 40..=48 {
             assert_eq!(
                 classify("/mnt/remote/out.log", Some(&fdinfo(id)), None),
                 Some(StdioKind::Other),
                 "mount {id}"
             );
         }
-        // Not on FUSE: the stat decides.
-        let stat_once = |mode: libc::mode_t, rdev: u64, drivers: Option<&str>| {
+        // On a local, in-kernel filesystem, one stat decides.
+        let stat_once = |mount: u64, mode: libc::mode_t, rdev: u64, drivers: Option<&str>| {
             let mut stats = 0;
             let kind = StdioKind::of_guest_descriptor(
                 b"/home/user/out.log",
-                Some(&fdinfo(29)),
+                Some(&fdinfo(mount)),
                 &mounts,
                 drivers,
                 || {
@@ -646,38 +687,51 @@ mod tests {
             kind
         };
         assert_eq!(
-            stat_once(libc::S_IFREG | 0o644, 0, None),
+            stat_once(29, libc::S_IFREG | 0o644, 0, None),
             Some(StdioKind::File)
         );
-        assert_eq!(stat_once(libc::S_IFIFO, 0, None), Some(StdioKind::Pipe));
+        assert_eq!(
+            stat_once(49, libc::S_IFREG | 0o600, 0, None),
+            Some(StdioKind::File)
+        );
+        assert_eq!(stat_once(29, libc::S_IFIFO, 0, None), Some(StdioKind::Pipe));
         let pty = (136 << 8) | 7;
         let drivers = "pty_slave            /dev/pts      136 0-1048575 pty:slave\n";
         assert_eq!(
-            stat_once(libc::S_IFCHR, pty, Some(drivers)),
+            stat_once(29, libc::S_IFCHR, pty, Some(drivers)),
             Some(StdioKind::Tty)
         );
         assert_eq!(
-            stat_once(libc::S_IFCHR, (1 << 8) | 3, Some(drivers)),
+            stat_once(29, libc::S_IFCHR, (1 << 8) | 3, Some(drivers)),
             Some(StdioKind::CharDevice)
         );
-        assert_eq!(stat_once(libc::S_IFCHR, pty, None), None);
-        // A fusectl mount is no FUSE file system.
-        assert_eq!(
-            StdioKind::of_guest_descriptor(
-                b"/sys/fs/fuse/connections/45/waiting",
-                Some(&fdinfo(43)),
-                &mounts,
-                None,
-                || Some((libc::S_IFREG | 0o400, 0)),
-            ),
-            Some(StdioKind::File)
-        );
+        assert_eq!(stat_once(29, libc::S_IFCHR, pty, None), None);
         // No mount ID, or a mount neither namespace lists.
         assert_eq!(classify("/home/user/out.log", None, None), None);
         assert_eq!(
             classify("/memfd:input (deleted)", Some(&fdinfo(7)), None),
             None
         );
+    }
+
+    /// A process is the expected root when its maps map the file its `exe`
+    /// link names with the inode the root's exec ran, whatever spaces the
+    /// path holds; another inode, another path, or no mapping is not it.
+    #[test]
+    fn the_root_is_known_by_its_mapped_image() {
+        let maps = "\
+55d0c8a00000-55d0c8a02000 r--p 00000000 00:2a 100483                     /usr/bin/echo
+55d0c8a02000-55d0c8a06000 r-xp 00002000 00:2a 100483                     /usr/bin/echo
+7f1e2c000000-7f1e2c022000 r--p 00000000 00:2a 160034633                  /usr/lib64/ld-linux-x86-64.so.2
+7ffc1a000000-7ffc1a021000 rw-p 00000000 00:00 0                          [stack]
+7f1e2d000000-7f1e2d001000 r-xp 00000000 00:2a 77                         /opt/my tools/run me (deleted)
+";
+        assert!(maps_name_image(maps, b"/usr/bin/echo", 100483));
+        assert!(!maps_name_image(maps, b"/usr/bin/echo", 100484));
+        assert!(!maps_name_image(maps, b"/usr/bin/true", 100483));
+        assert!(maps_name_image(maps, b"/opt/my tools/run me (deleted)", 77));
+        assert!(!maps_name_image(maps, b"[stack]", 0));
+        assert!(!maps_name_image("", b"/usr/bin/echo", 100483));
     }
 
     /// A character device is a terminal when a terminal driver in the
