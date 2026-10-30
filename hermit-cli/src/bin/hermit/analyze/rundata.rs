@@ -197,6 +197,21 @@ impl RunData {
         self.is_a_match.is_some()
     }
 
+    /// For a test that drives a phase with a launch it models: the completed
+    /// observation `launch` makes, whether the run met the target, and the
+    /// schedule it recorded.
+    #[cfg(test)]
+    pub(super) fn complete_for_test(
+        &mut self,
+        met: bool,
+        recorded: &[SchedEvent],
+    ) -> anyhow::Result<()> {
+        self.is_a_match = Some(met);
+        PreemptionRecord::from_sched_events(recorded.to_vec())
+            .write_to_disk(self.sched_path_out())
+            .map_err(anyhow::Error::msg)
+    }
+
     /// Called after the run has been launched, normalize the output preemptions and swap around so
     /// that our output file points to the normalized version.
     pub fn normalize_preempts_out(&mut self) {

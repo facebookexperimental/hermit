@@ -1210,18 +1210,56 @@ impl AnalyzeOpts {
         schedule: &PreemptionRecord,
         decision: usize,
         continuation: MaybeTimeslice,
+        deciding: (bool, &Option<PrettyBacktrace>),
+        without_event: (&[SchedEvent], &Path),
+    ) -> anyhow::Result<Option<Report>> {
+        self.report_timing_decision_with(
+            schedule,
+            decision,
+            continuation,
+            deciding,
+            without_event,
+            (
+                |record, len| {
+                    self.prefix_continuation(
+                        "final_target_schedule",
+                        record,
+                        len,
+                        continuation,
+                        |run| self.launch_prefix_trial(run, RunData::launch),
+                    )
+                },
+                |runname, variant, len, position| {
+                    self.prefix_stack(runname, variant, len, position, continuation)
+                },
+            ),
+        )
+    }
+
+    /// [`Self::report_timing_decision`], with `continue_target` running the
+    /// continuation of a record's first `len` events and `stack` each
+    /// stack-trace replay (its name, record, length and the event to take
+    /// the stack at), both giving completed outcomes or ending the analysis.
+    fn report_timing_decision_with(
+        &self,
+        schedule: &PreemptionRecord,
+        decision: usize,
+        continuation: MaybeTimeslice,
         (target_met, deciding): (bool, &Option<PrettyBacktrace>),
         (continued, continued_path): (&[SchedEvent], &Path),
+        (continue_target, stack): (
+            impl FnOnce(&PreemptionRecord, usize) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
+            impl Fn(
+                &str,
+                &PreemptionRecord,
+                usize,
+                usize,
+            ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
+        ),
     ) -> anyhow::Result<Option<Report>> {
         let events = schedule.schedevents();
         let thread = events[decision].dettid;
-        let (target_completed, target_continued_path) = self.prefix_continuation(
-            "final_target_schedule",
-            schedule,
-            decision + 1,
-            continuation,
-            |run| self.launch_prefix_trial(run, RunData::launch),
-        )?;
+        let (target_completed, target_continued_path) = continue_target(schedule, decision + 1)?;
         if !target_completed.target_met {
             bail!(
                 "final target prefix continuation did not meet the target criteria; no \
@@ -1252,7 +1290,7 @@ impl AnalyzeOpts {
         let without_record = continued_record(schedule, decision, continued);
         let next_stack = |runname: &str, variant: &PreemptionRecord, slice: &Slice| match slice.next
         {
-            Some((index, _)) => self.prefix_stack(runname, variant, index + 1, index, continuation),
+            Some((index, _)) => stack(runname, variant, index + 1, index),
             None => Ok((false, None)),
         };
         let (next_target_met, stack1) =
@@ -1295,7 +1333,7 @@ impl AnalyzeOpts {
                     // A slice of one event ends where it starts.
                     Ok((true, deciding.clone()))
                 } else {
-                    self.prefix_stack(runname, variant, end + 1, end, continuation)
+                    stack(runname, variant, end + 1, end)
                 }
             };
             let (_, with_end) = stack_at(
@@ -1886,6 +1924,17 @@ impl AnalyzeOpts {
         crit: CriticalSchedule,
         target_run: Option<&Path>,
     ) -> Result<Report, Error> {
+        self.phase6_record_outputs_with(crit, target_run, RunData::launch)
+    }
+
+    /// [`Self::phase6_record_outputs`], with `launch` running each
+    /// stack-trace replay.
+    fn phase6_record_outputs_with(
+        &self,
+        crit: CriticalSchedule,
+        target_run: Option<&Path>,
+        launch: impl Fn(&mut RunData) -> anyhow::Result<()>,
+    ) -> Result<Report, Error> {
         let tmp_dir = self.get_tmp()?;
         let CriticalSchedule {
             failing_schedule,
@@ -1947,14 +1996,14 @@ impl AnalyzeOpts {
             &final_passing_path,
             &passing_schedule,
             critical_event_index,
-            RunData::launch,
+            &launch,
         )?;
         let target = self.replay_for_stacks(
             runname1,
             &final_failing_path,
             &failing_schedule,
             critical_event_index,
-            RunData::launch,
+            &launch,
         )?;
         require_repeated_outcomes(
             &[
@@ -2515,11 +2564,6 @@ mod tests {
         );
     }
 
-    /// Capturing both stacks is not proof that the candidate completed. This
-    /// drives the stack-trace replay used by production reporting
-    /// ([`AnalyzeOpts::replay_for_stacks`]), whose completed outcome the
-    /// report then compares with the search's, rather than only the stack
-    /// launcher.
     /// A stack-trace replay certifies the decision only when it observes the
     /// outcome the search did: all four (expected, observed) pairs, for one
     /// replay and for either of the default search's two, as main's final
@@ -2557,6 +2601,105 @@ mod tests {
         }
     }
 
+    /// The default search's report ends the analysis when either stack-trace
+    /// replay observes the opposite of the search's outcome: a replay of the
+    /// passing schedule that meets the target, or one of the failing schedule
+    /// that misses it. The replays run through the report's own path
+    /// ([`AnalyzeOpts::phase6_record_outputs`]), with a launch that models
+    /// each completed outcome.
+    #[test]
+    fn the_default_search_report_ends_when_a_replay_contradicts_the_search() {
+        for (baseline_met, target_met, contradicted) in [
+            (true, true, "final_baseline_for_stacktraces"),
+            (false, false, "final_target_for_stacktraces"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+            options.tmp_dir = Some(dir.path().to_path_buf());
+            let error = options
+                .phase6_record_outputs_with(critical(&[1, 2, 1, 2], 2), None, |run| {
+                    let met = if run.name() == "final_target_for_stacktraces" {
+                        target_met
+                    } else {
+                        baseline_met
+                    };
+                    run.complete_for_test(met, &[])
+                })
+                .expect_err("a contradicting replay cannot certify the race")
+                .to_string();
+            assert!(
+                error.contains(&format!("{contradicted} observed the opposite")),
+                "{error}"
+            );
+        }
+    }
+
+    /// The timing decision's report ends the analysis when a stack-trace
+    /// replay of either continuation observes the opposite of its outcome:
+    /// the continuation without the event that meets the target, or the one
+    /// with it that misses. The replays run through the timing decision's
+    /// own path ([`AnalyzeOpts::report_timing_decision`]).
+    #[test]
+    fn the_timing_decision_ends_when_a_replay_contradicts_the_search() {
+        let tid = detcore::types::DetTid::from_raw;
+        let events = |tids: &[i32]| -> Vec<SchedEvent> {
+            tids.iter()
+                .map(|&t| SchedEvent::branches(tid(t), 1))
+                .collect()
+        };
+        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let schedule = PreemptionRecord::from_sched_events(events(&[1, 2, 1, 2]));
+        // Without event #1, thread 2 runs one event there; with it, two.
+        let continued = events(&[1, 2, 1]);
+        for (next_target_met, baseline_met, contradicted) in [
+            (true, true, Some("final_baseline_next_for_stacktraces")),
+            (false, false, Some("final_target_next_for_stacktraces")),
+            (true, false, None),
+        ] {
+            let result = options.report_timing_decision_with(
+                &schedule,
+                1,
+                None,
+                (true, &None),
+                (&continued, Path::new("final_baseline_schedule.preempts")),
+                (
+                    |_, len| {
+                        assert_eq!(len, 2);
+                        Ok((
+                            CompletedScheduleTrial {
+                                target_met: true,
+                                schedule: events(&[1, 2, 2, 1]),
+                            },
+                            PathBuf::from("final_target_schedule.preempts"),
+                        ))
+                    },
+                    |runname, _, _, _| match runname {
+                        "final_target_next_for_stacktraces" => Ok((next_target_met, None)),
+                        "final_baseline_next_for_stacktraces" => Ok((baseline_met, None)),
+                        other => panic!("unexpected replay {other}"),
+                    },
+                ),
+            );
+            match contradicted {
+                Some(replay) => {
+                    let error = result
+                        .expect_err("a contradicting replay cannot certify the decision")
+                        .to_string();
+                    assert!(
+                        error.contains(&format!("{replay} observed the opposite")),
+                        "{error}"
+                    );
+                }
+                None => assert!(result.unwrap().is_some()),
+            }
+        }
+    }
+
+    /// Capturing both stacks is not proof that the candidate completed. This
+    /// drives the stack-trace replay used by production reporting
+    /// ([`AnalyzeOpts::replay_for_stacks`]), whose completed outcome the
+    /// report then compares with the search's, rather than only the stack
+    /// launcher.
     #[test]
     fn a_timed_out_final_replay_cannot_validate_the_expected_outcome() {
         let dir = tempfile::tempdir().unwrap();
