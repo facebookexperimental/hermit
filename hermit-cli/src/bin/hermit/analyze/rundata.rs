@@ -69,12 +69,63 @@ pub enum TrialEnd {
 /// does not support: the container's exit-122 arm returns a bare
 /// `PolicyRefusal`, whose reason Detcore logged before exiting. A refusal
 /// decided before the guest starts (an option or a backend Hermit does not
-/// admit) carries its reason as context instead.
+/// admit) carries its reason as context instead. [`RunData::run_error`] puts
+/// its diagnostics over every refusal a trial's run returns, so it decides
+/// this before it adds them and records the answer in the context it adds
+/// ([`RefusedTrial`]), which is what a trial's launch is read by.
 pub fn guest_reached_a_refusal(error: &anyhow::Error) -> bool {
+    if let Some(refused) = error.downcast_ref::<RefusedTrial>() {
+        return refused.guest_started;
+    }
     error.chain().count() == 1
         && error
             .downcast_ref::<crate::app::container::PolicyRefusal>()
             .is_some()
+}
+
+/// The context [`RunData::run_error`] puts over a refusal of a trial's run:
+/// its diagnostic message, and whether the guest had started when Hermit
+/// refused it ([`guest_reached_a_refusal`], decided on the refusal as the
+/// run returned it).
+#[derive(Debug)]
+pub struct RefusedTrial {
+    message: String,
+    guest_started: bool,
+}
+
+impl std::fmt::Display for RefusedTrial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// What `hermit run` returns to [`RunData::run_now`]: the exit status, the
+/// guest's captured output, and the scheduler's terminal outcome, if any.
+pub type RunResult = (
+    reverie::process::ExitStatus,
+    Option<Output>,
+    Option<detcore::TerminalOutcome>,
+);
+
+/// What [`RunData::run_now`] takes in place of `hermit run`'s result.
+/// Production never sets one: it is a seam for tests, narrower than
+/// [`TrialRunner`], that takes a run through `run_now`'s own handling of
+/// that result (a refusal's classification and diagnostics) and then
+/// [`RunData::launch`]'s journal, without a guest.
+pub type HermitRunFn = dyn Fn(&RunData) -> anyhow::Result<RunResult> + Send + Sync;
+
+/// [`AnalyzeOpts::hermit_run`]: unset, or a [`HermitRunFn`].
+#[derive(Clone, Default)]
+pub struct HermitRun(pub Option<std::sync::Arc<HermitRunFn>>);
+
+impl std::fmt::Debug for HermitRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "HermitRun(set)"
+        } else {
+            "HermitRun(unset)"
+        })
+    }
 }
 
 /// What runs a trial's guest in place of [`RunData::run_now`]. Production
@@ -493,7 +544,12 @@ impl RunData {
             RecordedEnd::Timeout => {
                 Err(self.name_the_trial_bound(anyhow::Error::new(RunTimeoutMarker)))
             }
-            RecordedEnd::Refusal => Err(anyhow::Error::new(crate::app::container::PolicyRefusal)),
+            // The error the run's launch returned: the refusal the guest
+            // reached, with run_error's diagnostics over it.
+            RecordedEnd::Refusal => Err(self.run_error(
+                anyhow::Error::new(crate::app::container::PolicyRefusal),
+                self.logged_to.as_deref(),
+            )),
         }))
     }
 
@@ -604,7 +660,10 @@ impl RunData {
         self.runopts.write_debug_options_dump()?;
 
         let started = Instant::now();
-        let ran = self.runopts.run(&gopts, true);
+        let ran = match self.analyze_opts.hermit_run.0.clone() {
+            Some(run) => run(self),
+            None => self.runopts.run(&gopts, true),
+        };
         stop::check()?;
         let (_, output, terminal_outcome) = ran.map_err(|error| {
             self.run_error(self.name_the_trial_bound(error), gopts.log_file.as_deref())
@@ -730,6 +789,10 @@ impl RunData {
 
     /// Keep every failure typed. A policy refusal has no completed guest
     /// outcome, whether its reason arrived as context or was logged separately.
+    /// Whether the guest had started when Hermit refused the run is decided
+    /// here, on the refusal as the run returned it, and kept in the context
+    /// added over it ([`RefusedTrial`]): the journal admits only such a
+    /// refusal, and that context would otherwise hide the answer.
     fn run_error(&self, error: anyhow::Error, log: Option<&Path>) -> anyhow::Error {
         if error
             .downcast_ref::<crate::app::container::PolicyRefusal>()
@@ -737,16 +800,20 @@ impl RunData {
         {
             return error;
         }
+        let guest_started = guest_reached_a_refusal(&error);
         let diagnostics = log.map_or_else(
             || "Hermit's stderr above".to_owned(),
             |path| format!("the trial log {}", path.display()),
         );
-        error.context(format!(
-            "Hermit refused analysis run {}; no program outcome was established. \
-             Inspect the refusal below and {diagnostics}; use a supported operation or \
-             configuration before retrying.",
-            self.runname,
-        ))
+        error.context(RefusedTrial {
+            message: format!(
+                "Hermit refused analysis run {}; no program outcome was established. \
+                 Inspect the refusal below and {diagnostics}; use a supported operation or \
+                 configuration before retrying.",
+                self.runname,
+            ),
+            guest_started,
+        })
     }
 
     /// Any post-processing that needs to be applied to a recorded file of SchedEvents
@@ -4992,6 +5059,97 @@ mod tests {
             )
             .unwrap();
         assert_eq!(options.journal.lookup(&key), None);
+    }
+
+    /// A refusal the guest reached arrives from `hermit run` as a bare
+    /// `PolicyRefusal` (the container's exit-122 arm), and `run_now` puts
+    /// `run_error`'s diagnostics over it, as over every refusal of a trial's
+    /// run. The journal records it all the same, and a later invocation's
+    /// launch of the trial answers with the same error instead of running it
+    /// again. A refusal decided before the guest started, whose reason is its
+    /// context (an option or a configuration Hermit does not admit), is not
+    /// journaled: the later launch runs the trial again. Both go through
+    /// `launch` and `run_now`, with only `hermit run`'s result in place.
+    #[test]
+    fn a_refusal_the_guest_reached_is_journaled_through_run_error_and_resumes_as_the_same_error() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use reverie::process::ExitStatus;
+        use reverie::process::RunError;
+
+        let guest_started = || {
+            crate::app::container::classify_container_result::<RunResult>(Err(
+                RunError::ExitStatus(ExitStatus::Exited(
+                    detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                )),
+            ))
+            .unwrap_err()
+        };
+        let before_the_guest = || {
+            anyhow::Error::new(crate::app::container::PolicyRefusal)
+                .context("unsupported configuration at admission")
+        };
+        // The trial, the refusal `hermit run` returns, and whether it is
+        // journaled.
+        type Case = (&'static str, fn() -> anyhow::Error, bool);
+        let cases: [Case; 2] = [
+            ("bisect_round_001", guest_started, true),
+            ("bisect_round_002", before_the_guest, false),
+        ];
+        for (name, refusal, journaled) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let runs = Arc::new(AtomicUsize::new(0));
+            let with_hermit_run = |options: &mut AnalyzeOpts| {
+                let runs = runs.clone();
+                options.hermit_run = HermitRun(Some(Arc::new(move |_: &RunData| {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    Err(refusal())
+                })));
+            };
+
+            let mut options = journaled_options(dir.path());
+            with_hermit_run(&mut options);
+            let mut first = RunData::new_baseline(&options, name.into()).unwrap();
+            let refused = first.launch().unwrap_err();
+            let message = format!("{refused:#}");
+            assert!(
+                refused
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
+                    .is_some(),
+                "{name}: {message}"
+            );
+            assert!(
+                message.contains(&format!("Hermit refused analysis run {name}")),
+                "{name}: {message}"
+            );
+            assert_eq!(
+                crate::app::classify_failure(&refused),
+                "HERMIT_POLICY_REFUSAL class=policy-refusal"
+            );
+            assert_eq!(
+                options
+                    .journal
+                    .lookup(&first.journal_key())
+                    .map(|entry| entry.end),
+                journaled.then_some(RecordedEnd::Refusal),
+                "{name}: {message}"
+            );
+
+            // A later invocation's launch of the same trial.
+            let mut reopened = journaled_options(dir.path());
+            with_hermit_run(&mut reopened);
+            let mut again = RunData::new_baseline(&reopened, name.into()).unwrap();
+            let resumed = again.launch().unwrap_err();
+            assert_eq!(format!("{resumed:#}"), message, "{name}");
+            assert_eq!(reopened.journal.answered(), u64::from(journaled), "{name}");
+            assert_eq!(
+                runs.load(Ordering::SeqCst),
+                if journaled { 1 } else { 2 },
+                "{name}"
+            );
+        }
     }
 
     /// A recording that analyze removed after reading it (to save disk) is

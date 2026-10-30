@@ -169,6 +169,7 @@ impl BisectOpts {
             partial_report_written: false,
             resumed_progress: None,
             trial_runner: Default::default(),
+            hermit_run: Default::default(),
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
