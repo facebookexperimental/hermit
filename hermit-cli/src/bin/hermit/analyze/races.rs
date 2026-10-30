@@ -76,8 +76,6 @@ use detcore_model::access_trace::EventIndex;
 use detcore_model::access_trace::EventRef;
 use detcore_model::access_trace::FdOp;
 use detcore_model::access_trace::LifetimeOp;
-use detcore_model::access_trace::SignalDelivery;
-use detcore_model::access_trace::SignalRecord;
 use detcore_model::access_trace::SyscallRecord;
 use detcore_model::access_trace::Task;
 use detcore_model::access_trace::TimerId;
@@ -464,6 +462,7 @@ pub fn find_racing_accesses(
     let mut notes = truncation_notes(target, baseline, outcome.as_ref());
     let truncated = !notes.is_empty();
     notes.extend(finder.backward_edge_notes());
+    notes.extend(finder.uncounted_kill_notes());
 
     let victims = finder.victims(outcome_thread);
     let pairs = finder.flipped_pairs(&victims.ranked);
@@ -812,7 +811,6 @@ struct LifetimePair<'a> {
 /// One trace, indexed.
 struct Run<'a> {
     syscalls: Vec<&'a SyscallRecord>,
-    signals: Vec<&'a SignalRecord>,
     by_op: BTreeMap<(DetTid, u64), &'a SyscallRecord>,
     /// Recorded and derived edges, sorted by `from` event.
     edges: Vec<HbEdge>,
@@ -835,14 +833,6 @@ impl<'a> Run<'a> {
             })
             .collect();
         let by_op = syscalls.iter().map(|s| ((s.tid, s.nth), *s)).collect();
-        let signals = trace
-            .records
-            .iter()
-            .filter_map(|r| match r {
-                TraceRecord::Signal(signal) => Some(signal),
-                _ => None,
-            })
-            .collect();
         let (backward, mut edges): (Vec<HbEdge>, Vec<HbEdge>) = trace
             .records
             .iter()
@@ -860,7 +850,6 @@ impl<'a> Run<'a> {
         edges.sort_by_key(|e| (e.from.event, e.to.event, e.from.tid, e.to.tid, e.kind));
         Self {
             syscalls,
-            signals,
             by_op,
             edges,
             untracked: data.untracked,
@@ -875,24 +864,6 @@ impl<'a> Run<'a> {
             .range((thread, 0)..=(thread, u64::MAX))
             .next_back()
             .map(|(_, sys)| *sys)
-    }
-
-    /// Whether the trace shows signal `signo` ending a thread of `task` by its
-    /// default action at or after event `from`.
-    fn fatal_signal_after(&self, task: Task, signo: i32, from: EventIndex) -> bool {
-        self.signals.iter().any(|signal| {
-            signal.signo == signo
-                && signal.event >= from
-                && signal.delivery == SignalDelivery::Fatal
-                && match task {
-                    Task::Thread(tid) => signal.tid == tid,
-                    Task::Process(pid) => self
-                        .syscalls
-                        .iter()
-                        .any(|sys| sys.tid == signal.tid && sys.pid == pid),
-                    Task::ProcessGroup(_) => false,
-                }
-        })
     }
 
     /// One note per channel that a call between `from` and `to` wrote or
@@ -1294,6 +1265,36 @@ impl<'a> Finder<'a> {
             decision,
             end,
         }
+    }
+
+    /// One note per kill in the window that sent another signal than
+    /// SIGKILL and did not fail: it gives no lifetime pair
+    /// ([`Finder::ended_tasks`]), and the result says so rather than show
+    /// fewer endings without a word.
+    fn uncounted_kill_notes(&self) -> Vec<String> {
+        self.in_window()
+            .filter(|kill| !kill.target.result.is_some_and(|r| r < 0))
+            .filter(|kill| {
+                kill.target.accesses.iter().any(|access| {
+                    matches!(
+                        access,
+                        Access::Lifetime {
+                            op: LifetimeOp::Signal { signo },
+                            ..
+                        } if *signo != 0 && *signo != libc::SIGKILL
+                    )
+                })
+            })
+            .map(|kill| {
+                format!(
+                    "{} at event {} is not counted as ending its target: the access trace \
+                     records only the disposition observed before the signal's event, not \
+                     whether the target died of it, so only SIGKILL is counted.",
+                    call_text(kill.target),
+                    kill.target.pre
+                )
+            })
+            .collect()
     }
 
     fn backward_edge_notes(&self) -> Vec<String> {
@@ -1939,9 +1940,10 @@ impl<'a> Finder<'a> {
         pairs
     }
 
-    /// The tasks `kill` ends: an exit or exec, and a signal that kills (a
-    /// SIGKILL, or one the target trace shows ending a thread of the task by
-    /// its default action).
+    /// The tasks `kill` ends: an exit or exec, and a SIGKILL. Another signal
+    /// can end a task by its default action too, but the trace records only
+    /// the disposition observed before the signal's event, which does not
+    /// show that the task died of it, so such a signal is not counted.
     fn ended_tasks(&self, kill: &SyscallRecord) -> Vec<Task> {
         if kill.result.is_some_and(|r| r < 0) {
             // A failed kill, exit or exec ended nothing.
@@ -1953,12 +1955,9 @@ impl<'a> Finder<'a> {
                 Access::Lifetime { target, op } => Some((*target, *op)),
                 _ => None,
             })
-            .filter(|(target, op)| match op {
+            .filter(|(_, op)| match op {
                 LifetimeOp::Exit | LifetimeOp::Exec => true,
-                LifetimeOp::Signal { signo } => {
-                    *signo == libc::SIGKILL
-                        || self.target.fatal_signal_after(*target, *signo, kill.pre)
-                }
+                LifetimeOp::Signal { signo } => *signo == libc::SIGKILL,
                 LifetimeOp::Create | LifetimeOp::Wait => false,
             })
             .map(|(target, _)| target)
@@ -5361,8 +5360,9 @@ mod tests {
             lock(Some(0)),
         ]);
 
-        // A kill that failed, or a signal the trace does not show ending
-        // the process (a handled SIGUSR1), ended nothing.
+        // A kill that failed, or a signal other than SIGKILL, which the
+        // trace does not show ending the process, ended nothing; the result
+        // says that only SIGKILL is counted.
         for (signo, result) in [(9, -1), (libc::SIGUSR1, 0)] {
             let target = trace(vec![
                 clock.clone(),
@@ -5381,6 +5381,16 @@ mod tests {
                 RaceStatus::Found,
                 "signal {signo} = {result}: {}",
                 r.reason
+            );
+            let uncounted = r
+                .notes
+                .iter()
+                .any(|note| note.contains("only SIGKILL is counted"));
+            assert_eq!(
+                uncounted,
+                signo != 9,
+                "signal {signo} = {result}: {:?}",
+                r.notes
             );
         }
 
