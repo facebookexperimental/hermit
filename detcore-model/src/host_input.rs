@@ -313,6 +313,9 @@ pub enum StdioKind {
     Directory,
     /// No open descriptor.
     Closed,
+    /// Another kind of file, such as a symbolic link an `O_PATH` descriptor
+    /// names.
+    Other,
 }
 
 impl StdioKind {
@@ -327,24 +330,32 @@ impl StdioKind {
             libc::S_IFCHR => Self::CharDevice,
             libc::S_IFBLK => Self::BlockDevice,
             libc::S_IFDIR => Self::Directory,
-            // `S_IFLNK` cannot be an open descriptor's kind.
-            _ => Self::File,
+            _ => Self::Other,
         }
     }
 
-    /// The kind of this process's descriptor `fd`: its `st_mode` and whether
-    /// it is a terminal, or [`Self::Closed`] where it is not open.
-    pub fn of_descriptor(fd: std::os::fd::RawFd) -> Self {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: fstat writes a whole `struct stat` when it succeeds.
-        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-            return Self::Closed;
-        }
-        // SAFETY: fstat succeeded, so it wrote the struct.
-        let stat = unsafe { stat.assume_init() };
-        // SAFETY: isatty only queries the descriptor.
-        let terminal = unsafe { libc::isatty(fd) } == 1;
-        Self::from_mode(stat.st_mode, terminal)
+    /// Whether the character device numbered `rdev` belongs to a terminal
+    /// driver, by `drivers`, the kernel's list of them (the text of
+    /// `/proc/tty/drivers`: one driver per line, ending with its major
+    /// number, its minor number or range, and its type). Detcore classifies
+    /// a guest's descriptor by `stat` of its `/proc/<pid>/fd` link, which
+    /// opens nothing, so it cannot ask `isatty`.
+    pub fn is_terminal_device(rdev: u64, drivers: &str) -> bool {
+        // glibc's `gnu_dev_major` and `gnu_dev_minor`.
+        let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+        let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+        drivers.lines().any(|line| {
+            let mut fields = line.split_whitespace().rev();
+            let (Some(_kind), Some(minors), Some(driver_major)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return false;
+            };
+            let (first, last) = minors.split_once('-').unwrap_or((minors, minors));
+            driver_major.parse() == Ok(major)
+                && first.parse().is_ok_and(|first: u64| first <= minor)
+                && last.parse().is_ok_and(|last: u64| minor <= last)
+        })
     }
 
     fn describe(self) -> &'static str {
@@ -357,6 +368,7 @@ impl StdioKind {
             Self::BlockDevice => "a block device",
             Self::Directory => "a directory",
             Self::Closed => "closed",
+            Self::Other => "another kind of file",
         }
     }
 }
@@ -372,16 +384,6 @@ pub struct StdioKinds {
 }
 
 impl StdioKinds {
-    /// The kinds of this process's own standard descriptors, which a guest
-    /// launched to inherit them has.
-    pub fn of_this_process() -> Self {
-        Self {
-            stdin: StdioKind::of_descriptor(libc::STDIN_FILENO),
-            stdout: StdioKind::of_descriptor(libc::STDOUT_FILENO),
-            stderr: StdioKind::of_descriptor(libc::STDERR_FILENO),
-        }
-    }
-
     /// The descriptors whose kind differs between `recorded` and `now`, in
     /// descriptor order.
     pub fn changes(recorded: &Self, now: &Self) -> Vec<StdioChange> {
@@ -491,6 +493,45 @@ mod tests {
     /// terminal only when it says so. A replay names each descriptor whose
     /// kind changed, in descriptor order. A set without stdio kinds is
     /// written as before, and one with them round-trips.
+    /// A character device is a terminal when a terminal driver in the
+    /// kernel's list owns its major number and its minor number: a pty slave,
+    /// a serial port and the console are; /dev/null and a minor number past
+    /// a driver's range are not.
+    #[test]
+    fn terminal_devices_follow_the_kernels_driver_list() {
+        let drivers = "\
+/dev/tty             /dev/tty        5       0 system:/dev/tty
+/dev/console         /dev/console    5       1 system:console
+/dev/vc/0            /dev/vc/0       4       0 system:vtmaster
+serial               /dev/ttyS       4 64-95 serial
+pty_slave            /dev/pts      136 0-1048575 pty:slave
+";
+        let device = |major: u64, minor: u64| {
+            ((major & 0xfff) << 8)
+                | ((major & !0xfff) << 32)
+                | (minor & 0xff)
+                | ((minor & !0xff) << 12)
+        };
+        for (major, minor, terminal) in [
+            (136, 3, true),
+            (136, 1_000_000, true),
+            (4, 64, true),
+            (4, 95, true),
+            (4, 96, false),
+            (5, 1, true),
+            (1, 3, false),
+        ] {
+            assert_eq!(
+                StdioKind::is_terminal_device(device(major, minor), drivers),
+                terminal,
+                "{major}:{minor}"
+            );
+        }
+        assert!(!StdioKind::is_terminal_device(device(136, 3), ""));
+        // A symbolic link an `O_PATH` descriptor names is no regular file.
+        assert_eq!(StdioKind::from_mode(libc::S_IFLNK, false), StdioKind::Other);
+    }
+
     #[test]
     fn stdio_kinds_name_each_changed_descriptor() {
         assert_eq!(

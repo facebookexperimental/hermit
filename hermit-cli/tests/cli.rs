@@ -26873,6 +26873,74 @@ fn a_schedule_replay_names_a_stdio_kind_changed_since_the_recording() {
     );
 }
 
+/// A library caller's `Command` decides the guest's standard descriptors,
+/// and the run records the kinds the guest has at its first exec, not the
+/// caller's own. Here the guest's stdout is one end of a socket pair, which
+/// this test process's stdout never is: the summary says `socket`, and the
+/// guest's output arrives on the other end. Recording the calling process's
+/// descriptors would name its stdout instead.
+#[test]
+fn a_library_run_records_the_stdio_kinds_of_its_commands_descriptors() {
+    use std::io::Read;
+
+    // A Detcore session in this process, as
+    // library_runs_return_on_a_256_kib_thread runs one: in a fresh process
+    // of this binary, away from the threaded harness's sibling sessions.
+    const CHILD: &str = "HERMIT_LIBRARY_STDIO_KINDS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_library_run_records_the_stdio_kinds_of_its_commands_descriptors",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let summary = directory.path().join("summary.json");
+    let (guest_end, mut caller_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    let summary_path = Some(summary.clone());
+    // Built on the launching thread: the command is not `Send`.
+    let status = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            let config = hermit::DetConfig {
+                sequentialize_threads: true,
+                record_host_inputs: true,
+                ..Default::default()
+            };
+            let mut command = reverie::process::Command::new("/bin/echo");
+            command.arg("through the socket");
+            command.stdin(reverie::process::Stdio::null());
+            command.stdout(guest_end);
+            hermit::run(command, config, false, &summary_path)
+                .map(|status| status.code())
+                .map_err(|error| format!("{error:#}"))
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(status, Ok(Some(0)));
+    let mut written = String::new();
+    caller_end.read_to_string(&mut written).unwrap();
+    assert_eq!(written, "through the socket\n");
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+    let stdio = &summary["host_inputs"]["stdio"];
+    assert_eq!(stdio["stdin"], "char_device", "{summary}");
+    assert_eq!(stdio["stdout"], "socket", "{summary}");
+}
+
 /// A run whose output Hermit captures records the kinds of the standard
 /// descriptors its guest was given, not Hermit's own. `--verify` gives each
 /// run's guest a snapshot of Hermit's stdin (here `/dev/null`) and piped

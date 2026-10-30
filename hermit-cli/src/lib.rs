@@ -838,37 +838,6 @@ pub fn output_backend_stdin() -> Result<Stdio, Error> {
     }
 }
 
-/// The kinds of file behind the standard descriptors a launch on `backend`
-/// gives the guest (`detcore::Config::launch_stdio`). An output-capturing
-/// launch gives it the stdin [`output_backend_stdin`] hands out (the
-/// snapshot, or `/dev/null`) and piped stdout and stderr, whatever this
-/// process's own descriptors are; any other launch lets it inherit this
-/// process's. `None` for KVM, whose runtime serves the guest's stdio itself,
-/// and for DBT, whose runtime records no host inputs.
-fn launch_stdio(
-    backend: Backend,
-    capture_output: bool,
-) -> Result<Option<detcore_model::host_input::StdioKinds>, Error> {
-    use detcore_model::host_input::StdioKind;
-    use detcore_model::host_input::StdioKinds;
-    if matches!(backend, Backend::Kvm | Backend::Dbt) {
-        return Ok(None);
-    }
-    if !capture_output {
-        return Ok(Some(StdioKinds::of_this_process()));
-    }
-    let stdin = match output_backend_stdin_file()? {
-        Some(file) => StdioKind::of_descriptor(file.as_raw_fd()),
-        // `Stdio::null()` opens /dev/null.
-        None => StdioKind::CharDevice,
-    };
-    Ok(Some(StdioKinds {
-        stdin,
-        stdout: StdioKind::Pipe,
-        stderr: StdioKind::Pipe,
-    }))
-}
-
 /// The result of recording a command.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Recording {
@@ -4101,7 +4070,6 @@ async fn dispatch_backend(
         crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
     }
     config.launch_image = launched_image(&command);
-    config.launch_stdio = launch_stdio(backend, false)?;
     if backend == Backend::Kvm {
         return Ok(run_kvm(
             &command,
@@ -4498,7 +4466,6 @@ async fn dispatch_output_backend(
         crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
     }
     config.launch_image = launched_image(&command);
-    config.launch_stdio = launch_stdio(backend, true)?;
     if backend == Backend::Kvm {
         return run_kvm(
             &command,
