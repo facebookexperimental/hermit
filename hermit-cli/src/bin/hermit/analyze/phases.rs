@@ -3008,20 +3008,21 @@ impl AnalyzeOpts {
             let empty = PreemptionRecord::from_sched_events(Vec::new());
             alternative
                 .prefix_trial(runname, &empty, 0, continuation)
-                .and_then(|mut run| run.launch_trial())
+                .and_then(|mut run| run.launch().map(|()| run.is_a_match()))
         })
     }
 
     /// [`Self::try_alternative_timing`], with `launch` running the trial
     /// (`runname`) on the options it is given, these options under the
-    /// alternatives: how it ended decides the cause. A trial that missed
-    /// shows the settings cause the outcome; one that met the target shows
-    /// they do not; one that did not finish (a bound or a refusal) or could
-    /// not run shows nothing, and the verdict says it was not tried.
+    /// alternatives, and saying whether it met the target: how it ended
+    /// decides the cause. A trial that missed shows the settings cause the
+    /// outcome; one that met the target shows they do not; one that did not
+    /// finish (a bound or a refusal: its launch's error) or could not run
+    /// shows nothing, and the verdict says it was not tried.
     fn try_alternative_timing_with(
         &self,
         timing: &[TimingSetting],
-        launch: impl FnOnce(&AnalyzeOpts, &str) -> anyhow::Result<TrialEnd>,
+        launch: impl FnOnce(&AnalyzeOpts, &str) -> anyhow::Result<bool>,
     ) -> AlternativeTiming {
         let runname = "prefix_alternative_timing";
         let trial = format!("{runname}.repro");
@@ -3045,17 +3046,25 @@ impl AnalyzeOpts {
                 .join(" and ")
         );
         match launch(&alternative, runname) {
-            Ok(TrialEnd::Missed) => AlternativeTiming::Missed { trial },
-            Ok(TrialEnd::Met) => AlternativeTiming::Met { trial },
-            Ok(TrialEnd::Unfinished(stop)) => AlternativeTiming::Untried {
-                why: format!(
-                    "the trial with them ({trial} in the workspace) {}",
-                    match stop {
-                        Stop::Bound => "did not finish",
-                        Stop::Refusal => "was refused by Hermit",
-                    }
-                ),
-            },
+            Ok(false) => AlternativeTiming::Missed { trial },
+            Ok(true) => AlternativeTiming::Met { trial },
+            Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                AlternativeTiming::Untried {
+                    why: format!("the trial with them ({trial} in the workspace) did not finish"),
+                }
+            }
+            Err(error)
+                if error.chain().count() == 1
+                    && error
+                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .is_some() =>
+            {
+                AlternativeTiming::Untried {
+                    why: format!(
+                        "the trial with them ({trial} in the workspace) was refused by Hermit"
+                    ),
+                }
+            }
             Err(error) => AlternativeTiming::Untried {
                 why: format!("the trial with them could not run ({error:#})"),
             },
@@ -5899,7 +5908,6 @@ mod tests {
     /// refused) or failed trial shows nothing.
     #[test]
     fn the_alternative_timing_trial_decides_the_cause_by_how_it_ends() {
-        use crate::analyze::rundata::Stop;
         let options = AnalyzeOpts::try_parse_from([
             "analyze",
             "--run-arg=--scheduler-turn-cost=10000",
@@ -5914,22 +5922,21 @@ mod tests {
             ["--pipe-wake-latency=50000", "--scheduler-turn-cost=10000"]
         );
         // How the trial ends, and what the cause must then be.
-        type Case = (anyhow::Result<TrialEnd>, fn(&AlternativeTiming) -> bool);
+        type Case = (anyhow::Result<bool>, fn(&AlternativeTiming) -> bool);
         let cases: [Case; 5] = [
             (
-                Ok(TrialEnd::Missed),
+                Ok(false),
                 |t| matches!(t, AlternativeTiming::Missed { trial } if trial == "prefix_alternative_timing.repro"),
             ),
-            (Ok(TrialEnd::Met), |t| {
-                matches!(t, AlternativeTiming::Met { .. })
-            }),
+            (Ok(true), |t| matches!(t, AlternativeTiming::Met { .. })),
             (
-                Ok(TrialEnd::Unfinished(Stop::Bound)),
+                Err(anyhow::Error::new(RunTimeoutMarker)),
                 |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("prefix_alternative_timing.repro")),
             ),
-            (Ok(TrialEnd::Unfinished(Stop::Refusal)), |t| {
-                matches!(t, AlternativeTiming::Untried { .. })
-            }),
+            (
+                Err(anyhow::Error::new(PolicyRefusal)),
+                |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("was refused by Hermit")),
+            ),
             (
                 Err(anyhow::anyhow!("no such binary")),
                 |t| matches!(t, AlternativeTiming::Untried { why } if why.contains("could not run (no such binary)")),
