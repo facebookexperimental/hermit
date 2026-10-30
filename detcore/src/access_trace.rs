@@ -2682,7 +2682,7 @@ mod tests {
         event.op = Op::SignalReceived(crate::types::SigWrapper(signal));
         let contents = Shared::default();
         let mut writer = AccessTraceWriter::new(Box::new(contents.clone()), 0, None, None).unwrap();
-        writer.observe(0, &event, payload, &Groups);
+        writer.observe(0, &event, Some(payload), &Groups);
 
         // Thread B changes the shared disposition while A is held after its
         // SignalReceived event. A's earlier observation must not turn into a
@@ -2724,7 +2724,7 @@ mod tests {
             let contents = Shared::default();
             let mut writer =
                 AccessTraceWriter::new(Box::new(contents.clone()), 0, None, None).unwrap();
-            writer.observe(0, &event, payload, &Groups);
+            writer.observe(0, &event, Some(payload), &Groups);
             writer.finish(1).unwrap();
             let bytes = contents.0.lock().unwrap().clone();
             let trace = read_access_trace(bytes.as_slice()).unwrap();
@@ -2791,11 +2791,11 @@ mod tests {
             );
             for n in 0..3 {
                 let getpid = || entry(Sysno::getpid, n + 1);
-                writer.observe(2 * n, &prehook(3, Sysno::getpid), getpid(), &Groups);
+                writer.observe(2 * n, &prehook(3, Sysno::getpid), Some(getpid()), &Groups);
                 writer.observe(
                     2 * n + 1,
                     &posthook(3, Sysno::getpid),
-                    exit(3, vec![]),
+                    Some(exit(3, vec![])),
                     &Groups,
                 );
             }
