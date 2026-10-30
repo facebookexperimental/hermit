@@ -55,6 +55,7 @@ use crate::app::analyze::races::RacingAccesses;
 use crate::app::analyze::races::Window;
 use crate::app::analyze::races::find_racing_accesses;
 use crate::app::analyze::races::outcome_point;
+use crate::app::analyze::races::uncounted_signal_outcome;
 use crate::app::analyze::rundata::RunData;
 use crate::app::analyze::types::AnalyzeOpts;
 use crate::app::container::RunTimeoutMarker;
@@ -258,6 +259,8 @@ impl AnalyzeOpts {
             root,
         };
         let outcome = outcome_point(&target_trace.trace, decision, &criteria);
+        let uncounted_signal =
+            uncounted_signal_outcome(&target_trace.trace, decision, &criteria, outcome.as_ref());
         let outcome_thread = outcome.as_ref().map(|o| o.thread);
         let mut result = find_racing_accesses(
             &target_trace.trace,
@@ -274,6 +277,7 @@ impl AnalyzeOpts {
                 ));
             }
         }
+        result.notes.extend(uncounted_signal);
         if let Some((_, note)) = realized {
             result.notes.insert(0, note);
         }

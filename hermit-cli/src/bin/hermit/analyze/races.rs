@@ -751,13 +751,15 @@ pub struct OutcomeCriteria<'a> {
 }
 
 /// O, where the target trace meets its outcome at or after `decision`: the
-/// first of a fatal signal ending the root process whose exit status the
-/// criteria accept, the write to stdout or stderr after which that stream's
-/// output (the first 256 bytes of each write, as the trace keeps them) first
+/// first of the write to stdout or stderr after which that stream's output
+/// (the first 256 bytes of each write, as the trace keeps them) first
 /// matches its pattern, and the root process's `exit_group` whose code the
 /// criteria accept. The exit criterion is about the root process's status
-/// only, and `--target-exit-code=any` leaves it out: every run meets it.
-/// `None` when the trace shows none, and the window runs to its end.
+/// only, and `--target-exit-code=any` leaves it out: every run meets it. A
+/// signal that ends the process is not an outcome point: the trace records
+/// only the disposition observed before the signal's event, which does not
+/// show that the process died of it. `None` when the trace shows none, and
+/// the window runs to its end.
 pub fn outcome_point(
     trace: &AccessTrace,
     decision: EventIndex,
@@ -787,11 +789,6 @@ pub fn outcome_point(
                     .is_match(ExitStatus::Exited(sys.args[0] as i32 & 0xff))
         })
         .map(|sys| outcome_of(sys, sys.pre));
-    // A signal record names the thread; its process is the one the trace
-    // shows that thread's calls in.
-    let in_root = |tid: DetTid| {
-        root.is_some_and(|root| syscalls.iter().any(|sys| sys.tid == tid && sys.pid == root))
-    };
     for sys in &syscalls {
         let (Some(bytes), Sysno::write | Sysno::writev | Sysno::pwrite64) =
             (sys.out_bytes.as_deref(), sys.sysno)
@@ -813,10 +810,36 @@ pub fn outcome_point(
             break;
         }
     }
-    let killed = trace.records.iter().find_map(|r| match r {
+    [written, exited]
+        .into_iter()
+        .flatten()
+        .min_by_key(|o| o.event)
+}
+
+/// The sentence that says a signal is not the outcome point
+/// ([`outcome_point`]): the first signal record at or after `decision`, in
+/// the root process, whose signal the exit criterion accepts as a death and
+/// which comes before `outcome`, if any. It used to be taken as the outcome
+/// point; the trace does not show that the process died of it.
+pub fn uncounted_signal_outcome(
+    trace: &AccessTrace,
+    decision: EventIndex,
+    criteria: &OutcomeCriteria<'_>,
+    outcome: Option<&OutcomeRef>,
+) -> Option<String> {
+    let root = criteria
+        .root
+        .filter(|_| !matches!(criteria.exit_code, ExitStatusConstraint::Any))?;
+    let in_root = |tid: DetTid| {
+        trace
+            .records
+            .iter()
+            .any(|r| matches!(r, TraceRecord::Syscall(sys) if sys.tid == tid && sys.pid == root))
+    };
+    let signal = trace.records.iter().find_map(|r| match r {
         TraceRecord::Signal(signal)
             if signal.event >= decision
-                && signal.delivery == SignalDelivery::Fatal
+                && outcome.is_none_or(|o| signal.event < o.event)
                 && in_root(signal.tid)
                 && nix::sys::signal::Signal::try_from(signal.signo).is_ok_and(|signo| {
                     criteria
@@ -824,18 +847,17 @@ pub fn outcome_point(
                         .is_match(ExitStatus::Signaled(signo, false))
                 }) =>
         {
-            Some(OutcomeRef {
-                event: signal.event,
-                thread: signal.tid,
-                text: format!("{} ends the process", signal_text(signal.signo as u64)),
-            })
+            Some(signal)
         }
         _ => None,
-    });
-    [killed, written, exited]
-        .into_iter()
-        .flatten()
-        .min_by_key(|o| o.event)
+    })?;
+    Some(format!(
+        "{} reaches the root process at event {}; it is not taken as the outcome point: the \
+         access trace records only the disposition observed before the signal's event, not \
+         whether the process died of it.",
+        signal_text(signal.signo as u64),
+        signal.event
+    ))
 }
 
 fn outcome_of(sys: &SyscallRecord, event: EventIndex) -> OutcomeRef {
@@ -4302,7 +4324,9 @@ mod tests {
     use detcore_model::access_trace::CursorOp;
     use detcore_model::access_trace::EdgeRecord;
     use detcore_model::access_trace::FutexOp;
+    use detcore_model::access_trace::ObservedSignalDisposition;
     use detcore_model::access_trace::ReturnedBytes;
+    use detcore_model::access_trace::SignalRecord;
     use detcore_model::access_trace::SyncObject;
     use detcore_model::access_trace::TraceEnd;
     use detcore_model::access_trace::TraceHeader;
@@ -7899,7 +7923,7 @@ mod tests {
         };
         let exit = |pre, code| call(pre, 9, pre, Sysno::exit_group, &[code], None, Vec::new());
         let records = |calls: Vec<SyscallRecord>, fatal: Option<EventIndex>| {
-            // Thread 5, which the fatal signal hits, is in the root process.
+            // Thread 5, which the signal hits, is in the root process.
             let mut records: Vec<TraceRecord> = vec![TraceRecord::Syscall(call(
                 80,
                 5,
@@ -7918,7 +7942,7 @@ mod tests {
                     code: 0,
                     addr: None,
                     sender: None,
-                    delivery: SignalDelivery::Fatal,
+                    observed_disposition: ObservedSignalDisposition::Default,
                 }));
             }
             traced(records)
@@ -7950,16 +7974,34 @@ mod tests {
                 text: "write(2, \"of file descriptor 6\", 21)".to_string(),
             })
         );
-        // Without a stderr pattern, the fatal signal comes before the exit.
+        // Without a stderr pattern, the exit is the outcome: a signal that
+        // reaches the process under its default disposition, before the
+        // exit, is not shown to end it.
         let nonzero_only = OutcomeCriteria {
             stdout: None,
             stderr: None,
             exit_code: &nonzero,
             root,
         };
+        let exit_outcome = outcome_point(&trace, S, &nonzero_only);
         assert_eq!(
-            outcome_point(&trace, S, &nonzero_only).map(|o| (o.event, o.thread, o.text)),
-            Some((108, t(5), "SIGABRT ends the process".to_string()))
+            exit_outcome.clone().map(|o| (o.event, o.thread, o.text)),
+            Some((110, t(9), "exit_group(1)".to_string()))
+        );
+        // The result says that the signal is not taken as the outcome, where
+        // it comes before the outcome point; not after it.
+        let note = uncounted_signal_outcome(&trace, S, &nonzero_only, exit_outcome.as_ref());
+        assert!(
+            note.as_deref().is_some_and(|note| note.starts_with(
+                "SIGABRT reaches the root \
+                 process at event 108; it is not taken as the outcome point"
+            )),
+            "{note:?}"
+        );
+        let write_outcome = outcome_point(&trace, S, &stderr_and_nonzero);
+        assert_eq!(
+            uncounted_signal_outcome(&trace, S, &stderr_and_nonzero, write_outcome.as_ref()),
+            None
         );
         // An exit code the criteria refuse, and output before the decision,
         // are no outcome.
