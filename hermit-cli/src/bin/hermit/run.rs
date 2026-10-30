@@ -5378,6 +5378,14 @@ fn untrap_passthrough_syscalls_is_an_opt_in_refused_where_its_calls_are_counted(
     default.validate_args_with_perf_support(true).unwrap();
     assert!(!default.det_opts.det_config.untrap_passthrough_syscalls);
 
+    // Validation reads a replayed record before this refusal, so the replay
+    // case names a readable one; this one states nothing.
+    let directory = tempfile::tempdir().unwrap();
+    let record = directory.path().join("preemptions.json");
+    detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+        .write_to_disk(&record)
+        .unwrap();
+    let replay = format!("--replay-schedule-from={}", record.display());
     for (argument, backend, refused_with) in [
         (Some("--strict"), None, "--strict"),
         // KVM refuses the default preemption timer before this check.
@@ -5392,11 +5400,7 @@ fn untrap_passthrough_syscalls_is_an_opt_in_refused_where_its_calls_are_counted(
             None,
             "preemption record",
         ),
-        (
-            Some("--replay-schedule-from=/tmp/p"),
-            None,
-            "preemption record",
-        ),
+        (Some(replay.as_str()), None, "preemption record"),
         (Some("--happens-before=/tmp/hb"), None, "--happens-before"),
         (Some("--verify-run=/tmp/v"), None, "--verify-run"),
         (Some("--namespace-only"), None, "backend other than ptrace"),
