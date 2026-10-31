@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3055,
-      "applicable": 2243,
-      "selectable": 1754,
-      "population": 2995,
-      "population_candidate_selected": 1754,
+      "cells": 3070,
+      "applicable": 2246,
+      "selectable": 1757,
+      "population": 3010,
+      "population_candidate_selected": 1757,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 766
+      "population_candidate_disabled": 778
     },
     "by_backend": {
       "dbt": {
-        "cells": 611,
+        "cells": 614,
         "applicable": 559,
         "selectable": 554,
-        "population": 599,
+        "population": 602,
         "population_candidate_selected": 554,
         "population_candidate_not_selected": 2,
-        "population_candidate_disabled": 43
+        "population_candidate_disabled": 46
       },
       "in-guest-trap": {
-        "cells": 611,
+        "cells": 614,
         "applicable": 314,
         "selectable": 314,
-        "population": 599,
+        "population": 602,
         "population_candidate_selected": 314,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 285
+        "population_candidate_disabled": 288
       },
       "kvm": {
-        "cells": 611,
-        "applicable": 578,
-        "selectable": 571,
-        "population": 599,
-        "population_candidate_selected": 571,
+        "cells": 614,
+        "applicable": 581,
+        "selectable": 574,
+        "population": 602,
+        "population_candidate_selected": 574,
         "population_candidate_not_selected": 3,
         "population_candidate_disabled": 25
       },
       "liteinst": {
-        "cells": 611,
+        "cells": 614,
         "applicable": 315,
         "selectable": 315,
-        "population": 599,
+        "population": 602,
         "population_candidate_selected": 315,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 284
+        "population_candidate_disabled": 287
       },
       "sabre": {
-        "cells": 611,
+        "cells": 614,
         "applicable": 477,
         "selectable": 0,
-        "population": 599,
+        "population": 602,
         "population_candidate_selected": 0,
         "population_candidate_not_selected": 470,
-        "population_candidate_disabled": 129
+        "population_candidate_disabled": 132
       }
     }
   },
@@ -70,6 +70,11 @@
     {"test_id":"applications/c-toolchain-workflow","backend":"kvm","category":"applications","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"applications/c-toolchain-workflow","backend":"liteinst","category":"applications","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst multi-exec toolchain qualification must ratchet after the ptrace reference path"},
     {"test_id":"applications/c-toolchain-workflow","backend":"sabre","category":"applications","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe multi-exec toolchain qualification must ratchet after the ptrace reference path"},
+    {"test_id":"applications/cc-compile-and-run","backend":"dbt","category":"applications","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Not measured; the shared-file vfork slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1108)"},
+    {"test_id":"applications/cc-compile-and-run","backend":"in-guest-trap","category":"applications","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"applications/cc-compile-and-run","backend":"kvm","category":"applications","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"applications/cc-compile-and-run","backend":"liteinst","category":"applications","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst multi-exec toolchain qualification must ratchet after the ptrace reference path"},
+    {"test_id":"applications/cc-compile-and-run","backend":"sabre","category":"applications","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe multi-exec toolchain qualification must ratchet after the ptrace reference path"},
     {"test_id":"applications/example-timed-progress-bar","backend":"dbt","category":"applications","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"applications/example-timed-progress-bar","backend":"in-guest-trap","category":"applications","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"applications/example-timed-progress-bar","backend":"kvm","category":"applications","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -1215,6 +1220,11 @@
     {"test_id":"c-programs/setitimer-determinism","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/setitimer-determinism","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/setitimer-determinism","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"c-programs/shared-file-vfork","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Not measured; the shared-file vfork slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1108)"},
+    {"test_id":"c-programs/shared-file-vfork","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest's vfork and posix_spawn children exec it again"},
+    {"test_id":"c-programs/shared-file-vfork","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/shared-file-vfork","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest's vfork and posix_spawn children exec it again"},
+    {"test_id":"c-programs/shared-file-vfork","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Not measured; the shared-file vfork slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1108)"},
     {"test_id":"c-programs/short-io-split-identity","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/short-io-split-identity","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/short-io-split-identity","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -1560,6 +1570,11 @@
     {"test_id":"c-programs/vectored-io","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/vectored-io","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/vectored-io","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"c-programs/vfork-shares-memory","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Not measured; the vfork write-back slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1087)"},
+    {"test_id":"c-programs/vfork-shares-memory","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest's vfork, clone, clone3 and posix_spawn children exec it again"},
+    {"test_id":"c-programs/vfork-shares-memory","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/vfork-shares-memory","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest's vfork, clone, clone3 and posix_spawn children exec it again"},
+    {"test_id":"c-programs/vfork-shares-memory","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Not measured; the vfork write-back slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1087)"},
     {"test_id":"c-programs/vforkexec","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/vforkexec","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."},
     {"test_id":"c-programs/vforkexec","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

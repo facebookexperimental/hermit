@@ -3221,20 +3221,21 @@ fi
 # build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
 # This pin changes no tool selection or native recipe; limits retained.
 # This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 64fa62fccc499112457dd3a096447f35454a14f9: native recipe input objects equal 78e3cadac76b5cc3b937f46d63d2e1d73e9973f6.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 7cd9c9529f275ee91f1738e13fadaf04755d7f6a: native recipe input objects equal 64fa62fccc499112457dd3a096447f35454a14f9.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 47828ea062ed8e35b9555c509d4a376fbdcea35d: native recipe input objects equal 7cd9c9529f275ee91f1738e13fadaf04755d7f6a.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 47828ea062ed8e35b9555c509d4a376fbdcea35d ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 47828ea062ed8e35b9555c509d4a376fbdcea35d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# VF1 CARRY TO 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 (2026-10-31): native recipe input objects equal 47828ea062ed8e35b9555c509d4a376fbdcea35d. Interval: six commits, KVM vfork children and write-back, in reverie-kvm, reverie-kvm-core and reverie-linuxemu only; no DBT path touched.
+# Interval: the kvm lane's vfork-style children while the address space holds
+# shared-file views (071fa36a), sparse private copies for snapshots of such an
+# address space (877808ed), a test that a vfork child with shared-file views
+# shares the THP-disable flag (b2b5dbb9), and a vfork child's changes to
+# private memory returned to its parent, which waits in its call, with the
+# mapping changes a copy cannot carry back refused by name (0e2e1106), in
+# reverie, reverie-kvm, reverie-kvm-core and reverie-linuxemu. The reverie-dbt
+# tree, the root Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

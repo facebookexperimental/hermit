@@ -9394,6 +9394,75 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/shared-file-vfork
+    description: A process that holds MAP_SHARED file views creates vfork and posix_spawn children that exec, exit, fail to exec, take signals and vfork again, for tests/c/shared_file_vfork.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/shared_file_vfork.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Not measured; the shared-file vfork slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1108)
+          sabre: Not measured; the shared-file vfork slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1108)
+          liteinst: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest's vfork and posix_spawn children exec it again"
+          in-guest-trap: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest's vfork and posix_spawn children exec it again"
+        expected_stdout:
+          ptrace: "shared-file vfork exec=ok exit=ok failed-exec=ok signals=child killed=ok nested=ok spawn=ok views=ok\n"
+          kvm: "shared-file vfork exec=ok exit=ok failed-exec=ok signals=child killed=ok nested=ok spawn=ok views=ok\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: this guest asserts strict verification and native-equal output; it asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts strict verification and native-equal output; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification cell and has not been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification cell
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/sigmask-preemption
     description: Strict verification for tests/c/sigmask_preemption.c
     lane: portable
@@ -12144,6 +12213,75 @@ test:
           in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/vfork-shares-memory
+    description: vfork, clone and clone3 children with CLONE_VM|CLONE_VFORK, and posix_spawn children, store into their parent's memory before they exec, fail to exec, exit or die by a signal, with and without a shared file view, and the parent sees every store when its call returns, for tests/c/vfork_shares_memory.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/vfork_shares_memory.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Not measured; the vfork write-back slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1087)
+          sabre: Not measured; the vfork write-back slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1087)
+          liteinst: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest's vfork, clone, clone3 and posix_spawn children exec it again"
+          in-guest-trap: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest's vfork, clone, clone3 and posix_spawn children exec it again"
+        expected_stdout:
+          ptrace: "vfork exec no-view: stored=91 read=file failed=0 exit 0\nvfork failed-exec no-view: stored=92 read=file failed=2 exit 0\nvfork exit no-view: stored=93 read=file failed=0 exit 0\nvfork signal no-view: stored=94 read=file failed=0 signal 15\nclone exec no-view: stored=95 read=file failed=0 exit 0\nclone failed-exec no-view: stored=96 read=file failed=2 exit 0\nclone exit no-view: stored=97 read=file failed=0 exit 0\nclone signal no-view: stored=98 read=file failed=0 signal 15\nclone3 exec no-view: stored=99 read=file failed=0 exit 0\nclone3 failed-exec no-view: stored=100 read=file failed=2 exit 0\nclone3 exit no-view: stored=101 read=file failed=0 exit 0\nclone3 signal no-view: stored=102 read=file failed=0 signal 15\nposix_spawn missing no-view: ENOENT\nposix_spawn helper no-view: exit 0\nblocking: child read \"written by another process\" (27 bytes), child ok, writer ok\nthreads: child ok, page[0]=0x91 page[64]=0x55\nvfork exec view: stored=91 read=file failed=0 exit 0\nvfork failed-exec view: stored=92 read=file failed=2 exit 0\nvfork exit view: stored=93 read=file failed=0 exit 0\nvfork signal view: stored=94 read=file failed=0 signal 15\nclone exec view: stored=95 read=file failed=0 exit 0\nclone failed-exec view: stored=96 read=file failed=2 exit 0\nclone exit view: stored=97 read=file failed=0 exit 0\nclone signal view: stored=98 read=file failed=0 signal 15\nclone3 exec view: stored=99 read=file failed=0 exit 0\nclone3 failed-exec view: stored=100 read=file failed=2 exit 0\nclone3 exit view: stored=101 read=file failed=0 exit 0\nclone3 signal view: stored=102 read=file failed=0 signal 15\nposix_spawn missing view: ENOENT\nposix_spawn helper view: exit 0\n"
+          kvm: "vfork exec no-view: stored=91 read=file failed=0 exit 0\nvfork failed-exec no-view: stored=92 read=file failed=2 exit 0\nvfork exit no-view: stored=93 read=file failed=0 exit 0\nvfork signal no-view: stored=94 read=file failed=0 signal 15\nclone exec no-view: stored=95 read=file failed=0 exit 0\nclone failed-exec no-view: stored=96 read=file failed=2 exit 0\nclone exit no-view: stored=97 read=file failed=0 exit 0\nclone signal no-view: stored=98 read=file failed=0 signal 15\nclone3 exec no-view: stored=99 read=file failed=0 exit 0\nclone3 failed-exec no-view: stored=100 read=file failed=2 exit 0\nclone3 exit no-view: stored=101 read=file failed=0 exit 0\nclone3 signal no-view: stored=102 read=file failed=0 signal 15\nposix_spawn missing no-view: ENOENT\nposix_spawn helper no-view: exit 0\nblocking: child read \"written by another process\" (27 bytes), child ok, writer ok\nthreads: child ok, page[0]=0x91 page[64]=0x55\nvfork exec view: stored=91 read=file failed=0 exit 0\nvfork failed-exec view: stored=92 read=file failed=2 exit 0\nvfork exit view: stored=93 read=file failed=0 exit 0\nvfork signal view: stored=94 read=file failed=0 signal 15\nclone exec view: stored=95 read=file failed=0 exit 0\nclone failed-exec view: stored=96 read=file failed=2 exit 0\nclone exit view: stored=97 read=file failed=0 exit 0\nclone signal view: stored=98 read=file failed=0 signal 15\nclone3 exec view: stored=99 read=file failed=0 exit 0\nclone3 failed-exec view: stored=100 read=file failed=2 exit 0\nclone3 exit view: stored=101 read=file failed=0 exit 0\nclone3 signal view: stored=102 read=file failed=0 signal 15\nposix_spawn missing view: ENOENT\nposix_spawn helper view: exit 0\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: this guest asserts strict verification and native-equal output; it asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts strict verification and native-equal output; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification cell and has not been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification cell
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this C guest.'
         backends_enabled: []
         backends_disabled:
           ptrace: No custom edge-case arguments have been calibrated for this C guest

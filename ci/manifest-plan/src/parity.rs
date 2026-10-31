@@ -6289,7 +6289,14 @@ mod tests {
         // it faults after a failed protection-key allocation, and at a guard
         // page, https://github.com/rrnewton/hermit/issues/4793) add one row
         // per candidate backend each: 3055.
-        assert_eq!(parsed.cells.len(), 3055);
+        // c-programs/shared-file-vfork and applications/cc-compile-and-run
+        // (vfork and posix_spawn children of a process that holds a shared
+        // file view, https://github.com/rrnewton/reverie/issues/1108) add one
+        // row each per candidate backend: 3065. c-programs/vfork-shares-memory
+        // (a vfork child's stores are its parent's when the parent's call
+        // returns, https://github.com/rrnewton/reverie/issues/1087) adds one
+        // row per candidate backend: 3070.
+        assert_eq!(parsed.cells.len(), 3070);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448

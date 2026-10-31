@@ -944,6 +944,20 @@
         {
           "lane": "portable",
           "category": "applications",
+          "test": "applications/cc-compile-and-run",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/cc-compile-and-run",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
           "test": "applications/example-timed-progress-bar",
           "mode": "replay",
           "backend": "ptrace"
@@ -9540,6 +9554,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/shared-file-vfork",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/shared-file-vfork",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/short-io-split-identity",
           "mode": "replay",
           "backend": "ptrace"
@@ -11998,6 +12026,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/vectored-io",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -33426,6 +33468,13 @@
         {
           "lane": "portable",
           "category": "applications",
+          "test": "applications/cc-compile-and-run",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
           "test": "applications/example-timed-progress-bar",
           "mode": "verify",
           "backend": "ptrace"
@@ -34994,6 +35043,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/shared-file-vfork",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/short-io-split-identity",
           "mode": "verify",
           "backend": "ptrace"
@@ -35471,6 +35527,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/vectored-io",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -38699,6 +38762,13 @@
           "lane": "portable",
           "category": "applications",
           "test": "applications/c-toolchain-workflow",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/cc-compile-and-run",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -43262,6 +43332,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/shared-file-vfork",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/short-io-split-identity",
           "mode": "replay",
           "backend": "ptrace"
@@ -44593,6 +44670,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/vectored-io",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -59536,6 +59620,20 @@
         {
           "lane": "portable",
           "category": "applications",
+          "test": "applications/cc-compile-and-run",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
+          "test": "applications/cc-compile-and-run",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "applications",
           "test": "applications/example-timed-progress-bar",
           "mode": "replay",
           "backend": "ptrace"
@@ -68079,6 +68177,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/shared-file-vfork",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/shared-file-vfork",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/short-io-split-identity",
           "mode": "replay",
           "backend": "ptrace"
@@ -70537,6 +70649,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/vectored-io",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vfork-shares-memory",
           "mode": "verify",
           "backend": "ptrace"
         },

@@ -2624,6 +2624,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/shared_file_vfork.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
+      "why": "tests/c/shared_file_vfork.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: a process that holds MAP_SHARED views of an ordinary file must be able to create vfork and posix_spawn children that exec, exit, fail to exec, handle a signal and vfork again, with every store through a view reaching the parent and the parent's views showing exactly the file's bytes afterwards, as the gcc driver does after glibc maps its iconv module cache (https://github.com/rrnewton/reverie/issues/1108)"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/shm_coherency_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
       "why": "tests/c/shm_coherency_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: forks a writer and samples MAP_SHARED anonymous, MAP_SHARED file-backed and memfd mappings without any added barrier, printing the observed words and the branch taken including whether a partial update was caught, plus MAP_PRIVATE COW isolation and msync writeback, so verify's double run asserts that what each process OBSERVES is reproducible"
@@ -3409,6 +3415,12 @@
       "why": "tests/c/vfork_parent_killed.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_killed_vfork_parent_does_not_stop_the_schedule compiles this guest, in which a vfork child sends SIGKILL to its parent and exits while the grandparent waits, and requires the run to finish with exit 0 and print 'A killed by signal 9' (https://github.com/rrnewton/hermit/issues/3984); it remains a guest fixture because a generic manifest cannot bound the run with a deadline and assert this exact output for a scheduler-liveness regression."
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/vfork_shares_memory.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
+      "why": "tests/c/vfork_shares_memory.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: a vfork-style child (vfork, clone or clone3 with CLONE_VM|CLONE_VFORK, posix_spawn) shares its parent's memory until it execs or exits, so its stores, and the errno glibc's posix_spawn child writes after a failed exec, must be the parent's when the parent's call returns, after an exec, a failed exec, an exit or a death by a signal, with and without a shared file view (https://github.com/rrnewton/reverie/issues/1087)"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/virtual_cpus.c",
       "runner": "hermit-cli/tests/cli.rs",
@@ -3635,6 +3647,12 @@
       "path": "tests/e2e/applications/c-toolchain-workflow.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/applications/c-toolchain-workflow.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/applications/cc-compile-and-run.sh",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
+      "why": "tests/e2e/applications/cc-compile-and-run.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: compiles and links the benchmark suite's cc_run program with cc in a UTF-8 locale, where the gcc driver starts its children under glibc's shared view of its iconv module cache if the C library ships one, and runs it as a posix_spawn child of a process that holds a read-only MAP_SHARED view of the source (https://github.com/rrnewton/reverie/issues/1108)"
     },
     {
       "disposition": "manifest-test",

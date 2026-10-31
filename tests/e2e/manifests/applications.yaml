@@ -360,6 +360,75 @@ test:
           sabre: No edge-case Hermit arguments are required
           liteinst: No edge-case Hermit arguments are required
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: applications/cc-compile-and-run
+    description: Compile and link a small C program with cc and run it as a posix_spawn child of a process that holds a read-only MAP_SHARED view of its source; the benchmark suite's cc_run scenario
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/e2e/applications/cc-compile-and-run.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: this cell asserts strict verification and a fixed output; it asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: The fixed source, compiler flags and locale make the compile-and-run transaction deterministic by construction
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: Not measured; the shared-file vfork slice qualified ptrace and KVM (https://github.com/rrnewton/reverie/issues/1108)
+          sabre: SaBRe multi-exec toolchain qualification must ratchet after the ptrace reference path
+          liteinst: LiteInst multi-exec toolchain qualification must ratchet after the ptrace reference path
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+        expected_stdout:
+          ptrace: "14999995\n"
+          kvm: "14999995\n"
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification cell and has not been run for it.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification cell
+          dbt: Record/replay is unsupported by DBI
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the compile-and-run transaction is serial, so there is no schedule-diversity oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The build graph is intentionally serial
+          dbt: Chaos scheduling is unsupported by DBI
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: applications/git-repository-workflow
     description: Create two Git commits, verify the repository, and archive the resulting tree
     lane: portable
