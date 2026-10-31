@@ -348,6 +348,51 @@ fn record_replay_locks_a_file_created_on_a_guest_private_tmpfs() {
     );
 }
 
+/// Issue 5007 mode (b): the guest creates a file itself, then opens the
+/// *existing* file by a relative path (no `O_CREAT`) and flocks the
+/// descriptor — the JVM lock-file pattern. Replay must materialize or
+/// register that recorded flock target; it must not panic with "cannot
+/// replay flock side effects for descriptor N outside the replay root".
+#[test]
+fn record_replay_flocks_a_self_created_file_opened_by_relative_path() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mountpoint = tempfile::tempdir().expect("failed to create guest workdir");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!("--workdir={}", mountpoint.path().display()))
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf x > 9 && exec 9<>9 && flock -n 9 && echo locked && rm 9",
+        ]);
+    let output = command_output(
+        command,
+        "record/replay of flock on a self-created relative-path file",
+    );
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined_output.contains("cannot replay flock side effects"),
+        "replay panicked on the recorded flock target:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("locked\n"),
+        "the guest did not take its lock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
 /// Records `script` with standard output `record_stdout`, then lets `prepare`
 /// reset host state and replays the recording with `--autopilot` and standard
 /// output `replay_stdout`, returning the replay's output.

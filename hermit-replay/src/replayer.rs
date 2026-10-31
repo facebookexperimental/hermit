@@ -1690,7 +1690,20 @@ impl Replayer {
             Ok(resolved) => match metadata(&resolved.object) {
                 Ok(found) if flags.contains(OFlag::O_TMPFILE) => found.is_dir(),
                 Ok(found) if found.file_type().is_file() => {
-                    materialized_file_is_registered(pid, &found)
+                    // A regular file already beneath the replay root is a
+                    // real lockable object whether or not an earlier replay
+                    // step registered it. Registration can lag the guest's
+                    // own creation of the file (its creating open may have
+                    // been served virtually), and requiring it here made a
+                    // later flock on the descriptor panic (issue 5007).
+                    // Register it now and materialize the open for real.
+                    if !materialized_file_is_registered(pid, &found)
+                        && let Ok(root_identity) = replay_root_identity(pid)
+                        && let Ok(object) = duplicate_controller_fd(resolved.object.as_raw_fd())
+                    {
+                        let _ = register_materialized(root_identity, object);
+                    }
+                    true
                 }
                 _ => false,
             },
@@ -2270,9 +2283,10 @@ impl Replayer {
     /// Only a descriptor that materialized in the replay root is a real kernel
     /// descriptor; the others are eventfd placeholders standing in for opens that
     /// replay serves from the log (see `handle_virtual_fd_create`). Locking a
-    /// placeholder would lock the wrong object, while replaying only the return
-    /// value would falsely claim the lock exists. Replay therefore fails closed
-    /// for such a descriptor rather than silently dropping the side effect.
+    /// placeholder would lock the wrong object. A real file the guest created
+    /// itself is registered on demand here (and at its open), so the lock is
+    /// really taken; only a placeholder with no lockable object falls back to
+    /// the recorded result, and never a panic (issue 5007).
     ///
     /// Unlike `handle_replayed_side_effect`, this re-issues the call even when
     /// the recording FAILED, and that is the load-bearing part. A recorded
@@ -2299,14 +2313,24 @@ impl Replayer {
         guest: &mut G,
         syscall: Flock,
     ) -> Result<i64, Errno> {
-        assert!(
-            self.fd_is_in_replay_root(guest.pid(), syscall.fd()),
-            "cannot replay flock side effects for descriptor {} outside the replay root; \
-             returning the recorded result would falsely claim a lock was acquired",
-            syscall.fd()
-        );
-        let call = Syscall::from(syscall);
+        // Never panic on an unregistered descriptor (issue 5007): a file the
+        // guest created itself can reach flock before replay registered it.
+        // Register it now; only a descriptor with no real file in the replay
+        // (an eventfd placeholder for a virtually served open) falls back to
+        // the recorded result, since there is no lockable object a contender
+        // could observe inside the replay root.
+        if !self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
+            remember_materialized_file(guest.pid(), syscall.fd());
+        }
         let recorded = next_event!(guest, Return);
+        if !self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
+            tracing::debug!(
+                fd = syscall.fd(),
+                "flock on an unmaterialized replay descriptor; returning the recorded result"
+            );
+            return recorded;
+        }
+        let call = Syscall::from(syscall);
         let actual = guest.inject_with_retry(call).await;
         assert_eq!(
             actual, recorded,
