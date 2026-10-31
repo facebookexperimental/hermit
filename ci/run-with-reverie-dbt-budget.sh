@@ -3161,7 +3161,7 @@ fi
 # build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
 # This pin changes no tool selection or native recipe; limits retained.
 # This is budget carry, not a native cache HIT or a fresh timing sample.
-# CARRY TO 0e2e1106cd0a279d5ce1772adb1ceaec9c4e8e1b (2026-10-31): from 78e3cadac76b5cc3b937f46d63d2e1d73e9973f6.
+# CARRY TO 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 (2026-10-31): from 78e3cadac76b5cc3b937f46d63d2e1d73e9973f6.
 # Interval: the kvm lane's vfork-style children while the address space holds
 # shared-file views (071fa36a), sparse private copies for snapshots of such an
 # address space (877808ed), a test that a vfork child with shared-file views
@@ -3174,7 +3174,7 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-# VF1 CARRY TO 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 (2026-10-31): native recipe input objects equal 47828ea062ed8e35b9555c509d4a376fbdcea35d. Interval: six commits, KVM vfork children and write-back, in reverie-kvm, reverie-kvm-core and reverie-linuxemu only; no DBT path touched.
+# CARRY TO 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 (2026-10-31): from 1e16daf7bb2cd250537b20c56c3d985b24e68cd0.
 # Interval: a vfork parent's wait that ends when its thread group exits or an
 # exec or a peer's failure cancels the waiting thread, Linux's mm_release
 # clear_child_tid store and wake at a vfork child's window end, mapping
@@ -3182,6 +3182,18 @@ fi
 # named refusal of thread creation in a vfork child (bc51aede), in reverie-kvm,
 # reverie-kvm-core and reverie-linuxemu. The reverie-dbt tree, the root
 # Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+# CARRY TO 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 (2026-10-31): from 1e16daf7bb2cd250537b20c56c3d985b24e68cd0.
+# Interval: a vfork child's mm_release() decided and made by the Linux provider
+# (the clear_child_tid store, the write-back, the wake, then the parent's
+# release), nothing written back once the parent's process has committed its
+# exit, a fresh mapping incarnation for the pages a remap grows a mapping by,
+# and the incarnation map shared copy-on-write between copies (0de69a0c), in
+# reverie-kvm, reverie-kvm-core and reverie-linuxemu. The reverie-dbt tree,
+# the root Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged.
 # reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
