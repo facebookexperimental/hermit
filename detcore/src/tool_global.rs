@@ -8231,8 +8231,12 @@ pub enum SignalScope {
 /// `HostFileIdentity::content` (PR #4791; allocated 25, renumbered to 36
 /// on main's 27, then renumbered mechanically to 41 on main's 40). 45 is
 /// #4796's TraceSchedEvent/WithWatchOrder revision, live-computed at its
-/// rebase onto 41 skipping reserved 42 to 44, and is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 45;
+/// rebase onto 41 skipping reserved 42 to 44.
+/// https://github.com/rrnewton/hermit/pull/4769's `PublishInstructionOffset`
+/// pair, appended after the `CpuClockProcess` pair at the tail of each
+/// enum, is revision 46, the next revision after 45, and is the current
+/// revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 46;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

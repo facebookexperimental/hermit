@@ -99,8 +99,11 @@ mod tests {
     /// layout on top of 31's, 40 is the `CpuClockProcess` pair allocated
     /// to https://github.com/rrnewton/hermit/pull/4885, 41 is the
     /// `HostFileIdentity::content` layout of
-    /// https://github.com/rrnewton/hermit/pull/4791, and 45, this
-    /// change's `TraceSchedEvent`/`WithWatchOrder` revision, is current.
+    /// https://github.com/rrnewton/hermit/pull/4791, 45 is
+    /// https://github.com/rrnewton/hermit/pull/4796's
+    /// `TraceSchedEvent`/`WithWatchOrder` revision, and 46, this
+    /// change's (https://github.com/rrnewton/hermit/pull/4769), is the
+    /// current revision.
     /// 42 to 44 are queued or advisory claims at this rebase
     /// (42 on drain/4759, 43 for PR 4627, 44 for kvm-2b-3 in the
     /// allocation table). Remove an entry when its change lands, with
@@ -296,6 +299,17 @@ mod tests {
         // its rebase onto main's 41, skipping reserved 42 to 44; digest
         // measured at the sealed head.
         (45, "5e346726bb0f7c7d", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::PublishInstructionOffset` and
+        // `GlobalResponse::PublishInstructionOffset`, appended after the
+        // `CpuClockProcess` pair at the tail of each enum
+        // (https://github.com/rrnewton/hermit/pull/4769; 26 above
+        // https://github.com/rrnewton/hermit/pull/4728's 25 on its own
+        // base, renumbered to 46 at this rebase: the next revision after
+        // main's landed 45 (https://github.com/rrnewton/hermit/pull/4796's
+        // `TraceSchedEvent`/`WithWatchOrder` revision), skipping only
+        // the reserved 33 to 39 and 42 to 44; digests measured at this
+        // head).
+        (46, "0dbbe4f192bc0983", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
