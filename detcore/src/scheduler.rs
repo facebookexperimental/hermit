@@ -10908,10 +10908,11 @@ impl Scheduler {
     /// `VforkFailed` instead of the parent's continuation and has no child.
     ///
     /// The child of a successful clone may register before or after the parent posts its
-    /// continuation (Reverie's backend contract, "When a `vfork` child registers": on ptrace the
-    /// kernel keeps the parent inside the injected `clone(2)` until the child execs or exits, so
-    /// the child has registered first; KVM starts the child only after the parent's call has
-    /// returned). So an unfulfilled barrier (`None`) at the parent's continuation means the child
+    /// continuation (Reverie's backend contract, "When a `vfork` child registers"). On ptrace the
+    /// kernel keeps the parent inside the injected `clone(2)` until the child execs or exits, and
+    /// reverie-kvm now keeps it there the same way, so on both the child has registered first;
+    /// the contract still allows a backend that starts the child only after the parent's call has
+    /// returned. So an unfulfilled barrier (`None`) at the parent's continuation means the child
     /// is still on its way, and the barrier is kept until the child registers. A barrier
     /// ends without a registered child only at `VforkFailed`, at the parent's exit, or at
     /// the continuation once the child was torn down before registering

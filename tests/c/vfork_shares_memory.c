@@ -29,18 +29,49 @@
  *   the child exits and then sees what the child read;
  * - "threads": the parent has another live thread; the child and that thread
  *   store different bytes of the same page during the window, ordered by two
- *   pipes, and the parent sees both stores;
+ *   pipes, and the parent sees both stores. Run alone in a lazily bound
+ *   build, the child and the thread each resolve read or write through the
+ *   dynamic loader during the window, and both change its relocation counter,
+ *   which KVM refuses by name as a conflict; the full run resolves both
+ *   before ("blocking" does), and so do the modes below that need it;
  * - "conflict": as "threads", but the thread stores to the byte the child
  *   stored, after the child: Linux keeps the thread's value;
  * - "map-change CALL": a vfork child of a process that holds no shared view
  *   changes a mapping with CALL (mmap, munmap, mprotect, mremap or brk) and
  *   exits, where on Linux the change is its parent's too; or, with CALL
  *   "scratch", maps a page, stores into it, makes it read-only and writable
- *   again and unmaps it, leaving its parent's mappings as they were.
+ *   again and unmaps it, leaving its parent's mappings as they were; or, with
+ *   CALL "remap", unmaps a page of the parent's and maps a new one there with
+ *   the same protection, where on Linux the parent then has the new page;
+ * - "parent-remap": the parent has another live thread; the child stores into
+ *   a page of an anonymous mapping, and the thread then maps a new anonymous
+ *   page over it with MAP_FIXED, during the window: on Linux the child's store
+ *   went with the old page, and the parent sees zero;
+ * - "clear-tid ENDING": a vfork child registers a parent word holding 91 as
+ *   its clear_child_tid (set_tid_address) and ends its window by ENDING (exec,
+ *   failed-exec, exit, signal, or segv, a store to an unmapped address that
+ *   kills it with SIGSEGV): Linux's mm_release() clears the word before
+ *   the parent's call returns, since the parent shares the mm; a failed exec
+ *   keeps the registration, and the child's exit clears it. With ENDING
+ *   "exit-wake", another thread of the parent waits on the word (FUTEX_WAIT
+ *   for 91, for at most 5 s) while the child exits after a pause: Linux wakes
+ *   it, or it finds the word already 0;
+ * - "thread-in-child": a vfork child creates a thread, waits for it to exit
+ *   and exits;
+ * - "leader-exec": a second thread of the process vforks a child that blocks
+ *   in its window, and the main thread execs this program meanwhile: on
+ *   Linux the exec kills the waiting thread (its wait is killable), the
+ *   child runs on as the process's child, and the new image releases it and
+ *   reaps it; the child's store went to the old image;
+ * - "parent-dies": the main thread vforks a child that blocks reading a pipe
+ *   only the parent's process can write, and another thread exits the
+ *   process with status 3 during the window: on Linux the waiting thread
+ *   dies, the process exits 3, and the child reads end of file.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -342,6 +373,10 @@ static int map_change(const char *call) {
       failed = mprotect(page, 4096, PROT_READ) != 0;
     } else if (strcmp(call, "mremap") == 0) {
       failed = mremap(page, 4096, 8192, MREMAP_MAYMOVE) == MAP_FAILED;
+    } else if (strcmp(call, "remap") == 0) {
+      failed = munmap(page, 4096) != 0 ||
+               mmap(page, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                    -1, 0) != page;
     } else if (strcmp(call, "scratch") == 0) {
       unsigned char *scratch =
           mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -363,9 +398,289 @@ static int map_change(const char *call) {
   return 0;
 }
 
+/* Resolves, in a lazily bound build, every function the modes below call
+ * during a window, so that no window resolves a symbol through the dynamic
+ * loader there (see "threads" above). */
+static void resolve_before_window(void) {
+  int fds[2];
+  char byte = 0;
+  REQUIRE(pipe(fds) == 0, "pipe resolve");
+  REQUIRE(write(fds[1], &byte, 1) == 1 && read(fds[0], &byte, 1) == 1, "resolve");
+  REQUIRE(close(fds[0]) == 0 && close(fds[1]) == 0, "close resolve");
+  struct timespec none = {0, 0};
+  nanosleep(&none, NULL);
+  void *page = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  REQUIRE(page != MAP_FAILED && munmap(page, 4096) == 0, "mmap resolve");
+  REQUIRE(syscall(SYS_getpid) > 0, "syscall resolve");
+}
+
+static volatile unsigned char *remap_page;
+
+static void *remap_thread(void *unused) {
+  (void)unused;
+  char byte;
+  if (read(to_thread[0], &byte, 1) != 1) {
+    return (void *)1;
+  }
+  if (mmap((void *)remap_page, 4096, PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != (void *)remap_page) {
+    return (void *)2;
+  }
+  if (write(to_child[1], "k", 1) != 1) {
+    return (void *)3;
+  }
+  return NULL;
+}
+
+/* The parent's other thread replaces the mapping of a page the child stored
+ * into, during the window. */
+static int parent_remap(void) {
+  resolve_before_window();
+  remap_page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  REQUIRE(remap_page != MAP_FAILED, "mmap remap page");
+  REQUIRE(pipe(to_thread) == 0 && pipe(to_child) == 0, "pipes");
+  pthread_t thread;
+  REQUIRE(pthread_create(&thread, NULL, remap_thread, NULL) == 0, "pthread_create");
+  pid_t child = vfork();
+  REQUIRE(child >= 0, "vfork parent-remap");
+  if (child == 0) {
+    remap_page[100] = 0x91;
+    char byte;
+    if (write(to_thread[1], "c", 1) != 1 || read(to_child[0], &byte, 1) != 1) {
+      _exit(1);
+    }
+    _exit(0);
+  }
+  unsigned seen = remap_page[100];
+  int status = wait_for(child);
+  void *result;
+  REQUIRE(pthread_join(thread, &result) == 0 && result == NULL, "pthread_join");
+  printf("parent-remap: child %s, page[100]=%#x\n",
+         WIFEXITED(status) && WEXITSTATUS(status) == 0 ? "ok" : "failed", seen);
+  return 0;
+}
+
+static volatile int tid_word;
+static volatile int after_failed_exec;
+/* An unmapped address the "segv" ending stores to. */
+static volatile uintptr_t fault_address = 8;
+static volatile int waiter_errno;
+
+/* Waits on tid_word while it holds 91, for at most 5 s, once it has told the
+ * child it is about to. */
+static void *tid_waiter(void *unused) {
+  (void)unused;
+  if (write(to_child[1], "w", 1) != 1) {
+    return (void *)1;
+  }
+  struct timespec timeout = {5, 0};
+  long rc = syscall(SYS_futex, &tid_word, FUTEX_WAIT, 91, &timeout, NULL, 0);
+  waiter_errno = rc == 0 ? 0 : errno;
+  return NULL;
+}
+
+/* A vfork child registers tid_word as its clear_child_tid and ends its window
+ * by `ending`. */
+static int clear_tid(const char *ending, char *program) {
+  tid_word = 91;
+  after_failed_exec = 0;
+  int waiting = strcmp(ending, "exit-wake") == 0;
+  pthread_t thread;
+  if (waiting) {
+    resolve_before_window();
+    REQUIRE(pipe(to_child) == 0, "pipe");
+    REQUIRE(pthread_create(&thread, NULL, tid_waiter, NULL) == 0, "pthread_create");
+  }
+  pid_t child = vfork();
+  REQUIRE(child >= 0, "vfork clear-tid");
+  if (child == 0) {
+    syscall(SYS_set_tid_address, &tid_word);
+    if (strcmp(ending, "exec") == 0) {
+      char *child_argv[] = {program, "helper", NULL};
+      execve(program, child_argv, environ);
+      _exit(127);
+    }
+    if (strcmp(ending, "failed-exec") == 0) {
+      char *missing_argv[] = {"missing", NULL};
+      execve("/nonexistent/vfork-shares-memory-helper", missing_argv, environ);
+      after_failed_exec = tid_word;
+      _exit(0);
+    }
+    if (strcmp(ending, "signal") == 0) {
+      raw_kill(syscall(SYS_getpid), SIGTERM);
+      _exit(11);
+    }
+    if (strcmp(ending, "segv") == 0) {
+      /* Through a volatile, so that gcc's -Warray-bounds does not reject a
+       * store to a constant null-page address (Reverie's fixture, built
+       * without -Werror, stores to address 8 directly). */
+      *(volatile int *)fault_address = 1;
+      _exit(12);
+    }
+    if (waiting) {
+      char byte;
+      struct timespec pause = {0, 50 * 1000 * 1000};
+      if (read(to_child[0], &byte, 1) != 1) {
+        _exit(20);
+      }
+      nanosleep(&pause, NULL);
+    }
+    _exit(0);
+  }
+  int seen = tid_word;
+  int status = wait_for(child);
+  char described[32];
+  describe_status(status, described, sizeof(described));
+  if (waiting) {
+    void *result;
+    REQUIRE(pthread_join(thread, &result) == 0 && result == NULL, "pthread_join");
+    printf("clear-tid %s: word=%d waiter %s %s\n", ending, seen,
+           waiter_errno == 0 || waiter_errno == EAGAIN ? "woken" : strerror(waiter_errno),
+           described);
+    return 0;
+  }
+  printf("clear-tid %s: word=%d after-failed-exec=%d %s\n", ending, seen, after_failed_exec,
+         described);
+  return 0;
+}
+
+static char thread_stack[64 * 1024] __attribute__((aligned(16)));
+static volatile int thread_ran;
+static volatile pid_t thread_tid;
+
+static int thread_body(void *unused) {
+  (void)unused;
+  thread_ran = 1;
+  return 0;
+}
+
+/* A vfork child creates a thread, waits for it to exit, and exits. */
+static int thread_in_child(void) {
+  pid_t child = vfork();
+  REQUIRE(child >= 0, "vfork thread-in-child");
+  if (child == 0) {
+    pid_t parent_tid = 0;
+    long tid = clone(thread_body, thread_stack + sizeof(thread_stack),
+                     CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+                         CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID,
+                     NULL, &parent_tid, NULL, &thread_tid);
+    if (tid < 0) {
+      _exit(20);
+    }
+    thread_tid = (pid_t)tid;
+    while (thread_tid != 0) {
+      syscall(SYS_futex, &thread_tid, FUTEX_WAIT, (int)tid, NULL, NULL, 0);
+    }
+    _exit(thread_ran ? 0 : 21);
+  }
+  int status = wait_for(child);
+  char described[32];
+  describe_status(status, described, sizeof(described));
+  printf("thread-in-child: %s\n", described);
+  return 0;
+}
+
+static int ready_pipe[2];
+static int release_pipe[2];
+
+static void *vfork_worker(void *unused) {
+  (void)unused;
+  pid_t child = vfork();
+  if (child == 0) {
+    stored = 99;
+    pid_t self = (pid_t)syscall(SYS_getpid);
+    char byte;
+    if (write(ready_pipe[1], &self, sizeof(self)) != (ssize_t)sizeof(self) ||
+        read(release_pipe[0], &byte, 1) != 1) {
+      _exit(20);
+    }
+    _exit(7);
+  }
+  /* Not reached on Linux: the main thread's exec kills this thread first. */
+  return (void *)(intptr_t)child;
+}
+
+/* A second thread vforks a child that blocks in its window, and the main
+ * thread execs this program meanwhile. */
+static int leader_exec(char *program) {
+  resolve_before_window();
+  REQUIRE(pipe(ready_pipe) == 0 && pipe(release_pipe) == 0, "pipes");
+  pthread_t thread;
+  REQUIRE(pthread_create(&thread, NULL, vfork_worker, NULL) == 0, "pthread_create");
+  pid_t child;
+  REQUIRE(read(ready_pipe[0], &child, sizeof(child)) == (ssize_t)sizeof(child), "read child");
+  char child_arg[16];
+  char fd_arg[16];
+  snprintf(child_arg, sizeof(child_arg), "%d", (int)child);
+  snprintf(fd_arg, sizeof(fd_arg), "%d", release_pipe[1]);
+  char *exec_argv[] = {program, "leader-exec-image", child_arg, fd_arg, NULL};
+  execve(program, exec_argv, environ);
+  REQUIRE(0, "execve");
+  return 1;
+}
+
+/* The image the main thread exec'd: releases the child and reaps it. */
+static int leader_exec_image(const char *child_arg, const char *fd_arg) {
+  pid_t child = (pid_t)atoi(child_arg);
+  int seen = stored;
+  REQUIRE(write(atoi(fd_arg), "r", 1) == 1, "release child");
+  int status = wait_for(child);
+  char described[32];
+  describe_status(status, described, sizeof(described));
+  printf("leader-exec: stored=%d after=%d child %s\n", seen, stored, described);
+  return 0;
+}
+
+static int dies_pipe[2];
+
+static void *exit_process(void *unused) {
+  (void)unused;
+  struct timespec pause = {0, 50 * 1000 * 1000};
+  nanosleep(&pause, NULL);
+  _exit(3);
+}
+
+/* Another thread exits the process while the main thread waits in vfork for
+ * a child that blocks until the process's end closes a pipe. */
+static int parent_dies(void) {
+  resolve_before_window();
+  REQUIRE(pipe(dies_pipe) == 0, "pipe");
+  pthread_t thread;
+  REQUIRE(pthread_create(&thread, NULL, exit_process, NULL) == 0, "pthread_create");
+  pid_t child = vfork();
+  REQUIRE(child >= 0, "vfork parent-dies");
+  if (child == 0) {
+    char byte;
+    /* The child's own file table holds a copy of the write end. */
+    close(dies_pipe[1]);
+    _exit(read(dies_pipe[0], &byte, 1) == 0 ? 0 : 1);
+  }
+  /* Not reached on Linux: the other thread ends the process first. */
+  printf("parent returned from vfork\n");
+  return 4;
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "helper") == 0) {
     return 0;
+  }
+  if (argc == 4 && strcmp(argv[1], "leader-exec-image") == 0) {
+    return leader_exec_image(argv[2], argv[3]);
+  }
+  if (argc == 2 && strcmp(argv[1], "leader-exec") == 0) {
+    return leader_exec(argv[0]);
+  }
+  if (argc == 2 && strcmp(argv[1], "parent-dies") == 0) {
+    return parent_dies();
+  }
+  if (argc == 2 && strcmp(argv[1], "parent-remap") == 0) {
+    return parent_remap();
+  }
+  if (argc == 3 && strcmp(argv[1], "clear-tid") == 0) {
+    return clear_tid(argv[2], argv[0]);
+  }
+  if (argc == 2 && strcmp(argv[1], "thread-in-child") == 0) {
+    return thread_in_child();
   }
   if (argc == 3 && strcmp(argv[1], "map-change") == 0) {
     return map_change(argv[2]);
@@ -392,7 +707,9 @@ int main(int argc, char **argv) {
   /* Before the process maps a view: once it has unmapped one, KVM keeps the
    * pages that held it as separately backed pages, and every later fork or
    * vfork copy of this process copies its whole arena, which would spend
-   * this program's CPU budget there rather than on what it tests. */
+   * this program's CPU budget there rather than on what it tests. "threads"
+   * relies on the cases before it having resolved read and write (see its
+   * description above). */
   blocking();
   threads(0);
   void *view = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);

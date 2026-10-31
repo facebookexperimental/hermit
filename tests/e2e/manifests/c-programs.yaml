@@ -12327,6 +12327,9 @@ test:
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."
           in-guest-trap: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."
+        expected_stdout:
+          ptrace: "refused vfork: -1 Invalid argument\nchild pid: 5\nparent pid: 3\n"
+          kvm: "refused vfork: -1 Invalid argument\nchild pid: 5\nparent pid: 3\n"
       naked:
         ci: false
         backends_enabled: []
