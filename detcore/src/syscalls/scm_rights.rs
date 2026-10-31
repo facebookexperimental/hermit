@@ -1557,6 +1557,43 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.receipt_mode(guest) == ReceiptMode::Discovered
     }
 
+    /// Whether a receive marks the inotify instances it delivers on a backend
+    /// that discovers them (`mark_discovered_inotify_receipts`), so it must
+    /// know what it delivered (`ThreadState::receive_geometry`).
+    pub(crate) fn marks_discovered_inotify_receipts<G: Guest<Self>>(&self, guest: &G) -> bool {
+        self.discovers_received_descriptors(guest)
+            && self.cfg.use_nonblocking_sockets()
+            && !self.cfg.recordreplay_modes
+    }
+
+    /// Where the tool discovers received descriptors (DBT, whose Tool shares
+    /// the guest's descriptor table), the receiver's description is made from
+    /// the host's status flags (`ThreadState::with_detfd`), and an inotify
+    /// instance's host O_NONBLOCK may be the one Detcore set when its sender
+    /// made it (`Detcore::handle_inotify_init1`) rather than the sender's own.
+    /// So each inotify instance a receive delivered (`delivered`) whose host
+    /// description is nonblocking has a guest blocking mode that is unknown
+    /// until the guest sets it (`DetFd::blocking_mode_unknown`), as an
+    /// unmatched receipt's is where receipts are recorded: an `F_GETFL` of
+    /// it, and a read of it that finds nothing queued, are refused by name
+    /// rather than answered with a mode that may be wrong (a blocking read
+    /// answered with EAGAIN, which Linux never gives it).
+    fn mark_discovered_inotify_receipts<G: Guest<Self>>(&self, guest: &G, delivered: &Delivered) {
+        if !self.marks_discovered_inotify_receipts(guest) {
+            return;
+        }
+        for &fd in &delivered.fds {
+            // A number another thread has closed meanwhile is not discovered.
+            let _ = guest.thread_state().with_detfd(fd, |detfd| {
+                if detfd.ty() == crate::fd::FdType::Inotify
+                    && detfd.status_flags() & libc::O_NONBLOCK != 0
+                {
+                    detfd.mark_blocking_mode_unknown();
+                }
+            });
+        }
+    }
+
     /// Record in this thread's descriptor table each descriptor a receive
     /// from `from` installed (`delivered`), where this run records received
     /// descriptors and the receive completed in the caller's turn (`in_turn`,
@@ -1572,7 +1609,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// an inotify instance, and each descriptor whose facts cannot be taken.
     /// Without sequentialized threads none is recorded, logged at debug level
     /// only (a warning per call, or per tool process, would differ between
-    /// runs that share a process). `cloexec` is whether the receive asked for
+    /// runs that share a process). Where the tool discovers them, none is
+    /// recorded either, and the inotify instances among them are marked
+    /// (`Self::mark_discovered_inotify_receipts`). `cloexec` is whether the receive asked for
     /// its descriptors close-on-exec (`MSG_CMSG_CLOEXEC`), which a descriptor
     /// listed without its facts keeps. A tool error, after which record and
     /// replay could no longer follow each other, ends the run.
@@ -1586,7 +1625,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         from: ReceivedFrom,
     ) -> Result<Vec<RawFd>, Error> {
         match self.receipt_mode(guest) {
-            ReceiptMode::Discovered => return Ok(Vec::new()),
+            ReceiptMode::Discovered => {
+                self.mark_discovered_inotify_receipts(guest, delivered);
+                return Ok(Vec::new());
+            }
             ReceiptMode::Unrecorded(why) => {
                 if !delivered.fds.is_empty() || delivered.refused.is_some() {
                     // A listing of this table cannot come from the model now

@@ -42850,6 +42850,63 @@ fn run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name() {
     );
 }
 
+/// The DBT twin of the two receipts of
+/// [`a_read_of_an_unmatched_received_inotify_instance_is_refused_by_name`]
+/// and of the matched one that ptrace and KVM serve
+/// (tests/c/inotify_blocking_read.c's `received` and `received-unmatched`;
+/// natively each read waits for the event the main thread makes). DBT's Tool
+/// shares the guest's descriptor table, so Detcore records no receipt there:
+/// it discovers the received instance from the host's status flags, where
+/// the O_NONBLOCK may be the one Detcore set when the sender made it. Both
+/// receipts are refused by name, through DBT's fail-closed exit (status 101
+/// with the "unsupported syscall" report, as every Detcore refusal on DBT
+/// ends), rather than answered with a nonblocking mode and an EAGAIN that
+/// Linux never gives their blocking reads.
+#[test]
+fn run_dbt_received_inotify_instances_are_refused_by_name() {
+    if dbt_unavailable("run_dbt_received_inotify_instances_are_refused_by_name") {
+        return;
+    }
+    let guest = inotify_blocking_read_guest().to_str().unwrap().to_owned();
+    // `received` asks F_GETFL first; `received-unmatched` reads at once.
+    for (case, syscall, reason) in [
+        (
+            "received",
+            "fcntl",
+            "Detcore refuses fcntl(F_GETFL): Detcore cannot tell the blocking mode of inotify \
+             descriptor",
+        ),
+        (
+            "received-unmatched",
+            "read",
+            "Detcore refuses read: Detcore cannot tell whether this read of inotify descriptor",
+        ),
+    ] {
+        let args = [
+            "--backend=dbt",
+            "run",
+            "--strict",
+            "--",
+            guest.as_str(),
+            case,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(output.status.code(), Some(101), "{args:?}: {log}");
+        assert!(log.contains(reason), "{case}: {log}");
+        assert!(
+            log.contains("received over SCM_RIGHTS without the open file description its sender"),
+            "{case}: {log}"
+        );
+        assert!(
+            log.contains(&format!("detcore-dbt: unsupported syscall: {syscall}")),
+            "{case}: {log}"
+        );
+        let out = stdout(&output);
+        assert!(!out.contains("EAGAIN"), "{case}: {out}");
+    }
+}
+
 /// The KVM twin of
 /// [`a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux`]: a
 /// signal sent to a guest blocked in a polled `read`, `write` or `waitpid`

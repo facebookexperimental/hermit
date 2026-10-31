@@ -5185,7 +5185,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Recvmsg,
     ) -> Result<i64, Error> {
         let discovered = self.discovers_received_descriptors(guest);
-        let wanted = !discovered || self.cfg.virtualize_time;
+        // Where the tool discovers received descriptors, what a receive
+        // delivered is needed for the locks of every descriptor delivered
+        // (with virtual time), and to mark the inotify instances among them
+        // (`Detcore::marks_discovered_inotify_receipts`).
+        let wanted = !discovered
+            || self.cfg.virtualize_time
+            || self.marks_discovered_inotify_receipts(guest);
         let in_turn = self.completes_in_turn(guest, call);
         Self::begin_receive_geometry(guest, wanted, &Syscall::Recvmsg(call));
         let result = self.receive_one_message(guest, call).await;
@@ -5614,7 +5620,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Recvmmsg,
     ) -> Result<i64, Error> {
-        let wanted = !self.discovers_received_descriptors(guest);
+        // Where the tool discovers received descriptors, what a receive
+        // delivered is needed only to mark the inotify instances among them
+        // (`Detcore::marks_discovered_inotify_receipts`).
+        let wanted = !self.discovers_received_descriptors(guest)
+            || self.marks_discovered_inotify_receipts(guest);
         let in_turn = self.completes_in_turn(guest, call);
         Self::begin_receive_geometry(guest, wanted, &Syscall::Recvmmsg(call));
         let result = self.receive_message_batch(guest, call).await;

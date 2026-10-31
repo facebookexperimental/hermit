@@ -46,7 +46,9 @@
 //! is blocking can only come from outside the run, and a blocking read of it,
 //! which would wait in the host, is refused by name before it runs. One whose
 //! host description is nonblocking, received without the open file
-//! description its sender modelled (an unmatched receipt), may carry
+//! description its sender modelled (an unmatched receipt, or any receipt on a
+//! backend that discovers received descriptors from the host's flags,
+//! `Detcore::mark_discovered_inotify_receipts`), may carry
 //! Detcore's own O_NONBLOCK rather than the sender's, so its blocking mode is
 //! unknown until the guest sets it (`DetFd::blocking_mode_unknown`): an
 //! `F_GETFL` of it, and a read of it that finds nothing queued, are refused

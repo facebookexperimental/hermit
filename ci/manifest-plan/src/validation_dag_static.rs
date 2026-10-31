@@ -4569,7 +4569,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // its tight loop): 764 + 12 = 776.
     // a_read_of_an_unmatched_received_inotify_instance_is_refused_by_name
     // (https://github.com/rrnewton/hermit/issues/4768): 776 + 1 = 777.
-    ("test.cli", 777),
+    // run_dbt_received_inotify_instances_are_refused_by_name (the same
+    // issue, DBT's receipts): 777 + 1 = 778.
+    ("test.cli", 778),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5186,7 +5188,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same recount at bc48233db5 as test.cli: 682 + 1 = 683.
     // The same twelve N3 cli cases: 683 + 12 = 695.
     // The same unmatched-received-inotify case: 695 + 1 = 696.
-    ("test.cli_on_host", 696),
+    // The same DBT received-inotify case: 696 + 1 = 697.
+    ("test.cli_on_host", 697),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
