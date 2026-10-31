@@ -33268,7 +33268,7 @@
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_KNOWN_GAP_LEDGER": "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "22",
+        "NEXTEST_EXPECTED_EXECUTED": "37",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-execution-tests\",\"--test\",\"deadline_slice_cap\"]"
       },
       "networkonly": false,

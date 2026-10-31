@@ -4768,7 +4768,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4929's first slice on top. ci/kvm-gap-ledger.rs runs all 42 and refuses a
     // population that does not leave exactly this many required. Deleting a
     // row (a gap that now passes) or adding a test raises it.
-    ("privileged-test.deadline_slice_cap_kvm", 22),
+    ("privileged-test.deadline_slice_cap_kvm", 37),
     // The same three https://github.com/rrnewton/hermit/issues/3260 tests as
     // test.cli; all 99 prior identities retained. The same
     // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli

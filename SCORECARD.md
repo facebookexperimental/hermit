@@ -80,34 +80,19 @@ These rows are part of the selected regression denominator even though they are 
 
 ## Known gaps of validation nodes, outside every count above
 
-Each row below is a test that a validation node runs and expects to FAIL on its backend: a known gap, listed with its tracking issue in the node's known-gap ledger. These **20** rows are not manifest cells, so they are in none of the counts or percentages above. Each one counts as a failing test, never as a pass and never as not applicable. The node records it as `diagnostic_fail` when it fails the way its row says, and fails outright when it passes (promote it to required) or fails some other way. In a signature, `\n` is a newline and `<N>` any run of digits. The same rows, with their tracking URLs, are in `ci/compat-envelope/known-gaps.json`.
+Each row below is a test that a validation node runs and expects to FAIL on its backend: a known gap, listed with its tracking issue in the node's known-gap ledger. These **5** rows are not manifest cells, so they are in none of the counts or percentages above. Each one counts as a failing test, never as a pass and never as not applicable. The node records it as `diagnostic_fail` when it fails the way its row says, and fails outright when it passes (promote it to required) or fails some other way. In a signature, `\n` is a newline and `<N>` any run of digits. The same rows, with their tracking URLs, are in `ci/compat-envelope/known-gaps.json`.
 
 ### `privileged-test.deadline_slice_cap_kvm` (`--backend=kvm`)
 
-**22** required tests must pass; **20** known gaps, from `hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv`:
+**37** required tests must pass; **5** known gaps, from `hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv`:
 
 | Test | Gap | Tracking issue | Must fail with | Status |
 | --- | --- | --- | --- | --- |
-| `a_spinner_without_syscalls_keeps_its_maximum_slice` | T2 | https://github.com/rrnewton/hermit/issues/4954 | a stop by its CPU budget | failing (known gap) |
-| `a_timed_waiter_keeps_the_stops_an_untimed_waiter_does_not` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
 | `itimer_a_private_descriptor_table_consumer_re_arms` | D | https://github.com/rrnewton/hermit/issues/4929 | output showing `"privfd" "5000"\nstatus: exit status: 2\nstdout:\n\nstderr:\n\nnote: run with` | failing (known gap) |
-| `itimer_a_recorded_schedule_replays` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
 | `itimer_a_sigsuspend_loop_takes_every_expiry` | C | https://github.com/rrnewton/hermit/issues/4929 | output showing `failed: deliveries=` | failing (known gap) |
 | `itimer_an_ignored_expiry_stops_the_timer_until_a_dequeue` | E | https://github.com/rrnewton/hermit/issues/4929 | output showing `failed: ignored_remaining_us=` | failing (known gap) |
-| `itimer_coalescing_schedules_verify_bitwise` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
-| `itimer_coalescing_verifies_under_chaos` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
-| `itimer_coalescing_verifies_under_the_random_heuristic` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
-| `itimer_expiries_recur_once_per_slice_end` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
 | `itimer_generation_discard_follows_the_wait_mask` | E+F' | https://github.com/rrnewton/hermit/issues/4929 | output showing `failed: poll: result=0 first_us=` | failing (known gap) |
 | `itimer_mixed_masks_keep_the_timer_running` | G | https://github.com/rrnewton/hermit/issues/4929 | output showing `\npositive=<N> samples=20 progress=<N>\n\nnote: run with` | failing (known gap) |
-| `itimer_two_cpu_bound_threads_finish_in_their_work_time` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
-| `itimer_waiting_schedules_verify_bitwise` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
-| `skipped_slice_ends_come_before_a_cpuid` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
-| `skipped_slice_ends_come_before_a_signal` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
-| `skipped_slice_ends_come_before_a_trapped_instruction` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
-| `skipped_slice_ends_survive_exec` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
-| `skipped_slice_ends_survive_the_backstop` | T2+oracle | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
-| `slice_ends_taken_without_a_stop_leave_the_run_unchanged` | T2 | https://github.com/rrnewton/hermit/issues/4954 | output showing `unsupported_preemption: --backend=kvm refuses --max-timeslice` | failing (known gap) |
 
 ## Run history
 
