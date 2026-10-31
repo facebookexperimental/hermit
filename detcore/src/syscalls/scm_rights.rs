@@ -2815,6 +2815,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.mark_record_sequence_unknown();
             })?;
         }
+        // An inotify instance whose host description is nonblocking, in a run
+        // where Detcore makes every inotify instance it creates physically
+        // nonblocking (`Detcore::handle_inotify_init1`): received without the
+        // open file description its sender modelled, its O_NONBLOCK may be
+        // Detcore's own rather than the sender's, so the guest's blocking mode
+        // is unknown until the guest sets it (`DetFd::blocking_mode_unknown`).
+        if link.as_deref() == Some(crate::syscalls::inotify::INOTIFY_LINK)
+            && facts.status_flags & libc::O_NONBLOCK != 0
+            && self.cfg.use_nonblocking_sockets()
+            && !self.cfg.recordreplay_modes
+        {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.mark_blocking_mode_unknown())?;
+        }
         // A placeholder descriptor, which its identity and its tag tell apart
         // (`descriptor_directory`).
         self.recognize_received_placeholder(guest, fd, stat, facts.status_flags)

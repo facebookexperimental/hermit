@@ -3207,6 +3207,58 @@ where
     )
 }
 
+/// Whether the signal that woke a part of a call that made progress
+/// (`ThreadState::call_progress`), on a backend whose turn does not decide
+/// interruption, would be delivered to the caller now, by its own mask and
+/// dispositions (`own_disposition_interrupts`): a blocked or ignored signal
+/// leaves the part waiting, as it leaves Linux's read waiting.
+async fn progress_signal_interrupts<T, G>(
+    guest: &mut G,
+    status: ResumeStatus,
+) -> Result<bool, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut stack = guest.stack().await;
+    let mask_addr = stack.reserve::<KernelSigset>();
+    let action_addr = stack.reserve::<KernelSigaction>();
+    let _guard = stack.commit()?;
+    own_disposition_interrupts(guest, status, mask_addr, action_addr).await
+}
+
+/// The errno a polled call that would still wait returns when a signal ends
+/// the wait: the call's restart code (`NonblockableSyscall::signal_interrupt_errno`),
+/// except for a read of an inotify instance that is nonblocking for the
+/// guest by now, which another thread's F_SETFL or FIONBIO made it while the
+/// read waited. `inotify_read` tests the file's current O_NONBLOCK before it
+/// looks for a pending signal, so Linux returns EAGAIN there
+/// (<https://github.com/torvalds/linux/blob/v6.17/fs/notify/inotify/inotify_user.c#L249-L299>).
+/// A mode change alone ends no wait: Linux's reader sleeps on until an event
+/// or a signal wakes it, and this applies only at such a wake.
+fn interrupted_wait_errno<T, G, C>(guest: &G, call: C) -> Errno
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+    C: NonblockableSyscall + Into<Syscall>,
+{
+    let interrupt = call.signal_interrupt_errno();
+    let Some(fd) = get_fd(call.into()) else {
+        return interrupt;
+    };
+    let nonblocking_inotify = guest
+        .thread_state()
+        .with_detfd(fd, |detfd| {
+            detfd.ty() == FdType::Inotify && detfd.is_nonblocking()
+        })
+        .unwrap_or(false);
+    if nonblocking_inotify {
+        Errno::EAGAIN
+    } else {
+        interrupt
+    }
+}
+
 // Private helper.
 async fn retry_nonblocking_syscall_helper<T, G, C>(
     guest: &mut G,
@@ -3264,6 +3316,19 @@ where
     let checks_at_turn = !gated
         && rsrc.signal_interrupt_errno() == Some(Errno::ERESTARTSYS.into_raw())
         && decides_interruption_at_turn(guest, rsrc.signal_state_task);
+    // A part of a call that transferred bytes in an earlier part (a readv
+    // reading on into a later iovec, `Detcore::readv_inotify`): Linux's
+    // per-iovec loop returns those bytes once the next iovec's read ends
+    // early, so any wake that would deliver a signal ends this part, a named
+    // wake as well as a copy still pending (`TurnSignals::ends`), while a
+    // blocked or ignored signal leaves it waiting. Where the turn does not
+    // decide (a backend whose guest threads are not host tasks), the woken
+    // part decides from the guest's own mask and dispositions, as a parked
+    // pipe write does (`execute_blocking_pipe_write`): the restart errno would
+    // end the call with a short count, which the backend's restart of a call
+    // with no progress cannot undo.
+    let progress = guest.thread_state().call_progress;
+    let decides_progress_itself = progress && !checks_at_turn && !gated;
     // Where the turn decides, each probe owns the guest's mask while it blocks
     // every blockable signal (`KernelSignalWait::block_in_place`). The mask
     // goes back before a retry yields, so target selection still sees which
@@ -3348,11 +3413,24 @@ where
         // first. The probe below goes through the record/replay path like
         // every attempt (Codex review of
         // https://github.com/rrnewton/hermit/pull/4198).
-        // This call transfers nothing until it completes, so only a copy still
-        // pending ends it (`TurnSignals::ends`).
+        // A call that has transferred nothing ends only for a copy still
+        // pending; a part after progress ends for a named wake too
+        // (`TurnSignals::ends`, `progress` above).
         let signaled = match turn {
-            Some(turn) => turn.ends(false),
-            None => !gated && matches!(resumed, ResumeStatus::Signaled(_)),
+            Some(turn) => turn.ends(progress),
+            None if gated => false,
+            // Continuation parts are scalar reads, whose nonblocking form
+            // holds no scratch stack (`network_comm_syscall`).
+            None if decides_progress_itself
+                && maybe_stackguard.is_none()
+                && matches!(resumed, ResumeStatus::Signaled(_)) =>
+            {
+                match progress_signal_interrupts(guest, resumed.clone()).await {
+                    Ok(interrupts) => interrupts,
+                    Err(error) => break Err(error),
+                }
+            }
+            None => matches!(resumed, ResumeStatus::Signaled(_)),
         };
         // A pending real-time timer expiration in the set this wait takes
         // (https://github.com/rrnewton/hermit/issues/4089).
@@ -3486,7 +3564,7 @@ where
             break result;
         }
         if signaled && call.syscall_would_have_blocked(syscall_result) {
-            let errno = call.signal_interrupt_errno();
+            let errno = interrupted_wait_errno(guest, call);
             tracing::trace!(
                 "retry_nonblocking_syscall: interrupted by signal while {} would block: {:?}",
                 call.display(&guest.memory()),
@@ -3499,7 +3577,7 @@ where
         // before it parked or one whose commit woke it.
         if gated && call.syscall_would_have_blocked(syscall_result) {
             match gated_wait_ends(guest, None) {
-                Ok(true) => break Err(call.signal_interrupt_errno().into()),
+                Ok(true) => break Err(interrupted_wait_errno(guest, call).into()),
                 Ok(false) => {}
                 Err(error) => break Err(error),
             }
@@ -7911,6 +7989,65 @@ pub(crate) mod kernel_signal_wait_failures {
     /// Reuse the local-memory guest for descriptor guards that need no injections.
     pub(crate) fn fd_test_guest() -> impl Guest<Detcore> {
         WaitGuest::live(0).0
+    }
+
+    /// A signal that ends a polled read that would still wait returns the
+    /// read's restart errno, except for an inotify read whose descriptor is
+    /// nonblocking for the guest by then, as another thread's F_SETFL or
+    /// FIONBIO makes it during the wait: `inotify_read` tests O_NONBLOCK
+    /// before a pending signal, so Linux returns EAGAIN. A pipe read keeps
+    /// the restart errno, as `pipe_read`'s interrupted wait returns
+    /// -ERESTARTSYS itself.
+    #[test]
+    fn a_signal_ends_an_inotify_read_made_nonblocking_meanwhile_with_eagain() {
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+
+        let (guest, _) = WaitGuest::live(guest_mask());
+        // SAFETY: inotify_init1 returns a new owned descriptor.
+        let inotify = unsafe {
+            std::fs::File::from_raw_fd(libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC))
+        };
+        let (pipe, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (inotify, pipe) = (inotify.as_raw_fd(), pipe.as_raw_fd());
+        guest
+            .thread
+            .add_fd(inotify, nix::fcntl::OFlag::O_RDONLY, FdType::Inotify, None)
+            .unwrap();
+        guest
+            .thread
+            .add_fd(pipe, nix::fcntl::OFlag::O_RDONLY, FdType::Pipe, None)
+            .unwrap();
+        for fd in [inotify, pipe] {
+            guest
+                .thread
+                .with_detfd(fd, |d| d.set_physically_nonblocking())
+                .unwrap();
+        }
+        let read = |fd| syscalls::Read::new().with_fd(fd);
+        assert_eq!(
+            interrupted_wait_errno(&guest, read(inotify)),
+            Errno::ERESTARTSYS
+        );
+        assert_eq!(
+            interrupted_wait_errno(&guest, read(pipe)),
+            Errno::ERESTARTSYS
+        );
+        for fd in [inotify, pipe] {
+            guest
+                .thread
+                .with_detfd(fd, |d| d.set_logical_nonblocking(true))
+                .unwrap();
+        }
+        assert_eq!(interrupted_wait_errno(&guest, read(inotify)), Errno::EAGAIN);
+        assert_eq!(
+            interrupted_wait_errno(&guest, syscalls::Readv::new().with_fd(inotify)),
+            Errno::EAGAIN
+        );
+        assert_eq!(
+            interrupted_wait_errno(&guest, read(pipe)),
+            Errno::ERESTARTSYS
+        );
     }
 
     #[test]

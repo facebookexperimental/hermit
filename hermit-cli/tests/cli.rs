@@ -236,6 +236,7 @@ static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCESS_SIGNAL_RECEIVER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REALTIME_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIPE_READ_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static INOTIFY_BLOCKING_READ_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VDSO_SYMBOL_VERSIONS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGEV_THREAD_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1536,6 +1537,32 @@ fn pipe_read_signal_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "pipe-read-signal guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn inotify_blocking_read_guest() -> &'static Path {
+    INOTIFY_BLOCKING_READ_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("inotify-blocking-read");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create inotify-blocking-read guest directory");
+        let guest = build_root.join("inotify_blocking_read");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/inotify_blocking_read.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile inotify-blocking-read guest");
+        assert!(
+            output.status.success(),
+            "inotify-blocking-read guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -42538,6 +42565,240 @@ fn assert_bitwise_parity(path: &str, case: &str) {
         compared["left"].as_u64().is_some_and(|left| left > 0)
             && compared["left"] == compared["right"],
         "{case}: {report}"
+    );
+}
+
+/// Serves, on the abstract unix socket `name`, one inotify instance that is
+/// blocking on the host and watches `dir` for IN_CREATE, to the first client:
+/// an instance from outside the run, as the received-outside case of
+/// tests/c/inotify_blocking_read.c expects. The returned closure, called once
+/// the run is over, releases a server that no client reached and waits for it.
+fn serve_outside_inotify_instance(name: &str, dir: &Path) -> impl FnOnce() {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+    use std::os::linux::net::SocketAddrExt as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::net::SocketAddr;
+    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::UnixStream;
+
+    let address = SocketAddr::from_abstract_name(name.as_bytes()).expect("abstract socket address");
+    let listener = UnixListener::bind_addr(&address).expect("this test serves the abstract name");
+    let watched =
+        std::ffi::CString::new(dir.as_os_str().as_bytes()).expect("a directory path without NUL");
+    let server = thread::spawn(move || {
+        let (connection, _) = listener.accept().expect("accept a connection");
+        // SAFETY: inotify_init1 returns a new descriptor or -1.
+        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        assert!(
+            raw >= 0,
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: inotify_init1 just returned this descriptor, which nothing else owns.
+        let instance = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: `watched` is NUL-terminated and `instance` is a live inotify descriptor.
+        let watch = unsafe {
+            libc::inotify_add_watch(instance.as_raw_fd(), watched.as_ptr(), libc::IN_CREATE)
+        };
+        assert!(
+            watch >= 0,
+            "inotify_add_watch: {}",
+            std::io::Error::last_os_error()
+        );
+        let fds = [instance.as_raw_fd()];
+        // A client that is not the guest (the release below) may be gone.
+        let _ = nix::sys::socket::sendmsg::<()>(
+            connection.as_raw_fd(),
+            &[std::io::IoSlice::new(b"x")],
+            &[nix::sys::socket::ControlMessage::ScmRights(&fds)],
+            nix::sys::socket::MsgFlags::empty(),
+            None,
+        );
+    });
+    move || {
+        // A run that ended before its guest connected leaves the server in accept.
+        if !server.is_finished() {
+            let _ = UnixStream::connect_addr(&address);
+        }
+        server.join().expect("the server thread");
+    }
+}
+
+/// The two kinds of inotify instance a guest can receive whose blocking read
+/// Detcore cannot let wait, each refused by name rather than answered with a
+/// result Linux could not give (tests/c/inotify_blocking_read.c; natively each
+/// read waits for the event the main thread makes):
+/// - received-unmatched: a blocking instance received over a datagram socket
+///   sent to a name, which Detcore cannot match to the open file description
+///   its sender modelled. It may carry Detcore's own O_NONBLOCK, so its
+///   blocking mode is unknown, and a read of it that finds nothing queued is
+///   refused rather than answered EAGAIN or made to wait on a guess.
+/// - received-outside: an instance from outside the run, blocking on the
+///   host, served by this test over an abstract unix socket (so the run uses
+///   --network=host, which --strict refuses). Its read would wait in the host,
+///   where nothing orders the wait, so it is refused before it runs.
+#[test]
+fn a_read_of_an_unmatched_received_inotify_instance_is_refused_by_name() {
+    let guest = inotify_blocking_read_guest().to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--",
+        guest.as_str(),
+        "received-unmatched",
+    ];
+    let output = hermit(&args);
+    let unmatched = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {unmatched}"
+    );
+    assert!(
+        unmatched
+            .contains("Detcore refuses read: Detcore cannot tell whether this read of inotify"),
+        "{unmatched}"
+    );
+    assert!(
+        unmatched.contains("received over SCM_RIGHTS without the open file description its sender"),
+        "{unmatched}"
+    );
+
+    let dir = process_build_root("inotify-outside").join("watched");
+    fs::create_dir_all(&dir).expect("failed to create the watched directory");
+    let name = format!("hermit-cli-inotify-outside-{}", std::process::id());
+    let release = serve_outside_inotify_instance(&name, &dir);
+    let args = [
+        "run",
+        "--network=host",
+        "--",
+        guest.as_str(),
+        "received-outside",
+        name.as_str(),
+        dir.to_str().unwrap(),
+    ];
+    let output = hermit(&args);
+    release();
+    let outside = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {outside}"
+    );
+    assert!(
+        outside.contains("Detcore refuses read: Detcore cannot let this read of inotify"),
+        "{outside}"
+    );
+    assert!(
+        outside.contains("its host description is blocking, so the instance came from outside"),
+        "{outside}"
+    );
+}
+
+/// The KVM twin of
+/// [`a_read_of_an_unmatched_received_inotify_instance_is_refused_by_name`]
+/// (both of its cases), and the two refusals only KVM meets, each by name
+/// rather than with a result Linux could not give
+/// (tests/c/inotify_blocking_read.c's cases): a
+/// zero-count read of an inotify instance, which KVM's executor refuses
+/// because it cannot show that the host read returns at once; and, without
+/// sequentialized threads, a blocking read that finds nothing queued, which
+/// the executor answers with EAGAIN, an answer Linux never gives a blocking
+/// read, so Detcore refuses it.
+#[test]
+fn run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let guest = inotify_blocking_read_guest().to_str().unwrap().to_owned();
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--",
+        guest.as_str(),
+        "received-unmatched",
+    ];
+    let output = hermit(&args);
+    let unmatched = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {unmatched}"
+    );
+    assert!(
+        unmatched.contains("received over SCM_RIGHTS without the open file description its sender"),
+        "{unmatched}"
+    );
+
+    let dir = process_build_root("inotify-outside-kvm").join("watched");
+    fs::create_dir_all(&dir).expect("failed to create the watched directory");
+    let name = format!("hermit-cli-inotify-outside-kvm-{}", std::process::id());
+    let release = serve_outside_inotify_instance(&name, &dir);
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--network=host",
+        "--",
+        guest.as_str(),
+        "received-outside",
+        name.as_str(),
+        dir.to_str().unwrap(),
+    ];
+    let output = hermit(&args);
+    release();
+    let outside = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {outside}"
+    );
+    assert!(
+        outside.contains("its host description is blocking, so the instance came from outside"),
+        "{outside}"
+    );
+
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--",
+        guest.as_str(),
+        "zero",
+    ];
+    let output = hermit(&args);
+    let zero = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{args:?}: {zero}"
+    );
+    assert!(
+        zero.contains("unsupported KVM zero-count read on guest fd"),
+        "{zero}"
+    );
+    assert!(zero.contains("the endpoint may wait in the host"), "{zero}");
+
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--no-sequentialize-threads",
+        "--",
+        guest.as_str(),
+        "read",
+    ];
+    let output = hermit(&args);
+    let relaxed = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {relaxed}"
+    );
+    assert!(
+        relaxed.contains("the backend answered a blocking read of inotify descriptor"),
+        "{relaxed}"
     );
 }
 

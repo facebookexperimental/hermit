@@ -954,6 +954,15 @@ struct OpenFileDescription {
     /// path, inside the container or not, may also hold an end of it.
     #[serde(default)]
     named_fifo: bool,
+    /// An inotify instance received over SCM_RIGHTS without the open file
+    /// description its sender modelled (an unmatched receipt), whose host
+    /// description is nonblocking, in a run where Detcore makes every inotify
+    /// instance it creates physically nonblocking: that O_NONBLOCK may be
+    /// Detcore's rather than the sender's, so the guest's blocking mode is
+    /// unknown (`Detcore::record_received_descriptors`). Cleared once the
+    /// guest sets the mode itself (F_SETFL, FIONBIO).
+    #[serde(default)]
+    blocking_mode_unknown: bool,
 
     /// cached statbuf
     ///
@@ -1304,6 +1313,9 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("physically_nonblocking", &self.physically_nonblocking);
         debug.field("fifo_awaiting_guest_peer", &self.fifo_awaiting_guest_peer);
         debug.field("named_fifo", &self.named_fifo);
+        if self.blocking_mode_unknown {
+            debug.field("blocking_mode_unknown", &true);
+        }
         debug.field("stat", &self.stat);
         debug.field("random_device_offset", &self.random_device_offset);
         debug.field("random_device_stream", &self.random_device_stream);
@@ -1698,6 +1710,7 @@ impl DetFd {
                 stdio_alias_group: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
+                blocking_mode_unknown: false,
             }))),
         }
     }
@@ -1835,6 +1848,8 @@ impl DetFd {
                 description.status_flags &= !OFlag::O_NONBLOCK.bits();
             }
             description.physically_nonblocking = enabled;
+            // The guest has now set the mode itself.
+            description.blocking_mode_unknown = false;
         })
     }
 
@@ -1849,6 +1864,8 @@ impl DetFd {
             } else {
                 description.status_flags &= !OFlag::O_NONBLOCK.bits();
             }
+            // The guest has now set the mode itself.
+            description.blocking_mode_unknown = false;
         })
     }
 
@@ -2751,6 +2768,18 @@ impl DetFd {
         self.with_description(|d| d.physically_nonblocking = true);
     }
 
+    /// Whether the guest's blocking mode of this open file description is
+    /// unknown (`OpenFileDescription::blocking_mode_unknown`).
+    pub(crate) fn blocking_mode_unknown(&self) -> bool {
+        self.with_description(|d| d.blocking_mode_unknown)
+    }
+
+    /// Mark the guest's blocking mode of every alias of this open file
+    /// description unknown (`OpenFileDescription::blocking_mode_unknown`).
+    pub(crate) fn mark_blocking_mode_unknown(&self) {
+        self.with_description(|d| d.blocking_mode_unknown = true);
+    }
+
     /// Whether this is a FIFO that may still become an internally polled pipe
     /// (see `OpenFileDescription::fifo_awaiting_guest_peer`).
     pub(crate) fn fifo_awaiting_guest_peer(&self) -> bool {
@@ -2798,6 +2827,8 @@ impl DetFd {
                 .bits();
             description.status_flags = (description.status_flags & !mutable) | (flags & mutable);
             description.physically_nonblocking = oflags_nonblocking(description.status_flags);
+            // The guest has now set the mode itself.
+            description.blocking_mode_unknown = false;
         })
     }
 
@@ -4257,6 +4288,35 @@ mod tests {
         fd.set_nonblocking(false);
         assert!(!fd.is_nonblocking());
         assert!(!fd.physically_nonblocking());
+    }
+
+    /// An inotify instance received without its sender's open file
+    /// description has an unknown blocking mode, shared by every alias, until
+    /// the guest sets the mode: F_SETFL (`set_status_flags`), a FIONBIO that
+    /// Detcore satisfies logically (`set_logical_nonblocking`) or forwards
+    /// (`set_nonblocking`).
+    #[test]
+    fn an_unknown_blocking_mode_is_known_once_the_guest_sets_it() {
+        let owner = DetTid::from_raw(10);
+        let setters: [fn(&DetFd); 3] = [
+            |fd| fd.set_status_flags(0),
+            |fd| fd.set_logical_nonblocking(true),
+            |fd| fd.set_nonblocking(false),
+        ];
+        for (index, set) in setters.into_iter().enumerate() {
+            let fd = DetFd::new(
+                3,
+                OFlag::O_NONBLOCK,
+                FdType::Inotify,
+                OpenFileId::new(owner, index as u64),
+            );
+            let alias = fd.clone().with_fd(4);
+            assert!(!fd.blocking_mode_unknown());
+            fd.mark_blocking_mode_unknown();
+            assert!(alias.blocking_mode_unknown(), "setter {index}: alias");
+            set(&alias);
+            assert!(!fd.blocking_mode_unknown(), "setter {index}");
+        }
     }
 
     #[test]

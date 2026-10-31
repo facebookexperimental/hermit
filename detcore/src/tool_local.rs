@@ -5879,6 +5879,13 @@ pub struct ThreadState<T> {
     /// returns. Never carried across a fork or a migration.
     #[serde(skip)]
     pub(crate) inotify_queue: Option<crate::syscalls::inotify::QueueCount>,
+    /// Whether the call this thread runs in parts has transferred bytes in an
+    /// earlier part (a readv reading on into a later iovec,
+    /// `Detcore::readv_inotify`): a wake that would deliver a signal then ends
+    /// the part with those bytes, and any other wake leaves it waiting
+    /// (`retry_nonblocking_syscall_helper`). Set only around such a part.
+    #[serde(skip)]
+    pub(crate) call_progress: bool,
     /// The syscall in progress, while the run records an access trace: the
     /// descriptors it named and the slot changes it made
     /// (`crate::access_trace`). Never carried across a fork or a migration.
@@ -7128,6 +7135,7 @@ impl<T> ThreadState<T> {
             entry_import: None,
             send_inspection: None,
             inotify_queue: None,
+            call_progress: false,
             traced_call: Default::default(),
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),

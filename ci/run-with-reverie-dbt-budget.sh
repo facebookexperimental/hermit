@@ -3169,7 +3169,15 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=96fe01686ad7ab7a1c3a56cb2dbb79ed9e0173e2
+# CARRY TO d6191234ec270a6270d8b991fc0f0b2f88ef7808 (2026-11-01): from 96fe01686ad7ab7a1c3a56cb2dbb79ed9e0173e2.
+# One LinuxEmu commit on 96fe0168: a read of an inotify instance whose host
+# description is blocking is refused by name; the zero-count read refusal says
+# what it cannot show. reverie-linuxemu and reverie-kvm-core only.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+expected_pin=d6191234ec270a6270d8b991fc0f0b2f88ef7808
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

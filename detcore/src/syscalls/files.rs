@@ -9175,18 +9175,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // A blocking read with nothing queued waits in Detcore's turns,
                 // on the instance `handle_inotify_init1` made physically
                 // nonblocking, as a pipe's or an eventfd's does.
-                crate::syscalls::inotify::begin_count(guest, call.fd(), call).await;
-                let result = self.execute_nonblockable_fd_syscall(guest, call).await;
-                let queued = crate::syscalls::inotify::end_count(guest);
-                crate::syscalls::inotify::finish(
-                    guest,
-                    Sysno::read,
-                    call.fd(),
-                    Some(destination),
-                    queued,
-                    result,
-                )
-                .await
+                self.inotify_read_part(guest, Sysno::read, call.fd(), call, Some(destination))
+                    .await
+                    .0
             }
             FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd | FdType::Epoll => {
                 trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
@@ -12339,14 +12330,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call.cmd() {
             F_GETFL => {
                 let physical_flags = self.record_or_replay(guest, call).await?;
-                let (logical_nonblocking, rendered_nofollow) =
+                let (logical_nonblocking, rendered_nofollow, mode_unknown) =
                     guest.thread_state().with_detfd(fd, |detfd| {
                         (
                             detfd.is_nonblocking(),
                             detfd.procfs_rendered_path().is_some()
                                 && detfd.status_flags() & libc::O_NOFOLLOW != 0,
+                            detfd.blocking_mode_unknown(),
                         )
                     })?;
+                // An inotify instance received without the open file
+                // description its sender modelled may carry Detcore's own
+                // O_NONBLOCK (`DetFd::blocking_mode_unknown`): refused by
+                // name under the fail-closed policy rather than answered
+                // with a mode that may be wrong.
+                if mode_unknown && self.cfg.panic_on_unsupported_syscalls {
+                    let reason = format!(
+                        "Detcore cannot tell the blocking mode of inotify descriptor {fd}: it \
+                         was received over SCM_RIGHTS without the open file description its \
+                         sender modelled, so its O_NONBLOCK may be Detcore's own rather than \
+                         the guest's"
+                    );
+                    tracing::error!("Detcore refuses fcntl(F_GETFL): {reason}");
+                    return self
+                        .refuse_unserviceable_operation_because(
+                            guest,
+                            Sysno::fcntl,
+                            Errno::EINVAL,
+                            &reason,
+                        )
+                        .await;
+                }
                 Ok(guest_status_flags(
                     physical_flags,
                     logical_nonblocking,

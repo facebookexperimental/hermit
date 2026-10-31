@@ -22452,6 +22452,25 @@ exit "$(cat "$PWD/exit-status")"
     fn population_parity_candidates_preserve_identical_guest_arguments() {
         const DELIBERATELY_UNEQUAL: &[(&str, &str, &str)] = &[
             (
+                "c-programs/inotify-blocking-read",
+                "dbt",
+                "`--no-received` skips the received descriptor, which DBT discovers with the \
+                 O_NONBLOCK Detcore set on its sender's description, as it does a received pipe end",
+            ),
+            (
+                "c-programs/inotify-blocking-read",
+                "kvm",
+                "`--no-zero-read` skips the zero-count read, which KVM's executor refuses by name \
+                 because it cannot show that the host read returns at once",
+            ),
+            (
+                "c-programs/inotify-blocking-signal",
+                "kvm",
+                "`--no-process-signal` skips the signal sent to the process, which KVM refuses by \
+                 name for a process of several threads \
+                 (https://github.com/rrnewton/hermit/issues/4034)",
+            ),
+            (
                 "c-programs/madvise-determinism",
                 "kvm",
                 "`--kvm` adds the guest's KVM-only madvise advice checks",

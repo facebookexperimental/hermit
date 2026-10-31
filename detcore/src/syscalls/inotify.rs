@@ -33,10 +33,24 @@
 //! in the reading thread's turn (`IOAction::NonblockizeRetry`,
 //! <https://github.com/rrnewton/hermit/issues/4768>). Under record and replay,
 //! and without sequentialized threads, an instance stays as the guest made it
-//! and a blocking read waits in the kernel outside the turns
-//! (`IOAction::Blocking`), so which events it returns, and so the numbering,
-//! can depend on host timing there. A read that carries no rename (every
-//! cookie zero) is left alone and asks global state nothing.
+//! and a blocking read runs outside the turns (`IOAction::Blocking`): where
+//! the backend waits in the kernel, which events it returns, and so the
+//! numbering, can depend on host timing there; a backend that cannot wait
+//! there answers EAGAIN, which a blocking read never gets on Linux, and such
+//! a read is refused by name ([`Detcore::inotify_read_part`]). A read that
+//! carries no rename (every cookie zero) is left alone and asks global state
+//! nothing.
+//!
+//! A received instance (`crate::syscalls::scm_rights`) is the one exception
+//! to "every instance is physically nonblocking". One whose host description
+//! is blocking can only come from outside the run, and a blocking read of it,
+//! which would wait in the host, is refused by name before it runs. One whose
+//! host description is nonblocking, received without the open file
+//! description its sender modelled (an unmatched receipt), may carry
+//! Detcore's own O_NONBLOCK rather than the sender's, so its blocking mode is
+//! unknown until the guest sets it (`DetFd::blocking_mode_unknown`): an
+//! `F_GETFL` of it, and a read of it that finds nothing queued, are refused
+//! by name rather than answered with a mode that may be wrong.
 //!
 //! A read that faults: `inotify_read` copies whole events in order and
 //! returns -EFAULT when a copy faults, after the earlier events were copied
@@ -202,7 +216,7 @@ impl CookieTable {
 /// length of each of its buffers, in order. Captured before the call: Linux
 /// imports a vectored read's iovecs before it reads, and the events it writes
 /// may overwrite them.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Destination(Vec<(usize, usize)>);
 
 impl Destination {
@@ -278,9 +292,16 @@ impl Destination {
         None
     }
 
-    /// How many buffers there are.
-    fn len(&self) -> usize {
-        self.0.len()
+    /// The buffer at `index`: its address and length.
+    fn at(&self, index: usize) -> (usize, usize) {
+        self.0[index]
+    }
+
+    /// The index of the first nonempty buffer after the one at `index`: the
+    /// iovec Linux's per-iovec loop reads after one it filled
+    /// (`iov_iter_advance` steps over empty iovecs).
+    fn next_nonempty_after(&self, index: usize) -> Option<usize> {
+        (index + 1..self.0.len()).find(|&next| self.0[next].1 > 0)
     }
 
     /// The index of the first nonempty buffer after those that a read which
@@ -872,6 +893,129 @@ fn took_all_and_only(before: Option<usize>, after: Option<usize>, length: usize)
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// One read of the inotify descriptor `fd` into `destination` (`None`:
+    /// iovecs Hermit could not read), as Detcore runs it: `call` is the
+    /// guest's `read`, `readv` or `preadv2` (`sysno`), or one part of a
+    /// `readv` ([`Self::readv_inotify`]). A blocking read with nothing queued
+    /// waits in Detcore's turns, on the instance `handle_inotify_init1` made
+    /// physically nonblocking, as a pipe's or an eventfd's does. The events
+    /// it returns get their cookies ([`finish`]). Returns that result, the
+    /// queue's byte count before the attempt that completed, and whether the
+    /// read waited in Detcore's turns (it is blocking for the guest).
+    ///
+    /// Refused by name, under the fail-closed policy
+    /// (`--panic-on-unsupported-syscalls`), rather than answered with a
+    /// result Linux could not give:
+    /// - before it runs, a blocking read of an instance whose host
+    ///   description is blocking, in a run where Detcore makes every instance
+    ///   it creates physically nonblocking: such an instance came from
+    ///   outside the run, and its read would wait in the host, where nothing
+    ///   orders the wait;
+    /// - once it fails with EAGAIN, which a blocking read never gets on
+    ///   Linux, a read of an instance that is blocking for the guest (the
+    ///   backend could not wait, as KVM's cannot without sequentialized
+    ///   threads), or of one whose blocking mode is unknown
+    ///   (`DetFd::blocking_mode_unknown`). That attempt took no event.
+    pub(crate) async fn inotify_read_part<G, C>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        fd: RawFd,
+        call: C,
+        destination: Option<Destination>,
+    ) -> (Result<i64, Error>, Option<usize>, bool)
+    where
+        G: Guest<Self>,
+        C: SyscallInfo + crate::syscalls::helpers::NonblockableSyscall + Into<Syscall> + Copy,
+    {
+        let (inotify, logically_nonblocking, physically_nonblocking) = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                (
+                    detfd.ty() == crate::fd::FdType::Inotify,
+                    detfd.is_nonblocking(),
+                    detfd.physically_nonblocking(),
+                )
+            })
+            .unwrap_or((false, true, true));
+        if inotify
+            && !logically_nonblocking
+            && !physically_nonblocking
+            && self.cfg.use_nonblocking_sockets()
+            && !self.cfg.recordreplay_modes
+            && self.cfg.panic_on_unsupported_syscalls
+        {
+            let reason = format!(
+                "Detcore cannot let this read of inotify descriptor {fd} wait: its host \
+                 description is blocking, so the instance came from outside the run (received \
+                 or inherited), and its wait would follow host timing"
+            );
+            tracing::error!("Detcore refuses {sysno}: {reason}");
+            let refusal = self
+                .refuse_unserviceable_operation_because(guest, sysno, Errno::EOPNOTSUPP, &reason)
+                .await;
+            return (refusal, None, false);
+        }
+        begin_count(guest, fd, call).await;
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        let (before, waits) = end_count_waiting(guest);
+        let result = match result {
+            Err(Error::Errno(Errno::EAGAIN)) => self.inotify_eagain(guest, sysno, fd).await,
+            result => result,
+        };
+        let result = finish(guest, sysno, fd, destination, before, result).await;
+        (result, before, waits)
+    }
+
+    /// [`Self::inotify_read_part`]'s answer to an attempt of a read of the
+    /// inotify descriptor `fd` that failed with EAGAIN: EAGAIN where the
+    /// guest's mode is nonblocking and known, and otherwise a refusal by name
+    /// under the fail-closed policy (EAGAIN as it is under any other).
+    async fn inotify_eagain<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        fd: RawFd,
+    ) -> Result<i64, Error> {
+        let (inotify, logically_nonblocking, mode_unknown) = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                (
+                    detfd.ty() == crate::fd::FdType::Inotify,
+                    detfd.is_nonblocking(),
+                    detfd.blocking_mode_unknown(),
+                )
+            })
+            .unwrap_or((false, true, false));
+        let reason = if !inotify || !self.cfg.panic_on_unsupported_syscalls {
+            None
+        } else if mode_unknown {
+            Some(format!(
+                "Detcore cannot tell whether this read of inotify descriptor {fd}, which found \
+                 nothing queued, would wait: the instance was received over SCM_RIGHTS without \
+                 the open file description its sender modelled, so its O_NONBLOCK may be \
+                 Detcore's own rather than the guest's"
+            ))
+        } else if !logically_nonblocking {
+            Some(format!(
+                "the backend answered a blocking read of inotify descriptor {fd} with EAGAIN, \
+                 which Linux never returns for one: it reports that the read would block, and \
+                 Detcore does not wait for it here (threads are not sequentialized, or the \
+                 instance's mode changed outside the run)"
+            ))
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => {
+                tracing::error!("Detcore refuses {sysno}: {reason}");
+                self.refuse_unserviceable_operation_because(guest, sysno, Errno::EAGAIN, &reason)
+                    .await
+            }
+            None => Err(Errno::EAGAIN.into()),
+        }
+    }
+
     /// `call`, a `readv` of an inotify instance (or a `preadv2` at the current
     /// offset with no flag but RWF_HIPRI, which Linux serves as one), as Linux
     /// runs it.
@@ -889,53 +1033,94 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// next call fails with EAGAIN and the attempt returns the earlier bytes.
     /// So when the attempt's count ends exactly at the start of a later
     /// nonempty iovec and it left the queue empty ([`left_nothing_queued`]),
-    /// the rest of the array is read the same way, as Linux's loop goes on,
-    /// and the counts add up; once something has been read, a later part
-    /// that fails returns the bytes read so far, as `do_loop_readv_writev`
-    /// does. Each part's events get their cookies as one read's do
-    /// ([`finish`]). The array is read again from guest memory for each
-    /// part, where Linux imported it once.
+    /// the rest of the array is read as Linux's loop reads it: one iovec at a
+    /// time, each a `read` of that iovec waiting in Detcore's turns, until
+    /// one returns less than its iovec or fails, and the counts add up; once
+    /// something has been read, a later part that fails returns the bytes
+    /// read so far, as `do_loop_readv_writev` does. A signal ends such a part
+    /// only where it would be delivered (`ThreadState::call_progress`). Each
+    /// part's events get their cookies as one read's do ([`finish`]).
+    ///
+    /// Every part reads into the buffers the array named when the call began:
+    /// Linux imports the array once (`import_iovec`), before it reads or
+    /// waits, so neither the events this call writes, which may land on the
+    /// array, nor another thread changes where a later iovec's events go. The
+    /// observers that read the call's arguments after it returns see that
+    /// array too (`ThreadState::entry_import`).
     pub(crate) async fn readv_inotify<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Readv,
     ) -> Result<i64, Error> {
         let fd = call.fd();
-        let array = call.iov().map_or(0, |iov| iov.as_raw());
-        let mut part = call;
-        let mut first = 0usize;
-        let mut done = 0usize;
-        loop {
-            let destination =
-                Destination::iovecs(&guest.memory(), array + first * IOVEC, part.len());
-            begin_count(guest, fd, part).await;
-            let result = self.execute_nonblockable_fd_syscall(guest, part).await;
-            let (before, waits) = end_count_waiting(guest);
-            let next = match (&result, &destination) {
-                (Ok(length), Some(destination)) if waits && *length > 0 => {
-                    let length = *length as usize;
-                    match destination.next_to_read(length) {
-                        Some(next) if left_nothing_queued(guest, fd, before, length).await => {
-                            Some((next, destination.len()))
-                        }
-                        _ => None,
+        // The array as the call began, read before the first attempt.
+        let layout = Destination::iovecs(
+            &guest.memory(),
+            call.iov().map_or(0, |iov| iov.as_raw()),
+            call.len(),
+        );
+        let entry = crate::syscalls::entry_import::EntryImport::capture(
+            &guest.memory(),
+            &Syscall::Readv(call),
+        )
+        .map(Box::new);
+        let (first, before, waits) = self
+            .inotify_read_part(guest, Sysno::readv, fd, call, layout.clone())
+            .await;
+        let Ok(first) = first else {
+            return first;
+        };
+        let mut done = usize::try_from(first).unwrap_or(0);
+        let Some(layout) = layout else {
+            return Ok(done as i64);
+        };
+        let mut next = match layout.next_to_read(done) {
+            Some(next)
+                if waits && done > 0 && left_nothing_queued(guest, fd, before, done).await =>
+            {
+                next
+            }
+            _ => return Ok(done as i64),
+        };
+        // What the first part kept for the call's observers, which the parts
+        // after it, plain reads, would otherwise clear.
+        let first_view = guest.thread_state().entry_import.clone();
+        let result = loop {
+            let (base, size) = layout.at(next);
+            let part = syscalls::Read::new()
+                .with_fd(fd)
+                .with_buf(AddrMut::from_raw(base))
+                .with_len(size);
+            guest.thread_state_mut().call_progress = true;
+            let (result, _, _) = self
+                .inotify_read_part(
+                    guest,
+                    Sysno::readv,
+                    fd,
+                    part,
+                    Some(Destination::buffer(base, size)),
+                )
+                .await;
+            guest.thread_state_mut().call_progress = false;
+            match result {
+                Ok(length) if usize::try_from(length) == Ok(size) => {
+                    done += size;
+                    match layout.next_nonempty_after(next) {
+                        Some(after) => next = after,
+                        None => break Ok(done as i64),
                     }
                 }
-                _ => None,
-            };
-            let result = finish(guest, Sysno::readv, fd, destination, before, result).await;
-            match (result, next) {
-                (Ok(length), Some((next, count))) => {
-                    done += length as usize;
-                    first += next;
-                    let rest = syscalls::Addr::<libc::iovec>::from_raw(array + first * IOVEC);
-                    part = call.with_iov(rest).with_len(count - next);
-                }
-                (Ok(length), None) => break Ok((done + length as usize) as i64),
-                (Err(Error::Errno(_)), _) if done > 0 => break Ok(done as i64),
-                (Err(error), _) => break Err(error),
+                Ok(length) => break Ok((done + usize::try_from(length).unwrap_or(0)) as i64),
+                Err(Error::Errno(_)) => break Ok(done as i64),
+                Err(error) => break Err(error),
             }
-        }
+        };
+        let view = match first_view {
+            Some(view) => Some(view),
+            None => entry.filter(|entry| entry.differs(&guest.memory())),
+        };
+        guest.thread_state_mut().entry_import = view;
+        result
     }
 }
 
@@ -1252,7 +1437,11 @@ mod tests {
         // still counts: Linux waits in it too, then fails it with EINVAL.
         let gaps = Destination(vec![(0x1000, 32), (0x1800, 0), (0x2000, 8)]);
         assert_eq!(gaps.next_to_read(32), Some(2));
-        assert_eq!(gaps.len(), 3);
+        // Each later part reads the next nonempty buffer after the one it
+        // filled, at the address the array named when the call began.
+        assert_eq!(gaps.next_nonempty_after(0), Some(2));
+        assert_eq!(gaps.next_nonempty_after(2), None);
+        assert_eq!(gaps.at(2), (0x2000, 8));
     }
 
     #[test]

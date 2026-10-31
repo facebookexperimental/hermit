@@ -14057,8 +14057,8 @@ test:
     modes:
       verify:
         ci: true
-        # Qualified 2026-10-31: 21 of 21 canonical strict verify pairs each on ptrace (1146 INFO
-        # records each side) and KVM (1139), stdout identical to the native run's; DBT passes in
+        # Qualified 2026-10-31: 21 of 21 canonical strict verify pairs each on ptrace (3041 INFO
+        # records each side) and KVM (2886), stdout identical to the native run's; DBT passes in
         # the pinned root.
         backends_enabled:
           - ptrace
@@ -14068,6 +14068,19 @@ test:
           sabre: SaBRe is archived (2026-10-25); this cell was added after and has not been run on it
           liteinst: 'The in-guest runtime cannot create a thread ("the in-guest backend cannot create a thread or a vfork child: clone, clone3 and vfork other than a plain fork are not forwarded"), and every case of this guest blocks a sibling thread; the run is refused by name (measured in the pinned root on 2026-10-31)'
           in-guest-trap: 'The in-guest runtime cannot create a thread ("the in-guest backend cannot create a thread or a vfork child: clone, clone3 and vfork other than a plain fork are not forwarded"), and every case of this guest blocks a sibling thread; the run is refused by name (measured in the pinned root on 2026-10-31)'
+        # KVM's executor refuses a zero-count read of an inotify instance by name: it cannot
+        # show that the host read returns at once, as an alias outside the guest could clear
+        # the instance's O_NONBLOCK. That case is left out there (the guest's --no-zero-read).
+        # DBT discovers a descriptor received over SCM_RIGHTS when a call first names it, with
+        # the host's status flags, so the received case's descriptor shows the O_NONBLOCK
+        # Detcore set on its sender's description and its blocking read answers EAGAIN. A
+        # received pipe end does the same, at main too (measured 2026-10-31), so the case is
+        # left out there (the guest's --no-received).
+        guest_args:
+          kvm:
+            - --no-zero-read
+          dbt:
+            - --no-received
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14133,9 +14146,15 @@ test:
           - kvm
         backends_disabled:
           sabre: SaBRe is archived (2026-10-25); this cell was added after and has not been run on it
-          dbt: 'DBT does not interrupt a scheduler-managed polled read with a signal: probed in the pinned root on 2026-10-31, the run spins until the cell exceeds its 22 CPU s budget, and DBT likewise does not interrupt the scheduler-managed pipe writes of the custom mode of c-programs/writev-determinism'
+          dbt: 'DBT does not end a blocked read with EINTR for a caught signal without SA_RESTART, so the eintr case waits until the cell exceeds its 22 CPU s budget (probed in the pinned root on 2026-10-31). This is not new: main at 6d34a412, where this read still waited in the host, hangs in the same case, and so does a pipe read of the same shape, at main and here (measured 2026-10-31). The custom mode of c-programs/writev-determinism disables DBT for the same class of interrupted pipe writes'
           liteinst: 'The in-guest runtime cannot create a thread ("the in-guest backend cannot create a thread or a vfork child: clone, clone3 and vfork other than a plain fork are not forwarded"), and every case of this guest blocks a sibling thread; the run is refused by name (measured in the pinned root on 2026-10-31)'
           in-guest-trap: 'The in-guest runtime cannot create a thread ("the in-guest backend cannot create a thread or a vfork child: clone, clone3 and vfork other than a plain fork are not forwarded"), and every case of this guest blocks a sibling thread; the run is refused by name (measured in the pinned root on 2026-10-31)'
+        # KVM refuses a process-directed signal to a process of several threads by name
+        # (https://github.com/rrnewton/hermit/issues/4034), so readv-boundary-procdir is left
+        # out there (the guest's --no-process-signal).
+        guest_args:
+          kvm:
+            - --no-process-signal
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
