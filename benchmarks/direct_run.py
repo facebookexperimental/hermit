@@ -112,22 +112,40 @@ def measure_idle_fractions(sample_s: float = 0.5) -> dict[int, float]:
 
 
 def bounds_for(backend: str, cpu: int, timeout_s: float, memory_mb: int,
-               kvm_memory_mb: int, output_cap: int) -> "Bounds":
-    """Per-backend bounds. KVM rows get the larger address-space limit:
-    KVM's host VA footprint plus exec-time allocations exceed 16 GiB and
-    the host ENOMEM then reaches the guest's execve (intermittent exit
-    126; https://github.com/rrnewton/reverie/issues/1225). Without the
-    16 GiB limit the same cells failed 0/88."""
-    return Bounds(cpu, timeout_s,
-                  kvm_memory_mb if backend == "kvm" else memory_mb, output_cap)
+               kvm_memory_max: str, output_cap: int) -> "Bounds":
+    """Per-backend bounds.
+
+    KVM rows run with NO RLIMIT_AS (RLIM_INFINITY) and memory bounded by a
+    cgroup instead: reverie#1225's AS1 fix makes Hermit refuse KVM when the
+    host soft RLIMIT_AS is finite (exit 122), and the earlier 16 GiB limit
+    intermittently failed guest execve (ENOMEM, exit 126; 0/88 unlimited).
+    Other backends keep their 16 GiB RLIMIT_AS -- simpler, and no backend
+    there has refused it. MemoryMax=16G size: measured KVM peak RSS was
+    6,353,424 KiB (~6.2 GiB) on the jq seed cell and 28 MiB on /bin/true
+    (GNU time maxrss), so 16G gives ~2.5x headroom over the worst seed."""
+    if backend == "kvm":
+        return Bounds(cpu, timeout_s, memory_mb, output_cap,
+                      memory_mode="cgroup", cgroup_memory=kvm_memory_max)
+    return Bounds(cpu, timeout_s, memory_mb, output_cap)
+
+
+def launch_command(cmd: list[str], bounds: "Bounds") -> list[str]:
+    """The argv actually exec'd for a sample (pure; tested)."""
+    if bounds.memory_mode == "cgroup":
+        return ["systemd-run", "--user", "--scope", "-p",
+                f"MemoryMax={bounds.cgroup_memory}", "--", *cmd]
+    return list(cmd)
 
 
 class Bounds:
-    def __init__(self, cpu: int, timeout_s: float, memory_mb: int, output_cap: int):
+    def __init__(self, cpu: int, timeout_s: float, memory_mb: int, output_cap: int,
+                 memory_mode: str = "rlimit", cgroup_memory: str = "16G"):
         self.cpu = cpu
         self.timeout_s = timeout_s
         self.memory_mb = memory_mb
         self.output_cap = output_cap
+        self.memory_mode = memory_mode
+        self.cgroup_memory = cgroup_memory
 
     def preexec(self) -> None:  # runs in the child before exec
         os.setsid()
@@ -135,16 +153,25 @@ class Bounds:
         # No RLIMIT_CPU: LiteInst (correctly) refuses a finite physical CPU
         # limit, which would leak host timing into the deterministic guest.
         # The wall timeout above is the CPU-time backstop.
-        mem = self.memory_mb * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+        if self.memory_mode == "rlimit":
+            mem = self.memory_mb * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+        # cgroup mode: RLIMIT_AS stays RLIM_INFINITY; MemoryMax bounds memory.
 
     def describe(self) -> dict:
+        if self.memory_mode == "cgroup":
+            memory = (f"APPLIED:cgroup MemoryMax={self.cgroup_memory} via "
+                      "systemd-run --user --scope (RLIMIT_AS=RLIM_INFINITY; reverie#1225 AS1)")
+            cgroup = "APPLIED:systemd-run --user --scope for the sample"
+        else:
+            memory = f"APPLIED:RLIMIT_AS={self.memory_mb}MiB"
+            cgroup = "NOT_APPLIED:/sys/fs/cgroup not writable by invoking user; rlimits+affinity are the replacement"
         return {
             "bound.wall": f"APPLIED:{self.timeout_s:g}s process-group SIGKILL",
             "bound.cpu": f"APPLIED:K=1 quietest-cpu={self.cpu} sched_setaffinity; RLIMIT_CPU NOT_APPLIED (LiteInst refuses finite physical RLIMIT_CPU; wall timeout is the backstop)",
-            "bound.memory": f"APPLIED:RLIMIT_AS={self.memory_mb}MiB",
+            "bound.memory": memory,
             "bound.output": f"APPLIED:cap={self.output_cap}B per stream",
-            "bound.cgroup": "NOT_APPLIED:/sys/fs/cgroup not writable by invoking user; rlimits+affinity are the replacement",
+            "bound.cgroup": cgroup,
         }
 
 
@@ -193,7 +220,8 @@ def run_sample(cmd: list[str], bounds: Bounds, expect_stdout: str | None,
             env.update(extra_env)
         rusage0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         start = time.perf_counter_ns()
-        proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f, env=env,
+        proc = subprocess.Popen(launch_command(cmd, bounds),
+                                stdout=out_f, stderr=err_f, env=env,
                                 cwd=ROOT, preexec_fn=bounds.preexec)
         try:
             proc.wait(timeout=bounds.timeout_s)
@@ -255,8 +283,8 @@ def main() -> int:
     ap.add_argument("--warmups", type=int, default=1)
     ap.add_argument("--timeout", type=float, default=120.0)
     ap.add_argument("--memory-mb", type=int, default=16384)
-    ap.add_argument("--kvm-memory-mb", type=int, default=65536,
-                    help="RLIMIT_AS for KVM rows (default 65536 MiB; see bounds_for)")
+    ap.add_argument("--kvm-memory-max", default="16G",
+                    help="cgroup MemoryMax for KVM rows (default 16G; see bounds_for)")
     ap.add_argument("--output-cap", type=int, default=8 * 1024 * 1024)
     ap.add_argument("--cpu", type=int, default=None)
     ap.add_argument("--getpid-counts", default="0,10000,50000,100000")
@@ -273,7 +301,7 @@ def main() -> int:
         measure_idle_fractions(), set(os.sched_getaffinity(0)))
     def make_bounds(backend: str) -> Bounds:
         return bounds_for(backend, cpu, args.timeout, args.memory_mb,
-                          args.kvm_memory_mb, args.output_cap)
+                          args.kvm_memory_max, args.output_cap)
 
     bounds = make_bounds(backends[0] if backends else "native")
     counts = [int(c) for c in args.getpid_counts.split(",")]
@@ -296,7 +324,7 @@ def main() -> int:
         "warmups": args.warmups,
         "bounds": bounds.describe(),
         "bounds_kvm": make_bounds("kvm").describe(),
-        "bounds_note": "KVM rows use --kvm-memory-mb RLIMIT_AS (reverie#1225); other backends use --memory-mb",
+        "bounds_note": "KVM rows: cgroup MemoryMax (--kvm-memory-max), no RLIMIT_AS (reverie#1225 AS1); other backends: RLIMIT_AS --memory-mb",
         "relaxations": {"liteinst": "--max-timeslice=disabled", "others": "none (--strict)"},
         "loadavg_start": load_start,
         "workloads": {},

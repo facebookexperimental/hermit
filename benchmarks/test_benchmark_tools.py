@@ -52,15 +52,25 @@ class TestDirectRun(unittest.TestCase):
         self.assertTrue(desc["bound.wall"].startswith("APPLIED"))
 
 
-    def test_bounds_for_kvm_gets_larger_as_limit(self):
+    def test_bounds_for_kvm_gets_cgroup_not_rlimit(self):
         kvm = direct.bounds_for("kvm", cpu=1, timeout_s=10, memory_mb=16384,
-                                kvm_memory_mb=65536, output_cap=100)
+                                kvm_memory_max="16G", output_cap=100)
         ptrace = direct.bounds_for("ptrace", cpu=1, timeout_s=10,
-                                   memory_mb=16384, kvm_memory_mb=65536,
+                                   memory_mb=16384, kvm_memory_max="16G",
                                    output_cap=100)
-        self.assertEqual(kvm.memory_mb, 65536)
-        self.assertEqual(ptrace.memory_mb, 16384)
-        self.assertIn("65536MiB", kvm.describe()["bound.memory"])
+        # AS1 (reverie#1225): KVM must see RLIM_INFINITY, memory via cgroup.
+        self.assertEqual(kvm.memory_mode, "cgroup")
+        self.assertEqual(kvm.cgroup_memory, "16G")
+        self.assertIn("APPLIED:cgroup MemoryMax=16G",
+                      kvm.describe()["bound.memory"])
+        self.assertEqual(ptrace.memory_mode, "rlimit")
+        self.assertIn("RLIMIT_AS=16384MiB", ptrace.describe()["bound.memory"])
+        cmd = direct.launch_command(["hermit", "run", "--", "/bin/true"], kvm)
+        self.assertEqual(cmd[:6], ["systemd-run", "--user", "--scope", "-p",
+                                   "MemoryMax=16G", "--"])
+        self.assertEqual(cmd[6:], ["hermit", "run", "--", "/bin/true"])
+        self.assertEqual(
+            direct.launch_command(["hermit", "run"], ptrace), ["hermit", "run"])
 
     def test_prepare_command(self):
         entry = {"argv": ["/bin/bash", "x.sh", "--run"], "prepare_script": True}

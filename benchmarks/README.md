@@ -118,7 +118,9 @@ timeout with process-group kill, a K=1 CPU set plus `RLIMIT_CPU`,
 `RLIMIT_AS`, and capped output files — and records every bound as
 `APPLIED`/`NOT_APPLIED` in its output metadata (a dedicated cgroup is
 `NOT_APPLIED` where `/sys/fs/cgroup` is not user-writable; rlimits plus
-affinity are the stated replacement). It measures startup (`/bin/true`) and
+affinity are the stated replacement). KVM rows instead run with no
+`RLIMIT_AS` and a cgroup `MemoryMax=16G` via `systemd-run --user --scope`
+(reverie#1225 AS1 refuses KVM under a finite soft `RLIMIT_AS`). It measures startup (`/bin/true`) and
 the `getpid` per-call slope/intercept for native, ptrace, KVM, LiteInst, and
 DBT, and writes raw samples with full-SHA metadata to
 `benchmarks/results/direct/results.json`. Use it for timing only; general
