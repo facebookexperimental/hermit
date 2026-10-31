@@ -19,6 +19,11 @@
       "state": "completed",
       "result": "success"
     },
+    "GREEN_FLAKY": {
+      "validation_exit_code": 0,
+      "state": "completed",
+      "result": "success"
+    },
     "FAILED": {
       "validation_exit_code": 1,
       "state": "completed",

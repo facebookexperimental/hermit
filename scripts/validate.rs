@@ -26186,6 +26186,21 @@ fn parent_owns_scorecard_writeback(owner: Option<&str>, managed: bool) -> bool {
     managed && owner == Some(SCORECARD_WRITEBACK_OWNER)
 }
 
+/// The receipt status for a completed run: a pass that needed bounded
+/// retries is GREEN_FLAKY, a distinct passing status (owner lexicon
+/// 2026-10-30), never FAILED. The `FINAL_VALIDATE_STATUS:` line keeps
+/// PASSED for it, since that line's exit-code coupling (PASSED=0) is what
+/// existing wrappers read; the distinct value rides in the service result
+/// and the ledger's landing_signal/retry rollup.
+fn final_validate_status_for_summary(summary: &RunSummary) -> Option<FinalValidateStatus> {
+    match final_validate_status(summary.verdict) {
+        Some(FinalValidateStatus::Passed) if !summary.flaky.is_empty() => {
+            Some(FinalValidateStatus::PassedFlaky)
+        }
+        other => other,
+    }
+}
+
 fn final_validate_status(verdict: Verdict) -> Option<FinalValidateStatus> {
     match verdict {
         Verdict::Pass | Verdict::SelfTest | Verdict::CacheHit => Some(FinalValidateStatus::Passed),
@@ -27142,7 +27157,7 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
 fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<(), String> {
     use std::io::Write;
 
-    let Some(status) = final_validate_status(summary.verdict) else {
+    let Some(status) = final_validate_status_for_summary(summary) else {
         return Ok(());
     };
     let result = ValidationServiceResult {
@@ -33423,6 +33438,38 @@ mod final_validate_status_tests {
         assert_eq!(
             final_validate_status(completed_verdict(clean)),
             Some(FinalValidateStatus::Passed)
+        );
+    }
+
+    #[test]
+    fn green_flaky_is_a_distinct_passing_receipt_status() {
+        let mut summary = RunSummary::new(Verdict::Pass, 0, "fixture", Vec::new());
+        assert_eq!(
+            final_validate_status_for_summary(&summary),
+            Some(FinalValidateStatus::Passed)
+        );
+        summary.flaky = vec![TestIdRetry {
+            node: "e2e.manifest_compat".into(),
+            id: "compat/javac".into(),
+            retry_classes: Vec::new(),
+            inner_retry_occurrences: 1,
+        }];
+        let status = final_validate_status_for_summary(&summary).unwrap();
+        assert_eq!(status, FinalValidateStatus::PassedFlaky);
+        assert_eq!(status.as_str(), "GREEN_FLAKY");
+        assert_eq!(status.exit_code(), 0);
+        assert_eq!(status.service_result(), "success");
+        assert!(status.is_passing());
+        // The serialized receipt carries the distinct value, not FAILED.
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::json!("GREEN_FLAKY")
+        );
+        // A failed run stays FAILED even with recovered retries in it.
+        summary.verdict = Verdict::Fail;
+        assert_eq!(
+            final_validate_status_for_summary(&summary),
+            Some(FinalValidateStatus::Failed)
         );
     }
 

@@ -75,16 +75,27 @@ pub const FIELD_NAMES: [&str; 11] = [
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FinalValidateStatus {
     Passed,
+    /// All tests passed, but at least one needed a bounded retry. A distinct
+    /// passing status (owner lexicon 2026-10-30: GREEN-FLAKY is landable),
+    /// never FAILED; the retry counts ride in the ledger rollup.
+    #[serde(rename = "GREEN_FLAKY")]
+    PassedFlaky,
     Failed,
     CouldNotRun,
 }
 
 impl FinalValidateStatus {
-    pub const ALL: [Self; 3] = [Self::Passed, Self::Failed, Self::CouldNotRun];
+    pub const ALL: [Self; 4] = [
+        Self::Passed,
+        Self::PassedFlaky,
+        Self::Failed,
+        Self::CouldNotRun,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Passed => "PASSED",
+            Self::PassedFlaky => "GREEN_FLAKY",
             Self::Failed => "FAILED",
             Self::CouldNotRun => "COULD_NOT_RUN",
         }
@@ -92,7 +103,7 @@ impl FinalValidateStatus {
 
     pub const fn exit_code(self) -> i32 {
         match self {
-            Self::Passed => 0,
+            Self::Passed | Self::PassedFlaky => 0,
             Self::Failed => 1,
             Self::CouldNotRun => 75,
         }
@@ -104,10 +115,15 @@ impl FinalValidateStatus {
 
     pub const fn service_result(self) -> &'static str {
         match self {
-            Self::Passed => "success",
+            Self::Passed | Self::PassedFlaky => "success",
             Self::Failed => "failure",
             Self::CouldNotRun => "no-result",
         }
+    }
+
+    /// Whether this status is a passing, landing-eligible outcome.
+    pub const fn is_passing(self) -> bool {
+        matches!(self, Self::Passed | Self::PassedFlaky)
     }
 }
 
@@ -332,8 +348,7 @@ impl ValidationServiceResult {
             // PASSED run's failed write-back into exit 75, so records they
             // wrote stay readable.
             let expected_command_exit = validation_exit;
-            let historical_writeback_exit = self.final_validate_status
-                == FinalValidateStatus::Passed
+            let historical_writeback_exit = self.final_validate_status.is_passing()
                 && matches!(
                     self.scorecard_writeback,
                     Some(ScorecardWriteback::Failed { .. })
@@ -391,7 +406,7 @@ impl ValidationServiceResult {
         // still agree with itself.
         if let (true, Some(passed), Some(executed)) = (
             self.schema_version >= TEST_COUNTS_SCHEMA_VERSION
-                && self.final_validate_status == FinalValidateStatus::Passed,
+                && self.final_validate_status.is_passing(),
             self.passed_tests,
             self.executed_tests,
         ) {
