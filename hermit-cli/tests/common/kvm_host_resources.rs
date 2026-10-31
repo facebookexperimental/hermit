@@ -25,6 +25,10 @@ const GIB: u64 = 1024 * MIB;
 /// every guest process and once more for each exec in flight.
 const GUEST_MEMORY: u64 = 3 * GIB;
 
+/// The launch test's smallest limit lies below one reservation
+/// ([`launch_refusal`]).
+const _: () = assert!(2 * GIB < GUEST_MEMORY);
+
 /// The launch refusal's reason, as it names it.
 const RESERVATIONS: &str = "reserves 3 GiB (3221225472 bytes) of host address space for every \
      guest process, plus 3 GiB (3221225472 bytes) more for each exec in flight";
@@ -55,7 +59,10 @@ fn remaining(start: Instant, budget: Duration) -> Duration {
 /// Under a finite soft `RLIMIT_AS`, `hermit --backend=kvm run` refuses to
 /// start, by name and before the guest runs, and the refusal names both
 /// remedies and the reason no finite limit can work. The same command without
-/// the limit starts the guest, so the refusal is the limit's.
+/// the limit starts the guest, so the refusal is the limit's. One limit is
+/// below a single 3 GiB reservation: had the check moved after the backend's
+/// first reservation, that reservation would fail first, and the run would
+/// end without the refusal.
 pub(super) fn launch_refusal() {
     let _lock = super::hermit_run_guard();
     if !Path::new("/dev/kvm").exists() {
@@ -125,6 +132,12 @@ pub(super) fn launch_refusal() {
             16 * GIB,
             16 * GIB,
             "(soft 16 GiB (17179869184 bytes), hard 16 GiB (17179869184 bytes))".to_owned(),
+        ),
+        (
+            "soft-2-gib",
+            2 * GIB,
+            inherited.rlim_max,
+            format!("(soft 2 GiB (2147483648 bytes), hard {inherited_hard}"),
         ),
     ] {
         let directory = root.join(name);

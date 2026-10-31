@@ -191,11 +191,11 @@ async fn kvm_failed_completion_never_publishes_a_success_summary() {
 async fn kvm_exec_out_of_host_resources_past_its_point_of_no_return_is_a_policy_refusal() {
     use crate::error::FailureKind;
     const DIAGNOSTIC: &str = "KVM exec: host memory ran out after the old image was discarded: \
-        replacing the image failed (host filesystem operation failed: allocating 67108864 bytes \
-        for a copy of the new image: memory allocation failed) under this process's RLIMIT_AS \
-        (soft 4831838208 bytes, hard unlimited); the old image cannot be restored, so the run \
-        ends here";
+        replacing the image failed (allocating 67108864 bytes of host memory for a copy of the \
+        new image failed) under this process's RLIMIT_AS (soft 4831838208 bytes, hard \
+        unlimited); the old image cannot be restored, so the run ends here";
     let refusal = || reverie_kvm::Error::HostResources {
+        resource: reverie_kvm::HostResource::Memory,
         diagnostic: DIAGNOSTIC.to_owned(),
     };
     for (backend, kind) in [
