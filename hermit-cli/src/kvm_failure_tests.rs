@@ -180,6 +180,75 @@ async fn kvm_failed_completion_never_publishes_a_success_summary() {
     assert_eq!(std::fs::read_dir(unwritable).unwrap().count(), 0);
 }
 
+/// An exec the KVM backend could not finish past its point of no return,
+/// because a host resource of Hermit's own process ran out, ends the run as a
+/// policy refusal (exit 122) that names the resource. reverie-kvm's
+/// `Error::HostResources`, alone or beneath the wrappers a run's failure is
+/// aggregated in, keeps the policy class across the container boundary, and
+/// its diagnostic leads the run's first Error line. Any other backend failure
+/// keeps the backend-failure class.
+#[tokio::test]
+async fn kvm_exec_out_of_host_resources_past_its_point_of_no_return_is_a_policy_refusal() {
+    use crate::error::FailureKind;
+    const DIAGNOSTIC: &str = "KVM exec: host memory ran out after the old image was discarded: \
+        replacing the image failed (host filesystem operation failed: allocating 67108864 bytes \
+        for a copy of the new image: memory allocation failed) under this process's RLIMIT_AS \
+        (soft 4831838208 bytes, hard unlimited); the old image cannot be restored, so the run \
+        ends here";
+    let refusal = || reverie_kvm::Error::HostResources {
+        diagnostic: DIAGNOSTIC.to_owned(),
+    };
+    for (backend, kind) in [
+        (refusal(), FailureKind::PolicyRefusal),
+        (
+            reverie_kvm::Error::SharedFailure(std::sync::Arc::new(refusal())),
+            FailureKind::PolicyRefusal,
+        ),
+        (
+            reverie_kvm::Error::WithCleanup {
+                primary: std::sync::Arc::new(refusal()),
+                cleanup: vec![std::sync::Arc::new(reverie_kvm::Error::RunAborted)],
+            },
+            FailureKind::PolicyRefusal,
+        ),
+        (
+            reverie_kvm::Error::InvalidGuestPid(-17),
+            FailureKind::BackendRunFailure,
+        ),
+    ] {
+        let config = DetConfig {
+            sequentialize_threads: true,
+            ..DetConfig::default()
+        };
+        let global_state = detcore::GlobalState::init_global_state(&config).await;
+        global_state.report_backend_failure(reverie::BackendFailure {
+            pid: reverie::Pid::from_raw(17),
+            tid: reverie::Pid::from_raw(18),
+            phase: "exec host-resources refusal control",
+        });
+        let completion = reverie_kvm::ToolRunCompletion {
+            global_state,
+            result: Err(backend),
+        };
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            finish_kvm_tool_completion(completion, false, &None),
+        )
+        .await
+        .expect("failure cleanup must finish naturally")
+        .expect_err("a backend failure is not a guest status");
+        if kind == FailureKind::PolicyRefusal {
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("KVM guest execution failed: {DIAGNOSTIC}")),
+                "{error}"
+            );
+        }
+        assert_eq!(crate::error::SerializableError::from(error).kind(), kind);
+    }
+}
+
 #[tokio::test]
 async fn kvm_failed_completion_preserves_requested_partial_preemption_recording() {
     let directory = tempfile::tempdir().unwrap();

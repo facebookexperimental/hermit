@@ -170,6 +170,22 @@ fn is_policy_refusal(err: &Error) -> bool {
             || cause.is::<detcore::ReplayDepartureError>()
             || cause.is::<reverie_ptrace::UntracedStubSyscall>()
             || is_chosen_root_id_taken(cause)
+            || is_kvm_host_resources_refusal(cause)
+    }
+    // The KVM backend's end of a run whose exec it could not finish past the
+    // exec's point of no return, because a host resource of Hermit's own
+    // process ran out (reverie-kvm's `Error::HostResources`, found beneath
+    // the wrappers a run's failure is aggregated in). The guest saw no errno;
+    // before that point the same shortage is Detcore's refusal of the exec.
+    #[cfg(target_arch = "x86_64")]
+    fn is_kvm_host_resources_refusal(cause: &(dyn std::error::Error + 'static)) -> bool {
+        cause
+            .downcast_ref::<reverie_kvm::Error>()
+            .is_some_and(reverie_kvm::Error::is_host_resources_refusal)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn is_kvm_host_resources_refusal(_cause: &(dyn std::error::Error + 'static)) -> bool {
+        false
     }
     // The guest's first process could not have its chosen ID
     // (`--no-namespace`, `Command::pid`): another task took it after Hermit

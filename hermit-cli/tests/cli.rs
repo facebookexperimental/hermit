@@ -48,6 +48,9 @@ mod kvm_cancellation;
 #[path = "common/kvm_itimer.rs"]
 mod kvm_itimer;
 
+#[path = "common/kvm_host_resources.rs"]
+mod kvm_host_resources;
+
 #[path = "common/kvm_nonleader_exec.rs"]
 mod kvm_nonleader_exec;
 
@@ -22158,6 +22161,23 @@ fn run_ptrace_nonleader_exec_refuses_preemption_artifacts() {
 #[test]
 fn run_kvm_nonleader_exec_is_policy_refusal() {
     kvm_nonleader_exec::run();
+}
+
+/// Under a finite soft `RLIMIT_AS`, `hermit --backend=kvm run` refuses to
+/// start (exit 122), naming both limits, the reason no finite limit fits (3 GiB
+/// reserved per guest process plus 3 GiB per exec in flight) and the remedy,
+/// before the guest runs; the same command unlimited runs the guest.
+#[test]
+fn run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts() {
+    kvm_host_resources::launch_refusal();
+}
+
+/// An exec whose validation memory the host refuses (the supervisor's soft
+/// `RLIMIT_AS` lowered from outside once the guest runs) ends the run with the
+/// backend's named refusal (exit 122); the guest never sees ENOMEM.
+#[test]
+fn run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem() {
+    kvm_host_resources::exec_refusal();
 }
 
 /// A guest that never stops, under a log level that makes hermit narrate it.

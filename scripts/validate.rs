@@ -43,7 +43,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "381af35f50ffb3d6a7a036894cfa1479508abb73" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "d7adaf6858378b75ebaa91b4a538efd1ca19ba93" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! serde_json = "1"
 //! toml = "0.8.23"
@@ -7326,11 +7326,8 @@ mod e2e_runner_tests {
                 assert!(dropped.contains(cargo_tag), "{tag} replaces nothing");
             }
         }
-        // 21 dropped since the host compatprep.fixtures step retired from
-        // full (issue 4997, one writer): the Cargo full plan no longer
-        // carries it for the Buck plan to drop. 22 before.
-        assert_eq!(dropped.len(), 21, "{dropped:?}");
-        assert_eq!(buck_tags.len(), cargo_tags.len() - 21 + 19);
+        assert_eq!(dropped.len(), 22, "{dropped:?}");
+        assert_eq!(buck_tags.len(), cargo_tags.len() - 22 + 19);
         assert_eq!(buck.profile, "full");
         assert_eq!(buck.selection_mode, "full");
         assert!(buck.suite_complete);
@@ -13142,11 +13139,6 @@ fn privileged_nodes_for_scope(
                 "privileged-test.pmu_ptrace_completion_cases",
                 "privileged-test.pmu_detcore_time_cases",
                 "privileged-test.pmu_cli_cases",
-                // The PMU chaos cases (chaos_buck_* in hermit_modes) are a
-                // ptrace PMU node like the three above; the node was
-                // renamed from pmu_chaos_cli_cases without joining this
-                // list, so selective ptrace runs skipped them.
-                "privileged-test.pmu_buck_chaos_cases",
                 "privileged-pmu.preemption",
                 "privileged-cpuid.cpu_profile_v3",
                 "privileged-cpuid.faulting",
@@ -14554,13 +14546,10 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         .find(|step| step.tag() == "e2e.manifest_compat")
         .cloned()
         .ok_or("strict-compat bucket: e2e.manifest_compat is absent")?;
-    // The host compatprep.fixtures step is retired from full/portable
-    // whenever its pinned twin exists (issue 4997, one writer), so the
-    // preparation node in the full plan is the pinned one.
     let prep = first
         .steps
         .iter()
-        .find(|step| step.tag() == "compatprep.fixtures_in_pinned_root")
+        .find(|step| step.tag() == "compatprep.fixtures")
         .ok_or("strict-compat bucket: fixture-preparation node is absent")?;
     let selector = format!(
         "target/debug/test-harness run --lane portable --category compat {}",
@@ -14592,10 +14581,10 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // extracted from validate.sh, the 25 of
     // https://github.com/rrnewton/hermit/issues/4269, less the 4 heavy rows
     // the super run type runs (218 - 4), less the logger and pkg-config
-    // rows deselected with the pinned-image move (214 - 2). The cargo and
-    // gcov rows deselected 2026-10-31 under issue 4997 came back the same
-    // day once the fixture race was fixed (271ec81bd4).
-    let expected = 212;
+    // rows deselected with the pinned-image move (214 - 2), less the
+    // cargo and gcov rows deselected 2026-10-31 (212 - 2;
+    // <https://github.com/rrnewton/hermit/issues/4997>).
+    let expected = 210;
     if rows.len() != expected {
         return Err(format!(
             "strict-compat bucket: compat.yaml has {} CI rows; the full run has {expected}",
@@ -14655,22 +14644,23 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     }
     canonicalizing_compat_operand_bracket(root)?;
     let workload = root.join("tests/compat/real_compat_workload.sh");
-    for label in ["cargo", "df"] {
-        let argv = rows
-            .get(label)
-            .ok_or_else(|| format!("strict-compat bucket: fixture-backed row {label} is absent"))?;
-        let want: [&OsStr; 5] = [
-            "env".as_ref(),
-            "REAL_COMPAT_FIXTURES=/run-state/strict-compat/real-compat-fixtures".as_ref(),
-            "bash".as_ref(),
-            workload.as_os_str(),
-            label.as_ref(),
-        ];
-        if argv.as_slice() != want {
-            return Err(format!(
-                "strict-compat bucket: {label} does not use its explicit fixture/tool contract: {argv:?}"
-            ));
-        }
+    // The cargo row was deselected 2026-10-31
+    // (<https://github.com/rrnewton/hermit/issues/4997>); df keeps the
+    // fixture/tool contract check.
+    let df_argv = rows
+        .get("df")
+        .ok_or("strict-compat bucket: fixture-backed row df is absent")?;
+    let df_want: [&OsStr; 5] = [
+        "env".as_ref(),
+        "REAL_COMPAT_FIXTURES=/run-state/strict-compat/real-compat-fixtures".as_ref(),
+        "bash".as_ref(),
+        workload.as_os_str(),
+        "df".as_ref(),
+    ];
+    if df_argv.as_slice() != df_want {
+        return Err(format!(
+            "strict-compat bucket: df does not use its explicit fixture/tool contract: {df_argv:?}"
+        ));
     }
     for (label, path) in [
         ("seq", "/run-state/strict-compat/real-compat-fixtures"),
@@ -14747,10 +14737,6 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         ));
     }
     let mut execution_prep = prep.clone();
-    // The bracket's stand-in keeps the retired host step's tag: the two
-    // observed steps below depend on "compatprep.fixtures" by that name.
-    execution_prep.group = "compatprep".into();
-    execution_prep.job = "fixtures".into();
     execution_prep.deps.clear();
     execution_prep.cmd = "true".into();
     execution_prep.timeout = 10;
@@ -18741,7 +18727,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "108");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "107");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -18836,19 +18822,18 @@ mod nextest_timeout_tests {
         // run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first and
         // run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit
         // (https://github.com/rrnewton/hermit/issues/4930): 105. And
-        // run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux
-        // and run_kvm_a_second_path_past_another_process_cmdline_is_refused_by_name
-        // and run_kvm_argument_errors_on_another_process_procfs_answer_as_linux
-        // (the KVM named refusals): 108.
+        // run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts
+        // and run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem
+        // (https://github.com/rrnewton/reverie/issues/1225): 107.
         // The spinner is retained but ignored and excluded because its explicit
-        // maximum requests an unavailable timer: 107 selected CLI tests remain.
+        // maximum requests an unavailable timer: 106 selected CLI tests remain.
         assert_eq!(
             names.len(),
-            108,
+            107,
             "update the exact CI inventory with new KVM tests"
         );
         names.retain(|name| name != excluded);
-        assert_eq!(names.len(), 107);
+        assert_eq!(names.len(), 106);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
@@ -18886,9 +18871,8 @@ mod nextest_timeout_tests {
             "run_kvm_virtual_timeout_is_reported_from_the_childs_note",
             "run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first",
             "run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit",
-            "run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux",
-            "run_kvm_a_second_path_past_another_process_cmdline_is_refused_by_name",
-            "run_kvm_argument_errors_on_another_process_procfs_answer_as_linux",
+            "run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts",
+            "run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -19995,11 +19979,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first and
         // run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit
         // (https://github.com/rrnewton/hermit/issues/4930): 105 selected. And
-        // run_kvm_masked_ppoll_with_a_pending_signal_answers_as_linux and
-        // run_kvm_a_second_path_past_another_process_cmdline_is_refused_by_name and
-        // run_kvm_argument_errors_on_another_process_procfs_answer_as_linux
-        // (the KVM named refusals): 108 selected.
-        ("privileged-only-test.cli_kvm", 108usize),
+        // run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts
+        // and run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem
+        // (https://github.com/rrnewton/reverie/issues/1225): 107 selected.
+        ("privileged-only-test.cli_kvm", 107usize),
     ] {
         let step = privileged
             .steps
@@ -26186,21 +26169,6 @@ fn parent_owns_scorecard_writeback(owner: Option<&str>, managed: bool) -> bool {
     managed && owner == Some(SCORECARD_WRITEBACK_OWNER)
 }
 
-/// The receipt status for a completed run: a pass that needed bounded
-/// retries is GREEN_FLAKY, a distinct passing status (owner lexicon
-/// 2026-10-30), never FAILED. The `FINAL_VALIDATE_STATUS:` line keeps
-/// PASSED for it, since that line's exit-code coupling (PASSED=0) is what
-/// existing wrappers read; the distinct value rides in the service result
-/// and the ledger's landing_signal/retry rollup.
-fn final_validate_status_for_summary(summary: &RunSummary) -> Option<FinalValidateStatus> {
-    match final_validate_status(summary.verdict) {
-        Some(FinalValidateStatus::Passed) if !summary.flaky.is_empty() => {
-            Some(FinalValidateStatus::PassedFlaky)
-        }
-        other => other,
-    }
-}
-
 fn final_validate_status(verdict: Verdict) -> Option<FinalValidateStatus> {
     match verdict {
         Verdict::Pass | Verdict::SelfTest | Verdict::CacheHit => Some(FinalValidateStatus::Passed),
@@ -27157,7 +27125,7 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
 fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<(), String> {
     use std::io::Write;
 
-    let Some(status) = final_validate_status_for_summary(summary) else {
+    let Some(status) = final_validate_status(summary.verdict) else {
         return Ok(());
     };
     let result = ValidationServiceResult {
@@ -33442,38 +33410,6 @@ mod final_validate_status_tests {
     }
 
     #[test]
-    fn green_flaky_is_a_distinct_passing_receipt_status() {
-        let mut summary = RunSummary::new(Verdict::Pass, 0, "fixture", Vec::new());
-        assert_eq!(
-            final_validate_status_for_summary(&summary),
-            Some(FinalValidateStatus::Passed)
-        );
-        summary.flaky = vec![TestIdRetry {
-            node: "e2e.manifest_compat".into(),
-            id: "compat/javac".into(),
-            retry_classes: Vec::new(),
-            inner_retry_occurrences: 1,
-        }];
-        let status = final_validate_status_for_summary(&summary).unwrap();
-        assert_eq!(status, FinalValidateStatus::PassedFlaky);
-        assert_eq!(status.as_str(), "GREEN_FLAKY");
-        assert_eq!(status.exit_code(), 0);
-        assert_eq!(status.service_result(), "success");
-        assert!(status.is_passing());
-        // The serialized receipt carries the distinct value, not FAILED.
-        assert_eq!(
-            serde_json::to_value(status).unwrap(),
-            serde_json::json!("GREEN_FLAKY")
-        );
-        // A failed run stays FAILED even with recovered retries in it.
-        summary.verdict = Verdict::Fail;
-        assert_eq!(
-            final_validate_status_for_summary(&summary),
-            Some(FinalValidateStatus::Failed)
-        );
-    }
-
-    #[test]
     fn schema_five_publishes_detail_only_for_could_not_run() {
         let temp = tempfile::tempdir().unwrap();
         let expected_detail = vec![
@@ -33927,14 +33863,14 @@ mod shared_consumer_tests {
         let selected_tags: BTreeSet<String> = selected.steps.iter().map(Step::tag).collect();
         for tag in [
             "privileged-test.pmu_cli_cases",
-            "privileged-test.pmu_buck_chaos_cases",
+            "privileged-test.pmu_chaos_cli_cases",
         ] {
             assert!(selected_tags.contains(tag), "missing {tag}");
         }
         let chaos = full
             .steps
             .iter()
-            .find(|step| step.tag() == "privileged-test.pmu_buck_chaos_cases")
+            .find(|step| step.tag() == "privileged-test.pmu_chaos_cli_cases")
             .unwrap();
         for dependency in &chaos.deps {
             assert!(selected_tags.contains(dependency), "missing {dependency}");
@@ -33955,7 +33891,7 @@ mod shared_consumer_tests {
         assert!(!portable
             .steps
             .iter()
-            .any(|step| step.tag() == "privileged-test.pmu_buck_chaos_cases"));
+            .any(|step| step.tag() == "privileged-test.pmu_chaos_cli_cases"));
         assert_committed_shared_integration_test_serialization(&full.steps, &full.resource_caps)
             .unwrap();
         let isolated = full

@@ -3161,8 +3161,11 @@ fi
 # build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
 # This pin changes no tool selection or native recipe; limits retained.
 # This is budget carry, not a native cache HIT or a fresh timing sample.
-# AS1 CARRY TO 47828ea062ed8e35b9555c509d4a376fbdcea35d: native recipe input objects equal 8c7460b343c88535f500aaf79a22bb03c1381de2.
-# Interval: three commits, the KVM exec host-resource refusals, in reverie, reverie-kvm and reverie-linuxemu only; no DBT path touched.
+# F1 CARRY TO 8c7460b343c88535f500aaf79a22bb03c1381de2: native recipe input objects equal 78e3cadac76b5cc3b937f46d63d2e1d73e9973f6.
+# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
+# This pin changes no tool selection or native recipe; limits retained.
+# This is budget carry, not a native cache HIT or a fresh timing sample.
+# AS1 CARRY TO 47828ea062ed8e35b9555c509d4a376fbdcea35d: native recipe input objects equal 8c7460b343c88535f500aaf79a22bb03c1381de2. Interval: three commits, KVM exec host-resource refusals, in reverie, reverie-kvm and reverie-linuxemu only; no DBT path touched.
 # build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
 # This pin changes no tool selection or native recipe; limits retained.
 # This is budget carry, not a native cache HIT or a fresh timing sample.

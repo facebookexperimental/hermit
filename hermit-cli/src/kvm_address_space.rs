@@ -20,9 +20,11 @@
 //! (<https://github.com/rrnewton/reverie/issues/1225>). Hermit refuses such a
 //! run before the guest starts instead, by name and on every run.
 //!
-//! This is launch policy. The backend still refuses, by name, an exec whose
-//! memory a host refuses for another reason (a limit lowered after launch,
-//! `vm.max_map_count`), and Detcore ends the run on that refusal.
+//! This is launch policy, about Hermit's own process. It never raises the
+//! limit, and it does not touch the guest's view of `RLIMIT_AS`, which
+//! Detcore models as before. The backend still refuses, by name, an exec
+//! whose memory a host refuses for another reason (a limit lowered after
+//! launch, `vm.max_map_count`), and the run ends on that refusal.
 
 use std::fmt;
 
@@ -49,29 +51,43 @@ impl KvmAddressSpaceRefusal {
     }
 }
 
+/// A size in bytes as the refusal prints it: in GiB, with the exact byte
+/// count, for example `3 GiB (3221225472 bytes)`.
+fn size_text(bytes: u64) -> String {
+    const GIB: u64 = 1 << 30;
+    if bytes.is_multiple_of(GIB) {
+        format!("{} GiB ({bytes} bytes)", bytes / GIB)
+    } else {
+        format!("{:.2} GiB ({bytes} bytes)", bytes as f64 / GIB as f64)
+    }
+}
+
 /// An `RLIMIT_AS` value as the refusal prints it.
 fn limit_text(value: libc::rlim_t) -> String {
     if value == libc::RLIM_INFINITY {
         "unlimited".to_owned()
     } else {
-        format!("{value} bytes")
+        size_text(value)
     }
 }
 
 impl fmt::Display for KvmAddressSpaceRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let guest_memory = size_text(self.guest_memory_bytes as u64);
         write!(
             f,
             "kvm_address_space_limit: --backend=kvm refuses to start under a finite RLIMIT_AS \
-             (soft {}, hard {}): the KVM backend reserves {} bytes of host address space for \
-             every guest process and once more for each exec, so a run under a finite limit \
-             would stop wherever the guest's process tree and host thread scheduling put the \
-             peak; run Hermit with an unlimited address-space limit (`ulimit -v unlimited`, \
-             which needs an unlimited hard limit or privilege) and bound its memory with a \
-             cgroup (memory.max) instead; the guest has not started",
+             (soft {}, hard {}): the KVM backend reserves {guest_memory} of host address space \
+             for every guest process, plus {guest_memory} more for each exec in flight, and \
+             RLIMIT_AS counts every reserved byte although only the pages a guest touches use \
+             memory, so no finite limit fits every process tree, and under one a run would stop \
+             wherever the guest's process tree and host thread scheduling put the peak; Hermit \
+             does not raise the limit itself; run Hermit with an unlimited address-space limit \
+             (`ulimit -v unlimited`, which needs an unlimited hard limit or privilege) and bound \
+             its memory with a cgroup instead (memory.max, which charges the memory the run \
+             uses, not the address space it reserves); the guest has not started",
             limit_text(self.soft),
             limit_text(self.hard),
-            self.guest_memory_bytes,
         )
     }
 }
@@ -104,8 +120,9 @@ mod tests {
     const GUEST_MEMORY: usize = 3 << 30;
 
     /// Only an unlimited soft limit starts the backend; every finite one is
-    /// refused, whatever the hard limit, and the refusal names both limits,
-    /// the reservation and the remedy.
+    /// refused, whatever the hard limit, and the refusal names both limits
+    /// (in GiB and bytes), the reservations behind the refusal, and both
+    /// remedies.
     #[test]
     fn kvm_starts_only_under_an_unlimited_soft_address_space_limit() {
         let limit = |soft, hard| libc::rlimit {
@@ -117,11 +134,32 @@ mod tests {
             KvmAddressSpaceRefusal::for_limit(limit(unlimited, unlimited), GUEST_MEMORY),
             None
         );
-        for (soft, hard, hard_text) in [
-            (16 << 30, 16 << 30, "17179869184 bytes"),
-            (16 << 30, unlimited, "unlimited"),
-            (1 << 40, unlimited, "unlimited"),
-            (0, 0, "0 bytes"),
+        for (soft, hard, soft_text, hard_text) in [
+            (
+                16 << 30,
+                16 << 30,
+                "16 GiB (17179869184 bytes)",
+                "16 GiB (17179869184 bytes)",
+            ),
+            (
+                16 << 30,
+                unlimited,
+                "16 GiB (17179869184 bytes)",
+                "unlimited",
+            ),
+            (
+                1 << 40,
+                unlimited,
+                "1024 GiB (1099511627776 bytes)",
+                "unlimited",
+            ),
+            (
+                3537227776,
+                unlimited,
+                "3.29 GiB (3537227776 bytes)",
+                "unlimited",
+            ),
+            (0, 0, "0 GiB (0 bytes)", "0 GiB (0 bytes)"),
         ] {
             let refusal = KvmAddressSpaceRefusal::for_limit(limit(soft, hard), GUEST_MEMORY)
                 .expect("a finite soft limit is refused");
@@ -129,18 +167,29 @@ mod tests {
             assert!(
                 text.starts_with(&format!(
                     "kvm_address_space_limit: --backend=kvm refuses to start under a finite \
-                     RLIMIT_AS (soft {soft} bytes, hard {hard_text}): "
+                     RLIMIT_AS (soft {soft_text}, hard {hard_text}): "
                 )),
                 "{text}"
             );
+            // The reason, in GiB: 3 GiB per guest process, plus 3 GiB per
+            // exec in flight.
             assert!(
                 text.contains(
-                    "reserves 3221225472 bytes of host address space for every guest process \
-                     and once more for each exec"
+                    "reserves 3 GiB (3221225472 bytes) of host address space for every guest \
+                     process, plus 3 GiB (3221225472 bytes) more for each exec in flight"
                 ),
                 "{text}"
             );
+            assert!(
+                text.contains("Hermit does not raise the limit itself"),
+                "{text}"
+            );
+            // Both remedies: an unlimited limit, and a cgroup bound instead.
             assert!(text.contains("`ulimit -v unlimited`"), "{text}");
+            assert!(
+                text.contains("bound its memory with a cgroup instead (memory.max"),
+                "{text}"
+            );
             assert!(text.ends_with("the guest has not started"), "{text}");
         }
     }

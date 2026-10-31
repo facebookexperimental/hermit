@@ -217,7 +217,7 @@ pub(super) fn bounded_verify_command(
     (status, captured.then_some(capture))
 }
 
-fn bounded_command_polling(
+pub(super) fn bounded_command_polling(
     command: &mut Command,
     directory: &Path,
     wall_limit: Duration,
