@@ -87,9 +87,9 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: 31 (PR #4867), not on this
-    /// base yet. Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[31];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 30 (PR #4728, returned for
+    /// a clean rebase). Remove an entry when its change lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[30];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -234,7 +234,13 @@ mod tests {
         // main's 27, skipping 28 reserved for the pending 4789 change;
         // digest measured at this head).
         (29, "05a9f7a4ca16cde1", "f013e36743d8d9e6"),
->>>>>>> d39e4d5a71 (Fix the 4884 rebase onto current main)
+        // Adds `GlobalRequest::PostCrash`, `GlobalResponse::PostCrash` and
+        // `GlobalResponse::WithPostCrashBound`
+        // (https://github.com/rrnewton/hermit/pull/4867; renumbered to 31 at
+        // this rebase onto main's pidfd revision 27, skipping reserved
+        // 28 (4789) and 30 (4728); digest measured at this head).
+        (31, "0000000000000000", "f013e36743d8d9e6"),
+>>>>>>> f52a5d4146 (Record a global RPC revision for `PostCrash`, `WithPostCrashBound`)
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
