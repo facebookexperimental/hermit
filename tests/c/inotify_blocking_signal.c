@@ -35,6 +35,24 @@
 //   the read waiting, then sends SIGUSR1 (no SA_RESTART). inotify_read tests
 //   O_NONBLOCK before a pending signal, so the read fails with EAGAIN, not
 //   EINTR, and the handler runs.
+// - mode-setfl-blocked, mode-setfl-ignored: the same mode change, then
+//   SIGUSR2, which the reader blocks or the process ignores. Neither wakes
+//   the reader, so the read returns the event the main thread makes 20 ms
+//   later, and a blocked SIGUSR2 is still pending once it returns.
+// - readv-event-signal, readv3-boundary-event-signal,
+//   readv3-boundary-event-signal-restart: the main thread makes one event
+//   while the reader waits in a readv of two one-event iovecs (or of three,
+//   with an event queued before the readv filling the first), and at once
+//   sends SIGUSR1. The readv takes the event into the iovec it waits in;
+//   the next iovec's read finds the signal pending before it waits, so the
+//   readv returns the bytes read so far (32, or 64 of three), the handler
+//   runs, and an event made 20 ms later stays queued. A count is never
+//   restarted, so SA_RESTART changes nothing.
+// - pipe-replaced-eintr: the main thread puts a nonblocking inotify instance
+//   at the descriptor number of a reader blocked on an empty blocking pipe
+//   (dup3), then sends SIGUSR1 (no SA_RESTART). The read keeps the pipe it
+//   began on, so it fails with EINTR, not the instance's EAGAIN, after the
+//   handler.
 //
 // Arguments: an optional --no-process-signal, which leaves out
 // readv-boundary-procdir (KVM refuses a process-directed signal to a process
@@ -100,7 +118,8 @@ static void install(int flags) {
 
 struct blocked_read {
   int fd;
-  // 0: read; 1: readv of the whole buffer; 2: readv of two one-event iovecs.
+  // 0: read; 1: readv of the whole buffer; 2 or 3: readv of two or three
+  // one-event iovecs.
   int vectored;
   // A signal the reader blocks before it reads, or 0.
   int block;
@@ -126,10 +145,11 @@ static void *reader(void *argument) {
     if (pthread_sigmask(SIG_BLOCK, &set, NULL) != 0) fail("pthread_sigmask");
   }
   if (write(ready[1], "r", 1) != 1) fail("write");
-  struct iovec iov[2] = {{r->buffer, sizeof r->buffer}, {NULL, 0}};
-  if (r->vectored == 2) {
+  struct iovec iov[3] = {{r->buffer, sizeof r->buffer}, {NULL, 0}, {NULL, 0}};
+  if (r->vectored >= 2) {
     iov[0].iov_len = EVENT;
     iov[1] = (struct iovec){r->buffer + EVENT, EVENT};
+    iov[2] = (struct iovec){r->buffer + 2 * EVENT, EVENT};
   }
   r->got = r->vectored ? readv(r->fd, iov, r->vectored) : read(r->fd, r->buffer, sizeof r->buffer);
   r->error = r->got < 0 ? errno : 0;
@@ -318,6 +338,137 @@ static void mode_signal_case(const char *label, int fionbio, const char *dir) {
   close(r.fd);
 }
 
+// The main thread makes a sibling's blocking descriptor nonblocking (F_SETFL)
+// while the sibling waits in a read, then sends SIGUSR2, which the reader
+// blocks (`how` 'b') or the process ignores ('i'), and makes the event the
+// read waits for 20 ms after the signal.
+static void mode_quiet_signal_case(const char *label, char how, const char *dir) {
+  char path[96];
+  snprintf(path, sizeof path, "%s/%s", root, dir);
+  if (mkdir(path, 0700) != 0) fail("mkdir");
+  handled = 0;
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = how == 'i' ? SIG_IGN : handler;
+  sigemptyset(&sa.sa_mask);
+  if (sigaction(SIGUSR2, &sa, NULL) != 0) fail("sigaction");
+  struct blocked_read r = {.fd = inotify_init1(IN_CLOEXEC), .block = how == 'b' ? SIGUSR2 : 0};
+  if (r.fd < 0) fail("inotify_init1");
+  if (inotify_add_watch(r.fd, path, IN_CREATE) < 0) fail("inotify_add_watch");
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, reader, &r) != 0) fail("pthread_create");
+  char byte;
+  if (read(ready[0], &byte, 1) != 1) fail("read");
+  sleep_ms(1);
+  if (fcntl(r.fd, F_SETFL, O_NONBLOCK) != 0) fail("F_SETFL");
+  sleep_ms(20);
+  int waiting = !r.returned;
+  if (pthread_kill(thread, SIGUSR2) != 0) fail("pthread_kill");
+  sleep_ms(20);
+  create_in(dir, "c1");
+  if (pthread_join(thread, NULL) != 0) fail("pthread_join");
+  signal(SIGUSR2, SIG_DFL);
+  const struct inotify_event *first = (const struct inotify_event *)r.buffer;
+  printf("%s read %zd bytes (%s), handled %d, still waiting after the mode change: %s\n", label,
+         r.got, r.got < 0 ? strerrorname_np(r.error) : "ok", r.handled_at_return,
+         waiting ? "yes" : "no");
+  char what[160];
+  snprintf(what, sizeof what, "%s: the mode change alone leaves the read waiting", label);
+  report(what, waiting);
+  snprintf(what, sizeof what, "%s: the signal leaves the read waiting for the event made after it",
+           label);
+  report(what, r.handled_at_return == 0 && r.got == EVENT && strcmp(first->name, "c1") == 0);
+  if (how == 'b') {
+    printf("%s: pending once the read returned %d, handlers run on unblocking %d\n", label,
+           r.pending_after, r.handled_after_unblock);
+    snprintf(what, sizeof what,
+             "%s: the blocked signal stays pending, and its handler runs once when the reader "
+             "unblocks it",
+             label);
+    report(what, r.pending_after == 1 && r.handled_after_unblock == 1);
+  }
+  close(r.fd);
+}
+
+// The main thread makes one event while a sibling waits in a readv of
+// `iovecs` one-event iovecs (2, or 3 with an event queued before the readv
+// filling the first, so that it waits in the second), then at once sends
+// SIGUSR1, whose handler has SA_RESTART when `restart` is set, and makes a
+// last event 20 ms later.
+static void event_signal_case(const char *label, int iovecs, int restart, const char *dir) {
+  char path[96];
+  snprintf(path, sizeof path, "%s/%s", root, dir);
+  if (mkdir(path, 0700) != 0) fail("mkdir");
+  handled = 0;
+  install(restart ? SA_RESTART : 0);
+  struct blocked_read r = {.fd = inotify_init1(IN_CLOEXEC), .vectored = iovecs};
+  if (r.fd < 0) fail("inotify_init1");
+  if (inotify_add_watch(r.fd, path, IN_CREATE) < 0) fail("inotify_add_watch");
+  int queued = iovecs == 3;
+  if (queued) create_in(dir, "q1");
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, reader, &r) != 0) fail("pthread_create");
+  char byte;
+  if (read(ready[0], &byte, 1) != 1) fail("read");
+  sleep_ms(1);
+  create_in(dir, "e1");
+  if (pthread_kill(thread, SIGUSR1) != 0) fail("pthread_kill");
+  sleep_ms(20);
+  create_in(dir, "l1");
+  if (pthread_join(thread, NULL) != 0) fail("pthread_join");
+  // What the readv left queued.
+  if (fcntl(r.fd, F_SETFL, O_NONBLOCK) != 0) fail("F_SETFL");
+  char rest[2 * EVENT] __attribute__((aligned(8)));
+  ssize_t left = read(r.fd, rest, sizeof rest);
+  const struct inotify_event *first = (const struct inotify_event *)r.buffer;
+  const struct inotify_event *second = (const struct inotify_event *)(r.buffer + EVENT);
+  const struct inotify_event *last = (const struct inotify_event *)rest;
+  printf("%s read %zd bytes (%s), handled %d, left queued %zd\n", label, r.got,
+         r.got < 0 ? strerrorname_np(r.error) : "ok", r.handled_at_return, left);
+  char what[160];
+  snprintf(what, sizeof what,
+           "%s: the readv returns the bytes it read before the signal, after the handler", label);
+  int events = queued ? r.got == 2 * EVENT && strcmp(first->name, "q1") == 0 &&
+                            strcmp(second->name, "e1") == 0
+                      : r.got == EVENT && strcmp(first->name, "e1") == 0;
+  report(what, r.handled_at_return == 1 && events);
+  snprintf(what, sizeof what, "%s: the event made after the signal stays queued", label);
+  report(what, left == EVENT && strcmp(last->name, "l1") == 0);
+  close(r.fd);
+}
+
+// The main thread puts a nonblocking inotify instance at the descriptor
+// number of a sibling blocked reading an empty blocking pipe (dup3), then
+// sends SIGUSR1, whose handler has no SA_RESTART.
+static void replaced_signal_case(const char *label) {
+  handled = 0;
+  install(0);
+  int pipefd[2];
+  if (pipe2(pipefd, O_CLOEXEC) != 0) fail("pipe2");
+  struct blocked_read r = {.fd = pipefd[0]};
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, reader, &r) != 0) fail("pthread_create");
+  char byte;
+  if (read(ready[0], &byte, 1) != 1) fail("read");
+  sleep_ms(1);
+  int instance = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+  if (instance < 0) fail("inotify_init1");
+  if (dup3(instance, r.fd, O_CLOEXEC) != r.fd) fail("dup3");
+  if (close(instance) != 0) fail("close");
+  sleep_ms(20);
+  if (pthread_kill(thread, SIGUSR1) != 0) fail("pthread_kill");
+  if (pthread_join(thread, NULL) != 0) fail("pthread_join");
+  printf("%s read %zd bytes (%s), handled %d\n", label, r.got,
+         r.got < 0 ? strerrorname_np(r.error) : "ok", r.handled_at_return);
+  char what[160];
+  snprintf(what, sizeof what,
+           "%s: the read keeps the pipe it began on: EINTR, not EAGAIN, after the handler",
+           label);
+  report(what, r.handled_at_return == 1 && r.got == -1 && r.error == EINTR);
+  close(r.fd);
+  close(pipefd[1]);
+}
+
 static int selected(const char *only, const char *name) {
   return only == NULL || strcmp(only, name) == 0;
 }
@@ -350,15 +501,27 @@ int main(int argc, char **argv) {
   }
   if (selected(only, "mode-setfl-signal")) mode_signal_case("mode-setfl-signal", 0, "ms");
   if (selected(only, "mode-fionbio-signal")) mode_signal_case("mode-fionbio-signal", 1, "mf");
+  if (selected(only, "mode-setfl-blocked")) mode_quiet_signal_case("mode-setfl-blocked", 'b', "mb");
+  if (selected(only, "mode-setfl-ignored")) mode_quiet_signal_case("mode-setfl-ignored", 'i', "mi");
+  if (selected(only, "readv-event-signal")) event_signal_case("readv-event-signal", 2, 0, "es");
+  if (selected(only, "readv3-boundary-event-signal")) {
+    event_signal_case("readv3-boundary-event-signal", 3, 0, "e3");
+  }
+  if (selected(only, "readv3-boundary-event-signal-restart")) {
+    event_signal_case("readv3-boundary-event-signal-restart", 3, 1, "e3r");
+  }
+  if (selected(only, "pipe-replaced-eintr")) replaced_signal_case("pipe-replaced-eintr");
   // Leave nothing behind (the watches are gone with their instances).
   char path[96];
-  const char *files[] = {"s/c1", "b/b1", "rb/c1", "ri/c1", "bb/b1", "bb/c1",
-                         "bi/b1", "bi/c1", "bp/b1", "bp/c1"};
+  const char *files[] = {"s/c1",  "b/b1",  "rb/c1", "ri/c1",  "bb/b1",  "bb/c1",  "bi/b1",
+                         "bi/c1", "bp/b1", "bp/c1", "mb/c1",  "mi/c1",  "es/e1",  "es/l1",
+                         "e3/q1", "e3/e1", "e3/l1", "e3r/q1", "e3r/e1", "e3r/l1"};
   for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
     snprintf(path, sizeof path, "%s/%s", root, files[i]);
     unlink(path);
   }
-  const char *dirs[] = {"e", "s", "v", "b", "rb", "ri", "bb", "bi", "bp", "ms", "mf"};
+  const char *dirs[] = {"e",  "s",  "v",  "b",  "rb", "ri", "bb", "bi",
+                        "bp", "ms", "mf", "mb", "mi", "es", "e3", "e3r"};
   for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
     snprintf(path, sizeof path, "%s/%s", root, dirs[i]);
     rmdir(path);

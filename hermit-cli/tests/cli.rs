@@ -42699,14 +42699,17 @@ fn a_read_of_an_unmatched_received_inotify_instance_is_refused_by_name() {
 
 /// The KVM twin of
 /// [`a_read_of_an_unmatched_received_inotify_instance_is_refused_by_name`]
-/// (both of its cases), and the two refusals only KVM meets, each by name
-/// rather than with a result Linux could not give
-/// (tests/c/inotify_blocking_read.c's cases): a
-/// zero-count read of an inotify instance, which KVM's executor refuses
-/// because it cannot show that the host read returns at once; and, without
-/// sequentialized threads, a blocking read that finds nothing queued, which
-/// the executor answers with EAGAIN, an answer Linux never gives a blocking
-/// read, so Detcore refuses it.
+/// (both of its cases), and the refusals only KVM meets, each by name rather
+/// than with a result Linux could not give (tests/c/inotify_blocking_read.c's
+/// cases): with Detcore's refusal relaxed (`--allow-unsupported-syscalls`),
+/// the read of the instance from outside, which KVM's executor refuses
+/// because it would wait in the host; a zero-count read of an inotify
+/// instance, which the executor refuses because it cannot show that the host
+/// read returns at once; and, without sequentialized threads, a blocking read
+/// that finds nothing queued, which the executor answers with EAGAIN, an
+/// answer Linux never gives a blocking read, so Detcore refuses it. The
+/// executor's two refusals end the run as Hermit's policy refusals (exit 122
+/// and the marker), not as a failure of Hermit's.
 #[test]
 fn run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name() {
     if !Path::new("/dev/kvm").exists() {
@@ -42760,6 +42763,46 @@ fn run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name() {
         "{outside}"
     );
 
+    // With Detcore's refusal relaxed, the read reaches the executor, which
+    // refuses it by name (BlockingInotifyRead) rather than wait in the host.
+    let name = format!(
+        "hermit-cli-inotify-outside-kvm-relaxed-{}",
+        std::process::id()
+    );
+    let release = serve_outside_inotify_instance(&name, &dir);
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--network=host",
+        "--allow-unsupported-syscalls",
+        "--",
+        guest.as_str(),
+        "received-outside",
+        name.as_str(),
+        dir.to_str().unwrap(),
+    ];
+    let output = hermit(&args);
+    release();
+    let executor = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {executor}"
+    );
+    assert!(
+        executor.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "{executor}"
+    );
+    assert!(!executor.contains("HERMIT_INTERNAL_FAILURE"), "{executor}");
+    assert!(
+        executor.contains("unsupported KVM read of inotify guest fd"),
+        "{executor}"
+    );
+    assert!(
+        executor.contains("its host description is blocking, so the read would wait in the host"),
+        "{executor}"
+    );
+
     let args = [
         "--backend=kvm",
         "run",
@@ -42772,9 +42815,14 @@ fn run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name() {
     let zero = stderr(&output);
     assert_eq!(
         output.status.code(),
-        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
         "{args:?}: {zero}"
     );
+    assert!(
+        zero.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "{zero}"
+    );
+    assert!(!zero.contains("HERMIT_INTERNAL_FAILURE"), "{zero}");
     assert!(
         zero.contains("unsupported KVM zero-count read on guest fd"),
         "{zero}"

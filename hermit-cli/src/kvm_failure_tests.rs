@@ -337,6 +337,73 @@ async fn kvm_failure_error_retains_scheduler_recording_and_primary_causes() {
     ));
 }
 
+// The KVM executor's refusals by name leave the run's error as a policy
+// refusal (exit 122 with its marker, once the container restores the class)
+// through every wrapping a run's failure takes on its way to the serialization
+// boundary: bare, as a guest thread's worker failure, and with a cleanup error
+// and a failed recording in addition. Every other KVM error stays a backend
+// failure in the same wrappings, and a refusal that is only a cleanup error
+// does not make the run a refusal.
+#[test]
+fn kvm_named_refusals_are_policy_refusals_and_other_errors_stay_failures() {
+    use std::sync::Arc;
+
+    use crate::error::FailureKind;
+    use crate::error::SerializableError;
+
+    let in_worker = |cause| reverie_kvm::Error::WorkerFailure {
+        tid: 5,
+        error: Arc::new(cause),
+    };
+    let with_cleanup = |cause| reverie_kvm::Error::WithCleanup {
+        primary: Arc::new(cause),
+        cleanup: vec![Arc::new(reverie_kvm::Error::HostIo(
+            std::io::Error::from_raw_os_error(libc::EIO),
+        ))],
+    };
+    let recording_failed = || detcore::BackendFailureCleanup {
+        scheduler: Ok(()),
+        preemption_recording: Err("recording control".to_owned()),
+    };
+    let refusals: [fn() -> reverie_kvm::Error; 2] = [
+        || reverie_kvm::Error::PotentiallyBlockingZeroRead { fd: 3 },
+        || reverie_kvm::Error::BlockingInotifyRead { fd: 4 },
+    ];
+    let failures: [fn() -> reverie_kvm::Error; 3] = [
+        || reverie_kvm::Error::UnexpectedVcpuExit("hlt".to_owned()),
+        || reverie_kvm::Error::InvalidGuestPid(-17),
+        || reverie_kvm::Error::HostIo(std::io::Error::from_raw_os_error(libc::EIO)),
+    ];
+    let cases = refusals
+        .iter()
+        .map(|make| (make, FailureKind::PolicyRefusal))
+        .chain(
+            failures
+                .iter()
+                .map(|make| (make, FailureKind::BackendRunFailure)),
+        );
+    for (make, kind) in cases {
+        for error in [
+            kvm_execution_error(make(), None),
+            kvm_execution_error(in_worker(make()), None),
+            kvm_execution_error(with_cleanup(in_worker(make())), Some(recording_failed())),
+        ] {
+            let message = format!("{error:#}");
+            assert_eq!(SerializableError::from(error).kind(), kind, "{message}");
+        }
+    }
+    let secondary = reverie_kvm::Error::WithCleanup {
+        primary: Arc::new(reverie_kvm::Error::RunAborted),
+        cleanup: vec![Arc::new(reverie_kvm::Error::PotentiallyBlockingZeroRead {
+            fd: 3,
+        })],
+    };
+    assert_eq!(
+        SerializableError::from(kvm_execution_error(secondary, None)).kind(),
+        FailureKind::BackendRunFailure
+    );
+}
+
 #[cfg(feature = "kvm-native-test-support")]
 mod combined {
     use std::future::Future;

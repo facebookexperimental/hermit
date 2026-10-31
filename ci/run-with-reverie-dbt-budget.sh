@@ -3177,7 +3177,16 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=d6191234ec270a6270d8b991fc0f0b2f88ef7808
+# CARRY TO a7e7587c3b5167c8a48e262b8871bfb9aef72fc4 (2026-11-01): from d6191234ec270a6270d8b991fc0f0b2f88ef7808.
+# One reverie-kvm-core commit on d6191234: Error::is_named_refusal tells the
+# executor's refusals by name (PotentiallyBlockingZeroRead,
+# BlockingInotifyRead) from its failures, by the original cause.
+# reverie-kvm-core only.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+expected_pin=a7e7587c3b5167c8a48e262b8871bfb9aef72fc4
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

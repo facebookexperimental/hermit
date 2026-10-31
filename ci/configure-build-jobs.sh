@@ -3237,8 +3237,17 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d6191234ec270a6270d8b991fc0f0b2f88ef7808 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d6191234ec270a6270d8b991fc0f0b2f88ef7808 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO a7e7587c3b5167c8a48e262b8871bfb9aef72fc4 (2026-11-01): from d6191234ec270a6270d8b991fc0f0b2f88ef7808.
+# One reverie-kvm-core commit on d6191234: Error::is_named_refusal tells the
+# executor's refusals by name (PotentiallyBlockingZeroRead,
+# BlockingInotifyRead) from its failures, by the original cause.
+# reverie-kvm-core only.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a7e7587c3b5167c8a48e262b8871bfb9aef72fc4 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a7e7587c3b5167c8a48e262b8871bfb9aef72fc4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

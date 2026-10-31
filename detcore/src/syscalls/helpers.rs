@@ -3208,10 +3208,12 @@ where
 }
 
 /// Whether the signal that woke a part of a call that made progress
-/// (`ThreadState::call_progress`), on a backend whose turn does not decide
-/// interruption, would be delivered to the caller now, by its own mask and
-/// dispositions (`own_disposition_interrupts`): a blocked or ignored signal
-/// leaves the part waiting, as it leaves Linux's read waiting.
+/// (`CallParts::progress`), or a read of an inotify instance that is
+/// nonblocking for the guest by now (`interrupted_wait_errno`), on a backend
+/// whose turn does not decide interruption, would be delivered to the caller
+/// now, by its own mask and dispositions (`own_disposition_interrupts`): a
+/// blocked or ignored signal leaves the read waiting, as it leaves Linux's
+/// read waiting.
 async fn progress_signal_interrupts<T, G>(
     guest: &mut G,
     status: ResumeStatus,
@@ -3227,35 +3229,130 @@ where
     own_disposition_interrupts(guest, status, mask_addr, action_addr).await
 }
 
-/// The errno a polled call that would still wait returns when a signal ends
-/// the wait: the call's restart code (`NonblockableSyscall::signal_interrupt_errno`),
-/// except for a read of an inotify instance that is nonblocking for the
-/// guest by now, which another thread's F_SETFL or FIONBIO made it while the
-/// read waited. `inotify_read` tests the file's current O_NONBLOCK before it
-/// looks for a pending signal, so Linux returns EAGAIN there
-/// (<https://github.com/torvalds/linux/blob/v6.17/fs/notify/inotify/inotify_user.c#L249-L299>).
-/// A mode change alone ends no wait: Linux's reader sleeps on until an event
-/// or a signal wakes it, and this applies only at such a wake.
-fn interrupted_wait_errno<T, G, C>(guest: &G, call: C) -> Errno
+/// The open file description of the inotify instance a read began on, if
+/// `call` is a read of one: Linux's read keeps that file through
+/// `ksys_read` whatever another thread later puts at its number
+/// (<https://github.com/torvalds/linux/blob/v6.17/fs/read_write.c#L704-L720>),
+/// so the errno a signal wake returns is that description's to decide
+/// (`interrupted_wait_errno`). A clone shares the description with every
+/// alias, so a later F_SETFL or FIONBIO through any of them shows here.
+fn inotify_description_of<T, G, C>(guest: &G, call: C) -> Option<crate::fd::DetFd>
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
     C: NonblockableSyscall + Into<Syscall>,
 {
-    let interrupt = call.signal_interrupt_errno();
-    let Some(fd) = get_fd(call.into()) else {
-        return interrupt;
-    };
-    let nonblocking_inotify = guest
+    let fd = get_fd(call.into())?;
+    guest
         .thread_state()
         .with_detfd(fd, |detfd| {
-            detfd.ty() == FdType::Inotify && detfd.is_nonblocking()
+            (detfd.ty() == FdType::Inotify).then(|| detfd.clone())
         })
-        .unwrap_or(false);
-    if nonblocking_inotify {
+        .ok()
+        .flatten()
+}
+
+/// The errno a polled call that would still wait returns when a signal ends
+/// the wait: the call's restart code (`NonblockableSyscall::signal_interrupt_errno`),
+/// except for a read that began on an inotify instance (`began_on`,
+/// `inotify_description_of`) that is nonblocking for the guest by now, which
+/// another thread's F_SETFL or FIONBIO made it while the read waited.
+/// `inotify_read` tests the file's current O_NONBLOCK before it looks for a
+/// pending signal, so Linux returns EAGAIN there
+/// (<https://github.com/torvalds/linux/blob/v6.17/fs/notify/inotify/inotify_user.c#L249-L299>).
+/// A mode change alone ends no wait: Linux's reader sleeps on until an event
+/// or a signal it would deliver wakes it, and this applies only at such a
+/// wake (where the turn does not decide, the woken read asks,
+/// `progress_signal_interrupts`). What another thread puts at the
+/// descriptor's number while the read waits changes nothing: the
+/// description the read began on decides.
+fn interrupted_wait_errno<C>(began_on: Option<&crate::fd::DetFd>, call: C) -> Errno
+where
+    C: NonblockableSyscall,
+{
+    if began_on.is_some_and(crate::fd::DetFd::is_nonblocking) {
         Errno::EAGAIN
     } else {
-        interrupt
+        call.signal_interrupt_errno()
+    }
+}
+
+/// A call Detcore runs in parts, one after another (a readv reading on into a
+/// later iovec, `Detcore::readv_inotify`; `ThreadState::call_parts`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CallParts {
+    /// Whether an earlier part transferred bytes. A wake that would deliver
+    /// a signal then ends the part now running with those bytes, and any
+    /// other wake leaves it waiting (`retry_nonblocking_syscall_helper`).
+    pub(crate) progress: bool,
+    /// A signal an earlier part completed with pending. It ends the first
+    /// later part that would wait: Linux's next `->read` finds it with
+    /// `signal_pending()` before it sleeps, so `do_loop_readv_writev` returns
+    /// the bytes read so far
+    /// (<https://github.com/torvalds/linux/blob/v6.17/fs/read_write.c#L835-L866>).
+    pub(crate) carried: Option<CarriedSignal>,
+}
+
+/// What the turn on which a part of a call run in parts completed knew of a
+/// signal that would end a later part (`CallParts::carried`).
+#[derive(Clone, Debug)]
+pub(crate) enum CarriedSignal {
+    /// The turn decided it (`TurnSignals::ends`: a named wake or a pending
+    /// copy that the call's mask and the signal's disposition deliver).
+    Decided,
+    /// A wake the turn did not decide: on a backend whose guest threads are
+    /// not host tasks (KVM), the later part decides from the guest's own mask
+    /// and dispositions (`progress_signal_interrupts`); a backend's own
+    /// observation of a signal (`ResumeStatus::Signaled(None)`) is trusted, as
+    /// a turn trusts it.
+    Wake(ResumeStatus),
+}
+
+/// The signal a part completing on this turn carries to the parts after it
+/// (`CallParts::carried`): one the turn found that would end a part after
+/// progress (`turn`, read where the turn decides), or the turn's signal wake
+/// where it does not. Under the in-guest delivery gate none is carried: each
+/// part decides at its own turns (`gated_wait_ends`).
+fn carried_signal(
+    turn: Option<TurnSignals>,
+    resumed: &ResumeStatus,
+    gated: bool,
+) -> Option<CarriedSignal> {
+    match turn {
+        Some(turn) => turn.ends(true).then_some(CarriedSignal::Decided),
+        None if gated => None,
+        None => matches!(resumed, ResumeStatus::Signaled(_))
+            .then(|| CarriedSignal::Wake(resumed.clone())),
+    }
+}
+
+/// Whether the signal an earlier part of a call run in parts completed with
+/// (`CallParts::carried`) ends the part now running, which would wait. Taken
+/// once: one that would not be delivered leaves the part waiting, and its
+/// later wakes decide. `decides_itself`: the backend's turn does not decide
+/// interruption (KVM), so the guest's own mask and dispositions decide
+/// (`progress_signal_interrupts`).
+async fn carried_signal_ends<T, G>(
+    guest: &mut G,
+    decides_itself: bool,
+    gated: bool,
+) -> Result<bool, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let carried = guest
+        .thread_state_mut()
+        .call_parts
+        .as_mut()
+        .and_then(|parts| parts.carried.take());
+    match carried {
+        None => Ok(false),
+        Some(CarriedSignal::Decided) => Ok(true),
+        Some(CarriedSignal::Wake(status)) if decides_itself => {
+            progress_signal_interrupts(guest, status).await
+        }
+        Some(CarriedSignal::Wake(_)) => Ok(!gated),
     }
 }
 
@@ -3327,8 +3424,16 @@ where
     // pipe write does (`execute_blocking_pipe_write`): the restart errno would
     // end the call with a short count, which the backend's restart of a call
     // with no progress cannot undo.
-    let progress = guest.thread_state().call_progress;
-    let decides_progress_itself = progress && !checks_at_turn && !gated;
+    let progress = guest
+        .thread_state()
+        .call_parts
+        .as_ref()
+        .is_some_and(|parts| parts.progress);
+    let decides_itself = !checks_at_turn && !gated;
+    let decides_progress_itself = progress && decides_itself;
+    // The inotify instance a read began on, whose own O_NONBLOCK decides the
+    // errno a signal wake returns (`interrupted_wait_errno`).
+    let began_on = inotify_description_of(guest, call0);
     // Where the turn decides, each probe owns the guest's mask while it blocks
     // every blockable signal (`KernelSignalWait::block_in_place`). The mask
     // goes back before a retry yields, so target selection still sees which
@@ -3416,12 +3521,24 @@ where
         // A call that has transferred nothing ends only for a copy still
         // pending; a part after progress ends for a named wake too
         // (`TurnSignals::ends`, `progress` above).
+        // A read that began on an inotify instance that is nonblocking for
+        // the guest by now ends at a signal wake with EAGAIN
+        // (`interrupted_wait_errno`), which, unlike the restart errno, no
+        // backend's restart of a call whose signal it would not deliver
+        // undoes. Where the turn does not decide, it decides as a part after
+        // progress does: a blocked or ignored signal leaves it waiting, as
+        // it leaves Linux's reader asleep.
+        let mode_wake_decides_itself = decides_itself
+            && began_on
+                .as_ref()
+                .is_some_and(crate::fd::DetFd::is_nonblocking);
         let signaled = match turn {
             Some(turn) => turn.ends(progress),
             None if gated => false,
             // Continuation parts are scalar reads, whose nonblocking form
-            // holds no scratch stack (`network_comm_syscall`).
-            None if decides_progress_itself
+            // holds no scratch stack (`network_comm_syscall`), as does every
+            // read and readv.
+            None if (decides_progress_itself || mode_wake_decides_itself)
                 && maybe_stackguard.is_none()
                 && matches!(resumed, ResumeStatus::Signaled(_)) =>
             {
@@ -3563,8 +3680,28 @@ where
         {
             break result;
         }
+        // A part after progress that would wait while a signal an earlier
+        // part completed with is still pending ends, as Linux's next `->read`
+        // does when it finds `signal_pending()` before it sleeps
+        // (`CallParts::carried`).
+        let carried_ends =
+            if progress && !signaled && call.syscall_would_have_blocked(syscall_result) {
+                match carried_signal_ends(
+                    guest,
+                    decides_progress_itself && maybe_stackguard.is_none(),
+                    gated,
+                )
+                .await
+                {
+                    Ok(ends) => ends,
+                    Err(error) => break Err(error),
+                }
+            } else {
+                false
+            };
+        let signaled = signaled || carried_ends;
         if signaled && call.syscall_would_have_blocked(syscall_result) {
-            let errno = interrupted_wait_errno(guest, call);
+            let errno = interrupted_wait_errno(began_on.as_ref(), call);
             tracing::trace!(
                 "retry_nonblocking_syscall: interrupted by signal while {} would block: {:?}",
                 call.display(&guest.memory()),
@@ -3577,7 +3714,7 @@ where
         // before it parked or one whose commit woke it.
         if gated && call.syscall_would_have_blocked(syscall_result) {
             match gated_wait_ends(guest, None) {
-                Ok(true) => break Err(interrupted_wait_errno(guest, call).into()),
+                Ok(true) => break Err(interrupted_wait_errno(began_on.as_ref(), call).into()),
                 Ok(false) => {}
                 Err(error) => break Err(error),
             }
@@ -3626,6 +3763,14 @@ where
                 record_retry_event(guest, call).await;
             }
         } else {
+            // A part of a call run in parts completes: a signal this turn
+            // found, which would end a later part, stays pending for the
+            // parts after it, as Linux's does (`CallParts::carried`).
+            if let Some(carried) = carried_signal(turn, &resumed, gated)
+                && let Some(parts) = guest.thread_state_mut().call_parts.as_mut()
+            {
+                parts.carried = Some(carried);
+            }
             let normalized =
                 call.normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0);
             if normalized != syscall_result {
@@ -7992,18 +8137,21 @@ pub(crate) mod kernel_signal_wait_failures {
     }
 
     /// A signal that ends a polled read that would still wait returns the
-    /// read's restart errno, except for an inotify read whose descriptor is
-    /// nonblocking for the guest by then, as another thread's F_SETFL or
-    /// FIONBIO makes it during the wait: `inotify_read` tests O_NONBLOCK
-    /// before a pending signal, so Linux returns EAGAIN. A pipe read keeps
-    /// the restart errno, as `pipe_read`'s interrupted wait returns
-    /// -ERESTARTSYS itself.
+    /// read's restart errno, except for a read that began on an inotify
+    /// instance that is nonblocking for the guest by then, as another
+    /// thread's F_SETFL or FIONBIO makes it during the wait: `inotify_read`
+    /// tests O_NONBLOCK before a pending signal, so Linux returns EAGAIN. A
+    /// pipe read keeps the restart errno, as `pipe_read`'s interrupted wait
+    /// returns -ERESTARTSYS itself. The description the read began on
+    /// decides, not what its number names at the wake: a pipe read whose
+    /// number a sibling's dup2 points at a nonblocking inotify instance keeps
+    /// the restart errno, as Linux's read keeps the pipe it began on.
     #[test]
     fn a_signal_ends_an_inotify_read_made_nonblocking_meanwhile_with_eagain() {
         use std::os::fd::AsRawFd;
         use std::os::fd::FromRawFd;
 
-        let (guest, _) = WaitGuest::live(guest_mask());
+        let (mut guest, _) = WaitGuest::live(guest_mask());
         // SAFETY: inotify_init1 returns a new owned descriptor.
         let inotify = unsafe {
             std::fs::File::from_raw_fd(libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC))
@@ -8025,12 +8173,16 @@ pub(crate) mod kernel_signal_wait_failures {
                 .unwrap();
         }
         let read = |fd| syscalls::Read::new().with_fd(fd);
+        let inotify_read = inotify_description_of(&guest, read(inotify));
+        let pipe_read = inotify_description_of(&guest, read(pipe));
+        assert!(inotify_read.is_some());
+        assert!(pipe_read.is_none(), "only an inotify read is bound");
         assert_eq!(
-            interrupted_wait_errno(&guest, read(inotify)),
+            interrupted_wait_errno(inotify_read.as_ref(), read(inotify)),
             Errno::ERESTARTSYS
         );
         assert_eq!(
-            interrupted_wait_errno(&guest, read(pipe)),
+            interrupted_wait_errno(pipe_read.as_ref(), read(pipe)),
             Errno::ERESTARTSYS
         );
         for fd in [inotify, pipe] {
@@ -8039,15 +8191,98 @@ pub(crate) mod kernel_signal_wait_failures {
                 .with_detfd(fd, |d| d.set_logical_nonblocking(true))
                 .unwrap();
         }
-        assert_eq!(interrupted_wait_errno(&guest, read(inotify)), Errno::EAGAIN);
         assert_eq!(
-            interrupted_wait_errno(&guest, syscalls::Readv::new().with_fd(inotify)),
+            interrupted_wait_errno(inotify_read.as_ref(), read(inotify)),
             Errno::EAGAIN
         );
         assert_eq!(
-            interrupted_wait_errno(&guest, read(pipe)),
+            interrupted_wait_errno(
+                inotify_read.as_ref(),
+                syscalls::Readv::new().with_fd(inotify)
+            ),
+            Errno::EAGAIN
+        );
+        assert_eq!(
+            interrupted_wait_errno(pipe_read.as_ref(), read(pipe)),
             Errno::ERESTARTSYS
         );
+        // A sibling's dup2 points the pipe read's number at the nonblocking
+        // inotify instance: the read began on the pipe, whose restart errno
+        // stands.
+        guest
+            .thread
+            .dup_fd(inotify, pipe, nix::fcntl::OFlag::empty())
+            .unwrap();
+        assert_eq!(
+            interrupted_wait_errno(pipe_read.as_ref(), read(pipe)),
+            Errno::ERESTARTSYS
+        );
+        assert!(inotify_description_of(&guest, read(pipe)).is_some());
+    }
+
+    /// The signal a part of a call run in parts completes with carries to the
+    /// parts after it (`carried_signal`): one the turn found that would end a
+    /// part after progress, a pending copy or a named wake; where the turn does
+    /// not decide, its signal wake; and none under the in-guest delivery gate
+    /// or for a turn that found nothing. It ends the first later part that
+    /// would wait, once (`carried_signal_ends`).
+    #[test]
+    fn a_part_carries_the_signal_its_turn_found_to_the_next() {
+        let pending = TurnSignals {
+            named: 0,
+            pending: kernel_sigset_bit(libc::SIGUSR1),
+        };
+        let named = TurnSignals {
+            named: kernel_sigset_bit(libc::SIGUSR1),
+            pending: 0,
+        };
+        let wake = ResumeStatus::Signaled(None);
+        assert!(matches!(
+            carried_signal(Some(pending), &ResumeStatus::Normal, false),
+            Some(CarriedSignal::Decided)
+        ));
+        assert!(matches!(
+            carried_signal(Some(named), &wake, false),
+            Some(CarriedSignal::Decided)
+        ));
+        assert!(carried_signal(Some(TurnSignals::default()), &wake, false).is_none());
+        assert!(matches!(
+            carried_signal(None, &wake, false),
+            Some(CarriedSignal::Wake(ResumeStatus::Signaled(None)))
+        ));
+        assert!(carried_signal(None, &wake, true).is_none());
+        assert!(carried_signal(None, &ResumeStatus::Normal, false).is_none());
+
+        let (mut guest, _) = WaitGuest::live(guest_mask());
+        let ends = |guest: &mut WaitGuest, carried, decides_itself, gated| {
+            guest.thread.call_parts = Some(CallParts {
+                progress: true,
+                carried,
+            });
+            let ends =
+                futures::executor::block_on(carried_signal_ends(guest, decides_itself, gated))
+                    .unwrap();
+            let left = guest.thread.call_parts.as_ref().unwrap().carried.is_some();
+            (ends, left)
+        };
+        assert_eq!(
+            ends(&mut guest, Some(CarriedSignal::Decided), false, false),
+            (true, false)
+        );
+        assert_eq!(
+            ends(
+                &mut guest,
+                Some(CarriedSignal::Wake(wake.clone())),
+                false,
+                false
+            ),
+            (true, false)
+        );
+        assert_eq!(
+            ends(&mut guest, Some(CarriedSignal::Wake(wake)), false, true),
+            (false, false)
+        );
+        assert_eq!(ends(&mut guest, None, false, false), (false, false));
     }
 
     #[test]

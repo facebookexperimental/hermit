@@ -1942,7 +1942,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the batched round's targeted rerun at the merged head (the six
     // forced-gate rows fail only for want of a locally built liteinst
     // runtime, which the validate builds; they pass there).
-    ("test.hermit_unit", 1329),
+    // The KVM executor's refusals by name as policy refusals
+    // (https://github.com/rrnewton/hermit/issues/4768) add one hermit-run
+    // unit: 1329 + 1 = 1330.
+    ("test.hermit_unit", 1330),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3207,8 +3210,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4768) add three detcore units:
     // 3348 + 3 = 3351, by nextest list. Their review fixes add two more (an
     // unknown blocking mode, and EAGAIN for a read made nonblocking during
-    // its wait): 3351 + 2 = 3353, by nextest list.
-    ("test.detcore_unit", 3353),
+    // its wait): 3351 + 2 = 3353, by nextest list. Their second review adds
+    // one more (a signal a readv part's turn found carries to the next part):
+    // 3353 + 1 = 3354, by nextest list.
+    ("test.detcore_unit", 3354),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5717,7 +5722,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same twenty-seven N3 detcore units: 3321 + 27 = 3348.
     // The same three blocking-inotify units: 3348 + 3 = 3351.
     // The same two blocking-inotify review-fix units: 3351 + 2 = 3353.
-    ("test.detcore_unit_on_host", 3353),
+    // The same blocking-inotify second-review unit: 3353 + 1 = 3354.
+    ("test.detcore_unit_on_host", 3354),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6124,7 +6130,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same four T2 and replay-refusal units as test.hermit_unit:
     // 1319 + 4 = 1323 (carried: the hosted lane did not run here; the
     // portable twin executed 1329 in the targeted rerun).
-    ("test.hermit_unit_on_host", 1323),
+    // The same KVM named-refusal unit: 1323 + 1 = 1324.
+    ("test.hermit_unit_on_host", 1324),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

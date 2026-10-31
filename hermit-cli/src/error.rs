@@ -172,6 +172,7 @@ fn is_policy_refusal(err: &Error) -> bool {
             || cause.is::<reverie_ptrace::UntracedStubSyscall>()
             || is_chosen_root_id_taken(cause)
             || is_kvm_host_resources_refusal(cause)
+            || is_kvm_named_refusal(cause)
     }
     // The KVM backend's end of a run whose exec it could not finish past the
     // exec's point of no return, because a host resource of Hermit's own
@@ -186,6 +187,21 @@ fn is_policy_refusal(err: &Error) -> bool {
     }
     #[cfg(not(target_arch = "x86_64"))]
     fn is_kvm_host_resources_refusal(_cause: &(dyn std::error::Error + 'static)) -> bool {
+        false
+    }
+    // The KVM executor's refusals by name (`reverie_kvm::Error::is_named_refusal`,
+    // decided by the failure's original cause beneath Reverie's wrappers): an
+    // operation it declines because it cannot perform it faithfully, such as a
+    // read that would wait in the host. Every other KVM error stays a backend
+    // failure.
+    #[cfg(target_arch = "x86_64")]
+    fn is_kvm_named_refusal(cause: &(dyn std::error::Error + 'static)) -> bool {
+        cause
+            .downcast_ref::<reverie_kvm::Error>()
+            .is_some_and(reverie_kvm::Error::is_named_refusal)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn is_kvm_named_refusal(_cause: &(dyn std::error::Error + 'static)) -> bool {
         false
     }
     // The guest's first process could not have its chosen ID

@@ -1038,8 +1038,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// one returns less than its iovec or fails, and the counts add up; once
     /// something has been read, a later part that fails returns the bytes
     /// read so far, as `do_loop_readv_writev` does. A signal ends such a part
-    /// only where it would be delivered (`ThreadState::call_progress`). Each
-    /// part's events get their cookies as one read's do ([`finish`]).
+    /// only where it would be delivered, whether it wakes the part or an
+    /// earlier part completed with it pending, as Linux's next part finds it
+    /// with `signal_pending()` before it sleeps (`ThreadState::call_parts`).
+    /// Each part's events get their cookies as one read's do ([`finish`]).
     ///
     /// Every part reads into the buffers the array named when the call began:
     /// Linux imports the array once (`import_iovec`), before it reads or
@@ -1048,6 +1050,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// observers that read the call's arguments after it returns see that
     /// array too (`ThreadState::entry_import`).
     pub(crate) async fn readv_inotify<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+    ) -> Result<i64, Error> {
+        guest.thread_state_mut().call_parts = Some(crate::syscalls::helpers::CallParts::default());
+        let result = self.readv_inotify_parts(guest, call).await;
+        guest.thread_state_mut().call_parts = None;
+        result
+    }
+
+    /// [`Self::readv_inotify`]'s parts, run while `ThreadState::call_parts`
+    /// is set.
+    async fn readv_inotify_parts<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Readv,
@@ -1085,13 +1100,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // What the first part kept for the call's observers, which the parts
         // after it, plain reads, would otherwise clear.
         let first_view = guest.thread_state().entry_import.clone();
+        // Every part from here on follows one that transferred bytes.
+        if let Some(parts) = guest.thread_state_mut().call_parts.as_mut() {
+            parts.progress = true;
+        }
         let result = loop {
             let (base, size) = layout.at(next);
             let part = syscalls::Read::new()
                 .with_fd(fd)
                 .with_buf(AddrMut::from_raw(base))
                 .with_len(size);
-            guest.thread_state_mut().call_progress = true;
             let (result, _, _) = self
                 .inotify_read_part(
                     guest,
@@ -1101,7 +1119,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Some(Destination::buffer(base, size)),
                 )
                 .await;
-            guest.thread_state_mut().call_progress = false;
             match result {
                 Ok(length) if usize::try_from(length) == Ok(size) => {
                     done += size;

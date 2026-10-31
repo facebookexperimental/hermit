@@ -14139,8 +14139,9 @@ test:
     modes:
       verify:
         ci: true
-        # Qualified 2026-10-31: 21 of 21 canonical strict verify pairs each on ptrace and KVM,
-        # stdout identical to the native run's.
+        # Qualified 2026-10-31 with its seventeen cases (sixteen on KVM, below): 21 of 21
+        # canonical strict verify pairs each on ptrace and KVM, stdout identical to the native
+        # run's.
         backends_enabled:
           - ptrace
           - kvm
