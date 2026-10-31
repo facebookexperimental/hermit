@@ -41,8 +41,10 @@ The default installation includes **ptrace and KVM**. SaBRe support, e9patch
 preprocessing and LiteInst are off by default and require their explicit Cargo
 features plus separately supplied runtime artifacts. DBT is available through
 [source builds](https://github.com/rrnewton/hermit), rather than this registry
-release. KVM requires read/write access to `/dev/kvm`, compatible CPU features
-and performance counters; ptrace is the default execution path.
+release. KVM requires read/write access to `/dev/kvm`, compatible CPU features,
+performance counters and an unlimited address-space limit (`ulimit -v`; it
+refuses to start under a finite `RLIMIT_AS`); ptrace is the default execution
+path.
 
 ### Ubuntu AppArmor and user namespaces
 

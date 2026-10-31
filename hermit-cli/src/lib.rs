@@ -46,6 +46,7 @@ mod id;
 #[cfg(feature = "liteinst")]
 pub mod in_guest_exits;
 pub mod instruction_map;
+pub mod kvm_address_space;
 #[cfg(feature = "liteinst")]
 use hermit_record_format::interp;
 pub mod liteinst_bootstrap;
@@ -3842,6 +3843,10 @@ async fn run_kvm(
     capture_output: bool,
 ) -> Result<Output, Error> {
     let dispatch_started = Instant::now();
+    // Before anything is reserved: under a finite RLIMIT_AS the run would
+    // stop wherever the guest's process tree put the backend's peak
+    // reservation (kvm_address_space), so it is refused here, every time.
+    kvm_address_space::admit_kvm_address_space(KVM_GUEST_MEMORY_BYTES)?;
     // A caller that built no container (a library caller): the KVM guest's
     // host file operations run in this process's namespace, whatever its
     // command asks (the backend applies no chroot or mount of the command),

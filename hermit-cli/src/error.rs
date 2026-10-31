@@ -268,6 +268,9 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         || error
             .chain()
             .any(|cause| cause.is::<crate::preemption_admission::UnqualifiedAnnotatedReplay>())
+        || error
+            .chain()
+            .any(|cause| cause.is::<crate::kvm_address_space::KvmAddressSpaceRefusal>())
     {
         FailureKind::PolicyRefusal
     } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {
@@ -511,6 +514,23 @@ mod tests {
         assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
         assert!(serialized.context.iter().any(|message| {
             message.contains("unsupported_preemption") && message.contains("--backend=dbt")
+        }));
+    }
+
+    #[test]
+    fn a_kvm_address_space_refusal_keeps_its_policy_class_across_the_container_boundary() {
+        let refusal = crate::kvm_address_space::KvmAddressSpaceRefusal::for_limit(
+            libc::rlimit {
+                rlim_cur: 16 << 30,
+                rlim_max: 16 << 30,
+            },
+            3 << 30,
+        )
+        .expect("a finite limit is refused");
+        let serialized = SerializableError::from(Error::new(refusal).context("launch refused"));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(serialized.context.iter().any(|message| {
+            message.contains("kvm_address_space_limit") && message.contains("--backend=kvm")
         }));
     }
 

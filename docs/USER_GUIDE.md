@@ -345,7 +345,11 @@ shares the caller's network and remains incompatible with `--strict`.
 
 The same executable accepts `--backend=sabre` and `--backend=e9patch`.
 A default `cargo install` does not enable these selections. KVM requires
-read-write `/dev/kvm` access plus a guest-kernel ABI.
+read-write `/dev/kvm` access plus a guest-kernel ABI, and an unlimited
+address-space limit: it reserves 3 GiB of host address space for every guest
+process and each exec, so Hermit refuses to start it under a finite
+`RLIMIT_AS` (`kvm_address_space_limit`, exit 122; see
+[ERROR_CATALOG.md](ERROR_CATALOG.md)). Bound its memory with a cgroup instead.
 
 See [SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for the measured
 `Stripped` allowlist, build commands, and known gaps. An enabled probe is

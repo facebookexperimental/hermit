@@ -207,7 +207,9 @@ cargo build --release --workspace --features hermit-run/third-party-backends
 
 Use the staged executable for these backends; a default `cargo install` does
 not enable them. KVM requires read-write `/dev/kvm` access plus its guest-kernel
-Linux ABI.
+Linux ABI, and an unlimited address-space limit (`ulimit -v`): it reserves 3 GiB
+of host address space for every guest process and each exec, and Hermit refuses
+to start it (exit 122) under a finite `RLIMIT_AS`.
 
 SaBRe and e9patch preprocessing are **archived** since 2026-10-25: they still
 build and keep per-commit smoke checks, but they get no feature work. SaBRe's
