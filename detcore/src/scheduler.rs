@@ -7702,6 +7702,11 @@ impl Scheduler {
             fair.reassign(caller, new_leader);
         }
         self.discarded_at_send.rekey_thread(caller, new_leader);
+        // The access trace's sends waiting on the caller's queue move with
+        // it, before `logically_kill_thread(&caller)` below forgets its id.
+        if let Some(writer) = self.access_trace.as_mut() {
+            writer.rekey_thread(caller, new_leader);
+        }
         self.work_span_transfer_thread(caller, new_leader);
 
         let survivor_priority = match replay_resume {
@@ -33468,6 +33473,117 @@ mod test {
                 tid: joiner,
                 event: 3
             }
+        );
+    }
+
+    /// A non-leader exec keeps the caller's own pending signals under the
+    /// leader's tid (Linux's `de_thread` keeps the exec caller, and
+    /// `exchange_tids` gives it the leader's id), so the access trace's
+    /// sends to the caller follow it through the scheduler's exec handoff.
+    /// Thread 41 of process 40 queues SIGUSR1 to itself with a forged
+    /// SI_USER naming process 50, and thread 50 tkills SIGUSR2 to thread 41.
+    /// Thread 41 execs and goes on as 40, and process 50 kills process 40
+    /// with SIGUSR1. Linux delivers 41's own SIGUSR1 first, and that
+    /// delivery must not take 50's kill as its cause; the SIGUSR2 delivery
+    /// to 40 keeps its edge from the tkill.
+    #[test]
+    fn a_nonleader_exec_keeps_the_callers_pending_sends_under_the_leader() {
+        use detcore_model::access_trace::EventRef;
+        use detcore_model::access_trace::ObservedSignalDisposition;
+        use detcore_model::schedule::Op;
+
+        use crate::access_trace::AccessPayload;
+        use crate::access_trace::SyscallEntry;
+        use crate::access_trace::SyscallOutcome;
+        let (leader, caller, killer) = (
+            DetTid::from_raw(40),
+            DetTid::from_raw(41),
+            DetTid::from_raw(50),
+        );
+        let (usr1, usr2) = (libc::SIGUSR1, libc::SIGUSR2);
+        let mut sched = Scheduler::new(&Config::default());
+        let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+        let (writer, bytes) = crate::access_trace::in_memory_writer();
+        sched.access_trace = Some(writer);
+        let call = |sched: &mut Scheduler, pre: u64, tid: DetTid, sysno: Sysno, args: [u64; 6]| {
+            let pid = DetPid::from_raw(if tid == killer { 50 } else { 40 });
+            let writer = sched.access_trace.as_mut().unwrap();
+            writer.observe(
+                pre,
+                &SchedEvent::syscall(tid, sysno, SyscallPhase::Prehook),
+                Some(AccessPayload::SyscallEntry(SyscallEntry {
+                    pid,
+                    nth: 1,
+                    sysno,
+                    args,
+                    accesses: Vec::new(),
+                })),
+                &ThreadTree::default(),
+            );
+            writer.observe(
+                pre + 1,
+                &SchedEvent::syscall(tid, sysno, SyscallPhase::Posthook),
+                Some(AccessPayload::SyscallExit(Box::new(SyscallOutcome {
+                    result: 0,
+                    accesses: Vec::new(),
+                    returned: None,
+                    out_bytes: None,
+                }))),
+                &ThreadTree::default(),
+            );
+        };
+        // A delivery to the leader whose siginfo names process 50.
+        let deliver = |sched: &mut Scheduler, index: u64, signo: i32, code: i32| {
+            let mut info = [0u8; 128];
+            info[8..12].copy_from_slice(&code.to_ne_bytes());
+            info[16..20].copy_from_slice(&50i32.to_ne_bytes());
+            let note = crate::access_trace::signal_note(
+                signo,
+                Some(&info),
+                ObservedSignalDisposition::Handler,
+            );
+            sched.access_trace.as_mut().unwrap().observe(
+                index,
+                &SchedEvent {
+                    op: Op::SignalReceived(SigWrapper(signo)),
+                    ..SchedEvent::branches(leader, 1)
+                },
+                Some(AccessPayload::Signal(note)),
+                &ThreadTree::default(),
+            );
+        };
+        let queue = [40, 41, usr1 as u64, 0, 0, 0];
+        call(&mut sched, 1, caller, Sysno::rt_tgsigqueueinfo, queue);
+        let tkill = [41, usr2 as u64, 0, 0, 0, 0];
+        call(&mut sched, 3, killer, Sysno::tkill, tkill);
+        assert_eq!(
+            reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm),
+            vec![leader, caller]
+        );
+        let kill = [40, usr1 as u64, 0, 0, 0, 0];
+        call(&mut sched, 5, killer, Sysno::kill, kill);
+        call(&mut sched, 7, leader, Sysno::getpid, [0; 6]);
+        deliver(&mut sched, 9, usr1, libc::SI_USER);
+        deliver(&mut sched, 10, usr2, libc::SI_TKILL);
+        sched.access_trace.take().unwrap().finish(11).unwrap();
+        let edges: Vec<(EventRef, EventRef, SyncObject)> = crate::access_trace::edges_of(&bytes)
+            .into_iter()
+            .filter(|edge| edge.kind == EdgeKind::Signal)
+            .map(|edge| (edge.from, edge.to, edge.object))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![(
+                EventRef {
+                    tid: killer,
+                    event: 3
+                },
+                EventRef {
+                    tid: leader,
+                    event: 10
+                },
+                SyncObject::Signal(usr2)
+            )]
         );
     }
 

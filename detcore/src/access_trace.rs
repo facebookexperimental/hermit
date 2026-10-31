@@ -1505,6 +1505,26 @@ impl AccessTraceWriter {
         edges.evicted.retain(|signal| !to_it(signal));
     }
 
+    /// `former` exec'd from a thread other than its process's leader and
+    /// goes on as `leader`. Linux keeps the exec caller's task and gives it
+    /// the leader's thread id, and the signals pending for that task alone
+    /// stay queued on it. So the sends to `former` alone, pending or
+    /// evicted, now target `leader`. The scheduler calls this after it has
+    /// retired the old leader, whose own sends Linux discards with it, and
+    /// before it retires `former`'s id ([`Self::note_thread_gone`]), which
+    /// would otherwise drop them: a sigqueue send to itself that keeps its
+    /// process's deliveries of that signal without an edge
+    /// ([`SendKind::Queue`]), and a tkill whose delivery to the leader it
+    /// causes.
+    pub fn rekey_thread(&mut self, former: DetTid, leader: DetTid) {
+        let edges = &mut self.edges;
+        for signal in edges.signals.iter_mut().chain(edges.evicted.iter_mut()) {
+            if signal.target == Task::Thread(former) {
+                signal.target = Task::Thread(leader);
+            }
+        }
+    }
+
     /// Make room for one more pending send (see [`MAX_PENDING_SIGNALS`]).
     fn evict_pending_signal(&mut self) {
         let signals = &self.edges.signals;
