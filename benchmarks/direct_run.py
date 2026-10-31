@@ -111,6 +111,17 @@ def measure_idle_fractions(sample_s: float = 0.5) -> dict[int, float]:
     return fractions
 
 
+def bounds_for(backend: str, cpu: int, timeout_s: float, memory_mb: int,
+               kvm_memory_mb: int, output_cap: int) -> "Bounds":
+    """Per-backend bounds. KVM rows get the larger address-space limit:
+    KVM's host VA footprint plus exec-time allocations exceed 16 GiB and
+    the host ENOMEM then reaches the guest's execve (intermittent exit
+    126; https://github.com/rrnewton/reverie/issues/1225). Without the
+    16 GiB limit the same cells failed 0/88."""
+    return Bounds(cpu, timeout_s,
+                  kvm_memory_mb if backend == "kvm" else memory_mb, output_cap)
+
+
 class Bounds:
     def __init__(self, cpu: int, timeout_s: float, memory_mb: int, output_cap: int):
         self.cpu = cpu
@@ -244,6 +255,8 @@ def main() -> int:
     ap.add_argument("--warmups", type=int, default=1)
     ap.add_argument("--timeout", type=float, default=120.0)
     ap.add_argument("--memory-mb", type=int, default=16384)
+    ap.add_argument("--kvm-memory-mb", type=int, default=65536,
+                    help="RLIMIT_AS for KVM rows (default 65536 MiB; see bounds_for)")
     ap.add_argument("--output-cap", type=int, default=8 * 1024 * 1024)
     ap.add_argument("--cpu", type=int, default=None)
     ap.add_argument("--getpid-counts", default="0,10000,50000,100000")
@@ -258,7 +271,11 @@ def main() -> int:
         ap.error(f"unknown backends: {sorted(bad)}")
     cpu = args.cpu if args.cpu is not None else pick_quiet_cpu(
         measure_idle_fractions(), set(os.sched_getaffinity(0)))
-    bounds = Bounds(cpu, args.timeout, args.memory_mb, args.output_cap)
+    def make_bounds(backend: str) -> Bounds:
+        return bounds_for(backend, cpu, args.timeout, args.memory_mb,
+                          args.kvm_memory_mb, args.output_cap)
+
+    bounds = make_bounds(backends[0] if backends else "native")
     counts = [int(c) for c in args.getpid_counts.split(",")]
 
     fixture_src = ROOT / "benchmarks/fixtures/getpid_loop.c"
@@ -278,6 +295,8 @@ def main() -> int:
         "iterations": args.iterations,
         "warmups": args.warmups,
         "bounds": bounds.describe(),
+        "bounds_kvm": make_bounds("kvm").describe(),
+        "bounds_note": "KVM rows use --kvm-memory-mb RLIMIT_AS (reverie#1225); other backends use --memory-mb",
         "relaxations": {"liteinst": "--max-timeslice=disabled", "others": "none (--strict)"},
         "loadavg_start": load_start,
         "workloads": {},
@@ -286,7 +305,7 @@ def main() -> int:
     # Startup: hermit run -- /bin/true (native: direct /bin/true).
     startup = {}
     for b in backends:
-        startup[b] = measure(hermit_cmd(args.hermit, b, ["/bin/true"]), bounds,
+        startup[b] = measure(hermit_cmd(args.hermit, b, ["/bin/true"]), make_bounds(b),
                              "", args.iterations, args.warmups)
         print(f"startup {b}: {startup[b].get('wall', {}).get('median')}", file=sys.stderr)
     results["workloads"]["startup_true"] = startup
@@ -297,7 +316,7 @@ def main() -> int:
         per_count = {}
         for n in counts:
             per_count[str(n)] = measure(
-                hermit_cmd(args.hermit, b, [str(fixture), str(n)]), bounds,
+                hermit_cmd(args.hermit, b, [str(fixture), str(n)]), make_bounds(b),
                 f"calls={n}", args.iterations, args.warmups)
         xs = [float(n) for n in counts if n > 0]
         ys = [per_count[str(int(x))]["wall"]["median"] for x in xs
@@ -339,7 +358,7 @@ def main() -> int:
             per_backend = {}
             for b in backends:
                 per_backend[b] = measure(
-                    hermit_cmd(args.hermit, b, entry["argv"]), bounds, None,
+                    hermit_cmd(args.hermit, b, entry["argv"]), make_bounds(b), None,
                     args.iterations, args.warmups,
                     extra_env=spec_env)
                 wall = per_backend[b].get("wall", {}).get("median")

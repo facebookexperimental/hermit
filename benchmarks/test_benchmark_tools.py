@@ -52,6 +52,16 @@ class TestDirectRun(unittest.TestCase):
         self.assertTrue(desc["bound.wall"].startswith("APPLIED"))
 
 
+    def test_bounds_for_kvm_gets_larger_as_limit(self):
+        kvm = direct.bounds_for("kvm", cpu=1, timeout_s=10, memory_mb=16384,
+                                kvm_memory_mb=65536, output_cap=100)
+        ptrace = direct.bounds_for("ptrace", cpu=1, timeout_s=10,
+                                   memory_mb=16384, kvm_memory_mb=65536,
+                                   output_cap=100)
+        self.assertEqual(kvm.memory_mb, 65536)
+        self.assertEqual(ptrace.memory_mb, 16384)
+        self.assertIn("65536MiB", kvm.describe()["bound.memory"])
+
     def test_prepare_command(self):
         entry = {"argv": ["/bin/bash", "x.sh", "--run"], "prepare_script": True}
         self.assertEqual(direct.prepare_command(entry),
