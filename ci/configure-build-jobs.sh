@@ -3140,7 +3140,7 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-# CARRY TO 0c35d21fca4485fac3194071b13b6e34f6573f1b (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
+# CARRY TO 641887661b506b4d856489eb06787bc5b4f40a28 (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
 # Interval: reverie train (1111, 1116, 1136, 1147, 1148, 1152, 1155,
 # 1160, 1161, 1162, 1178, 1179). The reverie-dbt tree is unchanged;
 # reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
@@ -3161,105 +3161,18 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-# F1 CARRY TO d4307cec5902cbdc38a48f6222833a593003b525: native recipe input objects equal 0c35d21fca4485fac3194071b13b6e34f6573f1b.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 3d6dd4be69a01c7ff80039e7736a350a4e525865: native recipe input objects equal d4307cec5902cbdc38a48f6222833a593003b525.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 01e1ca4f2e0bc828dd5cb7e51117538c07ab0dd8: native recipe input objects equal 3d6dd4be69a01c7ff80039e7736a350a4e525865.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 61db78e2e0b2e140d620de6b465f6ba07ef2b5ec: native recipe input objects equal 01e1ca4f2e0bc828dd5cb7e51117538c07ab0dd8.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 3c76566c09cb543cc04fb71bc9d3823c614eb7f5: native recipe input objects equal 61db78e2e0b2e140d620de6b465f6ba07ef2b5ec.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 92a45068a62fbd28a038a5c56decc21bb7648428: native recipe input objects equal 3c76566c09cb543cc04fb71bc9d3823c614eb7f5.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 26b7b1b9e74bb26aa3d6d1a08bf36e0640365c41: native recipe input objects equal 92a45068a62fbd28a038a5c56decc21bb7648428.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO c0711049d706f031e1e4df218dc8b0da44915fa3: native recipe input objects equal 26b7b1b9e74bb26aa3d6d1a08bf36e0640365c41.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 66fd12532383c54499a36c9742d6a708ccab1192: native recipe input objects equal c0711049d706f031e1e4df218dc8b0da44915fa3.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO d0f99b24a6fedfb10bd538e7127b61cb850fc939: native recipe input objects equal 66fd12532383c54499a36c9742d6a708ccab1192.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 3872090227e6cd77d4a2ae7bf4994569680e25c9: native recipe input objects equal d0f99b24a6fedfb10bd538e7127b61cb850fc939.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 0d71f7272e88746651dd28e83728a78b8acafed2: native recipe input objects equal 3872090227e6cd77d4a2ae7bf4994569680e25c9.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 9e2495120befa75e4fa4934d054a5c5507023079: native recipe input objects equal 0d71f7272e88746651dd28e83728a78b8acafed2.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 0caf8e11f0e6198db5699814c792612b75568276: native recipe input objects equal 9e2495120befa75e4fa4934d054a5c5507023079.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# F1 CARRY TO 78e3cadac76b5cc3b937f46d63d2e1d73e9973f6: native recipe input objects equal 0caf8e11f0e6198db5699814c792612b75568276.
-# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
-# This pin changes no tool selection or native recipe; limits retained.
-# This is budget carry, not a native cache HIT or a fresh timing sample.
-# CARRY TO 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 (2026-10-31): from 78e3cadac76b5cc3b937f46d63d2e1d73e9973f6.
-# Interval: the kvm lane's vfork-style children while the address space holds
-# shared-file views (071fa36a), sparse private copies for snapshots of such an
-# address space (877808ed), a test that a vfork child with shared-file views
-# shares the THP-disable flag (b2b5dbb9), and a vfork child's changes to
-# private memory returned to its parent, which waits in its call, with the
-# mapping changes a copy cannot carry back refused by name (0e2e1106), in
-# reverie, reverie-kvm, reverie-kvm-core and reverie-linuxemu. The reverie-dbt
-# tree, the root Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged.
+# CARRY TO b74df9352dca3d70d68e8ac4801df9089c5b8139 (2026-10-30): from 641887661b506b4d856489eb06787bc5b4f40a28.
+# Interval: Reverie main 64188766..dc415e98 (one commit, dc415e98, which
+# fixes a reverie-dbt evidence test in reverie-dbt/src/evidence.rs), then
+# this slice: LinuxEmu's FIONREAD forwarding on inotify and its
+# faulting-iovec copy-back (de4e3baa). The reverie-dbt tree changed
+# (dc415e98) and the committed inventory stays 1043.
 # reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-# CARRY TO 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 (2026-10-31): from 1e16daf7bb2cd250537b20c56c3d985b24e68cd0.
-# Interval: a vfork parent's wait that ends when its thread group exits or an
-# exec or a peer's failure cancels the waiting thread, Linux's mm_release
-# clear_child_tid store and wake at a vfork child's window end, mapping
-# incarnations that tell a page mapped again from the page it replaced, and a
-# named refusal of thread creation in a vfork child (bc51aede), in reverie-kvm,
-# reverie-kvm-core and reverie-linuxemu. The reverie-dbt tree, the root
-# Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged.
-# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
-# and third-party/ are byte-identical by git object id between the pins
-# (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
-# carries, not runtime equivalence.
-# CARRY TO 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 (2026-10-31): from 1e16daf7bb2cd250537b20c56c3d985b24e68cd0.
-# Interval: a vfork child's mm_release() decided and made by the Linux provider
-# (the clear_child_tid store, the write-back, the wake, then the parent's
-# release), nothing written back once the parent's process has committed its
-# exit, a fresh mapping incarnation for the pages a remap grows a mapping by,
-# and the incarnation map shared copy-on-write between copies (0de69a0c), in
-# reverie-kvm, reverie-kvm-core and reverie-linuxemu. The reverie-dbt tree,
-# the root Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged.
-# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
-# and third-party/ are byte-identical by git object id between the pins
-# (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
-# carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1e16daf7bb2cd250537b20c56c3d985b24e68cd0 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b74df9352dca3d70d68e8ac4801df9089c5b8139 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b74df9352dca3d70d68e8ac4801df9089c5b8139 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
