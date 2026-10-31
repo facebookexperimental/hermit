@@ -1939,7 +1939,7 @@ mod tests {
             let source = record(format);
             options.time_skip_sources.lock().unwrap().remember(&source);
             options
-                .write_trial_schedule(events.clone(), &output)
+                .write_trial_schedule_from(events.clone(), &[], &output)
                 .unwrap();
             let written = PreemptionReader::try_new(&output).unwrap().into_inner();
             assert_eq!(written.format_version(), format);
@@ -1958,7 +1958,7 @@ mod tests {
                 }
                 std::fs::write(&output, b"existing output must survive refusal").unwrap();
                 let error = options
-                    .write_trial_schedule(events.clone(), &output)
+                    .write_trial_schedule_from(events.clone(), &[], &output)
                     .unwrap_err();
                 let message = error.to_string();
                 assert!(message.contains("different timing formats"), "{message}");
