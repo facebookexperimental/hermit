@@ -89,16 +89,23 @@ mod tests {
     /// Revisions reserved for a change that is not on this base yet, which
     /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 39 are reserved for
     /// pending changes in the coordinator's allocation table (39 for kvm
-    /// 2b-1). At this head 28 is https://github.com/rrnewton/hermit/pull/4789's,
-    /// 29 is https://github.com/rrnewton/hermit/pull/4884's, 30 is
+    /// 2b-1), and 41 to 44 are queued or advisory claims at this rebase
+    /// (41 on queued heads, 42 on drain/4759, 43 for PR 4627, 44 for
+    /// kvm-2b-3 in the allocation table). At this head 28 is
+    /// https://github.com/rrnewton/hermit/pull/4789's, 29 is
+    /// https://github.com/rrnewton/hermit/pull/4884's, 30 is
     /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
     /// https://github.com/rrnewton/hermit/pull/4867's, 32 is the stopless
     /// layout on top of 31's, 40 is the `CpuClockProcess` pair allocated
-    /// to https://github.com/rrnewton/hermit/pull/4885, and 41, the
+    /// to https://github.com/rrnewton/hermit/pull/4885, 41 is the
     /// `HostFileIdentity::content` layout of
-    /// https://github.com/rrnewton/hermit/pull/4791, is the current
-    /// revision.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
+    /// https://github.com/rrnewton/hermit/pull/4791, and 45, this
+    /// change's `TraceSchedEvent`/`WithWatchOrder` revision, is current.
+    /// 42 to 44 are queued or advisory claims at this rebase
+    /// (42 on drain/4759, 43 for PR 4627, 44 for kvm-2b-3 in the
+    /// allocation table). Remove an entry when its change lands, with
+    /// its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39, 42, 43, 44];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -284,6 +291,11 @@ mod tests {
         // 4 to 6 because main's 30 took domain 4 for the scheduled event
         // and domain 5 for its reply; digests measured at this head).
         (41, "aeb38079447d34fb", "f013e36743d8d9e6"),
+        // Retypes `GlobalRequest::TraceSchedEvent`; adds
+        // `GlobalResponse::WithWatchOrder` (#4796). Live-computed as 45 at
+        // its rebase onto main's 41, skipping reserved 42 to 44; digest
+        // measured at the sealed head.
+        (45, "972afd3cae07a4c4", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
