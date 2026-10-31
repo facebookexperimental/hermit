@@ -1562,19 +1562,24 @@ pub(super) const GUEST_DEV_SHM: &str = "/dev/shm";
 /// keeps the host's), or where the host has no `/dev/shm` to cover.
 pub(super) fn private_dev_shm<'a>(covering: impl Iterator<Item = &'a Path>) -> Option<Mount> {
     let target = Path::new(GUEST_DEV_SHM);
-    is_uncovered_directory(target, covering).then(|| {
+    is_uncovered_directory(target, covering, Path::is_dir).then(|| {
         Mount::tmpfs(target)
             .source("tmpfs")
             .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_STRICTATIME)
     })
 }
 
-/// Whether the host has a directory at guest path `target` for a mount of
-/// Hermit's own to cover, and none of the caller's mounts at `covering` covers
-/// it (a mount at `target` or at one of its ancestors, which replaces it).
-fn is_uncovered_directory<'a>(target: &Path, mut covering: impl Iterator<Item = &'a Path>) -> bool {
+/// Whether the host has a directory at guest path `target` (by `is_dir`) for
+/// a mount of Hermit's own to cover, and none of the caller's mounts at
+/// `covering` covers it (a mount at `target` or at one of its ancestors,
+/// which replaces it).
+fn is_uncovered_directory<'a>(
+    target: &Path,
+    mut covering: impl Iterator<Item = &'a Path>,
+    is_dir: impl Fn(&Path) -> bool,
+) -> bool {
     let resolved = canonical_mount_target(target);
-    target.is_dir() && !covering.any(|user| resolved.starts_with(canonical_mount_target(user)))
+    is_dir(target) && !covering.any(|user| resolved.starts_with(canonical_mount_target(user)))
 }
 
 /// Where Linux distributions mount the mqueue filesystem, which lists the IPC
@@ -1593,13 +1598,38 @@ pub(super) const GUEST_DEV_MQUEUE: &str = "/dev/mqueue";
 /// `/dev/mqueue` (a mount at `/dev/mqueue`, `/dev` or `/`; a bind of the
 /// host's `/dev/mqueue` keeps the host's queues there), or where the host has
 /// no `/dev/mqueue`. A caller's mount below `/dev/mqueue`, which the private
-/// mount would cover, is refused.
+/// mount would cover, is refused ([`refuse_mount_below_private_mqueue`]).
 pub(super) fn private_mqueue<'a>(
     user_targets: impl Iterator<Item = &'a Path> + Clone,
 ) -> Result<Option<Mount>, Error> {
     let target = Path::new(GUEST_DEV_MQUEUE);
-    if !is_uncovered_directory(target, user_targets.clone()) {
+    if !is_uncovered_directory(target, user_targets.clone(), Path::is_dir) {
         return Ok(None);
+    }
+    refuse_mount_below_private_mqueue(user_targets, Path::is_dir)?;
+    Ok(Some(
+        Mount::new(target)
+            .source("mqueue")
+            .fstype("mqueue")
+            .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC),
+    ))
+}
+
+/// Refuse a mount at one of the caller's targets `user_targets` that the
+/// guest's own `/dev/mqueue` ([`private_mqueue`]) would cover: one below
+/// `/dev/mqueue`, where the host has that directory (by `is_dir`) and no
+/// other of the caller's mounts covers it. `hermit run` checks this with the
+/// other `--mount` targets before setup, ahead of the check that a target
+/// exists on the host: a host's `/dev/mqueue` holds only the host's queues,
+/// so a target below it is usually missing there, and that would hide why
+/// the mount cannot be made.
+pub(super) fn refuse_mount_below_private_mqueue<'a>(
+    user_targets: impl Iterator<Item = &'a Path> + Clone,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Result<(), Error> {
+    let target = Path::new(GUEST_DEV_MQUEUE);
+    if !is_uncovered_directory(target, user_targets.clone(), is_dir) {
+        return Ok(());
     }
     let resolved = canonical_mount_target(target);
     if let Some(below) = user_targets
@@ -1612,12 +1642,7 @@ pub(super) fn private_mqueue<'a>(
             below.display()
         );
     }
-    Ok(Some(
-        Mount::new(target)
-            .source("mqueue")
-            .fstype("mqueue")
-            .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC),
-    ))
+    Ok(())
 }
 
 /// Whether guest path `path` is `/dev/shm` itself.

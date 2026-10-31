@@ -91,6 +91,7 @@ use super::container::private_dev_shm;
 use super::container::private_mqueue;
 use super::container::refuse_bind_from_host_dev_shm;
 use super::container::refuse_covered_bind_source;
+use super::container::refuse_mount_below_private_mqueue;
 use super::global_opts::GlobalOpts;
 use super::host_capabilities::cpu_identity;
 use super::host_capabilities::exact_branch_counter_verdict;
@@ -167,6 +168,28 @@ fn missing_mount_target(mounts: &[MountArg], exists: impl Fn(&Path) -> bool) -> 
         (!target.starts_with(TMP_DIR) && !under_an_earlier_mount && !exists(target))
             .then_some(target)
     })
+}
+
+/// Refuse a `--mount` target before setup, by the host's paths (`exists`,
+/// `is_dir`): first one the guest's own `/dev/mqueue` would cover
+/// ([`refuse_mount_below_private_mqueue`]), which would otherwise be named as
+/// missing, since a host's `/dev/mqueue` holds only its queues; then the
+/// first [`missing_mount_target`].
+fn validate_mount_targets(
+    mounts: &[MountArg],
+    exists: impl Fn(&Path) -> bool,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Result<(), Error> {
+    refuse_mount_below_private_mqueue(mounts.iter().map(|mount| mount.get_target()), is_dir)?;
+    if let Some(target) = missing_mount_target(mounts, exists) {
+        anyhow::bail!(
+            "--mount target {} does not exist on this host. Hermit mounts onto an existing \
+             path outside {TMP_DIR}: create it first, or choose a target under {TMP_DIR}, \
+             which Hermit creates in the guest's private {TMP_DIR}.",
+            target.display()
+        );
+    }
+    Ok(())
 }
 
 /// Refuse a run on a host without `/tmp` (Android) when `TMPDIR` is unset:
@@ -3958,6 +3981,39 @@ fn a_mount_target_an_earlier_mount_provides_is_not_refused() {
     assert_eq!(
         missing_mount_target(&mounts(&["--mount=type=tmpfs,target=/tmp/x"]), host),
         None
+    );
+}
+
+/// A `--mount` below `/dev/mqueue`, which the guest's own mqueue filesystem
+/// would cover, is refused as that before its target is looked for on the
+/// host, whose `/dev/mqueue` holds only the host's queues. On a host without
+/// `/dev/mqueue` no private one is mounted, and the missing target is named.
+#[test]
+fn a_mount_the_private_dev_mqueue_would_cover_is_refused_before_its_target_is_looked_for() {
+    let mounts = run_opts_for(&[
+        "hermit",
+        "run",
+        "--mount=type=tmpfs,target=/dev/mqueue/below",
+        "/bin/true",
+    ])
+    .mount;
+    let dev_mqueue = |path: &Path| path == Path::new("/dev/mqueue");
+    let refused = validate_mount_targets(&mounts, dev_mqueue, dev_mqueue)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains(
+            "cannot mount at /dev/mqueue/below: the guest's /dev/mqueue is its own mqueue filesystem"
+        ),
+        "{refused}"
+    );
+    let no_dev_mqueue = |_: &Path| false;
+    let refused = validate_mount_targets(&mounts, no_dev_mqueue, no_dev_mqueue)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("--mount target /dev/mqueue/below does not exist on this host"),
+        "{refused}"
     );
 }
 
@@ -11753,15 +11809,7 @@ impl RunOpts {
                 );
             }
         }
-        if let Some(target) = missing_mount_target(&self.mount, Path::exists) {
-            anyhow::bail!(
-                "--mount target {} does not exist on this host. Hermit mounts onto an existing \
-                 path outside {TMP_DIR}: create it first, or choose a target under {TMP_DIR}, \
-                 which Hermit creates in the guest's private {TMP_DIR}.",
-                target.display()
-            );
-        }
-        Ok(())
+        validate_mount_targets(&self.mount, Path::exists, Path::is_dir)
     }
 
     fn validate_e9patch_mount_targets(&self) -> Result<(), Error> {
