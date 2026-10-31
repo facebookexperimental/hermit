@@ -261,6 +261,11 @@ mod tests {
         // here rather than relabel 31 (revopus1's R1 on this change).
         // Digest measured at this head.
         (32, "e178ac33707f23b5", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::CpuClockProcess` and `GlobalResponse::CpuClockProcess`
+        // (https://github.com/rrnewton/hermit/pull/4885; revision 20 at its base,
+        // renumbered to 33 at the drain rebase after main's landed 32 (the
+        // stopless layout on top of 31); digests measured at this head).
+        (33, "956e7e45a14ae3e9", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
