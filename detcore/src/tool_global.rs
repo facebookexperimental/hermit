@@ -1913,12 +1913,16 @@ impl GlobalState {
                 // This is a separate authoritative input from the scheduler
                 // replay above. Validate both when raw Config names both;
                 // never authorize one through an `.or(...)` of their paths.
+                // A record of a format this Hermit does not read is a policy
+                // refusal too (`RecordFormatRefusal`, from `Recording::read`),
+                // as the scheduler's schedule replay treats it: this public
+                // constructor has no CLI preflight in front of it.
                 let history =
                     HistoryReader::read_for_replay(path, cfg.guest_ids).unwrap_or_else(|error| {
-                        if error
-                            .chain()
-                            .any(|cause| cause.is::<crate::preemptions::RecordAdmissionRefusal>())
-                        {
+                        if error.chain().any(|cause| {
+                            cause.is::<crate::preemptions::RecordAdmissionRefusal>()
+                                || cause.is::<crate::preemptions::RecordFormatRefusal>()
+                        }) {
                             crate::scheduler::exit_on_scheduler_refusal(&format!("{error:#}"));
                         }
                         panic!("{error:?}")
@@ -26876,6 +26880,99 @@ mod robust_exit_clock_tests {
             for owner in &f.owners {
                 assert!(!sched.next_turns.contains_key(&owner.dettid));
                 assert!(!sched.note_deregistration_accounted(owner.dettid));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod record_format_installer_tests {
+    use super::*;
+
+    const CASE: &str = "HERMIT_RECORD_FORMAT_INSTALLER_CASE";
+    const TEST: &str = "tool_global::record_format_installer_tests::a_priority_replay_of_an_unread_format_exits_with_the_policy_status";
+
+    /// The record each case installs for a priority replay.
+    fn record(case: &str) -> String {
+        let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT;
+        match case {
+            "newer" => format!(
+                r#"{{"per_thread":{{}},"global":[],"format_version":{}}}"#,
+                newest + 1
+            ),
+            "zero" => r#"{"per_thread":{},"global":[],"format_version":0}"#.to_owned(),
+            "explicit1" => r#"{"per_thread":{},"global":[],"format_version":1}"#.to_owned(),
+            "marked" => format!(
+                r#"{{"incomplete_preemption_record":{{"version":1,"replay_departed_at":7,"record":{{"per_thread":{{}},"global":[],"format_version":{}}}}}}}"#,
+                newest + 1
+            ),
+            "malformed" => "{not json".to_owned(),
+            "current" => crate::preemptions::PreemptionWriter::new(None)
+                .with_format(Some(newest))
+                .into_string(),
+            other => panic!("unknown case {other}"),
+        }
+    }
+
+    /// A raw-`Config` priority replay (`GlobalState::initialize`, behind the
+    /// public `init_for_external_scheduler` and `init_global_state`, with no
+    /// CLI preflight) of a record of a format this Hermit does not read exits
+    /// with the policy-refusal status and main's `validate_format` message,
+    /// legacy or marked incomplete; a malformed file keeps its panic and a
+    /// current record installs. Each case runs `GlobalState::for_tests` in a
+    /// process of its own, since the refusal exits.
+    #[test]
+    fn a_priority_replay_of_an_unread_format_exits_with_the_policy_status() {
+        if let Ok(case) = std::env::var(CASE) {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("history.json");
+            std::fs::write(&path, record(&case)).unwrap();
+            let config = Config {
+                sequentialize_threads: true,
+                replay_preemptions_from: Some(path),
+                replay_edited_preemptions: case == "marked",
+                ..Config::default()
+            };
+            let _state = GlobalState::for_tests(&config);
+            return;
+        }
+        let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT;
+        for (case, refused) in [
+            ("newer", Some(Some(newest + 1))),
+            ("zero", Some(Some(0))),
+            ("explicit1", Some(Some(1))),
+            ("marked", Some(Some(newest + 1))),
+            ("malformed", None),
+            ("current", None),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CASE, case)
+                .output()
+                .expect("run the case in a process of its own");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            match (case, refused) {
+                (_, Some(format)) => {
+                    assert_eq!(
+                        output.status.code(),
+                        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                        "{case}: {stderr}"
+                    );
+                    assert!(
+                        stderr.contains(&crate::preemptions::unread_format_message(format, 0)),
+                        "{case}: {stderr}"
+                    );
+                }
+                ("malformed", None) => {
+                    assert_ne!(
+                        output.status.code(),
+                        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                        "{case}: {stderr}"
+                    );
+                    assert!(!output.status.success(), "{case}: {stdout}");
+                }
+                (_, None) => assert!(output.status.success(), "{case}: {stdout}\n{stderr}"),
             }
         }
     }

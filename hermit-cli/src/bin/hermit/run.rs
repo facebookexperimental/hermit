@@ -6597,7 +6597,8 @@ fn replay_refuses_another_sleep_registration() {
 /// from a schedule trace that does not record the offsets (a record written
 /// before schedule traces held them), with `--chaos` (whose draws have no
 /// offset), of a record made with chaos slowdown, or under `--no-rcb-time`.
-/// A format-4 record's schedule trace replays; a record without offsets
+/// A record in the offsets format (`INSTRUCTION_OFFSET_FORMAT`) replays its
+/// schedule trace; a record without offsets
 /// replays as before. A record of a newer format is a policy refusal.
 #[test]
 fn replay_of_instruction_offsets_is_refused_where_unsupported() {

@@ -948,6 +948,89 @@ mod tests {
         }
     }
 
+    /// Main's admission of a record it can decode is unchanged: a newer
+    /// format, a stated 0 and an explicit 1 are refused with
+    /// `validate_format`'s message, byte for byte, and a newer record that
+    /// fails another check reports that check, as main does. The format probe
+    /// fires only when a record cannot be decoded: a newer one is then refused
+    /// by its format, and a current one keeps its decoding error. Applying the
+    /// probe before decoding fails this test: the empty list of time skips
+    /// and the zero-step offset would be reported as a format refusal.
+    #[test]
+    fn the_format_probe_fires_only_when_a_record_cannot_be_decoded() {
+        let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT;
+        let refusal = |bytes: &[u8]| {
+            Recording::decode(bytes)
+                .unwrap_err()
+                .downcast_ref::<crate::preemptions::RecordFormatRefusal>()
+                .map(|refusal| refusal.0.clone())
+        };
+        for format in [newest + 1, 0, 1] {
+            let main = format!(
+                "record format Some({format}) with 0 time skips: this Hermit reads formats 1 to \
+                 {newest}, and time skips need format 2 or later"
+            );
+            let legacy =
+                serde_json::json!({"per_thread": {}, "global": [], "format_version": format});
+            assert_eq!(refusal(legacy.to_string().as_bytes()), Some(main.clone()));
+            let boundary = serde_json::json!({"slice_boundary_recording": {
+                "preemptions": legacy, "schedule": [],
+            }});
+            assert_eq!(refusal(boundary.to_string().as_bytes()), Some(main));
+        }
+        // Decodable, newer, and refused for another reason first: main's
+        // message for that reason, not a format refusal.
+        let empty_skips = serde_json::json!({
+            "per_thread": {}, "global": [], "format_version": newest + 1, "time_skips": [],
+        });
+        assert_eq!(
+            refusal(empty_skips.to_string().as_bytes()),
+            Some("an empty list of time skips is written as no list".to_owned())
+        );
+        let mut zero_steps = serde_json::to_value(PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(DetTid::from_raw(3), 20).with_instruction_offset(Some(
+                crate::resources::InstructionOffset {
+                    rcb_target: 18,
+                    instructions: 0,
+                },
+            )),
+        ]))
+        .unwrap();
+        zero_steps["format_version"] = (newest + 1).into();
+        let error = Recording::decode(zero_steps.to_string().as_bytes()).unwrap_err();
+        assert!(
+            !error.is::<crate::preemptions::RecordFormatRefusal>(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("zero steps"), "{error:#}");
+        // Undecodable: refused by its format when it states a newer one, with
+        // the same message `validate_format` gives a decodable record; a
+        // current one keeps its decoding error.
+        for (format, refused) in [(newest + 1, true), (newest, false)] {
+            let broken =
+                serde_json::json!({"per_thread": {}, "global": 5, "format_version": format});
+            assert!(
+                serde_json::from_slice::<PreemptionRecord>(broken.to_string().as_bytes()).is_err()
+            );
+            let boundary = serde_json::json!({"slice_boundary_recording": {
+                "preemptions": broken, "schedule": [],
+            }});
+            for bytes in [broken.to_string(), boundary.to_string()] {
+                let error = Recording::decode(bytes.as_bytes()).unwrap_err();
+                match error.downcast_ref::<crate::preemptions::RecordFormatRefusal>() {
+                    Some(refusal) => {
+                        assert!(refused, "{bytes}: {error:#}");
+                        assert_eq!(
+                            refusal.0,
+                            crate::preemptions::unread_format_message(Some(format), 0)
+                        );
+                    }
+                    None => assert!(!refused, "{bytes}: {error:#}"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn actual_legacy_reader_rejects_even_an_empty_boundary_recording() {
         for markers in [false, true] {

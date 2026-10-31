@@ -343,8 +343,10 @@ mod tests {
     /// Minimizing a record with `--chaos-instruction-offset` decisions keeps
     /// each kept row's exact branch target and offset in every trial, so a
     /// trial still stops where the record did, and the minimal record keeps
-    /// the critical row's offset, stamped format 4. Here the target outcome
-    /// needs exactly the row that ended past its branch target.
+    /// the critical row's offset, in the rows-only form a preemption replay
+    /// arms (no format: rows alone claim no schedule trace and no jumps).
+    /// Here the target outcome needs exactly the row that ended past its
+    /// branch target.
     #[test]
     fn minimizing_keeps_each_rows_branch_target_and_instruction_offset() {
         use detcore::preemptions::InstructionOffset;
@@ -398,9 +400,10 @@ mod tests {
             })
             .unwrap();
         assert!(trials > 1);
+        assert_eq!(minimal.format_version(), None);
         assert_eq!(
-            minimal.format_version(),
-            Some(detcore::preemptions::INSTRUCTION_OFFSET_FORMAT)
+            minimal.recorded_offsets(),
+            detcore::preemptions::RecordedOffsets::RowsOnly
         );
         // The minimal record keeps the critical row, at its exact branch
         // target and offset, and drops every row after it.
@@ -415,6 +418,196 @@ mod tests {
             "{kept:?}"
         );
         assert!(kept.len() < 8, "{kept:?}");
+    }
+
+    /// Every record minimization writes, its trials' and the minimal one,
+    /// holds rows alone and states no format, from a source with jumps of
+    /// global time with or without instruction offsets: format 2 and every
+    /// later one claim a complete list of jumps, which rows alone do not hold.
+    /// Its rows keep their exact branch targets and offsets. Each written
+    /// record validates and reads back, and `hermit run`'s replay guard lets
+    /// the preemption replay that runs it through, while a schedule replay of
+    /// one that keeps an offset is refused with the rows-only message, as it
+    /// has no schedule trace to arm the offset at. Analyze's input check
+    /// accepts both sources, and refuses a minimal record that keeps an offset
+    /// when it is given back to analyze as an input, as any rows-only record.
+    #[test]
+    fn a_minimize_record_states_no_format_and_keeps_its_rows() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::InstructionOffset;
+        use detcore::preemptions::PreemptionWriter;
+        use detcore::preemptions::RecordedOffsets;
+        use detcore::preemptions::TimeSkip;
+        use detcore::preemptions::TimeSkipReason;
+        use detcore::types::SchedEvent;
+        let tid = DetTid::from_raw(3);
+        let critical = InstructionOffset {
+            rcb_target: 5_000,
+            instructions: 6,
+        };
+        let jumps = vec![
+            TimeSkip {
+                event: 1,
+                target: LogicalTime::from_nanos(50_000),
+                reason: TimeSkipReason::IdleGuestPollers,
+            },
+            TimeSkip {
+                event: 2,
+                target: LogicalTime::from_nanos(90_000),
+                reason: TimeSkipReason::IdleGuestPollers,
+            },
+        ];
+        for with_offsets in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let preempts_path = workspace.path().join("target.preempts");
+            let mut writer = PreemptionWriter::new(None)
+                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+            writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
+            let mut prior = detcore::DEFAULT_PRIORITY;
+            for k in 1..=8u64 {
+                let next = FIRST_PRIORITY + k;
+                writer.insert_reprioritization(
+                    tid,
+                    LogicalTime::from_nanos(k * 1000),
+                    k * 1000 + 2,
+                    prior,
+                    next,
+                    (with_offsets && k == 5).then_some(critical),
+                );
+                prior = next;
+            }
+            writer.insert_schedevent(
+                SchedEvent::branches(tid, 5_002)
+                    .with_instruction_offset(with_offsets.then_some(critical)),
+            );
+            writer.insert_schedevent(SchedEvent::branches(tid, 3));
+            let source: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+            let source = source.with_time_skips(jumps.clone());
+            source.validate().unwrap();
+            assert_eq!(
+                source.format_version(),
+                Some(if with_offsets {
+                    INSTRUCTION_OFFSET_FORMAT
+                } else {
+                    INSTRUCTION_OFFSET_FORMAT - 1
+                })
+            );
+            source.write_to_disk(&preempts_path).unwrap();
+            // The exact row of the source each kept row must match, by the time
+            // it ended: from a source with offsets its branch target and
+            // offset (one without is rebuilt by time alone, as `from_vecs`
+            // rebuilds it).
+            let source_rows: BTreeMap<LogicalTime, (Option<u64>, Option<InstructionOffset>)> = {
+                let mut rows = source.extract_all().remove(&tid).unwrap().into_iter();
+                let mut map = BTreeMap::new();
+                while let Some((time, _, rcbs, offset)) = rows.next_with_offset() {
+                    map.insert(time, (rcbs.filter(|_| with_offsets), offset));
+                }
+                map
+            };
+
+            let options =
+                AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                    .unwrap();
+            let trial = crate::analyze::rundata::RunData::get_raw_runopts(&options);
+            let mut schedule_replay = trial.det_opts.det_config.clone();
+            schedule_replay.chaos = false;
+            let guard = |recorded, schedule| {
+                crate::run::instruction_offset_replay_refusal(
+                    recorded,
+                    schedule,
+                    false,
+                    trial.selected_backend(),
+                    if schedule {
+                        &schedule_replay
+                    } else {
+                        &trial.det_opts.det_config
+                    },
+                )
+            };
+            let check = |path: &Path, label: &str| -> bool {
+                let written = PreemptionReader::try_new(path)
+                    .unwrap_or_else(|error| panic!("{label}: {error:#}"))
+                    .into_inner();
+                written.validate().unwrap();
+                assert_eq!(written.format_version(), None, "{label}");
+                assert_eq!(written.time_skips(), None, "{label}");
+                let mut rows = written.extract_all().remove(&tid).unwrap().into_iter();
+                while let Some((time, _, rcbs, offset)) = rows.next_with_offset() {
+                    assert_eq!(source_rows.get(&time), Some(&(rcbs, offset)), "{label}");
+                }
+                let keeps_offset = written.rows_carry_instruction_offsets();
+                let recorded = detcore::preemptions::read_recorded_offsets(path).unwrap();
+                assert_eq!(
+                    recorded,
+                    if keeps_offset {
+                        RecordedOffsets::RowsOnly
+                    } else {
+                        RecordedOffsets::None
+                    },
+                    "{label}"
+                );
+                // A minimization trial is a preemption replay of the record.
+                assert_eq!(guard(recorded, false), None, "{label}");
+                let schedule = guard(recorded, true);
+                if keeps_offset {
+                    assert!(
+                        schedule.as_deref().is_some_and(|why| why.contains(
+                            "its schedule trace does not record the instruction offsets its rows \
+                             hold"
+                        ) && why
+                            .contains("replay it with --replay-preemptions-from")),
+                        "{label}: {schedule:?}"
+                    );
+                } else {
+                    assert_eq!(schedule, None, "{label}");
+                }
+                keeps_offset
+            };
+            // Analyze's input check, on the input of this minimization.
+            options
+                .clone()
+                .adopt_instruction_offsets(&[("--run1-preemptions", &preempts_path)])
+                .unwrap();
+            let mut trials = 0;
+            let mut kept_offset = false;
+            let (_, minimal_path, _) = options
+                .minimize_with(&preempts_path, |runname, trial_preempts| {
+                    trials += 1;
+                    kept_offset |= check(trial_preempts, runname);
+                    let trial = PreemptionReader::new(trial_preempts).load_all();
+                    let history = trial.extract_all().remove(&tid).unwrap();
+                    let mut rows = history.into_iter();
+                    let mut has_critical = false;
+                    while let Some((time, _, _, _)) = rows.next_with_offset() {
+                        has_critical |= time == LogicalTime::from_nanos(5_000);
+                    }
+                    Ok(has_critical)
+                })
+                .unwrap();
+            assert!(trials > 1);
+            assert_eq!(kept_offset, with_offsets);
+            assert_eq!(check(&minimal_path, "minimal"), with_offsets);
+            // The minimal record given back to analyze as an input.
+            let fed_back = options
+                .clone()
+                .adopt_instruction_offsets(&[("--run1-preemptions", &minimal_path)]);
+            if with_offsets {
+                let error = fed_back.unwrap_err();
+                assert!(
+                    error
+                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .is_some()
+                        && format!("{error:#}").contains(
+                            "its schedule trace does not record the instruction offsets its rows \
+                             hold"
+                        ),
+                    "{error:#}"
+                );
+            } else {
+                fed_back.unwrap();
+            }
+        }
     }
 
     /// A minimization trial that `--max-log-bytes` ended stops the

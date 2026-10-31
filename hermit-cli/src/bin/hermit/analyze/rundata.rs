@@ -2026,8 +2026,9 @@ impl AnalyzeOpts {
     /// recording did. All sources must share one timing format; mixing
     /// formats cannot preserve their different switch-in charging rules.
     /// A record that notes its background starts (a prefix of a whole
-    /// recorded schedule) keeps its own format and its own jumps, from the
-    /// same recording as its starts, never another source's jumps beside them.
+    /// recorded schedule), or whose rows carry instruction offsets (a prefix
+    /// of a recorded schedule), keeps its own format and its own jumps, from
+    /// the same recording, never another source's jumps beside them.
     /// An incompatible format or invalid record is refused before writing.
     pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
         let (skips, format, identity) = {
@@ -2053,18 +2054,24 @@ impl AnalyzeOpts {
                 .require_same_for_chosen(&reserved_input)?;
         }
         // A trial that keeps a source's noted background starts (a prefix of
-        // its whole schedule) is one recording's whole history: it keeps that
-        // source's format and its own jumps, from the same recording as its
-        // starts, whichever source the cache would pick for the same events.
-        // Any other takes the sources' shared format, which lies below the
-        // background-starts format (`TimeSkipSources::remember`), and the
-        // cache's jumps.
-        let (record, skips) = if record.notes_background_starts() {
-            let own = record.time_skips().unwrap_or_default().to_vec();
-            (record, own)
-        } else {
-            (record.with_format(format), skips)
-        };
+        // its whole schedule), or whose rows carry instruction offsets (a
+        // schedule prefix keeps every row of its recording, whatever events
+        // it keeps), is one recording's history: it keeps that source's
+        // format, with what it says it notes, and its own jumps, from the same
+        // recording, whichever source the cache would pick for the same
+        // events. Stated in the sources' shared format, which lies below the
+        // background-starts and offsets formats (`TimeSkipSources::remember`),
+        // offset rows would read as a record written before schedule traces
+        // held offsets, which no schedule replay takes. Any other trial takes
+        // that shared format, raised again for offsets in its events
+        // (`PreemptionRecord::with_format`), and the cache's jumps.
+        let (record, skips) =
+            if record.notes_background_starts() || record.rows_carry_instruction_offsets() {
+                let own = record.time_skips().unwrap_or_default().to_vec();
+                (record, own)
+            } else {
+                (record.with_format(format), skips)
+            };
         let record = self.stamp_trial_record(
             record
                 .with_time_skips(skips)
@@ -2499,6 +2506,181 @@ mod tests {
     /// minimization trial whose knock-out let a thread start a slice past
     /// its recorded end stopped the whole analysis with Detcore's "Cannot
     /// set end of timeslice" panic (exit 101).
+    /// A prefix trial of a recording whose rows carry instruction offsets,
+    /// written as `prefix_trial` writes it, keeps the recording's offsets
+    /// format whether the prefix keeps no event, the events before the first
+    /// offset event, or the whole schedule: the metadata reader then reads it
+    /// as recorded with offsets, and neither `hermit run`'s replay guard
+    /// (`instruction_offset_replay_refusal`) nor analyze's input check
+    /// (`adopt_instruction_offsets`) refuses it. A record written before
+    /// schedule traces held offsets (rows only, no format) stays refused by
+    /// both. Writing the prefix in the sources' timing format fails this test.
+    #[test]
+    fn a_prefix_trial_of_a_recording_with_offset_rows_keeps_its_offsets_format() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::InstructionOffset;
+        use detcore::preemptions::PreemptionWriter;
+        use detcore::preemptions::RecordedOffsets;
+        use detcore::types::DetTid;
+        use detcore::types::LogicalTime;
+
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let mut writer = PreemptionWriter::new(None)
+            .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+        writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
+        writer.insert_schedevent(SchedEvent::branches(tid, 20));
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(10),
+            18,
+            detcore::DEFAULT_PRIORITY,
+            5,
+            Some(offset),
+        );
+        writer
+            .insert_schedevent(SchedEvent::branches(tid, 22).with_instruction_offset(Some(offset)));
+        writer.insert_schedevent(SchedEvent::branches(tid, 3));
+        let current: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+        current.validate().unwrap();
+        assert_eq!(current.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        assert!(current.rows_carry_instruction_offsets());
+        // The same rows in a record written before schedule traces held
+        // offsets: no format, no event offset.
+        let mut legacy = serde_json::to_value(&current).unwrap();
+        legacy.as_object_mut().unwrap().remove("format_version");
+        for event in legacy["global"].as_array_mut().unwrap() {
+            event.as_object_mut().unwrap().remove("instruction_offset");
+        }
+        let legacy: PreemptionRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.recorded_offsets(), RecordedOffsets::RowsOnly);
+
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("prefix.json");
+        for (source, expected) in [
+            (&current, RecordedOffsets::Recorded),
+            (&legacy, RecordedOffsets::RowsOnly),
+        ] {
+            let args =
+                crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("not analyze")
+            };
+            options.apply_global(&args.global);
+            options.time_skip_sources.lock().unwrap().remember(source);
+            for len in [0, 1, source.schedevents().len()] {
+                options
+                    .write_trial_record(source.schedule_prefix(len), &output)
+                    .unwrap();
+                let recorded = detcore::preemptions::read_recorded_offsets(&output).unwrap();
+                assert_eq!(recorded, expected, "prefix of {len} events");
+                let written = PreemptionReader::try_new(&output).unwrap().into_inner();
+                assert_eq!(
+                    written.format_version(),
+                    source.format_version(),
+                    "prefix of {len}"
+                );
+                let trial = RunData::get_raw_runopts(&options);
+                let mut replay = trial.det_opts.det_config.clone();
+                replay.chaos = false;
+                let guard = crate::run::instruction_offset_replay_refusal(
+                    recorded,
+                    true,
+                    false,
+                    trial.selected_backend(),
+                    &replay,
+                );
+                let check =
+                    options.adopt_instruction_offsets(&[("--replay-schedule-from", &output)]);
+                if expected == RecordedOffsets::Recorded {
+                    assert_eq!(guard, None, "prefix of {len}");
+                    check.unwrap_or_else(|error| panic!("prefix of {len}: {error:#}"));
+                } else {
+                    assert!(guard.is_some(), "prefix of {len}");
+                    let error = check.unwrap_err();
+                    assert!(
+                        error
+                            .downcast_ref::<crate::container::PolicyRefusal>()
+                            .is_some(),
+                        "prefix of {len}: {error:#}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A whole-schedule trial of a recording with instruction offsets takes
+    /// its jumps from that recording: the trial cache tells recordings apart
+    /// by their events' offsets too (`crate::time_skip_carry`), so S in format
+    /// 3 (the format below the offsets format) and T in `INSTRUCTION_OFFSET_FORMAT`
+    /// with an offset, over the same branches and with
+    /// other jumps, never lend each other their jumps, written and read back,
+    /// in either cache order.
+    #[test]
+    fn a_trial_of_a_recording_with_instruction_offsets_keeps_its_own_jumps() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::InstructionOffset;
+        use detcore::types::DetTid;
+
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let jump = |target| detcore::preemptions::TimeSkip {
+            event: 1,
+            target: detcore::types::LogicalTime::from_nanos(target),
+            reason: detcore::preemptions::TimeSkipReason::IdleGuestPollers,
+        };
+        let recording = |first: Option<InstructionOffset>, target| {
+            let record = PreemptionRecord::from_sched_events(vec![
+                SchedEvent::branches(tid, 20).with_instruction_offset(first),
+                SchedEvent::branches(tid, 5),
+            ])
+            .with_current_format()
+            .with_time_skips(vec![jump(target)]);
+            record.validate().unwrap();
+            record
+        };
+        let s = recording(None, 1000);
+        let t = recording(Some(offset), 2000);
+        assert_eq!(s.format_version(), Some(INSTRUCTION_OFFSET_FORMAT - 1));
+        assert_eq!(t.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("trial.json");
+        for order in [[&s, &t], [&t, &s]] {
+            let args =
+                crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("not analyze")
+            };
+            options.apply_global(&args.global);
+            for source in order {
+                options.time_skip_sources.lock().unwrap().remember(source);
+            }
+            for (source, format, target) in [
+                (&t, INSTRUCTION_OFFSET_FORMAT, 2000),
+                (&s, INSTRUCTION_OFFSET_FORMAT - 1, 1000),
+            ] {
+                options
+                    .write_trial_record(source.schedule_prefix(2), &output)
+                    .unwrap();
+                let written = detcore::preemptions::PreemptionReader::try_new(&output)
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(written.format_version(), Some(format));
+                assert_eq!(written.time_skips(), Some(&[jump(target)][..]));
+                assert_eq!(
+                    written.schedevents()[0].instruction_offset,
+                    source.schedevents()[0].instruction_offset
+                );
+            }
+        }
+    }
+
     #[test]
     fn analyze_replays_only_its_edited_preemption_records_as_edited() {
         let args =

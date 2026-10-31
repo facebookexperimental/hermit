@@ -56,7 +56,9 @@ pub type SharedTimeSkipSources = Arc<Mutex<TimeSkipSources>>;
 
 /// The hash of each prefix of `events`, from the empty one on: entry `i`
 /// covers `events[..i]`. An event's timestamp is left out, because analyze and
-/// bisect drop timestamps from the schedules they search.
+/// bisect drop timestamps from the schedules they search. Its instruction
+/// offset is in: two recordings whose events differ only there ran
+/// differently, so one never lends its jumps to the other's events.
 fn prefix_hashes(events: &[SchedEvent]) -> Vec<u64> {
     let mut hash = 0u64;
     std::iter::once(hash)
@@ -69,6 +71,7 @@ fn prefix_hashes(events: &[SchedEvent]) -> Vec<u64> {
                 event.count,
                 event.start_rip,
                 event.end_rip,
+                event.instruction_offset,
             )
                 .hash(&mut hasher);
             hash = hasher.finish();
@@ -409,6 +412,57 @@ mod tests {
         sources.remember(&schedule);
         let error = sources.trial_format().unwrap_err();
         assert!(error.to_string().contains("different timing formats"));
+    }
+
+    /// A recording whose schedule holds instruction offsets states
+    /// `INSTRUCTION_OFFSET_FORMAT`, and a trial's record without them states
+    /// the newest format below the offsets formats, with the same timing
+    /// rules: they share one format as sources, and a trial is written in it
+    /// unless it holds offsets.
+    #[test]
+    fn a_trial_shares_the_timing_format_of_a_recording_with_instruction_offsets() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
+        use detcore::preemptions::InstructionOffset;
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let with = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(DetTid::from_raw(3), 20).with_instruction_offset(Some(offset)),
+        ])
+        .with_current_format();
+        assert_eq!(with.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        let without = PreemptionRecord::from_sched_events(events(&[3])).with_current_format();
+        assert_eq!(
+            without.format_version(),
+            Some(INSTRUCTION_OFFSET_ROWS_FORMAT - 1)
+        );
+        let mut sources = TimeSkipSources::default();
+        sources.remember(&with);
+        sources.remember(&without);
+        let trial = sources.trial_format().unwrap();
+        assert_eq!(trial, Some(INSTRUCTION_OFFSET_ROWS_FORMAT - 1));
+        assert_eq!(
+            PreemptionRecord::from_sched_events(events(&[5]))
+                .with_format(trial)
+                .format_version(),
+            trial
+        );
+        assert_eq!(
+            PreemptionRecord::from_sched_events(with.schedevents().clone())
+                .with_format(trial)
+                .format_version(),
+            Some(INSTRUCTION_OFFSET_FORMAT)
+        );
+        // A source of a format this Hermit does not read keeps it, so a trial
+        // from it states it too and is refused, not lowered into a format
+        // this Hermit reads.
+        let newer = detcore::preemptions::PREEMPTION_RECORD_FORMAT + 1;
+        let mut sources = TimeSkipSources::default();
+        sources
+            .remember(&PreemptionRecord::from_sched_events(events(&[3])).with_format(Some(newer)));
+        assert_eq!(sources.trial_format().unwrap(), Some(newer));
     }
 
     fn with_metadata(record: PreemptionRecord, metadata: serde_json::Value) -> PreemptionRecord {

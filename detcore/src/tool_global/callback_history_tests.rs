@@ -1142,7 +1142,8 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
     let (_, _, rcbs, offset) = rows.next_with_offset().unwrap();
     assert_eq!((rcbs, offset), (Some(end), Some(armed)), "{record}");
     // The schedule trace records it too, on the timer's batch of branches,
-    // which the address the steps stopped at follows; the record says format 4.
+    // which the address the steps stopped at follows; the record states the
+    // offsets format.
     let schedule = serde_json::from_str::<crate::preemptions::PreemptionRecord>(&record).unwrap();
     assert_eq!(
         schedule.format_version(),
@@ -1318,7 +1319,13 @@ async fn a_schedule_replay_arms_a_recorded_instruction_offset() {
         });
         writer.insert_schedevent(SchedEvent::branches(tid, 1));
         let record = writer.into_string();
-        assert!(record.contains(r#""format_version":4"#), "{record}");
+        assert!(
+            record.contains(&format!(
+                r#""format_version":{}"#,
+                crate::preemptions::INSTRUCTION_OFFSET_FORMAT
+            )),
+            "{record}"
+        );
         std::fs::write(&path, record).unwrap();
 
         let (config, state, tid, process) = cancellation_test_state_with_config(config);

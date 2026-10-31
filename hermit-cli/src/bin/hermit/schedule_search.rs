@@ -1388,7 +1388,8 @@ mod tests {
     /// fragment that keeps its end: the sub-event search's splices put a new
     /// preemption at a branch inside the batch, and the remainder still ends
     /// where the recording did. Unsplit, the batch keeps it, and a trial
-    /// schedule written from either carries it, stamped format 4.
+    /// schedule written from either carries it, stamped with the offsets format
+    /// (`INSTRUCTION_OFFSET_FORMAT`).
     /// The sub-event search does not split a batch of branches that an
     /// instruction-offset timer ended: the timer's steps can cross branches,
     /// so the batch's last branches lie past its target, and a fragment that
