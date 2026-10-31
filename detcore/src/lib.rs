@@ -5080,6 +5080,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     receive_geometry: None,
                     entry_import: None,
                     send_inspection: None,
+                    inotify_queue: None,
                     traced_call: Default::default(),
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,

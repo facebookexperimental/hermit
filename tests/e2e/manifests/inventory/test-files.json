@@ -1065,8 +1065,20 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/inotify_blocking_faults.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace, SaBRe, DBT, LiteInst and in-guest-trap; ci=true)",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace, SaBRe, DBT, KVM, LiteInst and in-guest-trap; ci=true)",
       "why": "tests/c/inotify_blocking_faults.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: reads of a blocking inotify descriptor that Linux refuses before it reads the queue (a count past the address space, a readv whose second iovec lies outside it, a readv whose iovec array the guest cannot read) must fail with EFAULT and leave the buffer, which holds earlier events, and the queue exactly as they were, and a later read must return every event with the cookies another instance sees (https://github.com/rrnewton/hermit/issues/4793)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/inotify_blocking_read.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace, DBT and KVM; ci=true)",
+      "why": "tests/c/inotify_blocking_read.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: a sibling thread's blocking read, readv or preadv2 of an inotify instance made by inotify_init1(0) must wait for, and return, the event the main thread makes 20 ms later, where a blocking readv once held the scheduler's turn and hung the guest; a blocking readv whose first iovec a queued event fills must wait on into its second for the next event, as Linux reads one iovec at a time; two blocked readers of instances watching different directories must each get their own rename whole, pair cookies shared and the renames' cookies distinct, with the cookie values repeating in every run under Hermit; and F_GETFL must show the blocking mode that inotify_init, inotify_init1, F_SETFL and FIONBIO give, on a descriptor and its dup, with a nonblocking view's empty read failing with EAGAIN (https://github.com/rrnewton/hermit/issues/4768)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/inotify_blocking_signal.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
+      "why": "tests/c/inotify_blocking_signal.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: a signal sent to a thread blocked reading an empty blocking inotify instance must end a read or readv with EINTR after the handler runs when the handler lacks SA_RESTART, and restart the read, which then returns the event made after the handler ran, when it has SA_RESTART; and a readv whose first iovec a queued event filled, waiting on in its second, must return the first iovec's event rather than EINTR after the handler runs (https://github.com/rrnewton/hermit/issues/4768)"
     },
     {
       "disposition": "manifest-test",

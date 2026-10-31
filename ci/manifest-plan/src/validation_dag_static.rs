@@ -3203,7 +3203,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // detcore units, measured at its base (3279 + 27 = 3306, listed) and
     // re-measured at this landing by cargo nextest run -p hermit-detcore
     // --lib (3348 passed): 3321 + 27 = 3348.
-    ("test.detcore_unit", 3348),
+    // Blocking inotify reads that wait in Detcore's turns
+    // (https://github.com/rrnewton/hermit/issues/4768) add three detcore units:
+    // 3348 + 3 = 3351, by nextest list.
+    ("test.detcore_unit", 3351),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5702,7 +5705,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same thirty-seven NR units: 3242 + 37 = 3279.
     // The same recount at 4e916633ca as test.detcore_unit: 3279 + 42 = 3321.
     // The same twenty-seven N3 detcore units: 3321 + 27 = 3348.
-    ("test.detcore_unit_on_host", 3348),
+    // The same three blocking-inotify units: 3348 + 3 = 3351.
+    ("test.detcore_unit_on_host", 3351),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

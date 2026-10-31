@@ -3418,6 +3418,18 @@ where
         // attempt waited for its turn. The per-attempt check above
         // (`passes_descriptors_out_now`) rechecks the channel immediately
         // before each send, independently of the mutable control data.
+
+        // An inotify read counts its instance's queue right before each
+        // attempt, which runs next in this turn, so that the count it keeps
+        // is the one before the attempt that completes
+        // (`ThreadState::inotify_queue`). Boxed: only such a read counts.
+        if guest.thread_state().inotify_queue.is_some() {
+            Box::pin(crate::syscalls::inotify::count_before_attempt(
+                guest,
+                call.into(),
+            ))
+            .await;
+        }
         // Read actual metadata after reinstatement and all earlier awaits.
         // Observation adds no reads or allocation when buffer logging is off.
         let attempt_observation =

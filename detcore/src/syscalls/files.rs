@@ -8986,11 +8986,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             // datagram or SEQPACKET socket it consumes a pending message. Its
             // result goes through record/replay: a replayed descriptor may be
             // a placeholder whose own zero-count read fails differently.
+            // An inotify instance is the exception: its read waits for an
+            // event even for a zero count, and then fails with EINVAL, as no
+            // event fits (`inotify_read`), so its zero-count read waits as
+            // its other reads do, below.
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3601)
-            return self
-                .record_or_replay_preserving_tool_errors(guest, call)
-                .await;
+            let inotify = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.ty() == FdType::Inotify)
+                .unwrap_or(false);
+            if !inotify {
+                return self
+                    .record_or_replay_preserving_tool_errors(guest, call)
+                    .await;
+            }
         }
 
         let (serves_procfs_snapshot, cannot_read) =
@@ -9162,8 +9172,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     call.buf().map_or(0, |buf| buf.as_raw()),
                     call.len(),
                 );
-                let queued = crate::syscalls::inotify::queued_before(guest, call.fd(), call).await;
+                // A blocking read with nothing queued waits in Detcore's turns,
+                // on the instance `handle_inotify_init1` made physically
+                // nonblocking, as a pipe's or an eventfd's does.
+                crate::syscalls::inotify::begin_count(guest, call.fd(), call).await;
                 let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+                let queued = crate::syscalls::inotify::end_count(guest);
                 crate::syscalls::inotify::finish(
                     guest,
                     Sysno::read,
@@ -10869,24 +10883,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await
         } else if fd_type == FdType::Inotify {
-            let destination = crate::syscalls::inotify::Destination::iovecs(
-                &guest.memory(),
-                call.iov().map_or(0, |iov| iov.as_raw()),
-                call.len(),
-            );
-            let queued = crate::syscalls::inotify::queued_before(guest, call.fd(), call).await;
-            let result = self
-                .record_or_replay_preserving_tool_errors(guest, call)
-                .await;
-            crate::syscalls::inotify::finish(
-                guest,
-                Sysno::readv,
-                call.fd(),
-                destination,
-                queued,
-                result,
-            )
-            .await
+            // As `read`: a blocking readv with nothing queued waits in
+            // Detcore's turns, never in the kernel holding this thread's turn
+            // (https://github.com/rrnewton/hermit/issues/4768), and it reads
+            // on into its later iovecs as Linux's does.
+            self.readv_inotify(guest, call).await
         } else {
             self.record_or_replay_preserving_tool_errors(guest, call)
                 .await
@@ -11055,8 +11056,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         // read Detcore runs in turns it is run as one, so it waits as `readv`
         // does: the single kernel attempt below fails with EAGAIN on the
         // descriptor Detcore made physically nonblocking
-        // (https://github.com/rrnewton/hermit/issues/4822).
-        if offset == -1 && call.flags() == 0 && self.waits_in_turns(guest, call.fd()) {
+        // (https://github.com/rrnewton/hermit/issues/4822). So it is on an
+        // inotify instance, whose blocking `readv` also reads on into its
+        // later iovecs (`Detcore::readv_inotify`), with RWF_HIPRI too, the one
+        // flag Linux lets through to its per-iovec reads
+        // (`do_loop_readv_writev`).
+        let inotify = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.ty() == FdType::Inotify)
+            .unwrap_or(false);
+        if offset == -1
+            && ((inotify && call.flags() & !libc::RWF_HIPRI == 0)
+                || (call.flags() == 0 && self.waits_in_turns(guest, call.fd())))
+        {
             let readv = syscalls::Readv::new()
                 .with_fd(call.fd())
                 .with_iov(call.iov())
@@ -11116,10 +11128,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.iov().map_or(0, |iov| iov.as_raw()),
                 call.iov_len() as usize,
             );
-            let queued = crate::syscalls::inotify::queued_before(guest, call.fd(), call).await;
-            let result = self
-                .record_or_replay_preserving_tool_errors(guest, call)
-                .await;
+            // Only flags Linux refuses (EOPNOTSUPP, `do_loop_readv_writev`) come
+            // here, which it refuses before any wait; on an instance Detcore
+            // made physically nonblocking the first attempt is refused alike.
+            crate::syscalls::inotify::begin_count(guest, call.fd(), call).await;
+            let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+            let queued = crate::syscalls::inotify::end_count(guest);
             crate::syscalls::inotify::finish(
                 guest,
                 Sysno::preadv2,
@@ -12227,7 +12241,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// still recorded and replayed, with the kernel given `flags | O_NONBLOCK`
     /// in record and the recorded result returned in replay; a FIONBIO returns
     /// before `record_or_replay`, so neither phase records or applies it. Other
-    /// sockets and eventfds stay external in record/replay. A pipe whose
+    /// sockets, eventfds and inotify instances stay external in record/replay
+    /// (`handle_eventfd2` and `handle_inotify_init1` make those two physically
+    /// nonblocking only outside it). A pipe whose
     /// physical O_NONBLOCK came from the guest rather than from Detcore is also
     /// kept nonblocking; in record/replay the only such pipes are `pipe2` pipes,
     /// which Detcore has already made nonblocking.
@@ -12245,7 +12261,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 FdType::Socket if internal_socket => {
                     !self.cfg.recordreplay_modes || physically_nonblocking
                 }
-                FdType::Socket | FdType::Eventfd => !self.cfg.recordreplay_modes,
+                FdType::Socket | FdType::Eventfd | FdType::Inotify => !self.cfg.recordreplay_modes,
                 _ => false,
             }
     }
@@ -15502,13 +15518,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
-    /// inotify_init1 system call.
+    /// inotify_init1 system call (and inotify_init, which is inotify_init1
+    /// with no flags).
+    ///
+    /// As for an eventfd, the instance is made physically nonblocking
+    /// whenever Detcore sequentializes threads outside record and replay, and
+    /// the guest's blocking mode is the logical one Detcore keeps on the open
+    /// file description, which `F_GETFL`, `F_SETFL` and `FIONBIO` show and
+    /// change (`keeps_physically_nonblocking`). A blocking read with nothing
+    /// queued then waits in Detcore's turns (`IOAction::NonblockizeRetry`)
+    /// instead of in the kernel, where nothing orders the other guest tasks
+    /// whose filesystem operations would end it
+    /// (<https://github.com/rrnewton/hermit/issues/4768>).
     pub async fn handle_inotify_init1<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::InotifyInit1,
     ) -> Result<i64, Error> {
-        let fd = self.record_or_replay(guest, call).await? as RawFd;
+        let internally_nonblocking =
+            self.cfg.use_nonblocking_sockets() && !self.cfg.recordreplay_modes;
+        // Only IN_NONBLOCK is added: flags Linux refuses stay, so the call
+        // fails with EINVAL as the guest's own would.
+        let injected = if internally_nonblocking {
+            call.with_flags(call.flags() | syscalls::InitFlags::IN_NONBLOCK)
+        } else {
+            call
+        };
+        let fd = self.record_or_replay(guest, injected).await? as RawFd;
         self.add_fd(
             guest,
             fd,
@@ -15516,6 +15552,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Inotify,
         )
         .await?;
+        if internally_nonblocking {
+            self.maybe_set_nonblocking_fd(guest, fd);
+        }
         Ok(fd as i64)
     }
 
@@ -18862,6 +18901,41 @@ mod test {
                     ),
                     !recordreplay_modes || physically_nonblocking
                 );
+            }
+        }
+    }
+
+    /// An inotify instance stays physically nonblocking through the guest's
+    /// F_SETFL and FIONBIO wherever Detcore made it so at creation, as an
+    /// eventfd does: with sequentialized threads, outside record and replay
+    /// (<https://github.com/rrnewton/hermit/issues/4768>). Elsewhere the
+    /// guest's request reaches the kernel.
+    #[test]
+    fn inotify_instances_stay_physically_nonblocking_where_detcore_waits() {
+        for sequentialize_threads in [false, true] {
+            for recordreplay_modes in [false, true] {
+                let tool = crate::Detcore {
+                    detpid: crate::types::DetPid::from_raw(3),
+                    cfg: crate::Config {
+                        sequentialize_threads,
+                        recordreplay_modes,
+                        ..Default::default()
+                    },
+                    record_or_replay: crate::record_or_replay::NoopTool,
+                };
+                for physically_nonblocking in [false, true] {
+                    assert_eq!(
+                        tool.keeps_physically_nonblocking(
+                            crate::fd::FdType::Inotify,
+                            false,
+                            physically_nonblocking,
+                            false
+                        ),
+                        sequentialize_threads && !recordreplay_modes,
+                        "sequentialize_threads {sequentialize_threads}, record/replay \
+                         {recordreplay_modes}, physically nonblocking {physically_nonblocking}"
+                    );
+                }
             }
         }
     }

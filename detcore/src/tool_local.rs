@@ -5870,6 +5870,15 @@ pub struct ThreadState<T> {
     /// Never carried across a fork or a migration.
     #[serde(skip)]
     pub(crate) send_inspection: Option<crate::syscalls::SendInspection>,
+    /// The inotify read this thread is running, while the bytes queued on
+    /// its instance before the attempt that completes say what that attempt
+    /// took (`crate::syscalls::inotify::QueueCount`): `Some` from the read
+    /// handler's entry, measured again before each attempt of the internal
+    /// polling loop (`retry_nonblocking_syscall_helper`), so that it is the
+    /// count before the attempt that completed, and taken when the call
+    /// returns. Never carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) inotify_queue: Option<crate::syscalls::inotify::QueueCount>,
     /// The syscall in progress, while the run records an access trace: the
     /// descriptors it named and the slot changes it made
     /// (`crate::access_trace`). Never carried across a fork or a migration.
@@ -7118,6 +7127,7 @@ impl<T> ThreadState<T> {
             receive_geometry: None,
             entry_import: None,
             send_inspection: None,
+            inotify_queue: None,
             traced_call: Default::default(),
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),

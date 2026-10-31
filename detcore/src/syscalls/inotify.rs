@@ -22,14 +22,20 @@
 //!
 //! Determinism: the table is run-wide and forgets nothing, so every inotify
 //! instance and every process agrees on a rename's cookie, as on Linux, and a
-//! pair keeps one value however far apart its halves are read. For
-//! nonblocking reads (`IN_NONBLOCK`), the filesystem operations that queue
-//! the events and the reads that observe them all run in the scheduler's
-//! order, so the order of first observations, and with it every virtual
-//! cookie, is a function of the schedule. A blocking read is not covered: it
-//! waits in the host, so which events it returns, and so the numbering, can
-//! depend on host timing (<https://github.com/rrnewton/hermit/issues/4768>);
-//! KVM refuses blocking inotify reads. A read that carries no rename (every
+//! pair keeps one value however far apart its halves are read. The
+//! filesystem operations that queue the events and the reads that observe
+//! them all run in the scheduler's order, so the order of first
+//! observations, and with it every virtual cookie, is a function of the
+//! schedule. That covers a blocking read too: Detcore makes every instance it
+//! creates physically nonblocking and keeps the guest's blocking mode itself,
+//! as for an eventfd (`Detcore::handle_inotify_init1`), so a blocking read
+//! that finds nothing queued waits in Detcore's turns and is attempted again
+//! in the reading thread's turn (`IOAction::NonblockizeRetry`,
+//! <https://github.com/rrnewton/hermit/issues/4768>). Under record and replay,
+//! and without sequentialized threads, an instance stays as the guest made it
+//! and a blocking read waits in the kernel outside the turns
+//! (`IOAction::Blocking`), so which events it returns, and so the numbering,
+//! can depend on host timing there. A read that carries no rename (every
 //! cookie zero) is left alone and asks global state nothing.
 //!
 //! A read that faults: `inotify_read` copies whole events in order and
@@ -42,12 +48,14 @@
 //! `vfs_read` and `import_iovec`), and then copies nothing.
 //!
 //! Which of these happened is decided by the queue's byte count (`FIONREAD`)
-//! before and after the call, which says how many bytes the read took
-//! ([`queued_before`]), and by nothing else. The count is known only where
-//! the read runs once in the reading thread's turn: a nonblocking descriptor,
-//! sequentialized threads, outside record and replay, and a backend that
-//! serves `FIONREAD` on it. A read that took nothing copied nothing, and is
-//! left alone. A read that took bytes copied the events it dequeued up to
+//! before and after the attempt that completed, which says how many bytes it
+//! took ([`begin_count`]), and by nothing else. The count is known only where
+//! every attempt runs once in the reading thread's turn: sequentialized
+//! threads, outside record and replay, a nonblocking descriptor or a blocking
+//! one whose read Detcore attempts in its turns (counted before each
+//! attempt), and a backend that serves `FIONREAD` on it. A read that took
+//! nothing copied nothing, and is left alone. A read that took bytes copied
+//! the events it dequeued up to
 //! the first byte the guest cannot write, which depends only on the guest's
 //! page protections ([`copied_before_fault`], which reads and writes back no
 //! byte past those the read took). A page Hermit cannot read is taken for
@@ -261,6 +269,35 @@ impl Destination {
             }
             if filled == length {
                 return (size >= EVENT_HEADER).then_some((address, size));
+            }
+            filled = filled.checked_add(size)?;
+            if filled > length {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// How many buffers there are.
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The index of the first nonempty buffer after those that a read which
+    /// returned `length` bytes filled, when they end exactly at its start:
+    /// the buffer a blocking readv goes on to read, waiting for its events,
+    /// as `do_loop_readv_writev` calls `inotify_read` once per iovec
+    /// ([`Detcore::readv_inotify`]). Unlike [`Self::possibly_written`], a
+    /// buffer shorter than an event header counts: Linux waits in it too,
+    /// and then fails it with EINVAL.
+    fn next_to_read(&self, length: usize) -> Option<usize> {
+        let mut filled = 0usize;
+        for (index, &(_, size)) in self.0.iter().enumerate() {
+            if size == 0 {
+                continue;
+            }
+            if filled == length {
+                return Some(index);
             }
             filled = filled.checked_add(size)?;
             if filled > length {
@@ -708,35 +745,202 @@ where
     usize::try_from(i32::from_ne_bytes(bytes)).ok()
 }
 
-/// [`queued`] before `call`, a read of the inotify descriptor `fd`, where the
-/// count after it says how many bytes the read took: the read runs once, in
-/// the reading thread's turn, so nothing else changes the queue in between.
-/// That holds for a nonblocking descriptor under sequentialized threads,
-/// outside record and replay. `None` elsewhere.
-pub(crate) async fn queued_before<G, T, C>(guest: &mut G, fd: RawFd, call: C) -> Option<usize>
+/// The bytes queued on the instance an inotify read reads, before the attempt
+/// of it that completed: with the count after that attempt, they say how many
+/// bytes it took ([`taken`]). Kept in the reading thread's state
+/// (`ThreadState::inotify_queue`) from [`begin_count`] to [`end_count`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueueCount {
+    /// The descriptor the read reads.
+    fd: RawFd,
+    /// [`queued`] right before the latest attempt; `None` before the first
+    /// attempt of a read Detcore retries, and where `FIONREAD` fails.
+    before: Option<usize>,
+    /// Whether the read waits in Detcore's turns (`IOAction::NonblockizeRetry`):
+    /// it is blocking for the guest.
+    waits: bool,
+}
+
+/// Starts counting the queue for `call`, a read of the inotify descriptor
+/// `fd`, where the count right before the attempt that completes and the
+/// count after it say how many bytes that attempt took. That holds where
+/// every attempt runs once, in the reading thread's turn, so that nothing
+/// else changes the queue in between: under sequentialized threads and
+/// outside record and replay, for a descriptor whose read runs once here (a
+/// nonblocking one, `IOAction::PassThru`, counted now) or whose blocking read
+/// Detcore attempts in its turns (one it made physically nonblocking,
+/// `IOAction::NonblockizeRetry`, counted before each attempt by
+/// [`count_before_attempt`]). A read that waits in the kernel
+/// (`IOAction::Blocking`) has no count.
+pub(crate) async fn begin_count<G, T, C>(guest: &mut G, fd: RawFd, call: C)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
     C: SyscallInfo + Into<Syscall> + crate::syscalls::helpers::NonblockableSyscall,
 {
+    use crate::syscalls::helpers::IOAction;
+    guest.thread_state_mut().inotify_queue = None;
     let config = guest.config();
     if !config.sequentialize_threads || config.recordreplay_modes {
-        return None;
+        return;
     }
-    let wrapped: Syscall = call.into();
-    let call_fd = crate::syscalls::helpers::get_fd(wrapped)
-        .unwrap_or_else(|| panic!("Failed to get fd for {}", call.name()));
-    if !matches!(
-        crate::syscalls::helpers::ioaction_based_on_fd(guest, call_fd),
-        Ok(crate::syscalls::helpers::IOAction::PassThru)
-    ) {
-        return None;
+    let count = match crate::syscalls::helpers::ioaction_based_on_fd_status(guest, call) {
+        Ok(IOAction::PassThru) => QueueCount {
+            fd,
+            before: queued(guest, fd).await,
+            waits: false,
+        },
+        Ok(IOAction::NonblockizeRetry) => QueueCount {
+            fd,
+            before: None,
+            waits: true,
+        },
+        Ok(IOAction::Blocking) | Err(_) => return,
+    };
+    guest.thread_state_mut().inotify_queue = Some(count);
+}
+
+/// Counts the queue again right before an attempt of `call`, from Detcore's
+/// internal polling loop, if `call` reads the descriptor [`begin_count`]
+/// started counting: the attempt runs next, in this thread's turn.
+pub(crate) async fn count_before_attempt<G, T>(guest: &mut G, call: Syscall)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(count) = guest.thread_state().inotify_queue else {
+        return;
+    };
+    if crate::syscalls::helpers::get_fd(call) != Some(count.fd) {
+        return;
     }
-    queued(guest, fd).await
+    let before = queued(guest, count.fd).await;
+    guest.thread_state_mut().inotify_queue = Some(QueueCount { before, ..count });
+}
+
+/// Ends the count [`begin_count`] started: the bytes queued before the
+/// attempt that completed, where they are known.
+pub(crate) fn end_count<G, T>(guest: &mut G) -> Option<usize>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    end_count_waiting(guest).0
+}
+
+/// [`end_count`], and whether the read waited in Detcore's turns.
+fn end_count_waiting<G, T>(guest: &mut G) -> (Option<usize>, bool)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    guest
+        .thread_state_mut()
+        .inotify_queue
+        .take()
+        .map_or((None, false), |count| (count.before, count.waits))
+}
+
+/// Whether an attempt that returned `length` bytes, of a queue that held
+/// `before` bytes before it, took exactly those bytes and left nothing
+/// queued: the next iovec's own read found no event, so it failed with
+/// EAGAIN on the physically nonblocking instance, where Linux's blocking
+/// read would wait for one. Otherwise that read failed another way, as on
+/// Linux: an event too long for the iovec (EINVAL, which takes nothing and
+/// leaves the event queued) or a fault (EFAULT, which took the event).
+async fn left_nothing_queued<G, T>(
+    guest: &mut G,
+    fd: RawFd,
+    before: Option<usize>,
+    length: usize,
+) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if before.is_none() {
+        return false;
+    }
+    took_all_and_only(before, queued(guest, fd).await, length)
+}
+
+/// [`left_nothing_queued`] from the queue's counts `before` and `after` the
+/// attempt: it took exactly the `length` bytes it returned, and nothing is
+/// left. Unknown counts decide nothing.
+fn took_all_and_only(before: Option<usize>, after: Option<usize>, length: usize) -> bool {
+    matches!((before, after), (Some(before), Some(0)) if before == length)
+}
+
+impl<T: RecordOrReplay> Detcore<T> {
+    /// `call`, a `readv` of an inotify instance (or a `preadv2` at the current
+    /// offset with no flag but RWF_HIPRI, which Linux serves as one), as Linux
+    /// runs it.
+    ///
+    /// Inotify has no `read_iter`, so `do_loop_readv_writev` calls
+    /// `inotify_read` once per iovec, and on a blocking descriptor each call
+    /// waits while nothing is queued (fs/read_write.c, fs/notify/inotify/
+    /// inotify_user.c). A blocking readv whose events exactly fill its first
+    /// iovecs therefore waits on into the next one, and returns the bytes of
+    /// the earlier iovecs once that call fails (an event too long for it, a
+    /// fault, a signal) and the bytes of every iovec it fills otherwise. A
+    /// blocking readv Detcore runs in its turns
+    /// (`execute_nonblockable_fd_syscall`, `IOAction::NonblockizeRetry`)
+    /// attempts the call on the physically nonblocking instance, where that
+    /// next call fails with EAGAIN and the attempt returns the earlier bytes.
+    /// So when the attempt's count ends exactly at the start of a later
+    /// nonempty iovec and it left the queue empty ([`left_nothing_queued`]),
+    /// the rest of the array is read the same way, as Linux's loop goes on,
+    /// and the counts add up; once something has been read, a later part
+    /// that fails returns the bytes read so far, as `do_loop_readv_writev`
+    /// does. Each part's events get their cookies as one read's do
+    /// ([`finish`]). The array is read again from guest memory for each
+    /// part, where Linux imported it once.
+    pub(crate) async fn readv_inotify<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+    ) -> Result<i64, Error> {
+        let fd = call.fd();
+        let array = call.iov().map_or(0, |iov| iov.as_raw());
+        let mut part = call;
+        let mut first = 0usize;
+        let mut done = 0usize;
+        loop {
+            let destination =
+                Destination::iovecs(&guest.memory(), array + first * IOVEC, part.len());
+            begin_count(guest, fd, part).await;
+            let result = self.execute_nonblockable_fd_syscall(guest, part).await;
+            let (before, waits) = end_count_waiting(guest);
+            let next = match (&result, &destination) {
+                (Ok(length), Some(destination)) if waits && *length > 0 => {
+                    let length = *length as usize;
+                    match destination.next_to_read(length) {
+                        Some(next) if left_nothing_queued(guest, fd, before, length).await => {
+                            Some((next, destination.len()))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let result = finish(guest, Sysno::readv, fd, destination, before, result).await;
+            match (result, next) {
+                (Ok(length), Some((next, count))) => {
+                    done += length as usize;
+                    first += next;
+                    let rest = syscalls::Addr::<libc::iovec>::from_raw(array + first * IOVEC);
+                    part = call.with_iov(rest).with_len(count - next);
+                }
+                (Ok(length), None) => break Ok((done + length as usize) as i64),
+                (Err(Error::Errno(_)), _) if done > 0 => break Ok(done as i64),
+                (Err(error), _) => break Err(error),
+            }
+        }
+    }
 }
 
 /// How many bytes a read took from the queue of the inotify descriptor `fd`,
-/// which held `before` bytes ([`queued_before`]) before it.
+/// which held `before` bytes ([`end_count`]) before it.
 async fn taken<G, T>(guest: &mut G, fd: RawFd, before: Option<usize>) -> Option<usize>
 where
     G: Guest<Detcore<T>>,
@@ -749,9 +953,9 @@ where
 /// After `call`, a read of the inotify descriptor `fd` into `destination`
 /// (`None`: iovecs Hermit could not read), returned `result`: put virtual
 /// cookies in the events it read, including those it copied before a
-/// fault. `queued` is the queue's byte count before the call
-/// ([`queued_before`]). The result is returned as it is, whatever happens
-/// here.
+/// fault. `queued` is the queue's byte count before the attempt that
+/// completed ([`end_count`]). The result is returned as it is, whatever
+/// happens here.
 pub(crate) async fn finish<G, T>(
     guest: &mut G,
     call: Sysno,
@@ -807,9 +1011,9 @@ where
                 None => warn!(
                     "[detcore, dtid {dettid}] any events an inotify {call} copied at {} before \
                      it failed with EFAULT keep their host rename cookies: without the queue's \
-                     count (a blocking descriptor, threads that are not sequentialized, or a \
-                     backend that does not serve FIONREAD on it), Hermit cannot tell what Linux \
-                     copied, or whether it copied anything \
+                     count (a read that waits in the kernel, threads that are not \
+                     sequentialized, or a backend that does not serve FIONREAD on it), Hermit \
+                     cannot tell what Linux copied, or whether it copied anything \
                      (https://github.com/rrnewton/hermit/issues/4793)",
                     describe(&[(address, size)])
                 ),
@@ -1031,6 +1235,39 @@ mod tests {
         records.extend_from_slice(&[0; 10]);
         assert_eq!(cookie_offsets(&records), [8, 28, 44]);
         assert_eq!(cookie_offsets(&records[..15]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_blocking_readv_reads_on_into_the_buffer_after_those_it_filled() {
+        let two = Destination(vec![(0x1000, 32), (0x2000, 32)]);
+        // Filled exactly to the second buffer's start: that one is read next.
+        assert_eq!(two.next_to_read(32), Some(1));
+        // Nothing filled: the first buffer is still the one being read.
+        assert_eq!(two.next_to_read(0), Some(0));
+        // Inside a buffer, or past the last one: no later buffer to read.
+        assert_eq!(two.next_to_read(16), None);
+        assert_eq!(two.next_to_read(64), None);
+        assert_eq!(two.next_to_read(96), None);
+        // Empty buffers are skipped, and a buffer too short for any event
+        // still counts: Linux waits in it too, then fails it with EINVAL.
+        let gaps = Destination(vec![(0x1000, 32), (0x1800, 0), (0x2000, 8)]);
+        assert_eq!(gaps.next_to_read(32), Some(2));
+        assert_eq!(gaps.len(), 3);
+    }
+
+    #[test]
+    fn a_readv_reads_on_only_when_its_attempt_took_its_count_and_left_nothing() {
+        // Took exactly what it returned and nothing is left: the next iovec's
+        // read found no event, where Linux's blocking read waits.
+        assert!(took_all_and_only(Some(32), Some(0), 32));
+        // Took more than it returned: the next iovec's read faulted on an
+        // event it took (EFAULT), and Linux stops there too.
+        assert!(!took_all_and_only(Some(64), Some(0), 32));
+        // An event is left: it was too long for the next iovec (EINVAL).
+        assert!(!took_all_and_only(Some(64), Some(32), 32));
+        // Unknown counts decide nothing.
+        assert!(!took_all_and_only(None, Some(0), 32));
+        assert!(!took_all_and_only(Some(32), None, 32));
     }
 
     /// A readv's bytes fill each iovec in turn, skipping empty ones, and stop

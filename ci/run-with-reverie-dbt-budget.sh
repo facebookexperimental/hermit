@@ -3161,7 +3161,15 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=19c014c6507e7e5b179012a778ce2603ab940c2c
+# CARRY TO 96fe01686ad7ab7a1c3a56cb2dbb79ed9e0173e2 (2026-11-01): from 19c014c6507e7e5b179012a778ce2603ab940c2c.
+# Interval: Reverie main 19c014c6, the pin SP1 leaves, then this slice:
+# LinuxEmu accepts blocking inotify instances and keeps their host instance
+# nonblocking (96fe0168). reverie-linuxemu only.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+expected_pin=96fe01686ad7ab7a1c3a56cb2dbb79ed9e0173e2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

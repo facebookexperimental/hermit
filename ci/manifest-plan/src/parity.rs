@@ -6300,7 +6300,11 @@ mod tests {
         // language-runtimes/go-os-exec-output (spawns from several threads,
         // each pipe's write end shared with the other threads until its
         // close) add one row each per candidate backend: 3085.
-        assert_eq!(parsed.cells.len(), 3085);
+        // c-programs/inotify-blocking-read and c-programs/inotify-blocking-signal
+        // (blocking inotify reads, and signals sent to a blocked reader,
+        // https://github.com/rrnewton/hermit/issues/4768) add one row per
+        // candidate backend each: 3095.
+        assert_eq!(parsed.cells.len(), 3095);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
